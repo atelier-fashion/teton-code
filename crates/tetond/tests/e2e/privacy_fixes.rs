@@ -205,8 +205,10 @@ fn glob_enumerating_boundary_files_taints_and_reroutes() {
 /// 30,000 words / 120,000 bytes fits the 128k-derived pair (84,650 words /
 /// 253,952 bytes) with room to spare — under *both* of its 70% soft thresholds,
 /// so the `compact` duty never fires on the remote leg and the paste reaches the
-/// provider whole. It is 7× the local pair's words and 3.7× its bytes, so the
-/// local pin cannot take it unchanged.
+/// provider whole. It is 2.9× the local pair's words and 3.66× its bytes (10,240
+/// / 32,768 since REQ-590 ADR-9 — the word half window-derived, the byte half the
+/// unchanged constant), so the local pin cannot take it unchanged in either
+/// currency.
 ///
 /// The density is the point (REQ-586 Phase-3 F-19). At more than 4 B/word the
 /// **byte** guard would bind while the turn was still being assembled for the
@@ -339,7 +341,14 @@ fn a_128k_turn_blocked_by_privacy_is_refitted_before_the_local_pin_serves_it() {
         Some("local_engine"),
         "the pin is the local tier, whatever the blocked provider declared: {event}"
     );
-    assert_eq!(event["budget_tokens"].as_u64(), Some(4_096), "{event}");
+    // The local tier's pair (REQ-590). The **word** half is derived: the
+    // engine's 16,384-token window less the 1,024-token generation reservation,
+    // run through the same formula a declared window runs. The **byte** half is
+    // `LOCAL_BUDGET_BYTES`, unchanged — D-4 took the window derivation for it
+    // too (30,720) and ADR-9 reversed that. Spelled as literals because what
+    // this test is entitled to read is the *wire* — a client sees these two
+    // numbers and nothing about how they were made.
+    assert_eq!(event["budget_tokens"].as_u64(), Some(10_240), "{event}");
     assert_eq!(event["budget_bytes"].as_u64(), Some(32_768), "{event}");
     assert!(
         event["dropped_blocks"].as_u64().unwrap_or(0) > 0

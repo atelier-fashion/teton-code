@@ -49,8 +49,8 @@ use teton_providers::{BlockDetail, HarnessProfile, ProviderError, ToolCall};
 use crate::broadcast::EventBus;
 
 use super::budget::{
-    self, skill_append_fit, BudgetInputs, RouteBudget, SkillCaller, SkillStage, LOCAL_BUDGET_BYTES,
-    LOCAL_BUDGET_TOKENS, LOCAL_DIGEST_THRESHOLD_BYTES, LOCAL_DIGEST_THRESHOLD_TOKENS,
+    self, skill_append_fit, BudgetInputs, RouteBudget, SkillCaller, SkillStage,
+    LOCAL_GENERATION_RESERVATION,
 };
 use super::compact::COMPACT_DUTY;
 use super::completion::{
@@ -384,14 +384,28 @@ pub struct HarnessConfig {
     /// BPE tokens), so the context is bounded in bytes too: bytes are a
     /// conservative proxy for BPE tokens (code averages ≳2 bytes per token).
     ///
-    /// The default is the local pair — `LOCAL_BUDGET_TOKENS` ×
-    /// [`APPROX_BYTES_PER_TOKEN`](super::context::APPROX_BYTES_PER_TOKEN),
-    /// which keeps a full assembled prompt within the local engine's
-    /// 16,384-token window (`LOCAL_ENGINE_N_CTX`) with headroom. A **remote**
-    /// route's bytes are not that bridge: [`super::budget::derive`] takes them
-    /// from the route's window at the 2 B/token BPE floor
-    /// (`DUTY_REQUEST_BYTES_PER_TOKEN`), because on a 128k window `words × 8`
-    /// would be a byte budget nothing measured. Like the word half, this is
+    /// The default is the local route's pair, whose two halves have **different
+    /// provenance since REQ-590 ADR-9** — read `derive`'s local arm rather than
+    /// trusting this summary.
+    ///
+    /// The **word** half is window-derived (`LOCAL_ENGINE_N_CTX` less
+    /// `LOCAL_GENERATION_RESERVATION`, then the 3/2 rule). The **byte** half is
+    /// `LOCAL_BUDGET_TOKENS × APPROX_BYTES_PER_TOKEN` — the `words × 8` bridge,
+    /// unchanged, and *not* window-derived.
+    ///
+    /// D-4 briefly did derive it from the window, at the 2 B/token floor, which
+    /// gave 30,720. That was reversed: it made the pair *worse* than the old one
+    /// above 7.5 B/word — where code lives — and over the byte interval the
+    /// `/analyze` field report admits (`31 KB` rounded, so [30,500, 31,499]) it
+    /// was worth between +0.7% and −2.4%, mostly moving the refusal from the
+    /// word guard to the byte guard rather than removing it.
+    ///
+    /// The honest consequence, stated because it is the thing the window
+    /// derivation would have fixed: at the 2 B/token floor this byte half claims
+    /// 16,384 provider tokens against 15,360 usable, so a byte-saturated local
+    /// prompt out-claims the engine by exactly `LOCAL_GENERATION_RESERVATION`.
+    /// That was true before REQ-590 and stays true after it; the catch is the
+    /// engine's own typed `context_length_exceeded`. Like the word half, this is
     /// stamped by [`with_route_budget`](Self::with_route_budget) on the next
     /// route decision, so hand-sizing it for a different engine holds only
     /// until then.
@@ -462,24 +476,39 @@ pub struct HarnessConfig {
 
 impl Default for HarnessConfig {
     fn default() -> Self {
-        // The weak-model native shape. The pair and thresholds read the
-        // `LOCAL_*` constants from `harness::budget` — their one home
-        // (REQ-586, LESSON-456) — and `budget` carries the local derivation
-        // built from the same constants (the AC pins the two equal).
+        // The weak-model native shape. All five budget-bearing fields come off
+        // **one** local derivation, exactly as
+        // [`with_route_budget`](Self::with_route_budget) sets them for a routed
+        // turn — that method's whole purpose is that a config's pair and
+        // thresholds cannot disagree with the [`RouteBudget`] beside them, and
+        // a `Default` that set them from constants instead would be the one
+        // config in the crate that could (REQ-586 BR-8).
+        //
+        // Until REQ-590 the two were the same numbers by construction, because
+        // `derive`'s local arm returned the `LOCAL_*` constants. It now derives
+        // the local tier's pair from the engine's own window (ADR-2), so the
+        // constants and this pair are different values with different meanings
+        // — and this config runs on the local engine.
+        let budget = budget::derive(BudgetInputs::local());
         Self {
             max_turns: 12,
-            context_budget_tokens: LOCAL_BUDGET_TOKENS,
-            context_budget_bytes: LOCAL_BUDGET_BYTES,
-            summarize_threshold_tokens: LOCAL_DIGEST_THRESHOLD_TOKENS,
-            summarize_threshold_bytes: LOCAL_DIGEST_THRESHOLD_BYTES,
+            context_budget_tokens: budget.budget_tokens,
+            context_budget_bytes: budget.budget_bytes,
+            summarize_threshold_tokens: budget.digest_threshold_tokens,
+            summarize_threshold_bytes: budget.digest_threshold_bytes,
             max_tools: Some(5),
             require_verification: true,
             // Agent turns need room for prose plus a complete tool call. The
             // 256-token `GenParams` default is sized for the local tier's
             // summarize/classify duties and cut tool calls mid-JSON (BUG-147);
             // the reply scanner ends well-formed turns long before this cap.
+            //
+            // The number lives in `budget` (ADR-1), because that is where
+            // `derive` has to subtract it — and reading it here rather than
+            // reading this field there is what keeps `default() → derive() →
+            // generation_reservation()` from closing on itself.
             gen_params: GenParams {
-                max_tokens: 1_024,
+                max_tokens: LOCAL_GENERATION_RESERVATION,
                 temperature: 0.2,
             },
             // Unsupplied, not "off": see the field's docs. The prompt falls back
@@ -490,7 +519,7 @@ impl Default for HarnessConfig {
             // probes the root and sets it (REQ-583).
             session_root: None,
             known_projects: Vec::new(),
-            budget: budget::derive(BudgetInputs::local()),
+            budget,
         }
     }
 }
@@ -2727,6 +2756,13 @@ mod tests {
     /// Both sentences are written out in full rather than derived, because the
     /// claim under test *is* the bytes: this is the pin that fails if extending
     /// the outcome to the local tier changed what a remote refusal says.
+    ///
+    /// `5_000` and `4_096` here are **inputs to a formatter**, not a budget.
+    /// Nothing derives them and nothing measures against them; they are two
+    /// numbers chosen to be legible in a sentence, and REQ-590's sweep left them
+    /// alone for that reason. Renumbering them to the local tier's new pair
+    /// would say nothing more than they say now and would invite the next reader
+    /// to mistake a rendering test for a budget one.
     #[test]
     fn one_composer_words_both_window_refusals_and_leaves_the_remote_one_unchanged() {
         let remote = HarnessError::ContextLengthExceeded {
@@ -3008,7 +3044,8 @@ mod tests {
         let tools = ToolRegistry::with_builtins();
         let tool_ctx = ToolContext::new(std::env::temp_dir());
         let mut hook = NoopProvenanceHook;
-        let mut ctx = ContextManager::new("sys", config.context_budget_tokens);
+        let mut ctx = ContextManager::new("sys", config.context_budget_tokens)
+            .with_budget_bytes(config.context_budget_bytes);
         ctx.push_user("what is in nope.txt");
 
         let mut source = RemoteToolThenEndSource { calls: 0 };
@@ -3203,8 +3240,31 @@ mod tests {
         /// The window refusal the local tier produces when the rendered prompt
         /// does not fit its context window: `EngineError::ContextWindowExceeded`
         /// reaches the loop as [`HarnessError::LocalContextLengthExceeded`]
-        /// (REQ-589 TASK-239, `completion.rs`). The numbers are the pair the
-        /// reported `/analyze` failure measured.
+        /// (REQ-589 TASK-239, `completion.rs`).
+        ///
+        /// # Where its figures come from, and what they are not
+        ///
+        /// They are read off the [`HarnessConfig`] this source is called with —
+        /// one word past that config's own word budget — so the arm reports a
+        /// refusal against the budget the turn actually ran under.
+        ///
+        /// Until REQ-590 TASK-272 the arm held the literals `4_097 / 4_096` and
+        /// documented them as "the pair the reported `/analyze` failure
+        /// measured". They were not: this is a **scripted** source, `config` was
+        /// discarded, and no budget was consulted to produce them. The test that
+        /// asserted them back was asserting a constant against itself — it could
+        /// not redden when TASK-270 moved the local pair, and it did not
+        /// (LESSON-552's shape: a wire fact pinned by a value the test invented).
+        /// Reading the config is what makes the assertion say something: the
+        /// loop handed this source the route's budget, and the typed refusal
+        /// reached the caller carrying it unaltered.
+        ///
+        /// **This arm does not witness REQ-590 AC-12.** Nothing in
+        /// [`run_session_turn_with_pressure_policy`] refuses on a budget — the
+        /// loop's own answer to an oversized context is truncation, not refusal
+        /// — so a turn here cannot show that a 4,097-word local turn now serves.
+        /// That criterion is measured where a real budget decides a real turn,
+        /// in `tests/skill_over_budget_offer.rs`.
         WindowRefusal,
         /// A `read` of a file that does not exist — the shortest route to a
         /// folded tool result, and therefore to a second iteration.
@@ -3244,7 +3304,7 @@ mod tests {
             &mut self,
             prompt: &PreparedPrompt,
             _provenance: &EgressProvenance,
-            _config: &HarnessConfig,
+            config: &HarnessConfig,
             _tools: &ToolRegistry,
             _exposed: &[&str],
             _on_token: &mut (dyn for<'s> FnMut(&'s str) + Send),
@@ -3252,10 +3312,13 @@ mod tests {
             self.prompts.push(prompt.flat.clone());
             let call = self.prompts.len();
             match self.script.get(call - 1) {
+                // One word past the budget this turn was configured with — the
+                // engine's refusal in the shape the engine would make it. See
+                // [`ScriptedTurn::WindowRefusal`] for why it is not a literal.
                 Some(ScriptedTurn::WindowRefusal) => {
                     Err(HarnessError::LocalContextLengthExceeded {
-                        assembled_tokens: 4_097,
-                        budget_tokens: 4_096,
+                        assembled_tokens: config.context_budget_tokens + 1,
+                        budget_tokens: config.context_budget_tokens,
                     })
                 }
                 Some(ScriptedTurn::ToolCall) => Ok(SourceTurn {
@@ -3363,8 +3426,19 @@ mod tests {
             .context_refusal()
             .expect("a window refusal, not a generic engine failure");
         assert_eq!(refusal.origin, ContextRefusalOrigin::LocalEngine);
-        assert_eq!(refusal.assembled_tokens, 4_097);
-        assert_eq!(refusal.budget_tokens, 4_096);
+        // The engine's own figures, reaching the caller unaltered — not a
+        // re-measurement of whatever the loop ended up assembling. Read off the
+        // config the turn ran under rather than written as literals, so this
+        // says something when the local budget moves; see
+        // [`ScriptedTurn::WindowRefusal`] for what it said before REQ-590.
+        assert_eq!(refusal.budget_tokens, config.context_budget_tokens);
+        assert_eq!(refusal.assembled_tokens, config.context_budget_tokens + 1);
+        assert_eq!(
+            config.context_budget_tokens,
+            budget::derive(BudgetInputs::local()).budget_tokens,
+            "non-vacuity: the default harness must still be the local route's, or \
+             the pair above is not the one a local turn refuses against"
+        );
 
         // D-7: ordinary pressure resumes on the **next** turn. The policy above
         // was moved into that call and cannot be reused — a second turn states
@@ -4367,6 +4441,33 @@ mod tests {
         // reply scanner ends well-formed turns long before the cap.
         let config = HarnessConfig::default();
         assert!(config.gen_params.max_tokens >= 1_024);
+    }
+
+    /// ADR-1: the generation reservation has one home, and the arrow between
+    /// that home and this config runs one way.
+    ///
+    /// `gen_params.max_tokens` reads `LOCAL_GENERATION_RESERVATION`;
+    /// `budget::generation_reservation()` returns the same constant instead of
+    /// reading this field back off a fresh `HarnessConfig::default()`. Pinning
+    /// both ends equal is what makes the hoist a refactor rather than a second
+    /// number: the six callers that subtract the reservation and the adapters
+    /// that send it as `max_tokens` cannot drift apart.
+    ///
+    /// The literal is restated here deliberately. This is the assertion that
+    /// says the value did not move when its home did.
+    #[test]
+    fn the_generation_reservation_has_one_home() {
+        assert_eq!(
+            HarnessConfig::default().gen_params.max_tokens,
+            LOCAL_GENERATION_RESERVATION,
+            "the config sends exactly what `derive` reserves"
+        );
+        assert_eq!(
+            budget::generation_reservation(),
+            LOCAL_GENERATION_RESERVATION,
+            "and the accessor hands out the constant, not a field read"
+        );
+        assert_eq!(LOCAL_GENERATION_RESERVATION, 1_024);
     }
 
     #[test]

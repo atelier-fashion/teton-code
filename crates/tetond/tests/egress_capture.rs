@@ -1179,11 +1179,31 @@ fn over_budget_skill_trees(tag: &str) -> (std::path::PathBuf, std::path::PathBuf
     let _ = std::fs::remove_dir_all(&base);
     let root = base.join("repo");
     let home = base.join("home");
-    // Comfortably past the local pair in words (4,096) at four bytes a word, and
-    // comfortably inside discovery's 64 KiB ceiling for one `SKILL.md`.
-    let filler = "abc ".repeat(6_000);
+    // Comfortably past the local pair in **both** currencies, at four bytes a
+    // word (`"abc "`), and comfortably inside discovery's 64 KiB ceiling for one
+    // `SKILL.md`.
+    //
+    // Sized off the derived pair rather than a literal, and that is not a
+    // tidiness point: this fixture read `6_000` — chosen when the local word
+    // budget was 4,096 — and REQ-590 raised that budget to 10,240, at which
+    // point the bodies were no longer over budget in words at all. The
+    // `skill_fit` guard below is what said so, which is the shape this file's
+    // own doc promises ("shrink them and this test says so"). Reading the
+    // budget is what stops the guard having to.
+    let local_pair = tetond::harness::budget::derive(tetond::harness::BudgetInputs::local());
+    let filler = "abc ".repeat(local_pair.budget_tokens + local_pair.budget_tokens / 4);
     let write = |path: std::path::PathBuf, body: String| {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Discovery **names and skips** a `SKILL.md` past `SKILL_MAX_BYTES`
+        // rather than truncating it, so a fixture that outgrew the ceiling
+        // would arrive below as "no such skill" rather than as "too large".
+        assert!(
+            body.len() < tetond::skills::SKILL_MAX_BYTES as usize,
+            "fixture: a {} B SKILL.md is past discovery's {} B ceiling and would \
+             be skipped rather than measured",
+            body.len(),
+            tetond::skills::SKILL_MAX_BYTES
+        );
         std::fs::write(path, body).unwrap();
     };
     write(

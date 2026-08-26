@@ -11966,26 +11966,67 @@ fn fake_engine_loader(
 
 /// Generation context window for the local tier's engine, in **BPE tokens**.
 ///
-/// Sized to cover the harness's context budget, which is denominated in a
-/// different currency: `HarnessConfig::context_budget_tokens` (4,096 for the
-/// weak-model profile) counts *whitespace-approximated* tokens
-/// ([`crate::harness::context`]'s `approx_tokens`), and source code tokenizes
-/// at roughly 2.5–4 BPE tokens per whitespace word. A window equal to the
-/// budget's number therefore overflows on exactly the inputs the tier exists
-/// for — a folded `read` of a real file killed the first dogfooded turn with
-/// an opaque "local engine could not serve the turn" (that failure now carries
-/// the engine's own over-window sentence, BUG-146) — so the window is the
-/// budget's worst-case BPE expansion (~4×) plus generation headroom.
+/// **This constant is the source, not the consequence (REQ-590).** It used to
+/// be sized *to cover* a separately-chosen harness budget — 4,096 whitespace
+/// words times a worst-case ~4× BPE expansion, plus generation headroom. That
+/// dependency now runs the other way: the harness budget is derived **from**
+/// this number, so a reader who arrives here looking for the ~4× of margin the
+/// old wording promised will not find it.
 ///
-/// The harness now also bounds its side in this window's currency: the
-/// assembled context and the summarizer's input are capped in **bytes**
-/// (`HarnessConfig::context_budget_bytes`, sized to this window), so
-/// pathological content (a minified single-line file) is clamped or
-/// mechanically truncated instead of reaching the engine over-window. The
-/// engine's typed backend error remains as the backstop, never the expected
-/// path.
+/// # What derives from it
 ///
-/// ## Not feature-gated, because a second consumer derives from it
+/// * The local route's **word** budget, in
+///   [`derive`](crate::harness::budget::derive)'s local arm: `16,384 − 1,024
+///   reserved for the reply = 15,360 usable`, then the same 3/2 rule every
+///   window-derived route runs, giving **10,240 whitespace words**. That is
+///   *exactly* saturating and carries **zero** slack (ADR-6): 10,240 × 3/2 =
+///   15,360, so any content denser than 1.5 real BPE tokens per whitespace word
+///   overruns the engine at full budget, with the engine's own typed
+///   `context_length_exceeded` as the only catch. The local **byte** budget is
+///   not derived from here at all — ADR-9 kept it at
+///   [`LOCAL_BUDGET_BYTES`](crate::harness::budget::LOCAL_BUDGET_BYTES),
+///   32,768, and `derive`'s local arm says why.
+/// * [`COMPACT_OUTPUT_MAX_BYTES`](crate::harness::compact::COMPACT_OUTPUT_MAX_BYTES)
+///   and [`COMPACT_PROMPT_BUDGET_BYTES`](crate::harness::compact::COMPACT_PROMPT_BUDGET_BYTES)
+///   — the `compact` duty's output ceiling and its own prompt bound.
+/// * [`REDACT_CHUNK_MAX_BYTES`](crate::egress::redact::REDACT_CHUNK_MAX_BYTES)
+///   and `REDACT_PROMPT_BUDGET_BYTES`, on the same chain.
+///
+/// # So lowering it is not a local edit (BR-8, OQ-2)
+///
+/// Every number above moves with it, and the rules that keep those moves safe
+/// live in `harness/budget.rs`, not here:
+///
+/// * **BR-8** — `MIN_BUDGET_*` may never raise the local pair above what this
+///   window holds. The floor's "only ever raises" property is safe against a
+///   provider's *declaration*, which the provider can refuse in words a user
+///   reads, and is not safe against this **allocation**, where a budget above
+///   the window buys nothing a turn can spend. Latent at 16,384; live the
+///   moment this constant falls. `budget::Floor::HeldToTheEngine` is where it
+///   is enforced and tested at a synthetic window.
+/// * **OQ-2, open — and its premise moved under it.** OQ-2 was written against
+///   a byte half that fell with this window: at 4,096 tokens `window_pair`
+///   gives 6,144 bytes, below the harness's own ~6 KB system prompt plus the
+///   1 KiB truncation floor, i.e. a tier that cannot serve anything. Since
+///   ADR-9 the local arm **discards** that byte half and takes the constant, so
+///   the hazard at a small window now runs the *other* way: the local byte
+///   budget would still be 32,768 — 16,384 claimed tokens against 3,072 usable,
+///   a 5.3× overclaim, with no floor and no derivation to stop it, because
+///   BR-8's floor only ever guards against raising a *derived* pair. Neither
+///   number is safe at 4,096; they fail in opposite directions. Read `derive`'s
+///   local arm and OQ-2 together before changing this line.
+///
+/// The harness bounds its side in this window's currency as well as in words:
+/// the assembled context and the summarizer's input are capped in **bytes**
+/// (`HarnessConfig::context_budget_bytes`), so pathological content (a minified
+/// single-line file) is clamped or mechanically truncated instead of reaching
+/// the engine over-window. What that history cost is worth keeping: a folded
+/// `read` of a real file killed the first dogfooded turn with an opaque "local
+/// engine could not serve the turn", and that failure now carries the engine's
+/// own over-window sentence (BUG-146). The typed backend error is the backstop,
+/// never the expected path.
+///
+/// ## Not feature-gated, because other consumers derive from it
 ///
 /// `LlamaEngine::load` is the only *caller*, and it exists only under
 /// `--features tetond/llama`. But [`REDACT_CHUNK_MAX_BYTES`](crate::egress::redact::REDACT_CHUNK_MAX_BYTES)
@@ -34137,7 +34178,7 @@ provider_id = \"deepseek\"
     mod the_over_budget_offer {
         use super::*;
         use crate::grants::GrantRegistry;
-        use crate::harness::budget::{LOCAL_BUDGET_BYTES, LOCAL_BUDGET_TOKENS};
+        use crate::harness::budget::{derive, BudgetInputs, RouteBudget};
         use crate::harness::permissions::{AddressedPermissionDelivery, PermissionConfig};
         use crate::sessions::SessionRegistry;
         use crate::skills::{discover, RealFs};
@@ -34158,16 +34199,58 @@ provider_id = \"deepseek\"
         /// turn. Only a prompt carrying this one reached the end of the body.
         const TAIL_MARKER: &str = "SKILLTAILMARKER-247";
 
+        /// The local tier's budget as `derive` makes it — the same pair the
+        /// router stamps on a local route, read once so no fixture here has to
+        /// name it.
+        fn local_pair() -> RouteBudget {
+            derive(BudgetInputs::local())
+        }
+
         /// A body comfortably past the local pair in both currencies, and past a
-        /// 6,000-token cap by a wide margin.
+        /// 6,000-token cap by a wide margin — while staying **inside**
+        /// [`SKILL_MAX_BYTES`](crate::skills::SKILL_MAX_BYTES), which discovery
+        /// enforces by naming and skipping the file rather than truncating it.
         ///
-        /// Sized off [`LOCAL_BUDGET_TOKENS`] rather than a literal, so the
-        /// fixture cannot quietly stop being over budget if the pair moves.
+        /// Sized off the **derived** pair rather than off `LOCAL_BUDGET_TOKENS`,
+        /// which is what it read until REQ-590 and is no longer the local
+        /// tier's word budget. That constant is now the *no-better-fact* pair's
+        /// half, and when the local arm stopped returning it this body — 8,192
+        /// words — fell under the new 10,240-word budget while staying over the
+        /// byte half. The doc here already claimed to be sized "so the fixture
+        /// cannot quietly stop being over budget if the pair moves"; reading the
+        /// derivation is what actually makes that true.
+        ///
+        /// A quarter over the word half at four bytes a word (`"abc "`), not
+        /// double at five: doubling the derived pair puts a 100 KB file past
+        /// discovery's 64 KiB ceiling, at which point every test here fails with
+        /// "no skill `/heavy` you can dispatch" rather than with anything about a
+        /// budget. The ceiling is asserted below so that is a stated bound and
+        /// not a coincidence.
         fn oversized_body() -> String {
-            format!(
+            let words = local_pair().budget_tokens + local_pair().budget_tokens / 4;
+            let body = format!(
                 "Handle {MARKER} now.\n\n{}\n\nAnd then {TAIL_MARKER}.",
-                "word ".repeat(LOCAL_BUDGET_TOKENS * 2)
-            )
+                "abc ".repeat(words)
+            );
+            let pair = local_pair();
+            assert!(
+                body.split_whitespace().count() > pair.budget_tokens
+                    && body.len() > pair.budget_bytes,
+                "fixture: the body must be over the local pair in both currencies \
+                 ({} words / {} B against {} / {})",
+                body.split_whitespace().count(),
+                body.len(),
+                pair.budget_tokens,
+                pair.budget_bytes
+            );
+            assert!(
+                body.len() < crate::skills::SKILL_MAX_BYTES as usize,
+                "fixture: a {} B body is past discovery's {} B ceiling and would be \
+                 skipped rather than measured",
+                body.len(),
+                crate::skills::SKILL_MAX_BYTES
+            );
+            body
         }
 
         /// A remote provider declaring a large window under a small user cap —
@@ -34666,8 +34749,15 @@ provider_id = \"deepseek\"
                 "BR-7’s table for the local engine"
             );
             assert_eq!(
-                record.budget_tokens, LOCAL_BUDGET_TOKENS as u64,
-                "the budget the router stamped, verbatim"
+                (record.budget_tokens, record.budget_bytes),
+                (
+                    local_pair().budget_tokens as u64,
+                    local_pair().budget_bytes as u64
+                ),
+                "the budget the router stamped, verbatim — both halves, because \
+                 REQ-590 moved exactly one of them (the word half, up; the byte \
+                 half is unchanged, ADR-9) and a check on either alone would \
+                 have missed that"
             );
             assert!(
                 record.measured_tokens > record.budget_tokens,
@@ -35092,10 +35182,12 @@ provider_id = \"deepseek\"
             let router = build_router(&config, true, &BTreeMap::new());
 
             // Over the local pair in both currencies, and the same shape
-            // `would_seed_fit` produces.
+            // `would_seed_fit` produces. Read off the derivation so the
+            // comment stays true of the numbers beside it.
+            let local = derive(BudgetInputs::local());
             let measured = Fit {
-                tokens: LOCAL_BUDGET_TOKENS * 2,
-                bytes: LOCAL_BUDGET_BYTES * 2,
+                tokens: local.budget_tokens * 2,
+                bytes: local.budget_bytes * 2,
                 fits: false,
             };
             let plan = plan_over_budget_remedy(

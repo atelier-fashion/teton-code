@@ -1571,7 +1571,8 @@ mod tests {
         let tools = ToolRegistry::with_builtins();
         let tool_ctx = ToolContext::new(std::env::temp_dir());
         let mut hook = NoopProvenanceHook;
-        let mut ctx = ContextManager::new("sys", config.context_budget_tokens);
+        let mut ctx = ContextManager::new("sys", config.context_budget_tokens)
+            .with_budget_bytes(config.context_budget_bytes);
         ctx.push_user("show me the skills");
 
         let outcome = run_session_turn_with_source(

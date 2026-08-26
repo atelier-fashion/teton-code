@@ -672,10 +672,37 @@ fn oversized_for_a_declared_window() -> String {
     marked_body(12_000, 48_000)
 }
 
-/// The body AC-24 runs: over the local pair, and comfortably inside the
-/// 1,000,000-token window the rebind declares.
+/// The body AC-24 runs: over the local pair in **both** currencies, and
+/// comfortably inside the 1,000,000-token window the rebind declares.
+///
+/// Sized off `derive(BudgetInputs::local())` rather than written as two
+/// literals, because this fixture's whole job is to be over that pair and the
+/// pair now moves. It was `(6,000, 24,000)` — half again over a 4,096-word
+/// budget, and over nothing else once REQ-590 raised the word half to 10,240.
+/// It went on drawing an offer only because the system prompt pushed it past a
+/// byte half that had briefly fallen to 30,720, and stopped the moment ADR-9
+/// put that back to 32,768. A fixture named `oversized_for_the_local_pair` that
+/// is not oversized for the local pair takes both tests below with it, silently.
+///
+/// A quarter past the word half at 4 bytes a word absorbs Stage A's own
+/// overhead, which this fixture does not own — the body is measured *with* the
+/// system prompt — while staying clear of discovery's per-file
+/// `SKILL_MAX_BYTES`. Those two ceilings are closer than they look: doubling
+/// both halves of the pair lands on the 64 KiB file ceiling, at which point the
+/// skill is **skipped** and these tests fail with "no skill `/heavy` you can
+/// dispatch" rather than with anything about a budget.
 fn oversized_for_the_local_pair() -> String {
-    marked_body(6_000, 24_000)
+    let local = tetond::harness::budget::derive(tetond::harness::BudgetInputs::local());
+    let words = local.budget_tokens + local.budget_tokens / 4;
+    let bytes = words * 4;
+    assert!(
+        bytes > local.budget_bytes && (bytes as u64) < tetond::skills::SKILL_MAX_BYTES * 9 / 10,
+        "the fixture must clear the local byte half ({} B) and stay clear of discovery's {} B \
+         per-file ceiling; it is {bytes} B",
+        local.budget_bytes,
+        tetond::skills::SKILL_MAX_BYTES
+    );
+    marked_body(words, bytes)
 }
 
 // ---------------------------------------------------------------------------

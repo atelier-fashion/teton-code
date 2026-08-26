@@ -729,9 +729,29 @@ fn frame_untrusted_compaction(summary: &str) -> String {
 
 impl ContextManager {
     /// A manager with the given system prompt and token budget. The byte budget
-    /// defaults to `budget_tokens` × [`APPROX_BYTES_PER_TOKEN`] — the same
-    /// relationship `HarnessConfig::default` encodes; override it with
-    /// [`ContextManager::with_budget_bytes`] to match a specific engine window.
+    /// defaults to `budget_tokens` × [`APPROX_BYTES_PER_TOKEN`] — a **fallback
+    /// ratio**, not any route's pair.
+    ///
+    /// # It is no longer the relationship `HarnessConfig::default` encodes
+    ///
+    /// It was, while the local pair was `(4,096, 4,096 × 8)`. Since REQ-590
+    /// ADR-9 the pair's two halves have different provenance — the word half is
+    /// window-derived (10,240) and the byte half is the constant
+    /// [`LOCAL_BUDGET_BYTES`](super::budget::LOCAL_BUDGET_BYTES) (32,768), i.e.
+    /// 3.2 B/word, not 8. A caller that passes `config.context_budget_tokens`
+    /// here and takes this default therefore runs at **81,920** bytes: two and
+    /// a half times the byte guard the route actually derived, on the half that
+    /// binds essentially all real content.
+    ///
+    /// So a manager built from a
+    /// [`HarnessConfig`](super::turn_loop::HarnessConfig) must chain
+    /// [`ContextManager::with_budget_bytes`] with that config's
+    /// `context_budget_bytes`. Production does — `crate::carry::CarriedTurn::begin`
+    /// is the only real construction, and it chains both that and
+    /// [`ContextManager::with_window_label`]. The bare default is for fixtures
+    /// and probes that want a byte budget implied by a word count rather than
+    /// one a route decided; passing an explicit `budget_tokens` literal (the
+    /// usual `1_000_000` "words do not bind here") is the shape that means it.
     #[must_use]
     pub fn new(system: impl Into<String>, budget_tokens: usize) -> Self {
         Self {
@@ -3214,14 +3234,96 @@ mod tests {
     // The `digest` thresholds travel as a pair (REQ-586 BR-6, ADR-5).
     // ------------------------------------------------------------------
 
-    /// **AC-9, the local half.** The default route's pair is exactly what it was
-    /// before REQ-586 — the fraction is written as the constants' own ratio, so
-    /// this is arithmetic rather than a coincidence.
+    /// **REQ-586 AC-9, the local half — on the route it still describes.**
+    ///
+    /// The claim was "the default route's pair is exactly what it was before
+    /// REQ-586", and it is still true of the route that pair is *for*: a
+    /// provider declaring `max_context = 0`, which has no window fact to derive
+    /// from and runs under `LOCAL_DIGEST_THRESHOLD_*` unchanged.
+    ///
+    /// **It stopped describing `HarnessConfig::default()`** when REQ-590 gave
+    /// the local tier a window fact of its own (ADR-2/ADR-4), and that is
+    /// asserted below rather than left to the reader — a criterion whose
+    /// subject moves out from under it and is quietly re-pointed at a different
+    /// route is how a green test comes to witness nothing (LESSON-552).
     #[test]
     fn the_default_routes_digest_thresholds_are_byte_identical_to_today() {
+        let silent = crate::harness::budget::derive(crate::harness::budget::BudgetInputs {
+            window: 0,
+            cap: 0,
+            reservation: 1_024,
+            is_local: false,
+            redact_scan: false,
+            provider_id: Some("silent"),
+        });
+        assert_eq!(silent.digest_threshold_tokens, 1_500);
+        assert_eq!(silent.digest_threshold_bytes, 12_000);
+    }
+
+    /// **REQ-590 D-3, as amended by ADR-9.** What `HarnessConfig::default()` —
+    /// the *local* harness — now digests at, and the asymmetry that would
+    /// otherwise read as a bug.
+    ///
+    /// Words go **up** (1,500 → 3,750) and bytes **do not move at all**
+    /// (12,000), because `digest_thresholds` scales each half of the pair by
+    /// its own constant fraction and REQ-590 moved exactly one half: the word
+    /// budget rose 4,096 → 10,240 while the byte budget stayed
+    /// `LOCAL_BUDGET_BYTES`, 32,768. Both are pinned here so that a reader who
+    /// finds one of them surprising finds the arithmetic beside it — including
+    /// the reader who expected *both* to move.
+    ///
+    /// **D-4 briefly made the byte half fall too** (32,768 → 30,720), which
+    /// dragged this threshold down to 11,250 — a digest firing on *smaller*
+    /// tool results than before, on the tier least able to afford the extra
+    /// local call. ADR-9 reversed D-4 on the refusal measurement, and this
+    /// threshold returning to 12,000 is one of the things that reversal buys.
+    /// The unchanged figure is asserted rather than deleted, because "it did
+    /// not move" is the claim, and a test that dropped the assertion could not
+    /// make it.
+    ///
+    /// The config's thresholds are asserted against its **own** `budget` as
+    /// well as against the figures, because `with_route_budget` exists so a
+    /// config's thresholds cannot disagree with the `RouteBudget` beside them
+    /// and `Default` is the one constructor that could break that (REQ-586
+    /// BR-8).
+    #[test]
+    fn the_local_harnesss_digest_thresholds_moved_with_its_budget() {
         let config = super::super::turn_loop::HarnessConfig::default();
-        assert_eq!(config.summarize_threshold_tokens, 1_500);
+        assert_eq!(config.summarize_threshold_tokens, 3_750);
         assert_eq!(config.summarize_threshold_bytes, 12_000);
+        assert_eq!(
+            (
+                config.summarize_threshold_tokens,
+                config.summarize_threshold_bytes
+            ),
+            (
+                config.budget.digest_threshold_tokens,
+                config.budget.digest_threshold_bytes
+            ),
+            "the default config's thresholds and its own RouteBudget must be one \
+             pair of figures, not two"
+        );
+        // The asymmetry, stated as the arithmetic it is.
+        assert_eq!(
+            (config.budget.budget_tokens, config.budget.budget_bytes),
+            (10_240, 32_768)
+        );
+        assert_eq!(
+            config.budget.budget_bytes,
+            crate::harness::budget::LOCAL_BUDGET_BYTES,
+            "ADR-9: the local byte half is the constant, not a window derivation — if that has \
+             changed, the 12,000-byte digest threshold above has changed with it"
+        );
+        assert!(
+            config.summarize_threshold_tokens > 1_500,
+            "D-3: the word threshold rises with the word budget"
+        );
+        assert_eq!(
+            config.summarize_threshold_bytes, 12_000,
+            "ADR-9: and the byte threshold does not move, because the byte budget did not. D-4 \
+             would have put this at 11,250 — a digest firing on smaller results than before, on \
+             the tier least able to afford the extra local call"
+        );
     }
 
     /// **AC-9, the remote half.** On a 128k route a 3,000-word prose result

@@ -2566,17 +2566,30 @@ mod tests {
         assert_eq!((silent.budget_tokens, silent.budget_bytes), (4_096, 32_768));
         assert_eq!(silent.bound, BudgetBound::DefaultUnknown);
 
-        // The local tier: the same pair for a different reason, and classified
-        // from the routing table's local provider id (gotcha #9) — it has no
-        // `[[providers]]` entry at all, so a "capabilities look defaulted" test
-        // would have called `silent` local too. The bound is what separates
-        // them, which is why the pairs being equal is not enough.
+        // The local tier: **its own** pair since REQ-590, derived from the
+        // engine's `n_ctx` (16,384) less the generation reservation (1,024) by
+        // the same formula every declared window runs — not the no-better-fact
+        // pair above. Classified from the routing table's local provider id
+        // (gotcha #9): it has no `[[providers]]` entry at all, so a
+        // "capabilities look defaulted" test would have called `silent` local
+        // too.
         let local = router.budget_for(Some("local"));
-        assert_eq!((local.budget_tokens, local.budget_bytes), (4_096, 32_768));
+        assert_eq!((local.budget_tokens, local.budget_bytes), (10_240, 32_768));
         assert_eq!(local.bound, BudgetBound::LocalEngine);
+        // Two facts, and REQ-590 moved one of them. The bound was the *only*
+        // discriminator while the two arms returned one pair; the pair is now a
+        // discriminator too, and both are asserted because a build that lost
+        // the classification would still produce a plausible number, and one
+        // that lost the derivation would still produce the right bound.
         assert_ne!(
             silent.bound, local.bound,
-            "one pair, two reasons — the bound is the fact that tells them apart"
+            "the bound is what says which fact the pair came from"
+        );
+        assert_ne!(
+            (silent.budget_tokens, silent.budget_bytes),
+            (local.budget_tokens, local.budget_bytes),
+            "REQ-590: a route with a window fact and a route with none no longer \
+             run under one pair — the local tier derives from the engine"
         );
 
         // The user's cap is a window ceiling, not a post-hoc clamp: both
@@ -2607,10 +2620,15 @@ mod tests {
             "the scan bounds what leaves the machine; a local turn does not leave"
         );
 
-        // And the unresolvable route — no provider to derive from — carries the
-        // default pair its `HarnessConfig::default()` harness carries.
+        // And the unresolvable route — no provider to derive from — carries
+        // whatever `HarnessConfig::default()` carries, which is the same local
+        // derivation: `budget_inputs_for`'s `_ =>` arm answers for both, and
+        // since REQ-590 that is the engine's pair rather than the constants'.
+        // Asserted as an equality against the config rather than as a literal,
+        // so the two cannot drift apart whichever of them moves.
         let nowhere = router.budget_for(None);
         assert_eq!(nowhere, HarnessConfig::default().budget);
+        assert_eq!(nowhere, local, "the unresolvable route is the local arm");
     }
 
     /// **REQ-589 TASK-259's before/after guard.** Every field of every bound's
@@ -2674,8 +2692,25 @@ mod tests {
     /// TASK-259 extracted [`Router::budget_inputs_for`] — captured from the
     /// running code at `5a2ee33`, not hand-computed, so it is a record of
     /// behaviour rather than a restatement of the arithmetic.
+    ///
+    /// **One half of one row has moved since, deliberately** (REQ-590
+    /// TASK-270, D-3 as amended by ADR-9). `local_engine` no longer returns the
+    /// no-better-fact pair's *word* half: it derives from the engine's own
+    /// window like every other window-derived route, so `10240` replaces
+    /// `4096`. Its word digest threshold follows, `1500 → 3750`.
+    ///
+    /// Its **byte** half is unchanged at `32768`, and so is its byte digest
+    /// threshold at `12000`. D-4 briefly took the window-derived byte half here
+    /// too (`30720`, which would have dragged the byte digest threshold *down*
+    /// to `11250`) and was reversed on measurement — see ADR-9. The asymmetry
+    /// that survives is that one half of this pair is derived and the other is
+    /// the constant, which is stated at [`derive`](crate::harness::budget::derive)'s
+    /// local arm rather than left to be inferred from this table.
+    ///
+    /// The other four rows are byte-identical to the capture, which is what
+    /// says REQ-590 touched the local arm and nothing else.
     const BUDGET_FOR_GOLDEN: [&str; 5] = [
-        "local_engine: RouteBudget { budget_tokens: 4096, budget_bytes: 32768, bound: LocalEngine, window_label: \"the local context window\", digest_threshold_tokens: 1500, digest_threshold_bytes: 12000, floored: false, provider_id: None }",
+        "local_engine: RouteBudget { budget_tokens: 10240, budget_bytes: 32768, bound: LocalEngine, window_label: \"the local context window\", digest_threshold_tokens: 3750, digest_threshold_bytes: 12000, floored: false, provider_id: None }",
         "default_unknown: RouteBudget { budget_tokens: 4096, budget_bytes: 32768, bound: DefaultUnknown, window_label: \"silent's context window\", digest_threshold_tokens: 1500, digest_threshold_bytes: 12000, floored: false, provider_id: Some(\"silent\") }",
         "window: RouteBudget { budget_tokens: 84650, budget_bytes: 253952, bound: Window, window_label: \"wide's context window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 93000, floored: false, provider_id: Some(\"wide\") }",
         "user_cap: RouteBudget { budget_tokens: 25984, budget_bytes: 77952, bound: UserCap, window_label: \"capped's context window\", digest_threshold_tokens: 9515, digest_threshold_bytes: 28546, floored: false, provider_id: Some(\"capped\") }",

@@ -16,6 +16,14 @@
     "tokenizer_version": "tiktoken 0.14.0"
   },
   {
+    "file": "numeric_grid.txt",
+    "words": 10240,
+    "bytes": 20480,
+    "tokens": 20480,
+    "tokenizer": "o200k_base",
+    "tokenizer_version": "tiktoken 0.14.0"
+  },
+  {
     "file": "paths.txt",
     "words": 196,
     "bytes": 14952,

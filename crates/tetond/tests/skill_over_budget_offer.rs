@@ -16,7 +16,8 @@
 //!
 //! | AC | Test |
 //! |---|---|
-//! | AC-1 (the reported failure, offered) | [`the_reported_analyze_failure_is_offered_and_accepting_dispatches_it`] |
+//! | AC-1 (the boundary, offered and answered) | [`the_reported_analyze_measurement_serves_on_both_halves_of_the_local_pair`] |
+//! | **REQ-590 AC-12** (the reported measurement, served) | (same test, leg 4) |
 //! | AC-1 (accepting carries it whole) | [`an_accepted_offer_puts_every_measured_byte_of_the_expansion_on_the_wire`] |
 //! | AC-3 (decline is today's refusal) | [`declining_is_todays_refusal_in_every_byte`] |
 //! | AC-4 (silence is never consent) | [`no_unanswered_offer_resolves_to_proceed`] |
@@ -98,6 +99,9 @@
 //!   whether a real 16k-window engine then serves 4,097 words is AC-15's
 //!   question, and AC-15 is a runbook for a person. That is the whole reason
 //!   AC-1 stops at *dispatches* — the criterion says so in as many words.
+//!   REQ-590 AC-12 inherits the same limit: it asserts that this daemon no
+//!   longer refuses the measurement, not that llama.cpp then serves it. REQ-590
+//!   AC-14 is where a person checks the second half.
 //!
 //! ## AC-15 — the dogfood runbook
 //!
@@ -896,26 +900,176 @@ fn marked_body(word_count: usize, byte_count: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// AC-1 — the reported failure
+// AC-1 — the reported failure, and REQ-590 AC-12 — where it lands today
 // ---------------------------------------------------------------------------
 
-/// **AC-1 — `/analyze`'s own numbers, offered rather than refused, and answered
-/// rather than dead-ended.**
+/// The local route's budget, derived exactly as [`Router::budget_for`] derives
+/// it — never restated as a literal, because the whole of REQ-590 is that this
+/// pair is a derivation and not a constant any more.
+fn local_pair() -> tetond::harness::budget::RouteBudget {
+    tetond::harness::budget::derive(tetond::harness::BudgetInputs::local())
+}
+
+/// Stage A's own overhead on one fixture's tree, in each currency, measured off
+/// a **real turn in that very tree**.
+struct Overhead {
+    words: u64,
+    bytes: u64,
+}
+
+/// The calibration body's two figures, chosen only to be comfortably over the
+/// local pair in **both** currencies so the turn raises an offer to read the
+/// overhead off.
 ///
-/// The reported failure was *one word* over: 4,097 words against 4,096, with
-/// ~1.7 KB still free in the byte half, `bound: local engine`, on a route that
-/// declares no window at all. This reproduces that measurement **exactly** and
-/// then answers the offer both ways.
+/// Over in both, not one, since ADR-9. The old figures (6,000 / 24,000) cleared
+/// a 4,096-word budget by half and cleared nothing else; when REQ-590 raised the
+/// word half to 10,240 they went on raising an offer only because the system
+/// prompt pushed them past a byte half that had briefly fallen to 30,720. The
+/// reversal put that back to 32,768 and every fixture resting on that accident
+/// stopped raising an offer at all — which is a fixture testing the daemon's
+/// silence and calling it the daemon's question. See [`over_the_local_pair`].
+const CALIBRATION_WORDS: usize = 12_000;
+const CALIBRATION_BYTES: usize = 48_000;
+
+/// A body comfortably over the local route's derived pair in **both**
+/// currencies, whatever that pair currently is.
 ///
-/// # Why the body is calibrated rather than written
+/// Derived from [`local_pair`] rather than written as two literals. Five
+/// fixtures in this file exist only to reach the over-budget door on the local
+/// tier; none of them cares *which* guard opens it, and all five silently
+/// stopped reaching it when ADR-9 moved the byte half back up. A test whose
+/// subject is "what the daemon asks when a body does not fit" must not be able
+/// to pass by the body fitting, and the only way to guarantee that is to size
+/// the body against the number the daemon will actually compare it to.
+///
+/// A quarter past the word half at 4 bytes a word, rather than "+1": Stage A
+/// measures the body **with** the system prompt, so the margin also has to
+/// absorb an overhead this fixture does not own. The tests that need an exact
+/// boundary calibrate that overhead instead — see [`calibrate`].
+///
+/// # Two ceilings pull in opposite directions, so both are asserted
+///
+/// The body must clear the budget and stay under discovery's per-file
+/// [`SKILL_MAX_BYTES`](tetond::skills::SKILL_MAX_BYTES). Those two are closer
+/// together than they look now that the word half is 10,240: at more than
+/// ~6.4 bytes a word a full-budget body does not fit in a `SKILL.md` at all,
+/// and the failure does not present as anything about a budget — the skill is
+/// *skipped*, and every test here fails with "no skill `/heavy` you can
+/// dispatch". Naively doubling both halves of the pair lands exactly on the
+/// ceiling and does precisely that.
+fn over_the_local_pair() -> String {
+    let local = local_pair();
+    let words = local.budget_tokens + local.budget_tokens / 4;
+    let bytes = words * 4;
+    assert!(
+        bytes > local.budget_bytes,
+        "the fixture must clear the byte half too — {bytes} B against {} B",
+        local.budget_bytes
+    );
+    assert!(
+        (bytes as u64) < tetond::skills::SKILL_MAX_BYTES * 9 / 10,
+        "a {bytes} B body is within a tenth of discovery's {} B per-file ceiling; past it the \
+         skill is skipped rather than measured and every test here fails with `no skill you can \
+         dispatch` instead of anything about a budget",
+        tetond::skills::SKILL_MAX_BYTES
+    );
+    sized_body(words, bytes)
+}
+
+/// Read Stage A's overhead off `fx`, leaving exactly one offer behind it.
 ///
 /// Stage A measures the body *with the system prompt*, inside the user frame the
-/// expansion is wrapped in. A literal body therefore cannot name its own
-/// measured figures. The overhead is read off a **real turn in this very tree**
-/// — the root path reaches the system prompt, so a second fixture would not
-/// share the constant — and the second turn asserts the figures came out exactly
-/// where the arithmetic said. A change to the system prompt moves the
-/// calibration; it does not quietly end the reproduction.
+/// expansion is wrapped in, so a literal body cannot name its own measured
+/// figures. The root path reaches the system prompt — which is why [`Tree`]
+/// names are fixed-width and why this is measured per fixture rather than
+/// written down once. A change to the system prompt moves the calibration; it
+/// does not quietly end the reproduction, because every body below is sized
+/// through this and then re-asserted against the figures it produced.
+async fn calibrate(fx: &Fixture) -> Overhead {
+    let session = fx.session();
+    fx.invoke(&session)
+        .await
+        .expect_err("the calibration body must be over budget, or there is no offer to read");
+    let probe = subject_of(&fx.client.sole_offer());
+    assert_eq!(
+        (probe.budget_tokens, probe.budget_bytes),
+        (
+            local_pair().budget_tokens as u64,
+            local_pair().budget_bytes as u64
+        ),
+        "the turn must have run on the local route's derived pair"
+    );
+    Overhead {
+        words: probe.measured_tokens - CALIBRATION_WORDS as u64,
+        bytes: probe.measured_bytes - CALIBRATION_BYTES as u64,
+    }
+}
+
+/// **REQ-590 AC-12 — the whole point of the REQ, on a turn that really runs it:
+/// does a 4,097-word local turn at the reported body's size serve?**
+///
+/// It does, across the whole range of sizes the field report admits. That
+/// sentence is what this test exists to be able to say, and for most of
+/// REQ-590's implementation it was not true.
+///
+/// The reported failure was *one word* over: **4,097 words against 4,096**, with
+/// room still free in the byte half, `bound: local engine`, on a route that
+/// declares no window at all. REQ-590 gave that route a word budget derived from
+/// the engine's own window — 10,240 — and left the byte half at
+/// `LOCAL_BUDGET_BYTES`, 32,768. **Both** halves of the reported measurement are
+/// therefore inside the budget, and the turn is served silently.
+///
+/// # What the record actually says about the byte half
+///
+/// **The field report gives a rounded byte figure, not an exact one**, and this
+/// test is careful not to invent the difference. REQ-589's Description quotes
+/// the daemon's own rendered sentence — "about 4,097 words / **31 KB**" — and
+/// `bytes_figure` renders `(bytes + 500) / 1_000`, so `31 KB` means the true
+/// count lies somewhere in **[30,500, 31,499]**. No exact byte count for that
+/// body was ever recorded. The word half *is* exact: 4,097 is rendered without
+/// rounding, which is why every leg below is written at that word count.
+///
+/// That interval is 999 bytes wide and it **straddles** D-4's 30,720, so the
+/// record cannot settle whether D-4 would have refused the real body. What it
+/// can settle is the shape of the trade, and that needs no measurement at all:
+/// a window-derived byte half beats the constant only below **7.5 B/word**
+/// (`30,720 / d = 4,096 ⇒ d = 7.5`, exact). At 4,097 words the crossover body
+/// is 30,727.5 bytes — 228 above this interval's floor and 771 below its
+/// ceiling. Over the whole interval D-4's pair is worth between **+0.7% and
+/// −2.4%** against the old one. At best it barely helped; at worst it hurt.
+///
+/// # This test is the reversal, and it used to assert the opposite
+///
+/// D-4 originally took the window derivation for the byte half too, at which
+/// point the local byte budget was **30,720** — below most of the interval
+/// above. This test was written in that state, named
+/// `…_and_the_byte_half_is_the_boundary_now`, and asserted the reported
+/// measurement *fails* — a green test pinning the REQ's own motivating case as
+/// still broken.
+///
+/// ADR-9 reversed D-4. The reversal's own justification does not rest on any
+/// byte count: at **every** density the restored pair is non-regressive,
+/// `min(10_240, 32_768/d) ≥ min(4_096, 32_768/d)`, which is BR-7 proved by
+/// inspection. The name and the premise go with the reversal: what is asserted
+/// below is a body of the reported size serving, in both currencies.
+///
+/// # Four legs on one fixture
+///
+/// | measured | outcome |
+/// |---|---|
+/// | 4,097 words / `budget_bytes + 1` | offered, declined → today's refusal |
+/// | the same, accepted | dispatched whole |
+/// | 4,097 words / `budget_bytes` | served — the boundary's other side |
+/// | **4,097 words / a body inside the reported interval** | **served — the field report's size** |
+///
+/// Legs 1 and 3 differ by a **single byte**, and that pairing is what stops
+/// either passing for a reason of its own: the serving leg cannot be a fixture
+/// that merely drifted under budget, because its twin one byte larger is over.
+/// Leg 4 is then the report's own size rather than a boundary probe — a body as
+/// large as the field report's, asserted to serve on both halves.
+///
+/// Without leg 4 this file would pin the *boundary* and never the *case*; the
+/// two are not the same claim, and it was the second one REQ-590 was opened for.
 ///
 /// # What "dispatches" means here, and what it does not
 ///
@@ -923,56 +1077,106 @@ fn marked_body(word_count: usize, byte_count: usize) -> String {
 /// make the criterion untestable on the very route that motivated the REQ. What
 /// is asserted: the accepted turn is not refused, it reaches the engine, and the
 /// record it publishes carries the pair `skill_fit` measured rather than a
-/// second measurement of something shortened. Whether a real 16k-window
-/// llama.cpp then serves 4,097 words is AC-15's question, and AC-15 is a runbook
-/// for a person.
+/// second measurement of something shortened.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_reported_analyze_failure_is_offered_and_accepting_dispatches_it() {
-    /// The word budget of the local pair — the figure the report was one over.
-    const BUDGET_WORDS: u64 = tetond::harness::budget::LOCAL_BUDGET_TOKENS as u64;
-    /// Its byte half.
-    const BUDGET_BYTES: u64 = tetond::harness::budget::LOCAL_BUDGET_BYTES as u64;
-    /// One word over — the reported measurement.
-    const REPORTED_WORDS: u64 = BUDGET_WORDS + 1;
-    /// The reported byte half: 31 KB against a 33 KB budget, ~1.7 KB to spare.
-    const REPORTED_BYTES: u64 = 31_000;
+async fn the_reported_analyze_measurement_serves_on_both_halves_of_the_local_pair() {
+    /// The reported measurement's word half.
+    const REPORTED_WORDS: u64 = 4_097;
+    /// A byte size the reported body **could** have been — deliberately *not*
+    /// named as a measurement, because no exact byte count for that body exists.
+    ///
+    /// The record renders `31 KB`, which under `bytes_figure`'s
+    /// `(bytes + 500) / 1_000` means **[30,500, 31,499]**. This is that
+    /// interval's midpoint, 31,000, and it is a *choice* among the 1,000 sizes
+    /// the record admits, made for two reasons:
+    ///
+    /// * it re-renders as `31 KB`, so a body of this size would have produced
+    ///   the sentence the user actually saw; and
+    /// * it is above D-4's 30,720, which is what keeps leg 4 **discriminating**
+    ///   — a point drawn from the bottom 23% of the interval would serve under
+    ///   D-4 as well and this leg would stop telling the two states apart.
+    ///
+    /// The second reason is a property of the fixture, not evidence about the
+    /// field: it does not show that D-4 refused the real body, only that D-4
+    /// refuses a body the record equally admits. At ~7.57 B/word this size is
+    /// code-shaped, which is what `/analyze` was pointed at.
+    const A_BODY_INSIDE_THE_REPORTED_INTERVAL: u64 = 31_000;
 
-    let fx = Fixture::new(Spec::new("ac1", local_route(), sized_body(6_000, 24_000)));
+    let local = local_pair();
 
-    // -- leg 1: read Stage A's own overhead off a real turn -------------------
-    let calibration = fx.session();
-    fx.invoke(&calibration)
-        .await
-        .expect_err("a 6,000-word body on the local pair is over budget");
-    let probe = subject_of(&fx.client.sole_offer());
+    // The premise, asserted rather than recounted: 4,097 was one word over the
+    // pair this route ran under, and that constant is still in the tree.
     assert_eq!(
-        (probe.budget_tokens, probe.budget_bytes),
-        (BUDGET_WORDS, BUDGET_BYTES),
-        "the local pair is the budget the report quoted"
+        REPORTED_WORDS,
+        tetond::harness::budget::LOCAL_BUDGET_TOKENS as u64 + 1,
+        "the reported failure was one word over the no-better-fact pair, which is \
+         the constant the local arm used to return"
     );
-    let overhead_words = probe.measured_tokens - 6_000;
-    let overhead_bytes = probe.measured_bytes - 24_000;
 
-    // -- leg 2: the reported measurement, to the word and to the byte ---------
-    let body = marked_body(
-        usize::try_from(REPORTED_WORDS - overhead_words).unwrap(),
-        usize::try_from(REPORTED_BYTES - overhead_bytes).unwrap(),
+    // -- AC-12, in the arithmetic, before any turn runs ----------------------
+    //
+    // Both halves, each asserted to hold. The word half is where the report
+    // refused; the byte half is where D-4 would have moved the refusal to.
+    // Stating both is the difference between "the REQ moved a number" and "the
+    // REQ fixed the case".
+    assert!(
+        REPORTED_WORDS <= local.budget_tokens as u64,
+        "REQ-590 AC-12: the local word budget must hold the reported measurement — \
+         {REPORTED_WORDS} words against {}",
+        local.budget_tokens
     );
-    fx.write_body(&body);
+    assert!(
+        A_BODY_INSIDE_THE_REPORTED_INTERVAL <= local.budget_bytes as u64,
+        "REQ-590 AC-12 / ADR-9: the local byte budget must hold a body of the reported size too \
+         — {A_BODY_INSIDE_THE_REPORTED_INTERVAL} B against {}. D-4's window-derived byte half \
+         was 30,720, below most of the [30,500, 31,499] interval the record admits. If this \
+         assertion is red, the REQ has once again moved the refusal instead of removing it",
+        local.budget_bytes
+    );
+    // **Both halves, asserted as the fit AC-12 actually claims** — not as spare
+    // room. An earlier form of this pinned the leftover in each currency as an
+    // exact pair, which asserted a precision nobody has: the byte figure would
+    // have been the budget minus a body size the record never recorded. What
+    // AC-12 claims is that the reported measurement is inside the pair, and
+    // that is what is asserted, in both currencies at once so neither half can
+    // pass alone.
+    assert!(
+        REPORTED_WORDS <= local.budget_tokens as u64
+            && A_BODY_INSIDE_THE_REPORTED_INTERVAL <= local.budget_bytes as u64,
+        "REQ-590 AC-12: the reported measurement must fit **both** halves of the local pair — \
+         {REPORTED_WORDS} words / {A_BODY_INSIDE_THE_REPORTED_INTERVAL} B against {} / {}. \
+         Fitting one half and not the other is how the refusal moved currencies under D-4",
+        local.budget_tokens,
+        local.budget_bytes
+    );
+
+    let fx = Fixture::new(Spec::new(
+        "ac1",
+        local_route(),
+        sized_body(CALIBRATION_WORDS, CALIBRATION_BYTES),
+    ));
+    let overhead = calibrate(&fx).await;
+
+    // -- leg 1: one byte over, at the reported word count -> offered ----------
+    let over = marked_body(
+        usize::try_from(REPORTED_WORDS - overhead.words).unwrap(),
+        usize::try_from(local.budget_bytes as u64 + 1 - overhead.bytes).unwrap(),
+    );
+    fx.write_body(&over);
     let reported = fx.session();
     let mut sub = fx.events.subscribe(512);
     let refusal = fx
         .invoke(&reported)
         .await
-        .expect_err("the reported failure refuses when the offer is declined");
+        .expect_err("one byte over the budget refuses when the offer is declined");
 
     let offers = fx.client.offers();
     assert_eq!(offers.len(), 2, "the second turn put the question again");
     let offer = subject_of(&offers[1]);
     assert_eq!(
         (offer.measured_tokens, offer.measured_bytes),
-        (REPORTED_WORDS, REPORTED_BYTES),
-        "the calibrated body did not reproduce the reported pair — Stage A's \
+        (REPORTED_WORDS, local.budget_bytes as u64 + 1),
+        "the calibrated body did not reproduce the intended pair — Stage A's \
          overhead is no longer linear in the body it measures"
     );
     assert_eq!(offer.bound, BudgetBound::LocalEngine, "the reported route");
@@ -982,18 +1186,31 @@ async fn the_reported_analyze_failure_is_offered_and_accepting_dispatches_it() {
         "the local tier declares no window, so no other verdict is reachable"
     );
     assert!(
-        offer.measured_bytes < offer.budget_bytes,
-        "the report's byte half had room to spare — {} against {} — and a \
-         reproduction that was over in both currencies would be a different \
-         failure",
-        offer.measured_bytes,
-        offer.budget_bytes
+        offer.measured_tokens < offer.budget_tokens,
+        "the word half must have room to spare — {} against {} — or this leg is \
+         not the byte boundary it claims to be",
+        offer.measured_tokens,
+        offer.budget_tokens
     );
-    let quoted =
-        "about 4,097 words / 31 KB, and the budget is 4,096 words / 33 KB (bound: local engine)";
+    // The two figures as the sentence spells them. `bytes_figure` rounds to the
+    // nearest KB, so a measurement one byte over a 32,768 B budget renders as
+    // the *same* `33 KB` the budget does: at the boundary the sentence quotes
+    // two identical byte figures and only the word halves differ — and here the
+    // word halves are 4,097 against 10,240, which look like they fit. **A user
+    // at this boundary cannot tell from the sentence which currency refused
+    // them.** Pinned rather than avoided, because it is what they actually read;
+    // recorded as a REQ-590 finding rather than fixed here, because changing the
+    // figure's precision is a decision about every budget sentence, not this one.
+    //
+    // The bound closes it with REQ-590 AC-16's account of itself — the window
+    // and the reservation that produced the word half, and the byte half named
+    // as fixed so a reader does not try to reconcile 33 KB against 16,384.
+    let quoted = "about 4,097 words / 33 KB, and the budget is 10,240 words / 33 KB \
+                  (bound: local engine — the word half comes from the engine's 16,384-token \
+                  window, less the 1,024 reserved for the reply; the byte half is fixed)";
     assert!(
         offer.sentence.contains(quoted),
-        "the offer must quote the reported figures verbatim: {}",
+        "the offer must quote the figures it measured: {}",
         offer.sentence
     );
     assert!(
@@ -1017,20 +1234,20 @@ async fn the_reported_analyze_failure_is_offered_and_accepting_dispatches_it() {
         "a declined turn recorded an acceptance"
     );
 
-    // -- leg 3: the same measurement, accepted --------------------------------
+    // -- leg 2: the same measurement, accepted --------------------------------
     fx.client
         .answers(Answer::Select(OPTION_ID_OVER_BUDGET_PROCEED_ONCE));
     let sent = fx.session();
     let mut sub = fx.events.subscribe(512);
     fx.invoke(&sent)
         .await
-        .expect("accepting the reported offer dispatches the turn");
+        .expect("accepting the offer dispatches the turn");
     let published = drain(&mut sub);
     let record = accepted(&published);
     assert_eq!(record.len(), 1, "the acceptance was recorded once");
     assert_eq!(
         (record[0].measured_tokens, record[0].measured_bytes),
-        (REPORTED_WORDS, REPORTED_BYTES),
+        (REPORTED_WORDS, local.budget_bytes as u64 + 1),
         "the accepted record carries the pair `skill_fit` measured, not a second \
          measurement of a shortened expansion"
     );
@@ -1040,6 +1257,97 @@ async fn the_reported_analyze_failure_is_offered_and_accepting_dispatches_it() {
             .iter()
             .any(|e| matches!(e, Event::SessionUpdate(_))),
         "the accepted turn reached the engine and produced an answer: {:?}",
+        published.iter().map(Event::name).collect::<Vec<_>>()
+    );
+
+    // -- leg 3: one byte less — the boundary's other side ---------------------
+    //
+    // The same 4,097 words — the count leg 1 proved this calibration produces —
+    // at exactly `budget_bytes`. One byte separates this from leg 1, which is
+    // what makes leg 1's refusal and this leg's silence a statement about the
+    // guard rather than about either fixture.
+    let tag = "at the byte budget exactly";
+    let offers_so_far = fx.client.offers().len();
+    fx.write_body(&marked_body(
+        usize::try_from(REPORTED_WORDS - overhead.words).unwrap(),
+        usize::try_from(local.budget_bytes as u64 - overhead.bytes).unwrap(),
+    ));
+    let served = fx.session();
+    let mut sub = fx.events.subscribe(512);
+    fx.invoke(&served)
+        .await
+        .unwrap_or_else(|e| panic!("{tag}: a turn inside both halves must not be refused: {e:?}"));
+    let published = drain(&mut sub);
+    assert_eq!(
+        fx.client.offers().len(),
+        offers_so_far,
+        "{tag}: a turn that fits must raise **no** over-budget offer — a turn that \
+         served but asked anyway would pass a weaker test: {:?}",
+        questions(&fx.client)
+    );
+    assert!(
+        offered(&published).is_empty() && accepted(&published).is_empty(),
+        "{tag}: and announce nothing about a budget it did not exceed: {:?}",
+        published.iter().map(Event::name).collect::<Vec<_>>()
+    );
+    assert!(
+        published
+            .iter()
+            .any(|e| matches!(e, Event::SessionUpdate(_))),
+        "{tag}: the served turn reached the engine and produced an answer: {:?}",
+        published.iter().map(Event::name).collect::<Vec<_>>()
+    );
+
+    // -- leg 4: the field report itself. **AC-12** ----------------------------
+    //
+    // Not a boundary probe — the size the user sent. 4,097 words (exact, as the
+    // record renders it) at a byte count the record admits, run through the same
+    // fixture the three legs above calibrated. It serves: no question, no
+    // announcement, an answer.
+    //
+    // This is the leg the REQ is for. Legs 1–3 would all still pass with the
+    // byte half at D-4's 30,720, because each is written *relative to*
+    // `budget_bytes` and would simply move with it; **this one would not**, and
+    // that is the whole reason it is written against an absolute size instead.
+    // Read that as a property of the fixture: it shows D-4 refusing a body the
+    // record equally admits, not D-4 refusing the body the user actually sent —
+    // which the record cannot decide either way (see the constant's own note).
+    // It remains the only assertion in the file that can tell the two states
+    // apart.
+    let tag = "the reported measurement";
+    let offers_so_far = fx.client.offers().len();
+    fx.write_body(&marked_body(
+        usize::try_from(REPORTED_WORDS - overhead.words).unwrap(),
+        usize::try_from(A_BODY_INSIDE_THE_REPORTED_INTERVAL - overhead.bytes).unwrap(),
+    ));
+    let served = fx.session();
+    let mut sub = fx.events.subscribe(512);
+    fx.invoke(&served).await.unwrap_or_else(|e| {
+        panic!(
+            "REQ-590 AC-12: the reported /analyze turn — {REPORTED_WORDS} words / \
+             {A_BODY_INSIDE_THE_REPORTED_INTERVAL} bytes — must serve on the local tier. This \
+             is the size of the field report this REQ exists for, and a refusal here means the \
+             refusal has moved currencies rather than gone away: {e:?}"
+        )
+    });
+    let published = drain(&mut sub);
+    assert_eq!(
+        fx.client.offers().len(),
+        offers_so_far,
+        "{tag}: AC-12 requires the reported turn to raise no over-budget offer, not merely to \
+         survive one: {:?}",
+        questions(&fx.client)
+    );
+    assert!(
+        offered(&published).is_empty() && accepted(&published).is_empty(),
+        "{tag}: and to announce nothing about a budget it did not exceed: {:?}",
+        published.iter().map(Event::name).collect::<Vec<_>>()
+    );
+    assert!(
+        published
+            .iter()
+            .any(|e| matches!(e, Event::SessionUpdate(_))),
+        "{tag}: the reported turn reached the engine and produced an answer: {:?}",
         published.iter().map(Event::name).collect::<Vec<_>>()
     );
 }
@@ -1135,8 +1443,7 @@ async fn an_accepted_offer_puts_every_measured_byte_of_the_expansion_on_the_wire
 /// bytes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn declining_is_todays_refusal_in_every_byte() {
-    let fx =
-        Fixture::new(Spec::new("ac3", local_route(), sized_body(6_000, 24_000)).user_sourced());
+    let fx = Fixture::new(Spec::new("ac3", local_route(), over_the_local_pair()).user_sourced());
     let session = fx.session();
     let refusal = fx.invoke(&session).await.expect_err("declined");
     assert_eq!(refusal.code, error_code::SKILL_EXPANSION_TOO_LARGE);
@@ -1149,10 +1456,15 @@ async fn declining_is_todays_refusal_in_every_byte() {
         .map(|(a, _)| a)
         .collect();
     assert!(
-        shared.ends_with("(bound: local engine). "),
+        shared.ends_with("; the byte half is fixed). "),
         "the question and its decline must share the whole head — the subject, \
-         the stage clause, both figure pairs and the spoken bound. They diverge \
+         the stage clause, both figure pairs and the spoken bound, which since \
+         REQ-590 AC-16 ends by accounting for the local pair. They diverge \
          at: {shared}"
+    );
+    assert!(
+        shared.contains("(bound: local engine — "),
+        "…and the bound they share is this route's: {shared}"
     );
     assert_eq!(
         refusal.message,
@@ -1423,7 +1735,7 @@ async fn each_reachable_window_verdict_is_offered_and_pins_its_own_sentence() {
 fn route_for(bound: BudgetBound, verdict: WindowVerdict) -> (Fixture, Option<MockProvider>) {
     match (bound, verdict) {
         (BudgetBound::LocalEngine, WindowVerdict::WindowUnknown) => (
-            Fixture::new(Spec::new("v6loc", local_route(), sized_body(6_000, 24_000))),
+            Fixture::new(Spec::new("v6loc", local_route(), over_the_local_pair())),
             None,
         ),
         (BudgetBound::DefaultUnknown, WindowVerdict::WindowUnknown) => {
@@ -1710,7 +2022,7 @@ fn remedy_route(bound: BudgetBound) -> (Fixture, Option<MockProvider>) {
             let fx = Fixture::new(Spec::new(
                 "v7loc",
                 local_route_with_one_remote(&provider.openai_endpoint()),
-                sized_body(6_000, 24_000),
+                over_the_local_pair(),
             ));
             (fx, Some(provider))
         }
@@ -2345,11 +2657,7 @@ async fn the_accepted_path_never_says_no_provider_saw_this_turn() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_project_skills_trust_question_is_put_before_its_budget_question() {
     // -- leg 1: acknowledged — both questions, in BR-6's order ---------------
-    let fx = Fixture::new(Spec::new(
-        "ac9ord",
-        local_route(),
-        sized_body(6_000, 24_000),
-    ));
+    let fx = Fixture::new(Spec::new("ac9ord", local_route(), over_the_local_pair()));
     let session = fx.session();
     let refusal = fx
         .invoke(&session)
@@ -2391,7 +2699,7 @@ async fn a_project_skills_trust_question_is_put_before_its_budget_question() {
 
     // -- leg 2: declined — the trust refusal wins, and there is no offer ------
     let declined = Fixture::new(
-        Spec::new("ac9dec", local_route(), sized_body(6_000, 24_000))
+        Spec::new("ac9dec", local_route(), over_the_local_pair())
             .declining_trust()
             .answering(Answer::Select(OPTION_ID_OVER_BUDGET_PROCEED_ONCE)),
     );
@@ -2455,8 +2763,7 @@ async fn a_project_skills_trust_question_is_put_before_its_budget_question() {
 /// Same route, same body, same over-budget measurement; one field changed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_user_authored_skill_is_asked_only_the_budget_question() {
-    let fx =
-        Fixture::new(Spec::new("ac9usr", local_route(), sized_body(6_000, 24_000)).user_sourced());
+    let fx = Fixture::new(Spec::new("ac9usr", local_route(), over_the_local_pair()).user_sourced());
     let session = fx.session();
     let refusal = fx
         .invoke(&session)

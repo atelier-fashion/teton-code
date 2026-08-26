@@ -32,9 +32,11 @@
 //! # Why the counts are pinned exactly, and what to do when this fails
 //!
 //! Because "presence" is not the rule. `harness/budget.rs` is allowed to say
-//! `4_096` **once** — it is `LOCAL_BUDGET_TOKENS`, the token half of Teton's own
-//! local pair, which happens to be the same number Ollama's server grants by
-//! default. A presence-only allowance there would re-open exactly the hole this
+//! `4_096` **once** — it is `LOCAL_BUDGET_TOKENS`, the token half of the pair a
+//! route with **no window fact** runs under, which happens to be the same number
+//! Ollama's server grants by default. (It was the *local* pair until REQ-590
+//! gave the local tier a window of its own to derive from; the constant did not
+//! move, its readership did.) A presence-only allowance there would re-open exactly the hole this
 //! test exists for, since `budget.rs` is where a proposal is composed and
 //! therefore the likeliest place for a hard-coded vendor window to appear.
 //!
@@ -84,8 +86,9 @@ const KNOWN_UNRELATED_HOMES: &[(u32, &str, usize, &str)] = &[
         4_096,
         "harness/budget.rs",
         1,
-        "`LOCAL_BUDGET_TOKENS` — the token half of Teton's own local pair, and \
-         the collision ADR-6's clears-the-refusal guard exists for: it is \
+        "`LOCAL_BUDGET_TOKENS` — the token half of the pair a route with no \
+         window fact runs under (the local tier derives its own since REQ-590), \
+         and the collision ADR-6's clears-the-refusal guard exists for: it is \
          numerically Ollama's served default and is a different fact from it",
     ),
     (

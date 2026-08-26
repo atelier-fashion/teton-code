@@ -1,0 +1,144 @@
+{
+  "req": "REQ-590",
+  "branch": "feat/REQ-590-engine-derived-local-context-budget",
+  "startedAt": "2026-08-25T00:00:00Z",
+  "completed": false,
+  "currentPhase": 8,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "integrationBranch": "main",
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Resolve repos + worktree + preflight",
+      "completedAt": "2026-08-25T00:00:00Z",
+      "note": "single-repo; integration branch main (no staging signals); cleared a 4b collision from this REQ's own merged spec worktree"
+    },
+    {
+      "phase": 1,
+      "name": "Validate the requirement spec",
+      "completedAt": "2026-08-25T00:00:00Z",
+      "result": "approved after 2 blockers fixed: BR-8 (the latent floor rule) and BR-12 (observability) had no acceptance criterion \u2014 added AC-15 and AC-16",
+      "note": "LESSON-560's failure shape, caught by the gate one day after the lesson was written"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & break into tasks",
+      "completedAt": "2026-08-25T00:00:00Z",
+      "adrs": 8,
+      "tasks": 7,
+      "note": "Both exploration agents assumed the LOCAL_BUDGET_* constants move; BR-5 keeps them. ADR-8 records the corrections. Also refuted: the claim that LOCAL_ENGINE_N_CTX is cfg(llama)-gated \u2014 redact.rs imports it ungated, which is what makes the whole approach viable."
+    },
+    {
+      "phase": 3,
+      "name": "Validate architecture & tasks",
+      "completedAt": "2026-08-25T00:00:00Z",
+      "result": "approved \u2014 7 tasks, valid DAG, max 2 deps, all 16 ACs covered, no conflicting in-flight work"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-08-26T00:00:00Z",
+      "tasks": "269-275 + an unplanned D-4 reversal",
+      "result": "69 targets, 3,896 passed, 0 failed",
+      "note": "Phase 4 reversed one of its own decisions mid-flight. TASK-272 sized a fixture against the REAL reported body and found the REQ had moved the refusal from the word half to the byte half rather than removing it. D-4 (my inference from the owner's 'full window', not their explicit call) was reversed; the byte half is LOCAL_BUDGET_BYTES again. AC-12 now serves, mutation-verified."
+    },
+    {
+      "phase": 5,
+      "name": "Verify",
+      "completedAt": "2026-08-26T00:00:00Z",
+      "panel": "adversary, correctness-reviewer, test-auditor, reflector",
+      "result": "69 targets / 3,896 passed / 0 failed; 7/7 mutations caught; 0 new vacuity",
+      "headline": "The derivation held under attack; every Critical and Major any agent raised was a SENTENCE, not a line of logic. The sharpest finding was against the ORCHESTRATOR's own reasoning: the 31,014-byte figure used to justify reversing D-4 was never measured \u2014 REQ-589's record is a rendered '31 KB', an interval [30,500, 31,499] that straddles D-4's 30,720. The reversal stands on the crossover and on BR-7's strict non-regression, neither of which needs a measurement."
+    },
+    {
+      "phase": 6,
+      "name": "Create PR",
+      "completedAt": "2026-08-26T00:00:00Z",
+      "pr": "https://github.com/atelier-fashion/teton-code/pull/216",
+      "note": "draft flipped to ready; footprint block preserved"
+    },
+    {
+      "phase": 7,
+      "name": "PR cleanup & CI",
+      "completedAt": "2026-08-26T00:00:00Z",
+      "result": "CI 7/7 green; diff scan clean \u2014 0 debug prints in production src (all in the AC-10 example), no TODOs, no secrets, no leftover mutation markers, no unqualified use of the retracted byte figure"
+    }
+  ],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-590",
+      "branch": "feat/REQ-590-engine-derived-local-context-budget",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/216",
+      "prNumber": 216,
+      "merged": false
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-269",
+      "TASK-270",
+      "TASK-271",
+      "TASK-273",
+      "TASK-275",
+      "TASK-272",
+      "TASK-274",
+      "TASK-276",
+      "TASK-274",
+      "TASK-276 (D-4 reversal)"
+    ],
+    "failedTasks": []
+  },
+  "notes": "Spec merged as 64b6052 (#215) before the pipeline started. D-3 decided by owner: the word half takes the full window -> 10,240 words. D-4 (the byte half) was NOT an owner decision -- it was inferred from D-3 and recorded here as one; ADR-9 (2026-08-26) retracts that inference and reverses it. | Baseline corrected: 3,883 passed at 810c911 (my 3,879 brief figure was stale, from REQ-591's pre-D-6 tip). | Final pair is (10,240 words, 32,768 bytes): word half window-derived, byte half LOCAL_BUDGET_BYTES unchanged. The reported /analyze turn SERVES: 4,097 words (exact) at any byte size in [30,500, 31,499], which is the whole range the record's rendered '31 KB' admits. NOTE the byte figure 31,014 used in earlier notes here was NEVER MEASURED -- see verifyNotes for the retraction.",
+  "verifyNotes": [
+    "TASK-271 residual: COMPACT_OUTPUT_MAX_BYTES restates window_pair's byte formula rather than reading a shared accessor \u2014 two numbers on one chain, which is the LESSON-491 shape the task cited. Held together only by an equality assertion against derive's own answer. If a `pub const fn` for the local pair lands in budget.rs, the ceiling should read it. Check in verify.",
+    "ADR-6a: AC-4 is tautological once the byte half is derived (usable <= usable). It guards the coupling, not the bound. A green AC-4 is NOT evidence the budget fits the engine \u2014 BR-7's witnesses are AC-9's real-tokenizer measurement and the engine's own over_window.",
+    "AC-9 MEASURED (TASK-273): numeric_grid.txt \u2014 10,240 words / 20,480 bytes / 20,480 real o200k_base tokens = 1.33x the 15,360 usable window. BOTH harness guards admit it. Not cherry-picked: random, sparse and run-heavy grids of the same shape all measure exactly 2.000 tok/word, because o200k_base tokenizes every digit AND every separating space. Must land in ADR-6 (deferred only because TASK-275 held architecture.md).",
+    "ADR-6 CORRECTION NEEDED: the zero slack is STRUCTURAL, not a consequence of the 3/2 ratio. window_pair computes words = usable x den/num and the claim is words x num/den, so the ratio cancels \u2014 slack is 0 at every ratio and every reservation. Only an explicit margin (which D-3 declined) creates any. ADR-6 currently implies the ratio is the lever; it is not.",
+    "ADR-6 OVERSTATES THE SAFETY NET: it says REQ-589's offer plus the engine's typed refusal are the catches. The offer CANNOT fire for this class \u2014 skill_fit/skill_refusal raise it only when a SKILL EXPANSION exceeds the budget, and here both harness guards admit the content, so the harness believes the turn fits. Only the engine's ContextWindowExceeded (completion.rs:243) catches it, as a bare refusal. Verify should decide whether that is acceptable or whether the local tier needs a pre-flight token check.",
+    "TASK-273 note: numeric_grid joins base64 in KNOWN_UNCOVERED_AT_PINNED_FLOOR \u2014 REQ-586's combined estimate now has two documented gaps. base64 spends its byte budget fast so a full-budget turn of it is small; this one is byte-light, so a full-budget turn is admitted whole.",
+    "AC-10(a) MEASURED (M5 Max, real llama.cpp+Metal, n_ctx=16384): 6,164 tok -> 3,111 ms; 15,410 tok -> 13,548 ms. Ratio 4.35x, NOT the ~2.5x the spec predicted \u2014 attention's quadratic term; per-token cost 0.454 -> 0.877 ms/tok across 3k-15k. Full-budget turn costs ~+10.5 s to first token.",
+    "AC-10(b) FAILED AS WRITTEN: 12,885 ms first token vs the 1,000 ms max_first_token_ms bound (benchmark.rs:42). Fails on first-token latency, NOT on min_tokens_per_sec (decode holds 79-82 tok/s, ~16x above the 5.0 floor). CONTEXT THAT MATTERS: the duty is a short-prompt model-selection gate run once post-download, never per turn, and today's 4,096-word budget ALREADY costs ~3.1 s at full budget \u2014 3.1x over. The duty never covered full-budget turns.",
+    "AC-11 CORRECTS D-3's HEADLINE: 'holds ~2.5x more conversation' is true in ONE currency only. under_pressure is a disjunction over both halves and the crossover density moves 8 B/word -> 3 B/word, so real content flips from word-bound to BYTE-bound and the byte threshold FELL 6.25% (22,937 -> 21,504). Measured turns-to-pressure: 1.56x at 4 B/word, 1.11x at 6, 1.00x at 8, 1.00x at 20. D-4's byte regression reaches the COMPACTION threshold, not just BR-7's refusal band.",
+    "*** THE REQ AS BUILT DID NOT FIX ITS OWN MOTIVATING CASE (TASK-272). *** The reported /analyze body is 4,097 words / ~31,014 bytes (7.57 B/word). Before: refused by 1 WORD, fit on bytes with 1,754 spare. After the derived pair: fits on words with 6,143 spare, refused by 294 BYTES. The refusal moved halves. Crossover: the new pair beats the old only below 7.5 B/word \u2014 prose (5) +50%, code (8) -6.25%. Verify must confirm the reversal actually lands this.",
+    "D-4 REVERSED mid-Phase-4 (owner did not answer; proceeding, cheap to undo). Byte half returns to LOCAL_BUDGET_BYTES 32,768; word half stays derived at 10,240. Evidence the reduction bought nothing: numeric_grid (the pathological class) is 20,480 B, admitted at BOTH values, and overruns the engine regardless \u2014 no byte value in this range catches it. Side benefit: the compact ceiling (30,720) then sits 2,048 B under the budget, so BR-9 holds with room rather than exactly zero. NOTE: D-4 was MY inference from the owner's 'full window', not their explicit decision.",
+    "TASK-272 finding, unfixed and pinned: at the boundary the over-budget offer quotes two IDENTICAL byte figures ('about 4,097 words / 31 KB, and the budget is 10,240 words / 31 KB') because bytes_figure rounds to the nearest KB. The user cannot see which currency refused them.",
+    "TASK-272 finding: the word budget rose 2.5x but discovery's SKILL_MAX_BYTES (64 KiB) did not. 10,240 words above ~5.1 B/word no longer fits in a SKILL.md at all, and the failure surfaces as 'no skill you can dispatch' rather than anything about a budget. Two fixtures now assert the ceiling. Candidate follow-up REQ.",
+    "TASK-274 + TASK-276 DONE (2026-08-26). D-4 reversal finished: 15 red tests resolved. AC-12's witness renamed the_reported_analyze_measurement_serves_on_both_halves_of_the_local_pair and grew a 4th leg carrying the report's OWN byte figure (4,097 w / 31,014 B) -- the three boundary legs it had would all pass under D-4 too, so only that leg can tell the two states apart. ANSWER: the reported turn SERVES, 6,143 words and 1,754 bytes spare.",
+    "AC-7 is VOID (no byte band exists after ADR-9) and nothing was written against it. Its real content -- 'do not pin only the improving direction' -- is carried by AC-12's one-byte-apart legs and by AC-11's 8/20 B/word rows, which now assert after == before where under D-4 they asserted after <= before. requirement.md AC-7 says so.",
+    "AC-16 implemented in bound_clause: 'bound: local engine - the word half comes from the engine's 16,384-token window, less the 1,024 reserved for the reply; the byte half is fixed'. Figures interpolated from the constants. The byte half is named as NOT derived, which is the honest half after ADR-9. AC-6 mutation (fold LocalEngine into bound_clause's DefaultUnknown arm) RUN and CONFIRMED RED on both tests; reverted by re-editing the line.",
+    "AC-11 RE-MEASURED after the reversal: 15 / 11 / 8 / 4 turns (was 14 / 10 / 8 / 4 under D-4). Byte compaction threshold back to 22,937 (D-4 had it at 21,504) and the digest byte threshold back to 12,000 (D-4: 11,250). architecture.md's table carries both columns.",
+    "FIXTURE HAZARD, hit twice and now guarded: sizing a local over-budget body as 2x the pair lands on discovery's SKILL_MAX_BYTES (64 KiB) exactly, and the skill is SKIPPED -- every test then fails with 'no skill you can dispatch' rather than anything about a budget. over_the_local_pair() and oversized_for_the_local_pair() now size at 1.25x words / 4 B per word and assert both ceilings. This is the same SKILL_MAX_BYTES squeeze TASK-272 flagged as a candidate follow-up REQ; it is now load-bearing for the test suite too.",
+    "TASK-272's rendering finding STANDS and is pinned, not fixed: at the byte boundary the offer quotes two identical KB figures ('about 4,097 words / 33 KB, and the budget is 10,240 words / 33 KB') because bytes_figure rounds to the nearest KB. A user at that boundary cannot tell which currency refused them. Changing the figure's precision is a decision about every budget sentence, not this one.",
+    "SKILL_MAX_BYTES (64 KiB) is now load-bearing for the TEST SUITE, not just a product limit: sizing a local over-budget body at 2x the pair lands exactly on it, the skill is SKIPPED, and every affected test fails with 'no skill you can dispatch' rather than anything about a budget. Five fixtures now derive their size from derive() and assert both ceilings. Hit independently by TASK-272 and TASK-276. Strong follow-up REQ candidate.",
+    "UNFIXED, pinned: at the byte boundary the offer quotes two identical KB figures ('about 4,097 words / 33 KB, and the budget is 10,240 words / 33 KB') because bytes_figure rounds to the nearest KB. A user cannot tell which currency refused them. Changing that precision is a decision about every budget sentence, not just this one.",
+    "*** MY OWN ERROR, found by the adversarial pass. *** I asserted the reported /analyze body is 31,014 bytes and that D-4 refused it by 294. That is not a measurement. REQ-589's record is a RENDERED sentence, 'about 4,097 words / 31 KB', and bytes_figure rounds to the nearest KB, so the true count is in [30,500, 31,499] \u2014 an interval that STRADDLES D-4's 30,720. The record cannot decide whether D-4 refused that body. 31_014 appears nowhere in history before the reversal commit; session_ui.rs carries a different figure (31_744). The derived claims (6,143 / 1,754 spare, 7.57 B/word) all inherit the invented precision, and 7.57 sits just above the 7.5 crossover that the argument turns on.",
+    "THE REVERSAL STANDS on evidence that needs no measurement: (a) the crossover \u2014 D-4's pair beats the old one only below 7.5 B/word, so code at 8 loses 6.25%; pure arithmetic. (b) BR-7 under the restore: min(10240, 32768/d) >= min(4096, 32768/d) at EVERY density, strictly non-regressive. Re-ground ADR-9 on these and stop the test pinning unmeasurable precision.",
+    "Adversary Major 3: BR-8 / AC-15 / OQ-2 were never swept after ADR-9. AC-15 says 'derive fed a synthetic small window' \u2014 unimplementable, since derive's local arm ignores inputs.window and its byte half never passes through window_pair. The shipped test says so itself. And BR-8/OQ-2 reason from 'at a 4,096-token engine the byte half is 6,144' \u2014 after ADR-9 it is 32,768, a 5.3x overclaim. The person BR-8 exists to warn is pointed the wrong way.",
+    "Adversary Major 4: budget.rs:95-98's module doc still says random base64 is the ONLY corpus class where max(words x 3/2, bytes/2) >= tokens fails. This REQ ADDED a second in the same diff \u2014 numeric_grid, failing by 25%. token_corpus.rs was updated (KNOWN_UNCOVERED_AT_PINNED_FLOOR has 2 entries); the production doc was not. Its backstop clause also still names the digest threshold and REQ-589's offer, both of which ADR-9 established cannot catch this quadrant.",
+    "Adversary Major 5: skill_over_budget_offer.rs:20's AC map attributes AC-12 to LEG 3. Leg 3 is the boundary probe at budget_bytes exactly, which the test's own comment says would pass under D-4 too. Leg 4 is the discriminating one. The map points an auditor at the leg that cannot tell the two states apart \u2014 the exact mis-attribution ADR-9 was written about.",
+    "Adversary Minor: 'the reduction protected nothing' is asserted as a universal but demonstrated on one fixture where neither budget binds. The delta class is not empty \u2014 for a SKILL expansion (refused whole, never elided) a body in (30,720, 32,768] at under ~2.13 B/token is admitted at 32,768 and refused at 30,720; base64 instantiates it. Conclusion survives on the crossover alone, but the absolute phrasing in production doc comments is wrong.",
+    "CORRECTION LANDED (2026-08-26). The invented 31,014-byte figure and everything derived from it (6,143 / 1,754 spare, 7.57 B/word, 'refused by 294') are retired across 8 files. The reversal is re-grounded on three things that need no field measurement: (1) the crossover 30,720/d = 4,096 => d = 7.5 exactly, so D-4's pair beats the old one only below 7.5 B/word -- prose at 5 gains 50%, code at 8 loses 6.25%; (2) BR-7 holds by inspection under the restore, min(10240, 32768/d) >= min(4096, 32768/d) at every density; (3) what the record DOES support -- 4,097 exact words in [30,500, 31,499] bytes = 7.44-7.69 B/word, straddling the crossover, over which D-4 is worth between +0.7% and -2.4% and refuses on bytes across ~78% of the range. CORRECTED the brief's own arithmetic: it gave the density range as 6.5-7.7 B/word and the spread as +15%/-3%; 30,500/4,097 = 7.44, not 6.5, and the +15% end was that error propagated (ratio = 7.5/d over 3<=d<=8). AC-12's fixture keeps a concrete size because it must -- renamed A_BODY_INSIDE_THE_REPORTED_INTERVAL = 31,000, the interval's midpoint, chosen because it re-renders as '31 KB' and sits above 30,720 so leg 4 still discriminates; documented as a fixture property, not evidence about the field. The (6_143, 1_754) spare-room assertion is deleted and replaced with a both-halves-fit assertion.",
+    "SECOND self-error, caught by the fix agent: my correction brief said the admitted density range is '6.5-7.7 B/word' and D-4 lands '+15% to -3%'. Wrong \u2014 30,500/4,097 = 7.444, so the range is 7.44-7.69 and D-4 lands +0.76% to -2.46%. The slip inflated the only figure that made D-4 look defensible. Corrected figures are in the tree."
+  ],
+  "ownerDecisionsPending": [
+    "Full window vs trim, given prefill is 4.35x not 2.5x and compaction gain is 1.1-1.6x not 2.5x. PROCEEDING ON: keep the full window (D-3 unchanged). Rationale: prefill scales with what a turn actually sends, not with the ceiling, so ordinary turns are unaffected; the 1,000 ms duty was already 3.1x over at full budget before this REQ; the motivating /analyze case serves at ~3.1 s.",
+    "AC-10(b) recording. PROCEEDING ON: leave it UNTICKED and record the failure plus its context, rather than rewording a criterion after watching it fail \u2014 that is the AC-8 shape LESSON-560 describes and this session has already caught twice.",
+    "D-4's reversal was made without an owner answer (as D-4 itself was). It is recorded as ADR-9 with the measurement, and is cheap to re-reverse. The owner decision that was actually made is D-3 (the full window for the WORD half); D-4 was inferred from it."
+  ]
+}
