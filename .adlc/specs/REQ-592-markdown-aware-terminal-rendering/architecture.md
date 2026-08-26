@@ -101,15 +101,28 @@ reasonably conclude the pump's call is unnecessary. It is not — it is justifie
 by the idle path, not by the tail. Recorded because the wrong reason was load-bearing in three
 task briefs before a mutation test found it.
 
-**Decision: every `end_block()` call site lives in `client.rs`'s event pump** — the one place
-that owns both the surface and every path an event takes:
+**Decision: every flush call site lives in `client.rs`'s event pump** — the one place that owns
+both the surface and every path an event takes.
 
-1. at the end of `Connection::call`, on every return including the error paths;
-2. at the end of `Connection::drain_events` (the idle path);
-~~3. immediately before `resolve_permission` hands control to the `Prompter` (see ADR-4).~~
-   **Withdrawn during implementation (2026-08-26) — there are two call sites, not three.** See the
-   amendment in ADR-4. A reader who re-adds a third site from this ADR is re-adding a known bug;
-   the ownership sweep in `client.rs` fails with the reasoning attached.
+**Final shape after verify (2026-08-26). The verb is two verbs, and this list is what shipped:**
+
+| Verb | Does | Call sites |
+|---|---|---|
+| `end_block()` | emit held line, close table run, **clear the fence** | **one** — end of `Connection::call`, every return |
+| `emit_held()` | the first two only, fence untouched | **two** — end of `drain_events`; permission arm of `dispatch_event` |
+
+The three-site list this ADR originally carried was wrong twice over, and both errors were found
+by the verify pass rather than by reading:
+
+- **Site 2 was never a turn boundary.** `drain_events` runs on a 120 ms poll. Calling the
+  fence-clearing verb there reclassified a broadcasting peer's open code fence as markdown from
+  the next poll onward — BR-6's failure, produced by the very mechanism ADR-4 withdrew site 3 to
+  avoid. Found independently by two reviewers. It now calls `emit_held()`.
+- **Site 3 was withdrawn, then came back in the correct form.** See ADR-4.
+
+A reader who re-adds an `end_block()` call at *either* pause is re-adding a known bug. The
+ownership sweep fails with the reasoning attached, and region-checks the permission-arm call
+rather than merely counting.
 
 **Ownership is a pointer, not a description** ([[LESSON-547]]): **TASK-280 owns every
 `end_block()` call site.** `main.rs` must not add one, `hand_off_after_turn` must not call it,
@@ -155,6 +168,27 @@ reordering the screen.
 
 `end_block()` is a turn boundary and only a turn boundary. Mid-turn writers get what they need
 from `line()` and `repaint_row_above()`, which emit the buffer before claiming their row.
+
+**Second amendment, after the verify pass (2026-08-26). The paragraphs above are the reasoning
+that shipped a weaker guarantee than this ADR is about, and the security audit said so.**
+
+Everything above is still *true*: the call was correctly withdrawn, `line()` really does flush, and
+the property test really is mechanism-independent. What it got wrong is treating "the property
+happens to hold today" as equivalent to "the property is guaranteed". The audit's words: the
+weaker `end_block()` invariant had a structural sweep while **the stronger consent-ordering
+invariant had none**, resting instead on the incidental fact that all five paths through
+`resolve_permission` reach `surface.line(...)` before `prompter.ask(...)`.
+
+**What shipped is a third call site after all — but the right verb.** The permission arm of
+`dispatch_event` calls `emit_held()` immediately before `resolve_permission`. Flush without the
+fence clear, which is exactly the distinction the withdrawal was groping for and did not have a
+verb for at the time. Backed by a **region check** in the ownership sweep: the slice of `client.rs`
+between the permission arm and the `resolve_permission(` call must contain the call. Moving it
+*after* `resolve_permission` keeps the total count at two and still fails — the mutation a count
+alone cannot see.
+
+The property test stays, for the reason this ADR already gave. It is now the behavioural half of a
+guarantee whose structural half is the sweep, rather than the whole of it.
 
 ### ADR-5 — `unicode-width` is taken; this reverses my own earlier lean, and here is why
 
@@ -281,4 +315,11 @@ say the wrap is now the CLI's and not the terminal's.
 One paragraph under the `Surface`/`Prompter` seam entry (line ~643): the surface renders markdown
 for terminals only, opt-in at construction; layout is pure and width-parameterised in
 `markdown.rs`; styling is authored inside the sanitizer from a fixed table, never by callers; and
-`client.rs`'s pump is the sole owner of the block-flush verb.
+`client.rs`'s pump is the sole owner of **both** flush verbs — `end_block()` (which additionally
+clears the fence, one call site, a turn boundary) and `emit_held()` (which does not, two call
+sites, both mid-turn pauses).
+
+**Ported into `.adlc/context/architecture.md` on 2026-08-26**, and rewritten there when the verify
+pass split the verb. The first port described the pre-split design and sat in the durable doc
+contradicting the shipped code until the confirmation review caught it — which is why this section
+now says explicitly what needs to stay in sync.

@@ -664,16 +664,31 @@ sanitizer from a fixed table, never by callers**: a wrapping decorator would
 emit SGR into `defused_multiline`, which replaces every `\x1b` with a space and
 would ship the visible `[1m` debris REQ-573 already shipped once — LESSON-517's
 rule that a seam gaining a sanitizer must also take over every legitimate use of
-the alphabet it destroys. And the block-flush verb `Surface::end_block()` is
-defaulted to a no-op with **every call site in `client.rs`'s event pump**
-(`Connection::call`'s returns, including its error paths, and `drain_events`),
-enforced by an ownership sweep in that file. The reason is not the buffered
-tail: every arm of the turn loop writes through `line()`, which emits the
-pending buffer before claiming its row. It is that **only `end_block()` clears
-the code-fence bit** — an unclosed fence otherwise renders every later line of
-every later turn verbatim — and that the idle path has no closing `line()` to
-rely on. A mid-turn call is a bug rather than a belt-and-braces: clearing the
-fence at a pause re-flows a resumed code block mid-token.
+the alphabet it destroys. And the flush verbs are **two**, both defaulted to
+no-ops, with **every call site in `client.rs`'s event pump**, enforced by an
+ownership sweep in that file:
+
+- `Surface::end_block()` — emit the held line, close an open table run, **and
+  clear the code-fence bit**. Exactly one call site: the end of
+  `Connection::call`, on every return including its error paths.
+- `Surface::emit_held()` — the first two only; the fence is left alone. Two call
+  sites: the end of `drain_events`, and the permission arm of `dispatch_event`
+  immediately before control passes to a `Prompter`.
+
+The split is the whole point. The reason `end_block()` exists is not the
+buffered tail — every arm of the turn loop writes through `line()`, which emits
+the pending buffer before claiming its row. It is that **only `end_block()`
+clears the fence**, and an unclosed fence otherwise renders every later line of
+every later turn verbatim. But clearing the fence is a *turn-boundary* act: at a
+mid-turn pause it re-flows a resumed code block mid-token. So a pause needs the
+flush without the forgetting, which is `emit_held()`.
+
+Both pauses in the pump are that shape. The idle drain runs on a 120 ms poll and
+is not a turn boundary at all. The permission arm hands the terminal to a
+`Prompter`, which writes straight to stdout and cannot know a buffer is pending —
+so held text must go out first, or a consent question paints above the assistant
+text that gives it its meaning. That second one is a security property, and the
+sweep region-checks it rather than merely counting calls.
 
 
 ### ADR-008: Releases are signed, attested, and environment-gated; gates prove exactly what they claim (2026-08-01)
