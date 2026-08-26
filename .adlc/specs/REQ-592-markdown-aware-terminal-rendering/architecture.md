@@ -75,9 +75,31 @@ match conn.call(params, &mut ctx)? {        // `?` — transport failure escapes
 }
 ```
 
-Only the `Ok` arm reaches `hand_off_after_turn`. A flush hung there drops buffered text on
-**every failed turn**, and misses the transport `?` entirely. Fragments also render with no turn
-in flight at all, via `drain_events` (main.rs:787) when a second client drives the same session.
+Only the `Ok` arm reaches `hand_off_after_turn`. A flush hung there misses the transport `?`
+entirely, and fragments also render with no turn in flight at all, via `drain_events`
+(main.rs:787) when a second client drives the same session.
+
+**Amended during implementation (2026-08-26): the sentence that used to sit here was wrong.**
+It read "A flush hung there drops buffered text on **every failed turn**." It would not have.
+TASK-283 deleted *both* `end_block()` calls and the entire pty suite stayed green, because every
+arm of the turn loop writes through a `Surface` after `conn.call` returns — `line(Info, "")` or
+the verbose line on `Ok`, `line(Notice, …)` on `METHOD_NOT_FOUND`, and `render_turn_failure`'s
+`line(…)` on the error arm — and `line()` calls `emit_pending()` before claiming its row (BR-8).
+The tail is released either way.
+
+**The decision stands; the reason does not.** What `end_block()` actually buys is two things
+this argument never named:
+
+1. **The fence bit.** Only `end_block()` clears it, and nothing else can — `line()` emits the
+   pending buffer but leaves `fence` set. Without it an unclosed ```` ``` ```` renders every
+   subsequent line of every subsequent turn verbatim. This is the half with a terminal witness:
+   TASK-283's fence test fails under the mutation and passes without it.
+2. **`drain_events`.** The idle path has no closing `line()` guaranteed to follow it.
+
+So the *flush* half of the verb is redundant on the success path, and an ADR-3 reader could
+reasonably conclude the pump's call is unnecessary. It is not — it is justified by the fence and
+by the idle path, not by the tail. Recorded because the wrong reason was load-bearing in three
+task briefs before a mutation test found it.
 
 **Decision: every `end_block()` call site lives in `client.rs`'s event pump** — the one place
 that owns both the surface and every path an event takes:

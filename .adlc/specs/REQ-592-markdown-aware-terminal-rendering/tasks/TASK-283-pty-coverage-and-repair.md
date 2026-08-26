@@ -1,7 +1,7 @@
 ---
 id: TASK-283
 title: "Pty coverage for the rendered bytes, and repair of the assertions this REQ moves"
-status: draft
+status: complete
 parent: REQ-592
 created: 2026-08-26
 updated: 2026-08-26
