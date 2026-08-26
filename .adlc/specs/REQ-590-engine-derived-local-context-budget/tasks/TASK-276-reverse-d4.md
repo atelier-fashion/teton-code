@@ -11,9 +11,10 @@ dependencies: [TASK-270, TASK-271, TASK-272, TASK-273, TASK-275]
 ## Description
 
 Unplanned, and opened **after** TASK-269–275 had all landed. TASK-272's own witness measured the
-thing the REQ was opened for and found it still broken: the reported `/analyze` body
-(4,097 words / ~31,014 bytes) had gone from *refused by 1 word* to *refused by 294 bytes*. The
-refusal changed currencies instead of going away.
+thing the REQ was opened for and found it still broken: the reported `/analyze` body — 4,097
+words, and a byte count the record pins only to [30,500, 31,499] — had gone from *refused by 1
+word* to refused on **bytes** across ~78% of that range. The refusal changed currencies instead
+of going away.
 
 D-4 — "the byte half falls to 30,720" — was never an owner decision; it was inferred from D-3's
 "take the full window". It is reversed. The **word** half stays window-derived at 10,240; the
@@ -42,8 +43,8 @@ state it described.
 ## Acceptance Criteria
 
 - [x] `derive(BudgetInputs::local())` is `(10_240, 32_768)`, bound `LocalEngine`
-- [x] A 4,097-word / 31,014-byte local turn **serves**, raising no over-budget offer, asserted on
-      a real turn — `the_reported_analyze_measurement_serves_on_both_halves_of_the_local_pair`
+- [x] A 4,097-word local turn at a byte size inside the reported interval **serves**, raising no
+      over-budget offer, asserted on a real turn — `the_reported_analyze_measurement_serves_on_both_halves_of_the_local_pair`
 - [x] The residual the reversal accepts is asserted as an equality
       (`bytes_claim − words_claim == LOCAL_GENERATION_RESERVATION`), not hidden
 - [x] `COMPACT_OUTPUT_MAX_BYTES ≤` the local byte budget, as a relation (AC-8 unchanged)
@@ -54,8 +55,9 @@ state it described.
 
 The evidence, in one line each:
 
-- **The reported body.** 4,097 w / 31,014 B = 7.57 B/word. Under D-4: words fit with 6,143 spare,
-  bytes over by 294. Reversed: 1,754 B spare.
+- **The reported body.** 4,097 w (exact) / [30,500, 31,499] B (`31 KB`, rounded) = 7.44–7.69
+  B/word. Under D-4 it is over on bytes across ~78% of that range, and worth between +0.7% and
+  −2.4% over all of it. Reversed: it fits on both halves everywhere in the range.
 - **The crossover.** A window-derived byte half beats the constant only below 7.5 B/word. Prose
   (≈5) +50%; code (≈8) −6.25%.
 - **What the reduction protected.** Nothing measurable. `numeric_grid.txt` is 20,480 B, admitted

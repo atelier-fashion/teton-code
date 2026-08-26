@@ -45,12 +45,12 @@
 //! Its **byte** half stays [`LOCAL_BUDGET_BYTES`] — 32,768, unchanged since
 //! before REQ-586. The pair is therefore **asymmetric on purpose**: one half
 //! window-derived, one half the constant. REQ-590's D-4 originally took the
-//! window-derived byte half too (30,720) and was **reversed** on measurement:
-//! the 2 B/token bridge makes a window-derived byte half *smaller* than the
-//! constant, which would have refused the very `/analyze` body this REQ exists
-//! to serve (4,097 words / 31,014 bytes — under 10,240 words, over 30,720
-//! bytes) while catching nothing a real tokenizer does not already catch. The
-//! reasoning, with the measurements, is at [`derive`]'s local arm.
+//! window-derived byte half too (30,720) and was **reversed** on the
+//! arithmetic: the 2 B/token bridge makes a window-derived byte half *smaller*
+//! than the constant, so it beats the constant only below **7.5 B/word** — a
+//! regression on code, which is the local tier's own workload — while catching
+//! nothing a real tokenizer does not already catch. The reasoning is at
+//! [`derive`]'s local arm.
 //!
 //! The two arms differ in a **second** place, beside the byte half above: the
 //! floor. `MIN_BUDGET_*` raises a pair derived from a **declaration** — a
@@ -94,9 +94,22 @@
 //! word (covered by the 3/2 word ratio alone), while minified JSON and
 //! path-heavy shell output run 20–45 tokens per "word" and are covered only
 //! by the 2 B/token byte floor. `max(words × 3/2, bytes / 2) ≥ tokens` holds
-//! for every corpus class except random base64 (≈1.45 B/token — the
-//! documented gap, backstopped by the digest threshold and the typed
-//! `context_length_exceeded` outcome).
+//! for every corpus class except **two**, both recorded in `token_corpus.rs`'s
+//! `KNOWN_UNCOVERED_AT_PINNED_FLOOR` and asserted there in both directions:
+//!
+//! * **random base64** (≈1.45 B/token) — byte-dense past the 2 B/token floor:
+//!   4,150 B of it costs 2,868 tokens against a `max(81, 2_075)` estimate.
+//! * **`numeric_grid.txt`** (REQ-590 AC-9) — the *other* quadrant, token-dense
+//!   and byte-**light**: 10,240 words / 20,480 B costs 20,480 real tokens
+//!   against `max(15,360, 10,240) = 15,360`, short by 25%. This one was added
+//!   by REQ-590 itself, to exercise the budget rather than the estimator, and
+//!   it is why D-3's zero-margin word half is stated as a known cost (ADR-6).
+//!
+//! Both gaps are backstopped the same way: the digest threshold, and the
+//! engine's typed `context_length_exceeded` outcome. **Not REQ-589's
+//! over-budget offer** — that fires only where a *skill expansion* exceeds the
+//! budget, and in both quadrants above the two guards *admit* the content, so
+//! the harness believes the turn fits and no offer is reachable (ADR-9).
 //!
 //! ### What the corpus proves, and what it does not (verify m9)
 //!
@@ -165,10 +178,12 @@ pub const LOCAL_BUDGET_TOKENS: usize = 4_096;
 /// route's pair which is not window-derived** (REQ-590 ADR-9, D-4 reversed).
 /// The two bridges disagree in the direction nobody expects: at 16,384 −
 /// 1,024 usable the BPE floor gives 30,720, *below* this constant, so deriving
-/// the local byte half from the window would have **lowered** it — refusing the
-/// 31,014-byte `/analyze` body this REQ exists to serve, and catching no
-/// content class that a whitespace-byte count can catch at all. So the local
-/// arm takes the window for words and this constant for bytes. See [`derive`].
+/// the local byte half from the window would have **lowered** it — a byte
+/// budget that beats this one only below 7.5 B/word, which is a regression on
+/// the code the `/analyze` body this REQ exists to serve is made of, and which
+/// catches no content class that a whitespace-byte count can catch at all. So
+/// the local arm takes the window for words and this constant for bytes. See
+/// [`derive`].
 pub const LOCAL_BUDGET_BYTES: usize = LOCAL_BUDGET_TOKENS * APPROX_BYTES_PER_TOKEN;
 
 /// The smallest byte budget a route with a **declared** window may derive —
@@ -633,15 +648,25 @@ pub fn derive(inputs: BudgetInputs<'_>) -> RouteBudget {
         // 32,768 the local route has always run under. That trade was measured
         // rather than argued, and it fails on both counts:
         //
-        // * **It does not fix the case this REQ exists for.** The reported
-        //   `/analyze` body is 4,097 words / 31,014 bytes — 7.57 B/word. Words
-        //   4,097 ≤ 10,240 fits; bytes 31,014 > 30,720 refuses by 294. The
-        //   refusal would simply move from the word guard to the byte guard,
-        //   and the field report would still not serve.
         // * **The window-derived pair only beats the old one below 7.5
-        //   B/word.** Prose (≈5) gains 50%; code (≈8) *loses* 6.25%. For
-        //   analyzing code — the local tier's own workload — a window-derived
-        //   byte half is a regression.
+        //   B/word.** The crossover is exact and needs no field data:
+        //   `30,720 / d = 4,096 ⇒ d = 7.5`. Prose (≈5) gains 50%; code (≈8)
+        //   *loses* 6.25%. For analyzing code — the local tier's own workload —
+        //   a window-derived byte half is a regression.
+        // * **It very likely does not fix the case this REQ exists for.** The
+        //   record gives the reported `/analyze` body as 4,097 words (exact)
+        //   and `31 KB` (rounded to the nearest KB by `bytes_figure`, so the
+        //   true count is in [30,500, 31,499] — no exact byte count for it was
+        //   ever recorded). At 4,097 words the 7.5 B/word crossover falls at
+        //   30,727.5 bytes, which sits 228 above that interval's floor: across
+        //   the interval the window-derived pair is worth between **+0.7% and
+        //   −2.4%**, and over most of it the refusal would simply have moved
+        //   from the word guard to the byte guard. It never plausibly helped
+        //   this case by as much as one percent.
+        // * **The restore is non-regressive by inspection (BR-7).** At every
+        //   density `min(10_240, 32_768/d) ≥ min(4_096, 32_768/d)`, because
+        //   only the word half moved and it moved up. Nothing that serves
+        //   today is newly refused, whatever the reported body's real size was.
         // * **It protects nothing measurable.** The one sample that overruns
         //   the engine at full budget is `token_corpus.rs`'s `numeric_grid.txt`
         //   at 2.00 tokens/word: 20,480 bytes, admitted at 30,720 *and* at
@@ -3102,13 +3127,13 @@ mod tests {
     /// worth. It is recorded here rather than quietly removed because a
     /// criterion that is deleted looks like one that was never written.
     ///
-    /// Three measurements reversed it, all at [`derive`]'s local arm: the
-    /// window-derived byte half would have refused the 4,097-word / 31,014-byte
-    /// `/analyze` body this REQ exists to serve; it beats 32,768 only below 7.5
-    /// B/word, so it is a **regression** on code; and it catches no content
-    /// class — `token_corpus.rs`'s `numeric_grid.txt` overruns the engine at
-    /// 20,480 real tokens while sitting at 20,480 bytes, admitted under either
-    /// value.
+    /// Three findings reversed it, all at [`derive`]'s local arm: the
+    /// window-derived byte half beats 32,768 only below 7.5 B/word, so it is a
+    /// **regression** on code; across the whole byte interval the field report
+    /// admits it was worth between +0.7% and −2.4% on the very `/analyze` body
+    /// this REQ exists to serve; and it catches no content class —
+    /// `token_corpus.rs`'s `numeric_grid.txt` overruns the engine at 20,480
+    /// real tokens while sitting at 20,480 bytes, admitted under either value.
     ///
     /// ADR-6a is the second reason: after ADR-2 the derivation *defined*
     /// `budget_bytes = usable × DUTY_REQUEST_BYTES_PER_TOKEN`, so the old AC-4
@@ -3146,8 +3171,8 @@ mod tests {
             local.budget_bytes, LOCAL_BUDGET_BYTES,
             "REQ-590 reversed D-4 (ADR-9): the local byte half is the constant. If you meant to \
              derive it from the window instead, read `derive`'s local arm first — that value is \
-             30,720, which is *lower*, refuses the 31,014-byte body this REQ exists to serve, and \
-             catches nothing a real tokenizer does not already catch"
+             30,720, which is *lower*, beats this constant only below 7.5 B/word so it regresses \
+             on code, and catches nothing a real tokenizer does not already catch"
         );
         let window_bridge = usable * DUTY_REQUEST_BYTES_PER_TOKEN;
         assert_eq!(window_bridge, 30_720);

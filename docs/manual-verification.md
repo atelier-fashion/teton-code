@@ -3149,9 +3149,11 @@ AC-16 added.*
    couple of real source files is the honest sample; `head -c 31000` of a
    concatenation is fine.
 2. Send it in a local session. It must **serve**, with no over-budget offer.
-   This is the exact pair — 4,097 words / 31,014 bytes — that was refused before
-   REQ-590 (on words, by one) and would still be refused under D-4 (on bytes, by
-   294).
+   This is the size that was refused before REQ-590 (on words, by one). The
+   report's word count is exact at 4,097; its byte count is only known to
+   [30,500, 31,499] — the daemon rendered `31 KB` and `bytes_figure` rounds to
+   the nearest KB — so **any** payload you build in that range is faithful to
+   it, and under D-4 most of that range would have been refused again, on bytes.
 3. Now make one that genuinely does not fit — the same content grown past 33 KB
    — and send it **as a skill** (`/something`), which is the only path
    REQ-589's offer covers. Expect the over-budget question, **not** a silent

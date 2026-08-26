@@ -394,10 +394,11 @@ pub struct HarnessConfig {
     /// unchanged, and *not* window-derived.
     ///
     /// D-4 briefly did derive it from the window, at the 2 B/token floor, which
-    /// gave 30,720. That was reversed: it refused the very `/analyze` body this
-    /// REQ exists for (31,014 B) by 294 bytes, moving the refusal from the word
-    /// guard to the byte guard rather than removing it, and it made the pair
-    /// *worse* than the old one above 7.5 B/word — where code lives.
+    /// gave 30,720. That was reversed: it made the pair *worse* than the old one
+    /// above 7.5 B/word — where code lives — and over the byte interval the
+    /// `/analyze` field report admits (`31 KB` rounded, so [30,500, 31,499]) it
+    /// was worth between +0.7% and −2.4%, mostly moving the refusal from the
+    /// word guard to the byte guard rather than removing it.
     ///
     /// The honest consequence, stated because it is the thing the window
     /// derivation would have fixed: at the 2 B/token floor this byte half claims

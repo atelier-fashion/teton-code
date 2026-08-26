@@ -418,6 +418,24 @@ whole reason it exists, REQ-589's AC-15 having been left unwritten.
 edited**; every one of them was right about the state it described, and the point of this record
 is the state that replaced it.*
 
+### Who decided this, since that is the rule this record itself writes
+
+**I did — the implementing agent — on my own judgement, and no owner approved it.** The finding
+was put to the owner mid-Phase-4 and they did not answer; I said at the time that I was
+proceeding without a decision rather than blocking on one, and this record exists so that
+choice is legible instead of buried.
+
+Three things make proceeding defensible, and they are the argument, not an excuse:
+
+- It **restores the status quo ante**. 32,768 is the value the local route ran under before this
+  REQ opened; the reversal removes a change, it does not introduce one.
+- It is **cheap to undo** — one line in `derive`'s local arm (`pair.bytes = LOCAL_BUDGET_BYTES`),
+  with the tests on both sides of it already written.
+- The alternative was to ship a REQ whose own motivating case it had, at best, failed to fix.
+
+The last section of this record faults D-4 for being an inference wearing a decision's label.
+This record would earn the same fault if it did not say the above.
+
 ### The decision
 
 `derive`'s local arm keeps its **word** half window-derived — `(16,384 − 1,024) × 2/3 = 10,240`,
@@ -432,32 +450,46 @@ rather than a constant it once coincided with, and that is still right. What cha
 
 ### What reversed it
 
-The reported `/analyze` body is **4,097 words / ~31,014 bytes** — 7.57 bytes per whitespace
-word, which is what code is.
+**First, what the record does and does not say.** The `/analyze` failure survives only as the
+daemon's own *rendered* sentence, quoted in REQ-589's Description: "about **4,097 words / 31
+KB**". The word half is exact. The byte half is **not** — `bytes_figure` renders
+`(bytes + 500) / 1_000` (`teton-protocol/src/events.rs`), so `31 KB` means the true count lies in
+**[30,500, 31,499]**, an interval 999 bytes wide. **No exact byte count for that body was ever
+recorded, and this document previously asserted one (31,014) that was never measured.** At 4,097
+words the interval is **7.44–7.69 B/word**.
 
-| | word guard | byte guard | outcome |
-|---|---|---|---|
-| before REQ-590 | 4,097 vs 4,096 — **over by 1** | 31,014 vs 32,768 — fits, 1,754 spare | refused |
-| with D-4 (10,240 / 30,720) | fits, 6,143 spare | 31,014 vs 30,720 — **over by 294** | refused |
-| with D-4 reversed (10,240 / 32,768) | fits, 6,143 spare | fits, 1,754 spare | **serves** |
+That interval **straddles** D-4's 30,720, so the record cannot decide whether D-4 would have
+refused the reported body. Three findings reverse D-4 anyway, and none of them needs it:
 
-**The REQ as built did not fix the case it exists for.** The refusal did not go away; it changed
-currencies — and it went unnoticed because AC-12 is written in whitespace words, which is the
-exact blindness A-2's own note warned about for a *different* criterion.
+1. **The window-derived byte half only beats the constant below 7.5 B/word.** Pure arithmetic:
+   `30,720 / d = 4,096 ⇒ d = 7.5`, exact. Prose (≈5 B/word) gains 50%; code (≈8) *loses* 6.25%.
+   For analyzing code — the local tier's own workload — deriving the byte half is a regression.
+2. **On the field report itself, D-4 was worth between +0.7% and −2.4%.** For `3 ≤ d ≤ 8` the two
+   pairs' servable bodies stand in the ratio `7.5 / d`, so across the whole admissible interval:
 
-Three findings, each measured rather than argued:
+   | reported body's true size | density | D-4 vs. the old pair |
+   |---|---|---|
+   | 30,500 B (interval floor) | 7.44 B/word | +0.7% |
+   | 30,727.5 B (**the crossover**) | 7.50 B/word | break-even |
+   | 31,499 B (interval ceiling) | 7.69 B/word | −2.4% |
 
-1. **The field report still refused.** Above. TASK-272 had, in good faith, rewritten AC-12's
-   witness to assert that the byte half is "the boundary now" — a green test pinning this REQ's
-   motivating case as still broken.
-2. **The window-derived byte half only beats the constant below 7.5 B/word.** The crossover is
-   `LOCAL_BUDGET_BYTES / (usable × 2)`. Prose (≈5 B/word) gains 50%; code (≈8) *loses* 6.25%. For
-   analyzing code — the local tier's own workload — deriving the byte half is a regression.
+   The crossover sits 228 bytes above the floor and 771 below the ceiling. **At best D-4 helped
+   this case by under one percent; over most of the interval it hurt** — and where it hurt, the
+   refusal did not go away, it changed currencies from the word guard to the byte guard. That
+   would have gone unnoticed because AC-12 is written in whitespace words, which is the exact
+   blindness A-2's own note warned about for a *different* criterion. TASK-272 had, in good
+   faith, rewritten AC-12's witness to assert the byte half is "the boundary now" — a green test
+   pinning this REQ's motivating case as still broken.
 3. **It protects nothing measurable.** AC-9's `numeric_grid.txt`, the one sample in the corpus
    that overruns the engine at full budget, is 20,480 bytes: admitted at 30,720 **and** at
    32,768, costing 20,480 real `o200k_base` tokens against 15,360 usable either way. No byte
    value in this range catches that class. Only a real tokenizer does — which is what AC-9's test
    is, and why it stays.
+
+**And the restore is safe without any measurement at all.** Only the word half moved, and it
+moved up, so at every density `min(10,240, 32,768/d) ≥ min(4,096, 32,768/d)`. BR-7 —
+"no turn that serves today is newly refused" — holds by inspection, whatever the reported body's
+real size was.
 
 ### The residual, named rather than closed
 
@@ -483,7 +515,7 @@ point; it is corrected here rather than edited there.
 
 | | D-4 | reversed |
 |---|---|---|
-| the reported `/analyze` body (7.57 B/word) | refused by 294 B | **serves**, 1,754 B spare |
+| the reported `/analyze` body (7.44–7.69 B/word) | refused over ~78% of its admissible range | **serves** across all of it |
 | ordinary code at 8 B/word | −6.25% budget | unchanged |
 | prose at 5 B/word | +50% byte budget | unchanged |
 | BR-7 ("no turn that serves today is newly refused") | overridden | **holds** |
@@ -535,5 +567,6 @@ strength of a decision nobody had made.
 An inference wearing a decision's label is not reviewable as an inference. The tell was available
 in the spec's own text — D-4 opens *"Not a separate choice"* — and the fix is the general one:
 **a decision record should say who decided it, and an inference should say what it was inferred
-from.** D-4 now says both.
+from.** D-4 now says both — and so, at the top of this record, does ADR-9 itself, which was
+written before it said who made it.
 

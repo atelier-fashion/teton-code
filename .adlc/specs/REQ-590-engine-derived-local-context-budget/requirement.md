@@ -67,9 +67,10 @@ against a 4,096-*word* budget.
 
 > **Amended by ADR-9 (2026-08-25): only the first of these two defects is fixed.** The word half
 > is fixed. The byte half's missing reservation was fixed, measured, and **deliberately put
-> back**: subtracting the reservation from the byte half moves it 32,768 → 30,720, which refuses
-> the very `/analyze` body this REQ exists to serve (31,014 bytes) while catching nothing a real
-> tokenizer does not already catch. The 1,024-token overclaim described above therefore survives
+> back**: subtracting the reservation from the byte half moves it 32,768 → 30,720, which beats
+> the constant only below 7.5 B/word — a regression on code, and over most of the byte range the
+> `/analyze` field report admits it would have refused that body too — while catching nothing a
+> real tokenizer does not already catch. The 1,024-token overclaim described above therefore survives
 > this REQ, as a named and measured residual rather than an unexamined one. See D-4 and AC-4.
 > **The diagnosis in this section is correct; the remedy it implies is the one that was tried and
 > withdrawn.**
@@ -172,14 +173,32 @@ local engine a default-feature build can have.*
   because the reversal is only legible beside the thing it reversed — and because the band was
   what AC-7 was written against.
 
-- [ ] **BR-8 (floor): `MIN_BUDGET_*` may never raise the local pair above what the engine holds.**
-  The floor's "only ever raises" property is safe for a remote route with a declared window and is
-  not safe against a hard engine limit. **This rule is presently latent** — at
+- [ ] **BR-8 (floor): `MIN_BUDGET_*` may never raise a pair *derived from the engine's window*
+  above what that engine holds.** The floor's "only ever raises" property is safe for a remote
+  route with a declared window — a provider can refuse and say so — and is not safe against a
+  hard engine limit, where there is nobody to refuse. **This rule is presently latent** — at
   `LOCAL_ENGINE_N_CTX = 16,384` the floor never bites — and becomes live only if that constant
-  falls. It is stated so that whoever lowers it inherits the rule rather than the bug. Note the
-  remedy is *not* obviously "clamp to the window": at a 4,096-token engine the derived byte half
-  is 6,144, which `budget.rs:126-133` documents as **below the smallest prompt the harness can
-  produce**. That case is OQ-2, and BR-8 does not pretend to resolve it.
+  falls. It is stated so that whoever lowers it inherits the rule rather than the bug.
+
+  > **Swept after ADR-9 (2026-08-26), and the hazard runs the *opposite* way from what this rule
+  > originally described.** BR-8 was written when D-4 made **both** halves of the local pair
+  > window-derived. It now governs only the **word** half and `window_pair`'s own byte output,
+  > because ADR-9 overwrites the local byte half with the constant `LOCAL_BUDGET_BYTES` — which
+  > the floor never sees.
+  >
+  > The struck reasoning read: *"at a 4,096-token engine the derived byte half is 6,144, below
+  > the smallest prompt the harness can produce"*, i.e. the danger was a byte budget too
+  > **small**. Post-ADR-9 the local byte half at a 4,096-token engine is **32,768** — it does not
+  > shrink with the window at all — claiming 16,384 provider tokens against 3,072 usable, a
+  > **5.3× overclaim**. The word half would correctly fall to 2,048 words / 3,072 tokens, so the
+  > pair comes apart: one half tracks the engine, the other ignores it.
+  >
+  > There is no floor to blame for that, and BR-8 as written cannot catch it: the floor only ever
+  > *raises* a derived pair, and this byte half is never derived — it is **assigned**, above the
+  > engine, on purpose. That is the residual ADR-9 names and prices at today's window
+  > (`+1,024` tokens); what the note above adds is that the price is not constant — **it grows
+  > without bound as `LOCAL_ENGINE_N_CTX` falls.** That is now OQ-2, restated, and BR-8 still
+  > does not pretend to resolve it.
 
 - [ ] **BR-9: `COMPACT_OUTPUT_MAX_BYTES` may not exceed the local byte budget.** It was defined
   as `LOCAL_BUDGET_BYTES` (`compact.rs:134`) and its doc states the invariant it holds: a repair
@@ -283,13 +302,26 @@ local engine a default-feature build can have.*
 - [ ] AC-12: The `/analyze` case that motivated REQ-589 — 4,097 words on the local tier — is not
   refused and raises no over-budget offer. The field report, turned into a test.
 - [ ] AC-13: `cargo audit` clean; full suite green; no new clippy warnings.
-- [ ] AC-15 (BR-8): `derive` fed a **synthetic** small window (e.g. 4,096) produces a pair whose
-  byte half, at `DUTY_REQUEST_BYTES_PER_TOKEN`, does not exceed that window — i.e. the floor did
-  not raise it past what such an engine could hold. Paired on the same fixture with a window
-  large enough that the floor does not bite, so the test cannot pass by the floor never applying.
+- [ ] AC-15 (BR-8): **`window_pair` under `Floor::HeldToTheEngine`**, fed a synthetic small window
+  (e.g. 4,096), produces a pair whose byte half, at `DUTY_REQUEST_BYTES_PER_TOKEN`, does not
+  exceed that window — i.e. the floor did not raise it past what such an engine could hold.
+  Paired on the same fixture with a window large enough that the floor does not bite, so the test
+  cannot pass by the floor never applying; and with the *same* small window under
+  `Floor::RaisesADeclaration`, which **does** raise it, so the held row is not vacuous.
   **This rule is latent today** (at 16,384 the floor never bites), so the AC is written against a
   synthetic window rather than a real engine — a criterion that can only run on a configuration
   nobody ships is a criterion that never runs.
+
+  > **Corrected after ADR-9 (2026-08-26).** This AC used to say "`derive` fed a synthetic small
+  > window". **That is unimplementable, and always was on the local arm**: `derive`'s local
+  > branch ignores `inputs.window` entirely and calls `window_pair(LOCAL_ENGINE_N_CTX, …)`, so
+  > there is no synthetic window to feed it — and since ADR-9 its byte half never passes through
+  > `window_pair` at all. The criterion is therefore stated against the helper that actually owns
+  > the property, which is what the shipped test
+  > (`the_floor_never_raises_the_local_pair_above_the_engines_window`) already asserts and says of
+  > itself. Read its byte assertions as what the helper *would* give a small engine, **not** as
+  > the local route's byte budget, which is the constant and deliberately exceeds what a
+  > 16,384-token engine holds. See BR-8's note and OQ-2.
 - [ ] AC-16 (BR-12): The rendered `LocalEngine` bound names the window and the reservation that
   produced the pair. Asserted on the string a user actually sees, not on the fields behind it —
   a budget a user cannot account for is one they will report as a bug.
@@ -353,20 +385,26 @@ local engine a default-feature build can have.*
   D-4 was not an owner decision; it was an inference from D-3's "take the full window" — 30,720
   *is* the full-window derivation at the 2 B/token bridge. It was built, measured, and withdrawn.
 
-  **The measurement that reversed it.** The reported `/analyze` body is **4,097 words / 31,014
-  bytes** — 7.57 bytes per whitespace word, which is what code is:
+  **What reversed it.** The reported `/analyze` body is **4,097 words** (exact) and, per the
+  daemon's rendered `31 KB` — `bytes_figure` rounds to the nearest KB — somewhere in
+  **[30,500, 31,499] bytes**, i.e. **7.44–7.69 B/word**. *No exact byte count for it was ever
+  recorded; an earlier version of this section asserted 31,014, which was never measured.*
 
   | | word guard | byte guard | outcome |
   |---|---|---|---|
-  | before REQ-590 | 4,097 vs 4,096 — **over by 1** | 31,014 vs 32,768 — fits, 1,754 spare | refused |
-  | with D-4 | 4,097 vs 10,240 — fits, 6,143 spare | 31,014 vs 30,720 — **over by 294** | refused |
-  | with D-4 reversed | 4,097 vs 10,240 — fits, 6,143 spare | 31,014 vs 32,768 — fits, 1,754 spare | **serves** |
+  | before REQ-590 | 4,097 vs 4,096 — **over by 1** | fits, whatever its size in that range | refused |
+  | with D-4 | 4,097 vs 10,240 — fits | over 30,720 across ~78% of that range | **probably still refused** |
+  | with D-4 reversed | 4,097 vs 10,240 — fits | under 32,768 across all of it | **serves** |
 
-  **The REQ as built did not fix the case it exists for.** The refusal did not go away; it moved
-  currencies. Three findings, each measured rather than argued:
+  **The REQ as built very likely did not fix the case it exists for** — and could not be shown to
+  have fixed it either way, which is nearly as bad in a REQ whose only acceptance criterion for
+  the case is written in the *other* currency. Three findings, none needing the byte count:
 
-  1. **The field report still refused.** AC-12 was asserted in whitespace words and went green
-     while the body it names was refused on bytes.
+  1. **The field report probably still refused.** At 4,097 words the 7.5 B/word crossover falls
+     at 30,727.5 bytes — 228 above the interval's floor. Across the interval D-4 was worth
+     between **+0.7% and −2.4%**: at best it helped by under one percent, and over most of it
+     the refusal simply moved from the word guard to the byte guard. AC-12 was asserted in
+     whitespace words, so it went green either way.
   2. **The window-derived byte half only beats the constant below 7.5 B/word.** Prose (≈5) gains
      50%; code (≈8) *loses* 6.25%. For analyzing code — the local tier's own workload — it is a
      regression.
@@ -435,10 +473,28 @@ local engine a default-feature build can have.*
 
 - [ ] OQ-1: Should the local budget re-derive when the engine is swapped mid-session, or is
   stamping it at route-decision time enough?
-- [ ] OQ-2: If `LOCAL_ENGINE_N_CTX` ever falls, the derived byte half can land *below* the
-  harness's own 5,979-byte system prompt plus the 1 KiB truncation floor — a tier that cannot
-  serve anything. Is the answer a proportionally tiny budget, or should the tier decline to serve
-  and say why? BR-8 keeps this honest; it does not resolve it.
+- [ ] OQ-2 — **restated after ADR-9 (2026-08-26); the hazard is the reverse of what this question
+  originally described, and it stays open.** As drafted it asked: if `LOCAL_ENGINE_N_CTX` ever
+  falls, the *derived* byte half can land **below** the harness's own 5,979-byte system prompt
+  plus the 1 KiB truncation floor — a tier that cannot serve anything. That was the right worry
+  while D-4 derived the byte half. It no longer is: since ADR-9 the local byte half is the
+  constant `LOCAL_BUDGET_BYTES` and **does not fall with the window at all**.
+
+  The live question is the opposite one. At a 4,096-token engine the byte half is still 32,768,
+  claiming 16,384 provider tokens against 3,072 usable — a **5.3× overclaim**, against the
+  `+1,024`-token (1.07×) residual ADR-9 priced at today's window. The word half tracks the engine
+  and the byte half does not, so the smaller the engine the further apart the two halves' claims
+  drift, and the byte guard degenerates into no guard at all.
+
+  So: **should the local byte half stay a constant as the engine shrinks, and if not, what
+  replaces it?** Not the window derivation — ADR-9 measured that and reversed it, and using
+  `usable` is *precisely* D-4. A ceiling drawn from the **whole** window rather than the usable
+  part would at least be identity today — `min(LOCAL_BUDGET_BYTES, n_ctx × 2)` is
+  `min(32,768, 32,768)` at 16,384 and 8,192 at 4,096 — but it changes nothing at the only window
+  that ships, so it would have to be argued entirely on the small-engine case it exists for.
+  The alternative is a tier that declines to serve and says why. BR-8's note keeps this honest; it does not resolve it. Nothing here is
+  live at `LOCAL_ENGINE_N_CTX = 16,384`; it becomes live the day that constant falls, which is
+  REQ-547's territory.
 - [ ] OQ-3: **CLOSED** — D-3 decided by the owner, 2026-08-25: the full window for the word
   half. D-4 (the byte half) was *inferred* from that decision rather than made by the owner, and
   was **reversed** on measurement the same day — see D-4 and ADR-9. AC-10 and AC-11 measure the

@@ -17,7 +17,7 @@
 //! | AC | Test |
 //! |---|---|
 //! | AC-1 (the boundary, offered and answered) | [`the_reported_analyze_measurement_serves_on_both_halves_of_the_local_pair`] |
-//! | **REQ-590 AC-12** (the reported measurement, served) | (same test, leg 3) |
+//! | **REQ-590 AC-12** (the reported measurement, served) | (same test, leg 4) |
 //! | AC-1 (accepting carries it whole) | [`an_accepted_offer_puts_every_measured_byte_of_the_expansion_on_the_wire`] |
 //! | AC-3 (decline is today's refusal) | [`declining_is_todays_refusal_in_every_byte`] |
 //! | AC-4 (silence is never consent) | [`no_unanswered_offer_resolves_to_proceed`] |
@@ -1006,31 +1006,52 @@ async fn calibrate(fx: &Fixture) -> Overhead {
 }
 
 /// **REQ-590 AC-12 — the whole point of the REQ, on a turn that really runs it:
-/// does a 4,097-word / 31,014-byte local turn serve?**
+/// does a 4,097-word local turn at the reported body's size serve?**
 ///
-/// It does. That sentence is what this test exists to be able to say, and for
-/// most of REQ-590's implementation it was not true.
+/// It does, across the whole range of sizes the field report admits. That
+/// sentence is what this test exists to be able to say, and for most of
+/// REQ-590's implementation it was not true.
 ///
 /// The reported failure was *one word* over: **4,097 words against 4,096**, with
-/// ~1.7 KB still free in the byte half, `bound: local engine`, on a route that
+/// room still free in the byte half, `bound: local engine`, on a route that
 /// declares no window at all. REQ-590 gave that route a word budget derived from
 /// the engine's own window — 10,240 — and left the byte half at
 /// `LOCAL_BUDGET_BYTES`, 32,768. **Both** halves of the reported measurement are
 /// therefore inside the budget, and the turn is served silently.
 ///
+/// # What the record actually says about the byte half
+///
+/// **The field report gives a rounded byte figure, not an exact one**, and this
+/// test is careful not to invent the difference. REQ-589's Description quotes
+/// the daemon's own rendered sentence — "about 4,097 words / **31 KB**" — and
+/// `bytes_figure` renders `(bytes + 500) / 1_000`, so `31 KB` means the true
+/// count lies somewhere in **[30,500, 31,499]**. No exact byte count for that
+/// body was ever recorded. The word half *is* exact: 4,097 is rendered without
+/// rounding, which is why every leg below is written at that word count.
+///
+/// That interval is 999 bytes wide and it **straddles** D-4's 30,720, so the
+/// record cannot settle whether D-4 would have refused the real body. What it
+/// can settle is the shape of the trade, and that needs no measurement at all:
+/// a window-derived byte half beats the constant only below **7.5 B/word**
+/// (`30,720 / d = 4,096 ⇒ d = 7.5`, exact). At 4,097 words the crossover body
+/// is 30,727.5 bytes — 228 above this interval's floor and 771 below its
+/// ceiling. Over the whole interval D-4's pair is worth between **+0.7% and
+/// −2.4%** against the old one. At best it barely helped; at worst it hurt.
+///
 /// # This test is the reversal, and it used to assert the opposite
 ///
 /// D-4 originally took the window derivation for the byte half too, at which
-/// point the local byte budget was **30,720** and the reported body — 31,014
-/// bytes — was over it by 294. The refusal did not go away; it changed
-/// currencies. This test was written in that state, named
+/// point the local byte budget was **30,720** — below most of the interval
+/// above. This test was written in that state, named
 /// `…_and_the_byte_half_is_the_boundary_now`, and asserted the reported
 /// measurement *fails* — a green test pinning the REQ's own motivating case as
 /// still broken.
 ///
-/// ADR-9 reversed D-4 on exactly that measurement. The name and the premise go
-/// with it: what is asserted below is the field report serving, in both
-/// currencies, with the spare room in each stated as a number.
+/// ADR-9 reversed D-4. The reversal's own justification does not rest on any
+/// byte count: at **every** density the restored pair is non-regressive,
+/// `min(10_240, 32_768/d) ≥ min(4_096, 32_768/d)`, which is BR-7 proved by
+/// inspection. The name and the premise go with the reversal: what is asserted
+/// below is a body of the reported size serving, in both currencies.
 ///
 /// # Four legs on one fixture
 ///
@@ -1039,13 +1060,13 @@ async fn calibrate(fx: &Fixture) -> Overhead {
 /// | 4,097 words / `budget_bytes + 1` | offered, declined → today's refusal |
 /// | the same, accepted | dispatched whole |
 /// | 4,097 words / `budget_bytes` | served — the boundary's other side |
-/// | **4,097 words / 31,014 bytes** | **served — the field report** |
+/// | **4,097 words / a body inside the reported interval** | **served — the field report's size** |
 ///
 /// Legs 1 and 3 differ by a **single byte**, and that pairing is what stops
 /// either passing for a reason of its own: the serving leg cannot be a fixture
 /// that merely drifted under budget, because its twin one byte larger is over.
-/// Leg 4 is then the report itself rather than a boundary probe — the numbers
-/// the user actually sent, asserted to serve with room to spare in both halves.
+/// Leg 4 is then the report's own size rather than a boundary probe — a body as
+/// large as the field report's, asserted to serve on both halves.
 ///
 /// Without leg 4 this file would pin the *boundary* and never the *case*; the
 /// two are not the same claim, and it was the second one REQ-590 was opened for.
@@ -1061,10 +1082,25 @@ async fn calibrate(fx: &Fixture) -> Overhead {
 async fn the_reported_analyze_measurement_serves_on_both_halves_of_the_local_pair() {
     /// The reported measurement's word half.
     const REPORTED_WORDS: u64 = 4_097;
-    /// Its byte half, as REQ-589 reproduced it: the ~31 KB the report quoted
-    /// against a 33 KB budget with ~1.7 KB to spare. 7.57 bytes per whitespace
-    /// word — code, which is what `/analyze` was pointed at.
-    const REPORTED_BYTES: u64 = 31_014;
+    /// A byte size the reported body **could** have been — deliberately *not*
+    /// named as a measurement, because no exact byte count for that body exists.
+    ///
+    /// The record renders `31 KB`, which under `bytes_figure`'s
+    /// `(bytes + 500) / 1_000` means **[30,500, 31,499]**. This is that
+    /// interval's midpoint, 31,000, and it is a *choice* among the 1,000 sizes
+    /// the record admits, made for two reasons:
+    ///
+    /// * it re-renders as `31 KB`, so a body of this size would have produced
+    ///   the sentence the user actually saw; and
+    /// * it is above D-4's 30,720, which is what keeps leg 4 **discriminating**
+    ///   — a point drawn from the bottom 23% of the interval would serve under
+    ///   D-4 as well and this leg would stop telling the two states apart.
+    ///
+    /// The second reason is a property of the fixture, not evidence about the
+    /// field: it does not show that D-4 refused the real body, only that D-4
+    /// refuses a body the record equally admits. At ~7.57 B/word this size is
+    /// code-shaped, which is what `/analyze` was pointed at.
+    const A_BODY_INSIDE_THE_REPORTED_INTERVAL: u64 = 31_000;
 
     let local = local_pair();
 
@@ -1079,10 +1115,10 @@ async fn the_reported_analyze_measurement_serves_on_both_halves_of_the_local_pai
 
     // -- AC-12, in the arithmetic, before any turn runs ----------------------
     //
-    // Both halves, with the spare room in each named. The word half is where
-    // the report refused; the byte half is where D-4 would have moved the
-    // refusal to. Stating both is the difference between "the REQ moved a
-    // number" and "the REQ fixed the case".
+    // Both halves, each asserted to hold. The word half is where the report
+    // refused; the byte half is where D-4 would have moved the refusal to.
+    // Stating both is the difference between "the REQ moved a number" and "the
+    // REQ fixed the case".
     assert!(
         REPORTED_WORDS <= local.budget_tokens as u64,
         "REQ-590 AC-12: the local word budget must hold the reported measurement — \
@@ -1090,22 +1126,28 @@ async fn the_reported_analyze_measurement_serves_on_both_halves_of_the_local_pai
         local.budget_tokens
     );
     assert!(
-        REPORTED_BYTES <= local.budget_bytes as u64,
-        "REQ-590 AC-12 / ADR-9: the local byte budget must hold the reported measurement too — \
-         {REPORTED_BYTES} B against {}. D-4's window-derived byte half was 30,720 and refused \
-         this body by 294 bytes, which is the measurement that reversed it. If this assertion \
-         is red, the REQ has once again moved the refusal instead of removing it",
+        A_BODY_INSIDE_THE_REPORTED_INTERVAL <= local.budget_bytes as u64,
+        "REQ-590 AC-12 / ADR-9: the local byte budget must hold a body of the reported size too \
+         — {A_BODY_INSIDE_THE_REPORTED_INTERVAL} B against {}. D-4's window-derived byte half \
+         was 30,720, below most of the [30,500, 31,499] interval the record admits. If this \
+         assertion is red, the REQ has once again moved the refusal instead of removing it",
         local.budget_bytes
     );
-    assert_eq!(
-        (
-            local.budget_tokens as u64 - REPORTED_WORDS,
-            local.budget_bytes as u64 - REPORTED_BYTES
-        ),
-        (6_143, 1_754),
-        "the room the report has to spare in each currency. Pinned because the byte figure is \
-         the one that was 294 *short* under D-4, and a reader comparing the two states needs \
-         both numbers rather than an inequality"
+    // **Both halves, asserted as the fit AC-12 actually claims** — not as spare
+    // room. An earlier form of this pinned the leftover in each currency as an
+    // exact pair, which asserted a precision nobody has: the byte figure would
+    // have been the budget minus a body size the record never recorded. What
+    // AC-12 claims is that the reported measurement is inside the pair, and
+    // that is what is asserted, in both currencies at once so neither half can
+    // pass alone.
+    assert!(
+        REPORTED_WORDS <= local.budget_tokens as u64
+            && A_BODY_INSIDE_THE_REPORTED_INTERVAL <= local.budget_bytes as u64,
+        "REQ-590 AC-12: the reported measurement must fit **both** halves of the local pair — \
+         {REPORTED_WORDS} words / {A_BODY_INSIDE_THE_REPORTED_INTERVAL} B against {} / {}. \
+         Fitting one half and not the other is how the refusal moved currencies under D-4",
+        local.budget_tokens,
+        local.budget_bytes
     );
 
     let fx = Fixture::new(Spec::new(
@@ -1258,31 +1300,34 @@ async fn the_reported_analyze_measurement_serves_on_both_halves_of_the_local_pai
 
     // -- leg 4: the field report itself. **AC-12** ----------------------------
     //
-    // Not a boundary probe — the numbers the user sent. 4,097 words and 31,014
-    // bytes, the measurement that opened REQ-589 and then REQ-590, run through
-    // the same fixture the three legs above calibrated. It serves: no question,
-    // no announcement, an answer.
+    // Not a boundary probe — the size the user sent. 4,097 words (exact, as the
+    // record renders it) at a byte count the record admits, run through the same
+    // fixture the three legs above calibrated. It serves: no question, no
+    // announcement, an answer.
     //
     // This is the leg the REQ is for. Legs 1–3 would all still pass with the
-    // byte half at D-4's 30,720; **this one would not** — 31,014 is 294 bytes
-    // over that budget, and the report would refuse on the byte guard instead
-    // of the word guard. It is the only assertion in the file that can tell the
-    // difference between the two states, which is why it is written against the
-    // report's own figures rather than against `budget_bytes`.
+    // byte half at D-4's 30,720, because each is written *relative to*
+    // `budget_bytes` and would simply move with it; **this one would not**, and
+    // that is the whole reason it is written against an absolute size instead.
+    // Read that as a property of the fixture: it shows D-4 refusing a body the
+    // record equally admits, not D-4 refusing the body the user actually sent —
+    // which the record cannot decide either way (see the constant's own note).
+    // It remains the only assertion in the file that can tell the two states
+    // apart.
     let tag = "the reported measurement";
     let offers_so_far = fx.client.offers().len();
     fx.write_body(&marked_body(
         usize::try_from(REPORTED_WORDS - overhead.words).unwrap(),
-        usize::try_from(REPORTED_BYTES - overhead.bytes).unwrap(),
+        usize::try_from(A_BODY_INSIDE_THE_REPORTED_INTERVAL - overhead.bytes).unwrap(),
     ));
     let served = fx.session();
     let mut sub = fx.events.subscribe(512);
     fx.invoke(&served).await.unwrap_or_else(|e| {
         panic!(
             "REQ-590 AC-12: the reported /analyze turn — {REPORTED_WORDS} words / \
-             {REPORTED_BYTES} bytes — must serve on the local tier. This is the field report \
-             this REQ exists for, and a refusal here means the refusal has moved currencies \
-             rather than gone away: {e:?}"
+             {A_BODY_INSIDE_THE_REPORTED_INTERVAL} bytes — must serve on the local tier. This \
+             is the size of the field report this REQ exists for, and a refusal here means the \
+             refusal has moved currencies rather than gone away: {e:?}"
         )
     });
     let published = drain(&mut sub);

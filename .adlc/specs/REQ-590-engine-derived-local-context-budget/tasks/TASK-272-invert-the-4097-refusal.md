@@ -105,8 +105,10 @@ mistake a rendering test for a budget one. A note now says so in place.
 2. **For content denser than 7.5 B per whitespace word, this REQ lowers the local budget.** Old
    capacity was `min(4,096 words, 32,768/d)`; new is `min(10,240, 30,720/d)`. They cross at
    d = 7.5. Below it the raise is real (prose at 6 B/word: 4,096 → 5,120 words, +25%). Above it
-   both are byte-bound and the new pair is a flat **6.25% smaller**. Code averages 7–8 B/word and
-   the reported body sat at 7.57. The word half's 2.5× raise is inert for anything real.
+   both are byte-bound and the new pair is a flat **6.25% smaller**. Code averages 7–8 B/word, and
+   the reported body's own density is only known to a range — `31 KB` rendered, so
+   [30,500, 31,499] B over 4,097 words, i.e. **7.44–7.69 B/word**, which straddles the crossover.
+   The word half's 2.5× raise is inert for anything real.
 3. **The offer sentence quotes two identical byte figures at the boundary.** `bytes_figure`
    rounds to the nearest KB, so a measurement one byte over a 30,720 B budget renders as
    "about 4,097 words / 31 KB, and the budget is 10,240 words / 31 KB" — the user cannot see
