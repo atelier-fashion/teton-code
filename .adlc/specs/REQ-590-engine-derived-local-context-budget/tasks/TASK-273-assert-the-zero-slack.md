@@ -1,7 +1,7 @@
 ---
 id: TASK-273
 title: "The word half's zero slack is asserted, not accidental"
-status: draft
+status: complete
 parent: REQ-590
 created: 2026-08-25
 updated: 2026-08-25
@@ -31,17 +31,17 @@ Then measure the quadrant the byte guard does not cover.
 
 ## Acceptance Criteria
 
-- [ ] A test asserts `local_words × REMOTE_TOKENS_PER_WORD_NUM / REMOTE_TOKENS_PER_WORD_DEN`
+- [x] A test asserts `local_words × REMOTE_TOKENS_PER_WORD_NUM / REMOTE_TOKENS_PER_WORD_DEN`
       equals `LOCAL_ENGINE_N_CTX − LOCAL_GENERATION_RESERVATION` exactly, with a comment saying
       the zero gap is D-3's accepted consequence and what would make it non-zero
-- [ ] AC-9: a corpus sample that is **token-dense and byte-light** — whitespace-separated
+- [x] AC-9: a corpus sample that is **token-dense and byte-light** — whitespace-separated
       single-character tokens or a numeric column, ~2 B/word — at full word budget. Either it
       fits, or the test records that it does not and names `context_length_exceeded` as the
       intended outcome
-- [ ] The sample's token count comes from the real tokenizer (`o200k_base`), pre-measured into
+- [x] The sample's token count comes from the real tokenizer (`o200k_base`), pre-measured into
       the corpus like its siblings — **not** from `approx_tokens`. An assertion in whitespace
       words passes identically at 1.2 or 2.0 tokens/word and would prove nothing
-- [ ] The existing corpus samples still pass
+- [x] The existing corpus samples still pass
 
 ## Technical Notes
 

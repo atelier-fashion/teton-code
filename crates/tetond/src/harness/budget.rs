@@ -2979,6 +2979,183 @@ mod tests {
         );
     }
 
+    /// **REQ-590 ADR-6 (BR-10): the local word budget's slack is exactly zero,
+    /// and that is a decision — asserted here so it stops being invisible.**
+    ///
+    /// `10_240 × 3/2 = 15_360 = 16_384 − 1_024`. The word budget claims
+    /// *precisely* the tokens the engine has left after the generation it has
+    /// already promised itself, not one token fewer. Before REQ-590 the same
+    /// relation carried 2.5× headroom — 4,096 × 3/2 = 6,144 against 15,360
+    /// usable — and nothing at either definition site said so, in either era.
+    ///
+    /// # Why an equality, and why here
+    ///
+    /// LESSON-496: *an ordering policy is only as meaningful as the gap between
+    /// the limit and the count; it silently becomes "never" the moment
+    /// `limit == count`, and nothing in the code says so — the two numbers live
+    /// in different places, were chosen for different reasons, and their
+    /// coincidence is invisible at both definition sites.* Its prescribed habit
+    /// is to **assert the headroom**. D-3 spent the headroom deliberately
+    /// ([`LOCAL_ENGINE_N_CTX`] in full, no extra margin), so the habit is
+    /// inverted rather than dropped: pin that the gap **is** zero. A future
+    /// change that restores or worsens a margin nobody knew was at zero then
+    /// reddens a test that explains itself.
+    ///
+    /// This is the word twin of
+    /// [`the_local_byte_budget_fits_the_engines_own_window`] (AC-4), which
+    /// asserts the byte half's `≤`. Both are `=` in fact — ADR-6a — but only
+    /// this one says so, because only this one is the half with no second guard
+    /// behind it.
+    ///
+    /// # What would make it non-zero — and what would not
+    ///
+    /// The honest answer is narrower than a reader expects, so the test
+    /// measures the two wrong guesses instead of merely naming them:
+    ///
+    /// * **Not the window, and not the reservation.** Both feed `usable`, and
+    ///   the word budget is derived *from* `usable`, so raising
+    ///   [`LOCAL_GENERATION_RESERVATION`] shrinks the claim in lockstep and buys
+    ///   no margin at all. Swept below over six windows and four reservations.
+    /// * **Not the ratio either** — the guess this test exists to kill.
+    ///   [`window_pair`] computes `words = usable × den/num` and the claim is
+    ///   `words × num/den`, so the ratio cancels: the round trip returns
+    ///   `usable` at *every* `num/den`, give or take integer truncation. Swept
+    ///   below over five ratios. What the ratio actually controls is **which
+    ///   content classes fit**, not how much slack there is — see the next
+    ///   section.
+    /// * **An explicit margin subtracted before the ratio is applied.** This is
+    ///   the only lever that produces real slack, it is the change D-3
+    ///   declined, and it is shown below as the concrete counterfactual: a
+    ///   1,024-token margin leaves 1,025 tokens unclaimed.
+    ///
+    /// The residual 1 that the sweeps allow is integer truncation, not
+    /// headroom: it appears exactly when `usable` is not a multiple of `num`.
+    /// 15,360 = 3 × 5,120, so today it is 0 and the equality above is exact.
+    ///
+    /// **The equality is deliberately the brittle one and the sweeps are the
+    /// durable one**, and that division of labour is the point. Move the
+    /// reservation to 2,048 and the equality reddens by exactly 1 (14,335
+    /// against 14,336) while the sweeps stay green — mutation-run, 2026-08-25.
+    /// That is the intended experience: a human reads the failure, sees the
+    /// message say "1 is truncation, not headroom", and re-pins it. What must
+    /// never happen silently is the other direction — slack reappearing, or
+    /// growing, with nobody looking.
+    ///
+    /// # What the zero actually costs
+    ///
+    /// Because the claim is always exactly `usable`, whether a full-budget turn
+    /// fits is decided entirely by the **content**: it fits iff its real
+    /// tokens-per-word is at most `num/den` = 1.5. `rust.rs` measures 1.69 and
+    /// already fails that test — what saves Rust turns is the byte guard
+    /// binding first, at 6.8 B/word. The class the byte guard does not save is
+    /// AC-9's `numeric_grid.txt` (2.00 tokens/word at 2.00 B/word), measured in
+    /// `tests/token_corpus.rs` at 20,480 real tokens against these 15,360.
+    ///
+    /// So "raise the ratio" — not lower it — is the change that would buy
+    /// coverage, and it costs words on every route: at 2/1 the local budget
+    /// would be 7,680 words rather than 10,240. That trade is REQ-590's to
+    /// leave open, not this test's to make.
+    #[test]
+    fn the_local_word_budgets_slack_is_exactly_zero_by_design() {
+        /// The derivation's word round trip, parameterised by the ratio so the
+        /// "a different ratio would leave slack" guess can be measured rather
+        /// than argued: `window_pair`'s `usable × den/num`, claimed back at
+        /// `× num/den`.
+        fn claim_at(usable: usize, num: usize, den: usize) -> usize {
+            (usable * den / num) * num / den
+        }
+
+        let usable = (LOCAL_ENGINE_N_CTX - LOCAL_GENERATION_RESERVATION) as usize;
+        let local = derive(BudgetInputs::local());
+        let claimed = local.budget_tokens * REMOTE_TOKENS_PER_WORD_NUM / REMOTE_TOKENS_PER_WORD_DEN;
+
+        assert_eq!(
+            claimed, usable,
+            "the local word budget ({} words) claims {claimed} provider tokens against {usable} \
+             the engine has left after the {LOCAL_GENERATION_RESERVATION}-token generation. \
+             REQ-590 D-3 chose a gap of exactly 0 (ADR-6): if you meant to restore a margin, say \
+             so here and record what it costs. If this moved by 1, it is integer truncation — \
+             usable ({usable}) is no longer a multiple of {REMOTE_TOKENS_PER_WORD_NUM} — which is \
+             a rounding artifact rather than headroom",
+            local.budget_tokens
+        );
+        // The same round trip, straight out of the production constants, so the
+        // equality above cannot be read as a property of 15,360 alone.
+        assert_eq!(
+            claim_at(
+                usable,
+                REMOTE_TOKENS_PER_WORD_NUM,
+                REMOTE_TOKENS_PER_WORD_DEN
+            ),
+            usable
+        );
+
+        // Guess 1: the reservation is a margin dial. It is not — measured over
+        // the real derivation. `Floor::HeldToTheEngine` because the floor is
+        // the one thing that *does* break the relation, by design and upward
+        // (BR-8), so the sweep runs the arm the local tier actually takes.
+        for window in [
+            4_096u32,
+            8_192,
+            LOCAL_ENGINE_N_CTX,
+            32_768,
+            131_072,
+            200_000,
+        ] {
+            for reservation in [0u32, 512, LOCAL_GENERATION_RESERVATION, 4_096] {
+                let pair = window_pair(window, reservation, Floor::HeldToTheEngine);
+                let window_usable = window.saturating_sub(reservation) as usize;
+                let window_claimed =
+                    pair.tokens * REMOTE_TOKENS_PER_WORD_NUM / REMOTE_TOKENS_PER_WORD_DEN;
+                assert!(
+                    window_claimed <= window_usable,
+                    "window {window}, reservation {reservation}: the word budget ({} words) \
+                     claims {window_claimed} tokens against {window_usable} usable",
+                    pair.tokens
+                );
+                assert!(
+                    window_usable - window_claimed <= 1,
+                    "window {window}, reservation {reservation}: {} words leave {} tokens \
+                     unclaimed — more than integer truncation can explain, so the derivation has \
+                     acquired a margin the equality above does not know about",
+                    pair.tokens,
+                    window_usable - window_claimed
+                );
+            }
+        }
+
+        // Guess 2: a different words→tokens ratio would leave slack. It would
+        // not — the ratio cancels out of the round trip at every window.
+        for (num, den) in [(3usize, 2usize), (2, 1), (5, 4), (1, 1), (7, 4)] {
+            for candidate in [usable, usable + 1, usable + 2, 3_072, 199_000] {
+                let gap = candidate - claim_at(candidate, num, den);
+                assert!(
+                    gap <= 2,
+                    "{num}/{den} at usable {candidate} leaves {gap} tokens unclaimed — the ratio \
+                     is supposed to cancel, so this is either a real margin or an integer bound \
+                     this test has outgrown"
+                );
+            }
+        }
+
+        // The one lever that does produce slack, and the one D-3 declined:
+        // subtract a margin before the ratio is applied. Non-vacuity for the
+        // equality above too — it shows the two numbers are able to disagree.
+        const DECLINED_MARGIN: usize = 1_024;
+        let with_margin = claim_at(
+            usable - DECLINED_MARGIN,
+            REMOTE_TOKENS_PER_WORD_NUM,
+            REMOTE_TOKENS_PER_WORD_DEN,
+        );
+        assert!(
+            usable - with_margin >= DECLINED_MARGIN,
+            "a {DECLINED_MARGIN}-token margin would leave {} of {usable} unclaimed — if that is \
+             no longer true the derivation has changed shape and this counterfactual needs \
+             restating",
+            usable - with_margin
+        );
+    }
+
     /// **AC-1: one formula, driven from both sides.** The local tier's pair is
     /// exactly what a *provider* declaring the same window under the same
     /// reservation derives — the whole difference between the two arms is the

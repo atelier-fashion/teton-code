@@ -42,6 +42,30 @@ minified.json  a minified `cargo metadata --no-deps` subset of this workspace
 paths.txt      real `find crates -name '*.rs'` output (sorted), prefixed with
                the same CI checkout root, one absolute path per line.
 base64.txt     4 KiB of base64 over /dev/urandom bytes, wrapped at 76 columns.
+numeric_grid.txt
+               REQ-590 AC-9: the token-dense **byte-light** quadrant — a
+               small-integer matrix as `numpy.savetxt(fmt="%d")` writes one
+               (a quantized intensity raster), 160 rows x 64 columns of
+               space-separated single digits. Exactly 10,240 words / 20,480
+               bytes, i.e. one turn at the full local word budget that the
+               byte budget (30,720) admits with room to spare. Reproducible
+               by construction, in integer arithmetic so no libm rounding can
+               move a cell:
+
+                   ROWS, COLS = 160, 64
+                   "".join(
+                       " ".join(
+                           str((((x - 32) ** 2 + (y - 80) ** 2) // 53) % 10)
+                           for x in range(COLS)
+                       ) + "\\n"
+                       for y in range(ROWS)
+                   )
+
+               The measured density is a property of the *format*, not of
+               this particular field: a random 0-9 grid, a sparse 0/1 mask and
+               a run-heavy grid of the same shape all tokenize to exactly
+               2.000 tokens per whitespace word, because `o200k_base` gives
+               every digit and every separating space its own token.
 
 Usage
 -----
