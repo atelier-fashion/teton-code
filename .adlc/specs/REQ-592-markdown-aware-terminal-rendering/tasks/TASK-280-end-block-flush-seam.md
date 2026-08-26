@@ -1,7 +1,7 @@
 ---
 id: TASK-280
 title: "The flush seam: end_block(), owned entirely by the event pump"
-status: draft
+status: complete
 parent: REQ-592
 created: 2026-08-26
 updated: 2026-08-26
@@ -23,23 +23,23 @@ that no line falls off the end of a turn. Covers BR-8.
 
 ## Acceptance Criteria
 
-- [ ] AC-10: **no line falls off the end of a turn.** A turn whose final chunk carries no trailing
+- [x] AC-10: **no line falls off the end of a turn.** A turn whose final chunk carries no trailing
       newline still has its last line emitted before the session returns to the entry prompt.
       Both legs: on `RecordingSurface` the tail is emitted rather than held; at the pty the row is
       visible above the entry frame **and appears before any `hand_off_after_turn` line**.
-- [ ] Mutation-checked: remove the `end_block()` call in `Connection::call` and AC-10's test fails.
-- [ ] The **failed-turn path** is covered: a turn ending in `Err(err)` (not `METHOD_NOT_FOUND`)
+- [x] Mutation-checked: remove the `end_block()` call in `Connection::call` and AC-10's test fails.
+- [x] The **failed-turn path** is covered: a turn ending in `Err(err)` (not `METHOD_NOT_FOUND`)
       still flushes. This is the path `hand_off_after_turn` never reaches.
-- [ ] The **idle path** is covered: fragments arriving via `drain_events` with no turn in flight
+- [x] The **idle path** is covered: fragments arriving via `drain_events` with no turn in flight
       (a second client driving the same session) are emitted, not held.
-- [ ] A permission question raised mid-turn paints **below** already-streamed assistant text, not
+- [x] A permission question raised mid-turn paints **below** already-streamed assistant text, not
       above it (ADR-4).
-- [ ] **`end_block()` clears the fence bit as well as the buffers.** TASK-279 flagged this: an
+- [x] **`end_block()` clears the fence bit as well as the buffers.** TASK-279 flagged this: an
       unclosed ```` ``` ```` fence leaves `fence == true`, and without clearing it every subsequent
       line of every subsequent turn renders verbatim — no wrap, no styling. Deciding a block has
       ended is exactly this verb's job, which is why TASK-279 correctly refused to self-clear it.
       Assert it: an unterminated fence in one turn must not swallow the next turn's rendering.
-- [ ] `end_block()` is defaulted: `RecordingSurface`, the `Bare` impl (render.rs:597), and
+- [x] `end_block()` is defaulted: `RecordingSurface`, the `Bare` impl (render.rs:597), and
       `provider_test_ui`'s harness are **unmodified**, and no file consuming `&mut dyn Surface`
       changes.
 

@@ -84,7 +84,10 @@ that owns both the surface and every path an event takes:
 
 1. at the end of `Connection::call`, on every return including the error paths;
 2. at the end of `Connection::drain_events` (the idle path);
-3. immediately before `resolve_permission` hands control to the `Prompter` (see ADR-4).
+~~3. immediately before `resolve_permission` hands control to the `Prompter` (see ADR-4).~~
+   **Withdrawn during implementation (2026-08-26) — there are two call sites, not three.** See the
+   amendment in ADR-4. A reader who re-adds a third site from this ADR is re-adding a known bug;
+   the ownership sweep in `client.rs` fails with the reasoning attached.
 
 **Ownership is a pointer, not a description** ([[LESSON-547]]): **TASK-280 owns every
 `end_block()` call site.** `main.rs` must not add one, `hand_off_after_turn` must not call it,
@@ -103,10 +106,33 @@ A permission question raised mid-turn from the pump (client.rs:425–500) would 
 pipe because `cli_e2e` never sees a prompt. This hazard is new with this REQ and is not in the
 spec's BR-8, which names only `line()` and `repaint_row_above()`.
 
-Fixed at its origin: the pump calls `end_block()` before `resolve_permission` (ADR-3, site 3).
-The `Prompter` itself is unchanged — pushing the obligation into `prompt.rs` would need it to
-reach the surface's private state, and would add a second owner to the rule ADR-3 just gave to
-one.
+**Amended during implementation (2026-08-26). The prescribed fix was wrong and is withdrawn.**
+
+This ADR originally said: "the pump calls `end_block()` before `resolve_permission`". Implementing
+it surfaced two facts that between them kill the idea:
+
+**It buys nothing.** `resolve_permission` calls `surface.line(...)` before it ever reaches
+`prompter.ask`, on every path including both auto-decision paths and the over-budget offer — and
+`line()` already emits the pending buffer. The ordering property this ADR is about was *already*
+guaranteed. Removing the added call changes no bytes on any reachable path.
+
+**And it costs something real.** `end_block()` clears the fence bit, because its whole meaning is
+"a block ended". Calling it at a mid-turn *pause* means a model that opens a ```` ``` ```` fence,
+hits a tool call, and resumes inside that fence has its remaining lines reclassified as markdown.
+The damage is **word-wrapping** — a long code line re-flowed across rows mid-token. (An earlier
+draft of this amendment said the damage was inline emphasis being applied to `*` in code. That was
+wrong: unpaired asterisks survive classification. The mechanism is re-flow, and it was found by a
+test that passed under mutation until its fixture was rebuilt around a line three times the width.)
+
+So the hazard is real, and the mechanism that already handles it is `resolve_permission`'s own
+`line()`. What guards it is a **property test** — a shared byte sink where the `Prompter` and the
+`Surface` both write, asserting screen order — which is deliberately independent of *which* call
+provides the flush. That is what makes it survive this correction: a future refactor that drops
+the `line()`, or a new prompt path that asks before rendering, fails there rather than silently
+reordering the screen.
+
+`end_block()` is a turn boundary and only a turn boundary. Mid-turn writers get what they need
+from `line()` and `repaint_row_above()`, which emit the buffer before claiming their row.
 
 ### ADR-5 — `unicode-width` is taken; this reverses my own earlier lean, and here is why
 

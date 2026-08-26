@@ -280,6 +280,29 @@ impl Connection {
         params: P,
         ctx: &mut UiContext,
     ) -> anyhow::Result<Result<P::Result, RpcError>> {
+        // REQ-592 BR-8 / ADR-3, call site 1 of 2. The pump is what owns the
+        // surface, so the pump is what tells it the block is over — and it does
+        // so here rather than in `main.rs` because `main.rs` cannot reach every
+        // way this function ends. Three of the turn match's arms and the
+        // transport `?` all bypass `hand_off_after_turn`; a flush hung there
+        // would drop the tail of every failed turn.
+        //
+        // The body is a separate function purely so this holds on **every**
+        // return: the `?` on the send, on each `recv`, on a result that fails to
+        // deserialize, and on a dispatch that could not answer a permission are
+        // early returns, and a call written at the bottom of the loop would miss
+        // all of them.
+        let outcome = self.pump_until_answered(params, ctx);
+        ctx.surface.end_block();
+        outcome
+    }
+
+    /// [`Self::call`]'s body: everything up to the answer, with no flushing.
+    fn pump_until_answered<P: RpcMethod>(
+        &mut self,
+        params: P,
+        ctx: &mut UiContext,
+    ) -> anyhow::Result<Result<P::Result, RpcError>> {
         let id = self.send(params)?;
         loop {
             match self.recv()? {
@@ -355,6 +378,27 @@ impl Connection {
     pub fn drain_events(
         &mut self,
         ctx: &mut UiContext,
+        on_first: impl FnMut(),
+    ) -> anyhow::Result<Drained> {
+        // REQ-592 BR-8 / ADR-3, call site 2 of 2: the idle path. Fragments do
+        // reach the surface with no turn in flight — a second client driving the
+        // same session broadcasts its stream to this one — and `call`'s flush is
+        // no help there, because `call` is not running. Wrapped for the same
+        // reason `call` is: the `?` on a permission answer is an early return.
+        //
+        // Inert on the common case. An idle poll that drained nothing leaves the
+        // buffers empty, so this costs a poll interval nothing and cannot
+        // interrupt a turn — the entry loop polls here only while it is *not*
+        // inside `call`.
+        let outcome = self.pump_queued(ctx, on_first);
+        ctx.surface.end_block();
+        outcome
+    }
+
+    /// [`Self::drain_events`]'s body: everything queued, with no flushing.
+    fn pump_queued(
+        &mut self,
+        ctx: &mut UiContext,
         mut on_first: impl FnMut(),
     ) -> anyhow::Result<Drained> {
         let mut drained = Drained::default();
@@ -425,6 +469,35 @@ impl Connection {
         match session_ui::render_event(env, &mut *ctx.surface, &mut *ctx.state) {
             EventOutcome::Rendered => {}
             EventOutcome::Permission(req) if ctx.answer_permissions => {
+                // REQ-592 ADR-4 is satisfied here **without** an `end_block()`,
+                // and deliberately so. The property — a permission question
+                // never paints above assistant text the reader has not been
+                // shown — is real: `prompt.rs` writes questions straight to
+                // stdout and cannot know a buffer is pending. But
+                // `resolve_permission` renders the request through
+                // `surface.line(...)` before it ever reaches `prompter.ask`, on
+                // every path through it including the two auto-decision arms and
+                // the over-budget offer, and `line()` already emits the pending
+                // buffer ahead of its own row (BR-8).
+                //
+                // An `end_block()` here would therefore change no bytes on any
+                // reachable path while doing real damage: it clears the fence
+                // bit, and a permission prompt is a *pause* in a turn, not the
+                // end of one. A model that opens a ```rust fence, hits a tool
+                // call, and resumes after the answer would have the rest of its
+                // code classified as markdown and **word-wrapped at the terminal
+                // width** — one statement broken across rows mid-token, and a
+                // wrapped shell command is a different command. That is BR-6's
+                // failure exactly, caused by the thing meant to prevent a
+                // different one. Fence state ends at a turn boundary; the two
+                // call sites above are the turn boundaries.
+                //
+                // Both properties are pinned by tests rather than by a call
+                // here: the ordering by
+                // `a_permission_question_paints_below_the_text_that_preceded_it`
+                // below, and the surviving fence by
+                // `render::a_mid_turn_interruption_emits_the_tail_but_does_not_
+                // end_the_fence`.
                 let reply = session_ui::resolve_permission(
                     &req,
                     &mut *ctx.surface,
@@ -1563,6 +1636,343 @@ mod tests {
             surface.calls.is_empty(),
             "nothing rendered: {:?}",
             surface.calls
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-592 BR-8 / ADR-3: no line falls off the end of a turn (TASK-280)
+    // -----------------------------------------------------------------------
+
+    /// A streamed chunk of assistant text, as the daemon broadcasts it.
+    fn agent_chunk(text: &str) -> Incoming {
+        use teton_protocol::events::{Event, EventEnvelope, SessionUpdate, SessionUpdatePayload};
+        Incoming::Event(Box::new(EventEnvelope {
+            session_id: None,
+            seq: 1,
+            event: Event::SessionUpdate(SessionUpdate {
+                update: SessionUpdatePayload::AgentMessageChunk {
+                    text: text.to_owned(),
+                },
+            }),
+        }))
+    }
+
+    /// The turn request these tests put in flight. The method is the real one —
+    /// `session/prompt` is what a typed line sends — so what the pump does here
+    /// is what it does to a turn.
+    fn turn_params() -> methods::PromptTurnParams {
+        methods::PromptTurnParams {
+            session_id: teton_protocol::SessionId::from("s1"),
+            prompt: Vec::new(),
+            skill: None,
+        }
+    }
+
+    /// The daemon's answer to the first request a fixture sends.
+    fn turn_answered(id: i64) -> Incoming {
+        Incoming::Response(Response::success(
+            Id::Number(id),
+            serde_json::json!({ "turn_id": "t1", "stop_reason": "end_turn" }),
+        ))
+    }
+
+    /// Run `body` with a context over a markdown-rendering surface and return
+    /// the bytes that reached it.
+    ///
+    /// A rendering surface rather than a `RecordingSurface`, because a surface
+    /// that buffers nothing cannot show the difference between "emitted" and
+    /// "held" — which is the entire subject of these tests.
+    fn bytes_from_a_rendering_pump(body: impl FnOnce(&mut UiContext)) -> String {
+        let mut buf = Vec::new();
+        {
+            let mut surface = crate::render::PlainSurface::with_markdown(&mut buf, false, 60);
+            let mut state = SessionState::new();
+            let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+            let mut ctx = UiContext {
+                surface: &mut surface,
+                state: &mut state,
+                prompter: &mut prompter,
+                answer_permissions: true,
+                answer_model_proposals: true,
+                auto_accept_model: false,
+                typed_input: true,
+                session_id: None,
+                skills: crate::slash::SkillSnapshot::empty(),
+            };
+            body(&mut ctx);
+        }
+        String::from_utf8(buf).expect("the surface writes utf-8")
+    }
+
+    /// **AC-10.** A turn whose final chunk carries no trailing newline still has
+    /// its last line on screen by the time `call` returns — which is before
+    /// anything in `main.rs` runs, and therefore before the entry frame is
+    /// redrawn.
+    ///
+    /// The mutation this is aimed at: delete the `end_block()` in
+    /// [`Connection::call`] and the tail is held forever, so the user's answer
+    /// ends one sentence short and the session goes back to the prompt as if it
+    /// had said everything.
+    #[test]
+    fn a_turn_ending_without_a_newline_still_reaches_the_screen() {
+        let (mut conn, tx, _peer) = test_connection();
+        tx.send(agent_chunk("the finding is that the guard holds"))
+            .expect("queue");
+        tx.send(turn_answered(1)).expect("queue");
+
+        let out = bytes_from_a_rendering_pump(|ctx| {
+            let answered = conn.call(turn_params(), ctx).expect("the response arrives");
+            assert!(answered.is_ok(), "the daemon answered this turn");
+        });
+
+        assert_eq!(out, "the finding is that the guard holds\n");
+    }
+
+    /// **AC-10's failed-turn leg — the path `hand_off_after_turn` never
+    /// reaches.**
+    ///
+    /// At main.rs:1356 only the `Ok` arm of the turn match calls the hand-off,
+    /// so a flush hung there would drop the tail of every turn the daemon
+    /// refused. The pump flushes on the way out regardless of which answer came
+    /// back, which is precisely why ADR-3 put the call here.
+    #[test]
+    fn a_turn_the_daemon_failed_still_flushes_what_it_had_already_streamed() {
+        let (mut conn, tx, _peer) = test_connection();
+        tx.send(agent_chunk("I will check the tier first"))
+            .expect("queue");
+        tx.send(Incoming::Response(Response::failure(
+            Id::Number(1),
+            RpcError::new(error_code::INTERNAL_ERROR, "the tier fell over mid-turn"),
+        )))
+        .expect("queue");
+
+        let out = bytes_from_a_rendering_pump(|ctx| {
+            let answered = conn.call(turn_params(), ctx).expect("a frame did arrive");
+            assert!(
+                answered.is_err(),
+                "this fixture's turn must fail: it is the point of the test"
+            );
+        });
+
+        assert_eq!(out, "I will check the tier first\n");
+    }
+
+    /// **AC-10's transport leg.** The `?` on `recv` is an early return that no
+    /// call written at the bottom of the loop would cover: the daemon dropped
+    /// the connection with a partial line in the buffer, and the user still has
+    /// to see what they were told before the drop.
+    #[test]
+    fn a_turn_whose_connection_dropped_still_flushes_what_it_had_streamed() {
+        let (mut conn, tx, _peer) = test_connection();
+        tx.send(agent_chunk("halfway through the answer"))
+            .expect("queue");
+        // No response, and the only sender goes away — so `recv` fails and
+        // `call` returns through its transport `?`.
+        drop(tx);
+
+        let out = bytes_from_a_rendering_pump(|ctx| {
+            let dropped = conn.call(turn_params(), ctx);
+            assert!(dropped.is_err(), "the fixture hangs up on this turn");
+        });
+
+        assert_eq!(out, "halfway through the answer\n");
+    }
+
+    /// **AC-10's idle leg.** Fragments do arrive with no turn in flight — a
+    /// second client driving the same session broadcasts its stream to this one
+    /// — and `call`'s flush is no help there, because `call` is not running.
+    #[test]
+    fn a_fragment_drained_while_idle_is_emitted_not_held() {
+        let (mut conn, tx, _peer) = test_connection();
+        tx.send(agent_chunk("a line from the other client"))
+            .expect("queue");
+
+        let out = bytes_from_a_rendering_pump(|ctx| {
+            let drained = conn.drain_events(ctx, || {}).expect("drain");
+            assert_eq!(drained.rendered, 1, "the chunk was dispatched");
+        });
+
+        assert_eq!(out, "a line from the other client\n");
+    }
+
+    /// **ADR-4.** A permission question raised mid-turn must paint *below* the
+    /// assistant text that preceded it, never above it.
+    ///
+    /// `prompt.rs` writes questions and the entry frame straight to stdout — it
+    /// never goes through a `Surface`, which is why it cannot know a buffer is
+    /// pending. The fixture reproduces exactly that: the prompter and the
+    /// surface share one sink, so "what reached the screen, in order" is a
+    /// single byte sequence and the ordering is a property of it rather than of
+    /// two separate recordings a test lined up by hand.
+    ///
+    /// **The guarantee comes from `resolve_permission` itself, not from an
+    /// `end_block()` in the pump.** It renders the request through
+    /// `surface.line(...)` before it ever reaches `prompter.ask` — on every path
+    /// through it, including the two auto-decision arms and the over-budget
+    /// offer — and `line()` emits the pending buffer ahead of its own row
+    /// (BR-8). ADR-3 originally put a third `end_block()` call site here for
+    /// this property; it was dropped because it changed no bytes and clearing
+    /// the fence bit at a mid-turn pause mangles a fenced block the model
+    /// resumes after the answer (BR-6).
+    ///
+    /// So this test asserts the **property**, deliberately independent of which
+    /// mechanism provides it, and it outlives the call site it was written
+    /// beside. A refactor that drops that `line()`, or a new prompt path that
+    /// asks before it renders, fails here — instead of silently reordering the
+    /// screen at the one moment the order is the point: the question names the
+    /// thing the user is being asked to allow, and the sentence explaining it
+    /// would be printed after the answer was given.
+    #[test]
+    fn a_permission_question_paints_below_the_text_that_preceded_it() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        /// One sink with two writers, standing in for the terminal.
+        #[derive(Clone, Default)]
+        struct SharedSink(Rc<RefCell<Vec<u8>>>);
+
+        impl io::Write for SharedSink {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// A prompter that bypasses the `Surface` exactly as the real one does.
+        struct SinkPrompter {
+            sink: SharedSink,
+        }
+
+        impl Prompter for SinkPrompter {
+            fn ask(&mut self, question: &str) -> Option<String> {
+                use io::Write;
+                let _ = writeln!(self.sink, "{question}");
+                Some("n".to_owned())
+            }
+            fn ask_secret(&mut self, question: &str) -> Option<String> {
+                self.ask(question)
+            }
+        }
+
+        let (mut conn, tx, _peer) = test_connection();
+        tx.send(agent_chunk("let me run the test suite"))
+            .expect("queue");
+        tx.send(Incoming::Event(Box::new(
+            teton_protocol::events::EventEnvelope {
+                session_id: None,
+                seq: 2,
+                event: teton_protocol::events::Event::PermissionRequest(
+                    teton_protocol::events::PermissionRequest {
+                        request_id: teton_protocol::RequestId::from("r1"),
+                        tool_name: "shell".to_owned(),
+                        description: Some("run `cargo test`".to_owned()),
+                        subject: None,
+                        options: vec![teton_protocol::events::PermissionOption {
+                            option_id: "reject_once".to_owned(),
+                            label: "Reject once".to_owned(),
+                            kind: teton_protocol::events::PermissionOptionKind::RejectOnce,
+                        }],
+                    },
+                ),
+            },
+        )))
+        .expect("queue");
+
+        let sink = SharedSink::default();
+        {
+            let mut surface = crate::render::PlainSurface::with_markdown(sink.clone(), false, 60);
+            let mut state = SessionState::new();
+            let mut prompter = SinkPrompter { sink: sink.clone() };
+            let mut ctx = UiContext {
+                surface: &mut surface,
+                state: &mut state,
+                prompter: &mut prompter,
+                answer_permissions: true,
+                answer_model_proposals: true,
+                auto_accept_model: false,
+                typed_input: true,
+                session_id: None,
+                skills: crate::slash::SkillSnapshot::empty(),
+            };
+            conn.drain_events(&mut ctx, || {}).expect("drain");
+        }
+
+        let screen = String::from_utf8(sink.0.borrow().clone()).expect("utf-8");
+        let text = screen.find("let me run the test suite").unwrap_or_else(|| {
+            panic!("the streamed sentence never reached the screen: {screen:?}")
+        });
+        let question = screen
+            .find("allow shell?")
+            .unwrap_or_else(|| panic!("the question never reached the screen: {screen:?}"));
+        assert!(
+            text < question,
+            "the question painted above text the reader had not been shown, so the \
+             screen reads in the wrong order (ADR-4): {screen:?}"
+        );
+    }
+
+    /// **ADR-3's ownership rule, as a check rather than as a sentence**
+    /// ([[LESSON-547]]).
+    ///
+    /// A rule that crosses a seam is owned by exactly one side, and "the turn
+    /// loop flushes" plus "the surface flushes" are indistinguishable at review
+    /// time from two documents that agree. Scans the whole client, because the
+    /// failure this guards against is a *new* call site somewhere else — in
+    /// `main.rs` beside `hand_off_after_turn`, or as a self-flush inside
+    /// `render.rs` — which is the direction a rule like this actually rots in.
+    #[test]
+    fn only_the_event_pump_declares_a_block_over() {
+        let sources = crate::status::scan::production_sources();
+        assert!(
+            !sources.is_empty(),
+            "the client source scan matched nothing — it is no longer looking at \
+             anything"
+        );
+
+        let mut callers: Vec<&str> = Vec::new();
+        for (rel, src) in &sources {
+            // `.end_block()` is a *call*; `fn end_block` is the declaration and
+            // the implementation, both of which live in `render.rs` by design.
+            if crate::status::scan::code_only(src).contains(".end_block()") && rel != "client.rs" {
+                callers.push(rel);
+            }
+        }
+        assert!(
+            callers.is_empty(),
+            "deciding that a block has ended belongs to `client.rs`'s event pump \
+             (ADR-3); these files also call it and would be a second owner of the \
+             rule: {callers:?}"
+        );
+
+        // Non-vacuity, both halves: the pump really does call it, and `render.rs`
+        // really does define it.
+        let client = sources
+            .iter()
+            .find(|(rel, _)| rel == "client.rs")
+            .map(|(_, src)| crate::status::scan::code_only(src))
+            .expect("client.rs is a production source");
+        assert_eq!(
+            client.matches(".end_block()").count(),
+            2,
+            "the verb has exactly two call sites, and both are turn boundaries: \
+             the end of `call` and the end of `drain_events`. ADR-3 named a third \
+             — before `resolve_permission` — and it was dropped: it changed no \
+             bytes (`resolve_permission` renders through `line()`, which already \
+             emits the pending buffer) while clearing the fence bit at a *pause* \
+             in a turn rather than at the end of one, which mangles a fenced code \
+             block the model resumes after the prompt (BR-6)"
+        );
+        let render = sources
+            .iter()
+            .find(|(rel, _)| rel == "render.rs")
+            .map(|(_, src)| crate::status::scan::code_only(src))
+            .expect("render.rs is a production source");
+        assert!(
+            render.contains("fn end_block"),
+            "this assertion is only meaningful while render.rs owns the verb"
         );
     }
 

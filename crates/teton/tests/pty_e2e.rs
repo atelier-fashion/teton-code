@@ -887,6 +887,18 @@ fn a_reply_reciting_the_cli_earns_the_hand_off_line_at_a_terminal() {
     // recipe, with no mention of the in-session command.
     let reply = "register it from a shell: teton provider add kimi --kind \
                  openai-compatible.";
+    // REQ-592 AC-10's terminal leg rides this fixture, so the shape it needs is
+    // pinned here rather than left to luck: **the reply's last line carries no
+    // trailing newline**, which is the common case for a model reply and the one
+    // a streaming renderer holds. Assertions (1) and (5) below are then the two
+    // halves of AC-10 at a real terminal — the tail is on screen at all, and it
+    // is on screen *before* the `hand_off_after_turn` line and the entry frame
+    // that follows it. If this fixture ever grows a trailing newline, that
+    // coverage evaporates silently, which is what this line exists to prevent.
+    assert!(
+        !reply.ends_with('\n'),
+        "REQ-592 AC-10 needs a reply whose final chunk has no trailing newline"
+    );
     let daemon = TestDaemon::spawn_with(&daemon_path, &config, &[reply]);
 
     // Wide enough that the terminal cannot hard-wrap the sentence under test —
@@ -966,6 +978,14 @@ fn a_reply_reciting_the_cli_earns_the_hand_off_line_at_a_terminal() {
 
     // (5) After the reply, not before it: it is a hand-off from an answer the
     // user has already read.
+    //
+    // **REQ-592 AC-10 at a real terminal.** The fixture's reply ends without a
+    // newline (pinned above), so its last row is exactly the tail a streaming
+    // renderer holds — and this is the assertion that it is not still being
+    // held: `end_block()` runs at the end of `Connection::call`, which is before
+    // `main.rs` reaches `hand_off_after_turn` and before the entry frame is
+    // redrawn. A tail released too late would land on the wrong side of this
+    // comparison; a tail never released would fail step (1) above.
     let reply_at = seen
         .find("teton provider add kimi")
         .expect("asserted present");

@@ -319,12 +319,21 @@ an AC that covers no rule, or a rule no AC names, is a finding against this list
 - [ ] **AC-10** *(BR-8, tail flush)*: **No line may fall off the end of a turn.** A turn whose
       final chunk carries no trailing newline still has its last line on screen before the session
       returns to the entry prompt. Asserted on both legs, because neither alone is sufficient:
-      on a `RecordingSurface`, the tail is *emitted* rather than held; at the **pty**, the row is
+      on a buffering surface, the tail is *emitted* rather than held; at the **pty**, the row is
       actually visible above the entry frame, and it appears **before** any
       `hand_off_after_turn` line. Mutation-checked by removing the end-of-turn flush and watching
       the final line disappear — a buffer that silently eats the last sentence of every reply
       whose model happened not to send a trailing `\n` is the worst failure this REQ can ship, and
       the pipe path (AC-7) is structurally blind to it.
+
+      *Corrected during implementation (2026-08-26).* This criterion originally named
+      `RecordingSurface` for the "emitted rather than held" leg. **That surface has no buffer, so
+      it cannot distinguish emitted from held** — the leg was unreachable as worded, and the same
+      mistake sits in AC-9. Both are the same authoring error: I reached for the semantic test
+      surface for assertions that are specifically *about* the byte buffer, which only
+      `PlainSurface` has. The implemented legs use `PlainSurface::with_markdown`. Worth a lesson at
+      wrapup: a test surface chosen for what it makes easy to assert is the wrong surface when the
+      property under test is the thing that surface abstracts away.
 - [ ] **AC-11** *(BR-9)*: The REQ-579 setup hand-off, the REQ-581 connection hand-off, and the
       REQ-582 command hand-off each still fire on a turn whose reply contains the trigger text
       wrapped and styled — proving the accumulator saw the raw text and BR-9's ordering held.

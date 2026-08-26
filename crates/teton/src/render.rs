@@ -138,6 +138,46 @@ pub trait Surface {
     /// than something each implementor must remember to add.
     fn repaint_row_above(&mut self, _rows_up: usize, _kind: LineKind, _text: &str) {}
 
+    /// Declare that the block of streamed output just ended: emit anything the
+    /// surface is still holding, and drop whatever block state it accumulated
+    /// while holding it (REQ-592 BR-8, ADR-3).
+    ///
+    /// **Deciding that a block has ended is the caller's knowledge, not the
+    /// surface's** — the same division `repaint_row_above` makes about frame
+    /// geometry. A streaming renderer cannot tell a pause in the token stream
+    /// from the end of a reply, so it must never guess: the tail of a turn is
+    /// emitted because the event pump *knows* the turn is over, never because a
+    /// timer or a heuristic inside the surface decided the model had stopped
+    /// talking.
+    ///
+    /// **Every call site of this verb lives in `client.rs`'s event pump**
+    /// (ADR-3, [[LESSON-547]]). Not `main.rs`, not `hand_off_after_turn`, not a
+    /// self-flush in this module. The obvious site is `hand_off_after_turn`, and
+    /// it is wrong: only the `Ok` arm of the turn match reaches it, so a flush
+    /// hung there would drop buffered text on every failed turn and miss the
+    /// transport `?` entirely. The pump is the one place that owns the surface
+    /// on every path an event can take — including the idle path, where
+    /// fragments arrive with no turn in flight at all.
+    ///
+    /// **A turn boundary, and only a turn boundary.** This verb drops block
+    /// state — the open-fence bit among it — because the *block* ended, so
+    /// calling it at a mid-turn pause is a bug rather than a harmless extra
+    /// flush. A model that opens a ` ```rust ` fence, hits a tool call, and
+    /// resumes after the user answers the permission prompt would have the rest
+    /// of its code classified as markdown: `**ptr` opens a strong run, `*y * z`
+    /// picks up emphasis. That is BR-6's failure, caused by an over-eager call
+    /// to the thing meant to prevent a different one. If a mid-turn caller needs
+    /// the buffer on screen ahead of its own row, that is what `line()` and
+    /// `repaint_row_above()` already do for themselves.
+    ///
+    /// **Defaults to a no-op**, for `repaint_row_above`'s reason: a surface that
+    /// holds nothing has nothing to emit, so silence is the correct behaviour
+    /// rather than something each implementor must remember to add. That default
+    /// is also what keeps this verb from rippling through the ~15 modules that
+    /// consume `&mut dyn Surface` and the three implementors that buffer
+    /// nothing.
+    fn end_block(&mut self) {}
+
     /// Flush any buffered output. The default is a no-op.
     ///
     /// # Errors
@@ -832,6 +872,32 @@ impl<W: Write> Surface for PlainSurface<W> {
         let _ = self.out.flush();
     }
 
+    /// Emit the held tail and forget the block state that produced it.
+    ///
+    /// Two halves, and the second is the one that is easy to leave out. The
+    /// buffers go out through the same [`Self::emit_pending`] a mid-stream
+    /// `line()` uses, in the same order and for the same reason. **Then the
+    /// fence bit is cleared**, which no other path in this module ever does: a
+    /// reply that opened a ` ``` ` and never closed it leaves `fence == true`,
+    /// and a bit that survives the turn makes every subsequent line of every
+    /// subsequent turn render verbatim — no wrap, no styling, for the rest of
+    /// the session. The renderer cannot clear it on its own, because inside a
+    /// fence "this line is not markup" is exactly what it is supposed to
+    /// believe; only a caller that knows the block is over can say otherwise,
+    /// which is what this verb is.
+    ///
+    /// Order matters: the tail is emitted **before** the bit is dropped, so a
+    /// partial last line inside a fence still goes out verbatim rather than
+    /// being classified on its way past a fence that had just been declared
+    /// shut.
+    ///
+    /// That the bit is dropped at all is why the trait's contract restricts this
+    /// verb to a turn boundary — see [`Surface::end_block`].
+    fn end_block(&mut self) {
+        self.emit_pending();
+        self.set_fence(false);
+    }
+
     fn flush(&mut self) -> io::Result<()> {
         self.out.flush()
     }
@@ -1296,6 +1362,24 @@ mod tests {
         String::from_utf8(buf).unwrap()
     }
 
+    /// [`markdown_out`] with the block declared over afterwards — what
+    /// `client.rs`'s pump does at the end of a turn (ADR-3).
+    ///
+    /// Deliberately identical to `markdown_out` but for the one extra call, so a
+    /// pair of assertions taken over both is a statement about `end_block` and
+    /// nothing else.
+    fn markdown_out_ended(color: bool, width: usize, chunks: &[&str]) -> String {
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::with_markdown(&mut buf, color, width);
+            for chunk in chunks {
+                surface.fragment(chunk);
+            }
+            surface.end_block();
+        }
+        String::from_utf8(buf).unwrap()
+    }
+
     /// Everything that is not whitespace, in order — what a construct's
     /// characters are, independent of where the rows were broken.
     fn ink(text: &str) -> String {
@@ -1597,6 +1681,153 @@ mod tests {
             markdown_out(false, 40, &["half a ", "sentence\n"]),
             "half a sentence\n"
         );
+    }
+
+    /// **AC-10, surface leg.** …and `end_block()` is what lets it go. A model
+    /// whose last chunk carries no `\n` is the common case, not the exotic one,
+    /// so "held forever" and "shown" differ by exactly this call.
+    ///
+    /// The two assertions differ only in that call — everything else about the
+    /// two fixtures is identical — which is what makes this a statement about
+    /// the verb rather than about the renderer.
+    #[test]
+    fn end_block_emits_a_tail_that_no_newline_ever_completed() {
+        assert_eq!(
+            markdown_out(false, 40, &["half a sentence"]),
+            "",
+            "without the verb the tail is held, deliberately"
+        );
+        assert_eq!(
+            markdown_out_ended(false, 40, &["half a sentence"]),
+            "half a sentence\n"
+        );
+    }
+
+    /// **AC-10, table leg (BR-4).** A run of rows is buffered until something
+    /// that is not a row ends it — and at the end of a turn, nothing does.
+    /// `end_block()` closes the run and lays it out, and it does so *after* the
+    /// held partial line has been classified, so the last row is part of the
+    /// same table rather than the start of a second one.
+    #[test]
+    fn end_block_closes_a_table_run_whose_last_row_is_still_pending() {
+        assert_eq!(
+            markdown_out(false, 40, &["| a | b |\n|---|---|\n", "| ccc | ddd |"]),
+            "",
+            "the whole run is still buffered while the turn is running"
+        );
+        assert_eq!(
+            markdown_out_ended(false, 40, &["| a | b |\n|---|---|\n", "| ccc | ddd |"]),
+            "a    b\n\
+             ────────\n\
+             ccc  ddd\n",
+            "columns measured across all three rows: a split run would have laid \
+             the header out at width 1"
+        );
+    }
+
+    /// **AC-10's fence clause, and the sharpest reason this verb exists.**
+    ///
+    /// A reply that opens a ` ``` ` and never closes it — a truncated answer, an
+    /// interrupted turn, a model that simply forgot — leaves `fence == true`.
+    /// Nothing else in this module clears it, on purpose: inside a fence "this
+    /// line is not markup" is exactly what the renderer is supposed to believe,
+    /// so it cannot decide on its own that the block is over. Without
+    /// `end_block()` clearing it, every subsequent line of every subsequent turn
+    /// renders verbatim — no wrap, no styling — for the rest of the session.
+    ///
+    /// Asserted across two turns on **one** surface, because a per-turn surface
+    /// would clear the bit by construction and prove nothing.
+    #[test]
+    fn an_unterminated_fence_does_not_swallow_the_next_turn() {
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::with_markdown(&mut buf, false, 20);
+            // Turn one: a fence opens and the turn ends inside it.
+            surface.fragment("```sh\ncargo test\n");
+            surface.end_block();
+            // Turn two: ordinary prose, wide enough to need wrapping — which is
+            // precisely what a surviving fence bit would suppress.
+            surface.fragment("alpha bravo charlie delta echo\n");
+            surface.end_block();
+        }
+        let out = String::from_utf8(buf).unwrap();
+
+        assert_eq!(
+            out,
+            "cargo test\n\
+             alpha bravo charlie\n\
+             delta echo\n",
+            "the second turn rendered verbatim, so the first turn's unterminated \
+             fence outlived it: {out:?}"
+        );
+    }
+
+    /// **BR-6, across a mid-turn interruption.** A permission prompt, a routing
+    /// notice, or an indicator repaint is a *pause* in a turn, not the end of
+    /// one — so the buffered tail goes out ahead of the interrupting row (BR-8)
+    /// and the fence bit **survives it**. Only `end_block()` drops that bit, and
+    /// only the event pump calls `end_block()`, at a turn boundary.
+    ///
+    /// Without this, code the model resumes after the prompt is classified as
+    /// markdown and **word-wrapped at the terminal width**, so one statement is
+    /// broken across three rows mid-token. That is the renderer mangling the one
+    /// thing BR-6 makes verbatim, and re-indenting a paste is the least of what
+    /// it costs — a wrapped shell command is a *different command*.
+    ///
+    /// REQ-592's architecture originally put an `end_block()` call site
+    /// immediately before `resolve_permission` (ADR-3 site 3, for ADR-4's
+    /// ordering property). It was dropped for exactly this — and because it
+    /// changed no bytes, the ordering already being guaranteed by
+    /// `resolve_permission` rendering through `line()`.
+    ///
+    /// The fixture is chosen to be *destroyed* by a cleared fence rather than
+    /// merely nudged by one: the resumed line is three times the width, so a
+    /// classified copy is unmistakably re-flowed rather than coincidentally
+    /// identical. (Verified by mutation — routing `line()` through `end_block()`
+    /// yields `let b = *p * *q; //\na deliberately long\ntrailing comment`.)
+    #[test]
+    fn a_mid_turn_interruption_emits_the_tail_but_does_not_end_the_fence() {
+        const RESUMED: &str = "let b = *p * *q; // a deliberately long trailing comment";
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::with_markdown(&mut buf, true, 20);
+            surface.fragment("```rust\nlet a = 1;\n");
+            // The interruption: a notice claims the row mid-fence, exactly as
+            // `resolve_permission` does through `line()` before it asks.
+            surface.line(LineKind::Notice, "permission requested: shell");
+            // The model resumes *inside* the fence.
+            surface.fragment(&format!("{RESUMED}\n"));
+            surface.end_block();
+        }
+        let out = String::from_utf8(buf).unwrap();
+
+        // The notice landed between the two code rows, not on top of either.
+        assert_eq!(
+            out,
+            format!("let a = 1;\n>> permission requested: shell\n{RESUMED}\n"),
+            "the fence did not survive the interruption"
+        );
+        // Colour is on, so an escape could only have been authored by the inline
+        // styling table — which BR-6 turns off inside a fence.
+        assert!(!out.contains('\x1b'), "a fenced line was styled: {out:?}");
+        assert!(
+            !out.contains("```"),
+            "the fence marker was printed: {out:?}"
+        );
+    }
+
+    /// **BR-7.** The piped path builds a surface with no renderer at all, and
+    /// the new verb must be as inert there as `flush` is — including the
+    /// newline it would otherwise add to a tail that never had one.
+    #[test]
+    fn end_block_writes_nothing_on_a_surface_with_no_renderer() {
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::new(&mut buf);
+            surface.fragment("a tail with no newline");
+            surface.end_block();
+        }
+        assert_eq!(String::from_utf8(buf).unwrap(), "a tail with no newline");
     }
 
     /// **BR-3 at the seam.** Breaks land on whitespace, never inside a word —
