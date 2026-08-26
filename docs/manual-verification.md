@@ -2999,3 +2999,159 @@ Config file the daemon read      :
 (h) the unattended refusal DID quote the absolute row : yes / no
 Notes / findings :
 ```
+
+---
+
+# Manual verification runbook — REQ-590 AC-14 (the engine-derived local budget)
+
+**Status: OUTSTANDING.** REQ-590 stops the local tier short-circuiting to a fixed
+`(4,096 words, 32,768 B)` and derives its pair from the window the daemon
+actually loads with: `LOCAL_ENGINE_N_CTX 16,384` less a 1,024-token generation
+reservation, giving **10,240 words / 30,720 bytes**. Leave AC-14 unticked in
+`.adlc/specs/REQ-590-engine-derived-local-context-budget/requirement.md` until a
+person has run the procedure below and filled in the sign-off.
+
+> **REQ-589's AC-15 runbook was never written**, which is why REQ-590 arrived
+> with no field data of its own and had to take its measurements from scratch.
+> This leg exists so that does not happen twice. It is not satisfied by
+> intending to run it.
+
+## What this proves that CI does not
+
+CI proves the arithmetic and every surface that quotes it: the derivation from
+both sides (AC-1), the bound and its remedy (AC-2/AC-6/AC-16), the compaction
+ceiling relation (AC-8), the token-dense corpus (AC-9), the compaction cadence
+(AC-11, `crates/tetond/tests/compaction_cadence.rs`), the 4,097-word turn that
+used to be refused (AC-12). All of it runs against `ScriptedEngine` and
+`MockEngine`.
+
+What none of it establishes is the one claim the whole REQ rests on: that a
+prompt assembled **to** the new budget is a prompt the **real** engine accepts
+and answers. The default build has no engine — `--features llama` is not built in
+CI — so nothing in the suite has ever handed 30,720 bytes to llama.cpp. The zero
+word-slack ADR-6 accepts (`10,240 × 3/2 = 15,360 = 16,384 − 1,024`, exactly) is
+precisely the kind of thing that is fine in arithmetic and discovers a
+one-token-off error in the field.
+
+| Claim | Proven by CI? | Why not |
+|---|---|---|
+| The derived pair is `(10,240, 30,720)` | **yes** | `derive` is feature-free |
+| The rendered bound names the window and reservation | **yes** | asserted on the string |
+| A full-budget prompt fits the loaded `n_ctx` | **no** | no engine in CI |
+| A full-budget local turn actually answers | **no** | no engine, no weights |
+| What a full-budget turn *costs* in wall clock | **no** | see AC-10, taken by hand |
+
+## Prerequisites
+
+- A build **with the engine**: `cargo build --release --workspace --features
+  tetond/llama`. A default build has no local tier at all, and every session
+  goes remote-only — `teton doctor` says so in as many words. The flag is
+  non-default because it compiles llama.cpp, which needs `cmake`.
+- Weights present and verified, so nothing re-downloads 18 GiB. On this machine
+  they are at `~/Library/Application Support/teton/models/`.
+- The local tier actually loading — this REQ is about the local tier's budget,
+  so a session that silently went remote proves nothing. Confirm with
+  `teton doctor` **before** you start, not after.
+- `/verbose` on, which is what surfaces the `route …` line the budget rides.
+
+## Procedure
+
+### Leg (a) — the reported budget is the engine's window, arithmetic included
+
+1. `teton`, then `/verbose`.
+2. Ask anything short that stays local (`say hello`).
+3. Read the `route [ask/local] → …` line. It must carry a budget clause reading
+   **`budget 10,240 words / 30,720 B`** with **`bound: the local engine's
+   context window`**.
+4. **Check the arithmetic against the source, not against this page**:
+   `16,384 − 1,024 = 15,360` usable tokens; `15,360 × 2 ÷ 3 = 10,240` words;
+   `15,360 × 2 = 30,720` bytes. The bound clause should let you do that without
+   guessing which window it means (AC-16, BR-12).
+5. The bound must **not** offer `set capabilities.max_context` — there is no
+   provider declaration behind a local route, and sending a user to edit one is
+   BR-6's whole prohibition.
+
+### Leg (b) — the turn that used to be refused now serves (AC-12, the field report)
+
+This is the exact `/analyze` case that motivated REQ-589: **4,097 whitespace
+words against a 4,096-word budget**, on a machine whose engine had 16,384 tokens
+loaded.
+
+1. Make a file of a little over 4,096 whitespace words —
+   `python3 -c "print(('word '*4200).strip())" > /tmp/req590-4200.txt` is enough.
+2. In a local session, paste it or ask the model to read it and summarise.
+3. It must **serve**. Not a refusal, and **no over-budget offer** — REQ-589's
+   offer is for content that genuinely does not fit, and this now does.
+
+### Leg (c) — a turn at the *full* budget, which is the claim CI cannot make
+
+1. Build a prompt close to the new ceiling — around 10,000 whitespace words, or
+   around 30,000 bytes, whichever your content hits first. Real content, not
+   `word word word`: a couple of large source files is the honest sample.
+2. Send it as one turn.
+3. It must be answered. What must **not** happen is
+   `context_length_exceeded` / a `ContextWindowExceeded` backend error — that is
+   the engine refusing a prompt the harness said would fit, and it is the exact
+   failure the zero word-slack (ADR-6, BR-10) makes possible.
+4. **Time it.** A full-budget local turn takes materially longer to reach its
+   first token than a small one; the recorded figures are in `architecture.md`
+   § Measurements. If the turn appears to hang, wait at least 30 seconds before
+   deciding it has — on the reference machine prefill alone is ~14 seconds, and
+   a slower machine is the case A-4 flags.
+
+### Leg (d) — the deliberately dense turn, where the slack is zero
+
+The word half has **no** margin: 1.5 real BPE tokens per whitespace word is
+assumed exactly, and `budget.rs` measures Rust at 1.69. So content denser than
+the ratio overruns at full budget, and the byte guard does not cover
+*token-dense but byte-light* content.
+
+1. Build ~10,000 whitespace words of something token-dense and byte-light —
+   single-character tokens separated by spaces, or a numeric column
+   (`python3 -c "print(' '.join(str(i%10) for i in range(10000)))"`).
+2. Send it as one turn.
+3. **Either outcome is a pass for this leg, and which one it is, is the finding.**
+   If it answers, the ratio held. If it comes back as a
+   `context_length_exceeded` — the engine's own typed refusal — that is D-3's
+   intended catch working, and it should read as an ordinary local outcome with
+   REQ-589's offer behind it, **not** as a crash, a hang, or an opaque backend
+   string. Record which, verbatim.
+
+### Leg (e) — the byte band D-4 knowingly gave up (BR-7, AC-7)
+
+The byte half **fell**, 32,768 → 30,720. Content in that 2,048-byte band served
+yesterday and does not today.
+
+1. Make a byte-dense payload of about 31,500 bytes with few whitespace words —
+   minified JSON or a base64 blob is the natural shape.
+2. Send it. Expect the REQ-589 over-budget path, **not** a silent elision: the
+   regression was accepted precisely because there is now a surface that absorbs
+   it, and a silent truncation would mean there is not.
+
+## Sign-off
+
+```
+Date / build / commit                              :
+Machine (chip, RAM, OS)                            :
+Model loaded (name, quant, n_ctx)                  :
+`teton doctor` confirmed a loaded local engine     : yes / no  <-- must be "yes"
+
+(a) route line read `budget 10,240 words / 30,720 B` : yes / no  (verbatim:)
+(a) bound named the local engine's context window   : yes / no
+(a) the window and reservation were accountable     : yes / no
+(a) bound did NOT offer capabilities.max_context    : yes / no  <-- must be "yes"
+(b) the 4,097-word turn SERVED                      : yes / no  <-- must be "yes"
+(b) no over-budget offer was raised                 : yes / no  <-- must be "yes"
+(c) a ~full-budget turn was answered                 : yes / no
+(c) no ContextWindowExceeded / backend error         : yes / no
+(c) wall clock to first token                        :        s
+(c) wall clock to the finished answer                :        s
+(d) token-dense, byte-light turn — outcome           : answered | context_length_exceeded | other
+(d) if refused, the refusal was typed and readable   : yes / no
+(d) if refused, REQ-589's offer was behind it        : yes / no
+(d) verbatim message                                 :
+(e) ~31.5 KB byte-dense turn raised the offer        : yes / no
+(e) it was NOT silently elided                       : yes / no  <-- must be "yes"
+Anything that hung, aborted, or crashed              :
+Notes / findings                                     :
+```

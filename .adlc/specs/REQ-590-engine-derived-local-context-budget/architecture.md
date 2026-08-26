@@ -124,6 +124,28 @@ the ratio overruns at full budget. The byte guard covers dense-*and-heavy* conte
 the uncovered quadrant (token-dense, byte-light) with a real tokenizer, because an assertion
 written in whitespace words is structurally blind to it.
 
+### ADR-6a — AC-4 is a coupling guard, not a bound check (noted before implementation)
+
+Worth stating plainly so nobody reads more into a green AC-4 than is there.
+
+The property is `budget_bytes / DUTY_REQUEST_BYTES_PER_TOKEN ≤ window − reservation`. After
+ADR-2 the derivation *defines* `budget_bytes = (window − reservation) × DUTY_REQUEST_BYTES_PER_TOKEN`,
+so the property reduces to `usable ≤ usable` — **it cannot fail while the byte half is derived.**
+
+It is still worth having, because it fails today (32,768 / 2 = 16,384 > 15,360) and would fail
+again the moment someone re-pins the byte half to a constant. But what it guards is the
+**coupling**, not the bound: it cannot tell you the window is right, the reservation is right, or
+that the engine will accept the result.
+
+**Consequence for the verify phase:** do not accept AC-4 as evidence that the budget fits the
+engine. The claim "no surface reports a budget larger than the engine will accept" (BR-7) is
+carried by AC-9's real-tokenizer measurement and by the engine's own `over_window`, not by AC-4.
+
+This is the same shape as the word half's zero slack (ADR-6) — the derivation is exactly
+saturating in **both** currencies, `words × 3/2 = usable` and `bytes / 2 = usable`. That is a
+consequence of deriving both from one number, and it is fine; it just means neither half carries
+margin, and no assertion written in terms of the derivation can discover that.
+
 ### ADR-7 — The 4,097 test is inverted, not renumbered
 
 `turn_loop.rs:3365-3367` asserts:
@@ -173,3 +195,201 @@ reader who finds their output first is not misled:
   local route, so it cannot pass by coincidence.
 - **Every mutation-verified guard stays mutation-verified.** Moving a test does not preserve its
   bite; re-running the mutation does (LESSON-563).
+
+## Measurements (AC-10, AC-11, AC-14) — TASK-275
+
+D-3 took the full window and accepted that a local session now holds ~2.5× more conversation
+before compaction fires. REQ-586 deferred this whole decision on exactly this cost, and REQ-589's
+AC-15 runbook — which its own spec named as the first data point REQ-590 would need — was never
+written. This section ends that.
+
+**These numbers report; they do not gate.** D-3 is decided and none of what follows reverses it.
+
+### What can be asserted and what can only be recorded
+
+The distinction is not bookkeeping — a criterion dressed as a test that never runs is worse than a
+number with a date on it (LESSON-499's coverage boundary).
+
+| | where it lives | runs in default CI? |
+|---|---|---|
+| **AC-11** turns until compaction fires | `crates/tetond/tests/compaction_cadence.rs` | **yes** — pure arithmetic over two budgets; no weights, no `llama` |
+| **AC-10(a)** prefill wall clock | recorded below; re-take with `crates/teton-inference/examples/local_budget_cost.rs` | **no** |
+| **AC-10(b)** the REQ-544 BR-8 duty under load | recorded below; same example | **no** |
+| **AC-14** a large local turn by hand | `docs/manual-verification.md` | **no — and not by a script or an agent either** |
+
+AC-10 cannot run in CI: the real engine is behind `#[cfg(feature = "llama")]` (`runtime.rs:12011`)
+and building it compiles llama.cpp from source with cmake, which CI does not do.
+`ScriptedEngine` (`context_pressure.rs:98`) exercises the *logic* and measures nothing real, so it
+is not a substitute. AC-10's figures are therefore stamped with a machine and a date, and the
+example that produced them is committed so the next reader re-takes them rather than trusting
+them.
+
+### The reference machine
+
+| | |
+|---|---|
+| Machine | Apple M5 Max, 48 GiB unified memory |
+| OS / arch | macOS 26.6.2, arm64 |
+| Toolchain | rustc 1.97.1, `--release`, `-p teton-inference --features llama` |
+| Model | `qwen3-coder-30b-a3b.gguf` (Q4_K, 18.56 GB), the weights this machine's daemon serves |
+| Engine args | `gpu_layers = u32::MAX` (Metal), `n_ctx = 16_384` — the same arguments `LlamaEngineLoader` passes (`runtime.rs:12039-12044`) |
+| Date | 2026-08-25 |
+| Runs | two independent runs of the same binary; both are given, and they agree to within ~3% |
+
+**Load caveat, stated because it is the honest state of the machine:** three other agents were
+compiling in the same worktree during these runs. The absolute milliseconds carry that; the
+*ratios*, which are what AC-10(a) asks for, are taken within a single run and reproduced across
+both. A-4 already records that one machine's figures generalize only so far.
+
+Prompt sizes are the engine's own `prompt_tokens`, never `approx_tokens` — an assertion about a
+15,360-token prompt written in whitespace words is the blindness AC-9 exists to close. Every probe
+reported `cached_tokens: 0`, so these are cold prefills and not partial KV reuse.
+
+### AC-10(a) — prefill wall clock: **the ratio is 4.4×, not 2.5×, and that is the finding**
+
+| | prompt tokens | median time to first token | per-token |
+|---|---|---|---|
+| today's budget | 6,164 | **3,111 ms** (run 2: 3,141 ms) | 0.505 ms/token |
+| derived budget | 15,410 | **13,548 ms** (run 2: 13,914 ms) | 0.879 ms/token |
+| ratio | **2.50×** | **4.35×** (run 2: 4.43×) | **1.74×** |
+
+Samples, run 1: `[3077, 3111, 3145]` and `[13548, 13571, 13476]` ms, one warmup discarded each.
+
+The spec expected ~2.5×: *"prefill is ~linear in prompt tokens"*. **It is not**, and two points
+could not tell "steeper than linear" from "one sample was noisy", so the example sweeps five:
+
+| prompt tokens | median first token | ms/token |
+|---|---|---|
+| 3,082 | 1,398 ms | 0.454 |
+| 6,164 | 4,106 ms | 0.666 |
+| 9,246 | 5,943 ms | 0.643 |
+| 12,328 | 9,277 ms | 0.753 |
+| 15,410 | 13,518 ms | 0.877 |
+
+Per-token cost rises roughly monotonically and **nearly doubles** across the range (the 9,246 point
+sitting just under the 6,164 one is load noise, not a reversal). That is the shape of attention:
+prefill is `a·n + b·n²`, because every token attends to every token before it. A least-squares fit
+over the five points gives `ms/token ≈ 0.40 + 3.0e-5 · n`, which puts **a bit over half** of the
+15,410-token prefill in the quadratic term against ~12% of the 3,082-token one. Five points on a
+loaded machine do not pin the coefficients tightly; what they do establish is that the term is
+there and that it is not small at the top of this budget.
+
+**What D-3 costs, in one number: a full-budget local turn spends ~13.5 seconds before its first
+token, against ~3.1 seconds at today's budget — about +10.5 s — on an M5 Max, the fast end of the
+hardware the local tier admits.**
+
+Two things this does *not* say. It is not a per-turn tax on every local turn: it is the cost at the
+*top* of the budget, and a turn that carries little context prefills little. And it is not
+new work — the same tokens cost the same to prefill before this REQ; what changed is that the
+harness will now assemble a prompt that large, where before it refused at 4,096 words.
+
+### AC-10(b) — the REQ-544 BR-8 duty: **it does not still pass**
+
+`DutySpec::default()` (`benchmark.rs:36-45`) is `max_first_token_ms: 1000`, `min_tokens_per_sec: 5.0`.
+
+| | first token | tok/s (prefill-inclusive) | verdict |
+|---|---|---|---|
+| duty prompts as shipped (23–28 tokens) | 151 ms | 100.27 | **Pass** |
+| the same prompts behind a full-budget context (~15,170 tokens) | **12,885 ms** | 9.65 | **Fail** |
+
+Run 2: 153 ms / 98.23 → Pass; 12,910 ms / 9.61 → Fail. The failure reason is
+`"first-token latency 12885ms exceeds the 1000ms duty (BR-8)"`.
+
+**AC-10(b)'s pass condition — "the duty still passes" — is not met.** Three things have to be said
+about that, and none of them is "so ignore it":
+
+1. **It fails on the half nobody was watching.** The AC names `min_tokens_per_sec: 5.0`; the duty
+   fails on `max_first_token_ms`. Throughput clears its floor with room to spare.
+
+2. **The engine did not get slower; there is simply more to prefill.** With prefill excluded,
+   decode runs at **79–82 tok/s** under a full resident context against **135–139 tok/s** on a short
+   one — about 42% slower, and still ~16× above the 5.0 tok/s floor. Nothing here is a throughput
+   collapse.
+
+3. **`min_tokens_per_sec` does not measure what its name suggests once prompts are large, and its
+   Pass here is an artifact.** `run_benchmark` (`benchmark.rs:121-151`) divides *generated* tokens
+   by the *whole* wall clock, prefill included. Derived from the measured run: 281 generated tokens
+   at 9.65 tok/s is 29.1 s of wall clock, of which ~25.9 s was the two prefills and ~3.5 s the
+   decode. The ratio therefore turns on `GenParams::max_tokens` — 256 here — and not on the engine:
+   the same 25.9 s of prefill under a smaller generation cap would put it under 5.0 and "fail on
+   throughput" for a reason that has nothing to do with throughput. **If BR-11's duty is ever made
+   to bite on real turns, this is the metric to fix first.**
+
+**What this does not change today.** `DutySpec` is a *model-selection* gate, run once after
+download against `default_prompts()` (`runtime.rs:12051-12053`) and never again. Nothing in the
+daemon re-evaluates it per turn, so no full-budget local turn is refused or stepped down because of
+this figure. BR-11 asked what the duty would say if it were run under load; the answer is
+**"fail, on latency, by 13×"**, and the honest reading is that the duty as written can see neither
+prefill cost nor generation under a large resident context — which is exactly the gap AC-10(b) was
+written to name. It is named, and it is not closed by this REQ.
+
+### AC-11 — turns until compaction fires: **"~2.5× more conversation" is true in one currency only**
+
+Asserted in CI by `crates/tetond/tests/compaction_cadence.rs`, driving the production turn loop
+(`run_session_turn_with_source`) over a scripted local engine. Reproduce the table with:
+
+```text
+cargo test -p tetond --test compaction_cadence -- --nocapture
+```
+
+250-word user message plus a 120-word reply per turn; the count is the turn on which the
+accumulated conversation first crosses `under_compaction_pressure`.
+
+| bytes/word | stands for | before (4,096 w / 32,768 B) | after (10,240 w / 30,720 B) | ratio |
+|---|---|---|---|---|
+| 4 | source — the dense end of `budget.rs:205`'s ratio | 9 turns | **14 turns** | 1.56× |
+| 6 | ordinary prose | 9 turns | **10 turns** | 1.11× |
+| 8 | punctuation- and indent-heavy text | 8 turns | **8 turns** | 1.00× |
+| 20 | minified JSON, base64, path-heavy logs (`budget.rs:55-62`) | 4 turns | **4 turns** | 1.00× |
+
+**The gain decays with content density and is gone by 8 B/word.** The mechanism is that
+`under_compaction_pressure` is a *disjunction over both currencies*, so what binds is whichever
+budget the content exhausts first — and the crossover density is `budget_bytes / budget_tokens`:
+
+| | words | bytes | word-bound below |
+|---|---|---|---|
+| before | 4,096 | 32,768 | **8 B/word** |
+| after | 10,240 | 30,720 | **3 B/word** |
+
+Before this REQ essentially every real conversation was **word**-bound, and the word half is the
+half that rose 2.5×. After it, essentially every real conversation is **byte**-bound — and the byte
+half is the half that *fell*. Exactly, at `COMPACT_PRESSURE_PERCENT = 70`:
+
+- word threshold **2,867 → 7,168** words (2.5× up)
+- byte threshold **22,937 → 21,504** bytes (6.25% **down**)
+
+Both are pinned in `the_binding_guard_crosses_over_at_a_much_lower_density_after_this_req`.
+
+**This is D-4 priced, not a defect discovered.** D-4 decided the byte half falls to 30,720 and BR-7
+recorded the regression it accepts. What the measurement adds is that the regression is not
+confined to the 2,048-byte refusal band BR-7 describes: it also moves the *compaction* threshold
+down by the same 6.25%, so a byte-dense local session compacts marginally sooner than it does
+today, not later. At this fixture's message size that lands inside one turn's granularity, which is
+why the table reads 1.00× rather than below it — the threshold is the exact statement, the turn
+count is the lived one, and both are recorded rather than one standing in for the other.
+
+**The sentence to carry forward** is not D-3's "~2.5× more conversation". It is: *2.5× for
+source-shaped content, ~1.1× for prose, and nothing at all once content passes 8 bytes per
+whitespace word.*
+
+### AC-14 — the by-hand leg
+
+Written, not run: `docs/manual-verification.md`, "REQ-590 AC-14 (the engine-derived local budget)",
+five legs — the reported budget and its arithmetic, the 4,097-word turn that used to be refused, a
+full-budget turn, the token-dense/byte-light turn where ADR-6's slack is zero, and the byte band
+D-4 gave up. **AC-14 is not satisfied until a person fills in its sign-off block**; that is the
+whole reason it exists, REQ-589's AC-15 having been left unwritten.
+
+### What was *not* measured
+
+- **Any machine but this one.** A-4 already says the reference machine's figures generalize only so
+  far, and the local tier is hardware-adaptive by design. The +10.5 s prefill figure is from the
+  fast end of the admitted range; a machine at the slow end is unmeasured.
+- **Prefix-cache reuse across turns.** Every figure here is a *cold* prefill
+  (`Engine::complete`, `cached_tokens: 0`). REQ-564's cache means a real multi-turn session
+  re-prefills only the changed suffix, so the +10.5 s is the worst case per new full-budget prompt,
+  not a per-turn cost in a warm session. Quantifying the warm case is not in this REQ's scope and
+  is not claimed here.
+- **The duty under load on any generation cap but 256.** The `max_tokens`-dependence of
+  `min_tokens_per_sec` above is derived from the measured run's own arithmetic and stated as such,
+  not taken as a separate reading.
