@@ -2479,3 +2479,147 @@ fn each_over_budget_answer_settles_the_turn_the_way_its_label_said() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// REQ-592 OQ-4 — a resized terminal, at a real terminal (TASK-281)
+// ---------------------------------------------------------------------------
+
+/// **OQ-4's wiring, and the only test that can see it.**
+///
+/// ADR-9 decided against a `SIGWINCH` handler on the grounds that the width is
+/// re-read as the session goes, so a resize takes effect on the next block and
+/// already-printed rows keep their breaks. `PlainSurface` holds the width as a
+/// field, so that decision is only true if something in `main.rs` keeps telling
+/// it — and nothing outside a real terminal can tell whether anything does.
+/// `render.rs`'s unit tests call `set_width` themselves, which proves the verb
+/// works and says nothing about whether it is called; `cli_e2e` has no terminal
+/// to resize.
+///
+/// So: one session, two turns, and a window dragged narrower in between. The
+/// first reply fits the wide window and is emitted as a single row. The second
+/// is emitted as three, and the assertion is that its sentence can no longer be
+/// found in one piece.
+///
+/// **A pty transcript is the right instrument for this** and a screen scrape
+/// would be the wrong one. Hard-wrapping is a display artefact — the terminal
+/// folds a too-long row across lines without putting a byte anywhere — so the
+/// transcript holds exactly the bytes `teton` wrote. A CLI still laying out at
+/// the old width therefore writes the sentence contiguously, and this test fails
+/// on the presence of that contiguous run rather than on how it looked.
+///
+/// Mutation: delete the `ctx.surface.set_width(...)` from
+/// `next_interactive_line`'s `stdin_ready` arm and the second reply arrives in
+/// one piece.
+#[test]
+fn a_resized_window_lays_the_next_turn_out_at_the_new_width() {
+    // Wide enough for either sentence to be one row, then narrow enough that the
+    // second cannot be. Both are chosen so the greedy wrap has to break the
+    // sentence rather than merely re-space it.
+    const WIDE_COLS: u16 = 120;
+    const NARROW_COLS: u16 = 32;
+    const FIRST: &str = "the first answer is delivered while the terminal is still wide open here";
+    const SECOND: &str =
+        "the second answer arrives after the window has been dragged much narrower";
+
+    // The precondition the whole test rests on: at the wide width neither
+    // sentence wraps, so a CLI that never re-read the width would write the
+    // second one contiguously — which is the failure this detects.
+    assert!(
+        FIRST.len() < WIDE_COLS as usize && SECOND.len() < WIDE_COLS as usize,
+        "both fixtures must fit the wide window, or the test proves nothing"
+    );
+    assert!(
+        SECOND.len() > NARROW_COLS as usize,
+        "the second fixture must not fit the narrow window"
+    );
+
+    let daemon_path = daemon_bin();
+    // Every tier bound to the scripted local tier, for the REQ-558 reason the
+    // other typed-turn tests here bind them.
+    let tiers: String = ["reflex", "scan", "build", "think"]
+        .iter()
+        .map(|t| format!("[[tiers]]\ntier = \"{t}\"\nprovider_id = \"local\"\n\n"))
+        .collect();
+    let config = format!("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n{tiers}");
+    let daemon = TestDaemon::spawn_with(&daemon_path, &config, &[FIRST, SECOND]);
+
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 40,
+            cols: WIDE_COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+
+    let mut cmd = CommandBuilder::new(teton_bin());
+    cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
+    cmd.env("TETON_REPO_ROOT", &daemon.root);
+    let mut session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
+    drop(pty.slave);
+    let transcript = spawn_reader(pty.master.try_clone_reader().expect("pty reader"));
+    let mut writer = pty.master.take_writer().expect("pty writer");
+
+    assert!(
+        wait_for(&transcript, "ready (freeform)"),
+        "the session never reached the entry prompt; transcript:\n{}",
+        snapshot(&transcript)
+    );
+
+    writer.write_all(b"first question\r").expect("type");
+    writer.flush().ok();
+
+    // Turn one, at the wide width: the sentence is on screen in one piece,
+    // because 72 columns of prose fit a 120-column window without a break.
+    assert!(
+        wait_for(&transcript, FIRST),
+        "the first turn never produced its reply; transcript:\n{}",
+        snapshot(&transcript)
+    );
+
+    // **The drag.** `TIOCGWINSZ` on the slave reports the master's size, so this
+    // is the same fact a user's window manager would deliver.
+    pty.master
+        .resize(PtySize {
+            rows: 40,
+            cols: NARROW_COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("resize the pty");
+
+    // Typed only after the resize, which is what makes this the resize-then-type
+    // case: the entry frame was drawn — and its width read — *before* the drag,
+    // so a session that only measured the terminal when it drew the frame would
+    // still be laying out at 120 here.
+    writer.write_all(b"second question\r").expect("type");
+    writer.flush().ok();
+
+    // The head of the second sentence fits the narrow window and survives as one
+    // run, which is how we know the turn ran at all.
+    assert!(
+        wait_for(&transcript, "the second answer arrives after"),
+        "the second turn never produced its reply; transcript:\n{}",
+        snapshot(&transcript)
+    );
+
+    let seen = snapshot(&transcript);
+    let _ = session.kill();
+    let _ = session.wait();
+
+    assert!(
+        !seen.contains(SECOND),
+        "the reply after the resize was written as one unbroken row, so the \
+         session is still laying out at {WIDE_COLS} columns in a {NARROW_COLS}-\
+         column window (OQ-4). The terminal then hard-wraps it mid-word, which is \
+         the defect REQ-592 exists to remove; transcript:\n{seen}"
+    );
+    // And the other half of OQ-4: what was already printed keeps its breaks. The
+    // first reply is still in the transcript exactly as it was emitted — nothing
+    // re-flowed it when the window changed.
+    assert!(
+        seen.contains(FIRST),
+        "the pre-resize reply was re-flowed after the fact; transcript:\n{seen}"
+    );
+}

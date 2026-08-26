@@ -301,6 +301,14 @@ an AC that covers no rule, or a rule no AC names, is a finding against this list
 - [ ] **AC-7** *(BR-7, pipe leg)*: `cli_e2e` (piped stdout) output for a scripted turn carrying a
       table, bold text, and a code fence equals the concatenated raw chunks the daemon sent — the
       renderer is inert off a terminal, asserted rather than assumed.
+
+      *Measured during implementation (2026-08-26): this test is the **entire** guard for BR-7.*
+      Inverting the gate to always render leaves **all 75 pre-existing `cli_e2e` tests green** —
+      their fixture replies are plain paragraphs that wrap unchanged at the 80-column no-terminal
+      default, so the existing suite is structurally blind to the gate. TASK-281's "every existing
+      assertion still passes" criterion is worth keeping as a no-regression check but must not be
+      read as coverage: the old tests passing was never evidence the gate works. A future reader
+      tempted to delete AC-7 as redundant should note that nothing else fails when BR-7 breaks.
 - [ ] **AC-8** *(BR-7, colour leg)*: The terminal-but-no-colour path is covered on both halves.
       **Unit**: a surface constructed with `color = false` at a fixed width wraps its input and
       emits **zero** `\x1b` bytes, while the same input at `color = true` emits the SGR AC-5 pins.

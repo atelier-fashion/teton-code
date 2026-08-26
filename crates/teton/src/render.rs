@@ -178,6 +178,34 @@ pub trait Surface {
     /// nothing.
     fn end_block(&mut self) {}
 
+    /// Tell the surface the terminal is now `width` columns wide (REQ-592 OQ-4).
+    ///
+    /// **A setter, never a query the surface makes for itself.** This is the
+    /// same division `repaint_row_above` and `end_block` make, applied to the
+    /// one runtime fact layout needs: `PlainSurface` is generic over its writer
+    /// and [`crate::prompt::terminal_width`] reads `STDOUT_FILENO` specifically,
+    /// so a surface over a `Vec<u8>` that asked for its own width would be
+    /// measuring a terminal it is not writing to. Because the number always
+    /// arrives from outside, every layout decision below stays reachable from a
+    /// test with no terminal in sight — BR-10's rule, and the reason
+    /// [`PlainSurface::with_markdown`] takes a width in the first place.
+    ///
+    /// **Rows already emitted keep the breaks they were laid out with.** Only
+    /// blocks rendered after this call use the new width, which is exactly what
+    /// OQ-4 decided: no `SIGWINCH` handler, a resize takes effect on the next
+    /// block, and nothing already on screen is re-flowed. Text the surface is
+    /// still *holding* has not been emitted, so it is laid out at the new width
+    /// — the right answer, and the reason this deliberately does not flush.
+    /// Flushing here would also be `end_block`'s job, which belongs to the event
+    /// pump alone.
+    ///
+    /// **Defaults to a no-op**, for `end_block`'s reason: a surface that lays
+    /// nothing out has no width, so silence is correct rather than something
+    /// each implementor must remember to add. On a `PlainSurface` built without
+    /// a renderer it is a no-op too — there is no width to change, which is BR-7
+    /// holding here as it does everywhere else.
+    fn set_width(&mut self, _width: usize) {}
+
     /// Flush any buffered output. The default is a no-op.
     ///
     /// # Errors
@@ -281,32 +309,18 @@ impl<W: Write> PlainSurface<W> {
     /// terminal — BR-10's rule, so that every layout decision below is reachable
     /// from a test with no terminal in sight.
     // The one caller outside this module's own tests is `main.rs`'s surface
-    // construction, and it arrives in TASK-281 of this REQ — the task that owns
-    // the terminal gate, and the only place that knows whether stdout is one
-    // (ADR-1, [[LESSON-547]]: a rule that crosses a seam is owned by exactly one
-    // side). Until then the release build has no caller for this.
+    // construction — the place that owns the terminal gate, and the only place
+    // that knows whether stdout is one (ADR-1, [[LESSON-547]]: a rule that
+    // crosses a seam is owned by exactly one side).
     //
-    // `expect` rather than `allow` on purpose. An `allow` would go on being
-    // correct after TASK-281 wires this up and would sit here forever — which is
-    // the lingering-suppression failure tetond's ADR-J is about, and the same
-    // trap `markdown.rs`'s module-wide `allow(dead_code)` set for this task.
-    // `expect` inverts it: the moment a real caller exists the lint stops firing
-    // and *this attribute* becomes the warning, so `-D warnings` makes removing
-    // it a condition of landing the wiring rather than a note someone has to
-    // remember.
-    //
-    // Scoped to `not(test)` because the two compilations of this file disagree
-    // about the fact being asserted: the test target has sixteen callers below
-    // and the release binary has none, so an unconditional `expect` would be
-    // unfulfilled — and therefore a warning — in exactly the build where the
-    // constructor *is* exercised.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "TASK-281 adds the main.rs caller; this attribute fails the build once it does"
-        )
-    )]
+    // Until that caller existed this carried a `#[cfg_attr(not(test),
+    // expect(dead_code, …))]`, chosen over an `allow` because an `allow` would
+    // have gone on being correct once the wiring landed and would have sat here
+    // forever — the lingering-suppression failure tetond's ADR-J is about. The
+    // `expect` inverted it: the moment a real caller appeared the lint stopped
+    // firing, *the attribute* became the warning, and `-D warnings` made
+    // deleting it a condition of landing the gate. It did exactly that, and this
+    // paragraph is what is left of it.
     pub fn with_markdown(out: W, color: bool, width: usize) -> Self {
         Self {
             out,
@@ -896,6 +910,13 @@ impl<W: Write> Surface for PlainSurface<W> {
     fn end_block(&mut self) {
         self.emit_pending();
         self.set_fence(false);
+    }
+
+    /// No renderer, no width: the `if let` is the whole of BR-7's answer here.
+    fn set_width(&mut self, width: usize) {
+        if let Some(state) = self.markdown.as_mut() {
+            state.width = width;
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -1828,6 +1849,67 @@ mod tests {
             surface.end_block();
         }
         assert_eq!(String::from_utf8(buf).unwrap(), "a tail with no newline");
+    }
+
+    /// **OQ-4.** A resize takes effect on the next block, and the rows already
+    /// on screen keep the breaks they were laid out with.
+    ///
+    /// The same sentence twice, with a narrower width declared in between. The
+    /// first copy is a single 43-column row because it fits sixty; the second is
+    /// three rows because it does not fit twenty. Asserted as one exact string
+    /// rather than as two `contains`, because "the earlier output is untouched"
+    /// is a claim about bytes that are *no longer reachable* — once emitted they
+    /// cannot be re-flowed, and an equality is what says so.
+    ///
+    /// This is the defect the width-at-construction version shipped: a session
+    /// started at 200 columns and dragged down to 80 went on laying every
+    /// subsequent block out at 200, and the terminal then hard-wrapped those rows
+    /// mid-word — which is precisely the defect REQ-592 exists to remove,
+    /// returning for the rest of the session.
+    #[test]
+    fn set_width_lays_the_next_block_out_narrower_and_leaves_printed_rows_alone() {
+        let sentence = "the quick brown fox jumps over the lazy dog\n";
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::with_markdown(&mut buf, false, 60);
+            surface.fragment(sentence);
+            surface.set_width(20);
+            surface.fragment(sentence);
+        }
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "the quick brown fox jumps over the lazy dog\n\
+             the quick brown fox\n\
+             jumps over the lazy\n\
+             dog\n",
+            "the block after the resize must wrap at 20, and the one before it \
+             must still be the single row it was emitted as"
+        );
+    }
+
+    /// **BR-7, the other half of the new verb.** `set_width` on a surface with no
+    /// renderer changes nothing — it cannot switch one on.
+    ///
+    /// Worth its own test because the failure would be silent and would land
+    /// exactly where BR-7 promises it cannot: a piped session whose width
+    /// happened to be set would start wrapping the model's bytes. The `if let`
+    /// in the implementation is the whole guarantee, and this is what holds it
+    /// there.
+    #[test]
+    fn set_width_cannot_give_a_pipe_a_renderer() {
+        let sentence = "the quick brown fox jumps over the lazy dog\n";
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::with_color(&mut buf, false);
+            surface.set_width(20);
+            surface.fragment(sentence);
+        }
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            sentence,
+            "a surface with no renderer must pass the bytes through whatever it \
+             has been told about the terminal"
+        );
     }
 
     /// **BR-3 at the seam.** Breaks land on whitespace, never inside a word —

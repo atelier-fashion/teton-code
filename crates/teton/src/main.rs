@@ -65,7 +65,7 @@ mod web_setup_ui;
 use client::{Connection, UiContext};
 use keychain::{Cleanup, Keychain, PriorKey};
 use prompt::{FramedStdinPrompter, Prompter, StdinPrompter};
-use render::{stdout_surface, stdout_surface_with_color, LineKind, Surface};
+use render::{stdout_surface, stdout_surface_with_color, LineKind, PlainSurface, Surface};
 use session_ui::SessionState;
 use teton_protocol::socket_path::{self, DaemonPaths};
 
@@ -773,10 +773,20 @@ fn next_interactive_line(
     // immediately above the frame's top rule (ADR-556-4). `status_rows` is how
     // many rows that added, which is what `erase` needs to take back.
     let mut status_rows = paint_status(ctx, *tick);
-    entry.set_status(entry_status(ctx));
+    resync_terminal_width(entry, ctx);
     entry.draw(entry_prompt);
     loop {
         if prompt::stdin_ready(FRAME_INTERVAL) {
+            // **The decisive width read** (REQ-592 OQ-4). The two `resync_
+            // terminal_width` calls draw a frame, and a frame is drawn *before*
+            // the wait — so a terminal resized while the user sat at the prompt
+            // would hand the turn a width measured before the drag. Reading here
+            // is the last moment at which a typed line is still a line and not
+            // yet a turn, which makes "the next block uses the new width" true
+            // for the resize-then-type case as well as the resize-then-event
+            // one. One `TIOCGWINSZ` per typed line, against a turn that is about
+            // to make a model call.
+            ctx.surface.set_width(prompt::terminal_width());
             // Readable covers "a line is waiting" and "the descriptor is at
             // EOF"; `read_line` distinguishes them by yielding zero bytes.
             return Ok(entry.read_line());
@@ -790,8 +800,9 @@ fn next_interactive_line(
             status_rows = paint_status(ctx, *tick);
             // Recomposed on every redraw rather than cached: the level can have
             // changed since the last draw, and a stale row about permissions is
-            // worse than none.
-            entry.set_status(entry_status(ctx));
+            // worse than none. The same is true of the width, which is why the
+            // two travel together.
+            resync_terminal_width(entry, ctx);
             entry.draw(entry_prompt);
             continue;
         }
@@ -822,13 +833,54 @@ fn next_interactive_line(
     }
 }
 
+/// Re-read the terminal's width and hand it to both things measured in columns:
+/// the markdown renderer and the status row (REQ-592 OQ-4, REQ-560).
+///
+/// One `TIOCGWINSZ` feeding two consumers, because they are being asked the same
+/// question at the same instant and two reads could disagree — a row sized for
+/// one width above prose laid out at another is a worse answer than either.
+///
+/// This is where a resize *becomes* visible to the renderer. There is no
+/// `SIGWINCH` handler (ADR-9) and there does not need to be: the frame is
+/// redrawn whenever an event renders, and the width is read again each time, so
+/// the next block picks the new number up on its own. Already-printed rows keep
+/// the breaks they were laid out with, which is the other half of what OQ-4
+/// decided.
+///
+/// It is **not** the only site — see the read in [`next_interactive_line`]'s
+/// `stdin_ready` arm, which is the one that catches a resize made while the user
+/// was sitting at the prompt with nothing arriving from the daemon.
+///
+/// **Which of the two the tests hold, stated rather than left to be discovered.**
+/// `a_resized_window_lays_the_next_turn_out_at_the_new_width` pins the
+/// `stdin_ready` read; deleting the `set_width` here changes no observable byte
+/// and no test fails. That is not an accident and not a gap to be filled with a
+/// contrived fixture: the only text an idle drain renders goes out through
+/// `line()`, and OQ-5 decided `line()` kinds are **not** wrapped, so there is at
+/// present no rendering path that could tell the two widths apart. The call is
+/// kept because it costs nothing — `entry_status` performs that `TIOCGWINSZ`
+/// either way — and because it stops being unobservable the moment OQ-5's
+/// follow-up lands and a notice starts wrapping. A reader who deletes it as dead
+/// should expect it back with that REQ.
+fn resync_terminal_width(entry: &mut FramedStdinPrompter, ctx: &mut UiContext<'_>) {
+    let width = prompt::terminal_width();
+    ctx.surface.set_width(width);
+    entry.set_status(entry_status(ctx, width));
+}
+
 /// The status row's content for the next frame draw, or `None` for no row
 /// (REQ-560).
 ///
 /// Thin on purpose: what the row *says* is [`status::status_line`]'s decision,
 /// unit-tested with no terminal in the way (BR-8), and the only thing added here
-/// is the two runtime facts it cannot be pure about — the session's level and
-/// the terminal's width.
+/// is the one runtime fact it cannot be pure about — the session's level.
+///
+/// `width` arrives as a parameter rather than being queried here, since REQ-592:
+/// the renderer needs the same number at the same moment ([`resync_terminal_
+/// width`]), and a function that read it for itself would make the two
+/// consumers' answers independent for no reason. It is also the rule this REQ
+/// applies everywhere — query at the edge, pass the number into logic that can
+/// then be driven with no terminal in sight (BR-10).
 ///
 /// `None` propagates from two places and means the same thing in both: a level
 /// nobody has read yet, and a terminal too narrow for the row. Neither is an
@@ -837,10 +889,10 @@ fn next_interactive_line(
 ///
 /// The effort field is `None` until REQ-559 lands; this REQ renders the
 /// permission level alone and adds no `/effort` command (BR-14).
-fn entry_status(ctx: &UiContext<'_>) -> Option<String> {
+fn entry_status(ctx: &UiContext<'_>, width: usize) -> Option<String> {
     let level = ctx.state.permission_level?;
     let effort = status::effort_field(ctx.state.effort.as_ref());
-    status::status_line(level, effort.as_deref(), prompt::terminal_width())
+    status::status_line(level, effort.as_deref(), width)
 }
 
 /// Read the session's permission level into the render cache (REQ-560).
@@ -1045,7 +1097,22 @@ fn run_session(
     // exists — the banner names its line classes and the surface draws them.
     let color = interactive && banner::color_enabled();
 
-    let mut surface = stdout_surface_with_color(color);
+    // REQ-592 BR-7's gate, and the only place it is asked. Markdown rendering is
+    // a property of *having a terminal to lay text out in*, so the renderer is
+    // chosen at construction (ADR-1) rather than tested inside `fragment()`: the
+    // piped branch builds the same surface it always did, and "inert off a
+    // terminal" holds by construction rather than by a conditional a later edit
+    // could invert.
+    //
+    // The width is queried here, at the construction site, and passed in as a
+    // number — `prompt::terminal_width()` is the one place it is read (BR-10),
+    // and `markdown.rs` never names it, so every layout decision below stays
+    // reachable from a test with no terminal in sight.
+    let mut surface = if interactive {
+        PlainSurface::with_markdown(std::io::stdout(), color, prompt::terminal_width())
+    } else {
+        stdout_surface_with_color(color)
+    };
     let mut state = SessionState::new();
     state.verbose = verbose;
     // The same terminal fact, carried on the state for the one arm that draws

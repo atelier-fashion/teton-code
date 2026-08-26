@@ -209,9 +209,32 @@ say the wrap is now the CLI's and not the terminal's.
 - **OQ-3 (conditional clause):** unconditional. A protocol hint to tell the daemon its client is a
   terminal buys back ~250 bytes of a budget with 710 spare, and the CLI is the only client that
   ships. Revisit when a second client exists.
-- **OQ-4 (`SIGWINCH`):** no handler. `terminal_width()` is read per flushed block, so a resize
-  takes effect on the next block and already-printed rows keep their breaks. There is no SIGINT
-  handler in the CLI today either; adding signal handling for cosmetics is not proportionate.
+- **OQ-4 (`SIGWINCH`):** no handler. A resize takes effect on the next block; already-printed rows
+  keep their breaks. There is no SIGINT handler in the CLI today either; adding signal handling for
+  cosmetics is not proportionate.
+
+  *Clarified during implementation (2026-08-26).* This decision originally said `terminal_width()`
+  is "read per flushed block", which contradicts ADR-1's `with_markdown(out, color, width)`
+  signature — the width is a **constructor parameter**, and it must stay one: `PlainSurface<W>` is
+  generic over its writer, `terminal_width()` reads `STDOUT_FILENO` specifically, and a surface
+  over a `Vec<u8>` in a unit test must never query a real terminal. Two of my own decisions
+  disagreed and the implementation followed the signature, so the width was simply frozen at
+  construction and a resize never took effect at all — which returns this REQ's own defect after
+  any narrowing resize. Resolved by refreshing the held width through a new `Surface::set_width`
+  (defaulted to a no-op, so the piped surface and the two non-`PlainSurface` implementors are
+  untouched), rather than by making the layout query it. The behaviour OQ-4 describes is preserved;
+  the mechanism is a setter, not a per-block read.
+
+  **Two call sites, and the frame loop alone is not enough.** The obvious one — the frame loop that
+  already calls `terminal_width()` for `entry_status`, so the refresh costs no extra `ioctl` — is
+  insufficient by itself, because the frame is drawn *before* the wait for input: a window dragged
+  while the user sat at the prompt would hand the next turn a width measured before the drag. The
+  decisive read is therefore in `next_interactive_line`'s `stdin_ready` arm, the last moment at
+  which a typed line is still a line and not yet a turn. Verified by mutation: deleting that read
+  leaves `a_resized_window_lays_the_next_turn_out_at_the_new_width` (pty) failing, while deleting
+  the frame-loop one changes no observable byte — the only text an idle drain renders goes out
+  through `line()`, which OQ-5 leaves unwrapped. The frame-loop call is kept because it is free and
+  becomes load-bearing the day OQ-5's follow-up wraps a notice.
 - **OQ-5 (`line()` kinds):** unwrapped, as the spec leaned. Wrapping them would move bytes several
   `cli_e2e` and `pty_e2e` fixtures pin, for a class of text that is short by construction. Filed as
   a follow-up if it still reads badly after this ships.

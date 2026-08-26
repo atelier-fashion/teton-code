@@ -7588,3 +7588,103 @@ fn on_a_pipe_at_guarded_a_model_issued_project_skill_is_refused_without_eating_t
          the `y` that followed it; output:\n{stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REQ-592 BR-7: the renderer is inert off a terminal
+// ---------------------------------------------------------------------------
+
+/// A reply carrying all three of the constructs the renderer rewrites.
+///
+/// A table (whose columns it would measure and re-pad), bold text (whose markers
+/// it would take out and replace with SGR), and a fenced block (whose delimiters
+/// it would swallow, and whose three lines are each written to be misread as
+/// something else the moment they are classified: a list item, an emphasis span
+/// and a table row). Nothing here survives a rendering pass unchanged, which is
+/// what makes "unchanged" an assertion worth making.
+///
+/// Written with no leading or trailing blank line because the scripted engine
+/// `trim()`s each block, and the constant has to be exactly the bytes the daemon
+/// will stream.
+const MARKDOWN_REPLY: &str = "\
+Here is the **summary** you asked for.
+
+| tier | provider |
+| --- | --- |
+| think | kimi |
+| build | local |
+
+```text
+- not a list item
+**not bold**
+| not | a | table |
+```
+
+That is the whole of it.";
+
+/// **AC-7 / BR-7: a pipe sees the model's bytes, not a rendering of them.**
+///
+/// The gate `main.rs` opened in TASK-281 is `IsTerminal on stdout`, and this is
+/// the other side of it. A scripted turn streams [`MARKDOWN_REPLY`] one
+/// space-separated token at a time; the CLI's stdout is a pipe, so it builds the
+/// surface it always built and the concatenated chunks land verbatim.
+///
+/// The single `contains` is the whole claim — the reply appears as one
+/// contiguous run of bytes, so every chunk boundary closed up exactly where the
+/// daemon left it and nothing was inserted, dropped or re-laid between them. The
+/// three assertions after it do not add to that; they exist so a failure names
+/// *which* transform leaked rather than printing a hundred-byte diff.
+///
+/// Why this cannot be left to the unit tests: `PlainSurface::new` and
+/// `PlainSurface::with_color` build a surface with no renderer, so every test
+/// that constructs one is inertness-by-assumption. Only a real process,
+/// deciding for itself whether it has a terminal, can say the *binary* takes
+/// that branch — which is the thing BR-7 promises and the thing an inverted gate
+/// would break in exactly the sessions no test watches.
+///
+/// **This test is the only guard BR-7 has. Measured, not assumed:** with the
+/// gate forced open (`if interactive` → `if true`, so the renderer runs on a
+/// pipe), all **75** pre-existing `cli_e2e` tests still pass and only this one
+/// fails. The reason is that every other fixture reply is a short plain
+/// paragraph, and a plain paragraph re-wrapped at the 80-column no-terminal
+/// default comes out byte-identical — so the suite's byte comparisons, including
+/// the exact occurrence counts, are structurally incapable of seeing an inverted
+/// gate. Nothing else in this file covers what this covers. Anyone deleting it as
+/// redundant is removing the whole of BR-7's coverage, and should re-run that
+/// experiment before believing otherwise.
+#[test]
+fn a_piped_session_streams_the_reply_unrendered() {
+    let daemon_bin = daemon_bin();
+    let daemon = TestDaemon::spawn_scripted(&daemon_bin, &[MARKDOWN_REPLY]);
+    let teton = teton_bin();
+
+    // Stdout alone: the claim is about the bytes the surface wrote, and folding
+    // stderr in would widen what counts as a match.
+    let (stdout, _stderr, _status) =
+        daemon.run_cli_streams(&teton, &[], "lay out the routing table\n", CliSeams::Off);
+
+    assert_eq!(
+        stdout.matches(MARKDOWN_REPLY).count(),
+        1,
+        "the piped reply is not the daemon's own bytes: the renderer ran off a \
+         terminal, or the stream was reassembled (BR-7, AC-7).\n--- expected \
+         verbatim ---\n{MARKDOWN_REPLY}\n--- stdout ---\n{stdout}"
+    );
+
+    // Which transform leaked, if one did.
+    for (what, needle) in [
+        ("the fence delimiters were swallowed", "```text"),
+        ("the bold markers were replaced", "**summary**"),
+        ("the table columns were re-padded", "| think | kimi |"),
+    ] {
+        assert!(
+            stdout.contains(needle),
+            "{what} — {needle:?} is missing from a piped session; stdout:\n{stdout}"
+        );
+    }
+
+    // And nothing painted: no SGR, no cursor motion. A pipe gets text.
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "an escape reached a pipe; stdout:\n{stdout:?}"
+    );
+}
