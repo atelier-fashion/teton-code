@@ -49,8 +49,7 @@ use teton_providers::{BlockDetail, HarnessProfile, ProviderError, ToolCall};
 use crate::broadcast::EventBus;
 
 use super::budget::{
-    self, skill_append_fit, BudgetInputs, RouteBudget, SkillCaller, SkillStage, LOCAL_BUDGET_BYTES,
-    LOCAL_BUDGET_TOKENS, LOCAL_DIGEST_THRESHOLD_BYTES, LOCAL_DIGEST_THRESHOLD_TOKENS,
+    self, skill_append_fit, BudgetInputs, RouteBudget, SkillCaller, SkillStage,
     LOCAL_GENERATION_RESERVATION,
 };
 use super::compact::COMPACT_DUTY;
@@ -385,14 +384,15 @@ pub struct HarnessConfig {
     /// BPE tokens), so the context is bounded in bytes too: bytes are a
     /// conservative proxy for BPE tokens (code averages ≳2 bytes per token).
     ///
-    /// The default is the local pair — `LOCAL_BUDGET_TOKENS` ×
-    /// [`APPROX_BYTES_PER_TOKEN`](super::context::APPROX_BYTES_PER_TOKEN),
-    /// which keeps a full assembled prompt within the local engine's
-    /// 16,384-token window (`LOCAL_ENGINE_N_CTX`) with headroom. A **remote**
-    /// route's bytes are not that bridge: [`super::budget::derive`] takes them
-    /// from the route's window at the 2 B/token BPE floor
-    /// (`DUTY_REQUEST_BYTES_PER_TOKEN`), because on a 128k window `words × 8`
-    /// would be a byte budget nothing measured. Like the word half, this is
+    /// The default is the local route's derived pair — since REQ-590 the local
+    /// tier's bytes come from the engine's own window at the 2 B/token BPE
+    /// floor (`DUTY_REQUEST_BYTES_PER_TOKEN`), the same rule every
+    /// window-derived route runs, rather than from `LOCAL_BUDGET_TOKENS ×
+    /// APPROX_BYTES_PER_TOKEN`. That is what keeps a full assembled prompt
+    /// *inside* the local engine's 16,384-token window (`LOCAL_ENGINE_N_CTX`)
+    /// instead of a whole generation past it. The `words × 8` bridge survives
+    /// only where there is no window at all to derive from — a provider
+    /// declaring `max_context = 0`. Like the word half, this is
     /// stamped by [`with_route_budget`](Self::with_route_budget) on the next
     /// route decision, so hand-sizing it for a different engine holds only
     /// until then.
@@ -463,16 +463,26 @@ pub struct HarnessConfig {
 
 impl Default for HarnessConfig {
     fn default() -> Self {
-        // The weak-model native shape. The pair and thresholds read the
-        // `LOCAL_*` constants from `harness::budget` — their one home
-        // (REQ-586, LESSON-456) — and `budget` carries the local derivation
-        // built from the same constants (the AC pins the two equal).
+        // The weak-model native shape. All five budget-bearing fields come off
+        // **one** local derivation, exactly as
+        // [`with_route_budget`](Self::with_route_budget) sets them for a routed
+        // turn — that method's whole purpose is that a config's pair and
+        // thresholds cannot disagree with the [`RouteBudget`] beside them, and
+        // a `Default` that set them from constants instead would be the one
+        // config in the crate that could (REQ-586 BR-8).
+        //
+        // Until REQ-590 the two were the same numbers by construction, because
+        // `derive`'s local arm returned the `LOCAL_*` constants. It now derives
+        // the local tier's pair from the engine's own window (ADR-2), so the
+        // constants and this pair are different values with different meanings
+        // — and this config runs on the local engine.
+        let budget = budget::derive(BudgetInputs::local());
         Self {
             max_turns: 12,
-            context_budget_tokens: LOCAL_BUDGET_TOKENS,
-            context_budget_bytes: LOCAL_BUDGET_BYTES,
-            summarize_threshold_tokens: LOCAL_DIGEST_THRESHOLD_TOKENS,
-            summarize_threshold_bytes: LOCAL_DIGEST_THRESHOLD_BYTES,
+            context_budget_tokens: budget.budget_tokens,
+            context_budget_bytes: budget.budget_bytes,
+            summarize_threshold_tokens: budget.digest_threshold_tokens,
+            summarize_threshold_bytes: budget.digest_threshold_bytes,
             max_tools: Some(5),
             require_verification: true,
             // Agent turns need room for prose plus a complete tool call. The
@@ -496,7 +506,7 @@ impl Default for HarnessConfig {
             // probes the root and sets it (REQ-583).
             session_root: None,
             known_projects: Vec::new(),
-            budget: budget::derive(BudgetInputs::local()),
+            budget,
         }
     }
 }

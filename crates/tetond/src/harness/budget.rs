@@ -11,19 +11,42 @@
 //!
 //! ```text
 //! derive(inputs):
-//!   if is_local                → default pair, bound = LocalEngine
+//!   if is_local                → window_pair(LOCAL_ENGINE_N_CTX,
+//!                                            LOCAL_GENERATION_RESERVATION),
+//!                                bound = LocalEngine
+//!                                (the floor may not raise it above the engine)
 //!   elif window == 0           → default pair, bound = DefaultUnknown
 //!   else:
 //!     window_eff = cap if 0 < cap < window (bound = UserCap) else window (Window)
-//!     usable     = window_eff − reservation   (saturating; may be 0)
-//!     tokens     = max(usable × 2 / 3, MIN_BUDGET_TOKENS)
-//!     bytes      = max(usable × 2,     MIN_BUDGET_BYTES)
+//!     window_pair(window_eff, reservation):
+//!       usable   = window_eff − reservation   (saturating; may be 0)
+//!       tokens   = max(usable × 2 / 3, MIN_BUDGET_TOKENS)
+//!       bytes    = max(usable × 2,     MIN_BUDGET_BYTES)
 //!     if redact_scan and bytes > REDACT_SCANNABLE_CONTEXT_BYTES:
 //!         bytes = REDACT_SCANNABLE_CONTEXT_BYTES; bound = RedactScan
 //!         (applies LAST; the word component stays window-derived — BR-4)
 //!   digest thresholds = today's fraction of the pair, capped by the
 //!                       absolute ceiling
 //! ```
+//!
+//! ## The local tier derives, it does not default (REQ-590 BR-1/BR-2/BR-4)
+//!
+//! The local arm used to return the default pair, which is how a 4,097-word
+//! turn came to be refused against a 4,096-word budget on an engine holding
+//! 16,384 tokens. It now runs the **same formula** as a declared window, over
+//! the window the daemon actually loads with: `16,384 − 1,024 = 15,360`
+//! usable → **10,240 words / 30,720 bytes**. The bound stays `LocalEngine`
+//! because the source of the number is the engine, not a provider declaration
+//! anyone can edit (BR-6).
+//!
+//! The one place the two arms differ is the floor. `MIN_BUDGET_*` raises a
+//! pair derived from a **declaration** — a provider's promise, which the
+//! provider may then refuse against, saying so. The engine's `n_ctx` is an
+//! allocation, and a budget above it buys nothing a turn can spend, so the
+//! floor is held to the engine's own window there (BR-8). At 16,384 the floor
+//! never bites either way; the rule is latent, stated, and tested at a
+//! synthetic window so that whoever lowers that constant inherits the rule
+//! rather than the bug.
 //!
 //! Precedence, stated once and tested pairwise: `LocalEngine` >
 //! `DefaultUnknown` > (`RedactScan` when it bites) > `UserCap` > `Window`.
@@ -90,31 +113,35 @@ use super::context::{ContextManager, Fit, APPROX_BYTES_PER_TOKEN};
 use super::duty::DUTY_REQUEST_BYTES_PER_TOKEN;
 use super::permissions::{OverBudgetOptionLabels, OverBudgetRemedyLabels};
 use crate::egress::redact::REDACT_SCANNABLE_CONTEXT_BYTES;
+use crate::runtime::LOCAL_ENGINE_N_CTX;
 use crate::skills::SkillSource;
 
-/// The default context budget in whitespace-approximated tokens — **the one
-/// home** of the local pair's word half (LESSON-456).
+/// The **no-better-fact** context budget in whitespace-approximated tokens —
+/// **the one home** of the default pair's word half (LESSON-456).
 ///
-/// This is the weak-model native budget every route without a better fact
-/// runs under: the local tier (whose real window is the engine's `n_ctx`, not
-/// the provider's declaration), a remote provider with `max_context = 0`
-/// (BR-3: defaulted, and stated), and the unresolvable-route
-/// `HarnessConfig::default()`. 4,096 words × [`APPROX_BYTES_PER_TOKEN`] fits
-/// the local engine's 16,384-token window with headroom. Pinned by AC-1
-/// ("`max_context = 0` yields today's `(4096, 32768)`") and the existing
-/// margin tests; `HarnessConfig::default()` reads it from here — the literal
-/// has no second home (TASK-192's one-home grep).
+/// This is the weak-model native budget a route with genuinely no window fact
+/// runs under: a remote provider with `max_context = 0` (BR-3: defaulted, and
+/// stated). Pinned by REQ-586 AC-1 ("`max_context = 0` yields today's
+/// `(4096, 32768)`") and the existing margin tests; the literal has no second
+/// home (TASK-192's one-home grep).
+///
+/// **The local tier is no longer one of its callers** (REQ-590 ADR-2/ADR-4).
+/// The local route has a window fact — [`LOCAL_ENGINE_N_CTX`], the allocation
+/// the daemon loads with — so [`derive`]'s local arm derives from it like any
+/// other window instead of reaching for this pair. This constant is unchanged
+/// and stays exactly where it was: what moved is which routes read it, not
+/// what it says.
 pub const LOCAL_BUDGET_TOKENS: usize = 4_096;
 
 /// The default context budget's byte half: [`LOCAL_BUDGET_TOKENS`] bridged at
 /// [`APPROX_BYTES_PER_TOKEN`] (8 B per whitespace word) = 32,768 bytes.
 ///
-/// The word bridge, not the BPE floor: on the *local* pair bytes are derived
+/// The word bridge, not the BPE floor: on the *default* pair bytes are derived
 /// from words (a whitespace word of code averages ~7–8 bytes), which is the
-/// pre-REQ-586 rule unchanged (OQ-3). Remote pairs derive bytes from the
-/// window with [`DUTY_REQUEST_BYTES_PER_TOKEN`] instead — see
-/// [`derive`]. Pinned by AC-1 and the redact margin tests, which measure the
-/// default (local) shape (AC-13).
+/// pre-REQ-586 rule unchanged (OQ-3). Every **window-derived** pair — the
+/// local tier's included, since REQ-590 — derives its bytes from the window
+/// with [`DUTY_REQUEST_BYTES_PER_TOKEN`] instead; see [`derive`]. Pinned by
+/// REQ-586 AC-1, on the `max_context = 0` route that still runs under it.
 pub const LOCAL_BUDGET_BYTES: usize = LOCAL_BUDGET_TOKENS * APPROX_BYTES_PER_TOKEN;
 
 /// The smallest byte budget a route with a **declared** window may derive —
@@ -411,6 +438,26 @@ pub struct BudgetInputs<'a> {
 impl BudgetInputs<'_> {
     /// The local route's inputs: what `HarnessConfig::default()` derives its
     /// budget from, and the shape the router uses for the local tier.
+    ///
+    /// # Why the window and the reservation are still zero here
+    ///
+    /// They are the *provider's* facts — `capabilities.max_context` and the
+    /// `max_tokens` a remote route reserves out of it — and the local tier has
+    /// neither: no declaration to read, and nothing between the daemon and its
+    /// own engine. Since REQ-590 [`derive`]'s local arm has derived from
+    /// [`LOCAL_ENGINE_N_CTX`] and [`LOCAL_GENERATION_RESERVATION`]
+    /// **directly**, so filling these in would restate the same two constants
+    /// in a second place that no arm reads (LESSON-456).
+    ///
+    /// It would also cost two guards that depend on this value carrying no
+    /// window. [`derive`]'s local arm ignores `window`, `cap` and `redact_scan`
+    /// whatever they hold — `precedence_is_pinned_pairwise` sets all three and
+    /// pins that the pair does not move — and [`proposed_window`] derives its
+    /// candidate as `BudgetInputs { window: recipe.max_context, is_local:
+    /// false, ..route }`, whose `is_local: false` is mutation-tested by
+    /// `a_local_route_is_offered_the_window_of_the_provider_it_would_bind_to`.
+    /// A window here would make the local arm's own numbers depend on a caller,
+    /// and that mutation would stop reddening.
     #[must_use]
     pub const fn local() -> Self {
         Self {
@@ -460,9 +507,11 @@ pub struct RouteBudget {
     /// a budget bigger than the cap. The floor's cost was documented at
     /// [`MIN_BUDGET_BYTES`] from the start; this is what carries it to a user.
     ///
-    /// Never true for the [`BudgetBound::LocalEngine`] or
-    /// [`BudgetBound::DefaultUnknown`] arms: those return the default pair by
-    /// decision rather than by a clamp, and nothing was raised.
+    /// Never true for the [`BudgetBound::DefaultUnknown`] arm, which returns
+    /// the default pair by decision rather than by a clamp, and never true for
+    /// [`BudgetBound::LocalEngine`] either — that arm derives from a window,
+    /// but the floor is [`Floor::HeldToTheEngine`] there, so nothing is ever
+    /// raised (BR-8). Both mean the same thing here: nothing was raised.
     pub floored: bool,
     /// The provider whose declaration this pair was derived from, sanitized
     /// exactly as [`Self::window_label`] sanitizes it — `None` on the local
@@ -526,11 +575,31 @@ pub struct RouteBudget {
 #[must_use]
 pub fn derive(inputs: BudgetInputs<'_>) -> RouteBudget {
     if inputs.is_local {
-        // `None`, deliberately, even when the routing table gave the local tier
-        // a provider id: the local window is not a provider's declaration, so
-        // there is no `capabilities.max_context` for anyone to go and set. The
-        // label says the same thing, which is the invariant.
-        return default_pair(BudgetBound::LocalEngine, labelled_provider(None));
+        // The engine's own window, not `inputs.window`: the local tier has no
+        // `capabilities.max_context` to read, and the two fields that describe
+        // one are ignored here on purpose (see [`BudgetInputs::local`]). The
+        // window is [`LOCAL_ENGINE_N_CTX`] — the allocation `LlamaEngine::load`
+        // asks for, which llama.cpp does not clamp downward (REQ-590 D-1) — and
+        // the reservation is the constant the adapters send as `max_tokens`,
+        // read directly rather than through [`generation_reservation`] so this
+        // arm cannot close the `default() → derive() → …` cycle ADR-1 describes.
+        //
+        // `labelled_provider(None)` deliberately, even when the routing table
+        // gave the local tier a provider id: the local window is not a
+        // provider's declaration, so there is no `capabilities.max_context` for
+        // anyone to go and set. The label says the same thing, which is the
+        // invariant, and the bound stays `LocalEngine` so BR-6's remedy is the
+        // one about binding the tier remote rather than the one about editing a
+        // field that does not exist.
+        return budget_of(
+            window_pair(
+                LOCAL_ENGINE_N_CTX,
+                LOCAL_GENERATION_RESERVATION,
+                Floor::HeldToTheEngine,
+            ),
+            BudgetBound::LocalEngine,
+            labelled_provider(None),
+        );
     }
     if inputs.window == 0 {
         return default_pair(
@@ -546,35 +615,14 @@ pub fn derive(inputs: BudgetInputs<'_>) -> RouteBudget {
     } else {
         (inputs.window, BudgetBound::Window)
     };
-    let usable = window_eff.saturating_sub(inputs.reservation) as usize;
-
-    // Words: usable ÷ (3/2) — the safety ratio guarantees N words claim at
-    // most `usable` provider tokens (AC-3). Bytes: the 2 B/token BPE floor
-    // (AC-3; reused from duty.rs — gotcha #12: not a third number).
-    //
-    // Both are held at the floor rather than allowed to fall to nothing, and a
-    // reservation that swallows the whole window lands there too — a small or
-    // fully-reserved window may never reach for the *default* pair, which is
-    // larger than the window said and would report a bound the route does not
-    // have (verify M1). The floor only ever raises, never lowers, so no route
-    // with room to spare is touched by it.
-    let window_tokens = usable * REMOTE_TOKENS_PER_WORD_DEN / REMOTE_TOKENS_PER_WORD_NUM;
-    let window_bytes = usable * DUTY_REQUEST_BYTES_PER_TOKEN;
-    let budget_tokens = window_tokens.max(MIN_BUDGET_TOKENS);
-    let mut budget_bytes = window_bytes.max(MIN_BUDGET_BYTES);
-    // Whether the floor *bit*, kept as a fact rather than left implicit in the
-    // numbers: a surface comparing the pair against the floor would be
-    // re-deriving the thing this module exists to decide once (BR-8), and the
-    // bound alone cannot say it — `UserCap` is the same bound whether the cap
-    // is in force or has been overruled by the floor (TASK-194 2b).
-    let floored = window_tokens < MIN_BUDGET_TOKENS || window_bytes < MIN_BUDGET_BYTES;
+    let mut pair = window_pair(window_eff, inputs.reservation, Floor::RaisesADeclaration);
 
     // The redact clamp applies LAST and names the bound only when it bites
     // (BR-4): the scan is byte-denominated, so only bytes clamp — the word
     // component stays window-derived and the byte guard binds.
     let (mut window_label, provider_id) = labelled_provider(inputs.provider_id);
-    if inputs.redact_scan && budget_bytes > REDACT_SCANNABLE_CONTEXT_BYTES {
-        budget_bytes = REDACT_SCANNABLE_CONTEXT_BYTES;
+    if inputs.redact_scan && pair.bytes > REDACT_SCANNABLE_CONTEXT_BYTES {
+        pair.bytes = REDACT_SCANNABLE_CONTEXT_BYTES;
         bound = BudgetBound::RedactScan;
         // The clamp renames the **window**, not the provider: this route is
         // still `kimi`'s, and `capabilities.max_context` for `kimi` is still
@@ -584,22 +632,128 @@ pub fn derive(inputs: BudgetInputs<'_>) -> RouteBudget {
         window_label = REDACT_WINDOW_LABEL.to_owned();
     }
 
+    budget_of(pair, bound, (window_label, provider_id))
+}
+
+/// Whether [`MIN_BUDGET_TOKENS`]/[`MIN_BUDGET_BYTES`] may raise the pair a
+/// window derives (REQ-590 BR-8) — the one place [`derive`]'s two
+/// window-derived arms differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Floor {
+    /// The window is a **declaration**, so the floor raises a pair derived
+    /// below it and the route reports [`RouteBudget::floored`] (verify M1).
+    ///
+    /// The honest cost is [`MIN_BUDGET_BYTES`]'s own: the budget then admits
+    /// more than the declaration said, and those turns are sent knowing the
+    /// provider may refuse them — which a provider can do, in words a user can
+    /// read. That trade is what makes raising past a declaration acceptable.
+    RaisesADeclaration,
+    /// The window is the **engine's allocation**, so the floor may not raise
+    /// the pair above it (BR-8).
+    ///
+    /// There is no provider to refuse and explain here: `n_ctx` is memory the
+    /// daemon already asked for, and a budget above it buys nothing a turn can
+    /// spend — it only moves the failure from this module's own guard, which
+    /// says what happened, to the engine's over-window error, which the user
+    /// reads as the local model breaking. The floor's "only ever raises"
+    /// property is safe against a promise and is not safe against an
+    /// allocation.
+    ///
+    /// **Latent at today's constants** — 30,720 bytes is well clear of the
+    /// 16,384-byte floor, so this arm and [`Self::RaisesADeclaration`] agree at
+    /// [`LOCAL_ENGINE_N_CTX`] and AC-1's "one formula" claim is exact. It
+    /// becomes live only if that constant falls, which is precisely when
+    /// nobody will be thinking about this file, so it is written down and
+    /// tested at a synthetic window now (AC-15).
+    ///
+    /// It does **not** claim a small engine would then work: at a
+    /// 4,096-token `n_ctx` the derived byte half is 6,144, which
+    /// [`MIN_BUDGET_BYTES`] documents as below the smallest prompt the harness
+    /// can produce. That case is REQ-590's OQ-2, and this rule does not pretend
+    /// to resolve it — it only refuses to make it worse by inventing room the
+    /// engine does not have.
+    HeldToTheEngine,
+}
+
+/// The window-derived pair, before the redact clamp and before the digest
+/// thresholds are scaled to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowPair {
+    tokens: usize,
+    bytes: usize,
+    floored: bool,
+}
+
+/// **The one formula** (REQ-590 AC-1): a window and the generation it reserves
+/// become a `(words, bytes)` pair, whether that window is a provider's
+/// declaration or the local engine's `n_ctx`.
+///
+/// Words: `usable ÷ (3/2)` — the safety ratio guarantees N words claim at most
+/// `usable` provider tokens (REQ-586 AC-3). Bytes: the 2 B/token BPE floor
+/// (reused from `duty.rs` — gotcha #12: not a third number).
+///
+/// Both are held at [`Floor`] rather than allowed to fall to nothing, and a
+/// reservation that swallows the whole window lands there too — a small or
+/// fully-reserved *declaration* may never reach for the default pair, which is
+/// larger than the window said and would report a bound the route does not have
+/// (verify M1). The floor only ever raises, never lowers, so no route with room
+/// to spare is touched by it either way.
+fn window_pair(window_eff: u32, reservation: u32, floor: Floor) -> WindowPair {
+    let usable = window_eff.saturating_sub(reservation) as usize;
+    let window_tokens = usable * REMOTE_TOKENS_PER_WORD_DEN / REMOTE_TOKENS_PER_WORD_NUM;
+    let window_bytes = usable * DUTY_REQUEST_BYTES_PER_TOKEN;
+    match floor {
+        // Whether the floor *bit* is kept as a fact rather than left implicit
+        // in the numbers: a surface comparing the pair against the floor would
+        // be re-deriving the thing this module exists to decide once (BR-8),
+        // and the bound alone cannot say it — `UserCap` is the same bound
+        // whether the cap is in force or has been overruled by the floor
+        // (TASK-194 2b).
+        Floor::RaisesADeclaration => WindowPair {
+            tokens: window_tokens.max(MIN_BUDGET_TOKENS),
+            bytes: window_bytes.max(MIN_BUDGET_BYTES),
+            floored: window_tokens < MIN_BUDGET_TOKENS || window_bytes < MIN_BUDGET_BYTES,
+        },
+        // Equivalently: raise to the floor, then hold the result to what the
+        // window itself holds — which is the window, every time the floor would
+        // have bitten. `floored` is false because nothing was raised, and that
+        // is what the field means (TASK-194 2b), not "the floor was consulted".
+        Floor::HeldToTheEngine => WindowPair {
+            tokens: window_tokens,
+            bytes: window_bytes,
+            floored: false,
+        },
+    }
+}
+
+/// Assemble a derived pair into the fact the router stamps: the bound, the
+/// window's name and id, and the `digest` thresholds scaled to **this** pair.
+///
+/// Called after the redact clamp, never before, so the thresholds are a
+/// fraction of the budget the turn actually runs under rather than of the
+/// unclamped one (BR-4/BR-6).
+fn budget_of(
+    pair: WindowPair,
+    bound: BudgetBound,
+    labelled: (String, Option<String>),
+) -> RouteBudget {
+    let (window_label, provider_id) = labelled;
     let (digest_threshold_tokens, digest_threshold_bytes) =
-        digest_thresholds(budget_tokens, budget_bytes);
+        digest_thresholds(pair.tokens, pair.bytes);
     RouteBudget {
-        budget_tokens,
-        budget_bytes,
+        budget_tokens: pair.tokens,
+        budget_bytes: pair.bytes,
         bound,
         window_label,
         digest_threshold_tokens,
         digest_threshold_bytes,
-        floored,
+        floored: pair.floored,
         provider_id,
     }
 }
 
-/// The default (local) pair with the given bound and label — the
-/// `LocalEngine`/`DefaultUnknown` arms of [`derive`].
+/// The default pair with the given bound and label — [`derive`]'s
+/// `DefaultUnknown` arm, and since REQ-590 that arm alone.
 /// The label and its id arrive as one value from [`labelled_provider`], so this
 /// constructor cannot be handed a label naming one provider and an id naming
 /// another (REQ-587 BR-7).
@@ -2661,11 +2815,22 @@ mod tests {
     fn derivation_table() {
         let rows: &[(&str, BudgetInputs<'_>, usize, usize, BudgetBound)] = &[
             (
-                "local route yields the default pair",
+                // REQ-590: usable = 16,384 − 1,024 = 15,360; ×2/3 = 10,240;
+                // ×2 = 30,720. The engine's window, run through the same
+                // formula as any declaration — the row below is that same
+                // window declared by a provider, and the two must agree (AC-1).
+                "local route derives from the engine's window",
                 BudgetInputs::local(),
-                LOCAL_BUDGET_TOKENS,
-                LOCAL_BUDGET_BYTES,
+                10_240,
+                30_720,
                 BudgetBound::LocalEngine,
+            ),
+            (
+                "a declared 16,384-token window derives the same pair",
+                remote(LOCAL_ENGINE_N_CTX, 0, false),
+                10_240,
+                30_720,
+                BudgetBound::Window,
             ),
             (
                 "window 0 defaults, stated",
@@ -2781,6 +2946,237 @@ mod tests {
             assert_eq!(got.budget_bytes, *bytes, "{name}: budget_bytes");
             assert_eq!(got.bound, *bound, "{name}: bound");
         }
+    }
+
+    /// **AC-4 (BR-1/BR-4): the local byte budget never claims more provider
+    /// tokens than the engine the turn runs on can hold.**
+    ///
+    /// The property, in the byte currency the guard is actually denominated in:
+    /// `budget_bytes / DUTY_REQUEST_BYTES_PER_TOKEN` is the worst-case token
+    /// count a full budget claims, and it may not exceed
+    /// `LOCAL_ENGINE_N_CTX − LOCAL_GENERATION_RESERVATION` — the tokens left
+    /// after the generation the daemon has already promised itself.
+    ///
+    /// **This assertion failed against the pre-REQ-590 constants and that is
+    /// the point**: the default pair's 32,768 bytes claimed 16,384 tokens
+    /// against 15,360 usable, so a local turn at full budget was over the
+    /// engine's window by a whole generation's worth before it was assembled.
+    /// It was run red on purpose before the derivation moved.
+    ///
+    /// `REDACT_PROMPT_BUDGET_BYTES` (`redact.rs:133`) is the same arithmetic
+    /// over the same window and the same 1,024-token generation, and it has
+    /// been 30,720 all along — the harness's own context budget was the one
+    /// consumer of this window that did not follow the rule.
+    #[test]
+    fn the_local_byte_budget_fits_the_engines_own_window() {
+        let usable = (LOCAL_ENGINE_N_CTX - LOCAL_GENERATION_RESERVATION) as usize;
+        let local = derive(BudgetInputs::local());
+        let claimed = local.budget_bytes / DUTY_REQUEST_BYTES_PER_TOKEN;
+        assert!(
+            claimed <= usable,
+            "the local byte budget claims {claimed} provider tokens against {usable} the engine \
+             can hold"
+        );
+    }
+
+    /// **AC-1: one formula, driven from both sides.** The local tier's pair is
+    /// exactly what a *provider* declaring the same window under the same
+    /// reservation derives — the whole difference between the two arms is the
+    /// bound they stamp, because only one of them has a `capabilities.max_context`
+    /// behind it (BR-6).
+    ///
+    /// The hand arithmetic is asserted too, so the two sides moving together
+    /// cannot hide a move: an equality between two calls into one function is a
+    /// tautology the moment the function is wrong in both.
+    #[test]
+    fn the_local_pair_is_what_the_same_window_declared_would_derive() {
+        assert_eq!(
+            RESERVATION, LOCAL_GENERATION_RESERVATION,
+            "the declared side must run under the reservation the local arm reads, or `the same \
+             reservation` is not what is being compared"
+        );
+        let local = derive(BudgetInputs::local());
+        let declared = derive(remote(LOCAL_ENGINE_N_CTX, 0, false));
+
+        assert_eq!(
+            (local.budget_tokens, local.budget_bytes),
+            (declared.budget_tokens, declared.budget_bytes),
+            "the local tier derives a different pair than the same window declared"
+        );
+        assert_eq!(
+            (local.digest_threshold_tokens, local.digest_threshold_bytes),
+            (
+                declared.digest_threshold_tokens,
+                declared.digest_threshold_bytes
+            ),
+            "the thresholds are a fraction of the pair, so they follow it or the pair is not \
+             really shared"
+        );
+        assert_eq!((local.floored, declared.floored), (false, false));
+        // usable = 16,384 − 1,024 = 15,360; ×2/3 = 10,240; ×2 = 30,720.
+        assert_eq!((local.budget_tokens, local.budget_bytes), (10_240, 30_720));
+
+        // The one thing that differs, and the reason the arm exists at all.
+        assert_eq!(local.bound, BudgetBound::LocalEngine);
+        assert_eq!(declared.bound, BudgetBound::Window);
+
+        // Non-vacuity: the formula really is reading the window, so a different
+        // window is a different pair rather than a constant wearing two names.
+        let doubled = derive(remote(LOCAL_ENGINE_N_CTX * 2, 0, false));
+        assert_ne!(doubled.budget_tokens, local.budget_tokens);
+    }
+
+    /// **AC-2 (BR-2/BR-6): the default config's budget is still bound by the
+    /// local engine, asserted as the bound and as the sentence the bound
+    /// renders** — never as the numbers.
+    ///
+    /// **The mutation this exists for**: delete [`derive`]'s `is_local` arm.
+    /// `HarnessConfig::default()` then falls through to the `window == 0` path,
+    /// which stamps [`BudgetBound::DefaultUnknown`] and makes [`bound_clause`]
+    /// append *"— set `capabilities.max_context` for this provider"* — the one
+    /// remedy BR-6 forbids on a route that has no provider declaration for
+    /// anyone to go and edit. Every numeric pin on this config
+    /// (`turn_loop.rs:465-468` among them) stays green through that mutation,
+    /// because the default pair and the derived pair would both be reported
+    /// under a bound nobody checked.
+    #[test]
+    fn the_default_configs_budget_is_still_bound_by_the_local_engine() {
+        assert_eq!(
+            HarnessConfig::default().budget.bound,
+            BudgetBound::LocalEngine
+        );
+        assert_eq!(
+            derive(BudgetInputs::local()).bound,
+            BudgetBound::LocalEngine
+        );
+
+        let clause = bound_clause(&derive(BudgetInputs::local()), None);
+        assert_eq!(clause, "bound: local engine");
+        assert!(
+            !clause.contains("capabilities.max_context"),
+            "BR-6: the local route has no provider declaration to send anyone to: {clause}"
+        );
+        // Non-vacuity: the arm this would fall through to does say it.
+        assert!(bound_clause(&derive(remote(0, 0, false)), Some("kimi"))
+            .contains("set `capabilities.max_context`"));
+    }
+
+    /// **AC-3: `HarnessConfig::default()` and the local derivation both
+    /// terminate.**
+    ///
+    /// Passing is not the criterion — *returning* is. `HarnessConfig::default()`
+    /// builds its budget through [`derive`], and until REQ-590 the local arm
+    /// returned before reading anything; now it reads the reservation, so if it
+    /// ever read it back off a default-constructed config the two would recurse
+    /// until the stack ended. The guard is that
+    /// [`LOCAL_GENERATION_RESERVATION`] is a constant and
+    /// [`generation_reservation`] returns it directly (ADR-1) — this test is
+    /// what notices if either stops being true.
+    #[test]
+    fn the_default_config_and_the_local_derivation_both_terminate() {
+        let config = HarnessConfig::default();
+        let local = derive(BudgetInputs::local());
+        assert_eq!(config.budget, local);
+        assert_eq!(generation_reservation(), LOCAL_GENERATION_RESERVATION);
+        assert_eq!(
+            config.gen_params.max_tokens, LOCAL_GENERATION_RESERVATION,
+            "the budget subtracts the generation the adapters actually send"
+        );
+    }
+
+    /// **AC-5 (BR-5, REQ-586 AC-1): `max_context = 0` still yields
+    /// `(4,096, 32,768)` under `DefaultUnknown`** — on a route that is *not*
+    /// the local one, so it cannot pass by the two pairs happening to match.
+    ///
+    /// The constants did not move; what moved is which routes read them
+    /// (ADR-4). The inequality below is the half that makes this test
+    /// non-vacuous: it is now false that "the default pair" and "the local
+    /// pair" are the same numbers, and a change that quietly re-pointed the
+    /// `max_context = 0` route at the engine's window would be caught here
+    /// rather than in a surface that prints a window nobody declared.
+    #[test]
+    fn a_declared_window_of_zero_still_yields_the_default_pair() {
+        assert_eq!(LOCAL_BUDGET_TOKENS, 4_096);
+        assert_eq!(LOCAL_BUDGET_BYTES, 32_768);
+
+        let defaulted = derive(remote(0, 0, false));
+        assert_eq!(
+            (defaulted.budget_tokens, defaulted.budget_bytes),
+            (LOCAL_BUDGET_TOKENS, LOCAL_BUDGET_BYTES)
+        );
+        assert_eq!(defaulted.bound, BudgetBound::DefaultUnknown);
+        assert!(!defaulted.floored);
+
+        let local = derive(BudgetInputs::local());
+        assert_ne!(
+            (defaulted.budget_tokens, defaulted.budget_bytes),
+            (local.budget_tokens, local.budget_bytes),
+            "the two arms return different pairs now, which is what makes this row a test"
+        );
+    }
+
+    /// **AC-15 (BR-8): the floor may never raise the local pair above what the
+    /// engine can hold.**
+    ///
+    /// Latent at today's constants — 30,720 bytes is nowhere near the
+    /// 16,384-byte floor — so it is exercised at a **synthetic** window, on the
+    /// same helper the local arm runs, paired with a window large enough that
+    /// the floor does not bite. A criterion that can only run on a
+    /// configuration nobody ships is a criterion that never runs.
+    ///
+    /// The last block is what makes the small row non-vacuous: put the *same*
+    /// window through [`Floor::RaisesADeclaration`] and the floor does raise it
+    /// past what such an engine could hold — 16,384 bytes is 8,192 provider
+    /// tokens against a 4,096-token window. That is the right answer for a
+    /// declaration, which a provider can refuse against and say so, and the
+    /// wrong one for an allocation.
+    #[test]
+    fn the_floor_never_raises_the_local_pair_above_the_engines_window() {
+        for n_ctx in [4_096u32, 9_000, LOCAL_ENGINE_N_CTX, 65_536] {
+            let pair = window_pair(n_ctx, LOCAL_GENERATION_RESERVATION, Floor::HeldToTheEngine);
+            let usable = (n_ctx - LOCAL_GENERATION_RESERVATION) as usize;
+            let claimed = pair.bytes / DUTY_REQUEST_BYTES_PER_TOKEN;
+            assert!(
+                claimed <= usable,
+                "a {n_ctx}-token engine would run a budget claiming {claimed} tokens against \
+                 {usable} usable"
+            );
+            assert!(
+                pair.tokens * REMOTE_TOKENS_PER_WORD_NUM / REMOTE_TOKENS_PER_WORD_DEN <= usable,
+                "{n_ctx}: the word half claims more than the engine holds"
+            );
+            assert!(
+                !pair.floored,
+                "{n_ctx}: nothing was raised, so nothing is floored"
+            );
+        }
+
+        // The large window is not passing because the floor never applies: at
+        // 16,384 both policies agree, which is exactly AC-1's claim.
+        assert_eq!(
+            window_pair(
+                LOCAL_ENGINE_N_CTX,
+                LOCAL_GENERATION_RESERVATION,
+                Floor::HeldToTheEngine
+            ),
+            window_pair(
+                LOCAL_ENGINE_N_CTX,
+                LOCAL_GENERATION_RESERVATION,
+                Floor::RaisesADeclaration
+            )
+        );
+        // And the small one is: a declaration of the same size is raised past
+        // the window it declared, deliberately (verify M1, MIN_BUDGET_BYTES).
+        let declared = window_pair(
+            4_096,
+            LOCAL_GENERATION_RESERVATION,
+            Floor::RaisesADeclaration,
+        );
+        assert!(declared.floored);
+        assert!(
+            declared.bytes / DUTY_REQUEST_BYTES_PER_TOKEN > 4_096,
+            "the row above would be vacuous if the floor did not bite at this window"
+        );
     }
 
     /// **REQ-587 BR-7: the label names the provider the field carries, and
@@ -3186,7 +3582,10 @@ mod tests {
         };
         assert_eq!(derive(local_all).bound, BudgetBound::LocalEngine);
         // LocalEngine > RedactScan / UserCap / Window: local with everything
-        // set — the pair is the default, unclamped.
+        // set — the pair is the engine's own, underived from any of it and
+        // unclamped. Since REQ-590 the local arm derives a pair, but it derives
+        // it from [`LOCAL_ENGINE_N_CTX`], so a caller's window, cap and
+        // redact-scan posture still move nothing.
         let got = derive(BudgetInputs {
             window: 200_000,
             ..local_all
@@ -3194,8 +3593,10 @@ mod tests {
         assert_eq!(got.bound, BudgetBound::LocalEngine);
         assert_eq!(
             (got.budget_tokens, got.budget_bytes),
-            (LOCAL_BUDGET_TOKENS, LOCAL_BUDGET_BYTES)
+            (10_240, 30_720),
+            "a 200k window on a local route must not move the engine's pair"
         );
+        assert_eq!(derive(local_all), got, "nor must the window move it at all");
         // DefaultUnknown > UserCap: no window, a cap set — the cap has
         // nothing to ceiling.
         assert_eq!(
@@ -3227,18 +3628,40 @@ mod tests {
         assert_eq!(derive(remote(128_000, 0, false)).bound, BudgetBound::Window);
     }
 
-    /// AC-9's default-route half: the local pair's thresholds are exactly
-    /// today's literals — byte-identical, not merely proportional.
+    /// REQ-586 AC-9's default-route half: the **default** pair's thresholds are
+    /// exactly today's literals — byte-identical, not merely proportional.
+    ///
+    /// The local route left this row in REQ-590 and is asserted below instead:
+    /// its thresholds are the same fraction of a pair that moved, so they moved
+    /// with it. Sweeping the two together would have hidden that.
     #[test]
     fn digest_thresholds_on_the_default_route_are_todays() {
-        for inputs in [BudgetInputs::local(), remote(0, 0, false)] {
-            let got = derive(inputs);
-            assert_eq!(got.digest_threshold_tokens, 1_500);
-            assert_eq!(got.digest_threshold_bytes, 12_000);
-        }
+        let got = derive(remote(0, 0, false));
+        assert_eq!(got.digest_threshold_tokens, 1_500);
+        assert_eq!(got.digest_threshold_bytes, 12_000);
         assert_eq!(LOCAL_DIGEST_THRESHOLD_TOKENS, 1_500);
         assert_eq!(LOCAL_DIGEST_THRESHOLD_BYTES, 12_000);
         assert_eq!(LOCAL_BUDGET_BYTES, 32_768);
+    }
+
+    /// **D-3, accepted**: the local route's `digest` thresholds follow its pair,
+    /// and the two halves move in *opposite* directions.
+    ///
+    /// Words rise 1,500 → 3,750 because the word budget rose 4,096 → 10,240;
+    /// bytes fall 12,000 → 11,250 because the byte budget fell 32,768 → 30,720.
+    /// Each half is scaled by its own constant (`digest_thresholds`), so the
+    /// asymmetry is arithmetic rather than a bug — pinned here so it is read
+    /// as such.
+    #[test]
+    fn digest_thresholds_on_the_local_route_follow_its_derived_pair() {
+        let local = derive(BudgetInputs::local());
+        // 10,240 × 1,500 / 4,096 = 3,750;  30,720 × 12,000 / 32,768 = 11,250.
+        assert_eq!(
+            (local.digest_threshold_tokens, local.digest_threshold_bytes),
+            (3_750, 11_250)
+        );
+        assert!(local.digest_threshold_tokens > LOCAL_DIGEST_THRESHOLD_TOKENS);
+        assert!(local.digest_threshold_bytes < LOCAL_DIGEST_THRESHOLD_BYTES);
     }
 
     /// The thresholds scale as `min(fraction, ceiling)` on both currencies:
@@ -3318,23 +3741,53 @@ mod tests {
         );
     }
 
-    /// One source (task AC): `HarnessConfig::default()` carries `derive(local)`
-    /// and its pair is the `LOCAL_*` constants — the literals moved here and
-    /// nothing recomputes them.
+    /// One source (task AC): `HarnessConfig::default()` carries `derive(local)`,
+    /// and its four budget-bearing scalars are **that** budget's — not a second
+    /// set of numbers that happen to agree.
+    ///
+    /// They did agree by construction until REQ-590, because the local arm
+    /// returned the `LOCAL_*` constants the config also read. Now the two are
+    /// different values, and `with_route_budget`'s invariant — "a config's
+    /// budget-bearing fields cannot disagree with the [`RouteBudget`] beside
+    /// them" — is the thing being asserted rather than a coincidence being
+    /// re-observed. Reading the constants here again would give this one config
+    /// a pair its own `budget` field contradicts, which is the two-facts split
+    /// REQ-586 BR-8 exists to prevent.
     #[test]
     fn harness_config_default_reads_this_module() {
         let config = HarnessConfig::default();
-        assert_eq!(config.budget, derive(BudgetInputs::local()));
+        let local = derive(BudgetInputs::local());
+        assert_eq!(config.budget, local);
         assert_eq!(
             (config.context_budget_tokens, config.context_budget_bytes),
-            (LOCAL_BUDGET_TOKENS, LOCAL_BUDGET_BYTES)
+            (local.budget_tokens, local.budget_bytes)
         );
         assert_eq!(
             (
                 config.summarize_threshold_tokens,
                 config.summarize_threshold_bytes
             ),
-            (LOCAL_DIGEST_THRESHOLD_TOKENS, LOCAL_DIGEST_THRESHOLD_BYTES)
+            (local.digest_threshold_tokens, local.digest_threshold_bytes)
+        );
+        // The same five fields `with_route_budget` sets, set the same way: a
+        // routed config and the default cannot be built by two different rules,
+        // so re-stamping the local budget onto the default changes nothing.
+        let restamped = HarnessConfig::default().with_route_budget(local);
+        assert_eq!(
+            (
+                restamped.context_budget_tokens,
+                restamped.context_budget_bytes,
+                restamped.summarize_threshold_tokens,
+                restamped.summarize_threshold_bytes,
+                restamped.budget,
+            ),
+            (
+                config.context_budget_tokens,
+                config.context_budget_bytes,
+                config.summarize_threshold_tokens,
+                config.summarize_threshold_bytes,
+                config.budget,
+            )
         );
     }
 
@@ -3726,12 +4179,15 @@ mod tests {
             )),
             "the measured size, surcharge included ({words} words / {bytes} B): {message}"
         );
-        // The budget — the local pair, `4,096 words / 33 KB`.
+        // The budget — the local route's own derived pair, `10,240 words /
+        // 31 KB` since REQ-590, read off the value the refusal was handed
+        // rather than off the `LOCAL_*` constants, which this route no longer
+        // runs under (ADR-2/ADR-4).
         assert!(
             message.contains(&format!(
                 "the budget is {} words / {}",
-                thousands(LOCAL_BUDGET_TOKENS as u64),
-                bytes_figure(LOCAL_BUDGET_BYTES as u64)
+                thousands(budget.budget_tokens as u64),
+                bytes_figure(budget.budget_bytes as u64)
             )),
             "{message}"
         );
@@ -5187,11 +5643,12 @@ mod tests {
             )),
             "the measured size, surcharge included ({words} words / {bytes} B): {question}"
         );
+        let local = derive(BudgetInputs::local());
         assert!(
             question.contains(&format!(
                 "the budget is {} words / {}",
-                thousands(LOCAL_BUDGET_TOKENS as u64),
-                bytes_figure(LOCAL_BUDGET_BYTES as u64)
+                thousands(local.budget_tokens as u64),
+                bytes_figure(local.budget_bytes as u64)
             )),
             "{question}"
         );
