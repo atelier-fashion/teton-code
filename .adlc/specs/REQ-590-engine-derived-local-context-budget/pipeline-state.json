@@ -3,7 +3,7 @@
   "branch": "feat/REQ-590-engine-derived-local-context-budget",
   "startedAt": "2026-08-25T00:00:00Z",
   "completed": false,
-  "currentPhase": 7,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
@@ -11,7 +11,8 @@
     3,
     4,
     5,
-    6
+    6,
+    7
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -64,6 +65,12 @@
       "completedAt": "2026-08-26T00:00:00Z",
       "pr": "https://github.com/atelier-fashion/teton-code/pull/216",
       "note": "draft flipped to ready; footprint block preserved"
+    },
+    {
+      "phase": 7,
+      "name": "PR cleanup & CI",
+      "completedAt": "2026-08-26T00:00:00Z",
+      "result": "CI 7/7 green; diff scan clean \u2014 0 debug prints in production src (all in the AC-10 example), no TODOs, no secrets, no leftover mutation markers, no unqualified use of the retracted byte figure"
     }
   ],
   "repos": {
