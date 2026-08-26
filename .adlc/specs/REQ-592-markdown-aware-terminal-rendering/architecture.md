@@ -189,7 +189,7 @@ within 8,192 bytes. Measured on this branch:
 | Budget | Shape measured | Ceiling | Current | Slack |
 |---|---|---|---|---|
 | `MIN_BUDGET_BYTES` (budget.rs:4016) | default config, builtin registry | 8,192 | **6,411** | **1,781** |
-| `REDACT_BODY_OVERHEAD_BYTES` (redact.rs:2276) | worst case + skill roster at `ROSTER_MAX_BYTES` | 11 KiB | — | **710** |
+| `REDACT_BODY_OVERHEAD_BYTES` (redact.rs:2276) | worst case + skill roster at `ROSTER_MAX_BYTES` | 11 KiB | — | **476** |
 
 The redact budget binds first, so BR-2 named the right constant — but only one of two, and a
 larger clause would flip which binds. Candidate clause wordings measure 184–322 bytes, so
@@ -229,7 +229,7 @@ say the wrap is now the CLI's and not the terminal's.
 ### ADR-9 — Remaining open questions, decided
 
 - **OQ-3 (conditional clause):** unconditional. A protocol hint to tell the daemon its client is a
-  terminal buys back ~250 bytes of a budget with 710 spare, and the CLI is the only client that
+  terminal buys back ~250 bytes of a budget with 476 spare, and the CLI is the only client that
   ships. Revisit when a second client exists.
 - **OQ-4 (`SIGWINCH`):** no handler. A resize takes effect on the next block; already-printed rows
   keep their breaks. There is no SIGINT handler in the CLI today either; adding signal handling for

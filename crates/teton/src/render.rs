@@ -138,9 +138,38 @@ pub trait Surface {
     /// than something each implementor must remember to add.
     fn repaint_row_above(&mut self, _rows_up: usize, _kind: LineKind, _text: &str) {}
 
+    /// Emit anything the surface is still holding, and **touch no block state**
+    /// (REQ-592 BR-8).
+    ///
+    /// The poll-safe half of [`Surface::end_block`], and the difference between
+    /// the two is the whole reason there are two. Emitting held rows is
+    /// something any caller about to claim the terminal may need at any moment;
+    /// dropping block state is something only a caller that knows the *turn* is
+    /// over may do. Fused into one verb, the second half rides along on every
+    /// call site the first half needs — and the first half's call sites include
+    /// a 120 ms poll loop.
+    ///
+    /// So this is the verb for a caller that is about to write, or about to hand
+    /// the terminal to something that is not a `Surface` at all: the idle drain
+    /// before it returns to a frame redraw, and the event pump before it lets
+    /// [`crate::prompt::Prompter`] ask a permission question. It is the same
+    /// thing `line()` and `repaint_row_above()` already do for themselves before
+    /// their own row — named, so that a caller with no row of its own can ask
+    /// for it without reaching for the turn-boundary verb.
+    ///
+    /// **Defaults to a no-op**, for `repaint_row_above`'s reason: a surface that
+    /// holds nothing has nothing to emit, so silence is the correct behaviour
+    /// rather than something each implementor must remember to add.
+    fn emit_held(&mut self) {}
+
     /// Declare that the block of streamed output just ended: emit anything the
     /// surface is still holding, and drop whatever block state it accumulated
     /// while holding it (REQ-592 BR-8, ADR-3).
+    ///
+    /// [`Surface::emit_held`] plus the second half — and the second half is what
+    /// this verb is *for*. A caller that only needs the buffer on screen wants
+    /// `emit_held`; this one additionally forgets that a fence was open, which
+    /// is a claim about the model's output and not about the terminal.
     ///
     /// **Deciding that a block has ended is the caller's knowledge, not the
     /// surface's** — the same division `repaint_row_above` makes about frame
@@ -151,24 +180,46 @@ pub trait Surface {
     /// talking.
     ///
     /// **Every call site of this verb lives in `client.rs`'s event pump**
-    /// (ADR-3, [[LESSON-547]]). Not `main.rs`, not `hand_off_after_turn`, not a
-    /// self-flush in this module. The obvious site is `hand_off_after_turn`, and
-    /// it is wrong: only the `Ok` arm of the turn match reaches it, so a flush
-    /// hung there would drop buffered text on every failed turn and miss the
-    /// transport `?` entirely. The pump is the one place that owns the surface
-    /// on every path an event can take — including the idle path, where
-    /// fragments arrive with no turn in flight at all.
+    /// (ADR-3, [[LESSON-547]]), and since REQ-592's verify there is exactly one:
+    /// the end of `Connection::call`. Not `main.rs`, not `hand_off_after_turn`,
+    /// not a self-flush in this module.
+    ///
+    /// The obvious site is `hand_off_after_turn`, and it is wrong — though not
+    /// for the reason first recorded here, which was that a flush hung there
+    /// would drop buffered text on every failed turn. That overstates it: every
+    /// *arm* of `main.rs`'s turn match writes through [`Surface::line`] after
+    /// `call` returns, and `line()` emits the held buffer ahead of its own row
+    /// (BR-8), so on those paths the same bytes reach the screen in the same
+    /// order either way — moving the flush there changes no pty output at all.
+    ///
+    /// Three things the hand-off still cannot do. It cannot **clear the fence
+    /// bit**, the half only this verb performs: just the `Ok` arm of that match
+    /// reaches it, so a turn the daemon refused mid-fence would leave
+    /// `fence == true` and render every later reply of the session verbatim. It
+    /// never runs when `call` returns through its own transport `?`, which
+    /// leaves the entry loop without writing a line at all. And no arm of it
+    /// runs on the idle path, where fragments arrive with no turn in flight. The
+    /// pump is the one place that owns the surface on every path an event can
+    /// take.
     ///
     /// **A turn boundary, and only a turn boundary.** This verb drops block
     /// state — the open-fence bit among it — because the *block* ended, so
     /// calling it at a mid-turn pause is a bug rather than a harmless extra
     /// flush. A model that opens a ` ```rust ` fence, hits a tool call, and
     /// resumes after the user answers the permission prompt would have the rest
-    /// of its code classified as markdown: `**ptr` opens a strong run, `*y * z`
-    /// picks up emphasis. That is BR-6's failure, caused by an over-eager call
-    /// to the thing meant to prevent a different one. If a mid-turn caller needs
-    /// the buffer on screen ahead of its own row, that is what `line()` and
-    /// `repaint_row_above()` already do for themselves.
+    /// of its code classified as markdown and **word-wrapped at the terminal
+    /// width** — one statement broken across rows at a space, and a wrapped
+    /// shell command is a different command.
+    ///
+    /// The damage is re-flowed code, not stray emphasis: `**ptr` with no closing
+    /// pair keeps its literal marker, and `*y * z` fails the space-flank rule, so
+    /// [`markdown::parse_inline`] leaves both alone. Reaching for an emphasis
+    /// example here would understate it — the wrap is the part that changes what
+    /// the characters *mean*. That is BR-6's failure, caused by an over-eager
+    /// call to the thing meant to prevent a different one. A mid-turn caller
+    /// that needs the buffer on screen ahead of its own row has `line()`,
+    /// `repaint_row_above()`, and [`Surface::emit_held`] — none of which touch
+    /// the fence.
     ///
     /// **Defaults to a no-op**, for `repaint_row_above`'s reason: a surface that
     /// holds nothing has nothing to emit, so silence is the correct behaviour
@@ -236,9 +287,11 @@ pub trait Surface {
 ///   here. Inside a fence nothing is classified at all (BR-6).
 ///
 /// **Nothing here is flushed on a timer or a heuristic.** The verb that empties
-/// these at the end of a turn is `Surface::end_block`, and every call site of it
+/// these at the end of a turn is `Surface::end_block`, and its one call site
 /// belongs to `client.rs`'s event pump (ADR-3) — this module must never decide
-/// on its own that a block has ended.
+/// on its own that a block has ended. `Surface::emit_held` empties the first two
+/// without touching `fence`, which is what a caller that merely needs the screen
+/// current asks for.
 struct MarkdownState {
     /// The terminal width to lay out at, in columns. A parameter, never a query:
     /// the surface is handed the answer by the wiring that knows there is a
@@ -695,13 +748,17 @@ impl<W: Write> PlainSurface<W> {
     /// [`markdown::classify`] at all: BR-6 makes fence content verbatim, so
     /// classifying a line of shell inside one would read a glob's `*` as
     /// emphasis and a row of tabular output as a table cell. The closing
-    /// delimiter is still recognized, through the same
-    /// [`markdown::fence_delimiter`] the classifier itself asks — a fence the
-    /// two disagreed about would never close, and every remaining line of the
-    /// reply would render as code.
+    /// delimiter is recognized through [`markdown::fence_close`] — a
+    /// *different* question from the `fence_open` one [`markdown::classify`]
+    /// asks, and deliberately so. An opener may carry an info string
+    /// (```` ```rust ````); a closer may not. Asking one function both
+    /// questions is exactly what let a nested opener close its parent, which
+    /// the verify pass found and this split fixes. A fence the two disagreed
+    /// about would never close, and every remaining line of the reply would
+    /// render as code.
     fn render_source_line(&mut self, line: &str) {
         if self.markdown.as_ref().is_some_and(|state| state.fence) {
-            if markdown::fence_delimiter(line).is_some() {
+            if markdown::fence_close(line).is_some() {
                 self.set_fence(false);
             } else {
                 self.write_row(line);
@@ -743,10 +800,12 @@ impl<W: Write> PlainSurface<W> {
     /// and it may itself be the last row of the open table run — closing the run
     /// before classifying it would split one table into two.
     ///
-    /// This is not `end_block()`. That verb and every one of its call sites
-    /// belong to `client.rs`'s event pump (ADR-3); what happens here is the
-    /// narrow case where `line()` or `repaint_row_above()` is about to write and
-    /// the buffer must go out ahead of it.
+    /// This is not `end_block()`. That verb drops the fence bit too, and its one
+    /// call site belongs to `client.rs`'s event pump at a turn boundary (ADR-3);
+    /// what happens here is the narrow case where something is about to write
+    /// and the buffer must go out ahead of it. It is also the whole of
+    /// [`Surface::emit_held`] — the same narrow case, named for a caller that
+    /// has no row of its own to write.
     fn emit_pending(&mut self) {
         let Some(state) = self.markdown.as_mut() else {
             return;
@@ -884,6 +943,18 @@ impl<W: Write> Surface for PlainSurface<W> {
             "\x1b[s\x1b[{rows_up}A\r\x1b[K{prefix}{single_row}\x1b[u"
         );
         let _ = self.out.flush();
+    }
+
+    /// The held rows, and nothing else — the same [`Self::emit_pending`] a
+    /// mid-stream `line()` runs, exposed for a caller that has no row of its own.
+    ///
+    /// The fence bit is deliberately *not* touched here. That is the entire
+    /// distinction from [`Surface::end_block`] below, and it is what makes this
+    /// verb safe to call from a poll loop: the idle drain runs eight times a
+    /// second, and a fence cleared at that rate reclassifies a broadcast code
+    /// block as prose from the next poll onward.
+    fn emit_held(&mut self) {
+        self.emit_pending();
     }
 
     /// Emit the held tail and forget the block state that produced it.
@@ -1483,6 +1554,47 @@ mod tests {
         assert!(styled.contains("\x1b[36mcode\x1b[0m"), "{styled:?}");
     }
 
+    /// **BR-3 and BR-5 at the same byte: an inline run that *straddles* a wrap
+    /// break.**
+    ///
+    /// Every other styling test here either styles a single unbreakable word or
+    /// wraps a paragraph that carries no markers, so none of them ever asks what
+    /// happens when a run is still open at the end of a row. A terminal has no
+    /// notion of "this attribute continues on the next line" — SGR is a stream,
+    /// and a row that leaves bold open leaks it onto whatever is written next,
+    /// including the entry frame and the next turn's notices. So the run has to
+    /// be closed at the break and re-opened on the row after it, which is a
+    /// property of [`styled_span`] being called once per wrapped span rather
+    /// than once per run.
+    ///
+    /// Asserted as exact bytes rather than as "contains bold somewhere",
+    /// because the failure this is aimed at is an *absent reset* — and a
+    /// `contains` for text that is present either way cannot see one.
+    ///
+    /// (Verified by mutation: making `styled_span`'s post-loop reset fire only
+    /// when `base.is_some()` — so an in-progress inline run is not closed at a
+    /// row boundary — leaves the rest of the suite green and fails here.)
+    #[test]
+    fn a_styled_run_that_straddles_a_wrap_break_is_closed_and_reopened_per_row() {
+        let out = markdown_out_ended(true, 20, &["**alpha bravo charlie delta echo**\n"]);
+
+        assert_eq!(
+            out, "\x1b[1malpha bravo charlie\x1b[0m\n\x1b[1mdelta echo\x1b[0m\n",
+            "a run open at a row boundary must be closed there and re-opened on \
+             the next row: {out:?}"
+        );
+
+        // Said again as the invariant rather than as the string, so the reason
+        // survives a future width change: no row ends inside an open attribute.
+        for row in out.lines() {
+            assert!(
+                !row.contains('\x1b') || row.ends_with(RESET),
+                "a row that opened an attribute did not close it, so the \
+                 attribute leaks onto the next thing written: {row:?}"
+            );
+        }
+    }
+
     /// The two arms of `block_rows` — the surface assembling a styled row, and
     /// `markdown.rs` returning an unstyled one — must agree about where a row
     /// starts and where it ends. They share the wrap, but each builds its own
@@ -1797,9 +1909,10 @@ mod tests {
     ///
     /// REQ-592's architecture originally put an `end_block()` call site
     /// immediately before `resolve_permission` (ADR-3 site 3, for ADR-4's
-    /// ordering property). It was dropped for exactly this — and because it
-    /// changed no bytes, the ordering already being guaranteed by
-    /// `resolve_permission` rendering through `line()`.
+    /// ordering property). It was dropped for exactly this. What stands there
+    /// now is [`Surface::emit_held`] — the flush without the block-ending half —
+    /// so the ordering is owned by the pump rather than by whatever
+    /// `resolve_permission` happens to render first, and this test still holds.
     ///
     /// The fixture is chosen to be *destroyed* by a cleared fence rather than
     /// merely nudged by one: the resumed line is three times the width, so a

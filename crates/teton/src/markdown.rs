@@ -41,6 +41,15 @@
 //! terminal will hard-wrap it — a clipped row is a lie, and for a security
 //! finding it is the kind of lie that loses the sentence that mattered.
 //!
+//! The one place a word *is* divided is between two CJK characters, and it is
+//! the same posture rather than an exception to it. CJK prose carries no
+//! whitespace, so the over-wide-but-whole rule would emit a whole Japanese
+//! paragraph on one row and the terminal would hard-wrap it at a column nobody
+//! chose — the defect this feature exists to remove, arrived at by way of the
+//! rule that was supposed to prevent it. Dividing it at a character boundary
+//! discards nothing: the two halves are adjacent rows of the same text. See
+//! [`wide_break`].
+//!
 //! ## The recognized set is closed, and everything else is literal
 //!
 //! [`classify`] and [`parse_inline`] implement REQ-592's recognized-construct
@@ -166,6 +175,79 @@ fn word_spans(text: &str) -> Vec<Range<usize>> {
     spans
 }
 
+/// Characters that may not **begin** a row.
+///
+/// [`wide_break`] would otherwise put a full stop or a closing bracket at the
+/// left margin, which is the one CJK wrap defect a reader notices instantly.
+/// This is a deliberately small subset of Japanese kinsoku shori — the sentence
+/// punctuation, the closing brackets, the prolonged sound mark, the iteration
+/// marks and the small kana — and **not** an implementation of UAX #14. The full
+/// algorithm is a table this module would have to carry and keep current; the
+/// subset is one line of source and removes the case that looks broken. What it
+/// still gets wrong is recorded in REQ-592's Assumptions rather than hidden
+/// here.
+const NO_BREAK_BEFORE: &str =
+    "、。，．：；！？）］｝」』〉》】〕・ー々ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮ";
+
+/// Characters that may not **end** a row — the opening halves of the brackets
+/// [`NO_BREAK_BEFORE`] closes.
+const NO_BREAK_AFTER: &str = "（［｛「『〈《【〔";
+
+/// Whether a row may break between `left` and `right`.
+///
+/// Both sides must be **wide** — East-Asian W or F, which is exactly the
+/// two-column class `unicode-width` already measures for [`display_width`]. That
+/// single test carries three rules at once:
+///
+/// - it puts the break opportunities where CJK prose actually has them, which is
+///   the only reason a paragraph of Japanese wraps at all: it has no whitespace
+///   for [`word_spans`] to find;
+/// - it never breaks inside a run of combining marks, because a combining mark
+///   measures zero columns and so fails the test from whichever side it sits on;
+/// - it leaves Latin text exactly as it was, because a one-column character is
+///   not wide — `understandable` still has no break opportunity inside it and is
+///   still emitted whole and over-wide.
+///
+/// This is also the half of ADR-5 that the dependency was taken for and that had
+/// not been built: `unicode-width` was justified on measurement *and* break
+/// placement, and until this function existed it delivered only the first.
+fn wide_break_allowed(left: char, right: char) -> bool {
+    char_display_width(left) == 2
+        && char_display_width(right) == 2
+        && !NO_BREAK_AFTER.contains(left)
+        && !NO_BREAK_BEFORE.contains(right)
+}
+
+/// Where to break inside `word` so that it fits `avail` columns, or `None` when
+/// it has no break opportunity at all.
+///
+/// The **last** opportunity that still fits, so a row is filled rather than
+/// broken at the first chance it gets. When not even the first one fits, that
+/// first one is returned anyway, and the row goes out narrow-but-over-wide by
+/// one character: the alternative is the entire word on one row, which for CJK
+/// is the whole paragraph, and a 56-column row in a 20-column terminal is the
+/// hard wrap this feature exists to remove. Taking the smallest indivisible unit
+/// there is [`wrap_ranges`]'s over-wide-but-whole rule read for a script that has
+/// no whitespace — the same instinct, applied to a smaller "whole".
+fn wide_break(word: &str, avail: usize) -> Option<usize> {
+    let mut first: Option<usize> = None;
+    let mut best: Option<usize> = None;
+    let mut left: Option<char> = None;
+    for (at, right) in word.char_indices() {
+        if left.is_some_and(|prev| wide_break_allowed(prev, right)) {
+            first.get_or_insert(at);
+            if display_width(&word[..at]) > avail {
+                // Widths only grow along the word, so every later opportunity
+                // overflows too and there is nothing left to find.
+                break;
+            }
+            best = Some(at);
+        }
+        left = Some(right);
+    }
+    best.or(first)
+}
+
 /// Break `text` into rows, as byte ranges into `text`, fitting `first_avail`
 /// columns on the first row and `cont_avail` on every row after it.
 ///
@@ -180,9 +262,15 @@ fn word_spans(text: &str) -> Vec<Range<usize>> {
 /// typed after a full stop survive. Whitespace at a break is consumed, which is
 /// what a break is.
 ///
-/// Three rules, each one an acceptance criterion:
+/// Four rules, each one an acceptance criterion:
 ///
 /// - a break only ever lands on whitespace, never inside a word (AC-3);
+/// - **except between two CJK characters**, where there is no whitespace to land
+///   on. A word that does not fit is offered to [`wide_break`] first, and the
+///   rule below applies only when that finds nothing. Without this a Japanese
+///   paragraph is a single word, the rule below emits it whole, and the terminal
+///   hard-wraps it mid-token — the defect reached by way of the rule meant to
+///   prevent it;
 /// - a word wider than the available columns is emitted **whole on its own row**
 ///   rather than split or truncated (AC-3), so the row is over-wide and complete
 ///   instead of tidy and lossy;
@@ -194,6 +282,9 @@ pub fn wrap_ranges(text: &str, first_avail: usize, cont_avail: usize) -> Vec<Ran
     let words = word_spans(text);
     let mut rows: Vec<Range<usize>> = Vec::new();
     let mut next = 0;
+    // Where to resume inside `words[next]` after a CJK break. `None` for every
+    // row that starts on a word boundary, which is every row of Latin text.
+    let mut carry: Option<usize> = None;
     while next < words.len() {
         let avail = if rows.is_empty() {
             first_avail
@@ -201,18 +292,32 @@ pub fn wrap_ranges(text: &str, first_avail: usize, cont_avail: usize) -> Vec<Ran
             cont_avail
         }
         .max(1);
-        let start = words[next].start;
+        let start = carry.take().unwrap_or(words[next].start);
         // The first word is taken unconditionally: that is the over-wide-but-
         // whole rule, and without it a long token would loop forever.
         let mut end = words[next].end;
         let mut last = next + 1;
-        while last < words.len() {
-            let candidate = words[last].end;
-            if display_width(&text[start..candidate]) <= avail {
-                end = candidate;
-                last += 1;
-            } else {
-                break;
+        if display_width(&text[start..end]) > avail {
+            // The word does not fit, so filling with more words cannot help —
+            // widths only grow along the text. Either it divides between two
+            // wide characters or it goes out intact and over-wide.
+            if let Some(cut) = wide_break(&text[start..end], avail) {
+                rows.push(start..start + cut);
+                // `next` stays where it is: the rest of this word is the next
+                // row's first business. The cut is at least one character, so
+                // the remainder shrinks and the loop terminates.
+                carry = Some(start + cut);
+                continue;
+            }
+        } else {
+            while last < words.len() {
+                let candidate = words[last].end;
+                if display_width(&text[start..candidate]) <= avail {
+                    end = candidate;
+                    last += 1;
+                } else {
+                    break;
+                }
             }
         }
         rows.push(start..end);
@@ -585,32 +690,83 @@ pub fn table_cells(line: &str) -> Option<Vec<&str>> {
     Some(inner.split('|').map(str::trim).collect())
 }
 
-/// The info string of a ` ``` ` fence delimiter, or `None` when `line` is not
-/// one.
+/// The fewest backticks a fence delimiter carries.
+///
+/// CommonMark's figure, and the reason a fence may carry more of them: a block
+/// that needs to *contain* a fence opens with a longer run than the one it
+/// quotes. A reply demonstrating markdown does this every time.
+const FENCE_MIN_TICKS: usize = 3;
+
+/// A fence delimiter split into its backtick run and whatever follows it, or
+/// `None` when `line` is not a delimiter at all.
+///
+/// Column zero only, like every other block construct here. The run is **three
+/// or more** backticks rather than exactly three, which is the half of fence
+/// recognition that was missing: ```` ```` ```` came back as prose, so a reply
+/// that quoted a ` ``` ` block inside a ```` ```` ```` one never opened a fence
+/// at all and the quoted block was rendered as live markdown — its example table
+/// laid out as a table, a glob's `*` read as emphasis.
+fn fence_parts(line: &str) -> Option<(&str, &str)> {
+    let body = line.trim_end();
+    if body.len() != body.trim_start().len() {
+        return None;
+    }
+    let ticks = body.len() - body.trim_start_matches('`').len();
+    if ticks < FENCE_MIN_TICKS {
+        return None;
+    }
+    Some(body.split_at(ticks))
+}
+
+/// The info string of a delimiter that **opens** a fence, or `None`.
+///
+/// A backtick in the info string is not one: CommonMark forbids it for a
+/// backtick fence, and here it is also what keeps ``` `a` ``` — an inline code
+/// span alone on its line — from opening a block that never closes.
+fn fence_open(line: &str) -> Option<&str> {
+    let (_, info) = fence_parts(line)?;
+    if info.contains('`') {
+        return None;
+    }
+    Some(info.trim())
+}
+
+/// The backtick run of a delimiter that can **close** an already-open fence, or
+/// `None` when `line` cannot close one.
 ///
 /// Exists so the surface can ask this question **without** calling [`classify`].
 /// A caller holding an open fence must not classify what is inside it — BR-6
 /// makes fence content verbatim, so a `*` in a shell glob is not emphasis and a
 /// `|` in a table of output is not a cell. But that caller still has to
-/// recognize the *closing* delimiter, and recognizing it with a second
-/// hand-rolled rule over there is how the two drift: a line this module would
-/// call a fence and the surface would not is a fence that never closes, and
-/// every remaining line of the reply renders as code.
+/// recognize the closing delimiter, and recognizing it with a second hand-rolled
+/// rule over there is how the two drift: a line this module would call a fence
+/// and the surface would not is a fence that never closes, and every remaining
+/// line of the reply renders as code.
 ///
-/// Column zero only, like every other block construct here, and a fourth
-/// backtick is not a fence this module knows — both rules are `classify`'s,
-/// because `classify` now asks this function.
+/// **Closing and opening are different questions**, and answering the closing
+/// one with the opening rule is what this function used to do. A closer carries
+/// no info string — CommonMark says so — so under the opening rule the nested
+/// ` ```rust ` *inside* a quoted block closed the block that contained it, and
+/// everything after it rendered as markdown. Asking `is_some()` of the opening
+/// rule is the shape of that bug, so the opening rule is no longer what a caller
+/// reaches by that name; [`classify`] asks [`fence_open`] instead.
+///
+/// ## What is still not enforced: the closer must be at least as long
+///
+/// The run is returned rather than a `bool` so that a caller *can* compare it
+/// with the opener's, but nothing here can require the comparison — this
+/// function sees one line, and the opener's length is state the caller holds. A
+/// caller whose open-fence state is a `bool` therefore closes a ```` ```` ````
+/// block on the first bare ` ``` ` inside it. Recorded in REQ-592's Out of
+/// Scope; closing it means the caller remembering the run it opened with and
+/// passing it back.
 #[must_use]
-pub fn fence_delimiter(line: &str) -> Option<&str> {
-    let body = line.trim_end();
-    if body.len() != body.trim_start().len() {
+pub fn fence_close(line: &str) -> Option<&str> {
+    let (ticks, info) = fence_parts(line)?;
+    if !info.trim().is_empty() {
         return None;
     }
-    let info = body.strip_prefix("```")?;
-    if info.contains('`') {
-        return None;
-    }
-    Some(info.trim())
+    Some(ticks)
 }
 
 /// Whether every cell is only `-`, `:` and spaces, with at least one `-` — the
@@ -684,7 +840,10 @@ pub fn classify(line: &str) -> Block<'_> {
         };
     }
 
-    if let Some(info) = fence_delimiter(body) {
+    // The *opening* rule: a line that opens a fence may name a language, and it
+    // is [`fence_open`] rather than [`fence_close`] because the two questions
+    // have different answers and only one of them is this one.
+    if let Some(info) = fence_open(body) {
         return Block::Fence { info };
     }
 
@@ -780,6 +939,18 @@ const TRANSPOSED_INDENT: usize = 2;
 /// cases where attribution matters most.
 const UNNAMED_COLUMN: &str = "Column";
 
+/// What a data row with nothing in any of its cells is drawn as.
+///
+/// The transposed layout has no other way to say "there was a row here": a block
+/// is its labelled lines, and a row with no values has no labelled lines, so
+/// skipping it deletes the row without a trace. In a table of audit findings the
+/// reader who counts the blocks then gets a different number than the model
+/// wrote, which is the kind of quiet arithmetic error this module exists not to
+/// make. Inventing three words is the same trade [`UNNAMED_COLUMN`] already
+/// makes: a placeholder the reader can see is better than an absence they
+/// cannot.
+const EMPTY_ROW: &str = "(empty row)";
+
 /// A measured table: every row's cells as **display text**, plus each column's
 /// width in terminal columns.
 struct Table {
@@ -797,6 +968,27 @@ impl Table {
         let gutters = self.columns.len().saturating_sub(1) * display_width(COLUMN_GUTTER);
         self.columns.iter().sum::<usize>() + gutters
     }
+
+    /// Whether the run carries a separator row.
+    ///
+    /// GFM's delimiter row, and it is what makes a table a table rather than a
+    /// line that happens to contain pipes. [`table_cells`] cannot ask this — it
+    /// sees one line and a delimiter row is a property of the *run* — so it is
+    /// asked here, where the whole run is in hand. See [`layout_table`] for what
+    /// the answer decides and why the alternative was worse.
+    fn is_delimited(&self) -> bool {
+        self.rows.iter().any(Option::is_none)
+    }
+
+    /// Whether any column has a single column of anything to draw.
+    ///
+    /// A run of nothing but separator rows measures no columns at all, and a run
+    /// of nothing but empty cells measures columns of zero width. Both lay out
+    /// as a rule of length zero and rows of padding that `trim_end` then removes
+    /// — which is to say as **nothing**, from source that was not nothing.
+    fn has_content(&self) -> bool {
+        self.columns.iter().any(|width| *width > 0)
+    }
 }
 
 /// Measure a buffered run of table rows, or `None` when it is not one.
@@ -810,11 +1002,32 @@ impl Table {
 /// [`layout_table`] for why that is a contract and not an implementation
 /// detail.
 ///
+/// **Tabs become spaces.** [`display_width`] charges a tab [`TAB_COLUMNS`],
+/// which is the conservative estimate a wrap wants and the wrong number for a
+/// layout that pads: the terminal advances a tab to its own next tab stop, so a
+/// cell measured at eight columns can be drawn at three, and every column to the
+/// right of it lands somewhere other than where the padding put it. Estimating
+/// harder does not fix it — the estimate and the terminal are two authorities on
+/// one number ([[LESSON-529]]). Replacing the tab with the spaces it was charged
+/// for removes the second authority: what was measured is now literally what is
+/// drawn.
+///
 /// **The table's shape comes from its content, not from its separator.** The
 /// column count is the widest *data* row, so a row carrying a stray `|` widens
 /// the table by a column rather than losing the text after the pipe, and a
 /// separator row that declares more columns than anything else has does not
 /// invent an empty one.
+/// `text` with every tab replaced by the [`TAB_COLUMNS`] spaces
+/// [`display_width`] charges it, so that a measured width and a drawn width are
+/// the same number. Only the table layout needs this — see [`measure_table`].
+fn expand_tabs(text: String) -> String {
+    if text.contains('\t') {
+        text.replace('\t', &" ".repeat(TAB_COLUMNS))
+    } else {
+        text
+    }
+}
+
 fn measure_table(rows: &[&str]) -> Option<Table> {
     let mut cells: Vec<Option<Vec<String>>> = Vec::with_capacity(rows.len());
     for row in rows {
@@ -827,7 +1040,9 @@ fn measure_table(rows: &[&str]) -> Option<Table> {
             cells.push(None);
         } else {
             cells.push(Some(
-                raw.iter().map(|cell| parse_inline(cell).text).collect(),
+                raw.iter()
+                    .map(|cell| expand_tabs(parse_inline(cell).text))
+                    .collect(),
             ));
         }
     }
@@ -855,7 +1070,32 @@ fn measure_table(rows: &[&str]) -> Option<Table> {
 /// the surface. This function is the decision the buffer exists to make:
 /// `(rows, width) -> Vec<String>`, with no memory between calls.
 ///
-/// Three outcomes, tried in order:
+/// ## Two runs that are not tables, refused before any of that
+///
+/// **A run with no separator row.** [`table_cells`] answers for one line, and
+/// one line cannot tell a table row from prose: `|x| < |y|` and a regex
+/// alternation `|foo|bar|` have exactly the shape `|a|b|` has, and no
+/// line-local rule separates them — which is why GFM requires a delimiter row
+/// before it will call anything a table. So does this. Without the rule the
+/// pipes are eaten and the words between them are re-padded into columns:
+/// `|x| < |y|` reached the terminal as `x  <  y`, which is ordinary prose
+/// silently rewritten, in a module whose first promise is that nothing is
+/// discarded.
+///
+/// The cost, recorded rather than hidden: a prose line carrying pipes comes back
+/// **verbatim and unwrapped**, because the caller buffered it as a table run and
+/// this is the run's floor. That is strictly better than what it replaces — the
+/// characters are all there — and it is not the end state. Routing a
+/// separator-less run back through the paragraph path is the caller's decision
+/// to make, not this function's, since only the caller can un-buffer it.
+///
+/// **A run with nothing to draw.** A run of only separator rows measures no
+/// columns; a run of only empty cells measures columns of zero width. Both would
+/// lay out as a rule of length zero and rows that `trim_end` empties, so
+/// `layout_table(&["|---|---|"], 80)` returned `[""]` — the source gone and one
+/// blank line in its place. See [`Table::has_content`].
+///
+/// Three outcomes for a run that *is* a table, tried in order:
 ///
 /// 1. **The columns fit.** Cells are padded so each column lines up vertically
 ///    and each separator row is drawn as a rule. This is the layout that looks
@@ -898,6 +1138,9 @@ pub fn layout_table(rows: &[&str], width: usize) -> Vec<String> {
     let Some(table) = measure_table(rows) else {
         return raw_rows(rows);
     };
+    if !table.is_delimited() || !table.has_content() {
+        return raw_rows(rows);
+    }
     if table.aligned_width() <= width {
         return aligned_table(&table);
     }
@@ -962,7 +1205,14 @@ fn aligned_table(table: &Table) -> Vec<String> {
 ///   its cell boundaries visible;
 /// - **there are no data rows** — a header-only table has nothing to transpose,
 ///   and emitting nothing would discard the header;
-/// - **every data row is empty** — same reason, from the other end.
+/// - **every data row is empty** — same reason, from the other end. The labels
+///   live in the header, and a block with no values prints no labels, so a run
+///   whose every row is empty would come back as placeholders with the header's
+///   own text nowhere on screen. The source keeps it.
+///
+/// A row that is empty **among rows that are not** is a different case and is
+/// drawn rather than skipped, as [`EMPTY_ROW`]: there the header survives in the
+/// other blocks' labels, and what would go missing is the row itself.
 fn transposed_table(table: &Table, width: usize) -> Option<Vec<String>> {
     let header = table.rows.iter().flatten().next()?;
 
@@ -987,6 +1237,11 @@ fn transposed_table(table: &Table, width: usize) -> Option<Vec<String>> {
 
     let continuation = " ".repeat(TRANSPOSED_INDENT);
     let mut out: Vec<String> = Vec::new();
+    // Whether any row said anything at all. Tracked separately from `out` now
+    // that an empty row contributes a placeholder to it: the refusal above is
+    // about a run with no content anywhere, and a `Vec` of placeholders is
+    // exactly that while no longer being empty.
+    let mut spoke = false;
     for row in table.rows.iter().flatten().skip(1) {
         let mut block: Vec<String> = Vec::new();
         for (at, prefix) in prefixes.iter().enumerate() {
@@ -1000,7 +1255,10 @@ fn transposed_table(table: &Table, width: usize) -> Option<Vec<String>> {
             block.extend(wrap_indented(value, width, prefix, &continuation));
         }
         if block.is_empty() {
-            continue;
+            // Every cell was empty. The row still happened.
+            block.push(EMPTY_ROW.to_owned());
+        } else {
+            spoke = true;
         }
         if !out.is_empty() {
             out.push(String::new());
@@ -1008,10 +1266,10 @@ fn transposed_table(table: &Table, width: usize) -> Option<Vec<String>> {
         out.extend(block);
     }
 
-    if out.is_empty() {
-        None
-    } else {
+    if spoke {
         Some(out)
+    } else {
+        None
     }
 }
 
@@ -1196,6 +1454,118 @@ mod tests {
                 "this fixture is only meaningful while the two measures disagree"
             );
         }
+    }
+
+    /// **CJK prose wraps.** The regression that motivated this test: a Japanese
+    /// paragraph has no whitespace in it, so [`word_spans`] found one "word",
+    /// the over-wide-but-whole rule emitted it on one row, and a 56-column row
+    /// went to a 20-column terminal — which then hard-wrapped it mid-token at a
+    /// column nobody chose. That is the exact defect REQ-592 exists to remove,
+    /// reached by way of the rule meant to prevent it, and it made ADR-5 half
+    /// false: the dependency was justified on measurement *and* break placement,
+    /// and only the measurement had been built.
+    ///
+    /// Four claims, because a fix that only satisfied the first would be worse
+    /// than the defect.
+    #[test]
+    fn cjk_prose_breaks_between_characters_because_it_has_no_whitespace() {
+        let text = "これは非常に長い日本語の文章であり、折り返しが必要です。";
+        assert_eq!(
+            display_width(text),
+            56,
+            "this fixture is only meaningful while it is far wider than the widths swept below"
+        );
+
+        // (0) The reported case, spelled out rather than left to the sweep. A
+        // sweep that says "every row fits or is indivisible" is satisfied by a
+        // module that thinks *everything* is indivisible, which is the defect
+        // itself — so the rows are named.
+        assert_eq!(
+            wrap(text, 20),
+            vec![
+                "これは非常に長い日本".to_owned(),
+                "語の文章であり、折り".to_owned(),
+                "返しが必要です。".to_owned(),
+            ],
+            "the paragraph came back in one piece, so the terminal is left to hard-wrap it"
+        );
+
+        for width in 2..=40 {
+            let rows = wrap(text, width);
+
+            // (1) It fits, and the only row allowed past the width is a pair
+            // glued together by rule (3) below — `り、`, which cannot be divided
+            // because the sentence mark may not open a row. Stated in characters
+            // rather than by asking `wide_break` where the breaks are: a test
+            // that consults the code under test for its own oracle passes just
+            // as happily when that code has stopped finding any breaks at all.
+            for row in &rows {
+                assert!(
+                    display_width(row) <= width || row.chars().count() <= 2,
+                    "width {width}: {row:?} is {} columns and {} characters, so it was not \
+                     broken where it could have been",
+                    display_width(row),
+                    row.chars().count()
+                );
+            }
+
+            // (2) Nothing was dropped, duplicated or reordered on the way. The
+            // text carries no whitespace, so the rows rejoin to it exactly —
+            // a stronger claim than the word-by-word one a spaced fixture can
+            // make.
+            assert_eq!(rows.concat(), text, "width {width}");
+
+            // (3) Kinsoku, the subset of it this module carries: the sentence
+            // punctuation stays at the end of a row and never opens one. A
+            // break rule without this reads as broken on sight.
+            for row in &rows {
+                let first = row.chars().next().expect("no empty row is emitted");
+                assert!(
+                    !NO_BREAK_BEFORE.contains(first),
+                    "width {width}: row {row:?} opens with {first:?}, which may not begin a row"
+                );
+            }
+        }
+
+        // (4) Latin text is untouched by all of it. A one-column character is
+        // not wide, so there is no break opportunity inside an English word and
+        // it is still emitted whole and over-wide rather than hyphen-less-split.
+        assert_eq!(
+            wrap("understandable", 4),
+            vec!["understandable".to_owned()],
+            "a Latin word was divided, which is the failure mode this rule must not have"
+        );
+        assert_eq!(
+            wrap("alpha bravo", 5),
+            vec!["alpha".to_owned(), "bravo".to_owned()]
+        );
+    }
+
+    /// A break never lands inside a run of combining marks, and it still lands
+    /// at the ideograph boundary next to one.
+    ///
+    /// Both halves from one fixture, because a rule that satisfied only the
+    /// first would satisfy it by never breaking at all. `か` + U+3099 is a
+    /// decomposed `が`: the mark measures zero columns, so it is not wide from
+    /// either side and neither boundary around it is an opportunity — while
+    /// `日|本` still is.
+    #[test]
+    fn a_break_never_separates_a_combining_mark_from_what_it_marks() {
+        let text = "か\u{3099}日本";
+        assert_eq!(text.chars().count(), 4, "the fixture must stay decomposed");
+        assert_eq!(display_width(text), 6);
+
+        assert_eq!(
+            wrap(text, 4),
+            vec!["か\u{3099}日".to_owned(), "本".to_owned()],
+            "the break must land between the two ideographs and nowhere near the mark"
+        );
+
+        // With nothing but marks there is no opportunity at all, and the
+        // over-wide-but-whole rule takes over rather than a mark being orphaned
+        // onto a row of its own.
+        let marks = "か\u{3099}き\u{3099}く\u{3099}";
+        assert_eq!(wrap(marks, 2), vec![marks.to_owned()]);
     }
 
     /// **AC-3's CJK sweep: no emitted row exceeds the width in display
@@ -1727,6 +2097,52 @@ mod tests {
         assert!(matches!(classify("| : | : |"), Block::TableRow { .. }));
     }
 
+    /// **Opening a fence and closing one are different questions**, and the
+    /// regression is what happens when the closing one is answered with the
+    /// opening rule.
+    ///
+    /// A reply demonstrating markdown opens a ```` ```` ```` block and quotes a
+    /// ` ```rust ` one inside it. Under the opening rule the caller's
+    /// `fence_close(line).is_some()` was true of that nested opener, so the
+    /// quoted block *closed* the block that contained it — and the fence bit was
+    /// then inverted for the rest of the turn, with prose rendering as code and
+    /// code rendering as prose. The four-backtick half made it worse from the
+    /// other end: ```` ```` ```` was not a delimiter at all, so the outer block
+    /// never opened and its contents were live markdown.
+    #[test]
+    fn a_closing_fence_carries_no_info_string_and_may_be_longer_than_three() {
+        // The closing rule. An info string means an opener, and an opener
+        // cannot close anything.
+        assert_eq!(fence_close("```"), Some("```"));
+        assert_eq!(fence_close("````"), Some("````"));
+        assert_eq!(fence_close("```   "), Some("```"));
+        assert_eq!(
+            fence_close("```rust"),
+            None,
+            "a delimiter naming a language opens a fence; a caller holding an open one that \
+             treats it as a close inverts the fence bit for the rest of the reply"
+        );
+
+        // The opening rule, which is `classify`'s and is unchanged except that
+        // it now recognizes a run longer than three.
+        assert_eq!(classify("```rust"), Block::Fence { info: "rust" });
+        assert_eq!(classify("```"), Block::Fence { info: "" });
+        assert_eq!(
+            classify("````"),
+            Block::Fence { info: "" },
+            "four backticks is the delimiter a reply uses to quote a three-backtick block; \
+             unrecognized, the quoted block renders as live markdown"
+        );
+        assert_eq!(classify("````text"), Block::Fence { info: "text" });
+
+        // Neither rule reaches past two backticks or past column zero, and an
+        // inline code span alone on its line is not a block that never closes.
+        assert_eq!(fence_close("``"), None);
+        assert_eq!(fence_close(" ```"), None);
+        assert!(matches!(classify("``"), Block::Paragraph { .. }));
+        assert!(matches!(classify("`a`"), Block::Paragraph { .. }));
+    }
+
     // ---- AC-4: the two table layouts (BR-4) ---------------------------------
 
     /// The raw source rows, which is what every degrade path is compared to.
@@ -2099,6 +2515,156 @@ mod tests {
         // was promised, and guessing at it is the one move ADR-2 rules out.
         let mixed = ["| a | b |", "not a table row at all"];
         assert_eq!(layout_table(&mixed, 40), source_rows(&mixed));
+    }
+
+    /// **A run with nothing to draw keeps its source.** The regression: a run of
+    /// only separator rows measures no columns, so the aligned layout drew a
+    /// rule of length zero and `trim_end` emptied what was left —
+    /// `layout_table(&["|---|---|"], 80)` came back as `[""]`. The source was
+    /// gone and a blank line stood where it had been, in a module whose first
+    /// promise is that nothing is discarded.
+    ///
+    /// The all-empty-cells run is the same failure measured differently: the
+    /// columns exist and are zero wide, so every row pads out to nothing.
+    #[test]
+    fn a_run_with_no_content_to_draw_keeps_its_source() {
+        for run in [
+            ["|---|---|"].as_slice(),
+            ["| --- | :-: |"].as_slice(),
+            ["|---|", "|---|"].as_slice(),
+            ["||"].as_slice(),
+            ["| | |"].as_slice(),
+            ["|---|---|", "|  |  |"].as_slice(),
+        ] {
+            let out = layout_table(run, 80);
+            assert_eq!(
+                out,
+                source_rows(run),
+                "a run with nothing to lay out must come back as itself, not as blank lines"
+            );
+            assert!(
+                !out.iter().all(String::is_empty),
+                "every emitted row is empty, so the run vanished: {run:?}"
+            );
+        }
+    }
+
+    /// **A line of prose carrying pipes is not a table.** The regression, and it
+    /// is not a rare shape: `classify` tried [`table_cells`] before everything
+    /// else, so `|x| < |y|` was a table row of three cells and reached the
+    /// terminal as `x  <  y` — the pipes eaten and the words re-padded into
+    /// columns. A regex alternation `|foo|bar|` went the same way.
+    ///
+    /// No line-local rule can separate those from a real `|a|b|` row, because
+    /// they have the same shape. GFM does not try: a table needs a delimiter
+    /// row, and so a delimiter row is what [`layout_table`] requires before it
+    /// will lay a run out.
+    #[test]
+    fn a_line_of_prose_carrying_pipes_is_not_laid_out_as_a_table() {
+        for prose in ["|x| < |y|", "|foo|bar|", "| a | b |"] {
+            let out = layout_table(&[prose], 80);
+            assert_eq!(
+                out,
+                vec![prose.to_owned()],
+                "a run with no separator row must come back verbatim, pipes included"
+            );
+        }
+
+        // The same three cells with a delimiter row under them are a table, and
+        // are laid out as one. The rule discriminates rather than refusing
+        // everything.
+        let table = ["|x| < |y|", "|---|---|---|"];
+        assert_eq!(
+            layout_table(&table, 80),
+            vec!["x  <  y".to_owned(), RULE.to_string().repeat(7)]
+        );
+    }
+
+    /// **A tab in a cell does not move the column it is in.** Tabs are charged a
+    /// flat [`TAB_COLUMNS`], which is the right conservative estimate for a wrap
+    /// and the wrong number for a layout that pads: the terminal advances a tab
+    /// to its own next tab stop, so the padding computed from the estimate put
+    /// every later column somewhere the tab had not left room for. Observed as a
+    /// header row sitting one column left of its data.
+    ///
+    /// Asserted on the emitted rows rather than through a terminal, because the
+    /// fix is that the drawn text no longer contains a tab at all — what was
+    /// measured is literally what is drawn, so there is no second authority on
+    /// the number left to disagree.
+    #[test]
+    fn a_tab_in_a_cell_is_expanded_so_the_columns_still_line_up() {
+        let rows = ["| a\tb | c |", "|---|---|", "| 1 | 2 |"];
+        let out = layout_table(&rows, 80);
+
+        for row in &out {
+            assert!(
+                !row.contains('\t'),
+                "a tab reached the drawn row {row:?}, so its width is the terminal's opinion \
+                 rather than the one the padding was computed from"
+            );
+        }
+
+        // Every row's second column starts at the same offset, which is the
+        // whole claim. Measured in display columns, since that is what the
+        // padding is in.
+        let second_column: Vec<usize> = [&out[0], &out[2]]
+            .into_iter()
+            .map(|row| {
+                let last = row.rsplit_once("  ").expect("two columns and a gutter").1;
+                display_width(row) - display_width(last)
+            })
+            .collect();
+        assert_eq!(
+            second_column[0], second_column[1],
+            "the header and the data row disagree about where column two starts: {out:?}"
+        );
+        assert_eq!(out[0], "a        b  c", "{out:?}");
+        assert_eq!(out[2], "1           2", "{out:?}");
+
+        // The rule is a table-layout rule, not a change to what a tab measures:
+        // the wrap still charges the conservative full stop.
+        assert_eq!(display_width("a\tb"), 1 + TAB_COLUMNS + 1);
+    }
+
+    /// **A data row with nothing in any cell is drawn, not dropped.** The
+    /// transposed layout builds a block out of a row's labelled values, and a
+    /// row with no values built an empty block — which was then skipped, taking
+    /// the row with it. A reader counting blocks in a transposed audit table
+    /// gets a different number of findings than the model wrote, and no part of
+    /// the output says so.
+    ///
+    /// The header-preserving refusal still stands underneath it: a run whose
+    /// *every* row is empty has no labels to print either, so the source keeps
+    /// the header rather than the layout replacing it with placeholders.
+    #[test]
+    fn an_empty_row_among_rows_that_are_not_is_drawn_rather_than_dropped() {
+        let rows = [
+            "| Finding | Detail |",
+            "|---------|--------|",
+            "|  |  |",
+            "| a finding far too wide to align | c |",
+        ];
+        let out = layout_table(&rows, 24);
+        assert_eq!(
+            out,
+            vec![
+                EMPTY_ROW.to_owned(),
+                String::new(),
+                "Finding: a finding far".to_owned(),
+                "  too wide to align".to_owned(),
+                "Detail: c".to_owned(),
+            ]
+        );
+        assert_eq!(
+            out.iter().filter(|row| row.is_empty()).count() + 1,
+            2,
+            "the two data rows must still be two blocks: {out:?}"
+        );
+
+        // Every row empty: there is nothing to label the placeholders with, so
+        // the run degrades to its source and the header survives.
+        let all_empty = ["| Finding | Detail |", "|---------|--------|", "|  |  |"];
+        assert_eq!(layout_table(&all_empty, 4), source_rows(&all_empty));
     }
 
     // ---- BR-10: the structural sweep ---------------------------------------

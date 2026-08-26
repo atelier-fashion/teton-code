@@ -72,7 +72,10 @@ for the other:
 
 - **A prompt clause alone is advisory.** Models honour formatting guidance imperfectly and
   unevenly across tiers; a local 4B model will drift back to tables. Nothing about a clause makes
-  a wide table render legibly on the day the model emits one anyway.
+  a wide table render legibly on the day the model emits one anyway. LESSON-532 puts a number on
+  this: an instruction of exactly this kind scored **0/3** across three live A/B rounds on the
+  local tier, and its conclusion — put the guarantee on the surface where a test can pin it, let
+  the prompt be the nice-to-have — is the split BR-1 and BR-3..BR-7 already make.
 - **A renderer alone cannot rescue every shape.** BR-3's transposition makes a 6-column table
   *readable*, not *good*. Content authored for 80–120 columns beats content rewritten into it.
 
@@ -170,8 +173,10 @@ Not applicable — rendering crosses no gate.
       `neutralize_frame_labels` to be a no-op on the prompt, so the clause must carry **no
       flush-left `User:` or `Assistant:` label**.
 
-      Measured slack: (a) 710 bytes, (b) 1,781 bytes — **(a) binds first.** Candidate wordings
-      measure 184–322 bytes, so neither constant is expected to move.
+      Measured slack: (a) **476** bytes, (b) 1,781 bytes — **(a) binds first.** The shipped clause
+      is **347** bytes, leaving (a) at **129** against the 48-byte floor. Neither constant moved.
+      (Both figures here were wrong when first written: the slack was quoted from the stale ledger
+      as 710, and the clause was projected at 184–322 before the BR-1 reword added 45 bytes.)
 
 - [ ] **BR-3: Assistant prose is word-wrapped at the terminal's width.** The surface holds a
       partial line across `fragment()` calls — assistant text arrives token-by-token, so no single
@@ -439,7 +444,7 @@ an AC that covers no rule, or a rule no AC names, is a finding against this list
       mangled. If that fallback proves wrong in practice, revisiting this is a new REQ, not a
       patch — swapping the parser changes the streaming model.
 - [x] **OQ-3** *(decided in architecture — ADR-9: **unconditional**. A protocol hint buys back
-      ~250 bytes of a budget with 710 spare, and the CLI is the only client that ships. Revisit when
+      ~250 bytes of a budget with 476 spare, and the CLI is the only client that ships. Revisit when
       a second client exists.)*: **should BR-1's clause be conditional on the client being a terminal?** The daemon does
       not know — nothing on `session/create` carries a client-surface hint. Making it conditional
       is a protocol addition that buys back BR-2's bytes for piped sessions and keeps the clause
@@ -462,10 +467,26 @@ an AC that covers no rule, or a rule no AC names, is a finding against this list
 ## Out of Scope
 
 - Full CommonMark. Concretely, and as the constructs the recognized-construct table's fallthrough
-  rule covers: nested lists beyond one level, reference and autolinks, setext headings, indented
-  (non-fenced) code blocks, inline HTML, footnotes, task lists, nested emphasis, and `|` appearing
-  inside a code span inside a table cell. Each renders as literal text — legible but unstyled —
-  rather than raising a parse error. This is the accepted cost of OQ-2's hand-rolled decision.
+  rule covers: nested lists beyond one level, reference and autolinks, inline links `[text](url)`,
+  underscore emphasis `_text_`, setext headings, indented (non-fenced) code blocks, inline HTML,
+  footnotes, task lists, nested emphasis, and `|` appearing inside a code span inside a table cell.
+  Each renders as literal text — legible but unstyled — rather than raising a parse error. This is
+  the accepted cost of OQ-2's hand-rolled decision.
+
+- **Fence-length matching** (added at verify, 2026-08-26). N-backtick fences now open and close, but
+  a closer is **not required to be at least as long as its opener**, so a ```` ``` ```` inside a
+  ```` ```` ```` block still closes it early. The opener's length is state the *caller* holds and
+  the surface's is a `bool`; `fence_close` returns the backtick run rather than a bool precisely so
+  a future caller that remembers the opener can compare. Narrowed from "four-backtick fences are
+  never recognized at all", which was the pre-verify behaviour.
+
+- **Re-routing a pipe-bearing prose line back through the paragraph path** (added at verify,
+  2026-08-26). A line like `|x| < |y|` is no longer eaten as a table — GFM's real discriminator is
+  now applied, so a run with no separator row keeps its source verbatim. But it has already been
+  *buffered* as a table run by then, so it reaches the screen unwrapped and unstyled. Strictly
+  better than having its pipes dropped and its words re-padded; genuinely fixing it means the
+  surface un-buffering a separator-less run back into the paragraph path, which only the caller can
+  do. Filed as a follow-up rather than done here.
 - Syntax highlighting inside code fences.
 - OSC 8 hyperlinks, or any escape family beyond the SGR set BR-5's fixed table names.
 - A ratatui / alternate-screen TUI. The `Surface` seam exists so that is a separate REQ; this one
@@ -479,6 +500,14 @@ an AC that covers no rule, or a rule no AC names, is a finding against this list
 
 ## Retrieved Context
 
+- LESSON-532 (lesson, **added at verify, 2026-08-26 — missed by the tag-based retrieval**): For a
+  small local model, presence in context buys retrieval, not compliance. Three live A/B rounds
+  scored a prompt instruction **0/3** on the local tier while data transfer was perfect, and the
+  lesson concludes: "when a UX transition must happen, put the guarantee where a test can pin it —
+  the surface — and let the prompt be the nice-to-have." That is REQ-592's architecture exactly,
+  reached independently. It is corroboration rather than a correction, and it sets the prior for
+  AC-13 leg (a): **no visible change in local-tier output is the expected result, not a surprise,
+  and not grounds for re-running until the answer looks better** (BUG-168).
 - LESSON-537 (lesson, score 11): A second surface inherits every grammar and gate it touches
 - LESSON-548 (lesson, score 9): A refusal's remedy is a claim about the product's own surface
 - LESSON-529 (lesson, score 9): A display helper is a second parser

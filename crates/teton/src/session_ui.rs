@@ -8381,10 +8381,18 @@ mod tests {
             }
             // No `end_block()` here, and none is needed: the hand-off prints
             // through `line()`, which emits the renderer's pending buffer ahead
-            // of itself (BR-8). The verb and both of its call sites belong to
+            // of itself (BR-8). The verb and its call site belong to
             // `client.rs`'s event pump (ADR-3), and `only_the_event_pump_
             // declares_a_block_over` fails the build if a second owner appears —
             // including one in a test.
+            //
+            // Said "both of its call sites" until the verify pass split the verb:
+            // `end_block()` (flush + close the fence) now has exactly one site, at
+            // the end of `Connection::call`, and the flush-only `emit_held()` has
+            // the other two. This comment was wrong for as long as it took someone
+            // to read it, because it sits inside `#[cfg(test)]` and the ownership
+            // sweep reads production sources only — the one place this REQ's own
+            // drift guard cannot look.
             hand_off_after_turn(&mut state, &mut surface, true);
         }
         String::from_utf8(screen).expect("utf-8")

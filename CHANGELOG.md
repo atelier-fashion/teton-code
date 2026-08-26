@@ -70,6 +70,16 @@ user having asked for it.
   zero-width-joiner sequence counts as the sum of its components and can push
   its row past the window's edge. Fixing that needs a segmentation table as
   well, and was left out of scope deliberately.
+- **A paragraph now appears when it ends, not as it is typed.** Laying a line
+  out means holding it until its newline arrives, so a long paragraph that the
+  model streams without one lands all at once rather than word by word. This is
+  the most visible non-layout change in the release. Tables buffer for the same
+  reason and for longer — a table appears when its last row does.
+- **The end-to-end check of this feature has not been run.** Every rule above is
+  covered by automated tests, but those tests script the model's replies on
+  purpose, so nothing in CI proves that a *real* model's output is more legible
+  than it was. `docs/manual-verification.md` carries the runbook for that and is
+  marked OUTSTANDING.
 
 ## [0.1.25] - 2026-08-26
 
