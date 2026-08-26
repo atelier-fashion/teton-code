@@ -199,6 +199,16 @@ Not applicable — rendering crosses no gate.
       a renderer that let markdown style itself by admitting escapes would hand a fetched page the
       cursor back (informed by LESSON-517, REQ-573, REQ-563).
 
+      **Recorded limitation (2026-08-26): inline styling does not apply inside table cells.** BR-4
+      requires column measurement to ignore inline markers (a `**bold**` cell measures 4 columns,
+      not 8), so the table layout returns final display text with markers already removed. Styling
+      it would need either a second `parse_inline` pass — which strips a second time and shifts
+      every cell 4 columns left per marker pair, un-aligning the table — or markers left in the
+      output, which mis-measures (`| **a | b** |` is two literal cells to the table splitter but
+      one strong run once joined). A bold cell therefore renders **unstyled at the right column
+      rather than bold at the wrong one**. Alignment is the whole point of BR-4, so that is the
+      correct trade; lifting it needs a richer return type, not a second parse, and is a follow-up.
+
 - [ ] **BR-6: Fenced code is passed through, never reflowed and never styled.** Inside a ```` ``` ````
       fence, BR-3's wrapping and BR-5's inline parsing are both off: a wrapped line of code is a
       wrong line of code, and `*` inside a shell glob is not emphasis. Fence content is emitted
@@ -269,10 +279,19 @@ an AC that covers no rule, or a rule no AC names, is a finding against this list
       [`fixtures/audit-2026-08-26.md`](fixtures/audit-2026-08-26.md) — the real reply that
       motivated this REQ, 7 data rows whose second column measures 155..243 chars against a widest
       raw row of 263 — renders as one labelled block per data row at both 100 and 200
-      columns, with every value wrapped and **no emitted row exceeding the width**. The fixture is
+      columns, with **no emitted row exceeding the width**. The fixture is
       read from disk by the test, not transcribed into it: a table authored while knowing the
       layout algorithm tests the author's assumptions rather than the algorithm (LESSON-529's
       re-enactment corollary).
+
+      *Corrected during implementation (2026-08-26).* This criterion originally also demanded
+      "every value wrapped" at both widths. **That is false at 200 columns and asserting it would
+      have pinned a bug**: the label prefix leaves 191 usable columns, and four of the fixture's
+      seven values (153, 161, 168, 170) fit on one row — a break inserted there would be wrong.
+      The implemented assertion is the biconditional **wraps ⟺ value wider than the available
+      width**, which is strictly stronger than the original at both widths, plus an unconditional
+      "all seven wrap" at 100 columns where it does hold, plus a word-for-word round-trip proving
+      no value is clipped.
 - [ ] **AC-5** *(BR-5)*: A chunk containing `\x1b[2K\x1b[1A` renders as visible spaces, not as
       cursor motion, **with the markdown renderer in the path** — and the assertion is
       mutation-checked by removing the defuse call and watching it fail. `**bold**` in the same

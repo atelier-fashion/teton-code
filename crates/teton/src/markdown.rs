@@ -560,10 +560,11 @@ pub enum Block<'a> {
 /// what lies between the pipes, trimmed — `| a | b |` is two cells, and `||` is
 /// one empty cell.
 ///
-/// **The seam for TASK-278.** Column measurement and the two layouts (aligned
-/// when the columns fit, one labelled block per row when they do not) build on
-/// this and are not implemented here; recognition is, because the block
-/// classifier owes an answer for every row of the recognized-construct table.
+/// Recognition only, and it is shared: the block classifier calls it to answer
+/// for every row of the recognized-construct table, and [`measure_table`] calls
+/// it again to split the buffered run it is handed. Column measurement and the
+/// two layouts build on it in [`layout_table`], which is where a cell stops
+/// being a slice of the source and becomes display text.
 ///
 /// Escaped pipes (`\|`) are not honoured — a cell boundary is a `|`, full stop.
 /// The related out-of-scope case, a `|` inside a code span inside a cell, is
@@ -714,6 +715,273 @@ pub fn classify(line: &str) -> Block<'_> {
     Block::Paragraph {
         indent: 0,
         text: body,
+    }
+}
+
+// ---- Table layout (BR-4) ---------------------------------------------------
+
+/// What sits between two columns in the aligned layout.
+///
+/// Two spaces rather than a `│`: the columns are already separated by the fact
+/// that they line up, and a vertical rule would have to be defused-safe, widened
+/// for the CJK case, and argued about. The rule under the header carries the
+/// "this is a table" signal on its own.
+const COLUMN_GUTTER: &str = "  ";
+
+/// What separates a column's name from its value in the transposed layout.
+const LABEL_SEPARATOR: &str = ": ";
+
+/// The columns a transposed value's continuation rows are indented by.
+///
+/// Deliberately **not** the label's own width. Aligning continuation rows under
+/// the value would read better, but it makes the usable text width a function of
+/// the widest column name — a table whose header is `Recommended remediation`
+/// would lose 25 columns on every row of every block. A fixed two columns is
+/// enough to show that a row is a continuation and costs the value nothing.
+const TRANSPOSED_INDENT: usize = 2;
+
+/// What a column with no name in the header row is labelled, plus its 1-based
+/// position — `Column 3`.
+///
+/// A positional label rather than no label at all: a value printed bare in a
+/// labelled block is a value the reader cannot attribute to a column, and the
+/// two ways a column ends up unnamed (a header row with fewer cells than the
+/// body, and a `|` inside a cell splitting one column into two) are exactly the
+/// cases where attribution matters most.
+const UNNAMED_COLUMN: &str = "Column";
+
+/// A measured table: every row's cells as **display text**, plus each column's
+/// width in terminal columns.
+struct Table {
+    /// One entry per source row, in source order. `None` where a separator row
+    /// stood — it is structure, and the layouts draw it rather than print it.
+    rows: Vec<Option<Vec<String>>>,
+    /// Each column's display width, taken from the widest cell in it.
+    columns: Vec<usize>,
+}
+
+impl Table {
+    /// The terminal columns the aligned layout would need: every column at its
+    /// measured width, plus one gutter between each adjacent pair.
+    fn aligned_width(&self) -> usize {
+        let gutters = self.columns.len().saturating_sub(1) * display_width(COLUMN_GUTTER);
+        self.columns.iter().sum::<usize>() + gutters
+    }
+}
+
+/// Measure a buffered run of table rows, or `None` when it is not one.
+///
+/// Two things happen here that the rest of the layout then depends on.
+///
+/// **Cells are reduced to display text.** Every cell goes through
+/// [`parse_inline`], so a cell of `**bold**` measures four columns rather than
+/// eight and a column lines up against what the reader sees rather than against
+/// what the model typed. The stripped text is what the layouts then emit — see
+/// [`layout_table`] for why that is a contract and not an implementation
+/// detail.
+///
+/// **The table's shape comes from its content, not from its separator.** The
+/// column count is the widest *data* row, so a row carrying a stray `|` widens
+/// the table by a column rather than losing the text after the pipe, and a
+/// separator row that declares more columns than anything else has does not
+/// invent an empty one.
+fn measure_table(rows: &[&str]) -> Option<Table> {
+    let mut cells: Vec<Option<Vec<String>>> = Vec::with_capacity(rows.len());
+    for row in rows {
+        // The caller buffers a run of rows it classified; a line that is not a
+        // table row means the run is not the shape this function was promised.
+        // Guessing at it is the one move ADR-2 rules out, so the whole run
+        // degrades to its own source.
+        let raw = table_cells(row)?;
+        if is_separator_row(&raw) {
+            cells.push(None);
+        } else {
+            cells.push(Some(
+                raw.iter().map(|cell| parse_inline(cell).text).collect(),
+            ));
+        }
+    }
+
+    let mut columns: Vec<usize> = Vec::new();
+    for row in cells.iter().flatten() {
+        for (at, cell) in row.iter().enumerate() {
+            if columns.len() <= at {
+                columns.push(0);
+            }
+            columns[at] = columns[at].max(display_width(cell));
+        }
+    }
+
+    Some(Table {
+        rows: cells,
+        columns,
+    })
+}
+
+/// Lay a buffered run of table rows out at `width` (BR-4).
+///
+/// The caller holds the run — consecutive table rows arrive one at a time and
+/// the run ends when a non-table line does, which is buffering and belongs to
+/// the surface. This function is the decision the buffer exists to make:
+/// `(rows, width) -> Vec<String>`, with no memory between calls.
+///
+/// Three outcomes, tried in order:
+///
+/// 1. **The columns fit.** Cells are padded so each column lines up vertically
+///    and each separator row is drawn as a rule. This is the layout that looks
+///    like a table.
+/// 2. **They do not.** Each data row becomes its own labelled block — one line
+///    per column carrying that column's header and this row's value, the value
+///    wrapped under BR-3, blocks separated by a blank line. This is the layout
+///    that actually fixes the reported defect: the audit table that motivated
+///    REQ-592 has a second column measuring 155..243 columns, and no terminal
+///    is wide enough to align it.
+/// 3. **Not even that fits.** The raw source rows are emitted unchanged, pipes
+///    and all. They will be over-wide and the terminal will hard-wrap them —
+///    which is ADR-2's posture, because the alternative is clipping cells, and a
+///    clipped security finding is the sentence that mattered going missing.
+///
+/// ## The returned rows are final display text
+///
+/// Inline markers are already **removed** from what comes back: `**bold**` is
+/// emitted as `bold`. A caller must not run [`parse_inline`] over these rows.
+///
+/// That is a contract rather than a convenience. The padding is computed from
+/// the stripped width, so a second pass that stripped markers again would move
+/// text left by four columns per marker pair and un-align every column the first
+/// pass lined up — a display helper disagreeing with the consuming parser, which
+/// is [[LESSON-529]] exactly. Keeping the markers in the output instead has the
+/// same defect from the other end: `| **a | b** |` parses as two literal cells
+/// but as one strong run once joined, so the width measured here and the width
+/// drawn there would differ by four columns for reasons no test would predict.
+///
+/// The cost, recorded rather than hidden: **inline styling is not available
+/// inside a table.** A bold cell renders as unstyled text at the right column
+/// rather than as bold text at the wrong one.
+///
+/// ## What is still allowed past the edge
+///
+/// A single word wider than the available columns, per [`wrap_ranges`] — the
+/// whole-and-over-wide rule. Nothing is truncated to buy the promise.
+#[must_use]
+pub fn layout_table(rows: &[&str], width: usize) -> Vec<String> {
+    let Some(table) = measure_table(rows) else {
+        return raw_rows(rows);
+    };
+    if table.aligned_width() <= width {
+        return aligned_table(&table);
+    }
+    transposed_table(&table, width).unwrap_or_else(|| raw_rows(rows))
+}
+
+/// The source rows, unchanged — ADR-2's degrade-don't-truncate floor.
+///
+/// Separator rows included: this is the *source*, and a run that could not be
+/// laid out has no structure left to draw, only text to preserve.
+fn raw_rows(rows: &[&str]) -> Vec<String> {
+    rows.iter().map(|row| (*row).to_owned()).collect()
+}
+
+/// The aligned layout: cells padded to their column's width, separator rows
+/// drawn as a rule spanning the table.
+///
+/// The rule spans the *table's* width rather than the terminal's — a rule out to
+/// the right edge would claim columns the table does not occupy, and next to a
+/// 20-column table on a 200-column terminal that reads as a page break rather
+/// than as a header underline.
+fn aligned_table(table: &Table) -> Vec<String> {
+    let rule = thematic_break(table.aligned_width());
+    table
+        .rows
+        .iter()
+        .map(|row| {
+            let Some(cells) = row else {
+                return rule.clone();
+            };
+            let mut out = String::new();
+            for (at, target) in table.columns.iter().enumerate() {
+                if at > 0 {
+                    out.push_str(COLUMN_GUTTER);
+                }
+                let cell = cells.get(at).map_or("", String::as_str);
+                out.push_str(cell);
+                out.push_str(&" ".repeat(target.saturating_sub(display_width(cell))));
+            }
+            // The last column's padding is invisible, and shipping it would put
+            // trailing whitespace on every row of every table — which a terminal
+            // shows only when the cursor lands in it and a `git diff` shows
+            // always.
+            out.trim_end().to_owned()
+        })
+        .collect()
+}
+
+/// The transposed layout: one labelled block per data row, or `None` when the
+/// width cannot carry even that.
+///
+/// The header is the first non-separator row, and the data rows are the rest of
+/// them. Separator rows vanish entirely here: they separate a header from a body
+/// that this layout no longer prints in that arrangement, so there is nothing
+/// left for a rule to divide.
+///
+/// Three refusals, each returning `None` so that [`layout_table`] falls back to
+/// the raw source rather than emitting something worse:
+///
+/// - **the width cannot hold the widest label** — every block's first line would
+///   start over-wide, so no layout has happened and the source at least keeps
+///   its cell boundaries visible;
+/// - **there are no data rows** — a header-only table has nothing to transpose,
+///   and emitting nothing would discard the header;
+/// - **every data row is empty** — same reason, from the other end.
+fn transposed_table(table: &Table, width: usize) -> Option<Vec<String>> {
+    let header = table.rows.iter().flatten().next()?;
+
+    let prefixes: Vec<String> = (0..table.columns.len())
+        .map(|at| {
+            let name = header.get(at).map_or("", String::as_str).trim();
+            if name.is_empty() {
+                format!("{UNNAMED_COLUMN} {}{LABEL_SEPARATOR}", at + 1)
+            } else {
+                format!("{name}{LABEL_SEPARATOR}")
+            }
+        })
+        .collect();
+
+    // One column of value is the floor. Below it the label alone is already past
+    // the terminal's edge, and a "layout" whose every first line overflows is
+    // not a layout — it is the raw row with the pipes replaced by worse.
+    let widest_label = prefixes.iter().map(|p| display_width(p)).max()?;
+    if width <= widest_label {
+        return None;
+    }
+
+    let continuation = " ".repeat(TRANSPOSED_INDENT);
+    let mut out: Vec<String> = Vec::new();
+    for row in table.rows.iter().flatten().skip(1) {
+        let mut block: Vec<String> = Vec::new();
+        for (at, prefix) in prefixes.iter().enumerate() {
+            let value = row.get(at).map_or("", String::as_str);
+            // An empty cell is a column this row has nothing to say about.
+            // Printing `Finding: ` with nothing after it spends a line to say
+            // so, and a row missing its trailing cells would spend several.
+            if value.trim().is_empty() {
+                continue;
+            }
+            block.extend(wrap_indented(value, width, prefix, &continuation));
+        }
+        if block.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(String::new());
+        }
+        out.extend(block);
+    }
+
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
     }
 }
 
@@ -1399,7 +1667,7 @@ mod tests {
         }
     }
 
-    // ---- Table recognition (the TASK-278 seam) ------------------------------
+    // ---- Table recognition ---------------------------------------------------
 
     /// Cell splitting, which the classifier and TASK-278's layout share.
     #[test]
@@ -1427,6 +1695,380 @@ mod tests {
         assert!(matches!(classify("| ---x | --- |"), Block::TableRow { .. }));
         // Colons alone are not an alignment row.
         assert!(matches!(classify("| : | : |"), Block::TableRow { .. }));
+    }
+
+    // ---- AC-4: the two table layouts (BR-4) ---------------------------------
+
+    /// The raw source rows, which is what every degrade path is compared to.
+    fn source_rows(rows: &[&str]) -> Vec<String> {
+        rows.iter().map(|row| (*row).to_owned()).collect()
+    }
+
+    /// AC-4's fixture, read from disk.
+    ///
+    /// Resolved from `CARGO_MANIFEST_DIR` rather than from the current
+    /// directory: `cargo test` run from the workspace root and from
+    /// `crates/teton` have different working directories, and a relative path
+    /// would pass under one and fail under the other for reasons that have
+    /// nothing to do with the layout.
+    fn audit_fixture() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../.adlc/specs/REQ-592-markdown-aware-terminal-rendering/fixtures/audit-2026-08-26.md",
+        );
+        std::fs::read_to_string(&path).unwrap_or_else(|err| {
+            panic!(
+                "AC-4's fixture must be readable at {}: {err}",
+                path.display()
+            )
+        })
+    }
+
+    /// AC-4, aligned half: a table whose columns fit is padded so the columns
+    /// line up, and its separator row is **drawn** as a rule rather than
+    /// printed.
+    #[test]
+    fn a_table_that_fits_lines_its_columns_up_and_rules_its_separator() {
+        let rows = [
+            "| Name | Status |",
+            "|------|--------|",
+            "| alpha | ok |",
+            "| bravo-long | failed |",
+        ];
+        let out = layout_table(&rows, 40);
+
+        assert_eq!(
+            out,
+            vec![
+                "Name        Status".to_owned(),
+                RULE.to_string().repeat(18),
+                "alpha       ok".to_owned(),
+                "bravo-long  failed".to_owned(),
+            ]
+        );
+
+        // The alignment as a property rather than as a transcription: the second
+        // column starts at the same display offset on every row, which is what
+        // "lined up vertically" means when the rows have different widths.
+        for (row, value) in [(&out[0], "Status"), (&out[2], "ok"), (&out[3], "failed")] {
+            let at = row.find(value).expect("the second column's value");
+            assert_eq!(display_width(&row[..at]), 12, "{row:?}");
+        }
+
+        // Nothing structural leaked through as text.
+        for row in &out {
+            assert!(!row.contains('|'), "{row:?} still carries a table pipe");
+            assert!(
+                !row.contains("---"),
+                "the separator row was printed: {row:?}"
+            );
+            assert_eq!(
+                row.trim_end(),
+                row.as_str(),
+                "{row:?} carries trailing space"
+            );
+        }
+
+        // The rule spans the table, not the terminal — a 40-column rule next to
+        // an 18-column table reads as a page break, not as a header underline.
+        assert_eq!(display_width(&out[1]), 18);
+    }
+
+    /// AC-4, transposed half — the case the reported defect actually lives in.
+    ///
+    /// The table is **read from disk**, never transcribed. A table authored
+    /// while knowing the layout algorithm tests the author's assumptions rather
+    /// than the algorithm ([[LESSON-529]]'s re-enactment corollary), and this
+    /// one is real model output that the renderer was not designed against:
+    /// bold runs, code spans, arrows and em-dashes in a column that no terminal
+    /// is wide enough to align.
+    #[test]
+    fn the_audit_fixture_transposes_at_a_hundred_and_at_two_hundred_columns() {
+        let source = audit_fixture();
+        let rows: Vec<&str> = source
+            .lines()
+            .filter(|line| table_cells(line).is_some())
+            .collect();
+
+        // The fixture's shape, **re-measured** rather than trusted — its own
+        // header says to re-measure if the file changes, and a test that
+        // asserted the header's figures would be asserting the comment.
+        assert_eq!(
+            rows.len(),
+            9,
+            "the fixture's table is a header, a separator and 7 data rows"
+        );
+        let values: Vec<String> = rows[2..]
+            .iter()
+            .map(|row| parse_inline(table_cells(row).expect("a table row")[1]).text)
+            .collect();
+        assert_eq!(values.len(), 7);
+        let widest = values
+            .iter()
+            .map(|value| display_width(value))
+            .max()
+            .expect("seven values");
+        assert!(
+            widest > 200,
+            "the second column has to overflow both widths or the test is vacuous: {widest}"
+        );
+
+        for width in [100_usize, 200] {
+            let out = layout_table(&rows, width);
+
+            for row in &out {
+                assert!(
+                    display_width(row) <= width,
+                    "at {width} columns the row {row:?} is {} columns wide",
+                    display_width(row)
+                );
+                assert!(
+                    !row.contains('|'),
+                    "at {width}: {row:?} is still raw source"
+                );
+                assert!(
+                    !row.contains("---"),
+                    "at {width}: the separator row was printed: {row:?}"
+                );
+            }
+
+            // One labelled block per data row, blocks separated by a blank line.
+            let blocks: Vec<&[String]> = out.split(String::is_empty).collect();
+            assert_eq!(blocks.len(), 7, "at {width} columns: {out:#?}");
+
+            for (block, value) in blocks.iter().zip(&values) {
+                assert!(
+                    block[0].starts_with("Surface: "),
+                    "at {width}: {block:#?} does not lead with its first column"
+                );
+                let finding = block
+                    .iter()
+                    .position(|row| row.starts_with("Finding: "))
+                    .unwrap_or_else(|| panic!("at {width}: no Finding line in {block:#?}"));
+
+                // Every word of the value survives, in order: wrapped, never
+                // clipped. A truncated cell would show up here as a missing
+                // tail, which is precisely the failure ADR-2 forbids.
+                let emitted: Vec<&str> = block[finding..]
+                    .iter()
+                    .flat_map(|row| row.split_whitespace())
+                    .skip(1)
+                    .collect();
+                let expected: Vec<&str> = value.split_whitespace().collect();
+                assert_eq!(emitted, expected, "at {width} columns");
+
+                // Wrapping is asserted where it must happen rather than
+                // everywhere. The label leaves `width - 9` columns; a value
+                // wider than that has to occupy continuation rows, and one that
+                // is not must not, because a break inserted into a value that
+                // already fit would be a bug rather than a feature.
+                let available = width - display_width("Finding: ");
+                assert_eq!(
+                    block.len() - finding > 1,
+                    display_width(value) > available,
+                    "at {width} columns: {block:#?}"
+                );
+            }
+
+            // Non-vacuity for the wrap itself, stated per width because the two
+            // widths exercise different halves of it: at 100 columns all seven
+            // values (153..235 columns as measured above) overflow, at 200 only
+            // the widest three do.
+            let wrapped = blocks.iter().filter(|block| block.len() > 2).count();
+            assert!(wrapped > 0, "at {width} columns nothing wrapped");
+            if width == 100 {
+                assert_eq!(wrapped, 7, "at 100 columns every value must wrap");
+            }
+        }
+    }
+
+    /// AC-4's measurement rule: a column is measured against what is
+    /// **displayed**, not against what was typed.
+    #[test]
+    fn column_measurement_ignores_inline_markers() {
+        assert_eq!(display_width("**bold**"), 8);
+        assert_eq!(display_width(&parse_inline("**bold**").text), 4);
+
+        let rows = ["| Key | Value |", "|-----|-------|", "| **bold** | x |"];
+        let out = layout_table(&rows, 40);
+
+        // The first column is four columns wide, not eight, so `Value` lands at
+        // display column six. Measured against the source it would land at ten
+        // and the header would sit four columns adrift of the body it labels.
+        assert_eq!(
+            out,
+            vec![
+                "Key   Value".to_owned(),
+                RULE.to_string().repeat(11),
+                "bold  x".to_owned(),
+            ]
+        );
+    }
+
+    /// ADR-2's floor: at a width too small to lay the table out even
+    /// transposed, the **source** comes back — over-wide and complete rather
+    /// than tidy and lossy.
+    #[test]
+    fn a_width_too_narrow_for_even_the_transposed_layout_emits_the_raw_rows() {
+        let rows = [
+            "| Finding |",
+            "|---------|",
+            "| a very long finding that does not fit |",
+        ];
+
+        // `Finding: ` is nine columns, so at eight there is not one column left
+        // for a value: every block would open past the terminal's edge, which
+        // is not a layout. The source at least keeps its cell boundaries.
+        assert_eq!(layout_table(&rows, 8), source_rows(&rows));
+        assert_eq!(layout_table(&rows, 9), source_rows(&rows));
+
+        // One more column and the layout is possible again, if barely: one word
+        // per row, every word intact.
+        let barely = layout_table(&rows, 10);
+        assert!(
+            !barely.iter().any(|row| row.contains('|')),
+            "width 10 must lay out rather than degrade: {barely:?}"
+        );
+        let words: Vec<&str> = barely
+            .iter()
+            .flat_map(|row| row.split_whitespace())
+            .collect();
+        assert_eq!(
+            words,
+            vec!["Finding:", "a", "very", "long", "finding", "that", "does", "not", "fit"]
+        );
+    }
+
+    /// A `|` inside a cell splits it, because a cell boundary is a `|` full
+    /// stop (see [`table_cells`]). The tail therefore becomes an extra column
+    /// with no header — and it is **labelled by position rather than dropped**,
+    /// which is the difference between an odd-looking table and a lost
+    /// sentence.
+    #[test]
+    fn a_pipe_inside_a_cell_becomes_a_column_rather_than_a_lost_tail() {
+        let rows = [
+            "| Surface | Finding |",
+            "|---------|---------|",
+            "| shell | uses a | b pipeline |",
+        ];
+        assert_eq!(
+            layout_table(&rows, 20),
+            vec![
+                "Surface: shell".to_owned(),
+                "Finding: uses a".to_owned(),
+                "Column 3: b pipeline".to_owned(),
+            ]
+        );
+    }
+
+    /// A row with fewer cells than the table has columns says nothing about the
+    /// columns it is missing, so the block says nothing about them either —
+    /// rather than spending a line on a bare `Finding: `.
+    #[test]
+    fn a_row_missing_its_trailing_cell_omits_that_columns_line() {
+        let rows = [
+            "| Surface | Finding |",
+            "|---------|---------|",
+            "| alpha | a finding that is much too wide to align |",
+            "| bravo |",
+        ];
+        let out = layout_table(&rows, 20);
+
+        assert_eq!(
+            out,
+            vec![
+                "Surface: alpha".to_owned(),
+                "Finding: a finding".to_owned(),
+                "  that is much too".to_owned(),
+                "  wide to align".to_owned(),
+                String::new(),
+                "Surface: bravo".to_owned(),
+            ]
+        );
+        for row in &out {
+            assert_ne!(row.trim_end(), "Finding:", "an empty label was printed");
+        }
+    }
+
+    /// A header row shorter than the table's column count leaves a column
+    /// unnamed. The value still needs attributing to something, so it is
+    /// labelled by position.
+    #[test]
+    fn a_header_row_shorter_than_the_table_labels_the_rest_by_position() {
+        let rows = [
+            "| Surface |",
+            "|---------|",
+            "| alpha | an unheaded value that is far too wide to align |",
+        ];
+        let out = layout_table(&rows, 24);
+
+        assert_eq!(
+            out,
+            vec![
+                "Surface: alpha".to_owned(),
+                "Column 2: an unheaded".to_owned(),
+                "  value that is far too".to_owned(),
+                "  wide to align".to_owned(),
+            ]
+        );
+        assert!(widths(&out).iter().all(|w| *w <= 24), "{out:?}");
+    }
+
+    /// A single-column table has no columns to line up against each other, and
+    /// it still has to obey both halves of BR-4.
+    #[test]
+    fn a_single_column_table_aligns_or_transposes_like_any_other() {
+        let rows = [
+            "| Finding |",
+            "|---------|",
+            "| the first finding, wider than the width |",
+            "| the second finding |",
+        ];
+
+        // Wide enough: the values under a rule, with nothing else to align to.
+        let aligned = layout_table(&rows, 60);
+        assert_eq!(
+            aligned,
+            vec![
+                "Finding".to_owned(),
+                RULE.to_string().repeat(39),
+                "the first finding, wider than the width".to_owned(),
+                "the second finding".to_owned(),
+            ]
+        );
+
+        // Too narrow: one labelled block per row, blocks separated by a blank
+        // line, every value wrapped.
+        let transposed = layout_table(&rows, 24);
+        assert_eq!(
+            transposed,
+            vec![
+                "Finding: the first".to_owned(),
+                "  finding, wider than".to_owned(),
+                "  the width".to_owned(),
+                String::new(),
+                "Finding: the second".to_owned(),
+                "  finding".to_owned(),
+            ]
+        );
+        assert!(
+            widths(&transposed).iter().all(|w| *w <= 24),
+            "{transposed:?}"
+        );
+    }
+
+    /// Two runs there is nothing to lay out from, both of which fall back to the
+    /// source rather than to silence.
+    #[test]
+    fn a_run_with_nothing_to_transpose_falls_back_to_its_source() {
+        // A header with no body. Too narrow to align, and there are no data
+        // rows to turn into blocks — emitting nothing would discard the header.
+        let header_only = ["| Surface | Finding |", "|---------|---------|"];
+        assert_eq!(layout_table(&header_only, 12), source_rows(&header_only));
+
+        // A run the caller mis-buffered. The shape is not the one this function
+        // was promised, and guessing at it is the one move ADR-2 rules out.
+        let mixed = ["| a | b |", "not a table row at all"];
+        assert_eq!(layout_table(&mixed, 40), source_rows(&mixed));
     }
 
     // ---- BR-10: the structural sweep ---------------------------------------

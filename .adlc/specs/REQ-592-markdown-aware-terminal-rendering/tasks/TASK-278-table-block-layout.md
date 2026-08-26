@@ -1,7 +1,7 @@
 ---
 id: TASK-278
 title: "Table block layout: align when it fits, transpose when it does not"
-status: draft
+status: complete
 parent: REQ-592
 created: 2026-08-26
 updated: 2026-08-26
@@ -19,17 +19,17 @@ Add table measurement and layout to the pure module. Still no terminal bytes. Co
 
 ## Acceptance Criteria
 
-- [ ] AC-4 (aligned): a narrow table renders with its columns lined up vertically and its
+- [x] AC-4 (aligned): a narrow table renders with its columns lined up vertically and its
       separator row drawn as a rule rather than printed literally.
-- [ ] AC-4 (transposed): the table in
+- [x] AC-4 (transposed): the table in
       `.adlc/specs/REQ-592-markdown-aware-terminal-rendering/fixtures/audit-2026-08-26.md` —
       7 data rows, column 2 measuring 155..243 chars, widest raw row 263 — renders as one labelled
       block per data row at **both 100 and 200 columns**, every value wrapped, and **no emitted row
       exceeding the width in display columns**.
-- [ ] The fixture is **read from disk by the test**, not transcribed into it.
-- [ ] A width too small to lay the table out even transposed emits the raw source rows rather
+- [x] The fixture is **read from disk by the test**, not transcribed into it.
+- [x] A width too small to lay the table out even transposed emits the raw source rows rather
       than clipping cells (ADR-2's degrade-don't-truncate).
-- [ ] Column measurement ignores inline markers: a cell of `**bold**` measures 4 columns, not 8,
+- [x] Column measurement ignores inline markers: a cell of `**bold**` measures 4 columns, not 8,
       so alignment is against what is displayed rather than what is typed.
 
 ## Technical Notes
