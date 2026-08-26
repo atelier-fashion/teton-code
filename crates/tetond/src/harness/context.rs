@@ -3259,7 +3259,7 @@ mod tests {
     fn the_local_harnesss_digest_thresholds_moved_with_its_budget() {
         let config = super::super::turn_loop::HarnessConfig::default();
         assert_eq!(config.summarize_threshold_tokens, 3_750);
-        assert_eq!(config.summarize_threshold_bytes, 11_250);
+        assert_eq!(config.summarize_threshold_bytes, 12_000);
         assert_eq!(
             (
                 config.summarize_threshold_tokens,

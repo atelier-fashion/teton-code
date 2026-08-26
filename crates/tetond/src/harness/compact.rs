@@ -1106,19 +1106,41 @@ mod tests {
              repairing to",
             local.budget_bytes
         );
+        // **The equality that used to stand here is gone, deliberately (ADR-9).**
+        //
+        // TASK-271 asserted `ceiling == budget` on the reasoning that a ceiling
+        // *below* the budget leaves the duty unable to write the paragraph its
+        // own budget could hold. That was right while both were window-derived.
+        //
+        // ADR-9 reversed D-4: the byte budget is `LOCAL_BUDGET_BYTES` (32,768,
+        // word-derived) while the ceiling stays window-derived (30,720). They
+        // are answers to two different questions now — "how many bytes may a
+        // local prompt claim" and "how many bytes can this engine actually take
+        // back" — so equality would be a coincidence to pin, not an invariant.
+        //
+        // The 2,048 B between them is not slack the duty is being denied. It is
+        // exactly the amount by which the byte budget out-claims the engine at
+        // the 2 B/token floor — the known residual ADR-9 accepted, stated here
+        // in the one place the two numbers meet.
         assert_eq!(
-            COMPACT_OUTPUT_MAX_BYTES, local.budget_bytes,
-            "and it is not merely under that budget, it *is* it — a ceiling below the \
-             budget would leave the duty unable to write the paragraph its own budget \
-             could hold"
+            local.budget_bytes - COMPACT_OUTPUT_MAX_BYTES,
+            crate::harness::budget::LOCAL_BUDGET_BYTES
+                - (LOCAL_ENGINE_N_CTX.saturating_sub(LOCAL_GENERATION_RESERVATION) as usize
+                    * DUTY_REQUEST_BYTES_PER_TOKEN),
+            "the distance between the byte budget and the ceiling is no longer the distance \
+             between what the byte half claims and what the engine can take — one of the two \
+             has moved without the other, which is LESSON-491's shape returning"
         );
-        // The same fact through the config the turn loop actually runs on, so
-        // the chain is pinned at the surface as well as at the derivation.
-        assert_eq!(
-            COMPACT_OUTPUT_MAX_BYTES,
-            super::super::HarnessConfig::default().context_budget_bytes,
-            "the ceiling is the local route's context byte budget, because a compaction \
-             bigger than the window it makes room in is bytes spent to be thrown away"
+        // The same relation through the config the turn loop actually runs on,
+        // so the chain is pinned at the surface as well as at the derivation.
+        // `<=`, not `==`, for the reason above: since ADR-9 the two are answers
+        // to different questions and only their ordering is an invariant.
+        assert!(
+            COMPACT_OUTPUT_MAX_BYTES <= super::super::HarnessConfig::default().context_budget_bytes,
+            "the ceiling ({COMPACT_OUTPUT_MAX_BYTES} B) is above the local route's context \
+             byte budget ({} B), so a compaction can be bigger than the window it makes room \
+             in — bytes spent to be thrown away",
+            super::super::HarnessConfig::default().context_budget_bytes
         );
         assert_eq!(COMPACT_DUTY.ceiling_bytes(), COMPACT_OUTPUT_MAX_BYTES);
         assert_eq!(COMPACT_DUTY.category(), Category::Compact);
@@ -1150,121 +1172,28 @@ mod tests {
     /// could not say.
     const THE_CEILING_BEFORE_REQ_590: usize = crate::harness::budget::LOCAL_BUDGET_BYTES;
 
-    /// **REQ-590 AC-8, the behaviour half.** A compaction whose answer would
-    /// have landed the context in the 2,048-byte band between the local budget
-    /// (30,720) and the old ceiling (32,768) is now **applied**, where it used
-    /// to be rejected and the turn left to deterministic oldest-first eviction.
-    ///
-    /// # Why this is the test the relation needs
-    ///
-    /// `the_compact_ceiling_is_the_loosest_of_the_five` pins the two numbers
-    /// against each other; it cannot show what the disagreement *cost*. The
-    /// cost is here, and it was silent: the duty was allowed to accumulate up to
-    /// the old ceiling, `attempt_compaction` then measured the candidate against
-    /// the route's budget — 2,048 bytes lower — and degraded, on the one route
-    /// whose whole reason for calling a model was that the deterministic drop is
-    /// worse. Nothing in the logs said "the ceiling and the budget disagree";
-    /// the reason sentence read like an unlucky answer.
-    ///
-    /// With the ceiling re-pointed at the budget, `bound_to_ceiling` cuts the
-    /// duty's answer 2,048 bytes earlier and the same answer lands under budget.
-    ///
-    /// # The fixture is discriminating, and says so
-    ///
-    /// The band assertion below is not decoration: it recomputes where this
-    /// candidate *would* have landed under the old ceiling and fails if that is
-    /// not inside the gap — so a fixture drifting out of the band reddens here
-    /// rather than passing under both ceilings and testing nothing
-    /// (LESSON-563: moving a test does not preserve its bite).
-    ///
-    /// Measured, at today's constants: the compaction lands at **29,965 B**
-    /// against a 30,720 B budget, and at **32,013 B** under the old ceiling —
-    /// 1,293 bytes into the 2,048-byte gap, with ~755 bytes of slack on either
-    /// side of the band. The slack comes from the length of the `FORGET:` list:
-    /// every block the answer names is a byte the ceiling spends on numbers
-    /// rather than on paragraph, which is why the fixture is wide and shallow
-    /// rather than a handful of fat blocks.
-    ///
-    /// **Mutation:** pin `COMPACT_OUTPUT_MAX_BYTES` back at `LOCAL_BUDGET_BYTES`
-    /// and this goes red with `the compact duty's answer would have left the
-    /// context over budget (32013 B … against a budget of 30720 B)`.
-    #[tokio::test]
-    async fn a_compaction_that_lands_in_the_old_gap_is_applied_not_degraded() {
-        // Enough blocks that the whole conversation is offered and all but the
-        // step in progress may be forgotten: the `FORGET:` list is then long
-        // enough that cutting the answer at the ceiling cuts *summary*, which is
-        // the byte that decides this.
-        const BLOCKS: usize = 400;
-        const BLOCK_BYTES: usize = 30;
-
-        let config = super::super::HarnessConfig::default();
-        let budget_bytes = config.context_budget_bytes;
-        assert!(
-            THE_CEILING_BEFORE_REQ_590 > budget_bytes,
-            "there is no gap to test; if the default pair and the local pair have been \
-             brought back into agreement, this test has nothing left to say"
-        );
-
-        let mut ctx =
-            ContextManager::new("", config.context_budget_tokens).with_budget_bytes(budget_bytes);
-        for i in 0..BLOCKS {
-            ctx.push_user(format!("b{i} {}", "x".repeat(BLOCK_BYTES)));
-        }
-        let before = ctx.estimated_bytes();
-
-        // One unbroken run for the paragraph — far past either ceiling, so the
-        // ceiling and nothing else decides how much of it survives, and few
-        // enough whitespace words that the token budget never enters into it.
-        let numbers: Vec<String> = (1..BLOCKS).map(|i| i.to_string()).collect();
-        let answer = format!(
-            "FORGET: {}\nSUMMARY: {}",
-            numbers.join(" "),
-            "s".repeat(64 * 1024)
-        );
-        let route = local_route(&answer);
-
-        let out = ctx.compact_if_pressured(&route).await;
-
-        assert!(
-            !out.degraded,
-            "the compaction was thrown away: {:?}",
-            out.reason
-        );
-        assert_eq!(out.dropped_blocks, BLOCKS - 1);
-
-        let landed = ctx.estimated_bytes();
-        assert!(
-            landed <= budget_bytes,
-            "a compaction was applied that left the context at {landed} B against a \
-             {budget_bytes} B budget"
-        );
-        assert!(
-            landed < before,
-            "the compaction did not make the context smaller: {before} B -> {landed} B"
-        );
-
-        // And it really is the gap: the same answer under the old ceiling keeps
-        // exactly `THE_CEILING_BEFORE_REQ_590 - COMPACT_OUTPUT_MAX_BYTES` more
-        // bytes of paragraph, which is the only difference between the two runs.
-        let would_have_landed = landed + (THE_CEILING_BEFORE_REQ_590 - COMPACT_OUTPUT_MAX_BYTES);
-        assert!(
-            would_have_landed > budget_bytes && would_have_landed <= THE_CEILING_BEFORE_REQ_590,
-            "this fixture lands at {would_have_landed} B under the old ceiling, which is \
-             outside the {}..={THE_CEILING_BEFORE_REQ_590} band it is supposed to \
-             discriminate — it would pass under both ceilings and test nothing",
-            budget_bytes + 1
-        );
-
-        // The paragraph really is what was cut, and it survived as a paragraph:
-        // a summary cut down to nothing would fail this duty for a different
-        // reason and prove nothing about the ceiling.
-        let summary = &ctx.blocks()[0].text;
-        assert!(summary.contains("blocks elided"), "{summary:.120}");
-        assert!(
-            summary.matches('s').count() > COMPACT_BLOCK_MAX_BYTES,
-            "the surviving paragraph is too short to have been bounded by the ceiling"
-        );
-    }
+    // **`a_compaction_that_lands_in_the_old_gap_is_applied_not_degraded` was
+    // removed here (REQ-590 ADR-9); the hole is deliberate and this says why.**
+    //
+    // TASK-271 wrote it against D-4's state: the byte budget at 30,720 with the
+    // ceiling still reading `LOCAL_BUDGET_BYTES` (32,768), so an answer landing
+    // in the 2,048 B between them was rejected at the budget check and the turn
+    // degraded to oldest-first eviction. That band was the defect, and the test
+    // drove a real duty through it.
+    //
+    // ADR-9 reversed D-4. The byte budget is `LOCAL_BUDGET_BYTES` again and the
+    // ceiling is window-derived *below* it, so no ceiling-bounded answer can
+    // exceed the budget — the ordering is structural, and
+    // `the_compact_ceiling_is_the_loosest_of_the_five` pins it along with the
+    // residual between the two.
+    //
+    // The test asked for this itself. Its own guard read: *"there is no gap to
+    // test; if the default pair and the local pair have been brought back into
+    // agreement, this test has nothing left to say"* — written by an author who
+    // anticipated the reversal and made the test announce its obsolescence
+    // rather than pass quietly on a fixture that no longer discriminates.
+    // Widening the fixture until it fired again would have been manufacturing a
+    // property the arithmetic has removed (LESSON-563, from the other side).
 
     /// An unresolvable route is a routing failure carrying the resolver's own
     /// sentence — asserted here on the seam, because the call site's use of it is

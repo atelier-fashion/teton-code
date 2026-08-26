@@ -2574,7 +2574,7 @@ mod tests {
         // "capabilities look defaulted" test would have called `silent` local
         // too.
         let local = router.budget_for(Some("local"));
-        assert_eq!((local.budget_tokens, local.budget_bytes), (10_240, 30_720));
+        assert_eq!((local.budget_tokens, local.budget_bytes), (10_240, 32_768));
         assert_eq!(local.bound, BudgetBound::LocalEngine);
         // Two facts, and REQ-590 moved one of them. The bound was the *only*
         // discriminator while the two arms returned one pair; the pair is now a
@@ -2705,7 +2705,7 @@ mod tests {
     /// sure. The other four rows are byte-identical to the capture, which is
     /// what says REQ-590 touched the local arm and nothing else.
     const BUDGET_FOR_GOLDEN: [&str; 5] = [
-        "local_engine: RouteBudget { budget_tokens: 10240, budget_bytes: 30720, bound: LocalEngine, window_label: \"the local context window\", digest_threshold_tokens: 3750, digest_threshold_bytes: 11250, floored: false, provider_id: None }",
+        "local_engine: RouteBudget { budget_tokens: 10240, budget_bytes: 32768, bound: LocalEngine, window_label: \"the local context window\", digest_threshold_tokens: 3750, digest_threshold_bytes: 12000, floored: false, provider_id: None }",
         "default_unknown: RouteBudget { budget_tokens: 4096, budget_bytes: 32768, bound: DefaultUnknown, window_label: \"silent's context window\", digest_threshold_tokens: 1500, digest_threshold_bytes: 12000, floored: false, provider_id: Some(\"silent\") }",
         "window: RouteBudget { budget_tokens: 84650, budget_bytes: 253952, bound: Window, window_label: \"wide's context window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 93000, floored: false, provider_id: Some(\"wide\") }",
         "user_cap: RouteBudget { budget_tokens: 25984, budget_bytes: 77952, bound: UserCap, window_label: \"capped's context window\", digest_threshold_tokens: 9515, digest_threshold_bytes: 28546, floored: false, provider_id: Some(\"capped\") }",
