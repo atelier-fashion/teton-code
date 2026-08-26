@@ -384,15 +384,27 @@ pub struct HarnessConfig {
     /// BPE tokens), so the context is bounded in bytes too: bytes are a
     /// conservative proxy for BPE tokens (code averages ≳2 bytes per token).
     ///
-    /// The default is the local route's derived pair — since REQ-590 the local
-    /// tier's bytes come from the engine's own window at the 2 B/token BPE
-    /// floor (`DUTY_REQUEST_BYTES_PER_TOKEN`), the same rule every
-    /// window-derived route runs, rather than from `LOCAL_BUDGET_TOKENS ×
-    /// APPROX_BYTES_PER_TOKEN`. That is what keeps a full assembled prompt
-    /// *inside* the local engine's 16,384-token window (`LOCAL_ENGINE_N_CTX`)
-    /// instead of a whole generation past it. The `words × 8` bridge survives
-    /// only where there is no window at all to derive from — a provider
-    /// declaring `max_context = 0`. Like the word half, this is
+    /// The default is the local route's pair, whose two halves have **different
+    /// provenance since REQ-590 ADR-9** — read `derive`'s local arm rather than
+    /// trusting this summary.
+    ///
+    /// The **word** half is window-derived (`LOCAL_ENGINE_N_CTX` less
+    /// `LOCAL_GENERATION_RESERVATION`, then the 3/2 rule). The **byte** half is
+    /// `LOCAL_BUDGET_TOKENS × APPROX_BYTES_PER_TOKEN` — the `words × 8` bridge,
+    /// unchanged, and *not* window-derived.
+    ///
+    /// D-4 briefly did derive it from the window, at the 2 B/token floor, which
+    /// gave 30,720. That was reversed: it refused the very `/analyze` body this
+    /// REQ exists for (31,014 B) by 294 bytes, moving the refusal from the word
+    /// guard to the byte guard rather than removing it, and it made the pair
+    /// *worse* than the old one above 7.5 B/word — where code lives.
+    ///
+    /// The honest consequence, stated because it is the thing the window
+    /// derivation would have fixed: at the 2 B/token floor this byte half claims
+    /// 16,384 provider tokens against 15,360 usable, so a byte-saturated local
+    /// prompt out-claims the engine by exactly `LOCAL_GENERATION_RESERVATION`.
+    /// That was true before REQ-590 and stays true after it; the catch is the
+    /// engine's own typed `context_length_exceeded`. Like the word half, this is
     /// stamped by [`with_route_budget`](Self::with_route_budget) on the next
     /// route decision, so hand-sizing it for a different engine holds only
     /// until then.
@@ -3031,7 +3043,8 @@ mod tests {
         let tools = ToolRegistry::with_builtins();
         let tool_ctx = ToolContext::new(std::env::temp_dir());
         let mut hook = NoopProvenanceHook;
-        let mut ctx = ContextManager::new("sys", config.context_budget_tokens);
+        let mut ctx = ContextManager::new("sys", config.context_budget_tokens)
+            .with_budget_bytes(config.context_budget_bytes);
         ctx.push_user("what is in nope.txt");
 
         let mut source = RemoteToolThenEndSource { calls: 0 };

@@ -449,8 +449,9 @@ fn the_binding_guard_crosses_over_at_a_much_lower_density_after_this_req() {
     );
 
     // The soft thresholds themselves, which the turn counts only approximate:
-    // integer turns cannot resolve a 6.25% move, and the byte half's move is
-    // 6.25% down while the word half's is 2.5× up.
+    // integer turns cannot resolve a move this small, and here there is nothing
+    // to resolve on the byte half — it does not move at all (ADR-9 reversed
+    // D-4's 6.25% cut), while the word half's is 2.5× up.
     let pressure = |budget: usize| budget * COMPACT_PRESSURE_PERCENT / 100;
     assert_eq!(
         (

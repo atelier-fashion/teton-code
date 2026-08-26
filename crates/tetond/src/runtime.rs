@@ -11966,26 +11966,67 @@ fn fake_engine_loader(
 
 /// Generation context window for the local tier's engine, in **BPE tokens**.
 ///
-/// Sized to cover the harness's context budget, which is denominated in a
-/// different currency: `HarnessConfig::context_budget_tokens` (4,096 for the
-/// weak-model profile) counts *whitespace-approximated* tokens
-/// ([`crate::harness::context`]'s `approx_tokens`), and source code tokenizes
-/// at roughly 2.5–4 BPE tokens per whitespace word. A window equal to the
-/// budget's number therefore overflows on exactly the inputs the tier exists
-/// for — a folded `read` of a real file killed the first dogfooded turn with
-/// an opaque "local engine could not serve the turn" (that failure now carries
-/// the engine's own over-window sentence, BUG-146) — so the window is the
-/// budget's worst-case BPE expansion (~4×) plus generation headroom.
+/// **This constant is the source, not the consequence (REQ-590).** It used to
+/// be sized *to cover* a separately-chosen harness budget — 4,096 whitespace
+/// words times a worst-case ~4× BPE expansion, plus generation headroom. That
+/// dependency now runs the other way: the harness budget is derived **from**
+/// this number, so a reader who arrives here looking for the ~4× of margin the
+/// old wording promised will not find it.
 ///
-/// The harness now also bounds its side in this window's currency: the
-/// assembled context and the summarizer's input are capped in **bytes**
-/// (`HarnessConfig::context_budget_bytes`, sized to this window), so
-/// pathological content (a minified single-line file) is clamped or
-/// mechanically truncated instead of reaching the engine over-window. The
-/// engine's typed backend error remains as the backstop, never the expected
-/// path.
+/// # What derives from it
 ///
-/// ## Not feature-gated, because a second consumer derives from it
+/// * The local route's **word** budget, in
+///   [`derive`](crate::harness::budget::derive)'s local arm: `16,384 − 1,024
+///   reserved for the reply = 15,360 usable`, then the same 3/2 rule every
+///   window-derived route runs, giving **10,240 whitespace words**. That is
+///   *exactly* saturating and carries **zero** slack (ADR-6): 10,240 × 3/2 =
+///   15,360, so any content denser than 1.5 real BPE tokens per whitespace word
+///   overruns the engine at full budget, with the engine's own typed
+///   `context_length_exceeded` as the only catch. The local **byte** budget is
+///   not derived from here at all — ADR-9 kept it at
+///   [`LOCAL_BUDGET_BYTES`](crate::harness::budget::LOCAL_BUDGET_BYTES),
+///   32,768, and `derive`'s local arm says why.
+/// * [`COMPACT_OUTPUT_MAX_BYTES`](crate::harness::compact::COMPACT_OUTPUT_MAX_BYTES)
+///   and [`COMPACT_PROMPT_BUDGET_BYTES`](crate::harness::compact::COMPACT_PROMPT_BUDGET_BYTES)
+///   — the `compact` duty's output ceiling and its own prompt bound.
+/// * [`REDACT_CHUNK_MAX_BYTES`](crate::egress::redact::REDACT_CHUNK_MAX_BYTES)
+///   and `REDACT_PROMPT_BUDGET_BYTES`, on the same chain.
+///
+/// # So lowering it is not a local edit (BR-8, OQ-2)
+///
+/// Every number above moves with it, and the rules that keep those moves safe
+/// live in `harness/budget.rs`, not here:
+///
+/// * **BR-8** — `MIN_BUDGET_*` may never raise the local pair above what this
+///   window holds. The floor's "only ever raises" property is safe against a
+///   provider's *declaration*, which the provider can refuse in words a user
+///   reads, and is not safe against this **allocation**, where a budget above
+///   the window buys nothing a turn can spend. Latent at 16,384; live the
+///   moment this constant falls. `budget::Floor::HeldToTheEngine` is where it
+///   is enforced and tested at a synthetic window.
+/// * **OQ-2, open — and its premise moved under it.** OQ-2 was written against
+///   a byte half that fell with this window: at 4,096 tokens `window_pair`
+///   gives 6,144 bytes, below the harness's own ~6 KB system prompt plus the
+///   1 KiB truncation floor, i.e. a tier that cannot serve anything. Since
+///   ADR-9 the local arm **discards** that byte half and takes the constant, so
+///   the hazard at a small window now runs the *other* way: the local byte
+///   budget would still be 32,768 — 16,384 claimed tokens against 3,072 usable,
+///   a 5.3× overclaim, with no floor and no derivation to stop it, because
+///   BR-8's floor only ever guards against raising a *derived* pair. Neither
+///   number is safe at 4,096; they fail in opposite directions. Read `derive`'s
+///   local arm and OQ-2 together before changing this line.
+///
+/// The harness bounds its side in this window's currency as well as in words:
+/// the assembled context and the summarizer's input are capped in **bytes**
+/// (`HarnessConfig::context_budget_bytes`), so pathological content (a minified
+/// single-line file) is clamped or mechanically truncated instead of reaching
+/// the engine over-window. What that history cost is worth keeping: a folded
+/// `read` of a real file killed the first dogfooded turn with an opaque "local
+/// engine could not serve the turn", and that failure now carries the engine's
+/// own over-window sentence (BUG-146). The typed backend error is the backstop,
+/// never the expected path.
+///
+/// ## Not feature-gated, because other consumers derive from it
 ///
 /// `LlamaEngine::load` is the only *caller*, and it exists only under
 /// `--features tetond/llama`. But [`REDACT_CHUNK_MAX_BYTES`](crate::egress::redact::REDACT_CHUNK_MAX_BYTES)
@@ -34714,8 +34755,9 @@ provider_id = \"deepseek\"
                     local_pair().budget_bytes as u64
                 ),
                 "the budget the router stamped, verbatim — both halves, because \
-                 REQ-590 moved them in opposite directions and a check on one \
-                 would have missed the other"
+                 REQ-590 moved exactly one of them (the word half, up; the byte \
+                 half is unchanged, ADR-9) and a check on either alone would \
+                 have missed that"
             );
             assert!(
                 record.measured_tokens > record.budget_tokens,

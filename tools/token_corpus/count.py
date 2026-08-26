@@ -48,7 +48,7 @@ numeric_grid.txt
                (a quantized intensity raster), 160 rows x 64 columns of
                space-separated single digits. Exactly 10,240 words / 20,480
                bytes, i.e. one turn at the full local word budget that the
-               byte budget (30,720) admits with room to spare. Reproducible
+               byte budget (32,768) admits with room to spare. Reproducible
                by construction, in integer arithmetic so no libm rounding can
                move a cell:
 

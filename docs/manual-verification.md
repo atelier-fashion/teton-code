@@ -3126,9 +3126,15 @@ the ratio overruns at full budget, and the byte guard does not cover
 3. **Either outcome is a pass for this leg, and which one it is, is the finding.**
    If it answers, the ratio held. If it comes back as a
    `context_length_exceeded` — the engine's own typed refusal — that is D-3's
-   intended catch working, and it should read as an ordinary local outcome with
-   REQ-589's offer behind it, **not** as a crash, a hang, or an opaque backend
+   intended catch working, and it should read as an ordinary local outcome in
+   words you can act on, **not** as a crash, a hang, or an opaque backend
    string. Record which, verbatim.
+
+   **Do not expect an over-budget offer behind it.** REQ-589's offer fires only
+   when a *skill expansion* does not fit; this turn is inside both guards, so no
+   offer is reachable and the typed refusal is the only catch there is. That is
+   the point of the leg: it measures the one place the harness hands the
+   decision to the engine.
 
 ### Leg (e) — the reported measurement's own density, and the bound's account of itself
 
@@ -3176,7 +3182,7 @@ Model loaded (name, quant, n_ctx)                  :
 (c) wall clock to the finished answer                :        s
 (d) token-dense, byte-light turn — outcome           : answered | context_length_exceeded | other
 (d) if refused, the refusal was typed and readable   : yes / no
-(d) if refused, REQ-589's offer was behind it        : yes / no
+(d) if refused, NO over-budget offer appeared        : yes / no  <-- must be "yes"
 (d) verbatim message                                 :
 (e) ~4,100 w / ~31 KB turn SERVED                    : yes / no  <-- must be "yes"
 (e) no over-budget offer was raised for it           : yes / no  <-- must be "yes"

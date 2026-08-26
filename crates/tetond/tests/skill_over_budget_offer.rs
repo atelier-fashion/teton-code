@@ -16,7 +16,7 @@
 //!
 //! | AC | Test |
 //! |---|---|
-//! | AC-1 (the boundary, offered and answered) | [`the_reported_analyze_measurement_serves_and_the_byte_half_is_the_boundary_now`] |
+//! | AC-1 (the boundary, offered and answered) | [`the_reported_analyze_measurement_serves_on_both_halves_of_the_local_pair`] |
 //! | **REQ-590 AC-12** (the reported measurement, served) | (same test, leg 3) |
 //! | AC-1 (accepting carries it whole) | [`an_accepted_offer_puts_every_measured_byte_of_the_expansion_on_the_wire`] |
 //! | AC-3 (decline is today's refusal) | [`declining_is_todays_refusal_in_every_byte`] |

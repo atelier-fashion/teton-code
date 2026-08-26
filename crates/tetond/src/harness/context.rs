@@ -729,9 +729,29 @@ fn frame_untrusted_compaction(summary: &str) -> String {
 
 impl ContextManager {
     /// A manager with the given system prompt and token budget. The byte budget
-    /// defaults to `budget_tokens` × [`APPROX_BYTES_PER_TOKEN`] — the same
-    /// relationship `HarnessConfig::default` encodes; override it with
-    /// [`ContextManager::with_budget_bytes`] to match a specific engine window.
+    /// defaults to `budget_tokens` × [`APPROX_BYTES_PER_TOKEN`] — a **fallback
+    /// ratio**, not any route's pair.
+    ///
+    /// # It is no longer the relationship `HarnessConfig::default` encodes
+    ///
+    /// It was, while the local pair was `(4,096, 4,096 × 8)`. Since REQ-590
+    /// ADR-9 the pair's two halves have different provenance — the word half is
+    /// window-derived (10,240) and the byte half is the constant
+    /// [`LOCAL_BUDGET_BYTES`](super::budget::LOCAL_BUDGET_BYTES) (32,768), i.e.
+    /// 3.2 B/word, not 8. A caller that passes `config.context_budget_tokens`
+    /// here and takes this default therefore runs at **81,920** bytes: two and
+    /// a half times the byte guard the route actually derived, on the half that
+    /// binds essentially all real content.
+    ///
+    /// So a manager built from a
+    /// [`HarnessConfig`](super::turn_loop::HarnessConfig) must chain
+    /// [`ContextManager::with_budget_bytes`] with that config's
+    /// `context_budget_bytes`. Production does — `crate::carry::CarriedTurn::begin`
+    /// is the only real construction, and it chains both that and
+    /// [`ContextManager::with_window_label`]. The bare default is for fixtures
+    /// and probes that want a byte budget implied by a word count rather than
+    /// one a route decided; passing an explicit `budget_tokens` literal (the
+    /// usual `1_000_000` "words do not bind here") is the shape that means it.
     #[must_use]
     pub fn new(system: impl Into<String>, budget_tokens: usize) -> Self {
         Self {

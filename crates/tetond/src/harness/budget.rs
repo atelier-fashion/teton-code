@@ -52,11 +52,12 @@
 //! bytes) while catching nothing a real tokenizer does not already catch. The
 //! reasoning, with the measurements, is at [`derive`]'s local arm.
 //!
-//! The one place the two arms differ is the floor. `MIN_BUDGET_*` raises a
-//! pair derived from a **declaration** — a provider's promise, which the
-//! provider may then refuse against, saying so. The engine's `n_ctx` is an
-//! allocation, and a budget above it buys nothing a turn can spend, so the
-//! floor is held to the engine's own window there (BR-8). At 16,384 the floor
+//! The two arms differ in a **second** place, beside the byte half above: the
+//! floor. `MIN_BUDGET_*` raises a pair derived from a **declaration** — a
+//! provider's promise, which the provider may then refuse against, saying so.
+//! The engine's `n_ctx` is an allocation, and a budget above it buys nothing a
+//! turn can spend, so the floor is held to the engine's own window there
+//! (BR-8). At 16,384 the floor
 //! never bites either way; the rule is latent, stated, and tested at a
 //! synthetic window so that whoever lowers that constant inherits the rule
 //! rather than the bug.
@@ -651,11 +652,19 @@ pub fn derive(inputs: BudgetInputs<'_>) -> RouteBudget {
         // window derivation would have fixed: at the 2 B/token floor the byte
         // half claims 16,384 tokens against 15,360 usable, so a *byte-saturated*
         // local prompt is over the engine's window by 1,024 tokens before it is
-        // assembled. That was true before this REQ and stays true after it. The
-        // catches are the engine's own typed `context_length_exceeded`
-        // (`teton-inference/src/engine.rs` `over_window`) and REQ-589's
-        // over-budget offer — the same catches ADR-6 already relies on for the
-        // word half's zero slack, which no byte value can supply either.
+        // assembled. That was true before this REQ and stays true after it.
+        //
+        // The catch is the engine's own typed `context_length_exceeded`
+        // (`teton-inference/src/engine.rs` `over_window`) — and it is the *only*
+        // one, which is worth saying because REQ-589's over-budget offer looks
+        // like a second one and is not. That offer fires only where a **skill
+        // expansion** does not fit (`skill_append_fit`); a turn that saturates
+        // this byte budget is *at* it, not over it, so the fit check returns
+        // `SkillFit::Fits` and no offer is reachable — and a turn carrying no
+        // skill never reaches that check at all. Same for the
+        // token-dense/byte-light quadrant, where both guards admit. This is the
+        // same single catch ADR-6 relies on for the word half's zero slack,
+        // which no byte value can supply either.
         let mut pair = window_pair(
             LOCAL_ENGINE_N_CTX,
             LOCAL_GENERATION_RESERVATION,
@@ -699,8 +708,11 @@ pub fn derive(inputs: BudgetInputs<'_>) -> RouteBudget {
 }
 
 /// Whether [`MIN_BUDGET_TOKENS`]/[`MIN_BUDGET_BYTES`] may raise the pair a
-/// window derives (REQ-590 BR-8) — the one place [`derive`]'s two
-/// window-derived arms differ.
+/// window derives (REQ-590 BR-8) — one of the two places [`derive`]'s
+/// window-derived arms differ. The other is that the local arm keeps only this
+/// helper's **word** half and overwrites the byte half with
+/// [`LOCAL_BUDGET_BYTES`] (ADR-9), which is why this floor never sees the
+/// local route's real byte budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Floor {
     /// The window is a **declaration**, so the floor raises a pair derived
@@ -722,10 +734,13 @@ enum Floor {
     /// property is safe against a promise and is not safe against an
     /// allocation.
     ///
-    /// **Latent at today's constants** — at [`LOCAL_ENGINE_N_CTX`] the derived
-    /// 10,240 words / 30,720 bytes are well clear of the 2,048-word /
-    /// 16,384-byte floor, so this arm and [`Self::RaisesADeclaration`] agree
-    /// there and AC-1's "one formula" claim is exact for the word half. It
+    /// **Latent at today's constants** — at [`LOCAL_ENGINE_N_CTX`] *this
+    /// helper* derives 10,240 words / 30,720 bytes, both well clear of the
+    /// 2,048-word / 16,384-byte floor, so this arm and
+    /// [`Self::RaisesADeclaration`] agree there and AC-1's "one formula" claim
+    /// is exact for the word half. Read that 30,720 as `window_pair`'s own
+    /// figure and **not** as the local route's pair, which is (10,240, 32,768);
+    /// the paragraph below is the whole of the difference. It
     /// becomes live only if that constant falls, which is precisely when
     /// nobody will be thinking about this file, so it is written down and
     /// tested at a synthetic window now (AC-15).
@@ -3147,7 +3162,9 @@ mod tests {
         // And the cost of that choice, stated as an assertion so nobody reads
         // the reversal as free: at the 2 B/token floor a byte-saturated local
         // prompt is over the engine's window, by exactly the generation the
-        // daemon reserved. The catches are `over_window` and REQ-589's offer.
+        // daemon reserved. The catch is `over_window`, and it is the only one:
+        // REQ-589's offer fires only when a *skill expansion* does not fit, and
+        // a turn sitting *at* this budget fits, so no offer is reachable.
         let bytes_claim = local.budget_bytes / DUTY_REQUEST_BYTES_PER_TOKEN;
         assert_eq!(
             bytes_claim - usable,
