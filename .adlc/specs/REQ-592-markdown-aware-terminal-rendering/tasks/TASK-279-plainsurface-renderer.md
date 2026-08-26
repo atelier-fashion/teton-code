@@ -1,7 +1,7 @@
 ---
 id: TASK-279
 title: "Wire the renderer into PlainSurface, opt-in at construction"
-status: draft
+status: complete
 parent: REQ-592
 created: 2026-08-26
 updated: 2026-08-26

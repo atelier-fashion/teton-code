@@ -66,18 +66,6 @@
 //!   emphasis produces no styling at all rather than styling the outer half of
 //!   it.
 
-// Nothing outside this module calls into it yet: REQ-592 splits the layout
-// decisions (here) from the bytes that carry them (`render.rs`), and the surface
-// that consumes every function below arrives in TASK-279 of this same REQ. The
-// allow is therefore about **task ordering**, not about code nobody wants — the
-// house rule against a lingering `allow(dead_code)` (tetond's ADR-J: implied
-// dead code is how a deletion ends up owned by nobody) is satisfied by naming
-// the consumer and the condition. **Delete this attribute in TASK-279**, where
-// `PlainSurface::with_markdown` starts calling these; if it is still here when
-// the REQ closes, either the wiring never landed or a function here has no
-// caller, and both are findings rather than warnings to keep suppressed.
-#![allow(dead_code)]
-
 use std::ops::Range;
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -282,12 +270,25 @@ pub fn hanging_indent(marker: &str) -> usize {
     display_width(marker) + 1
 }
 
+/// The prefixes a list item's rows carry: the marker and its space on the first
+/// row, [`hanging_indent`]'s spaces on every row after it.
+///
+/// Split out from [`wrap_list_item`] because the two consumers need it in two
+/// shapes. `wrap_list_item` wants the finished rows; the styled path in
+/// `render.rs` wants the *ranges* [`wrap_ranges`] returns, so that a style lands
+/// on the same bytes the break was measured from — and it therefore assembles
+/// the row itself. Both must agree about what a list item's rows start with, so
+/// the answer is stated once here rather than twice on either side of the seam.
+#[must_use]
+pub fn list_item_prefixes(marker: &str) -> (String, String) {
+    (format!("{marker} "), " ".repeat(hanging_indent(marker)))
+}
+
 /// A list item wrapped at `width`, its marker printed once and its continuation
 /// rows aligned under the text (AC-3).
 #[must_use]
 pub fn wrap_list_item(marker: &str, text: &str, width: usize) -> Vec<String> {
-    let first = format!("{marker} ");
-    let cont = " ".repeat(hanging_indent(marker));
+    let (first, cont) = list_item_prefixes(marker);
     wrap_indented(text, width, &first, &cont)
 }
 
@@ -300,7 +301,12 @@ pub fn wrap_block_quote(text: &str, width: usize) -> Vec<String> {
 }
 
 /// What a quoted row carries.
-const QUOTE_PREFIX: &str = "> ";
+///
+/// `pub` for the same reason [`list_item_prefixes`] exists: `render.rs`'s styled
+/// path assembles a quoted row from [`wrap_ranges`] rather than from
+/// [`wrap_block_quote`], and a second `"> "` spelled out over there is a marker
+/// that can drift from this one.
+pub const QUOTE_PREFIX: &str = "> ";
 
 // ---- Inline spans (BR-5) ---------------------------------------------------
 
@@ -579,6 +585,34 @@ pub fn table_cells(line: &str) -> Option<Vec<&str>> {
     Some(inner.split('|').map(str::trim).collect())
 }
 
+/// The info string of a ` ``` ` fence delimiter, or `None` when `line` is not
+/// one.
+///
+/// Exists so the surface can ask this question **without** calling [`classify`].
+/// A caller holding an open fence must not classify what is inside it — BR-6
+/// makes fence content verbatim, so a `*` in a shell glob is not emphasis and a
+/// `|` in a table of output is not a cell. But that caller still has to
+/// recognize the *closing* delimiter, and recognizing it with a second
+/// hand-rolled rule over there is how the two drift: a line this module would
+/// call a fence and the surface would not is a fence that never closes, and
+/// every remaining line of the reply renders as code.
+///
+/// Column zero only, like every other block construct here, and a fourth
+/// backtick is not a fence this module knows — both rules are `classify`'s,
+/// because `classify` now asks this function.
+#[must_use]
+pub fn fence_delimiter(line: &str) -> Option<&str> {
+    let body = line.trim_end();
+    if body.len() != body.trim_start().len() {
+        return None;
+    }
+    let info = body.strip_prefix("```")?;
+    if info.contains('`') {
+        return None;
+    }
+    Some(info.trim())
+}
+
 /// Whether every cell is only `-`, `:` and spaces, with at least one `-` — the
 /// alignment row under a table's header.
 fn is_separator_row(cells: &[&str]) -> bool {
@@ -650,12 +684,8 @@ pub fn classify(line: &str) -> Block<'_> {
         };
     }
 
-    if let Some(info) = body.strip_prefix("```") {
-        // A fourth backtick is not a fence this module knows; it falls through
-        // to literal text rather than being guessed at.
-        if !info.contains('`') {
-            return Block::Fence { info: info.trim() };
-        }
+    if let Some(info) = fence_delimiter(body) {
+        return Block::Fence { info };
     }
 
     if let Some(cells) = table_cells(body) {

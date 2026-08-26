@@ -34,6 +34,11 @@ that no line falls off the end of a turn. Covers BR-8.
       (a second client driving the same session) are emitted, not held.
 - [ ] A permission question raised mid-turn paints **below** already-streamed assistant text, not
       above it (ADR-4).
+- [ ] **`end_block()` clears the fence bit as well as the buffers.** TASK-279 flagged this: an
+      unclosed ```` ``` ```` fence leaves `fence == true`, and without clearing it every subsequent
+      line of every subsequent turn renders verbatim — no wrap, no styling. Deciding a block has
+      ended is exactly this verb's job, which is why TASK-279 correctly refused to self-clear it.
+      Assert it: an unterminated fence in one turn must not swallow the next turn's rendering.
 - [ ] `end_block()` is defaulted: `RecordingSurface`, the `Bare` impl (render.rs:597), and
       `provider_test_ui`'s harness are **unmodified**, and no file consuming `&mut dyn Surface`
       changes.
