@@ -75,9 +75,13 @@ const SYSTEM: &str = "You are Teton Code.";
 /// pressing and be right.
 ///
 /// 4 B/word is denser than prose (≈6) and far sparser than a minified tool
-/// result (20–45 B/"word"), which puts it where the byte guard binds on a
-/// window-derived pair (bytes ÷ 2 > words × 3/2 for anything above 3 B/word)
-/// while both guards bind on the local pair (8 B/word).
+/// result (20–45 B/"word"), which puts it where the **byte** guard binds on any
+/// window-derived pair: bytes ÷ 2 > words × 3/2 for anything above 3 B/word.
+///
+/// That now includes the local pair. It was 8 B/word (4,096 / 32,768), where
+/// both guards bound at once; since REQ-590 the local tier derives from the
+/// engine's window like every other route (10,240 / 30,720), so its crossover
+/// is 3 B/word too and a 4 B/word fixture presses the byte guard here as well.
 fn filler(words: usize) -> String {
     let mut s = String::with_capacity(words * 4);
     for _ in 0..words {

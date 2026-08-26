@@ -34137,7 +34137,7 @@ provider_id = \"deepseek\"
     mod the_over_budget_offer {
         use super::*;
         use crate::grants::GrantRegistry;
-        use crate::harness::budget::{LOCAL_BUDGET_BYTES, LOCAL_BUDGET_TOKENS};
+        use crate::harness::budget::{derive, BudgetInputs, RouteBudget};
         use crate::harness::permissions::{AddressedPermissionDelivery, PermissionConfig};
         use crate::sessions::SessionRegistry;
         use crate::skills::{discover, RealFs};
@@ -34158,16 +34158,58 @@ provider_id = \"deepseek\"
         /// turn. Only a prompt carrying this one reached the end of the body.
         const TAIL_MARKER: &str = "SKILLTAILMARKER-247";
 
+        /// The local tier's budget as `derive` makes it — the same pair the
+        /// router stamps on a local route, read once so no fixture here has to
+        /// name it.
+        fn local_pair() -> RouteBudget {
+            derive(BudgetInputs::local())
+        }
+
         /// A body comfortably past the local pair in both currencies, and past a
-        /// 6,000-token cap by a wide margin.
+        /// 6,000-token cap by a wide margin — while staying **inside**
+        /// [`SKILL_MAX_BYTES`](crate::skills::SKILL_MAX_BYTES), which discovery
+        /// enforces by naming and skipping the file rather than truncating it.
         ///
-        /// Sized off [`LOCAL_BUDGET_TOKENS`] rather than a literal, so the
-        /// fixture cannot quietly stop being over budget if the pair moves.
+        /// Sized off the **derived** pair rather than off `LOCAL_BUDGET_TOKENS`,
+        /// which is what it read until REQ-590 and is no longer the local
+        /// tier's word budget. That constant is now the *no-better-fact* pair's
+        /// half, and when the local arm stopped returning it this body — 8,192
+        /// words — fell under the new 10,240-word budget while staying over the
+        /// byte half. The doc here already claimed to be sized "so the fixture
+        /// cannot quietly stop being over budget if the pair moves"; reading the
+        /// derivation is what actually makes that true.
+        ///
+        /// A quarter over the word half at four bytes a word (`"abc "`), not
+        /// double at five: doubling the derived pair puts a 100 KB file past
+        /// discovery's 64 KiB ceiling, at which point every test here fails with
+        /// "no skill `/heavy` you can dispatch" rather than with anything about a
+        /// budget. The ceiling is asserted below so that is a stated bound and
+        /// not a coincidence.
         fn oversized_body() -> String {
-            format!(
+            let words = local_pair().budget_tokens + local_pair().budget_tokens / 4;
+            let body = format!(
                 "Handle {MARKER} now.\n\n{}\n\nAnd then {TAIL_MARKER}.",
-                "word ".repeat(LOCAL_BUDGET_TOKENS * 2)
-            )
+                "abc ".repeat(words)
+            );
+            let pair = local_pair();
+            assert!(
+                body.split_whitespace().count() > pair.budget_tokens
+                    && body.len() > pair.budget_bytes,
+                "fixture: the body must be over the local pair in both currencies \
+                 ({} words / {} B against {} / {})",
+                body.split_whitespace().count(),
+                body.len(),
+                pair.budget_tokens,
+                pair.budget_bytes
+            );
+            assert!(
+                body.len() < crate::skills::SKILL_MAX_BYTES as usize,
+                "fixture: a {} B body is past discovery's {} B ceiling and would be \
+                 skipped rather than measured",
+                body.len(),
+                crate::skills::SKILL_MAX_BYTES
+            );
+            body
         }
 
         /// A remote provider declaring a large window under a small user cap —
@@ -34666,8 +34708,14 @@ provider_id = \"deepseek\"
                 "BR-7’s table for the local engine"
             );
             assert_eq!(
-                record.budget_tokens, LOCAL_BUDGET_TOKENS as u64,
-                "the budget the router stamped, verbatim"
+                (record.budget_tokens, record.budget_bytes),
+                (
+                    local_pair().budget_tokens as u64,
+                    local_pair().budget_bytes as u64
+                ),
+                "the budget the router stamped, verbatim — both halves, because \
+                 REQ-590 moved them in opposite directions and a check on one \
+                 would have missed the other"
             );
             assert!(
                 record.measured_tokens > record.budget_tokens,
@@ -35092,10 +35140,12 @@ provider_id = \"deepseek\"
             let router = build_router(&config, true, &BTreeMap::new());
 
             // Over the local pair in both currencies, and the same shape
-            // `would_seed_fit` produces.
+            // `would_seed_fit` produces. Read off the derivation so the
+            // comment stays true of the numbers beside it.
+            let local = derive(BudgetInputs::local());
             let measured = Fit {
-                tokens: LOCAL_BUDGET_TOKENS * 2,
-                bytes: LOCAL_BUDGET_BYTES * 2,
+                tokens: local.budget_tokens * 2,
+                bytes: local.budget_bytes * 2,
                 fits: false,
             };
             let plan = plan_over_budget_remedy(

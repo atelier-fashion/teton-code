@@ -10212,6 +10212,15 @@ mod over_budget_tests {
 
     /// The reported `/analyze` failure's own figures (REQ-589's Description):
     /// one word over a 4,096-word budget, with room to spare in bytes.
+    ///
+    /// **Historical, and deliberately left so.** REQ-590 gave the local tier a
+    /// budget derived from the engine's window, and no route runs under
+    /// `(4_096, 33_000)` with `bound: local engine` any more. It does not matter
+    /// here: these are opaque `u64`s riding a wire contract, and what this
+    /// module asserts is that a client re-words none of them. Re-cutting them at
+    /// today's pair would assert exactly the same thing while implying this
+    /// crate knows what the daemon's budget is, which it cannot — `teton` does
+    /// not depend on `tetond`.
     const MEASURED: (u64, u64) = (4_097, 31_744);
     const BUDGET: (u64, u64) = (4_096, 33_000);
 

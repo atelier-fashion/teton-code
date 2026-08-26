@@ -205,8 +205,9 @@ fn glob_enumerating_boundary_files_taints_and_reroutes() {
 /// 30,000 words / 120,000 bytes fits the 128k-derived pair (84,650 words /
 /// 253,952 bytes) with room to spare — under *both* of its 70% soft thresholds,
 /// so the `compact` duty never fires on the remote leg and the paste reaches the
-/// provider whole. It is 7× the local pair's words and 3.7× its bytes, so the
-/// local pin cannot take it unchanged.
+/// provider whole. It is 2.9× the local pair's words and 3.9× its bytes (the
+/// engine-derived 10,240 / 30,720 since REQ-590), so the local pin cannot take
+/// it unchanged in either currency.
 ///
 /// The density is the point (REQ-586 Phase-3 F-19). At more than 4 B/word the
 /// **byte** guard would bind while the turn was still being assembled for the
@@ -339,13 +340,18 @@ fn a_128k_turn_blocked_by_privacy_is_refitted_before_the_local_pin_serves_it() {
         Some("local_engine"),
         "the pin is the local tier, whatever the blocked provider declared: {event}"
     );
-    assert_eq!(event["budget_tokens"].as_u64(), Some(4_096), "{event}");
-    assert_eq!(event["budget_bytes"].as_u64(), Some(32_768), "{event}");
+    // The local tier's derived pair (REQ-590): the engine's 16,384-token window
+    // less the 1,024-token generation reservation, run through the same formula
+    // a declared window runs. Spelled as literals because what this test is
+    // entitled to read is the *wire* — a client sees these two numbers and
+    // nothing about how they were made.
+    assert_eq!(event["budget_tokens"].as_u64(), Some(10_240), "{event}");
+    assert_eq!(event["budget_bytes"].as_u64(), Some(30_720), "{event}");
     assert!(
         event["dropped_blocks"].as_u64().unwrap_or(0) > 0
             || event["elided_bytes"].as_u64().unwrap_or(0) > 0,
         "a refit that cut nothing would leave this vacuous — 120 KB does not fit \
-         32,768 bytes: {event}"
+         30,720 bytes: {event}"
     );
     assert_eq!(
         client.events_named("context_pressure").len(),

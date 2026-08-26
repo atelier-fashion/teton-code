@@ -2743,6 +2743,13 @@ mod tests {
     /// Both sentences are written out in full rather than derived, because the
     /// claim under test *is* the bytes: this is the pin that fails if extending
     /// the outcome to the local tier changed what a remote refusal says.
+    ///
+    /// `5_000` and `4_096` here are **inputs to a formatter**, not a budget.
+    /// Nothing derives them and nothing measures against them; they are two
+    /// numbers chosen to be legible in a sentence, and REQ-590's sweep left them
+    /// alone for that reason. Renumbering them to the local tier's new pair
+    /// would say nothing more than they say now and would invite the next reader
+    /// to mistake a rendering test for a budget one.
     #[test]
     fn one_composer_words_both_window_refusals_and_leaves_the_remote_one_unchanged() {
         let remote = HarnessError::ContextLengthExceeded {
@@ -3219,8 +3226,31 @@ mod tests {
         /// The window refusal the local tier produces when the rendered prompt
         /// does not fit its context window: `EngineError::ContextWindowExceeded`
         /// reaches the loop as [`HarnessError::LocalContextLengthExceeded`]
-        /// (REQ-589 TASK-239, `completion.rs`). The numbers are the pair the
-        /// reported `/analyze` failure measured.
+        /// (REQ-589 TASK-239, `completion.rs`).
+        ///
+        /// # Where its figures come from, and what they are not
+        ///
+        /// They are read off the [`HarnessConfig`] this source is called with —
+        /// one word past that config's own word budget — so the arm reports a
+        /// refusal against the budget the turn actually ran under.
+        ///
+        /// Until REQ-590 TASK-272 the arm held the literals `4_097 / 4_096` and
+        /// documented them as "the pair the reported `/analyze` failure
+        /// measured". They were not: this is a **scripted** source, `config` was
+        /// discarded, and no budget was consulted to produce them. The test that
+        /// asserted them back was asserting a constant against itself — it could
+        /// not redden when TASK-270 moved the local pair, and it did not
+        /// (LESSON-552's shape: a wire fact pinned by a value the test invented).
+        /// Reading the config is what makes the assertion say something: the
+        /// loop handed this source the route's budget, and the typed refusal
+        /// reached the caller carrying it unaltered.
+        ///
+        /// **This arm does not witness REQ-590 AC-12.** Nothing in
+        /// [`run_session_turn_with_pressure_policy`] refuses on a budget — the
+        /// loop's own answer to an oversized context is truncation, not refusal
+        /// — so a turn here cannot show that a 4,097-word local turn now serves.
+        /// That criterion is measured where a real budget decides a real turn,
+        /// in `tests/skill_over_budget_offer.rs`.
         WindowRefusal,
         /// A `read` of a file that does not exist — the shortest route to a
         /// folded tool result, and therefore to a second iteration.
@@ -3260,7 +3290,7 @@ mod tests {
             &mut self,
             prompt: &PreparedPrompt,
             _provenance: &EgressProvenance,
-            _config: &HarnessConfig,
+            config: &HarnessConfig,
             _tools: &ToolRegistry,
             _exposed: &[&str],
             _on_token: &mut (dyn for<'s> FnMut(&'s str) + Send),
@@ -3268,10 +3298,13 @@ mod tests {
             self.prompts.push(prompt.flat.clone());
             let call = self.prompts.len();
             match self.script.get(call - 1) {
+                // One word past the budget this turn was configured with — the
+                // engine's refusal in the shape the engine would make it. See
+                // [`ScriptedTurn::WindowRefusal`] for why it is not a literal.
                 Some(ScriptedTurn::WindowRefusal) => {
                     Err(HarnessError::LocalContextLengthExceeded {
-                        assembled_tokens: 4_097,
-                        budget_tokens: 4_096,
+                        assembled_tokens: config.context_budget_tokens + 1,
+                        budget_tokens: config.context_budget_tokens,
                     })
                 }
                 Some(ScriptedTurn::ToolCall) => Ok(SourceTurn {
@@ -3379,8 +3412,19 @@ mod tests {
             .context_refusal()
             .expect("a window refusal, not a generic engine failure");
         assert_eq!(refusal.origin, ContextRefusalOrigin::LocalEngine);
-        assert_eq!(refusal.assembled_tokens, 4_097);
-        assert_eq!(refusal.budget_tokens, 4_096);
+        // The engine's own figures, reaching the caller unaltered — not a
+        // re-measurement of whatever the loop ended up assembling. Read off the
+        // config the turn ran under rather than written as literals, so this
+        // says something when the local budget moves; see
+        // [`ScriptedTurn::WindowRefusal`] for what it said before REQ-590.
+        assert_eq!(refusal.budget_tokens, config.context_budget_tokens);
+        assert_eq!(refusal.assembled_tokens, config.context_budget_tokens + 1);
+        assert_eq!(
+            config.context_budget_tokens,
+            budget::derive(BudgetInputs::local()).budget_tokens,
+            "non-vacuity: the default harness must still be the local route's, or \
+             the pair above is not the one a local turn refuses against"
+        );
 
         // D-7: ordinary pressure resumes on the **next** turn. The policy above
         // was moved into that call and cannot be reused — a second turn states
