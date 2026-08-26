@@ -18,6 +18,59 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [Unreleased]
+
+### Added
+
+- **Replies are laid out for the terminal they are printed into (REQ-592).** A
+  session at a terminal now renders the model's markdown instead of printing it
+  raw. **Prose wraps at the window's width, breaking at spaces** — the mid-word
+  hard breaks a terminal produces at the column (`defens-` / `e-in-depth`) are
+  gone, and a word longer than the window is kept whole on its own row rather
+  than split or clipped. **Tables are laid out**: one that fits is drawn with
+  its columns aligned and a rule under the header, and one that does not is
+  **transposed** into a labelled `Column: value` block per row, wrapped, so a
+  wide audit table is readable at 80 columns instead of arriving as a ribbon of
+  `|` whose cell boundaries land wherever the window ends. `**bold**`,
+  `*emphasis*` and `` `code` `` render as styling rather than as literal
+  punctuation; headings, bullet and numbered lists, block quotes and horizontal
+  rules are drawn; **fenced code blocks keep their original line breaks and take
+  no styling**, so a diff or a shell block can still be copied out of the
+  screen. The window's width is re-read for each turn, so **resizing takes
+  effect on the next block** — rows already printed keep the breaks they were
+  drawn with.
+
+  **This is on only where there is a terminal to lay text out in.** With stdout
+  redirected or piped — a script, a shell pipeline, `teton … > file` — the byte
+  stream is exactly what it always was: the model's raw markdown, unwrapped and
+  unstyled. Colour is a separate switch: `NO_COLOR=1` or `TERM=dumb` keeps the
+  wrapping and the table layout and emits no escape sequences at all.
+
+- **The model is told where its words land (REQ-592).** The system prompt now
+  carries one sentence about output format: that the reply is printed into a
+  narrow terminal, that short paragraphs and bullet lists are preferred over
+  tables, that a table should be at most three short columns and never a
+  sentence in a cell, and that emphasis and fenced code should be used
+  sparingly. This is the other half of the same problem — laying out a
+  sentence-in-a-cell table well is still worse than not being handed one. It is
+  sent on every route, local and remote alike.
+
+### Known
+
+- **Inline styling is not available inside a table cell.** A bold cell renders
+  as unstyled text at the right column rather than as bold text at the wrong
+  one — the padding is computed from the stripped width, and a second styling
+  pass would un-align every column the first pass lined up. Alignment wins.
+- **Notices, tool lines, and the other single-line output kinds are not
+  wrapped.** Only assistant text is. That text is short by construction, and
+  wrapping it would move bytes several end-to-end fixtures pin; if it still
+  reads badly in the field it is a follow-up rather than an oversight.
+- **Grapheme clusters are measured by their parts.** Character width comes from
+  `unicode-width`, so CJK text and most emoji measure correctly, but a
+  zero-width-joiner sequence counts as the sum of its components and can push
+  its row past the window's edge. Fixing that needs a segmentation table as
+  well, and was left out of scope deliberately.
+
 ## [0.1.25] - 2026-08-26
 
 ### Added

@@ -3195,3 +3195,304 @@ Model loaded (name, quant, n_ctx)                  :
 Anything that hung, aborted, or crashed              :
 Notes / findings                                     :
 ```
+
+# Manual verification runbook — REQ-592 AC-13 (a real audit at 100 and at 200 columns)
+
+**Status: OUTSTANDING — nothing below has been executed.** This is a runbook
+written for a person at a terminal; it is not a record of a run, and no box in it
+may be ticked from CI or by an agent. Leave AC-13 unticked in
+`.adlc/specs/REQ-592-markdown-aware-terminal-rendering/requirement.md` until
+somebody has run the procedure below and filled in the sign-off.
+
+REQ-592 has **two halves in two crates**, and this is the only place they are
+judged together. TASK-282 changed **what the model writes** — an output-format
+clause in the system prompt telling it its reply lands in a narrow terminal.
+TASK-277..281 changed **how what it writes is drawn** — word wrap, table layout,
+inline styling, and the terminal gate. Neither is a bug in the other's layer, and
+fixing either alone leaves a visibly bad screen, which is why the REQ did both.
+
+## What this proves that CI does not
+
+Every automated acceptance criterion in this REQ **scripts its replies
+precisely** so that it does *not* depend on model behaviour. That is the correct
+way to test a renderer — and it is exactly why the pair of halves has never once
+been observed working together. A scripted fixture cannot be persuaded by a
+system-prompt clause.
+
+| Claim | Proven by CI? | Why not |
+|---|---|---|
+| Prose breaks at spaces, never mid-word | **yes** | AC-3, pure unit tests, no pty |
+| The audit fixture transposes with no over-wide row at 100 and 200 | **yes** | AC-4, fixture read from disk |
+| The renderer is inert with stdout piped | **yes** | AC-7 — and it is the *entire* guard for BR-7 |
+| `NO_COLOR` wraps and emits zero escapes | **yes** | AC-8, unit leg and pty leg |
+| Rendered bytes at a fixed pty width | **yes** | AC-12 |
+| A **real** reply is legible at 100 columns | **no** | legibility is a judgement, not an assertion |
+| The clause changes what a real model writes | **no** | every fixture reply is scripted |
+| The two halves compose on one screen | **no** | nothing in the suite runs both |
+
+The first judgement is the plain one: **is it better?** The fixture at
+`.adlc/specs/REQ-592-markdown-aware-terminal-rendering/fixtures/audit-2026-08-26.md`
+is the **before** — the session that motivated this REQ, whose tables reached the
+terminal as raw `|`-delimited prose hard-broken mid-word (`defens-` /
+`e-in-depth`). **That file holds the model's *reply*, not the prompt** — its own
+provenance comment says so, and says it is one section of one reply transcribed
+by hand rather than a captured stdout dump. The original session's exact wording
+was never recorded, so **this runbook carries the prompt** and every leg below
+uses it verbatim.
+
+The second is an *observation*, and it must be recorded as one. Leg (a) asks
+whether the clause moved the model — whether the reply arrives as short
+paragraphs and bullets rather than as sentence-in-a-cell tables. **If it did not,
+that is a finding about BR-1 worth writing down, not a reason to re-run until it
+looks good.** Prompt-adjacent behaviour is chaotic under byte-level changes
+(BUG-168 flipped a reply's shape with a 23-byte trim two sentences away), and
+REQ-577's `teton_docs` docstring needed live re-tuning for exactly this reason.
+A partial outcome is a real outcome: the renderer half can pass while the clause
+half does nothing, and the sign-off has separate lines for the two so that it
+can say so. Re-running the same prompt until a pleasing shape appears measures
+sampling noise and records it as evidence.
+
+## Prerequisites
+
+- **Both binaries built from this branch**, in the worktree:
+  `cargo build --release --workspace`. Run the CLI by path —
+  `./target/release/teton` — because `client.rs`'s daemon resolver prefers a
+  `teton-code` sitting **beside the CLI executable** before it falls back to
+  `PATH`.
+- **Stop any daemon that is already running, and confirm which one serves.**
+  This is the prerequisite that silently invalidates half the run: the daemon
+  takes a single-instance lock, so an already-running *older* `teton-code` is
+  **reused**, the system prompt is the shipped one, and TASK-282's half of this
+  REQ is not under test at all — while the renderer half works perfectly,
+  because that half lives in the CLI. `brew services stop teton` if it is the
+  launchd one; otherwise `pkill -f teton-code`. Then, once the session is up,
+  check from another shell that the path is this worktree's:
+
+  ```
+  pgrep -fl teton-code
+  ```
+
+  It must name `…/.claude/worktrees/<name>/target/release/teton-code`. Anything
+  else and legs (a) and (b) measure the old prompt.
+- `TETON_TEST_SEAMS` **unset**.
+- **Start the session inside the teton-code repository**, so the session root is
+  the tree being audited (REQ-583/584) and the model's file tools can actually
+  reach it.
+- **A tier that can audit a repository — write down which model.** A finding
+  about reply shape is a finding about *that* model: a local-tier reply is not
+  evidence about a remote one, or the reverse. Confirm the route with `/verbose`
+  and record the `route …` line.
+- **A terminal you can genuinely resize**, with `tput cols` to confirm the width
+  before each leg. `stty cols 100` sets the same `TIOCGWINSZ` the CLI reads and
+  is a fine way to drive the *layout*, but it does not narrow the window, so it
+  cannot support the legibility judgement legs (a) and (b) exist for. Where a
+  real 200-column window is not available (a laptop panel, a large font), say so
+  in the sign-off and run leg (b) with `stty cols 200` — the layout claim stays
+  checkable from a captured typescript, and the legibility half is recorded as
+  weakened rather than as passed.
+
+## The prompt
+
+Use this **verbatim in all four legs**. A leg that reworded it is measuring
+something else, and the clause's effect is only visible when the ask is held
+constant. It deliberately does not ask for a table and does not forbid one —
+what shape the model reaches for is the measurement.
+
+```
+Audit this repository for security defects. Cover the socket and IPC surface,
+the path jail, the shell tool, egress and provenance, SSRF, and redaction. Say
+what is strong and what is weak, and name the files.
+```
+
+## Procedure
+
+### Leg (a) — 100 columns, which is where the reported defect lived
+
+1. [ ] Resize the window to **100 columns**; confirm with `tput cols` → `100`.
+2. [ ] `./target/release/teton` in the repo, then `/verbose`. Record the route
+       line and the model.
+3. [ ] Paste the prompt and send it. Let the whole reply finish.
+4. [ ] **Prose.** Every wrapped row must break at a **space**. A break inside a
+       word — the `defens-` / `e-in-depth` signature — means the terminal did the
+       wrapping and the renderer did not, and is an outright failure of the leg.
+       No row may run past the window's right edge and continue at column 0.
+5. [ ] **Tables, if any arrived.** Each must be one of two shapes, never raw
+       `|` rows: **aligned** (columns lined up, a drawn rule under the header,
+       no printed `|---|` separator row), or **transposed** (one labelled
+       `Column: value` block per data row, continuation rows indented two
+       columns). At 100 columns a wide audit table should transpose.
+6. [ ] **Inline.** `**bold**` and `` `code` `` must appear as styling, not as
+       literal asterisks and backticks. Note that **inline styling inside a
+       table cell is deliberately absent** — a bold cell renders as unstyled
+       text at the right column. That is the documented trade, not a defect.
+7. [ ] **Fenced code, if any arrived.** Original line breaks kept, no styling
+       applied inside the fence, and a line longer than the window is left long
+       rather than re-flowed.
+8. [ ] **The judgement, in prose.** Compare against the fixture. Is this
+       legible — can you skim it and find a finding? Write a sentence or two in
+       the sign-off. "Better" is not enough on its own; say what is better and
+       what still is not.
+9. [ ] **The BR-1 observation, recorded as an observation.** Did the model
+       produce tables at all? If it did: how many columns, and did any cell hold
+       a whole sentence? The clause asks for at most three short columns and no
+       sentence in a cell. Record what actually arrived — including "it produced
+       the same wide tables as before", which is a legitimate and useful result.
+       **Do not re-run to get a nicer answer.**
+10. [ ] Keep the reply. Copying the scrollback into a scratch file is enough;
+        the sign-off quotes from it.
+
+### Leg (b) — 200 columns, where the layout has room
+
+1. [ ] **Without leaving the session**, resize the window to **200 columns**;
+       confirm with `tput cols`. Resizing mid-session is legitimate and is
+       itself worth one observation: the new width takes effect on the **next
+       turn**, and rows already on screen keep the breaks they were drawn with.
+       Record whether the next turn did lay out at the new width — a width
+       frozen at construction is a defect this REQ specifically closed.
+2. [ ] Send the same prompt again.
+3. [ ] Same four checks as leg (a): spaces not mid-word, tables in one of the
+       two shapes, inline styling, fences verbatim.
+4. [ ] **Expect some values not to wrap, and do not read that as a failure.** A
+       transposed block wraps a value only when the value is wider than the room
+       left beside its label; at 200 columns several of the fixture's values fit
+       on one row, and inserting a break there would be wrong. The rule is the
+       biconditional — wrapped **if and only if** too wide — not "everything
+       wraps".
+5. [ ] The judgement again, in prose: is 200 columns better than 100, worse, or
+       merely different? A table that transposes at 100 may align at 200, and
+       which reads better is worth recording.
+
+### Leg (c) — `NO_COLOR=1` at 100 columns: wrapping without escapes
+
+Colour and layout are separate branches of the same surface. This leg is the
+shipped-path witness that turning colour off does **not** turn wrapping off.
+
+1. [ ] Back to **100 columns** (`tput cols`).
+2. [ ] `NO_COLOR=1 ./target/release/teton`, same prompt.
+3. [ ] **Wrapping is still present** — prose breaks at spaces, tables still
+       aligned or transposed. A plain unwrapped ribbon here means the colour
+       switch reached the layout, which it must not.
+4. [ ] **No escapes reach the screen**: no colour, and no visible `[1m` debris.
+5. [ ] For a mechanical check, capture a typescript and count the lines
+       carrying an SGR sequence (BSD `script`, as on macOS; GNU `script` wants
+       `-c 'cmd' file`):
+
+   ```
+   NO_COLOR=1 script -q /tmp/req592-nocolor.typescript ./target/release/teton
+   LC_ALL=C grep -c $'\x1b\[[0-9;]*m' /tmp/req592-nocolor.typescript
+   ```
+
+   Expect **0**. If it is not zero, record the sequences verbatim — that is
+   the finding. (Cursor-motion escapes from the entry frame and the loading
+   indicator are *not* SGR and are not what this counts.)
+6. [ ] The same capture gives an honest widest-row figure, because with no SGR
+       in the stream the bytes and the columns agree for ASCII output:
+
+   ```
+   LC_ALL=C awk '{ if (length($0) > m) m = length($0) } END { print m }' \
+     /tmp/req592-nocolor.typescript
+   ```
+
+   Rows wider than 100 are expected only for the two documented cases: a
+   single word longer than the window (kept whole rather than split), and a
+   line inside a fence. Anything else is a finding. Non-ASCII content makes
+   byte length disagree with display width — note it rather than trusting
+   the number.
+
+### Leg (d) — stdout to a file: the renderer must be inert (BR-7, by eye)
+
+AC-7 asserts that piped bytes equal the raw chunks the daemon sent, for a
+**scripted** turn. This leg makes the same claim against a **real** reply, which
+is the only version that can catch a gate that happens to be inert for the
+fixture's shapes and not for something the fixture never contained. It matters
+more than it looks: inverting the gate leaves all of the pre-existing end-to-end
+tests green, so AC-7 plus this leg are the whole of BR-7's defence.
+
+1. [ ] `./target/release/teton > /tmp/req592-piped.md`, in the repo.
+2. [ ] **You will be typing blind.** The entry frame is written straight to
+       stdout by the prompter, and stdout is now the file — expected, not a bug.
+       Type the prompt, press Return, wait for the reply to finish, then Ctrl-D.
+3. [ ] Read the file. The assistant text must be **unrendered markdown**:
+       literal `|` table rows including the `|---|` separator, literal `**bold**`
+       and backticks, and long lines **unbroken** — no inserted newlines at any
+       column.
+4. [ ] No escape sequences at all:
+
+   ```
+   LC_ALL=C grep -c $'\x1b' /tmp/req592-piped.md
+   ```
+
+   Expect **0**.
+5. [ ] If typing blind is unworkable, the convenience form is
+
+   ```
+   printf '%s\n' 'Audit this repository for security defects. …' \
+     | ./target/release/teton > /tmp/req592-piped.md
+   ```
+
+   Note in the sign-off which form was used. The redirect-only form is the
+   faithful one — BR-7's gate reads *stdout* alone — while the piped form
+   changes stdin as well and matches AC-7's shape exactly. Either is
+   acceptable evidence; they are not the same evidence.
+6. [ ] **One observation worth taking here.** The output-format clause is
+       unconditional: the daemon is not told whether the client's stdout is a
+       terminal, so the model is told about a narrow terminal even on this run.
+       The reply's *shape* should therefore resemble legs (a) and (b) even
+       though its *rendering* does not. If the shape differs markedly, that is
+       sampling variance and belongs in the notes — it is also the cheapest
+       available evidence about how stable the clause's effect is.
+
+## Sign-off
+
+```
+REQ-592 sign-off
+----------------
+Verified by                                        :
+Date / build / commit                              :
+Platform / OS / terminal emulator                  :
+Model and tier (from the `route …` line)           :
+`pgrep -fl teton-code` named THIS worktree's binary : yes / no  <-- must be "yes"
+TETON_TEST_SEAMS confirmed unset                    : yes / no
+Session started inside the teton-code repo          : yes / no
+
+(a) tput cols read 100                              : yes / no
+(a) every prose break landed on a space             : yes / no  <-- must be "yes"
+(a) no row ran past the edge and continued at col 0 : yes / no  <-- must be "yes"
+(a) tables arrived?                                 : yes / no   (how many:)
+(a) each table was aligned or transposed, never raw : yes / no / n.a.
+(a) no literal `|---|` separator row was printed    : yes / no / n.a.
+(a) bold/code rendered as styling, not punctuation  : yes / no
+(a) fenced blocks kept their breaks, unstyled       : yes / no / n.a.
+(a) LEGIBILITY vs the fixture, in prose             :
+(a) BR-1 OBSERVATION — shape the model chose        :
+       tables produced?                             : yes / no
+       widest table, in columns                      :
+       any cell holding a whole sentence?            : yes / no
+       verdict: clause moved it / no visible effect / unclear
+(a) number of times the prompt was sent             :        <-- 1 is the honest answer
+
+(b) tput cols read 200 (or stty cols 200 — which:)  :
+(b) the resize took effect on the NEXT turn         : yes / no
+(b) already-printed rows kept their old breaks      : yes / no
+(b) every prose break landed on a space             : yes / no  <-- must be "yes"
+(b) tables aligned or transposed, never raw         : yes / no / n.a.
+(b) values that fit on one row were NOT broken      : yes / no
+(b) LEGIBILITY at 200 vs at 100, in prose           :
+
+(c) wrapping still present with NO_COLOR=1           : yes / no  <-- must be "yes"
+(c) SGR-carrying line count in the typescript        :          <-- must be 0
+(c) if non-zero, the sequences, verbatim             :
+(c) widest captured row                              :        cols
+(c) any over-wide row NOT a long word or a fence line:
+
+(d) form used                                        : redirect-only / piped-stdin
+(d) output was unrendered markdown (literal | ** `)  : yes / no  <-- must be "yes"
+(d) long lines were unbroken — no inserted newlines  : yes / no  <-- must be "yes"
+(d) escape-byte count in the file                    :          <-- must be 0
+(d) reply SHAPE resembled legs (a)/(b)               : yes / no  (notes:)
+
+Anything that hung, aborted, panicked, or crashed    :
+Findings worth filing (renderer half)                :
+Findings worth filing (clause half, incl. "no effect"):
+Notes                                                :
+```

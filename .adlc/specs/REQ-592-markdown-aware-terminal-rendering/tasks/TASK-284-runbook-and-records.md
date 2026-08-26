@@ -1,7 +1,7 @@
 ---
 id: TASK-284
 title: "The manual runbook, the architecture record, and the release note"
-status: draft
+status: complete
 parent: REQ-592
 created: 2026-08-26
 updated: 2026-08-26
