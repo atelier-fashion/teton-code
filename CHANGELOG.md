@@ -18,6 +18,83 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [0.1.25] - 2026-08-26
+
+### Added
+
+- **A turn that exceeds the context budget is offered, not refused (REQ-589).**
+  When a `/name` skill's expansion would take the turn past the route's budget,
+  the session now says so and asks, instead of refusing. The question names what
+  was measured, what the budget is, and which of the two guards — words or bytes
+  — is the one that bound. Answering *proceed* sends the turn; a going-forward
+  remedy is offered where the route has one to offer. Declining is exactly
+  today's refusal, byte for byte.
+
+- **Project skills are acknowledged before they run (REQ-591).** Typing `/name`
+  for a skill that lives in the session root's `.claude/` now asks once per
+  session before that repository's instructions are expanded — the same
+  acknowledgment the model's own `skill` tool has always needed. **On a machine
+  with project skills this is a new prompt appearing where there was none.**
+  Declining refuses the turn. At `plan` the body expands with every command
+  slot unrun, rather than refusing outright.
+
+- **`[skills] trusted_project_roots` — a durable allowlist for unattended runs
+  (REQ-591).** A repository named here runs its skills with nobody asked, which
+  is what makes `teton --skill deploy` work in CI. **This is a deliberate
+  widening**, and it is bounded: a human must list the exact tree, the user must
+  type the skill's name, every dynamic-context command still refuses at the
+  level, and the row answers the *typed* door only — no row lets the model's own
+  tool reach a project skill unattended.
+
+### Changed
+
+- **The local tier's context budget rose from 4,096 to 10,240 words (REQ-590).**
+  It is now derived from the engine's window (16,384 tokens, less 1,024 reserved
+  for the reply) instead of being a fixed pair. The byte half is unchanged at
+  32,768. **What an upgrade changes on a running machine:** a local session now
+  holds more conversation before compaction begins to forget — measured at 1.56×
+  at 4 bytes/word, 1.11× at 6, and no change at 8, because the byte guard binds
+  first for denser content. A turn that genuinely fills the new budget costs
+  about **13.5 s before its first token**, against ~3.1 s at the old budget;
+  prefill is quadratic, not linear, and this was measured rather than estimated.
+  Turns that do not fill it are unaffected — the budget is a ceiling, and a turn
+  pays only for what it sends.
+
+- **A malformed `[skills] trusted_project_roots` row stops the daemon from
+  starting.** A row is a canonical absolute path; `~/dev/repo` is not one and
+  would silently never match. The daemon refuses to start and names the correct
+  form, rather than running with an allowlist that looks populated and is inert.
+  No shipped release has ever written this table, so nothing existing migrates
+  into the fatal case.
+
+### Fixed
+
+- **`/analyze` and its neighbours no longer refuse a turn the engine could
+  hold.** The reported failure was one word over a 4,096-word budget on a
+  machine whose engine had a 16,384-token window loaded. It serves.
+
+- **The compaction repair can no longer exceed the budget it repairs to.** Its
+  output ceiling was pinned to a constant that stopped equalling the local
+  budget; a repair landing in the gap was rejected and the turn fell back to
+  dropping the oldest blocks — on the route that most needed the model's
+  judgement.
+
+### Known
+
+- A local turn of **token-dense, byte-light** content — a numeric grid, a column
+  of digits — can pass both budget guards and still exceed the engine's window,
+  because the bytes-per-token bridge the guards use is not a true floor for that
+  shape. The turn is refused by the engine with a typed error rather than
+  silently truncated. Measured, recorded, and not fixed here: a real bound needs
+  a tokenizer, not a byte proxy.
+
+- A client from **0.1.24 or earlier talking to a 0.1.25 daemon** does not render
+  the three new over-budget event lines — `Event` is a closed enum, so a frame
+  naming a variant the client has never heard of is dropped whole. The offer
+  itself is a permission request, not an event, so such a client is still asked
+  and still answers; it loses the transcript lines only. Upgrading both halves —
+  which `brew upgrade` does — avoids it.
+
 ## [0.1.24] - 2026-08-23
 
 ### Added
