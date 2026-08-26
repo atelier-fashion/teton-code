@@ -79,9 +79,12 @@ const SYSTEM: &str = "You are Teton Code.";
 /// window-derived pair: bytes ÷ 2 > words × 3/2 for anything above 3 B/word.
 ///
 /// That now includes the local pair. It was 8 B/word (4,096 / 32,768), where
-/// both guards bound at once; since REQ-590 the local tier derives from the
-/// engine's window like every other route (10,240 / 30,720), so its crossover
-/// is 3 B/word too and a 4 B/word fixture presses the byte guard here as well.
+/// both guards bound at once; since REQ-590 the local tier's *word* half
+/// derives from the engine's window like every other route (10,240 / 32,768),
+/// so its crossover is 3 B/word too and a 4 B/word fixture presses the byte
+/// guard here as well. The byte half itself did not move — D-4 briefly took it
+/// to 30,720 and ADR-9 reversed that — so the crossover moved entirely on the
+/// word half.
 fn filler(words: usize) -> String {
     let mut s = String::with_capacity(words * 4);
     for _ in 0..words {
@@ -342,7 +345,7 @@ fn drain(sub: &mut tetond::broadcast::Subscription) -> Published {
 /// Three 12,500-word blocks at 4 B/word (50,000 bytes each) under the **local**
 /// pair — the real one, `derive(BudgetInputs::local())`, not a number invented
 /// here — plus a short newest user message. Both guards are over: 37,500 words
-/// against 4,096, and 150 KB against 32,768. Three drops leave one block, which
+/// against 10,240, and 150 KB against 32,768. Three drops leave one block, which
 /// is where the loop stops by construction (`truncate_to_budget` never drops the
 /// most recent), and that one block is small enough that nothing is elided in
 /// place — so this fixture's report is a clean `dropped_blocks: 3` rather than a
@@ -826,7 +829,7 @@ fn a_report_with_nothing_in_it_is_the_one_that_says_nothing() {
 // | `max_context = 128000` | ≈250 KB | the skill expands and reaches the provider |
 // | `max_context = 0` | the default pair, stated | refused, `bound: unknown window`, remedy named |
 // | `max_context = 4096` | floored to (2,048 / 16 KiB) | refused, and the message says it was floored |
-// | the local tier | (4,096 / 32 KiB) | refused, `bound: local engine` |
+// | the local tier | (10,240 / 32 KiB) | refused, `bound: local engine` |
 //
 // **And the silence (BR-8c).** A refused turn emits **no** `context_pressure`
 // event of any kind — not a drop, not an elision, not a "nothing was clamped"

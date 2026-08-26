@@ -1808,8 +1808,8 @@ fn a_permanent_acknowledgment_writes_its_row_only_where_presence_is_satisfied() 
 // is the one cell of the reachability table the report actually landed in.
 //
 // The *figures* are no longer the report's own: REQ-590 gave the local tier a
-// derived budget (`BUDGET_PAIR`, 10,240 words / 31 KB) and the reported
-// measurement no longer exceeds its word half. That the report's own numbers
+// derived word budget (`BUDGET_PAIR`, 10,240 words / 33 KB) and the reported
+// measurement no longer exceeds either half. That the report's own numbers
 // now serve is REQ-590 AC-12, witnessed in `skill_over_budget_offer.rs`; what
 // this file keeps is the offer's *rendering*, exercised at whatever boundary
 // the route actually has.
@@ -1848,7 +1848,7 @@ fn budget_words() -> usize {
 /// A skill body large enough to blow the local route's budget on its own, in
 /// **both** currencies, while staying inside [`SKILL_FILE_CEILING_BYTES`].
 ///
-/// A quarter past [`budget_words`] at ~4 bytes a word, which lands ~72% past
+/// A quarter past [`budget_words`] at ~4 bytes a word, which lands ~86% past
 /// the byte half as well and ~19% short of the file ceiling. Deliberately clear
 /// of the budget boundary rather than one word over it as the report was: Stage
 /// A measures the body **with the system prompt**, whose size is not this test's
@@ -1893,18 +1893,23 @@ fn over_budget_skill_body() -> String {
 
 /// The budget pair the local route derives, spelled as the terminal spells it.
 ///
-/// Since REQ-590 the local tier derives from the engine's own window like any
-/// declared one: `LOCAL_ENGINE_N_CTX` (16,384) less the generation reservation
-/// (1,024) is 15,360 usable → 15,360 × 2/3 = **10,240 words** and 15,360 × 2 B
-/// = **30,720 B**, which `bytes_figure` (`(bytes + 500) / 1000`) rounds to
-/// `31 KB`.
+/// Since REQ-590 the local tier's **word** half derives from the engine's own
+/// window like any declared one: `LOCAL_ENGINE_N_CTX` (16,384) less the
+/// generation reservation (1,024) is 15,360 usable → 15,360 × 2/3 = **10,240
+/// words**.
+///
+/// The **byte** half is `LOCAL_BUDGET_BYTES`, **32,768 B**, which `bytes_figure`
+/// (`(bytes + 500) / 1000`) rounds to `33 KB`. D-4 briefly derived it from the
+/// window too (15,360 × 2 = 30,720, rendered `31 KB`) and ADR-9 reversed that —
+/// so the pair a terminal spells is asymmetric, one half derived and one half
+/// the constant.
 ///
 /// A literal, because this crate is the thin client and cannot read `tetond`'s
 /// constants — the same reason [`REMEDY_WRITE`] carries a vendor window as a
 /// literal. It is the **one** home of the pair in this file:
 /// [`offer_sentence`], [`decline_refusal`] and [`measured_pair`]'s
 /// non-vacuity threshold all read it rather than restating it.
-const BUDGET_PAIR: &str = "10,240 words / 31 KB";
+const BUDGET_PAIR: &str = "10,240 words / 33 KB";
 
 /// BR-3's `WindowUnknown` clause. The route declares no window, so the daemon
 /// says it cannot promise — and names the backstop ADR-3 built for exactly this
@@ -1952,6 +1957,25 @@ fn remedy_clause() -> String {
     format!("{REMEDY_WRITE} — {REMEDY_RISK}")
 }
 
+/// The bound as the daemon speaks it for the local route (REQ-590 AC-16).
+///
+/// Every other bound names something a user can go and read; this one names an
+/// engine, so since REQ-590 it accounts for its own number instead. The
+/// arithmetic is checkable from the sentence alone: `16,384 − 1,024 = 15,360`,
+/// and `15,360 × 2/3` is [`BUDGET_PAIR`]'s word half. The byte half is named as
+/// **fixed** because it is (ADR-9) — a clause implying both halves came from
+/// the window would send a reader to divide 33 KB by something and get an
+/// answer that does not reconcile.
+///
+/// A literal, for [`BUDGET_PAIR`]'s reason: this crate is the thin client and
+/// cannot read `tetond`'s constants. Its one home in this file, read by
+/// [`offer_sentence`] and [`decline_refusal`] alike — AC-3's claim is that
+/// those two share a head byte for byte, and two copies of this clause is the
+/// one edit that would make that claim vacuous.
+const LOCAL_BOUND: &str = "bound: local engine — the word half comes from the engine's \
+                           16,384-token window, less the 1,024 reserved for the reply; the byte \
+                           half is fixed";
+
 /// The daemon's finished question, with the one figure this fixture cannot fix
 /// left as a parameter.
 ///
@@ -1962,7 +1986,7 @@ fn offer_sentence(measured: &str) -> String {
     format!(
         "`/analyze` (this repository's skill) does not fit this route's context budget: the body \
          alone, with the system prompt, comes to about {measured}, and the budget is \
-         {BUDGET_PAIR} (bound: local engine). {WINDOW_UNKNOWN_CLAUSE} The durable fix is to {}. \
+         {BUDGET_PAIR} ({LOCAL_BOUND}). {WINDOW_UNKNOWN_CLAUSE} The durable fix is to {}. \
          Send it whole this once, take the durable fix, both, or neither?",
         remedy_clause()
     )
@@ -1979,9 +2003,9 @@ fn offer_sentence(measured: &str) -> String {
 fn decline_refusal(measured: &str) -> String {
     format!(
         "`/analyze` does not fit this route's context budget: the body alone, with the system \
-         prompt, comes to about {measured}, and the budget is {BUDGET_PAIR} (bound: local \
-         engine). Nothing was sent and no provider saw this turn — a skill expansion is carried \
-         whole or refused, never shortened into something you did not invoke."
+         prompt, comes to about {measured}, and the budget is {BUDGET_PAIR} ({LOCAL_BOUND}). \
+         Nothing was sent and no provider saw this turn — a skill expansion is carried whole or \
+         refused, never shortened into something you did not invoke."
     )
 }
 

@@ -2693,17 +2693,22 @@ mod tests {
     /// running code at `5a2ee33`, not hand-computed, so it is a record of
     /// behaviour rather than a restatement of the arithmetic.
     ///
-    /// **One row has moved since, deliberately** (REQ-590 TASK-270/272,
-    /// D-3). `local_engine` no longer returns the no-better-fact pair: it
-    /// derives from the engine's own window like every other window-derived
-    /// route, so `10240 / 30720` replaces `4096 / 32768`. Its digest
-    /// thresholds move with it, and they move **asymmetrically** — words up
-    /// `1500 → 3750`, bytes *down* `12000 → 11250` — because
-    /// `digest_thresholds` scales each half by its own constant and the byte
-    /// half of the budget fell. That is arithmetic, not a bug, and it is
-    /// written out here so the next reader does not have to re-derive it to be
-    /// sure. The other four rows are byte-identical to the capture, which is
-    /// what says REQ-590 touched the local arm and nothing else.
+    /// **One half of one row has moved since, deliberately** (REQ-590
+    /// TASK-270, D-3 as amended by ADR-9). `local_engine` no longer returns the
+    /// no-better-fact pair's *word* half: it derives from the engine's own
+    /// window like every other window-derived route, so `10240` replaces
+    /// `4096`. Its word digest threshold follows, `1500 → 3750`.
+    ///
+    /// Its **byte** half is unchanged at `32768`, and so is its byte digest
+    /// threshold at `12000`. D-4 briefly took the window-derived byte half here
+    /// too (`30720`, which would have dragged the byte digest threshold *down*
+    /// to `11250`) and was reversed on measurement — see ADR-9. The asymmetry
+    /// that survives is that one half of this pair is derived and the other is
+    /// the constant, which is stated at [`derive`](crate::harness::budget::derive)'s
+    /// local arm rather than left to be inferred from this table.
+    ///
+    /// The other four rows are byte-identical to the capture, which is what
+    /// says REQ-590 touched the local arm and nothing else.
     const BUDGET_FOR_GOLDEN: [&str; 5] = [
         "local_engine: RouteBudget { budget_tokens: 10240, budget_bytes: 32768, bound: LocalEngine, window_label: \"the local context window\", digest_threshold_tokens: 3750, digest_threshold_bytes: 12000, floored: false, provider_id: None }",
         "default_unknown: RouteBudget { budget_tokens: 4096, budget_bytes: 32768, bound: DefaultUnknown, window_label: \"silent's context window\", digest_threshold_tokens: 1500, digest_threshold_bytes: 12000, floored: false, provider_id: Some(\"silent\") }",

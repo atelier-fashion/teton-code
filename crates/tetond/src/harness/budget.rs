@@ -1455,6 +1455,40 @@ fn sentence_tail(caller: SkillCaller, bound: BudgetBound, sentence: &SkillSenten
 /// * The `unknown window` arm carries the remedy, because that is the bound a
 ///   new user meets and `capabilities.max_context` is the line they would go
 ///   and write (BR-8a's own example).
+/// * The `local engine` arm **accounts for its own number** and carries no
+///   remedy at all (REQ-590 BR-12/AC-16, BR-6/AC-6). See below.
+///
+/// # The local arm says where its budget came from (REQ-590 BR-12, AC-16)
+///
+/// Every other bound names something a user can go and read: a provider's
+/// `capabilities.max_context`, their own `context_budget_cap`, the redact
+/// scan's ceiling. `local engine` names an engine, and until REQ-590 that was
+/// the whole sentence — a user whose local budget was 4,096 words had nowhere
+/// to go to find out why. It is now derived, which makes it *more* mysterious
+/// rather than less unless the derivation is said out loud, so the clause
+/// carries the two numbers that produce it: the window the daemon loads with
+/// and the tokens held back for the reply. `16,384 − 1,024 = 15,360`, and
+/// `15,360 × 2/3` is the word figure standing beside this clause — the whole
+/// arithmetic, checkable by the reader who was surprised by it.
+///
+/// **The byte half is named as *not* derived**, which is the honest half of
+/// the sentence after D-4's reversal (ADR-9). It is [`LOCAL_BUDGET_BYTES`], a
+/// constant, and a clause implying both halves came from the window would send
+/// a reader to divide 32,768 by something and get an answer that does not
+/// reconcile. Saying "the byte half is fixed" costs six words and is true.
+///
+/// **No `capabilities.max_context` remedy, ever, on this arm** (BR-6). There is
+/// no provider declaration behind a local budget for anyone to edit, and the
+/// `DefaultUnknown` arm below would render exactly that sentence for
+/// `provider_id: None` — which is the bound the local route falls into if
+/// [`derive`]'s local branch is ever deleted (BR-2). The two arms are therefore
+/// asserted against each other rather than separately.
+///
+/// The **client's** route line (`session_ui::bound_clause`) still renders the
+/// plain `(bound: local engine)`: neither number is on the wire there, and
+/// REQ-590 does not add a field to carry them. That asymmetry is deliberate and
+/// narrow — the surface that has the facts states them, and the one that does
+/// not says nothing rather than guessing.
 ///
 /// The two qualifiers are appended independently rather than as an either/or:
 /// [`derive`] never sets `floored` on the [`BudgetBound::DefaultUnknown`] arm
@@ -1472,6 +1506,18 @@ fn bound_clause(budget: &RouteBudget, provider_id: Option<&str>) -> String {
             " — floored: below the smallest budget that holds the system prompt, so this budget \
              is already larger than the declaration allows",
         );
+    }
+    if budget.bound == BudgetBound::LocalEngine {
+        // REQ-590 AC-16: the two numbers, read from the constants the
+        // derivation reads, never restated. A reservation that moved and a
+        // sentence that did not would be the LESSON-491 shape this REQ spent
+        // three ADRs on.
+        clause.push_str(&format!(
+            " — the word half comes from the engine's {}-token window, less the {} reserved for \
+             the reply; the byte half is fixed",
+            thousands(u64::from(LOCAL_ENGINE_N_CTX)),
+            thousands(u64::from(LOCAL_GENERATION_RESERVATION)),
+        ));
     }
     if budget.bound == BudgetBound::DefaultUnknown {
         // A remote route always has an id in practice — the window came from
@@ -3383,7 +3429,10 @@ mod tests {
         );
 
         let clause = bound_clause(&derive(BudgetInputs::local()), None);
-        assert_eq!(clause, "bound: local engine");
+        assert!(
+            clause.starts_with("bound: local engine"),
+            "the bound is spoken in its own words: {clause}"
+        );
         assert!(
             !clause.contains("capabilities.max_context"),
             "BR-6: the local route has no provider declaration to send anyone to: {clause}"
@@ -3391,6 +3440,106 @@ mod tests {
         // Non-vacuity: the arm this would fall through to does say it.
         assert!(bound_clause(&derive(remote(0, 0, false)), Some("kimi"))
             .contains("set `capabilities.max_context`"));
+    }
+
+    /// **AC-16 (BR-12) and AC-6 (BR-6): the rendered `local engine` clause
+    /// accounts for its own number and offers no remedy — asserted on the
+    /// string, not on the fields behind it.**
+    ///
+    /// AC-16 says "the string a user actually sees" in as many words, and the
+    /// reason is REQ-591's LESSON-564: a claim about `RouteBudget`'s fields is
+    /// a claim about a struct, and the struct was never the thing in doubt.
+    /// What was in doubt is whether a user whose local budget moved from 4,096
+    /// to 10,240 words can find out *why*. So every assertion here is a
+    /// substring of the sentence, and the two numbers are recomputed from the
+    /// constants rather than written out — a reservation that moved and a
+    /// sentence that did not is the failure this test exists to catch, and it
+    /// cannot catch it against a literal.
+    ///
+    /// # The arithmetic is stated so the reader can check it
+    ///
+    /// `16,384 − 1,024 = 15,360`, `15,360 × 2/3 = 10,240` — the word figure the
+    /// sentence quotes beside this clause. Asserted here as a relation so that
+    /// a clause naming numbers which no longer produce the pair goes red.
+    ///
+    /// # AC-6's pairing, and the one place it differs from the criterion
+    ///
+    /// AC-6 pairs the local bound "against a remote `Window` bound, which
+    /// does [offer a `capabilities.max_context` remedy]". Two different
+    /// surfaces carry that remedy, and this test takes the one that lives in
+    /// *this* function:
+    ///
+    /// * **The bound clause.** Only [`BudgetBound::DefaultUnknown`] renders a
+    ///   `capabilities.max_context` instruction here, so that is the row this
+    ///   test pairs against. It is also the row that matters: deleting
+    ///   [`derive`]'s local branch drops the local route into exactly that arm
+    ///   with `provider_id: None`, which renders *"set `capabilities.max_context`
+    ///   for this provider"* on a route where no such provider exists (BR-2).
+    /// * **The remedy clause**, where a `Window`-bound route really is told to
+    ///   *"raise `capabilities.max_context = … for `frontier`"*. That pairing is
+    ///   pinned in `skill_over_budget_offer.rs`'s
+    ///   `every_bound_offers_exactly_the_remedy_the_table_names`, and is not
+    ///   restated here.
+    ///
+    /// **The mutation this exists for**: give the local bound the remote
+    /// clause — change the `LocalEngine` arm in [`bound_clause`] to append
+    /// `DefaultUnknown`'s remedy (or fold `LocalEngine` into that arm's
+    /// condition). Both the AC-6 assertion below and the negative in
+    /// `the_default_configs_budget_is_still_bound_by_the_local_engine` redden.
+    #[test]
+    fn the_local_bound_accounts_for_the_window_and_the_reservation_it_derived_from() {
+        let local = derive(BudgetInputs::local());
+        let clause = bound_clause(&local, None);
+
+        // -- AC-16: the window and the reservation, in the sentence ----------
+        let window = thousands(u64::from(LOCAL_ENGINE_N_CTX));
+        let reservation = thousands(u64::from(LOCAL_GENERATION_RESERVATION));
+        assert!(
+            clause.contains(&format!("{window}-token window")),
+            "AC-16: the clause must name the window the budget came from \
+             ({window} tokens): {clause}"
+        );
+        assert!(
+            clause.contains(&format!("less the {reservation} reserved for the reply")),
+            "AC-16: and what was held back for the generation ({reservation} tokens): {clause}"
+        );
+
+        // The account has to *reconcile*, or it is decoration. This is the
+        // arithmetic a reader would do with the two figures the clause names.
+        let usable = (LOCAL_ENGINE_N_CTX - LOCAL_GENERATION_RESERVATION) as usize;
+        assert_eq!(
+            usable * REMOTE_TOKENS_PER_WORD_DEN / REMOTE_TOKENS_PER_WORD_NUM,
+            local.budget_tokens,
+            "the clause names {LOCAL_ENGINE_N_CTX} less {LOCAL_GENERATION_RESERVATION}, but that \
+             does not produce the {} words standing beside it — the sentence has drifted from \
+             the derivation it describes",
+            local.budget_tokens
+        );
+
+        // And it does not claim the byte half, which is the constant
+        // ([`LOCAL_BUDGET_BYTES`]) and not window-derived at all since ADR-9.
+        assert!(
+            clause.contains("the byte half is fixed"),
+            "ADR-9: the clause must not imply both halves came from the window — the byte half \
+             is a constant, and a reader who tries to reconcile it against the window cannot: \
+             {clause}"
+        );
+        assert_eq!(
+            local.budget_bytes, LOCAL_BUDGET_BYTES,
+            "…which is only honest while it really is the constant"
+        );
+
+        // -- AC-6: no remedy on this arm, against one that has it ------------
+        assert!(
+            !clause.contains("capabilities.max_context"),
+            "AC-6/BR-6: the local route has no provider declaration to send anyone to: {clause}"
+        );
+        let fallthrough = bound_clause(&derive(remote(0, 0, false)), None);
+        assert!(
+            fallthrough.contains("set `capabilities.max_context` for this provider"),
+            "the pairing is vacuous unless the arm the local branch would fall into really does \
+             render the forbidden remedy: {fallthrough}"
+        );
     }
 
     /// **AC-3: `HarnessConfig::default()` and the local derivation both

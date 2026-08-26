@@ -3240,15 +3240,26 @@ mod tests {
         assert_eq!(silent.digest_threshold_bytes, 12_000);
     }
 
-    /// **REQ-590 D-3.** What `HarnessConfig::default()` — the *local* harness —
-    /// now digests at, and the asymmetry that would otherwise read as a bug.
+    /// **REQ-590 D-3, as amended by ADR-9.** What `HarnessConfig::default()` —
+    /// the *local* harness — now digests at, and the asymmetry that would
+    /// otherwise read as a bug.
     ///
-    /// Words go **up** (1,500 → 3,750) while bytes go **down** (12,000 →
-    /// 11,250), because `digest_thresholds` scales each half of the pair by its
-    /// own constant fraction and REQ-590 moved the two halves in opposite
-    /// directions: the word budget rose 4,096 → 10,240 and the byte budget fell
-    /// 32,768 → 30,720. Both are pinned here so that a reader who finds one of
-    /// them surprising finds the arithmetic beside it.
+    /// Words go **up** (1,500 → 3,750) and bytes **do not move at all**
+    /// (12,000), because `digest_thresholds` scales each half of the pair by
+    /// its own constant fraction and REQ-590 moved exactly one half: the word
+    /// budget rose 4,096 → 10,240 while the byte budget stayed
+    /// `LOCAL_BUDGET_BYTES`, 32,768. Both are pinned here so that a reader who
+    /// finds one of them surprising finds the arithmetic beside it — including
+    /// the reader who expected *both* to move.
+    ///
+    /// **D-4 briefly made the byte half fall too** (32,768 → 30,720), which
+    /// dragged this threshold down to 11,250 — a digest firing on *smaller*
+    /// tool results than before, on the tier least able to afford the extra
+    /// local call. ADR-9 reversed D-4 on the refusal measurement, and this
+    /// threshold returning to 12,000 is one of the things that reversal buys.
+    /// The unchanged figure is asserted rather than deleted, because "it did
+    /// not move" is the claim, and a test that dropped the assertion could not
+    /// make it.
     ///
     /// The config's thresholds are asserted against its **own** `budget` as
     /// well as against the figures, because `with_route_budget` exists so a
@@ -3275,12 +3286,23 @@ mod tests {
         // The asymmetry, stated as the arithmetic it is.
         assert_eq!(
             (config.budget.budget_tokens, config.budget.budget_bytes),
-            (10_240, 30_720)
+            (10_240, 32_768)
+        );
+        assert_eq!(
+            config.budget.budget_bytes,
+            crate::harness::budget::LOCAL_BUDGET_BYTES,
+            "ADR-9: the local byte half is the constant, not a window derivation — if that has \
+             changed, the 12,000-byte digest threshold above has changed with it"
         );
         assert!(
-            config.summarize_threshold_tokens > 1_500 && config.summarize_threshold_bytes < 12_000,
-            "D-3: the word threshold rises and the byte threshold falls, because \
-             the two halves of the budget moved in opposite directions"
+            config.summarize_threshold_tokens > 1_500,
+            "D-3: the word threshold rises with the word budget"
+        );
+        assert_eq!(
+            config.summarize_threshold_bytes, 12_000,
+            "ADR-9: and the byte threshold does not move, because the byte budget did not. D-4 \
+             would have put this at 11,250 — a digest firing on smaller results than before, on \
+             the tier least able to afford the extra local call"
         );
     }
 

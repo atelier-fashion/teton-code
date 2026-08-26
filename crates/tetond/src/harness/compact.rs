@@ -128,26 +128,41 @@ use crate::runtime::LOCAL_ENGINE_N_CTX;
 ///   engine window          16,384 tokens   (LOCAL_ENGINE_N_CTX)
 ///   − the generation        1,024 tokens   (LOCAL_GENERATION_RESERVATION)
 ///   = 15,360 usable        × 2 B/token     (DUTY_REQUEST_BYTES_PER_TOKEN)
-///   = 30,720 bytes  — which is exactly what `derive(BudgetInputs::local())`
-///                     hands the local route as its `budget_bytes`
+///   = 30,720 bytes  — everything a prompt of this window can hold once the
+///                     reply's room is set aside, which is the most a repair
+///                     could ever usefully return
 /// ```
 ///
 /// LESSON-491, verbatim: *"when two budgets constrain one flow, write the chain
 /// down once and derive each number from its neighbour; any two 'independent'
 /// numbers on one chain are a bug waiting to happen."* This constant is link
-/// three, and until REQ-590 it was pinned to link **one's** old value — it read
-/// `LOCAL_BUDGET_BYTES` (32,768), which was the local route's budget only while
-/// the local arm of [`derive`](super::budget::derive) returned the default pair.
-/// The moment that arm started deriving from the engine's window the two numbers
-/// disagreed by 2,048 bytes, and the sentence above became false: a compaction
-/// landing in that gap was rejected at the budget check and the turn fell back
-/// to deterministic oldest-first eviction, on the route that most needed the
-/// model's judgement. Nothing said so.
+/// three, and until REQ-590 it was pinned to link **one's** value by *name* —
+/// it read `LOCAL_BUDGET_BYTES` (32,768), which is a constant chosen for a
+/// route with no window at all, not a fact about this engine. It followed the
+/// engine only by coincidence, and the coincidence was invisible at both
+/// definition sites.
+///
+/// # Ceiling ≤ budget is an **ordering**, not an equality (REQ-590 ADR-9)
+///
+/// D-4 originally took the window-derived byte half for the local route too, at
+/// which point the ceiling and the budget were the same 30,720 by construction.
+/// **D-4 was reversed on measurement** — the local byte budget is
+/// [`LOCAL_BUDGET_BYTES`](super::budget::LOCAL_BUDGET_BYTES) again, 32,768 —
+/// so the two numbers now answer different questions and the relation between
+/// them is `ceiling ≤ budget`, with 2,048 bytes of room. That is the right
+/// shape: pinning the equality was defensible only while both sides derived
+/// from one number, and would now be a coincidence to assert.
+///
+/// The 2,048-byte gap is not slack in the engine's favour. It is exactly what
+/// the byte budget out-claims the engine by at the 2 B/token floor — 32,768 / 2
+/// = 16,384 tokens against 15,360 usable — so the ceiling is what a repair can
+/// really return and the budget is what the guard will really admit. The
+/// residual is stated where the numbers meet, in `tests/token_corpus.rs`'s
+/// `a_full_word_budget_turn_of_token_dense_byte_light_content_overruns_the_engine`.
 ///
 /// So the relation is held **by construction** here and **asserted as a
-/// relation** in `the_compact_ceiling_is_the_loosest_of_the_five` and
-/// `a_compaction_that_lands_in_the_old_gap_is_applied_not_degraded` — never as
-/// two literals that happen to agree, which is the shape that broke.
+/// relation** in `the_compact_ceiling_is_the_loosest_of_the_five` — never as two
+/// literals that happen to agree, which is the shape that broke.
 ///
 /// The one link this does *not* follow is the redact clamp or a remote route's
 /// larger pair: the ceiling is the **local** budget on purpose, for the same
@@ -1161,16 +1176,6 @@ mod tests {
             COMPACT_DUTY.max_tokens()
         );
     }
-
-    /// The ceiling this constant carried until REQ-590 — the *default* pair's
-    /// byte half, which stopped being the local route's budget the moment
-    /// [`derive`](super::super::budget::derive)'s local arm started deriving
-    /// from the engine's window (ADR-2/ADR-4).
-    ///
-    /// Read rather than written as 32,768: the point of the band below is that
-    /// these two numbers used to be the same and no longer are, which a literal
-    /// could not say.
-    const THE_CEILING_BEFORE_REQ_590: usize = crate::harness::budget::LOCAL_BUDGET_BYTES;
 
     // **`a_compaction_that_lands_in_the_old_gap_is_applied_not_degraded` was
     // removed here (REQ-590 ADR-9); the hole is deliberate and this says why.**

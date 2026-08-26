@@ -325,6 +325,8 @@ written to name. It is named, and it is not closed by this REQ.
 
 ### AC-11 — turns until compaction fires: **"~2.5× more conversation" is true in one currency only**
 
+*Re-measured after ADR-9 reversed D-4. Both readings are given; the bold column is what ships.*
+
 Asserted in CI by `crates/tetond/tests/compaction_cadence.rs`, driving the production turn loop
 (`run_session_turn_with_source`) over a scripted local engine. Reproduce the table with:
 
@@ -335,12 +337,17 @@ cargo test -p tetond --test compaction_cadence -- --nocapture
 250-word user message plus a 120-word reply per turn; the count is the turn on which the
 accumulated conversation first crosses `under_compaction_pressure`.
 
-| bytes/word | stands for | before (4,096 w / 32,768 B) | after (10,240 w / 30,720 B) | ratio |
-|---|---|---|---|---|
-| 4 | source — the dense end of `budget.rs:205`'s ratio | 9 turns | **14 turns** | 1.56× |
-| 6 | ordinary prose | 9 turns | **10 turns** | 1.11× |
-| 8 | punctuation- and indent-heavy text | 8 turns | **8 turns** | 1.00× |
-| 20 | minified JSON, base64, path-heavy logs (`budget.rs:55-62`) | 4 turns | **4 turns** | 1.00× |
+| bytes/word | stands for | before (4,096 w / 32,768 B) | after (10,240 w / 32,768 B) | ratio | *under D-4 (30,720 B)* |
+|---|---|---|---|---|---|
+| 4 | source — the dense end of `budget.rs:205`'s ratio | 9 turns | **15 turns** | 1.67× | *14 turns* |
+| 6 | ordinary prose | 9 turns | **11 turns** | 1.22× | *10 turns* |
+| 8 | punctuation- and indent-heavy text | 8 turns | **8 turns** | 1.00× | *8 turns* |
+| 20 | minified JSON, base64, path-heavy logs (`budget.rs:55-62`) | 4 turns | **4 turns** | 1.00× | *4 turns* |
+
+**Measured twice.** The last column is the same fixture under D-4's byte half, before ADR-9
+reversed it; it is kept because a reader who finds those figures in an older revision should be
+able to tell which measurement they are holding, and because the difference between the two
+columns is what the reversal bought.
 
 **The gain decays with content density and is gone by 8 B/word.** The mechanism is that
 `under_compaction_pressure` is a *disjunction over both currencies*, so what binds is whichever
@@ -349,28 +356,31 @@ budget the content exhausts first — and the crossover density is `budget_bytes
 | | words | bytes | word-bound below |
 |---|---|---|---|
 | before | 4,096 | 32,768 | **8 B/word** |
-| after | 10,240 | 30,720 | **3 B/word** |
+| after | 10,240 | 32,768 | **3 B/word** |
 
 Before this REQ essentially every real conversation was **word**-bound, and the word half is the
 half that rose 2.5×. After it, essentially every real conversation is **byte**-bound — and the byte
-half is the half that *fell*. Exactly, at `COMPACT_PRESSURE_PERCENT = 70`:
+half is the half that **did not move**. So the crossover moved entirely on the word half, and past
+8 B/word this REQ buys nothing at all rather than costing something. Exactly, at
+`COMPACT_PRESSURE_PERCENT = 70`:
 
 - word threshold **2,867 → 7,168** words (2.5× up)
-- byte threshold **22,937 → 21,504** bytes (6.25% **down**)
+- byte threshold **22,937 → 22,937** bytes (unchanged)
 
 Both are pinned in `the_binding_guard_crosses_over_at_a_much_lower_density_after_this_req`.
 
-**This is D-4 priced, not a defect discovered.** D-4 decided the byte half falls to 30,720 and BR-7
-recorded the regression it accepts. What the measurement adds is that the regression is not
-confined to the 2,048-byte refusal band BR-7 describes: it also moves the *compaction* threshold
-down by the same 6.25%, so a byte-dense local session compacts marginally sooner than it does
-today, not later. At this fixture's message size that lands inside one turn's granularity, which is
-why the table reads 1.00× rather than below it — the threshold is the exact statement, the turn
-count is the lived one, and both are recorded rather than one standing in for the other.
+**This measurement is what priced D-4, and then reversed it.** D-4 had decided the byte half falls
+to 30,720, and BR-7 recorded the refusal band it accepts. What this measurement added is that the
+regression was not confined to that band: the byte half also drives the *compaction* threshold,
+which fell by the same 6.25% (22,937 → 21,504) — so a byte-dense local session would have
+compacted marginally **sooner** after this REQ than before it, and the 4 and 6 B/word rows read 14
+and 10 rather than 15 and 11. That, together with the refusal measurement in ADR-9, is why D-4 was
+withdrawn. With it withdrawn, every row above is the same or better and none is worse.
 
-**The sentence to carry forward** is not D-3's "~2.5× more conversation". It is: *2.5× for
-source-shaped content, ~1.1× for prose, and nothing at all once content passes 8 bytes per
-whitespace word.*
+**The sentence to carry forward** is not D-3's "~2.5× more conversation". It is: *1.67× for
+source-shaped content, ~1.2× for prose, and nothing at all once content passes 8 bytes per
+whitespace word — because past that density the guard that binds is one this REQ does not
+touch.*
 
 ### AC-14 — the by-hand leg
 
@@ -379,6 +389,12 @@ five legs — the reported budget and its arithmetic, the 4,097-word turn that u
 full-budget turn, the token-dense/byte-light turn where ADR-6's slack is zero, and the byte band
 D-4 gave up. **AC-14 is not satisfied until a person fills in its sign-off block**; that is the
 whole reason it exists, REQ-589's AC-15 having been left unwritten.
+
+> **ADR-9 amends the fifth leg.** D-4 is reversed, so there is no byte band to give up and no
+> turn that serves today is newly refused. That leg is rewritten to the check the reversal makes
+> worth doing by hand instead: a local turn at the **reported measurement's own density** —
+> ~4,097 words and ~31 KB of code — which must serve silently, and whose rendered budget line
+> must read `10,240 words / 33 KB (bound: local engine — …)`.
 
 ### What was *not* measured
 
@@ -393,3 +409,131 @@ whole reason it exists, REQ-589's AC-15 having been left unwritten.
 - **The duty under load on any generation cap but 256.** The `max_tokens`-dependence of
   `min_tokens_per_sec` above is derived from the measured run's own arithmetic and stated as such,
   not taken as a separate reading.
+
+---
+
+## ADR-9 — D-4 is reversed: the byte half returns to `LOCAL_BUDGET_BYTES`
+
+*Recorded 2026-08-25, mid-Phase-4, after TASK-269 through TASK-275 had landed. **No ADR above is
+edited**; every one of them was right about the state it described, and the point of this record
+is the state that replaced it.*
+
+### The decision
+
+`derive`'s local arm keeps its **word** half window-derived — `(16,384 − 1,024) × 2/3 = 10,240`,
+exactly as ADR-2 built it — and takes its **byte** half from `LOCAL_BUDGET_BYTES`, **32,768**,
+the constant the local route has run under since before REQ-586. The pair is asymmetric on
+purpose: one half derived, one half the constant.
+
+`COMPACT_OUTPUT_MAX_BYTES` **stays** on the engine's own chain (ADR-5, 30,720). It is not moved
+back to `LOCAL_BUDGET_BYTES`: the whole of ADR-5 is that the ceiling should follow the window
+rather than a constant it once coincided with, and that is still right. What changes is that
+`ceiling ≤ budget` is now an **ordering with 2,048 bytes of room** rather than an equality.
+
+### What reversed it
+
+The reported `/analyze` body is **4,097 words / ~31,014 bytes** — 7.57 bytes per whitespace
+word, which is what code is.
+
+| | word guard | byte guard | outcome |
+|---|---|---|---|
+| before REQ-590 | 4,097 vs 4,096 — **over by 1** | 31,014 vs 32,768 — fits, 1,754 spare | refused |
+| with D-4 (10,240 / 30,720) | fits, 6,143 spare | 31,014 vs 30,720 — **over by 294** | refused |
+| with D-4 reversed (10,240 / 32,768) | fits, 6,143 spare | fits, 1,754 spare | **serves** |
+
+**The REQ as built did not fix the case it exists for.** The refusal did not go away; it changed
+currencies — and it went unnoticed because AC-12 is written in whitespace words, which is the
+exact blindness A-2's own note warned about for a *different* criterion.
+
+Three findings, each measured rather than argued:
+
+1. **The field report still refused.** Above. TASK-272 had, in good faith, rewritten AC-12's
+   witness to assert that the byte half is "the boundary now" — a green test pinning this REQ's
+   motivating case as still broken.
+2. **The window-derived byte half only beats the constant below 7.5 B/word.** The crossover is
+   `LOCAL_BUDGET_BYTES / (usable × 2)`. Prose (≈5 B/word) gains 50%; code (≈8) *loses* 6.25%. For
+   analyzing code — the local tier's own workload — deriving the byte half is a regression.
+3. **It protects nothing measurable.** AC-9's `numeric_grid.txt`, the one sample in the corpus
+   that overruns the engine at full budget, is 20,480 bytes: admitted at 30,720 **and** at
+   32,768, costing 20,480 real `o200k_base` tokens against 15,360 usable either way. No byte
+   value in this range catches that class. Only a real tokenizer does — which is what AC-9's test
+   is, and why it stays.
+
+### The residual, named rather than closed
+
+At `DUTY_REQUEST_BYTES_PER_TOKEN` a 32,768-byte budget claims **16,384** provider tokens — the
+engine's whole window — against **15,360** usable. The byte half out-claims the engine by exactly
+`LOCAL_GENERATION_RESERVATION`, 1,024 tokens, so a *byte-saturated* local prompt is over the
+window before it is assembled.
+
+**This is the state the local route was already in.** 32,768 has always bridged to the whole
+window; REQ-590 did not create the overclaim and, with this reversal, does not close it. What it
+does is give it a size and a home: the equality
+`bytes_claim − words_claim == LOCAL_GENERATION_RESERVATION` is asserted in
+`tests/token_corpus.rs`, in the one place the two claims meet, so the residual is a number rather
+than an adjective. AC-4 is rewritten around it.
+
+The catch for a prompt that really is over remains the engine's typed
+`context_length_exceeded`. **Not REQ-589's offer**: TASK-273 established that the offer fires
+only when a *skill expansion* exceeds the budget, and in this quadrant both harness guards admit
+the content, so the harness believes the turn fits. ADR-6 overstates the safety net on that
+point; it is corrected here rather than edited there.
+
+### What this cost and what it bought
+
+| | D-4 | reversed |
+|---|---|---|
+| the reported `/analyze` body (7.57 B/word) | refused by 294 B | **serves**, 1,754 B spare |
+| ordinary code at 8 B/word | −6.25% budget | unchanged |
+| prose at 5 B/word | +50% byte budget | unchanged |
+| BR-7 ("no turn that serves today is newly refused") | overridden | **holds** |
+| compaction threshold, bytes | 21,504 (−6.25%) | **22,937** (unchanged) |
+| digest byte threshold | 11,250 (−6.25%) | **12,000** (unchanged) |
+| AC-11 turns-to-pressure, 4 / 6 / 8 / 20 B/word | 14 / 10 / 8 / 4 | **15 / 11 / 8 / 4** |
+| the byte half's overclaim at 2 B/token | 0 | **+1,024 tokens** |
+
+Every row but the last is better or unchanged. The last is the price, and it is a price the local
+route was already paying.
+
+### Two of TASK-271's tests changed premise rather than value
+
+Recorded because "the test still passes" and "the test still tests something" are different
+claims (LESSON-563):
+
+- **`the_compact_ceiling_is_the_loosest_of_the_five`** asserted `ceiling == budget`. That was
+  right while both were window-derived; it would now be a coincidence to pin. It asserts the
+  ordering, and the 2,048-byte gap is explained at `COMPACT_OUTPUT_MAX_BYTES`' definition.
+- **`a_compaction_that_lands_in_the_old_gap_is_applied_not_degraded` is removed.** Its own guard
+  read: *"there is no gap to test; if the default pair and the local pair have been brought back
+  into agreement, this test has nothing left to say"* — written by an author who anticipated this
+  reversal and made the test announce its obsolescence rather than pass on a fixture that no
+  longer discriminates. Deleting it is what that guard asked for; widening the fixture until it
+  fired again would have been manufacturing a property the arithmetic has removed. A comment in
+  its place says so.
+
+### What ADR-9 does *not* change
+
+- **ADR-1, ADR-2, ADR-3.** The reservation constant, the local branch, the ungated window.
+- **ADR-5's reasoning.** The compaction ceiling follows the engine's chain, not a constant.
+- **ADR-6's zero word slack.** That is D-3's and it stands. Only its claim about REQ-589's offer
+  being a catch is corrected, above.
+- **ADR-6a.** Its warning is now *more* pointed, not less: with the byte half undererived, AC-4's
+  old form is not merely tautological but false, which is why AC-4 is rewritten rather than kept.
+- **ADR-7.** The 4,097 test is still inverted rather than renumbered — and this reversal is what
+  finally makes the inverted assertion true. Its witness is renamed
+  `the_reported_analyze_measurement_serves_on_both_halves_of_the_local_pair` and grew a fourth
+  leg carrying the report's own byte figure, because the three boundary legs it had would all
+  pass under D-4 as well.
+
+### The process finding, which is the part worth carrying forward
+
+**D-4 was never an owner decision.** D-3 — "take the full window" — was. D-4 was recorded as
+"DECIDED by D-3", i.e. inferred: the full-window derivation happens to produce 30,720 bytes, so
+the byte half was taken to follow. It was then built, and BR-7's regression was accepted on the
+strength of a decision nobody had made.
+
+An inference wearing a decision's label is not reviewable as an inference. The tell was available
+in the spec's own text — D-4 opens *"Not a separate choice"* — and the fix is the general one:
+**a decision record should say who decided it, and an inference should say what it was inferred
+from.** D-4 now says both.
+
