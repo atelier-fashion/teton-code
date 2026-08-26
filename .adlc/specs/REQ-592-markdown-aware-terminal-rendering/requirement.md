@@ -119,13 +119,22 @@ Not applicable — rendering crosses no gate.
 
 ## Business Rules
 
-- [ ] **BR-1: The system prompt carries an output-format clause.** `build_system_prompt` gains a
-      clause stating that the model's prose is printed into a plain terminal that renders no
-      markdown, and asking for short paragraphs and bullets over tables; that tables, when
-      genuinely the right shape, stay narrow (at most three short columns); and that emphasis and
-      fenced code are used sparingly. It follows `effective_web_clause`'s shape — the words live
-      in one named constant, the *decision to include it* lives in `build_system_prompt` (informed
-      by BUG-181).
+- [ ] **BR-1: The system prompt carries an output-format clause, and the clause is true after
+      this REQ ships.** `build_system_prompt` gains a clause stating that the reply is printed
+      into a **narrow terminal**, and asking for short paragraphs and bullets over tables; that
+      tables, when genuinely the right shape, stay narrow (at most three short columns, never a
+      sentence in a cell); and that emphasis and fenced code are used sparingly. It follows
+      `effective_web_clause`'s shape — the words live in one named constant, the *decision to
+      include it* lives in `build_system_prompt` (informed by BUG-181).
+
+      *Amended during implementation (2026-08-26).* This rule originally said the clause should
+      state the terminal "renders no markdown". That is true today and **false the moment BR-3..BR-6
+      land in this same REQ** — the CLI will render bold, emphasis, code spans, headings and
+      tables. Shipping it would put a false claim about Teton's own surface into the system prompt,
+      which is exactly BUG-181's defect class and exactly what this REQ cites as its motivation.
+      The operative fact is **narrowness**, not absence of rendering: a wide table is unreadable
+      whether or not it is laid out. The clause must state what stays true (informed by BUG-181,
+      LESSON-548 — a remedy is a claim about your own surface).
 
 - [ ] **BR-2: BR-1's clause fits the resident-prompt budget, or moves it deliberately.**
 
@@ -135,9 +144,16 @@ Not applicable — rendering crosses no gate.
 
       **(a)** `egress::redact::REDACT_BODY_OVERHEAD_BYTES` (11 KiB) is measured against the worst-case
       system prompt by `the_total_cap_clears_the_harness_context_budget_with_margin`, with a
-      `MIN_PROMPT_HEADROOM_BYTES` floor of 48. That test's own comment records the current
-      boundary: **710 bytes of filler passes, 711 fails.** BR-1's clause must be measured against
-      a re-run of that test, not against this figure. If it does not fit, the constant moves the
+      `MIN_PROMPT_HEADROOM_BYTES` floor of 48.
+
+      *Corrected during implementation (2026-08-26).* This rule originally quoted the boundary
+      recorded in `REDACT_BODY_OVERHEAD_BYTES`'s doc ledger — "710 bytes of filler passes, 711
+      fails". **That ledger is stale and was stale before this REQ began.** It dates from REQ-587;
+      the worst-case prompt has grown ~234 bytes since across REQ-583/585/587/589/590/591 without
+      the ledger being restated. The **measured** pre-edit margin is **476** bytes against the
+      48-byte floor. This is why the rule says *measure, do not trust the figure* — the figure it
+      originally quoted is the one that was wrong. Restating the stale ledger is a pre-existing
+      defect, filed separately rather than absorbed here. If the clause does not fit, the constant moves the
       way REQ-577, BUG-181 and REQ-587 moved it — and, since REQ-586 gave it a production reader,
       the raise also narrows every `[privacy] redact = true` route's scannable budget and must
       re-state `the_overhead_raise_restates_the_chunk_count_and_the_scannable_bound`. The floor is
@@ -306,6 +322,17 @@ an AC that covers no rule, or a rule no AC names, is a finding against this list
       with no panic, no dropped characters, and no partial styling. This is the mitigation OQ-2's
       hand-rolled decision rests on, so it is asserted rather than assumed: an unrecognized
       construct that mangles or swallows content would make the decision wrong.
+
+      **One carve-out, recorded during implementation (2026-08-26): the `-----` setext underline.**
+      A line of three or more dashes is *already* a thematic break in the recognized-construct
+      table, and it is one in CommonMark too, independent of any text above it. A line-oriented
+      streaming classifier cannot tell the two readings apart without lookahead it does not have
+      (BR-3 and BR-8 require emitting as text arrives, not at end of turn). It therefore draws a
+      rule. The heading *text* on the line above is unaffected and still renders as literal prose,
+      so nothing is mangled or swallowed — the screen shows text followed by a full-width rule,
+      which reads as an underlined heading. The `=====` form has no such ambiguity and is fully
+      literal. Both behaviours are asserted explicitly in `a_setext_heading_is_literal_text`
+      rather than left to be discovered.
 
 ## External Dependencies
 

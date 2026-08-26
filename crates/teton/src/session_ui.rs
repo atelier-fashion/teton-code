@@ -11239,6 +11239,7 @@ mod key_scan {
         ("firstrun.rs", include_str!("firstrun.rs")),
         ("keychain.rs", include_str!("keychain.rs")),
         ("loading.rs", include_str!("loading.rs")),
+        ("markdown.rs", include_str!("markdown.rs")),
         ("model_ui.rs", include_str!("model_ui.rs")),
         ("prompt.rs", include_str!("prompt.rs")),
         ("provider_setup_ui.rs", include_str!("provider_setup_ui.rs")),

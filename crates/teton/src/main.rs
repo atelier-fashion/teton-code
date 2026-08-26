@@ -49,6 +49,7 @@ mod effort_ui;
 mod firstrun;
 mod keychain;
 mod loading;
+mod markdown;
 mod model_ui;
 mod prompt;
 mod provider_setup_ui;

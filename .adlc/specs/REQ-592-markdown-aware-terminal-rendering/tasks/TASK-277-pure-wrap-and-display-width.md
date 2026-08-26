@@ -1,7 +1,7 @@
 ---
 id: TASK-277
 title: "The pure layout module: display width and word wrap"
-status: draft
+status: complete
 parent: REQ-592
 created: 2026-08-26
 updated: 2026-08-26
@@ -26,18 +26,18 @@ unit tests. Covers BR-3 and BR-10.
 
 ## Acceptance Criteria
 
-- [ ] AC-3: a paragraph wider than the width breaks at spaces and never mid-word; a single token
+- [x] AC-3: a paragraph wider than the width breaks at spaces and never mid-word; a single token
       longer than the width occupies its own row intact; a list item's continuation rows align
       under its text; `80` is used when no terminal is present.
-- [ ] Wrapping measures with `UnicodeWidthStr`/`UnicodeWidthChar`, not `chars().count()` — pinned
+- [x] Wrapping measures with `UnicodeWidthStr`/`UnicodeWidthChar`, not `chars().count()` — pinned
       by a test with CJK content asserting no emitted row exceeds the width in **display columns**.
-- [ ] The block classifier returns the right construct for every row of the
+- [x] The block classifier returns the right construct for every row of the
       recognized-construct table, and **literal text** for each construct listed under Out of
       Scope (AC-14's unit half): nested list, setext heading, indented code block, nested
       emphasis, `|` inside a code span inside a table cell. No panic, no dropped characters.
-- [ ] Structural sweep test: `markdown.rs` names no `print!`, `println!`, `write!`, `stdout`, or
+- [x] Structural sweep test: `markdown.rs` names no `print!`, `println!`, `write!`, `stdout`, or
       `terminal_width` — the module cannot do I/O or read the width. Modelled on `status.rs:445`.
-- [ ] Every test in this task runs under plain `cargo test` with no pty and no TTY (BR-10).
+- [x] Every test in this task runs under plain `cargo test` with no pty and no TTY (BR-10).
 
 ## Technical Notes
 

@@ -37,6 +37,11 @@ Covers BR-5, BR-6, and the mid-turn half of BR-8.
 - [ ] AC-14 (surface leg): each Out-of-Scope construct reaches the terminal as literal text.
 - [ ] **Every existing test in `render.rs` passes unmodified.** If any needs an edit, stop — the
       opt-in constructor is not doing its job.
+- [ ] **Remove the `#![allow(dead_code)]` at the top of `markdown.rs`.** TASK-277 added it because
+      nothing called into the module yet, and named this task as the removal condition. If it
+      survives the REQ, either the wiring never landed or a function in there has no caller —
+      both are findings, and tetond's ADR-J is against lingering allows. Deleting the attribute
+      and getting a clean `cargo clippy --workspace -- -D warnings` is the proof the wiring is real.
 - [ ] `cargo test -p teton` green; `cargo clippy --workspace -- -D warnings` clean.
 
 ## Technical Notes
