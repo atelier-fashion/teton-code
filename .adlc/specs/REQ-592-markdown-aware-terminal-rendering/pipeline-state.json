@@ -1,0 +1,92 @@
+{
+  "req": "REQ-592",
+  "branch": "feat/REQ-592-markdown-aware-terminal-rendering",
+  "startedAt": "2026-08-26T00:00:00Z",
+  "completed": false,
+  "currentPhase": 8,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Resolve repos + worktree + preflight",
+      "completedAt": "2026-08-26T00:00:00Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Requirement Spec",
+      "completedAt": "2026-08-26T00:00:00Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Break Into Tasks",
+      "completedAt": "2026-08-26T00:00:00Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-08-26T00:00:00Z"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-08-26T00:00:00Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify (reflect + review)",
+      "completedAt": "2026-08-26T00:00:00Z"
+    },
+    {
+      "phase": 6,
+      "name": "Create Pull Request",
+      "completedAt": "2026-08-26T00:00:00Z"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-08-26T00:00:00Z"
+    }
+  ],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.claude/worktrees/blissful-mclean-d3c7b6",
+      "branch": "feat/REQ-592-markdown-aware-terminal-rendering",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/220",
+      "prNumber": 220,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-277",
+      "TASK-282",
+      "TASK-278",
+      "TASK-279",
+      "TASK-280",
+      "TASK-281",
+      "TASK-283",
+      "TASK-284"
+    ],
+    "failedTasks": []
+  },
+  "notes": "Step 0 deviation: reused the existing session worktree (blissful-mclean-d3c7b6) rather than creating .worktrees/REQ-592. The REQ-592 artifacts were untracked and existed only here, so a worktree cut from origin/main would have failed preflight. Branch renamed from claude/security-audit-formatting-80bb89 to the conventional feat/REQ-592-* name so /manifest and /wrapup can see it. Branch was exactly at origin/main tip, so the base is identical to protocol. User authorized merge-without-asking at Phase 8 (2026-08-26). Phase 2 (/architect) was completed earlier in this same session before /proceed was invoked; architecture.md (9 ADRs) and 8 task files already exist and are current. Not re-run \u2014 re-running would regenerate and renumber tasks already validated. Artifacts verified present at the gate."
+}

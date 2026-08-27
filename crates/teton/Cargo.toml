@@ -34,6 +34,29 @@ anyhow = "1"
 # Terminal geometry (`TIOCGWINSZ`) for the framed entry area — the same crate
 # the daemon already uses for its peer-credential and lock syscalls.
 libc = "0.2"
+# REQ-592 ADR-5: display width for the markdown renderer's word wrap and column
+# alignment (`markdown.rs`). This crate's manifest treats its thin dependency set
+# as a property, and the codebase has twice declined a Unicode-tables crate —
+# `render.rs`'s `is_display_steering` ("pulling a Unicode-tables crate into the
+# CLI … would cost more than the gap is worth") and
+# `teton-core/src/session_root.rs`'s `neutralized`. Both of those declined a
+# *category* table for format characters: a cosmetic gap, and in
+# `is_display_steering`'s own words the remainder are characters "none of which
+# reorder or break a row".
+#
+# Display width is a different property with a different failure mode. A CJK
+# character measured as one column but displayed as two makes a wrapped row
+# **exceed** the terminal width; the terminal then hard-wraps it at the column,
+# mid-word — which is precisely the defect REQ-592 exists to fix. A wrong width
+# does not blemish the feature, it disables it for non-Latin content. For a
+# property that breaks the feature when it is wrong, a maintained table beats a
+# hand-rolled one, and `chars().count()` is rejected outright.
+#
+# The cost is bounded: `unicode-width` has no transitive dependencies. The gap
+# that remains — grapheme clusters, so ZWJ emoji sequences still measure wrong —
+# is unfixed by either choice and would need `unicode-segmentation` as well;
+# recorded in REQ-592's Assumptions rather than absorbed silently.
+unicode-width = "0.2"
 
 # The OS keychain lives behind the `Keychain` trait (see `keychain.rs`); the real
 # macOS implementation uses the Security framework and is compiled only on macOS

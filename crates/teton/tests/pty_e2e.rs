@@ -84,23 +84,30 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>) -> Transcript {
     transcript
 }
 
-/// Wait until `marker` appears in the transcript, or `WINDOW` elapses.
+/// Wait until `ready` accepts the accumulated transcript, or `WINDOW` elapses.
 ///
 /// Polls accumulated state rather than sleeping a fixed interval and hoping —
 /// a slow machine costs latency here, never a flake (LESSON-450).
-fn wait_for(transcript: &Transcript, marker: &str) -> bool {
+///
+/// The general form of [`wait_for`], which is a `contains` over this same loop.
+/// REQ-592's tail leg needs a **positional** condition — one row landing before
+/// a frame drawn later — and a substring test cannot express one: both halves
+/// are present in the transcript from the moment the first arrives, so a pair of
+/// `wait_for` calls would return on a state that has not happened yet.
+fn wait_until(transcript: &Transcript, ready: impl Fn(&str) -> bool) -> bool {
     let deadline = Instant::now() + WINDOW;
     while Instant::now() < deadline {
-        if transcript
-            .lock()
-            .expect("transcript mutex")
-            .contains(marker)
-        {
+        if ready(transcript.lock().expect("transcript mutex").as_str()) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(25));
     }
     false
+}
+
+/// Wait until `marker` appears in the transcript, or `WINDOW` elapses.
+fn wait_for(transcript: &Transcript, marker: &str) -> bool {
+    wait_until(transcript, |seen| seen.contains(marker))
 }
 
 fn snapshot(transcript: &Transcript) -> String {
@@ -887,11 +894,35 @@ fn a_reply_reciting_the_cli_earns_the_hand_off_line_at_a_terminal() {
     // recipe, with no mention of the in-session command.
     let reply = "register it from a shell: teton provider add kimi --kind \
                  openai-compatible.";
+    // REQ-592 AC-10's terminal leg rides this fixture, so the shape it needs is
+    // pinned here rather than left to luck: **the reply's last line carries no
+    // trailing newline**, which is the common case for a model reply and the one
+    // a streaming renderer holds. Assertions (1) and (5) below are then the two
+    // halves of AC-10 at a real terminal — the tail is on screen at all, and it
+    // is on screen *before* the `hand_off_after_turn` line and the entry frame
+    // that follows it. If this fixture ever grows a trailing newline, that
+    // coverage evaporates silently, which is what this line exists to prevent.
+    assert!(
+        !reply.ends_with('\n'),
+        "REQ-592 AC-10 needs a reply whose final chunk has no trailing newline"
+    );
     let daemon = TestDaemon::spawn_with(&daemon_path, &config, &[reply]);
 
-    // Wide enough that the terminal cannot hard-wrap the sentence under test —
-    // a wrapped line is still correct output, but it would split the marker and
-    // fail an assertion about wording rather than about behaviour.
+    // Wide enough that the sentence under test occupies one row.
+    //
+    // **Since REQ-592 the wrap that could break it is the CLI's, not the
+    // terminal's** (ADR-8). Before that REQ a hard wrap was a display artifact:
+    // the pty master received whatever bytes `teton` wrote, so an over-wide
+    // assistant line still reached this transcript contiguous and a `cols` that
+    // was too small cost nothing here. `BR-3` now puts **real `\n` bytes**
+    // between the rows, so a marker longer than `cols` would arrive genuinely
+    // split and an assertion about wording would fail for a reason that is not
+    // about wording.
+    //
+    // 200 against a 75-column reply, so the margin is wide. TASK-283 re-ran this
+    // rather than assuming it: the reply is one rendered row, `teton provider
+    // add kimi` is inside it, and the hand-off below is a `line()` kind, which
+    // OQ-5 leaves unwrapped at any width.
     let pty = native_pty_system()
         .openpty(PtySize {
             rows: 40,
@@ -966,6 +997,14 @@ fn a_reply_reciting_the_cli_earns_the_hand_off_line_at_a_terminal() {
 
     // (5) After the reply, not before it: it is a hand-off from an answer the
     // user has already read.
+    //
+    // **REQ-592 AC-10 at a real terminal.** The fixture's reply ends without a
+    // newline (pinned above), so its last row is exactly the tail a streaming
+    // renderer holds — and this is the assertion that it is not still being
+    // held: `end_block()` runs at the end of `Connection::call`, which is before
+    // `main.rs` reaches `hand_off_after_turn` and before the entry frame is
+    // redrawn. A tail released too late would land on the wrong side of this
+    // comparison; a tail never released would fail step (1) above.
     let reply_at = seen
         .find("teton provider add kimi")
         .expect("asserted present");
@@ -2458,4 +2497,813 @@ fn each_over_budget_answer_settles_the_turn_the_way_its_label_said() {
             if *writes { "write" } else { "not write" }
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// REQ-592 OQ-4 — a resized terminal, at a real terminal (TASK-281)
+// ---------------------------------------------------------------------------
+
+/// **OQ-4's wiring, and the only test that can see it.**
+///
+/// ADR-9 decided against a `SIGWINCH` handler on the grounds that the width is
+/// re-read as the session goes, so a resize takes effect on the next block and
+/// already-printed rows keep their breaks. `PlainSurface` holds the width as a
+/// field, so that decision is only true if something in `main.rs` keeps telling
+/// it — and nothing outside a real terminal can tell whether anything does.
+/// `render.rs`'s unit tests call `set_width` themselves, which proves the verb
+/// works and says nothing about whether it is called; `cli_e2e` has no terminal
+/// to resize.
+///
+/// So: one session, two turns, and a window dragged narrower in between. The
+/// first reply fits the wide window and is emitted as a single row. The second
+/// is emitted as three, and the assertion is that its sentence can no longer be
+/// found in one piece.
+///
+/// **A pty transcript is the right instrument for this** and a screen scrape
+/// would be the wrong one. Hard-wrapping is a display artefact — the terminal
+/// folds a too-long row across lines without putting a byte anywhere — so the
+/// transcript holds exactly the bytes `teton` wrote. A CLI still laying out at
+/// the old width therefore writes the sentence contiguously, and this test fails
+/// on the presence of that contiguous run rather than on how it looked.
+///
+/// Mutation: delete the `ctx.surface.set_width(...)` from
+/// `next_interactive_line`'s `stdin_ready` arm and the second reply arrives in
+/// one piece.
+#[test]
+fn a_resized_window_lays_the_next_turn_out_at_the_new_width() {
+    // Wide enough for either sentence to be one row, then narrow enough that the
+    // second cannot be. Both are chosen so the greedy wrap has to break the
+    // sentence rather than merely re-space it.
+    const WIDE_COLS: u16 = 120;
+    const NARROW_COLS: u16 = 32;
+    const FIRST: &str = "the first answer is delivered while the terminal is still wide open here";
+    const SECOND: &str =
+        "the second answer arrives after the window has been dragged much narrower";
+
+    // The precondition the whole test rests on: at the wide width neither
+    // sentence wraps, so a CLI that never re-read the width would write the
+    // second one contiguously — which is the failure this detects.
+    assert!(
+        FIRST.len() < WIDE_COLS as usize && SECOND.len() < WIDE_COLS as usize,
+        "both fixtures must fit the wide window, or the test proves nothing"
+    );
+    assert!(
+        SECOND.len() > NARROW_COLS as usize,
+        "the second fixture must not fit the narrow window"
+    );
+
+    let daemon_path = daemon_bin();
+    // Every tier bound to the scripted local tier, for the REQ-558 reason the
+    // other typed-turn tests here bind them.
+    let tiers: String = ["reflex", "scan", "build", "think"]
+        .iter()
+        .map(|t| format!("[[tiers]]\ntier = \"{t}\"\nprovider_id = \"local\"\n\n"))
+        .collect();
+    let config = format!("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n{tiers}");
+    let daemon = TestDaemon::spawn_with(&daemon_path, &config, &[FIRST, SECOND]);
+
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 40,
+            cols: WIDE_COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+
+    let mut cmd = CommandBuilder::new(teton_bin());
+    cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
+    cmd.env("TETON_REPO_ROOT", &daemon.root);
+    let mut session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
+    drop(pty.slave);
+    let transcript = spawn_reader(pty.master.try_clone_reader().expect("pty reader"));
+    let mut writer = pty.master.take_writer().expect("pty writer");
+
+    assert!(
+        wait_for(&transcript, "ready (freeform)"),
+        "the session never reached the entry prompt; transcript:\n{}",
+        snapshot(&transcript)
+    );
+
+    writer.write_all(b"first question\r").expect("type");
+    writer.flush().ok();
+
+    // Turn one, at the wide width: the sentence is on screen in one piece,
+    // because 72 columns of prose fit a 120-column window without a break.
+    assert!(
+        wait_for(&transcript, FIRST),
+        "the first turn never produced its reply; transcript:\n{}",
+        snapshot(&transcript)
+    );
+
+    // **The drag.** `TIOCGWINSZ` on the slave reports the master's size, so this
+    // is the same fact a user's window manager would deliver.
+    pty.master
+        .resize(PtySize {
+            rows: 40,
+            cols: NARROW_COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("resize the pty");
+
+    // Typed only after the resize, which is what makes this the resize-then-type
+    // case: the entry frame was drawn — and its width read — *before* the drag,
+    // so a session that only measured the terminal when it drew the frame would
+    // still be laying out at 120 here.
+    writer.write_all(b"second question\r").expect("type");
+    writer.flush().ok();
+
+    // The head of the second sentence fits the narrow window and survives as one
+    // run, which is how we know the turn ran at all.
+    assert!(
+        wait_for(&transcript, "the second answer arrives after"),
+        "the second turn never produced its reply; transcript:\n{}",
+        snapshot(&transcript)
+    );
+
+    let seen = snapshot(&transcript);
+    let _ = session.kill();
+    let _ = session.wait();
+
+    assert!(
+        !seen.contains(SECOND),
+        "the reply after the resize was written as one unbroken row, so the \
+         session is still laying out at {WIDE_COLS} columns in a {NARROW_COLS}-\
+         column window (OQ-4). The terminal then hard-wraps it mid-word, which is \
+         the defect REQ-592 exists to remove; transcript:\n{seen}"
+    );
+    // And the other half of OQ-4: what was already printed keeps its breaks. The
+    // first reply is still in the transcript exactly as it was emitted — nothing
+    // re-flowed it when the window changed.
+    assert!(
+        seen.contains(FIRST),
+        "the pre-resize reply was re-flowed after the fact; transcript:\n{seen}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-592 — the rendered bytes at a real terminal (TASK-283)
+// ---------------------------------------------------------------------------
+//
+// ## Why every leg below is here, and can be nowhere else
+//
+// `PlainSurface` gains its renderer only through `with_markdown`, and `main.rs`
+// reaches for that constructor only when stdout is a terminal (ADR-1, BR-7). A
+// piped run builds the surface it always built, so `cli_e2e` is not merely
+// uninterested in this feature — it is **structurally blind** to it, the same
+// way it is blind to the loading indicator and the hand-off nudge. `render.rs`'s
+// own unit tests do see the renderer, but they see it over a `Vec<u8>` at a
+// width they hand in themselves. That a real session hands it the *real*
+// terminal's width, on the real stream, at the real turn boundary, is a fact
+// only a process observed from outside can produce.
+//
+// ## Why the turns are scripted
+//
+// AC-12 is a claim about the renderer. TASK-282 added a clause to the system
+// prompt that changes what a live model writes, so a fixture that *solicited*
+// its own markdown would be asserting on the model's obedience and calling the
+// result layout. What a live model writes under the new clause is a
+// verification-notes observation, not something a test can pin ([[LESSON-481]]:
+// pay for the harness the gate demands, and say where a gap remains).
+//
+// ## What moved in the existing tests, and what did not
+//
+// ADR-8 predicted that assertions matching a contiguous run of assistant text
+// longer than their `cols` would begin failing. Re-verified here at TASK-283:
+// **none did.** Only two tests in this file assert on `fragment()`-kind text at
+// all — `a_reply_reciting_the_cli_earns_the_hand_off_line_at_a_terminal` (a
+// 75-column reply at 200 columns) and `a_resized_window_lays_the_next_turn_out_
+// at_the_new_width` (this REQ's own, which asserts *on* the break) — and the two
+// `wait_for`s on the default fixture's reply are matching 14 and 17 columns
+// against 100 and 200. Everything else in this file asserts on `line()`-kind
+// output or on the `Prompter`'s own bytes, neither of which BR-3 touches (OQ-5).
+// The exposure was real; the blast radius was empty. The comment at the
+// hand-off test records the reason its margin is now load-bearing.
+
+/// A pty width chosen to be **narrow enough to force every decision** the legs
+/// below assert on: a sentence of ordinary prose does not fit it, and a
+/// two-column table with one long cell cannot possibly be aligned in it.
+///
+/// It is also the number `prompt::terminal_width()` reports and hands to
+/// `with_markdown` unchanged, so the width the renderer lays out at *is* this
+/// constant — the pty's size is this feature's input, not a stage size.
+const RENDERED_COLS: u16 = 60;
+
+/// The audit paragraph as the **reader** sees it: markers consumed, words
+/// otherwise untouched. Kept beside its marked-up spelling below, with a
+/// fixture-integrity assertion tying the two together, so neither can drift into
+/// asserting about a sentence the other does not contain.
+const AUDIT_PARAGRAPH: &str = "The audit run by cargo audit produced a paragraph of prose \
+                               that is wider than sixty columns and must be broken across rows.";
+
+/// The same paragraph as the model wrote it, with one strong run and one code
+/// span in it. Both are early in the sentence and neither straddles a break at
+/// [`RENDERED_COLS`], which is what lets the SGR assertions name exact bytes.
+const AUDIT_SOURCE: &str = "The **audit** run by `cargo audit` produced a paragraph of prose \
+                            that is wider than sixty columns and must be broken across rows.";
+
+/// The table's one data value. With `unsafe deserialization` beside it the
+/// aligned layout needs 122 columns, so at 60 the transposition is forced rather
+/// than merely available (BR-4).
+const AUDIT_DETAIL: &str = "the parser reconstructs arbitrary objects from a pickled payload \
+                            that arrives on an untrusted queue";
+
+/// `text` with every CSI escape removed and every carriage return dropped —
+/// what a reader sees, rather than what the stream carries.
+///
+/// Both halves are needed and for different reasons. The renderer's rows are
+/// interleaved with the entry frame's own cursor motion (`\x1b[2A`, `\x1b[J`),
+/// and the pty's `ONLCR` puts a `\r` before every `\n` it forwards. A row
+/// measured or compared without stripping the two is a row measured against
+/// bytes that occupy no column of the screen.
+fn without_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {}
+            // CSI: `[`, parameter and intermediate bytes, then one final byte in
+            // `0x40..=0x7e`. Anything else after ESC is a two-character escape,
+            // and its second character has already been consumed by the `next`.
+            '\x1b' if chars.peek() == Some(&'[') => {
+                chars.next();
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            '\x1b' => {}
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Every **SGR** escape in `text` — the `\x1b[…m` sequences that set a colour or
+/// an attribute — rendered readably for a failure message.
+///
+/// Deliberately not "every escape", which is why AC-8's pty leg can make a
+/// whole-transcript claim at all. The entry frame writes `\x1b[2A` and `\x1b[J`
+/// on every redraw whatever the colour setting is, because that is **geometry**:
+/// it is how the frame stays put while output scrolls above it, and `NO_COLOR`
+/// has nothing to say about it. Styling is exactly the escapes whose final byte
+/// is `m`, and styling is what AC-8 is about.
+fn sgr_escapes(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut found: Vec<String> = Vec::new();
+    let mut at = 0;
+    while at + 1 < bytes.len() {
+        if bytes[at] != 0x1b || bytes[at + 1] != b'[' {
+            at += 1;
+            continue;
+        }
+        let mut end = at + 2;
+        while end < bytes.len() && !(0x40..=0x7e).contains(&bytes[end]) {
+            end += 1;
+        }
+        if end < bytes.len() && bytes[end] == b'm' {
+            found.push(format!(
+                "ESC{}",
+                String::from_utf8_lossy(&bytes[at + 1..=end])
+            ));
+        }
+        at = end + 1;
+    }
+    found
+}
+
+/// The transcript's rows as a reader sees them.
+fn display_rows(transcript: &str) -> Vec<String> {
+    without_escapes(transcript)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The consecutive non-empty rows beginning at the first row that opens with
+/// `head` — one rendered block, as it stands on screen.
+///
+/// This is how a wrap is asserted here rather than by pinning break columns. The
+/// claim BR-3 makes is that a block was broken into rows that fit *and that no
+/// word was lost or duplicated doing it*, which a rejoin states directly.
+/// Pinning the columns would restate `wrap_ranges`' own unit tests through a
+/// pty, and would move every time a fixture's wording did.
+fn rendered_block(rows: &[String], head: &str) -> Vec<String> {
+    let at = rows
+        .iter()
+        .position(|row| row.starts_with(head))
+        .unwrap_or_else(|| panic!("no rendered row opens with {head:?}; rows:\n{rows:#?}"));
+    rows[at..]
+        .iter()
+        .take_while(|row| !row.trim().is_empty())
+        .cloned()
+        .collect()
+}
+
+/// A `teton` session at a pty of a **known** width, driven by a scripted tier.
+///
+/// The three legs below need the same five facts and differ only in `cols`, the
+/// script, and the client's environment, so the shape is stated once rather than
+/// a fourth, fifth and sixth time.
+struct RenderedSession {
+    session: Box<dyn portable_pty::Child + Send + Sync>,
+    transcript: Transcript,
+    writer: Box<dyn Write + Send>,
+    /// Held open so the writer and the reader thread keep a live master; never
+    /// read directly.
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+    /// Killed and its root removed by its own `Drop`; held so it outlives the
+    /// session it is serving.
+    _daemon: TestDaemon,
+}
+
+impl RenderedSession {
+    /// Open a session at a pty exactly `cols` wide whose scripted tier answers
+    /// one typed turn per entry of `replies`, with `client_env` on the
+    /// **client's** environment.
+    ///
+    /// `client_env` is the client's and not the daemon's because the decision
+    /// AC-8 is about is the client's: `banner::color_enabled()` reads `NO_COLOR`
+    /// and `TERM` in the process that owns the terminal, and the daemon has no
+    /// say in it.
+    ///
+    /// Two environment facts are **pinned rather than inherited**, because a
+    /// developer's shell or a CI runner sets both and either would silently
+    /// invert a leg: `NO_COLOR` is removed (a shell that exports it would turn
+    /// AC-12's SGR assertions into a test of the developer's preferences) and
+    /// `TERM` is set to a non-`dumb` value (`color_enabled` refuses `dumb`, and
+    /// a runner with no `TERM` at all is a different case again). AC-8 then puts
+    /// `NO_COLOR` back deliberately, which is the whole of what it varies.
+    fn open(cols: u16, replies: &[&str], client_env: &[(&str, &str)]) -> Self {
+        let daemon_path = daemon_bin();
+        // Every tier bound to the scripted local tier, for the REQ-558 reason
+        // the other typed-turn tests here bind them: otherwise the turn resolves
+        // to an unreachable remote provider and fails before it can reply.
+        let tiers: String = ["reflex", "scan", "build", "think"]
+            .iter()
+            .map(|t| format!("[[tiers]]\ntier = \"{t}\"\nprovider_id = \"local\"\n\n"))
+            .collect();
+        let config = format!("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n{tiers}");
+        let daemon = TestDaemon::spawn_with(&daemon_path, &config, replies);
+
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: 40,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+
+        let mut cmd = CommandBuilder::new(teton_bin());
+        cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+        cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
+        cmd.env("TETON_REPO_ROOT", &daemon.root);
+        cmd.env_remove("NO_COLOR");
+        cmd.env("TERM", "xterm-256color");
+        for (key, value) in client_env {
+            cmd.env(key, value);
+        }
+        let session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
+        drop(pty.slave);
+        let transcript = spawn_reader(pty.master.try_clone_reader().expect("pty reader"));
+        let writer = pty.master.take_writer().expect("pty writer");
+        let opened = Self {
+            session,
+            transcript,
+            writer,
+            _master: pty.master,
+            _daemon: daemon,
+        };
+        assert!(
+            wait_for(&opened.transcript, "ready (freeform)"),
+            "the session never reached the entry prompt; transcript:\n{}",
+            opened.snapshot()
+        );
+        opened
+    }
+
+    /// Type one line at the terminal.
+    fn type_line(&mut self, line: &str) {
+        self.writer
+            .write_all(format!("{line}\r").as_bytes())
+            .expect("type at the pty");
+        self.writer.flush().ok();
+    }
+
+    fn wait_for(&self, marker: &str) -> bool {
+        wait_for(&self.transcript, marker)
+    }
+
+    fn snapshot(&self) -> String {
+        snapshot(&self.transcript)
+    }
+}
+
+impl Drop for RenderedSession {
+    fn drop(&mut self) {
+        let _ = self.session.kill();
+        let _ = self.session.wait();
+    }
+}
+
+/// **REQ-592 AC-12 — at a fixed terminal width, the bytes a scripted turn puts
+/// on screen are wrapped rows, a transposed table, and SGR-styled spans.**
+///
+/// Written here rather than claimed as covered by `render.rs`'s unit tests. Those
+/// prove the transform; this proves the *wiring* — that a terminal session builds
+/// a surface with a renderer on it, at the width `TIOCGWINSZ` reports, and that
+/// the bytes reaching the pty master are the rendered ones.
+///
+/// The table is deliberately the last thing in the reply, which couples this
+/// test to the flush: a buffered table run is laid out when the run **ends**, and
+/// a run that ends with the turn ends at `end_block()` (ADR-3). So the wait below
+/// is a wait on the whole reply having been rendered, flush included.
+#[test]
+fn a_rendered_turn_wraps_its_rows_transposes_its_table_and_styles_its_spans() {
+    // The two spellings of the paragraph are the same sentence. Without this the
+    // rejoin below could pass against a fixture that had drifted, asserting that
+    // the renderer reproduced a sentence nobody sent it.
+    assert_eq!(
+        AUDIT_SOURCE.replace("**", "").replace('`', ""),
+        AUDIT_PARAGRAPH,
+        "the marked-up and plain spellings of the audit paragraph must match"
+    );
+    // The precondition the wrap assertions rest on: the sentence does not fit.
+    assert!(
+        AUDIT_PARAGRAPH.chars().count() > RENDERED_COLS as usize,
+        "the paragraph must not fit the window, or the test proves nothing"
+    );
+
+    let reply = format!(
+        "## Audit findings\n\n{AUDIT_SOURCE}\n\n\
+         | Finding | Detail |\n| --- | --- |\n\
+         | unsafe deserialization | {AUDIT_DETAIL} |"
+    );
+    let mut session = RenderedSession::open(RENDERED_COLS, &[&reply], &[]);
+    session.type_line("audit the parser");
+
+    // The value's last word, and a single word is the one thing a wrap never
+    // splits (`wrap_ranges`' whole-and-over-wide rule), so this marker survives
+    // whatever the break positions turn out to be.
+    assert!(
+        session.wait_for("queue"),
+        "the scripted reply never reached the screen; transcript:\n{}",
+        session.snapshot()
+    );
+
+    let seen = session.snapshot();
+    let rows = display_rows(&seen);
+
+    // (1) BR-3: the paragraph is broken by the CLI, into rows that fit.
+    assert!(
+        !seen.contains(AUDIT_PARAGRAPH),
+        "the paragraph reached the terminal in one piece, so nothing wrapped it \
+         and the terminal is left to hard-wrap it mid-word — which is the defect \
+         REQ-592 exists to remove; transcript:\n{seen}"
+    );
+    let paragraph = rendered_block(&rows, "The audit run by");
+    assert!(
+        paragraph.len() > 1,
+        "the paragraph occupies one row, so it was not wrapped; rows:\n{paragraph:#?}"
+    );
+    for row in &paragraph {
+        // ASCII throughout, so a character is a column here. The CJK case is
+        // `markdown.rs`'s to prove, and it proves it with `display_width`
+        // (ADR-5) rather than through a pty.
+        assert!(
+            row.chars().count() <= RENDERED_COLS as usize,
+            "a rendered row is past the terminal's edge, so the terminal wraps it \
+             again: {row:?} is {} columns in a {RENDERED_COLS}-column window",
+            row.chars().count()
+        );
+    }
+    assert_eq!(
+        paragraph.join(" "),
+        AUDIT_PARAGRAPH,
+        "the wrapped rows must rejoin to exactly the sentence the model wrote — \
+         no word lost at a break and none duplicated; transcript:\n{seen}"
+    );
+
+    // (2) The heading's markers are consumed and its text is not.
+    assert!(
+        !seen.contains("## Audit findings"),
+        "the heading's `##` reached the screen, so nothing classified it; \
+         transcript:\n{seen}"
+    );
+    assert!(
+        rows.iter().any(|row| row == "Audit findings"),
+        "the heading's own text must survive the markers being removed; \
+         transcript:\n{seen}"
+    );
+
+    // (3) BR-4: a table too wide to align is transposed into labelled blocks.
+    assert!(
+        rows.iter()
+            .any(|row| row == "Finding: unsafe deserialization"),
+        "a table needing 122 columns in a {RENDERED_COLS}-column window must be \
+         transposed — one line per column, carrying that column's header and \
+         this row's value; transcript:\n{seen}"
+    );
+    // The two things it must not be instead, named separately because they fail
+    // for different reasons. The raw source rows are `layout_table`'s
+    // degrade-don't-truncate floor (ADR-2) and reaching it here would mean the
+    // transposition refused; an aligned row would mean it was never tried.
+    assert!(
+        !seen.contains("| unsafe deserialization |"),
+        "the table run reached the screen as its own source rows, which is the \
+         last-resort floor rather than a layout; transcript:\n{seen}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.contains("unsafe deserialization") && row.contains("the parser")),
+        "the table was drawn aligned — one row carrying both cells — at a width \
+         that cannot hold it, so the terminal hard-wraps it mid-cell; \
+         transcript:\n{seen}"
+    );
+    // And the transposed value is itself wrapped under BR-3, onto continuation
+    // rows carrying the fixed two-column indent rather than the label's width.
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("  ") && row.trim().ends_with("untrusted queue")),
+        "the transposed value must wrap onto indented continuation rows; \
+         transcript:\n{seen}"
+    );
+
+    // (4) BR-5: the styling is authored by the surface, from its own table, over
+    // text that was defused first — and the markers that asked for it are gone.
+    assert!(
+        seen.contains("\x1b[1maudit\x1b[0m"),
+        "`**audit**` must reach the screen as a bold run with its markers \
+         consumed; transcript:\n{seen}"
+    );
+    assert!(
+        seen.contains("\x1b[36mcargo audit\x1b[0m"),
+        "an inline code span must reach the screen cyan — a second style, so the \
+         SGR is being drawn from `inline_sgr`'s table rather than being one \
+         attribute applied to everything; transcript:\n{seen}"
+    );
+    assert!(
+        !seen.contains("**audit**") && !seen.contains("`cargo audit`"),
+        "the inline markers must not survive alongside the styling they asked \
+         for; transcript:\n{seen}"
+    );
+}
+
+/// **REQ-592 AC-8 (pty leg) — `NO_COLOR` in the child's environment leaves the
+/// rows wrapped and the transcript free of styling.**
+///
+/// The claim is scoped to **SGR** escapes, and that scoping is the honest part
+/// rather than a weakening. The entry frame writes `\x1b[2A` and `\x1b[J` on
+/// every redraw whatever the colour setting is: that is geometry, it is how the
+/// frame stays put while output scrolls above it, and `NO_COLOR` says nothing
+/// about it. A "no `\x1b` anywhere" assertion would therefore be false against a
+/// perfectly behaved session — see `sgr_escapes`.
+///
+/// What makes the emptiness meaningful is the other two halves. The rows are
+/// still wrapped and the markers are still consumed, so the renderer is *live*:
+/// `NO_COLOR` turned the styling off without turning the layout off, which is
+/// the property AC-8 is actually about. Without them, this test would pass
+/// against a build where `with_markdown` was never reached at all.
+#[test]
+fn a_no_color_session_wraps_its_rows_and_authors_no_styling() {
+    let mut session = RenderedSession::open(RENDERED_COLS, &[AUDIT_SOURCE], &[("NO_COLOR", "1")]);
+    session.type_line("audit the parser");
+
+    // The paragraph's last word: a single word, never split by a break, and the
+    // tail of a reply that carries no trailing newline — so waiting on it is
+    // also a wait on `end_block()` having released the held row.
+    assert!(
+        session.wait_for("rows."),
+        "the scripted reply never reached the screen; transcript:\n{}",
+        session.snapshot()
+    );
+
+    let seen = session.snapshot();
+    let rows = display_rows(&seen);
+
+    // (1) The layout still happened.
+    assert!(
+        !seen.contains(AUDIT_PARAGRAPH),
+        "the paragraph reached the terminal in one piece: `NO_COLOR` turned the \
+         layout off as well as the styling; transcript:\n{seen}"
+    );
+    let paragraph = rendered_block(&rows, "The audit run by");
+    assert!(
+        paragraph.len() > 1,
+        "the paragraph occupies one row, so it was not wrapped; rows:\n{paragraph:#?}"
+    );
+    assert_eq!(
+        paragraph.join(" "),
+        AUDIT_PARAGRAPH,
+        "the wrapped rows must rejoin to exactly the sentence the model wrote; \
+         transcript:\n{seen}"
+    );
+
+    // (2) The renderer really is the thing that laid them out — an inert surface
+    // would have passed the markers straight through.
+    assert!(
+        !seen.contains("**audit**") && !seen.contains("`cargo audit`"),
+        "the inline markers survived, so no renderer ran and (1) proves nothing \
+         about colour; transcript:\n{seen}"
+    );
+
+    // (3) And it authored no styling at all. Not "no bold" — no SGR of any kind,
+    // which is a property of the uncoloured code path never reaching
+    // `inline_sgr` rather than of a table that happened to return nothing.
+    let styling = sgr_escapes(&seen);
+    assert!(
+        styling.is_empty(),
+        "AC-8: a `NO_COLOR` session must author no styling escape anywhere; \
+         found {styling:?}; transcript:\n{seen:?}"
+    );
+
+    // (4) The negative above is about colour and not about a session that
+    // emitted nothing: the frame's cursor motion is still there.
+    assert!(
+        seen.contains('\x1b'),
+        "no escape of any kind reached the terminal, so (3) is vacuous — this is \
+         not a real terminal session; transcript:\n{seen:?}"
+    );
+}
+
+/// **REQ-592 AC-10 (pty leg) — a reply whose final chunk carries no trailing
+/// newline has its last row on screen, above the entry frame that follows.**
+///
+/// ## Why this is a separate test from the hand-off one
+///
+/// `a_reply_reciting_the_cli_earns_the_hand_off_line_at_a_terminal` pins a reply
+/// with no trailing newline and asserts its tail lands before the hand-off line,
+/// and TASK-280 recorded it as AC-10's terminal leg. Re-verified at TASK-283 now
+/// that TASK-281 has wired the renderer in, and it is **not** that leg: the
+/// hand-off is a `line()`, and `line()` calls `emit_pending()` before it claims
+/// its row (BR-8). So that test's tail is released by the hand-off's own write,
+/// and it passes byte-for-byte against a pump that never calls `end_block()` at
+/// all. It exercises the markdown path — the reply is buffered and re-emitted by
+/// the renderer rather than streamed — but it cannot see the flush.
+///
+/// This leg removes that particular flusher: the reply recites no CLI, so
+/// `hand_off_after_turn` writes nothing, and the entry frame that follows goes
+/// straight to stdout through the `Prompter`, which never touches a `Surface`
+/// (ADR-4).
+///
+/// ## What no pty leg can isolate, stated rather than implied
+///
+/// It still does not isolate `end_block()`, and TASK-283 found that by mutation
+/// rather than by reading: **deleting both `end_block()` calls from `client.rs`
+/// leaves this whole file green.** `main.rs`'s Ok arm ends every non-verbose turn
+/// with `ctx.surface.line(LineKind::Info, "")` — a blank row so the next entry
+/// frame starts clean, and a line that predates this REQ — and `line()` emits the
+/// pending buffer before it claims its row (BR-8). Every reachable arm of the
+/// turn loop writes through a `Surface` after the call returns, so the tail is
+/// released on all of them whether or not the pump flushes.
+///
+/// That is not a defect and it does not weaken AC-10, whose claim is about what
+/// the reader sees: this test fails if *nothing* releases the tail, which is the
+/// property. It does mean the flush half of `end_block()` has no terminal
+/// witness — the same observation ADR-4 already made when it withdrew the
+/// prompt-path call site ("`line()` already emits the pending buffer"), reaching
+/// one call site further than the ADR took it. The half that **does** have one
+/// is the fence bit, and `a_turn_boundary_closes_an_unclosed_fence_at_a_terminal`
+/// below is its leg.
+///
+/// Mutation for *this* test: make `Surface::end_block` and `Surface::line` both
+/// stop calling `emit_pending`, and the last row never arrives — the wait below
+/// spends its whole window while the head row is on screen the entire time.
+#[test]
+fn a_reply_without_a_trailing_newline_shows_its_last_row_above_the_frame() {
+    const HEAD: &str = "the review is finished and nothing is outstanding";
+    const TAIL: &str = "this last row carries no trailing newline";
+    // The entry frame's top rule, which is the terminal's width in box-drawing
+    // characters — the first bytes of the frame drawn after the turn.
+    let frame = "\u{2500}".repeat(RENDERED_COLS as usize);
+
+    // Both rows fit, so "the last row" is one row and the assertions below are
+    // about the flush rather than about the wrap (which AC-12's leg owns).
+    assert!(
+        HEAD.chars().count() <= RENDERED_COLS as usize
+            && TAIL.chars().count() <= RENDERED_COLS as usize,
+        "both rows must fit the window, or this leg is testing the wrap instead"
+    );
+
+    // `ScriptedFileEngine` trims each block, so the reply's final chunk carries
+    // no trailing newline by construction — which is the common shape of a model
+    // reply and the one a streaming renderer holds.
+    let reply = format!("{HEAD}\n{TAIL}");
+    let mut session = RenderedSession::open(RENDERED_COLS, &[&reply], &[]);
+    session.type_line("is anything left?");
+
+    // (1) The precondition: the turn ran and the *complete* line was rendered as
+    // it streamed. Without this, (2) failing could mean the turn never happened.
+    assert!(
+        session.wait_for(HEAD),
+        "the scripted reply never reached the screen; transcript:\n{}",
+        session.snapshot()
+    );
+
+    // (2) AC-10 itself, and (3) its ordering half, as one condition: the tail is
+    // on screen *and* a frame was drawn after it. Two `wait_for` calls could not
+    // say this — the frame is in the transcript from startup, so a second
+    // `contains` would return on a state that has not happened yet.
+    assert!(
+        wait_until(&session.transcript, |seen| {
+            seen.find(TAIL)
+                .is_some_and(|at| seen[at + TAIL.len()..].contains(&frame))
+        }),
+        "AC-10: the reply's last row must be on screen, above the entry frame \
+         that follows the turn. A tail still held is a tail the reader never \
+         sees; transcript:\n{}",
+        session.snapshot()
+    );
+
+    let seen = session.snapshot();
+
+    // (4) The fixture is the shape it claims to be. A hand-off line would be a
+    // *second* thing writing through the surface between the reply and the
+    // frame, and the ordering above would then hold for a reason that has
+    // nothing to do with the turn ending — which is how the hand-off test came
+    // to look like AC-10's leg without being it.
+    assert!(
+        !seen.contains("/provider setup"),
+        "this fixture must draw no hand-off line, or the ordering above is about \
+         the hand-off's own write rather than the turn's end; transcript:\n{seen}"
+    );
+}
+
+/// **REQ-592 — a turn boundary closes a fence the reply left open, and the pty
+/// is the only place that can see it happen.**
+///
+/// The companion to the leg above, and the reason `end_block()` is a verb at all
+/// rather than a line in `hand_off_after_turn`. Its second half — "then the fence
+/// bit is cleared" — is the one no other path in `render.rs` performs: inside a
+/// fence, "this line is not markup" is exactly what the renderer is supposed to
+/// believe, so only a caller that knows the block is over can say otherwise.
+///
+/// A reply that opens a ``` ``` ``` and never closes it therefore leaves the bit
+/// set, and a bit that survives the turn makes **every line of every subsequent
+/// turn** render verbatim — no wrap, no styling, for the rest of the session.
+/// That is a whole-session defect produced by one malformed reply, and it is
+/// invisible to `cli_e2e` (no renderer at all) and to `render.rs`'s unit tests
+/// (which call `end_block()` themselves, so they can only pin what the verb does,
+/// never that the pump reaches it between two real turns).
+///
+/// Mutation: delete either `end_block()` call from `client.rs`'s pump and the
+/// second turn's paragraph arrives byte-for-byte as the model wrote it, markers
+/// and all, on one over-wide row.
+#[test]
+fn a_turn_boundary_closes_an_unclosed_fence_at_a_terminal() {
+    // Opened, one line of content, never closed — the shape a reply takes when a
+    // model runs out of budget mid-block.
+    const UNCLOSED: &str = "```rust\nlet parsed = 1;";
+    const FENCED_ROW: &str = "let parsed = 1;";
+
+    let mut session = RenderedSession::open(RENDERED_COLS, &[UNCLOSED, AUDIT_SOURCE], &[]);
+    session.type_line("show me the parser");
+
+    // (1) The precondition: the fence really did open. Its content is on screen
+    // verbatim, which is what BR-6 promises and what proves the bit was set —
+    // without it the paragraph below could wrap for the trivial reason that no
+    // fence was ever recognized.
+    assert!(
+        session.wait_for(FENCED_ROW),
+        "the fenced reply never reached the screen; transcript:\n{}",
+        session.snapshot()
+    );
+
+    session.type_line("now describe the audit");
+    // The paragraph's last word, which is present in both outcomes — verbatim or
+    // wrapped — so this wait cannot itself decide the assertion below.
+    assert!(
+        session.wait_for("rows."),
+        "the second turn never produced its reply; transcript:\n{}",
+        session.snapshot()
+    );
+
+    let seen = session.snapshot();
+
+    // (2) The claim: the fence did not survive the turn boundary.
+    assert!(
+        !seen.contains(AUDIT_SOURCE),
+        "the second turn's paragraph was rendered verbatim, so the fence the \
+         first reply left open is still set: `end_block()` never cleared it, and \
+         every line of every remaining turn of this session renders as code; \
+         transcript:\n{seen}"
+    );
+
+    // (3) And it is genuinely being laid out again, not merely different.
+    let paragraph = rendered_block(&display_rows(&seen), "The audit run by");
+    assert!(
+        paragraph.len() > 1,
+        "the paragraph occupies one row after the fence closed; rows:\n{paragraph:#?}"
+    );
+    assert_eq!(
+        paragraph.join(" "),
+        AUDIT_PARAGRAPH,
+        "the turn after a fenced one must lay out exactly as any other turn does; \
+         transcript:\n{seen}"
+    );
 }

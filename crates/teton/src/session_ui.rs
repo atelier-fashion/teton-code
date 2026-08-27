@@ -4084,7 +4084,7 @@ fn format_attach(a: &DaemonClientAttach) -> String {
 mod tests {
     use super::*;
     use crate::prompt::ScriptedPrompter;
-    use crate::render::RecordingSurface;
+    use crate::render::{PlainSurface, RecordingSurface};
     use teton_protocol::events::{
         ByteSpan, ContextCleared, CostRecord, CostRecorded, FindingKind, ModelSelectionDecided,
         PlanEntry, PlanEntryStatus, SelectionSource, SessionRootChanged, SessionUpdate,
@@ -8331,6 +8331,191 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // REQ-592 AC-11 / BR-9: the accumulator sits upstream of the renderer
+    // -----------------------------------------------------------------------
+    //
+    // Every test above drives the turn onto a `RecordingSurface`, which renders
+    // nothing — so none of them can tell whether the three hand-offs read the
+    // model's words or the *screen's*. Since TASK-281 a session at a terminal
+    // builds a surface that wraps, re-lays and colours assistant text, and the
+    // three predicates all match substrings of the model's own prose. If a
+    // future edit ever moved the rendering ahead of `state.turn_reply
+    // .push_str(text)`, the trigger would arrive at the accumulator already
+    // broken across rows and every one of these lines would stop printing —
+    // silently, because all three are TTY-gated and `cli_e2e` runs on a pipe
+    // ([[LESSON-529]], [[LESSON-481]]).
+    //
+    // BR-9 is what makes that impossible, and it is preserved by *doing
+    // nothing*: ADR-1 puts the transform inside `PlainSurface`, so the raw chunk
+    // reaches the accumulator on its way to a surface that has not touched it
+    // yet. These tests are the proof that stayed true — they drive the real
+    // surface, at a width narrow enough that the trigger is guaranteed to be
+    // torn apart on screen, and then demand the line anyway.
+
+    /// The layout width AC-11's turns are rendered at.
+    ///
+    /// Eleven columns is not a realistic terminal and is not meant to be: it is
+    /// the width at which every trigger below (`teton provider add`, `teton
+    /// policy`, `teton doctor`) is *certainly* split across two rows, so the
+    /// "absent from the screen" half of each assertion is arithmetic rather than
+    /// a hope about a particular phrasing.
+    const AC11_WIDTH: usize = 11;
+
+    /// Drive one whole turn onto the surface `main.rs` builds at a terminal —
+    /// markdown on, colour on (TASK-281) — and return the bytes it wrote.
+    ///
+    /// The reply is cut into chunks at every space, the way a streaming engine
+    /// emits tokens, so no single chunk carries a trigger and the accumulator is
+    /// doing real work rather than being handed the answer whole.
+    fn rendered_hand_off_turn(prompt: &str, reply: &str, provider_ids: &[&str]) -> String {
+        let mut screen: Vec<u8> = Vec::new();
+        {
+            let mut surface = PlainSurface::with_markdown(&mut screen, true, AC11_WIDTH);
+            let mut state = SessionState::new();
+            state.provider_ids = provider_ids.iter().map(|id| (*id).to_owned()).collect();
+            state.begin_turn(prompt);
+            for token in reply.split_inclusive(' ') {
+                render_event(&envelope(chunk(token)), &mut surface, &mut state);
+            }
+            // No `end_block()` here, and none is needed: the hand-off prints
+            // through `line()`, which emits the renderer's pending buffer ahead
+            // of itself (BR-8). The verb and its call site belong to
+            // `client.rs`'s event pump (ADR-3), and `only_the_event_pump_
+            // declares_a_block_over` fails the build if a second owner appears —
+            // including one in a test.
+            //
+            // Said "both of its call sites" until the verify pass split the verb:
+            // `end_block()` (flush + close the fence) now has exactly one site, at
+            // the end of `Connection::call`, and the flush-only `emit_held()` has
+            // the other two. This comment was wrong for as long as it took someone
+            // to read it, because it sits inside `#[cfg(test)]` and the ownership
+            // sweep reads production sources only — the one place this REQ's own
+            // drift guard cannot look.
+            hand_off_after_turn(&mut state, &mut surface, true);
+        }
+        String::from_utf8(screen).expect("utf-8")
+    }
+
+    /// **AC-11 / BR-9.** All three hand-offs still fire on a turn whose reply
+    /// reached the screen wrapped and styled.
+    ///
+    /// Each row asserts the same three things, and the first two are what give
+    /// the third its meaning:
+    ///
+    ///   * the screen carries SGR — the renderer was really attached, so this is
+    ///     not a `RecordingSurface` test wearing a different name;
+    ///   * the reply reached the screen, and the trigger's **first word** with
+    ///     it — otherwise "the trigger is absent" would be true of a surface
+    ///     that drew no assistant text at all, and every row below would be
+    ///     vacuous;
+    ///   * the trigger is nonetheless **absent** from the screen — wrapping tore
+    ///     it in half, so a predicate reading rendered bytes could not match it;
+    ///   * the line printed anyway — therefore the predicate read the raw text,
+    ///     which is BR-9.
+    #[test]
+    fn every_hand_off_survives_a_reply_the_renderer_rewrote() {
+        for (case, prompt, reply, trigger, expected) in [
+            (
+                "REQ-579's setup hand-off",
+                "",
+                "you can run `teton provider add kimi` from a shell.\n",
+                "teton provider add",
+                hand_off_line().to_owned(),
+            ),
+            (
+                "REQ-581's connection hand-off",
+                "can you test the kimi connection?",
+                "kimi is routed, so `teton policy show` says it is fine.\n",
+                "teton policy",
+                connection_test_line().to_owned(),
+            ),
+            (
+                "REQ-582's command hand-off",
+                "",
+                "run `teton doctor` and read what it prints.\n",
+                "teton doctor",
+                "in this session: /doctor".to_owned(),
+            ),
+        ] {
+            let screen = rendered_hand_off_turn(prompt, reply, &["kimi"]);
+
+            assert!(
+                screen.contains('\u{1b}'),
+                "{case}: the surface drew no escape at all, so the renderer was \
+                 never attached and this test proves nothing; screen:\n{screen:?}"
+            );
+            // Non-vacuity. None of the three sentences the hand-offs print names
+            // `teton` — they name `/` spellings — so this word on screen can only
+            // have come from the rendered reply.
+            assert!(
+                screen.contains("teton"),
+                "{case}: the assistant text never reached the screen, so \"the \
+                 trigger is absent\" below is vacuously true; screen:\n{screen:?}"
+            );
+            assert!(
+                !screen.contains(trigger),
+                "{case}: {trigger:?} survived {AC11_WIDTH}-column layout intact, so \
+                 the screen still carries the trigger and the assertion below no \
+                 longer distinguishes the accumulator from it. Widen the reply or \
+                 narrow the width; screen:\n{screen:?}"
+            );
+            assert!(
+                screen.contains(&expected),
+                "{case}: the reply reached the screen rewritten and the hand-off \
+                 went quiet. Rendering has moved ahead of `state.turn_reply\
+                 .push_str(text)` and all three TTY-gated hand-offs are now \
+                 reading the screen instead of the model's words (BR-9). Expected \
+                 {expected:?}; screen:\n{screen:?}"
+            );
+        }
+    }
+
+    /// The same turn on a `RecordingSurface`, so the row above is anchored.
+    ///
+    /// Without this the wrapped test could go green on a predicate that had
+    /// stopped firing for *both* surfaces — a hand-off deleted outright reads as
+    /// "the renderer did not break it". These are the identical replies with no
+    /// renderer in the way, and they must earn exactly the same three lines.
+    #[test]
+    fn the_same_three_replies_earn_the_same_lines_with_no_renderer() {
+        for (case, prompt, reply, expected) in [
+            (
+                "REQ-579's setup hand-off",
+                "",
+                "you can run `teton provider add kimi` from a shell.\n",
+                hand_off_line().to_owned(),
+            ),
+            (
+                "REQ-581's connection hand-off",
+                "can you test the kimi connection?",
+                "kimi is routed, so `teton policy show` says it is fine.\n",
+                connection_test_line().to_owned(),
+            ),
+            (
+                "REQ-582's command hand-off",
+                "",
+                "run `teton doctor` and read what it prints.\n",
+                "in this session: /doctor".to_owned(),
+            ),
+        ] {
+            let mut surface = RecordingSurface::new();
+            let mut state = SessionState::new();
+            state.provider_ids = vec!["kimi".to_owned()];
+            state.begin_turn(prompt);
+            for token in reply.split_inclusive(' ') {
+                render_event(&envelope(chunk(token)), &mut surface, &mut state);
+            }
+            hand_off_after_turn(&mut state, &mut surface, true);
+            assert_eq!(
+                surface.lines_of(LineKind::Notice),
+                vec![expected.as_str()],
+                "{case}: {:?}",
+                surface.calls
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -11239,6 +11424,7 @@ mod key_scan {
         ("firstrun.rs", include_str!("firstrun.rs")),
         ("keychain.rs", include_str!("keychain.rs")),
         ("loading.rs", include_str!("loading.rs")),
+        ("markdown.rs", include_str!("markdown.rs")),
         ("model_ui.rs", include_str!("model_ui.rs")),
         ("prompt.rs", include_str!("prompt.rs")),
         ("provider_setup_ui.rs", include_str!("provider_setup_ui.rs")),

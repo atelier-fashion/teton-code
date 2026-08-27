@@ -25,6 +25,20 @@ use crate::{
 pub trait RpcMethod: Serialize + DeserializeOwned {
     /// The JSON-RPC `method` string this params type is sent under.
     const METHOD: &'static str;
+    /// Whether a completed call to this method is the end of an assistant
+    /// **turn** (REQ-592 BR-8 / ADR-3).
+    ///
+    /// Lives here, beside the wire name, because it is a property of the method
+    /// rather than of any caller: the client's event pump drops its markdown
+    /// fence exactly when a turn ends, and about thirty of its `call` sites —
+    /// every slash handler, the setup walkthroughs, the status probes — are not
+    /// turns at all. A per-call-site rule is one a handler can get wrong; a
+    /// per-method one is answered where the method is declared, so a future
+    /// turn-shaped RPC declares itself one in the same place it declares its
+    /// name.
+    ///
+    /// Defaulted to `false`: a method that says nothing about turns is not one.
+    const ENDS_TURN: bool = false;
     /// The result type expected in the matching response.
     type Result: Serialize + DeserializeOwned;
 }
@@ -1042,6 +1056,9 @@ pub struct PromptTurnResult {
 
 impl RpcMethod for PromptTurnParams {
     const METHOD: &'static str = "session/prompt";
+    // The one method in this file that is a turn — the client's markdown fence
+    // is dropped on its response and on no other (REQ-592 BR-8 / ADR-3).
+    const ENDS_TURN: bool = true;
     type Result = PromptTurnResult;
 }
 
@@ -3303,6 +3320,69 @@ mod tests {
     use crate::events::{ChosenBand, GpuClass, TierBand};
     use crate::ParseCategoryError;
     use crate::GENERIC_SEARCH_AUTH_TEMPLATE;
+
+    /// Reads `ENDS_TURN` the way [`crate::methods::RpcMethod`]'s one consumer
+    /// does — through the trait, generically — rather than off a concrete type.
+    /// Faithful to the call it stands in for, and it keeps the assertions below
+    /// runtime ones with a sentence attached instead of const-folded literals.
+    fn ends_turn<P: RpcMethod>() -> bool {
+        P::ENDS_TURN
+    }
+
+    /// **`session/prompt` is the only turn (REQ-592 BR-8 / ADR-3).**
+    ///
+    /// The client drops its markdown fence on a turn's response and on no
+    /// other. Through implementation that was decided by *where*
+    /// `Connection::call` was called from, which made it some thirty separate
+    /// judgements; the confirmation review found `/cost`, `/model` and
+    /// `/config` each answering it wrongly and re-flowing a second client's
+    /// streaming code block as prose. The answer moved here, beside the wire
+    /// name, so there is one judgement and it is written down.
+    ///
+    /// The negative half is the substantive one: a defaulted `false` makes the
+    /// positive trivially easy to get right and leaves a future turn-shaped RPC
+    /// as the only thing that can go wrong.
+    #[test]
+    fn only_the_prompt_method_ends_a_turn() {
+        assert!(
+            ends_turn::<PromptTurnParams>(),
+            "the one method that streams an assistant reply has to be the one \
+             that ends a block, or a reply that finished inside an unterminated \
+             fence renders every later reply of the session verbatim"
+        );
+
+        // The methods the confirmation review caught behind `call`: the slash
+        // commands, the setup walkthroughs, and the status probes that run
+        // beside a live stream.
+        for (method, ends) in [
+            (CostQueryParams::METHOD, ends_turn::<CostQueryParams>()),
+            (ConfigGetParams::METHOD, ends_turn::<ConfigGetParams>()),
+            (ConfigSetParams::METHOD, ends_turn::<ConfigSetParams>()),
+            (ModelListParams::METHOD, ends_turn::<ModelListParams>()),
+            (ModelSetParams::METHOD, ends_turn::<ModelSetParams>()),
+            (ModelStatusParams::METHOD, ends_turn::<ModelStatusParams>()),
+            (
+                SessionCreateParams::METHOD,
+                ends_turn::<SessionCreateParams>(),
+            ),
+            (SkillsListParams::METHOD, ends_turn::<SkillsListParams>()),
+            (
+                ProviderSetupCommitParams::METHOD,
+                ends_turn::<ProviderSetupCommitParams>(),
+            ),
+            (
+                WebSetupCommitParams::METHOD,
+                ends_turn::<WebSetupCommitParams>(),
+            ),
+        ] {
+            assert!(
+                !ends,
+                "`{method}` is not a turn, and a client that treated it as one \
+                 would clear its markdown fence in the middle of somebody \
+                 else's streaming code block (REQ-592 BR-6)"
+            );
+        }
+    }
 
     /// **Mixed-version skew, on the pairing ADR-007 explicitly endorses.**
     ///

@@ -280,6 +280,68 @@ impl Connection {
         params: P,
         ctx: &mut UiContext,
     ) -> anyhow::Result<Result<P::Result, RpcError>> {
+        // REQ-592 BR-8 / ADR-3. **The only `end_block()` in the client**, on the
+        // one branch where the RPC that just finished was a *turn*.
+        //
+        // This comment used to say that `call` returning *is* the turn boundary.
+        // It is not, and the gap was found at review: `call` is the **RPC**
+        // boundary, and roughly thirty of its callers are not turns — every
+        // slash handler in `main.rs` (`/cost`, `/model`, `/config`), the
+        // provider setup and connection-test flows, `answer_outstanding_model_
+        // proposal`'s own `model/status` probe. A fence cleared by any of those
+        // re-flows the rest of a second client's streaming ` ```rust ` block as
+        // prose the moment this user types a command: BR-6's failure arriving at
+        // user-command frequency instead of at the poll rate ADR-4's third call
+        // site was dropped for.
+        //
+        // So the fence is dropped on `P::ENDS_TURN` — a property of the
+        // **method**, declared beside its wire name, true for `session/prompt`
+        // and nothing else. Making it a property of the call would have left
+        // thirty sites each able to answer it wrongly, which is the shape of
+        // rule this REQ has already had to unpick twice. Every other method
+        // flushes and leaves block state alone, for `emit_held`'s reason below.
+        //
+        // Why the flush is here and not in `main.rs`'s `hand_off_after_turn` — corrected from
+        // what this comment said through REQ-592's implementation. The claim was
+        // that a flush hung there would drop the tail of every failed turn. That
+        // overstates it: every *arm* of the turn match writes through
+        // `Surface::line` after `call` returns, and `line()` emits the held
+        // buffer ahead of its own row (BR-8), so on those paths the same bytes
+        // land in the same order with or without this call — which is why
+        // deleting it leaves the pty suite green.
+        //
+        // Two things the hand-off still could not do. It **cannot clear the
+        // fence bit**, the half only this verb performs: just the `Ok` arm
+        // reaches the hand-off, so a turn the daemon refused mid-fence would
+        // leave the bit set and render every later reply of the session
+        // verbatim. And it never runs at all when `call` returns through its
+        // own transport `?` — that error leaves the entry loop without writing
+        // a line, so nothing else would emit the tail the drop interrupted.
+        //
+        // The body is a separate function so that holds on **every** return: the
+        // `?` on the send, on each `recv`, on a result that fails to deserialize,
+        // and on a dispatch that could not answer a permission are early returns,
+        // and a call written at the bottom of the loop would miss all of them.
+        let outcome = self.pump_until_answered(params, ctx);
+        if P::ENDS_TURN {
+            ctx.surface.end_block();
+        } else {
+            // A non-turn RPC still pumped events while it waited, so it may well
+            // have left a fragment held — nothing may be held across a return
+            // that hands the terminal back to a caller which is about to write
+            // through something other than this surface. Flush it, and leave the
+            // fence exactly where the streaming turn left it.
+            ctx.surface.emit_held();
+        }
+        outcome
+    }
+
+    /// [`Self::call`]'s body: everything up to the answer, with no flushing.
+    fn pump_until_answered<P: RpcMethod>(
+        &mut self,
+        params: P,
+        ctx: &mut UiContext,
+    ) -> anyhow::Result<Result<P::Result, RpcError>> {
         let id = self.send(params)?;
         loop {
             match self.recv()? {
@@ -355,6 +417,60 @@ impl Connection {
     pub fn drain_events(
         &mut self,
         ctx: &mut UiContext,
+        on_first: impl FnMut(),
+    ) -> anyhow::Result<Drained> {
+        // REQ-592 BR-8: the idle path. Fragments do reach the surface with no
+        // turn in flight — a second client driving the same session broadcasts
+        // its stream to this one — and `call`'s flush is no help there, because
+        // `call` is not running. Wrapped for the same reason `call` is: the `?`
+        // on a permission answer is an early return.
+        //
+        // **`emit_held`, never `end_block`.** This is a *poll* boundary, not a
+        // turn boundary: `main.rs`'s entry loop calls this every
+        // `FRAME_INTERVAL` — roughly eight times a second — and it has no way to
+        // know whether the broadcasting client's turn is over, because nothing
+        // on the bus says so. Ending the block here would clear the fence bit
+        // eight times a second, so a broadcast ` ```rust ` block would be
+        // reclassified as prose from the very next poll and word-wrapped at the
+        // terminal width. That is BR-6's failure arriving through the verb meant
+        // to prevent it, and it is why ADR-4's third call site was dropped.
+        //
+        // Held rows must still go out *inside* this call. `main.rs:798-808`
+        // erases the entry frame before the drain and redraws it after, so this
+        // is the only window in which a row can be written cleanly — and between
+        // windows the loading indicator's `repaint_row_above` would emit the
+        // buffer itself (BR-8), scrolling rows into a frame that is on screen.
+        // Nothing may be held across this return.
+        //
+        // The recorded cost: a partial line still on the wire is emitted as a
+        // finished row, and a still-growing table run is still closed and
+        // re-measured, once per poll. That is the same BR-8 trade `line()` makes
+        // at any mid-turn interruption, applied at the poll rate, and removing
+        // it needs the frame ownership in `main.rs` to change — not this seam.
+        //
+        // The other recorded cost, which is this one's mirror image. A client
+        // that only *watches* a co-driven session — it never prompts, so it
+        // never makes a turn `call` — can be left with the fence bit set
+        // **forever** if the broadcasting client's reply ends inside an
+        // unterminated ` ``` `. Nothing on the bus says a turn is over
+        // (`teton-protocol`'s `Event` has no turn-complete variant, checked),
+        // and a turn-ending `call` is the only thing that drops the bit, so
+        // every later reply this client sees renders verbatim. Clearing it here
+        // is exactly the fix that is worse than the defect — see the paragraph
+        // above. The real repair is a turn-boundary event, which is a protocol
+        // change and deliberately not invented here.
+        //
+        // Inert on the common case. An idle poll that drained nothing leaves the
+        // buffers empty, so this costs a poll interval nothing.
+        let outcome = self.pump_queued(ctx, on_first);
+        ctx.surface.emit_held();
+        outcome
+    }
+
+    /// [`Self::drain_events`]'s body: everything queued, with no flushing.
+    fn pump_queued(
+        &mut self,
+        ctx: &mut UiContext,
         mut on_first: impl FnMut(),
     ) -> anyhow::Result<Drained> {
         let mut drained = Drained::default();
@@ -425,6 +541,35 @@ impl Connection {
         match session_ui::render_event(env, &mut *ctx.surface, &mut *ctx.state) {
             EventOutcome::Rendered => {}
             EventOutcome::Permission(req) if ctx.answer_permissions => {
+                // REQ-592 ADR-4, structurally rather than incidentally. The
+                // property — **a permission question never paints above
+                // assistant text the reader has not been shown** — matters
+                // because `prompt.rs` writes questions straight to stdout: a
+                // `Prompter` is not a `Surface` and cannot know a buffer is
+                // pending, so a held sentence would be printed *after* the user
+                // had already answered the question it explains.
+                //
+                // It held before this line existed, but only by accident:
+                // `resolve_permission` happens to render through
+                // `surface.line(...)` on all five of its paths before it reaches
+                // `prompter.ask`, and `line()` emits the held buffer ahead of its
+                // own row (BR-8). That is a property of another module's
+                // control flow, one refactor away from being untrue, and it was
+                // the *stronger* of REQ-592's two ordering rules — while the
+                // weaker one (`end_block`'s ownership) had a source sweep and
+                // this had nothing. So the pump states it itself, at the seam it
+                // owns, immediately before it hands the terminal to a writer
+                // that is not a `Surface`.
+                //
+                // **`emit_held`, not `end_block`.** A permission prompt is a
+                // *pause* in a turn, not the end of one. Clearing the fence bit
+                // here is exactly the bug ADR-3's site 3 was dropped for: a model
+                // that opens a ```rust fence, hits a tool call, and resumes after
+                // the answer would have the rest of its code classified as
+                // markdown and word-wrapped at the terminal width, and a wrapped
+                // shell command is a different command (BR-6). The fence ends at
+                // a turn boundary, and `call` is the turn boundary.
+                ctx.surface.emit_held();
                 let reply = session_ui::resolve_permission(
                     &req,
                     &mut *ctx.surface,
@@ -453,6 +598,16 @@ impl Connection {
             }
             EventOutcome::ModelProposal(proposal) if ctx.answer_model_proposals => {
                 if ctx.state.claim_model_proposal(&proposal.request_id) {
+                    // ADR-4, the same rule as the permission arm above and for
+                    // the same reason: `resolve_proposal` reaches a `Prompter`,
+                    // which writes straight to stdout and cannot emit this
+                    // surface's held buffer. It happens to render the proposal
+                    // through `surface.line` first, which would flush it — but
+                    // that is the callee's rendering order, not a property of
+                    // this seam, and one reordering inside `model_ui` away from
+                    // painting a question above text the reader never saw.
+                    // `emit_held`, not `end_block`: a proposal is a pause.
+                    ctx.surface.emit_held();
                     if let Some(reply) = model_ui::resolve_proposal(
                         &proposal,
                         ctx.auto_accept_model,
@@ -486,6 +641,19 @@ impl Connection {
                 // Fire-and-forget like a permission answer: the ack comes back
                 // later as a stray response and is ignored. Awaiting it here
                 // would re-enter the event pump from inside an event dispatch.
+                //
+                // ADR-4, and this is the arm where it bites hardest. The
+                // question is an access-control consent — "allow this client to
+                // watch EVERY session on this daemon?" — and it fires exactly
+                // when a second client attaches mid-turn, which is the moment a
+                // fragment is most likely to be held. A consent question painted
+                // above the text it interrupted is a security prompt the reader
+                // answers without its context. `resolve_attach_consent` does
+                // write a notice first, and `session_ui.rs` says so in a doc
+                // comment — but a doc comment in the callee is not this seam
+                // owning its own rule. `emit_held`, not `end_block`: a consent
+                // question is a pause in whatever was streaming, not its end.
+                ctx.surface.emit_held();
                 let reply = session_ui::resolve_attach_consent(
                     &request,
                     &mut *ctx.surface,
@@ -1563,6 +1731,751 @@ mod tests {
             surface.calls.is_empty(),
             "nothing rendered: {:?}",
             surface.calls
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-592 BR-8 / ADR-3: no line falls off the end of a turn (TASK-280)
+    // -----------------------------------------------------------------------
+
+    /// A streamed chunk of assistant text, as the daemon broadcasts it.
+    fn agent_chunk(text: &str) -> Incoming {
+        use teton_protocol::events::{Event, EventEnvelope, SessionUpdate, SessionUpdatePayload};
+        Incoming::Event(Box::new(EventEnvelope {
+            session_id: None,
+            seq: 1,
+            event: Event::SessionUpdate(SessionUpdate {
+                update: SessionUpdatePayload::AgentMessageChunk {
+                    text: text.to_owned(),
+                },
+            }),
+        }))
+    }
+
+    /// The turn request these tests put in flight. The method is the real one —
+    /// `session/prompt` is what a typed line sends — so what the pump does here
+    /// is what it does to a turn.
+    fn turn_params() -> methods::PromptTurnParams {
+        methods::PromptTurnParams {
+            session_id: teton_protocol::SessionId::from("s1"),
+            prompt: Vec::new(),
+            skill: None,
+        }
+    }
+
+    /// A permission request as the daemon raises one, with a single
+    /// reject-once option — enough for `resolve_permission` to render, ask, and
+    /// compose a reply.
+    fn permission_envelope(tool: &str) -> Incoming {
+        use teton_protocol::events::{
+            Event, EventEnvelope, PermissionOption, PermissionOptionKind, PermissionRequest,
+        };
+        Incoming::Event(Box::new(EventEnvelope {
+            session_id: None,
+            seq: 2,
+            event: Event::PermissionRequest(PermissionRequest {
+                request_id: teton_protocol::RequestId::from("r1"),
+                tool_name: tool.to_owned(),
+                description: Some("run `cargo test`".to_owned()),
+                subject: None,
+                options: vec![PermissionOption {
+                    option_id: "reject_once".to_owned(),
+                    label: "Reject once".to_owned(),
+                    kind: PermissionOptionKind::RejectOnce,
+                }],
+            }),
+        }))
+    }
+
+    /// The daemon's answer to the first request a fixture sends.
+    fn turn_answered(id: i64) -> Incoming {
+        Incoming::Response(Response::success(
+            Id::Number(id),
+            serde_json::json!({ "turn_id": "t1", "stop_reason": "end_turn" }),
+        ))
+    }
+
+    /// Run `body` with a context over a markdown-rendering surface and return
+    /// the bytes that reached it.
+    ///
+    /// A rendering surface rather than a `RecordingSurface`, because a surface
+    /// that buffers nothing cannot show the difference between "emitted" and
+    /// "held" — which is the entire subject of these tests.
+    fn bytes_from_a_rendering_pump(body: impl FnOnce(&mut UiContext)) -> String {
+        let mut buf = Vec::new();
+        {
+            let mut surface = crate::render::PlainSurface::with_markdown(&mut buf, false, 60);
+            let mut state = SessionState::new();
+            let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+            let mut ctx = UiContext {
+                surface: &mut surface,
+                state: &mut state,
+                prompter: &mut prompter,
+                answer_permissions: true,
+                answer_model_proposals: true,
+                auto_accept_model: false,
+                typed_input: true,
+                session_id: None,
+                skills: crate::slash::SkillSnapshot::empty(),
+            };
+            body(&mut ctx);
+        }
+        String::from_utf8(buf).expect("the surface writes utf-8")
+    }
+
+    /// **AC-10.** A turn whose final chunk carries no trailing newline still has
+    /// its last line on screen by the time `call` returns — which is before
+    /// anything in `main.rs` runs, and therefore before the entry frame is
+    /// redrawn.
+    ///
+    /// The mutation this is aimed at: delete the `end_block()` in
+    /// [`Connection::call`] and the tail is held forever, so the user's answer
+    /// ends one sentence short and the session goes back to the prompt as if it
+    /// had said everything.
+    #[test]
+    fn a_turn_ending_without_a_newline_still_reaches_the_screen() {
+        let (mut conn, tx, _peer) = test_connection();
+        tx.send(agent_chunk("the finding is that the guard holds"))
+            .expect("queue");
+        tx.send(turn_answered(1)).expect("queue");
+
+        let out = bytes_from_a_rendering_pump(|ctx| {
+            let answered = conn.call(turn_params(), ctx).expect("the response arrives");
+            assert!(answered.is_ok(), "the daemon answered this turn");
+        });
+
+        assert_eq!(out, "the finding is that the guard holds\n");
+    }
+
+    /// **AC-10's failed-turn leg — the path `hand_off_after_turn` never
+    /// reaches.**
+    ///
+    /// At main.rs:1356 only the `Ok` arm of the turn match calls the hand-off,
+    /// so a flush hung there would never run on a turn the daemon refused. What
+    /// this test pins is that `call` itself returns with nothing held, whichever
+    /// answer came back.
+    ///
+    /// **What it does *not* prove, corrected at REQ-592's verify:** that moving
+    /// the flush into the hand-off would lose these bytes on screen. It would
+    /// not. `main.rs`'s failure arms all write through `Surface::line`, and
+    /// `line()` emits the held buffer ahead of its own row (BR-8), so the same
+    /// text lands in the same order. The half that cannot be moved is the fence
+    /// clear — see the comment on the call site, and
+    /// `render::an_unterminated_fence_does_not_swallow_the_next_turn` for what
+    /// happens when it does not run.
+    #[test]
+    fn a_turn_the_daemon_failed_still_flushes_what_it_had_already_streamed() {
+        let (mut conn, tx, _peer) = test_connection();
+        tx.send(agent_chunk("I will check the tier first"))
+            .expect("queue");
+        tx.send(Incoming::Response(Response::failure(
+            Id::Number(1),
+            RpcError::new(error_code::INTERNAL_ERROR, "the tier fell over mid-turn"),
+        )))
+        .expect("queue");
+
+        let out = bytes_from_a_rendering_pump(|ctx| {
+            let answered = conn.call(turn_params(), ctx).expect("a frame did arrive");
+            assert!(
+                answered.is_err(),
+                "this fixture's turn must fail: it is the point of the test"
+            );
+        });
+
+        assert_eq!(out, "I will check the tier first\n");
+    }
+
+    /// **AC-10's transport leg.** The `?` on `recv` is an early return that no
+    /// call written at the bottom of the loop would cover: the daemon dropped
+    /// the connection with a partial line in the buffer, and the user still has
+    /// to see what they were told before the drop.
+    #[test]
+    fn a_turn_whose_connection_dropped_still_flushes_what_it_had_streamed() {
+        let (mut conn, tx, _peer) = test_connection();
+        tx.send(agent_chunk("halfway through the answer"))
+            .expect("queue");
+        // No response, and the only sender goes away — so `recv` fails and
+        // `call` returns through its transport `?`.
+        drop(tx);
+
+        let out = bytes_from_a_rendering_pump(|ctx| {
+            let dropped = conn.call(turn_params(), ctx);
+            assert!(dropped.is_err(), "the fixture hangs up on this turn");
+        });
+
+        assert_eq!(out, "halfway through the answer\n");
+    }
+
+    /// **AC-10's idle leg.** Fragments do arrive with no turn in flight — a
+    /// second client driving the same session broadcasts its stream to this one
+    /// — and `call`'s flush is no help there, because `call` is not running.
+    #[test]
+    fn a_fragment_drained_while_idle_is_emitted_not_held() {
+        let (mut conn, tx, _peer) = test_connection();
+        tx.send(agent_chunk("a line from the other client"))
+            .expect("queue");
+
+        let out = bytes_from_a_rendering_pump(|ctx| {
+            let drained = conn.drain_events(ctx, || {}).expect("drain");
+            assert_eq!(drained.rendered, 1, "the chunk was dispatched");
+        });
+
+        assert_eq!(out, "a line from the other client\n");
+    }
+
+    /// **The idle drain is a *poll* boundary, not a turn boundary (REQ-592
+    /// verify, MAJOR 1).**
+    ///
+    /// `main.rs`'s entry loop calls `drain_events` every `FRAME_INTERVAL` —
+    /// about eight times a second — and nothing on the event bus says when a
+    /// broadcasting client's turn is over. So a drain that ended the block would
+    /// clear the fence bit between one poll and the next, and every remaining
+    /// line of a ` ```rust ` block arriving from the other client would be
+    /// classified as markdown and word-wrapped at the terminal width.
+    ///
+    /// The fixture is two drains on **one** surface, because a per-drain surface
+    /// would carry no fence bit between them and prove nothing. The resumed line
+    /// is deliberately longer than the fixture's 60 columns, so a classified copy
+    /// is unmistakably re-flowed rather than coincidentally identical.
+    ///
+    /// (Verified by mutation: restoring `end_block()` at the end of
+    /// `drain_events` splits the second row into three.)
+    #[test]
+    fn an_idle_drain_does_not_end_a_fence_the_other_client_is_still_inside() {
+        const RESUMED: &str =
+            "let b = *p * *q; // a deliberately long trailing comment that keeps going";
+        let (mut conn, tx, _peer) = test_connection();
+
+        let out = bytes_from_a_rendering_pump(|ctx| {
+            // Poll one: the broadcast opens a fence and streams a line of code.
+            tx.send(agent_chunk("```rust\nlet a = 1;\n"))
+                .expect("queue");
+            conn.drain_events(ctx, || {}).expect("drain");
+            // Poll two, one frame interval later: the same block continues.
+            tx.send(agent_chunk(&format!("{RESUMED}\n")))
+                .expect("queue");
+            conn.drain_events(ctx, || {}).expect("drain");
+        });
+
+        assert_eq!(
+            out,
+            format!("let a = 1;\n{RESUMED}\n"),
+            "the fence did not survive the poll, so a broadcast code block was \
+             re-flowed as prose (BR-6)"
+        );
+        assert!(
+            !out.contains("```"),
+            "the fence marker was printed: {out:?}"
+        );
+    }
+
+    /// A line inside a fence that is comfortably wider than the fixture's 60
+    /// columns, so a copy that was classified as prose is unmistakably re-flowed
+    /// rather than coincidentally identical.
+    ///
+    /// No `*`, `_` or backtick in it on purpose: the pair of tests below read
+    /// "the fence was dropped" off the **wrapping**, and inline emphasis eating
+    /// a character would make the negative assertion pass for the wrong reason.
+    const RESUMED_CODE: &str =
+        "let b = q; // a deliberately long trailing comment that keeps going here";
+
+    /// **`/cost` typed mid-stream must not re-flow somebody else's code block
+    /// (REQ-592 confirmation review, MAJOR 1).**
+    ///
+    /// `Connection::call` is the **RPC** boundary. It was treated as the turn
+    /// boundary through implementation and verify, and it is not: about thirty
+    /// of its callers are slash handlers, setup walkthroughs and status probes.
+    /// Dropping the fence on any of those is BR-6's failure — the one the poll
+    /// path was cleaned of at verify — arriving instead at the frequency a user
+    /// types commands.
+    ///
+    /// The fixture is a broadcast fence interrupted by one non-turn `call`, on
+    /// **one** surface, because a per-call surface would carry no fence bit
+    /// across the interruption and prove nothing.
+    ///
+    /// (Verified by mutation: making the branch unconditional — `end_block()`
+    /// on every RPC, which is what shipped — splits the resumed line in two.)
+    #[test]
+    fn a_non_turn_call_does_not_end_a_fence_the_other_client_is_still_inside() {
+        let (mut conn, tx, _peer) = test_connection();
+
+        let out = bytes_from_a_rendering_pump(|ctx| {
+            // The other client opens a fence and streams a line of code.
+            tx.send(agent_chunk("```rust\nlet a = 1;\n"))
+                .expect("queue");
+            conn.drain_events(ctx, || {}).expect("drain");
+            // This user types `/cost` while that block is still streaming.
+            tx.send(Incoming::Response(Response::success(
+                Id::Number(1),
+                serde_json::to_value(methods::CostQueryResult::default()).expect("a cost report"),
+            )))
+            .expect("queue");
+            let answered = conn
+                .call(methods::CostQueryParams::default(), ctx)
+                .expect("the response arrives");
+            assert!(answered.is_ok(), "the fixture answers the cost query");
+            // The same block continues afterwards.
+            tx.send(agent_chunk(&format!("{RESUMED_CODE}\n")))
+                .expect("queue");
+            conn.drain_events(ctx, || {}).expect("drain");
+        });
+
+        assert_eq!(
+            out,
+            format!("let a = 1;\n{RESUMED_CODE}\n"),
+            "the fence did not survive a `cost/query`, so a slash command \
+             re-flowed a broadcast code block as prose (BR-6)"
+        );
+    }
+
+    /// The other half of the same gate: `session/prompt` **is** a turn, and its
+    /// `call` still drops the fence.
+    ///
+    /// Without this leg the fix is only half-pinned — `if false` in place of
+    /// `if P::ENDS_TURN` would satisfy the test above and leave an unterminated
+    /// fence rendering every later reply of the session verbatim, which is the
+    /// defect `end_block()` exists for.
+    ///
+    /// (Verified by mutation: `if false` leaves the resumed line unwrapped and
+    /// fails here.)
+    #[test]
+    fn a_turn_call_does_end_the_fence_the_reply_left_open() {
+        let (mut conn, tx, _peer) = test_connection();
+
+        let out = bytes_from_a_rendering_pump(|ctx| {
+            tx.send(agent_chunk("```rust\nlet a = 1;\n"))
+                .expect("queue");
+            tx.send(turn_answered(1)).expect("queue");
+            let answered = conn.call(turn_params(), ctx).expect("the response arrives");
+            assert!(answered.is_ok(), "the fixture answers the turn");
+            // A later reply of the same session, drained while idle.
+            tx.send(agent_chunk(&format!("{RESUMED_CODE}\n")))
+                .expect("queue");
+            conn.drain_events(ctx, || {}).expect("drain");
+        });
+
+        assert!(
+            !out.contains(RESUMED_CODE),
+            "the turn ended inside an unterminated fence and the bit was never \
+             dropped, so the session's next reply is still being rendered \
+             verbatim: {out:?}"
+        );
+        assert!(
+            out.starts_with("let a = 1;\n"),
+            "the fenced line the turn did stream must still be verbatim: {out:?}"
+        );
+    }
+
+    /// **ADR-4, as a structural property of the pump rather than of
+    /// `resolve_permission`'s control flow (REQ-592 verify, MEDIUM).**
+    ///
+    /// Two things have to be true at once when a permission question goes up
+    /// mid-turn, and before this REQ's verify only one of them was owned by
+    /// anything:
+    ///
+    /// 1. **Nothing may be held.** `prompt.rs` writes the question straight to
+    ///    stdout — a `Prompter` is not a `Surface` — so a sentence still in the
+    ///    buffer would be printed *after* the user had answered the question it
+    ///    explains. The pump now emits held rows itself, immediately before it
+    ///    hands the terminal over.
+    /// 2. **The fence may not be cleared.** A prompt is a pause in a turn, not
+    ///    the end of one, so the code the model resumes after the answer must
+    ///    still be verbatim. This is why the emit is `emit_held()` and not
+    ///    `end_block()` — ADR-3's dropped third call site.
+    ///
+    /// The fixture holds a partial line *inside* an open fence and interrupts it
+    /// with a real permission event, so both properties are read off one byte
+    /// sequence.
+    ///
+    /// (Verified by mutation: `end_block()` in place of `emit_held()` in the
+    /// permission arm re-flows the resumed line across three rows. The
+    /// complementary mutation — deleting the call outright — is caught by
+    /// `only_the_event_pump_declares_a_block_over`'s region check rather than
+    /// here, because `resolve_permission` still renders through `line()` first;
+    /// that incidental flush is exactly what the sweep exists to stop being the
+    /// guarantee.)
+    #[test]
+    fn a_permission_prompt_emits_held_text_without_ending_the_fence() {
+        const RESUMED: &str =
+            "let b = *p * *q; // a deliberately long trailing comment that keeps going";
+        let (mut conn, tx, _peer) = test_connection();
+        tx.send(agent_chunk(
+            "```rust\nlet a = 1;\nlet held = 2; // no newline yet",
+        ))
+        .expect("queue");
+        tx.send(permission_envelope("shell")).expect("queue");
+        tx.send(agent_chunk(&format!("\n{RESUMED}\n")))
+            .expect("queue");
+
+        let out = bytes_from_a_rendering_pump(|ctx| {
+            conn.drain_events(ctx, || {}).expect("drain");
+        });
+
+        let held = out
+            .find("let held = 2; // no newline yet")
+            .unwrap_or_else(|| panic!("the held line never reached the screen: {out:?}"));
+        let question = out
+            .find("permission requested: shell")
+            .unwrap_or_else(|| panic!("the request never reached the screen: {out:?}"));
+        assert!(
+            held < question,
+            "the question painted above text the reader had not been shown: {out:?}"
+        );
+        assert!(
+            out.contains(&format!("{RESUMED}\n")),
+            "the resumed line was re-flowed, so the prompt ended the fence: {out:?}"
+        );
+        assert!(
+            !out.contains("```"),
+            "the fence marker was printed: {out:?}"
+        );
+    }
+
+    /// **The idle drain's error leg**, which `call` has three tests for and this
+    /// function had none.
+    ///
+    /// `pump_queued`'s only `?` is the reply to a permission it could not send —
+    /// the daemon went away between raising the request and being answered. The
+    /// wrapper is what makes the flush hold on that return too, exactly as it
+    /// does on `call`'s transport `?`.
+    ///
+    /// **Honest about what the fixture proves.** Unlike `call`'s failed-turn and
+    /// dropped-connection legs, no mutation confined to this file makes this one
+    /// red: every path that can reach that `?` renders through `Surface::line`
+    /// first, and `line()` emits the buffer itself. What the test pins is the
+    /// property — `drain_events` never returns with a row still held, whichever
+    /// way it returns — so a future silent error path is a failure here rather
+    /// than a sentence lost off the bottom of a redrawn frame.
+    #[test]
+    fn a_drain_that_could_not_answer_still_flushes_what_it_had_streamed() {
+        let (mut conn, tx, peer) = test_connection();
+        tx.send(agent_chunk("the tail that was already streamed"))
+            .expect("queue");
+        tx.send(permission_envelope("shell")).expect("queue");
+        // The daemon is gone, so composing the answer succeeds and sending it
+        // does not: `dispatch_event`'s `?` is the way out of this drain.
+        drop(peer);
+
+        let out = bytes_from_a_rendering_pump(|ctx| {
+            let failed = conn.drain_events(ctx, || {});
+            assert!(
+                failed.is_err(),
+                "this fixture's reply must fail to send: it is the point of the test"
+            );
+        });
+
+        assert!(
+            out.starts_with("the tail that was already streamed\n"),
+            "the streamed tail was still held when the drain gave up: {out:?}"
+        );
+    }
+
+    /// **ADR-4.** A permission question raised mid-turn must paint *below* the
+    /// assistant text that preceded it, never above it.
+    ///
+    /// `prompt.rs` writes questions and the entry frame straight to stdout — it
+    /// never goes through a `Surface`, which is why it cannot know a buffer is
+    /// pending. The fixture reproduces exactly that: the prompter and the
+    /// surface share one sink, so "what reached the screen, in order" is a
+    /// single byte sequence and the ordering is a property of it rather than of
+    /// two separate recordings a test lined up by hand.
+    ///
+    /// **Where the guarantee comes from, and where it used to come from.**
+    /// Through REQ-592's implementation it came from `resolve_permission`
+    /// itself: it renders the request through `surface.line(...)` before it ever
+    /// reaches `prompter.ask` — on all five of its paths, the two auto-decision
+    /// arms and the over-budget offer included — and `line()` emits the pending
+    /// buffer ahead of its own row (BR-8). True, but incidental: a property of
+    /// another module's control flow, one refactor away from being untrue, and
+    /// the only one of this REQ's two ordering rules with no structural owner.
+    /// Since verify the pump states it itself, with an `emit_held()` immediately
+    /// before that call. **Not** `end_block()` — ADR-3's third call site was
+    /// dropped because clearing the fence bit at a mid-turn pause mangles a
+    /// fenced block the model resumes after the answer (BR-6), and that reason
+    /// is unchanged.
+    ///
+    /// So this test asserts the **property**, deliberately independent of which
+    /// mechanism provides it, and it outlives the call site it was written
+    /// beside. A refactor that drops that `line()`, or a new prompt path that
+    /// asks before it renders, fails here — instead of silently reordering the
+    /// screen at the one moment the order is the point: the question names the
+    /// thing the user is being asked to allow, and the sentence explaining it
+    /// would be printed after the answer was given.
+    #[test]
+    fn a_permission_question_paints_below_the_text_that_preceded_it() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        /// One sink with two writers, standing in for the terminal.
+        #[derive(Clone, Default)]
+        struct SharedSink(Rc<RefCell<Vec<u8>>>);
+
+        impl io::Write for SharedSink {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// A prompter that bypasses the `Surface` exactly as the real one does.
+        struct SinkPrompter {
+            sink: SharedSink,
+        }
+
+        impl Prompter for SinkPrompter {
+            fn ask(&mut self, question: &str) -> Option<String> {
+                use io::Write;
+                let _ = writeln!(self.sink, "{question}");
+                Some("n".to_owned())
+            }
+            fn ask_secret(&mut self, question: &str) -> Option<String> {
+                self.ask(question)
+            }
+        }
+
+        let (mut conn, tx, _peer) = test_connection();
+        tx.send(agent_chunk("let me run the test suite"))
+            .expect("queue");
+        tx.send(Incoming::Event(Box::new(
+            teton_protocol::events::EventEnvelope {
+                session_id: None,
+                seq: 2,
+                event: teton_protocol::events::Event::PermissionRequest(
+                    teton_protocol::events::PermissionRequest {
+                        request_id: teton_protocol::RequestId::from("r1"),
+                        tool_name: "shell".to_owned(),
+                        description: Some("run `cargo test`".to_owned()),
+                        subject: None,
+                        options: vec![teton_protocol::events::PermissionOption {
+                            option_id: "reject_once".to_owned(),
+                            label: "Reject once".to_owned(),
+                            kind: teton_protocol::events::PermissionOptionKind::RejectOnce,
+                        }],
+                    },
+                ),
+            },
+        )))
+        .expect("queue");
+
+        let sink = SharedSink::default();
+        {
+            let mut surface = crate::render::PlainSurface::with_markdown(sink.clone(), false, 60);
+            let mut state = SessionState::new();
+            let mut prompter = SinkPrompter { sink: sink.clone() };
+            let mut ctx = UiContext {
+                surface: &mut surface,
+                state: &mut state,
+                prompter: &mut prompter,
+                answer_permissions: true,
+                answer_model_proposals: true,
+                auto_accept_model: false,
+                typed_input: true,
+                session_id: None,
+                skills: crate::slash::SkillSnapshot::empty(),
+            };
+            conn.drain_events(&mut ctx, || {}).expect("drain");
+        }
+
+        let screen = String::from_utf8(sink.0.borrow().clone()).expect("utf-8");
+        let text = screen.find("let me run the test suite").unwrap_or_else(|| {
+            panic!("the streamed sentence never reached the screen: {screen:?}")
+        });
+        let question = screen
+            .find("allow shell?")
+            .unwrap_or_else(|| panic!("the question never reached the screen: {screen:?}"));
+        assert!(
+            text < question,
+            "the question painted above text the reader had not been shown, so the \
+             screen reads in the wrong order (ADR-4): {screen:?}"
+        );
+    }
+
+    /// **ADR-3's ownership rule, as a check rather than as a sentence**
+    /// ([[LESSON-547]]).
+    ///
+    /// A rule that crosses a seam is owned by exactly one side, and "the turn
+    /// loop flushes" plus "the surface flushes" are indistinguishable at review
+    /// time from two documents that agree. Scans the whole client, because the
+    /// failure this guards against is a *new* call site somewhere else — in
+    /// `main.rs` beside `hand_off_after_turn`, or as a self-flush inside
+    /// `render.rs` — which is the direction a rule like this actually rots in.
+    ///
+    /// **Counted *and* region-checked, uniformly.** The confirmation review
+    /// found this test applying its own lesson to one site and not the others:
+    /// the permission arm was pinned to a span of source, while `drain_events`'
+    /// flush was held in place by arithmetic alone and could be relocated
+    /// anywhere in this file without failing anything. Every required site now
+    /// has to be *where* it has to be, and the counts are kept only for the
+    /// thing a region cannot see — a sixth site appearing somewhere new.
+    #[test]
+    fn only_the_event_pump_declares_a_block_over() {
+        let sources = crate::status::scan::production_sources();
+        assert!(
+            !sources.is_empty(),
+            "the client source scan matched nothing — it is no longer looking at \
+             anything"
+        );
+
+        let mut callers: Vec<&str> = Vec::new();
+        for (rel, src) in &sources {
+            // `.end_block()` is a *call*; `fn end_block` is the declaration and
+            // the implementation, both of which live in `render.rs` by design.
+            // `.emit_held()` travels with it: it is the half of the verb a
+            // non-pump caller would reach for, and the pump owns both.
+            let code = crate::status::scan::code_only(src);
+            if (code.contains(".end_block()") || code.contains(".emit_held()"))
+                && rel != "client.rs"
+            {
+                callers.push(rel);
+            }
+        }
+        assert!(
+            callers.is_empty(),
+            "deciding that a block has ended belongs to `client.rs`'s event pump \
+             (ADR-3); these files also call it and would be a second owner of the \
+             rule: {callers:?}"
+        );
+
+        // Non-vacuity, both halves: the pump really does call it, and `render.rs`
+        // really does define it.
+        let client = sources
+            .iter()
+            .find(|(rel, _)| rel == "client.rs")
+            .map(|(_, src)| crate::status::scan::code_only(src))
+            .expect("client.rs is a production source");
+        assert_eq!(
+            client.matches(".end_block()").count(),
+            1,
+            "the block-ending verb has exactly **one** call site, because there is \
+             exactly one turn boundary in this client: the `P::ENDS_TURN` branch \
+             of `call`. ADR-3 named three. The site before `resolve_permission` \
+             was dropped during implementation — it clears the fence bit at a \
+             *pause* in a turn — and the site at the end of `drain_events` was \
+             dropped at verify for the sharper version of the same reason: \
+             `main.rs` polls that function every FRAME_INTERVAL, so it is a poll \
+             boundary, and a fence cleared eight times a second re-flows a \
+             broadcast code block as prose (BR-6). Both now call `emit_held()`, \
+             which leaves block state alone"
+        );
+        assert_eq!(
+            client.matches(".emit_held()").count(),
+            5,
+            "the flush-only verb has exactly five call sites: the non-turn branch \
+             of `call` (an RPC that is not a turn still pumped events and may \
+             have left a fragment held), the end of `drain_events` (nothing may \
+             be held across a return that hands the terminal back to a frame \
+             redraw), and **each of the three arms of `dispatch_event` that reach \
+             a `Prompter`** — permission, model proposal, attach consent. A \
+             `Prompter` is not a `Surface` and cannot flush what this one is \
+             holding (ADR-4). The count went 2 → 5 at the confirmation review, \
+             which found the two sibling arms unguarded: they were safe only \
+             because their callees happen to render through `surface.line` \
+             first, which is the incidental property this sweep exists to stop \
+             being the guarantee"
+        );
+
+        // **Every required site is region-checked, not counted.** The counts
+        // above catch a *sixth* call site appearing; they cannot catch an
+        // existing one moving, and that is the mutation the confirmation review
+        // named: relocate `drain_events`' flush anywhere else in this file and
+        // the arithmetic is still satisfied while the rule is broken. So each
+        // site is pinned to the span of source it has to sit in.
+        fn region<'a>(client: &'a str, start: &str, end: &str) -> &'a str {
+            let at = client
+                .find(start)
+                .unwrap_or_else(|| panic!("this sweep's anchor is gone from client.rs: {start:?}"));
+            let len = client[at..]
+                .find(end)
+                .unwrap_or_else(|| panic!("{end:?} no longer follows {start:?} in client.rs"));
+            &client[at..at + len]
+        }
+
+        // ADR-3's seam, both halves of it. `call` clears the fence **only** on
+        // the turn branch: it is the RPC boundary, not the turn boundary, and
+        // some thirty of its callers (`/cost`, `/model`, `/config`, the setup
+        // flows) are not turns at all.
+        let call_tail = region(
+            &client,
+            "let outcome = self.pump_until_answered(params, ctx);",
+            "fn pump_until_answered<",
+        );
+        assert!(
+            call_tail.contains("if P::ENDS_TURN {")
+                && call_tail.contains("ctx.surface.end_block()"),
+            "the fence may be dropped only when the RPC that finished was a turn, \
+             and that has to be asked of the **method** (`P::ENDS_TURN`) rather \
+             than of the call site — thirty call sites are thirty chances to \
+             answer it wrongly. A `/cost` typed while a second client is \
+             mid-` ```rust ` block would otherwise re-flow the rest of that block \
+             as prose (BR-6)"
+        );
+        assert!(
+            call_tail.contains("ctx.surface.emit_held()"),
+            "a non-turn RPC still pumped events while it waited, so it still has \
+             to flush before it hands the terminal back — it just may not touch \
+             block state"
+        );
+
+        // The poll boundary. Pinned by region rather than by arithmetic for the
+        // reason the region check exists at all.
+        assert!(
+            region(
+                &client,
+                "let outcome = self.pump_queued(ctx, on_first);",
+                "fn pump_queued(",
+            )
+            .contains("ctx.surface.emit_held()"),
+            "nothing may be held across `drain_events`' return: `main.rs` erases \
+             the entry frame before the drain and redraws it after, so this is \
+             the only window in which a row can be written cleanly (BR-8)"
+        );
+
+        // ADR-4's ordering property, structurally, on **each** arm that hands
+        // the terminal to a `Prompter`. The sweep above says the fence is not
+        // cleared at a prompt; this says the buffer *is* emitted there, by this
+        // pump, rather than by whatever the callee happens to render first.
+        for (arm, callee, what) in [
+            (
+                "EventOutcome::Permission(req) if ctx.answer_permissions",
+                "session_ui::resolve_permission(",
+                "a permission question",
+            ),
+            (
+                "EventOutcome::ModelProposal(proposal) if ctx.answer_model_proposals",
+                "model_ui::resolve_proposal(",
+                "a model proposal",
+            ),
+            (
+                "EventOutcome::AttachConsent(request) if ctx.answer_permissions",
+                "session_ui::resolve_attach_consent(",
+                "an attach-consent question — an access-control decision, and the \
+                 one that fires exactly when a second client attaches mid-turn",
+            ),
+        ] {
+            assert!(
+                region(&client, arm, callee).contains("ctx.surface.emit_held()"),
+                "{what} must never paint above assistant text the reader has not \
+                 been shown (ADR-4). `prompt.rs` writes straight to stdout and \
+                 cannot emit a held buffer, so the pump has to do it before it \
+                 hands the terminal over — and it must be `emit_held`, not \
+                 `end_block`, because a prompt is a pause in a turn and not the \
+                 end of one. That `{callee}` happens to render through \
+                 `surface.line` first is the callee's ordering, not this seam's \
+                 rule"
+            );
+        }
+
+        let render = sources
+            .iter()
+            .find(|(rel, _)| rel == "render.rs")
+            .map(|(_, src)| crate::status::scan::code_only(src))
+            .expect("render.rs is a production source");
+        assert!(
+            render.contains("fn end_block") && render.contains("fn emit_held"),
+            "this assertion is only meaningful while render.rs owns both verbs"
         );
     }
 

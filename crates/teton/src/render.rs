@@ -17,7 +17,11 @@
 //! through a [`RecordingSurface`] and assert on the semantic `(kind, text)` pairs
 //! rather than on any particular byte formatting.
 
+use std::fmt::Write as _;
 use std::io::{self, Write};
+use std::ops::Range;
+
+use crate::markdown::{self, Block, Inline, InlineStyle};
 
 /// The semantic class of a rendered line. A concrete [`Surface`] decides how each
 /// class looks (a prefix now, a coloured pane later).
@@ -69,6 +73,43 @@ impl LineKind {
     }
 }
 
+/// The SGR parameters each inline markdown run is drawn with (REQ-592 BR-5).
+///
+/// [`LineKind::sgr`]'s table again, for the other axis: that one keys on the
+/// class of a whole line composed by this binary, this one keys on a run parsed
+/// out of the **model's** text. The reason they are both here rather than at
+/// their callers is identical and is the sharper of the two here — assistant
+/// text is the one thing on this surface a fetched page can steer, and
+/// [`defused_multiline`] has already replaced every `\x1b` in it with a space.
+/// A renderer that let the text carry its own SGR would be handing that page the
+/// cursor back, which is the hole REQ-563/573 closed; a renderer that read
+/// markers and then *printed* them would be the defect REQ-592 exists to fix. So
+/// the seam reads the markers, drops them, and authors the escape itself from
+/// this fixed alphabet ([[LESSON-517]]).
+///
+/// Emphasis is italic rather than dim because emphasis is supposed to stand out;
+/// a terminal that does not implement SGR 3 ignores it and the text is merely
+/// unstyled, which is the same outcome as `NO_COLOR`. A code span takes the
+/// banner art's cyan — a colour rather than an attribute, so a run of code stays
+/// legible next to bold and italic prose.
+fn inline_sgr(style: InlineStyle) -> &'static str {
+    match style {
+        InlineStyle::Strong => "1",
+        InlineStyle::Emphasis => "3",
+        InlineStyle::Code => "36",
+    }
+}
+
+/// What a heading's whole row is drawn with. The `#` markers are not printed
+/// (REQ-592's recognized-construct table), so with colour off a heading is its
+/// own text and nothing else — the same trade `NO_COLOR` makes everywhere.
+const HEADING_SGR: &str = "1";
+
+/// Closes every attribute this surface opens. One reset ends a nested pair as
+/// surely as it ends a single one, which is why the styled row never has to
+/// track what it has to undo.
+const RESET: &str = "\x1b[0m";
+
 /// The rendering target. See the module docs for the contract.
 pub trait Surface {
     /// Emit one complete, newline-terminated line of the given semantic class.
@@ -97,6 +138,125 @@ pub trait Surface {
     /// than something each implementor must remember to add.
     fn repaint_row_above(&mut self, _rows_up: usize, _kind: LineKind, _text: &str) {}
 
+    /// Emit anything the surface is still holding, and **touch no block state**
+    /// (REQ-592 BR-8).
+    ///
+    /// The poll-safe half of [`Surface::end_block`], and the difference between
+    /// the two is the whole reason there are two. Emitting held rows is
+    /// something any caller about to claim the terminal may need at any moment;
+    /// dropping block state is something only a caller that knows the *turn* is
+    /// over may do. Fused into one verb, the second half rides along on every
+    /// call site the first half needs — and the first half's call sites include
+    /// a 120 ms poll loop.
+    ///
+    /// So this is the verb for a caller that is about to write, or about to hand
+    /// the terminal to something that is not a `Surface` at all: the idle drain
+    /// before it returns to a frame redraw, and the event pump before it lets
+    /// [`crate::prompt::Prompter`] ask a permission question. It is the same
+    /// thing `line()` and `repaint_row_above()` already do for themselves before
+    /// their own row — named, so that a caller with no row of its own can ask
+    /// for it without reaching for the turn-boundary verb.
+    ///
+    /// **Defaults to a no-op**, for `repaint_row_above`'s reason: a surface that
+    /// holds nothing has nothing to emit, so silence is the correct behaviour
+    /// rather than something each implementor must remember to add.
+    fn emit_held(&mut self) {}
+
+    /// Declare that the block of streamed output just ended: emit anything the
+    /// surface is still holding, and drop whatever block state it accumulated
+    /// while holding it (REQ-592 BR-8, ADR-3).
+    ///
+    /// [`Surface::emit_held`] plus the second half — and the second half is what
+    /// this verb is *for*. A caller that only needs the buffer on screen wants
+    /// `emit_held`; this one additionally forgets that a fence was open, which
+    /// is a claim about the model's output and not about the terminal.
+    ///
+    /// **Deciding that a block has ended is the caller's knowledge, not the
+    /// surface's** — the same division `repaint_row_above` makes about frame
+    /// geometry. A streaming renderer cannot tell a pause in the token stream
+    /// from the end of a reply, so it must never guess: the tail of a turn is
+    /// emitted because the event pump *knows* the turn is over, never because a
+    /// timer or a heuristic inside the surface decided the model had stopped
+    /// talking.
+    ///
+    /// **Every call site of this verb lives in `client.rs`'s event pump**
+    /// (ADR-3, [[LESSON-547]]), and since REQ-592's verify there is exactly one:
+    /// the end of `Connection::call`. Not `main.rs`, not `hand_off_after_turn`,
+    /// not a self-flush in this module.
+    ///
+    /// The obvious site is `hand_off_after_turn`, and it is wrong — though not
+    /// for the reason first recorded here, which was that a flush hung there
+    /// would drop buffered text on every failed turn. That overstates it: every
+    /// *arm* of `main.rs`'s turn match writes through [`Surface::line`] after
+    /// `call` returns, and `line()` emits the held buffer ahead of its own row
+    /// (BR-8), so on those paths the same bytes reach the screen in the same
+    /// order either way — moving the flush there changes no pty output at all.
+    ///
+    /// Three things the hand-off still cannot do. It cannot **clear the fence
+    /// bit**, the half only this verb performs: just the `Ok` arm of that match
+    /// reaches it, so a turn the daemon refused mid-fence would leave
+    /// `fence == true` and render every later reply of the session verbatim. It
+    /// never runs when `call` returns through its own transport `?`, which
+    /// leaves the entry loop without writing a line at all. And no arm of it
+    /// runs on the idle path, where fragments arrive with no turn in flight. The
+    /// pump is the one place that owns the surface on every path an event can
+    /// take.
+    ///
+    /// **A turn boundary, and only a turn boundary.** This verb drops block
+    /// state — the open-fence bit among it — because the *block* ended, so
+    /// calling it at a mid-turn pause is a bug rather than a harmless extra
+    /// flush. A model that opens a ` ```rust ` fence, hits a tool call, and
+    /// resumes after the user answers the permission prompt would have the rest
+    /// of its code classified as markdown and **word-wrapped at the terminal
+    /// width** — one statement broken across rows at a space, and a wrapped
+    /// shell command is a different command.
+    ///
+    /// The damage is re-flowed code, not stray emphasis: `**ptr` with no closing
+    /// pair keeps its literal marker, and `*y * z` fails the space-flank rule, so
+    /// [`markdown::parse_inline`] leaves both alone. Reaching for an emphasis
+    /// example here would understate it — the wrap is the part that changes what
+    /// the characters *mean*. That is BR-6's failure, caused by an over-eager
+    /// call to the thing meant to prevent a different one. A mid-turn caller
+    /// that needs the buffer on screen ahead of its own row has `line()`,
+    /// `repaint_row_above()`, and [`Surface::emit_held`] — none of which touch
+    /// the fence.
+    ///
+    /// **Defaults to a no-op**, for `repaint_row_above`'s reason: a surface that
+    /// holds nothing has nothing to emit, so silence is the correct behaviour
+    /// rather than something each implementor must remember to add. That default
+    /// is also what keeps this verb from rippling through the ~15 modules that
+    /// consume `&mut dyn Surface` and the three implementors that buffer
+    /// nothing.
+    fn end_block(&mut self) {}
+
+    /// Tell the surface the terminal is now `width` columns wide (REQ-592 OQ-4).
+    ///
+    /// **A setter, never a query the surface makes for itself.** This is the
+    /// same division `repaint_row_above` and `end_block` make, applied to the
+    /// one runtime fact layout needs: `PlainSurface` is generic over its writer
+    /// and [`crate::prompt::terminal_width`] reads `STDOUT_FILENO` specifically,
+    /// so a surface over a `Vec<u8>` that asked for its own width would be
+    /// measuring a terminal it is not writing to. Because the number always
+    /// arrives from outside, every layout decision below stays reachable from a
+    /// test with no terminal in sight — BR-10's rule, and the reason
+    /// [`PlainSurface::with_markdown`] takes a width in the first place.
+    ///
+    /// **Rows already emitted keep the breaks they were laid out with.** Only
+    /// blocks rendered after this call use the new width, which is exactly what
+    /// OQ-4 decided: no `SIGWINCH` handler, a resize takes effect on the next
+    /// block, and nothing already on screen is re-flowed. Text the surface is
+    /// still *holding* has not been emitted, so it is laid out at the new width
+    /// — the right answer, and the reason this deliberately does not flush.
+    /// Flushing here would also be `end_block`'s job, which belongs to the event
+    /// pump alone.
+    ///
+    /// **Defaults to a no-op**, for `end_block`'s reason: a surface that lays
+    /// nothing out has no width, so silence is correct rather than something
+    /// each implementor must remember to add. On a `PlainSurface` built without
+    /// a renderer it is a no-op too — there is no width to change, which is BR-7
+    /// holding here as it does everywhere else.
+    fn set_width(&mut self, _width: usize) {}
+
     /// Flush any buffered output. The default is a no-op.
     ///
     /// # Errors
@@ -107,20 +267,68 @@ pub trait Surface {
     }
 }
 
+/// Everything the markdown renderer has to remember between calls (REQ-592
+/// ADR-1). Held in an `Option` on the surface, so a surface without one is not a
+/// surface with the renderer switched off — it has no renderer at all.
+///
+/// All three buffers exist because assistant text arrives token by token and
+/// none of the decisions can be made from one chunk:
+///
+/// - `pending` — a line is the unit every layout decision is taken over, and no
+///   single `fragment()` is a line. Text is held here until a `\n` completes it,
+///   or until something else claims the row (BR-8) and forces the partial line
+///   out as it stands.
+/// - `table` — a table's columns cannot be measured until the run of rows ends,
+///   which is the accepted cost in BR-4. The rows are held as their *source*
+///   lines, because [`markdown::layout_table`] is what turns a run into display
+///   text and it takes the whole run at once.
+/// - `fence` — [`markdown::classify`] is deliberately line-oriented and holds no
+///   memory, so the one bit of block state a streaming renderer needs lives
+///   here. Inside a fence nothing is classified at all (BR-6).
+///
+/// **Nothing here is flushed on a timer or a heuristic.** The verb that empties
+/// these at the end of a turn is `Surface::end_block`, and its one call site
+/// belongs to `client.rs`'s event pump (ADR-3) — this module must never decide
+/// on its own that a block has ended. `Surface::emit_held` empties the first two
+/// without touching `fence`, which is what a caller that merely needs the screen
+/// current asks for.
+struct MarkdownState {
+    /// The terminal width to lay out at, in columns. A parameter, never a query:
+    /// the surface is handed the answer by the wiring that knows there is a
+    /// terminal at all (BR-7, BR-10).
+    width: usize,
+    /// Streamed text received since the last `\n`, already defused.
+    pending: String,
+    /// Consecutive table rows buffered until the run ends, as their source text.
+    table: Vec<String>,
+    /// Whether a ` ``` ` fence is currently open.
+    fence: bool,
+}
+
 /// A plain streaming-text surface over any [`Write`] (stdout in the binary).
 ///
 /// It tracks whether the cursor is at the start of a line so that a `line()`
 /// arriving in the middle of streamed `fragment()`s first closes the open line —
 /// keeping notices and assistant text from colliding on one row.
+///
+/// Since REQ-592 it optionally renders markdown, and the option is taken **at
+/// construction** rather than tested inside `fragment()`. That is ADR-1, and the
+/// consequence it buys is BR-7: the piped path builds a surface with no
+/// renderer, so "inert off a terminal" is true by construction rather than by a
+/// conditional a later edit could invert — and every test that builds one
+/// through [`PlainSurface::new`] or [`PlainSurface::with_color`] keeps its bytes
+/// unchanged without having to say so.
 pub struct PlainSurface<W: Write> {
     out: W,
     at_line_start: bool,
     color: bool,
+    /// The markdown renderer, or `None` for the raw pass-through path.
+    markdown: Option<MarkdownState>,
 }
 
 impl<W: Write> PlainSurface<W> {
-    /// Wraps `out` in a surface that emits no colour. Starts assuming a fresh
-    /// line.
+    /// Wraps `out` in a surface that emits no colour and renders no markdown.
+    /// Starts assuming a fresh line.
     pub fn new(out: W) -> Self {
         Self::with_color(out, false)
     }
@@ -129,11 +337,54 @@ impl<W: Write> PlainSurface<W> {
     /// `color`. Whether the target can take colour is a property of the target,
     /// so it is the surface that holds the answer — the callers composing lines
     /// never need to know.
+    ///
+    /// Renders no markdown: assistant text is passed through defused and
+    /// otherwise untouched, which is what every non-terminal target wants.
     pub fn with_color(out: W, color: bool) -> Self {
         Self {
             out,
             at_line_start: true,
             color,
+            markdown: None,
+        }
+    }
+
+    /// Wraps `out` in a surface that renders assistant text as markdown at
+    /// `width` columns, styling it when `color` (REQ-592 BR-3..BR-6).
+    ///
+    /// The third constructor rather than a flag on the second, because the two
+    /// answers are independent and one of them is not about colour: a terminal
+    /// under `NO_COLOR` still wants its prose wrapped and its tables laid out,
+    /// it just wants none of it in SGR. `color` gates only the escapes.
+    ///
+    /// `width` is passed in because the query lives in `prompt.rs` and the
+    /// decision to render at all lives in the wiring that knows stdout is a
+    /// terminal — BR-10's rule, so that every layout decision below is reachable
+    /// from a test with no terminal in sight.
+    // The one caller outside this module's own tests is `main.rs`'s surface
+    // construction — the place that owns the terminal gate, and the only place
+    // that knows whether stdout is one (ADR-1, [[LESSON-547]]: a rule that
+    // crosses a seam is owned by exactly one side).
+    //
+    // Until that caller existed this carried a `#[cfg_attr(not(test),
+    // expect(dead_code, …))]`, chosen over an `allow` because an `allow` would
+    // have gone on being correct once the wiring landed and would have sat here
+    // forever — the lingering-suppression failure tetond's ADR-J is about. The
+    // `expect` inverted it: the moment a real caller appeared the lint stopped
+    // firing, *the attribute* became the warning, and `-D warnings` made
+    // deleting it a condition of landing the gate. It did exactly that, and this
+    // paragraph is what is left of it.
+    pub fn with_markdown(out: W, color: bool, width: usize) -> Self {
+        Self {
+            out,
+            at_line_start: true,
+            color,
+            markdown: Some(MarkdownState {
+                width,
+                pending: String::new(),
+                table: Vec::new(),
+                fence: false,
+            }),
         }
     }
 
@@ -258,6 +509,315 @@ fn defused_multiline(text: &str) -> String {
     neutralized(text, true)
 }
 
+/// One wrapped row's bytes: the text of `span`, with the SGR this surface
+/// authors drawn over the runs [`markdown::parse_inline`] found.
+///
+/// `base` is an attribute the *whole* row carries — a heading's bold — and it is
+/// re-opened after every inner run's reset, because one `\x1b[0m` ends
+/// everything that is open and there is no way to close just the inner one. An
+/// inner run inside a base therefore opens as a combined `base;inner`, which is
+/// how a code span inside a heading stays bold and cyan rather than losing the
+/// bold at its own reset.
+///
+/// Called **only** on the coloured path. With colour off the surface authors no
+/// escape at all — see [`PlainSurface::block_rows`], where that is a structural
+/// property rather than a branch that happens to be empty.
+fn styled_span(inline: &Inline, span: &Range<usize>, base: Option<&str>) -> String {
+    let mut out = String::with_capacity(span.len());
+    if let Some(base) = base {
+        let _ = write!(out, "\x1b[{base}m");
+    }
+    // Walked one character at a time and asked per byte offset rather than
+    // intersected span-by-span, because `style_at` is the accessor `Inline`
+    // exposes for exactly this and asking it is what keeps the styling indexed
+    // to the same string the break was measured from ([[LESSON-529]]).
+    let mut open: Option<InlineStyle> = None;
+    for (at, c) in inline.text[span.clone()].char_indices() {
+        let here = inline.style_at(span.start + at);
+        if here != open {
+            if open.is_some() {
+                out.push_str(RESET);
+            }
+            match (base, here) {
+                (Some(base), Some(style)) => {
+                    let _ = write!(out, "\x1b[{base};{}m", inline_sgr(style));
+                }
+                (None, Some(style)) => {
+                    let _ = write!(out, "\x1b[{}m", inline_sgr(style));
+                }
+                // The base was reset alongside the run that just closed, so it
+                // has to be re-opened for the plain text that follows.
+                (Some(base), None) if open.is_some() => {
+                    let _ = write!(out, "\x1b[{base}m");
+                }
+                (Some(_) | None, None) => {}
+            }
+            open = here;
+        }
+        out.push(c);
+    }
+    if open.is_some() || base.is_some() {
+        out.push_str(RESET);
+    }
+    out
+}
+
+/// [`markdown::wrap_indented`]'s rows, assembled here so that each one can carry
+/// SGR (REQ-592 BR-3 and BR-5 together).
+///
+/// The surface assembles rather than delegates on this path for one reason:
+/// [`markdown::wrap_ranges`] returns **byte ranges** into the same string
+/// [`markdown::parse_inline`] indexed its spans against, so a style lands on the
+/// bytes the break was measured from. Taking the finished strings back instead
+/// and finding the styled runs in them again would be a second measurement that
+/// could disagree with the first, which is the whole shape of [[LESSON-529]].
+fn styled_rows(
+    inline: &Inline,
+    width: usize,
+    first_prefix: &str,
+    cont_prefix: &str,
+    base: Option<&str>,
+) -> Vec<String> {
+    let first_avail = width.saturating_sub(markdown::display_width(first_prefix));
+    let cont_avail = width.saturating_sub(markdown::display_width(cont_prefix));
+    markdown::wrap_ranges(&inline.text, first_avail, cont_avail)
+        .into_iter()
+        .enumerate()
+        .map(|(row, span)| {
+            let prefix = if row == 0 { first_prefix } else { cont_prefix };
+            format!("{prefix}{}", styled_span(inline, &span, base))
+        })
+        .collect()
+}
+
+/// The markdown renderer's half of [`PlainSurface`]. Every method here is inert
+/// — an early `return` on a `None` field — when the surface was built without a
+/// renderer, which is what makes BR-7 a property of construction (ADR-1).
+impl<W: Write> PlainSurface<W> {
+    /// The width to lay out at, or the no-terminal default when there is no
+    /// renderer to ask. The fallback is unreachable from the paths that use it
+    /// (they all check the renderer first) and is named rather than invented so
+    /// that it cannot become a different number from the width query's own
+    /// fallback.
+    fn markdown_width(&self) -> usize {
+        self.markdown
+            .as_ref()
+            .map_or(markdown::DEFAULT_WIDTH, |state| state.width)
+    }
+
+    /// Write one finished row and its newline.
+    ///
+    /// Every byte the renderer emits goes through here, which is why
+    /// `at_line_start` is simply true afterwards: the renderer never leaves a
+    /// partial row on screen, so the bookkeeping still reads the **emitted**
+    /// text rather than the argument, exactly as [`Surface::fragment`]'s own
+    /// assignment does.
+    fn write_row(&mut self, row: &str) {
+        let _ = writeln!(self.out, "{row}");
+        self.at_line_start = true;
+    }
+
+    /// One block's rows, styled or not.
+    ///
+    /// The split is not an optimization and it is not a duplicate layout: with
+    /// colour off the surface has **no escape to author**, so the layout
+    /// module's own rows are already the finished bytes and it writes them
+    /// unchanged. That is what makes AC-8's "zero `\x1b` bytes" a property of
+    /// the code path rather than of a table lookup that happens to return
+    /// nothing — the uncoloured path never touches [`inline_sgr`] at all.
+    ///
+    /// Both arms bottom out in the same [`markdown::wrap_ranges`] call with the
+    /// same two available widths, so they cannot disagree about where a row
+    /// ends; and the prefixes each arm needs are stated once, in `markdown.rs`
+    /// ([`markdown::list_item_prefixes`], [`markdown::QUOTE_PREFIX`]), so they
+    /// cannot disagree about what a row starts with either.
+    fn block_rows(&self, block: &Block<'_>) -> Vec<String> {
+        let width = self.markdown_width();
+        match block {
+            Block::Heading { text, .. } => {
+                let inline = markdown::parse_inline(text);
+                if self.color {
+                    styled_rows(&inline, width, "", "", Some(HEADING_SGR))
+                } else {
+                    markdown::wrap(&inline.text, width)
+                }
+            }
+            Block::ListItem { marker, text } => {
+                let inline = markdown::parse_inline(text);
+                if self.color {
+                    let (first, cont) = markdown::list_item_prefixes(marker);
+                    styled_rows(&inline, width, &first, &cont, None)
+                } else {
+                    markdown::wrap_list_item(marker, &inline.text, width)
+                }
+            }
+            Block::Quote { text } => {
+                let inline = markdown::parse_inline(text);
+                if self.color {
+                    let quote = markdown::QUOTE_PREFIX;
+                    styled_rows(&inline, width, quote, quote, None)
+                } else {
+                    markdown::wrap_block_quote(&inline.text, width)
+                }
+            }
+            Block::Paragraph { indent, text } => {
+                let inline = markdown::parse_inline(text);
+                // The indent is a column count, so it is redrawn as spaces: a
+                // tab that measured eight columns comes back as eight of them.
+                // Keeping it at all is what makes an indented code block
+                // legible-but-unstyled rather than silently un-indented (AC-14).
+                let pad = " ".repeat(*indent);
+                if self.color {
+                    styled_rows(&inline, width, &pad, &pad, None)
+                } else {
+                    markdown::wrap_indented(&inline.text, width, &pad, &pad)
+                }
+            }
+            // Structure, not prose. `Blank` and `ThematicBreak` are one fixed
+            // row each; the fence and table variants are state the caller in
+            // `render_source_line` handles before it ever gets here.
+            Block::Blank
+            | Block::ThematicBreak
+            | Block::Fence { .. }
+            | Block::TableRow { .. }
+            | Block::TableSeparator { .. } => Vec::new(),
+        }
+    }
+
+    /// Emit one classified block.
+    fn render_block(&mut self, block: &Block<'_>) {
+        match block {
+            Block::Blank => self.write_row(""),
+            Block::ThematicBreak => {
+                let rule = markdown::thematic_break(self.markdown_width());
+                self.write_row(&rule);
+            }
+            Block::Fence { .. } | Block::TableRow { .. } | Block::TableSeparator { .. } => {}
+            Block::Heading { .. }
+            | Block::ListItem { .. }
+            | Block::Quote { .. }
+            | Block::Paragraph { .. } => {
+                let rows = self.block_rows(block);
+                if rows.is_empty() {
+                    // A construct with no text left after its markers — `# ` on
+                    // its own, or a bare `>`. It occupied a row in the model's
+                    // output, and emitting nothing would close up a paragraph
+                    // break the reader was shown. The marker is not reprinted
+                    // (that is the construct's whole point), so what lands is an
+                    // empty row, or `>` for a quote.
+                    let empty = match block {
+                        Block::Quote { .. } => markdown::QUOTE_PREFIX.trim_end(),
+                        _ => "",
+                    };
+                    self.write_row(empty);
+                    return;
+                }
+                for row in rows {
+                    self.write_row(&row);
+                }
+            }
+        }
+    }
+
+    /// Lay out and emit the buffered table run, if there is one (BR-4).
+    fn flush_table_run(&mut self) {
+        let Some(state) = self.markdown.as_mut() else {
+            return;
+        };
+        if state.table.is_empty() {
+            return;
+        }
+        let rows = std::mem::take(&mut state.table);
+        let width = state.width;
+        let borrowed: Vec<&str> = rows.iter().map(String::as_str).collect();
+        // Emitted exactly as `layout_table` returned them. It hands back final
+        // display text with the inline markers already removed and the padding
+        // computed from the stripped widths, so a `parse_inline` pass here would
+        // strip a second time and walk every cell four columns left per marker
+        // pair — the table's own doc comment calls that out as a contract rather
+        // than a detail. The recorded cost is BR-5's: no inline styling inside a
+        // table cell, unstyled at the right column beating bold at the wrong one.
+        for row in markdown::layout_table(&borrowed, width) {
+            self.write_row(&row);
+        }
+    }
+
+    /// Render one **complete** source line of assistant text.
+    ///
+    /// The fence check comes first and does not go through
+    /// [`markdown::classify`] at all: BR-6 makes fence content verbatim, so
+    /// classifying a line of shell inside one would read a glob's `*` as
+    /// emphasis and a row of tabular output as a table cell. The closing
+    /// delimiter is recognized through [`markdown::fence_close`] — a
+    /// *different* question from the `fence_open` one [`markdown::classify`]
+    /// asks, and deliberately so. An opener may carry an info string
+    /// (```` ```rust ````); a closer may not. Asking one function both
+    /// questions is exactly what let a nested opener close its parent, which
+    /// the verify pass found and this split fixes. A fence the two disagreed
+    /// about would never close, and every remaining line of the reply would
+    /// render as code.
+    fn render_source_line(&mut self, line: &str) {
+        if self.markdown.as_ref().is_some_and(|state| state.fence) {
+            if markdown::fence_close(line).is_some() {
+                self.set_fence(false);
+            } else {
+                self.write_row(line);
+            }
+            return;
+        }
+
+        match markdown::classify(line) {
+            // A run of rows is buffered until something that is not a row ends
+            // it, because a column's width is not knowable from one row.
+            Block::TableRow { .. } | Block::TableSeparator { .. } => {
+                if let Some(state) = self.markdown.as_mut() {
+                    state.table.push(line.to_owned());
+                }
+            }
+            Block::Fence { .. } => {
+                self.flush_table_run();
+                self.set_fence(true);
+            }
+            other => {
+                self.flush_table_run();
+                self.render_block(&other);
+            }
+        }
+    }
+
+    /// Open or close the fence bit.
+    fn set_fence(&mut self, open: bool) {
+        if let Some(state) = self.markdown.as_mut() {
+            state.fence = open;
+        }
+    }
+
+    /// Emit everything the renderer is still holding, so that a caller about to
+    /// claim a row does not paint over text the reader has not seen (BR-8).
+    ///
+    /// Order matters and is not the order the buffers are declared in. The
+    /// partial line goes **first**, because it is the newest text in the stream
+    /// and it may itself be the last row of the open table run — closing the run
+    /// before classifying it would split one table into two.
+    ///
+    /// This is not `end_block()`. That verb drops the fence bit too, and its one
+    /// call site belongs to `client.rs`'s event pump at a turn boundary (ADR-3);
+    /// what happens here is the narrow case where something is about to write
+    /// and the buffer must go out ahead of it. It is also the whole of
+    /// [`Surface::emit_held`] — the same narrow case, named for a caller that
+    /// has no row of its own to write.
+    fn emit_pending(&mut self) {
+        let Some(state) = self.markdown.as_mut() else {
+            return;
+        };
+        let pending = std::mem::take(&mut state.pending);
+        if !pending.is_empty() {
+            self.render_source_line(&pending);
+        }
+        self.flush_table_run();
+    }
+}
+
 impl<W: Write> Surface for PlainSurface<W> {
     /// The styling wraps the *defused* text and is drawn from
     /// [`LineKind::sgr`], never from the argument — so a caller cannot colour a
@@ -283,6 +843,14 @@ impl<W: Write> Surface for PlainSurface<W> {
             "{kind:?} is styled by the surface; it must not carry its own escapes \
              (they will be neutralized into visible debris): {text:?}"
         );
+
+        // A line owns its row, so anything the renderer is still holding goes
+        // out ahead of it (REQ-592 BR-8) — otherwise a notice arriving mid-turn
+        // prints above a sentence the reader has not been shown yet, and the
+        // screen reads in the wrong order. Inert without a renderer, and it
+        // leaves the surface at the start of a row, so the close below is
+        // unchanged for both paths.
+        self.emit_pending();
 
         // Close any open streamed line first so the notice starts clean.
         if !self.at_line_start {
@@ -313,10 +881,41 @@ impl<W: Write> Surface for PlainSurface<W> {
     /// ending in a bare `\r` would otherwise leave the bookkeeping claiming a
     /// fresh row while the cursor sat mid-row, and the next `line()` would print
     /// over the streamed text instead of below it.
+    ///
+    /// With a renderer attached (REQ-592) the defusing happens **first and
+    /// unchanged**, and every markdown decision is taken over the already-defused
+    /// text. That ordering is the feature's central constraint: a renderer that
+    /// parsed first and defused second would be reading an attacker's escape
+    /// bytes as markup, and one that let its own styling through the guard would
+    /// have to weaken the guard. Here the escapes are already spaces by the time
+    /// [`markdown::classify`] sees the line, and the SGR is authored afterwards
+    /// from [`inline_sgr`]'s fixed table ([[LESSON-517]], BR-5).
     fn fragment(&mut self, text: &str) {
         let shown = defused_multiline(text);
-        let _ = write!(self.out, "{shown}");
-        self.at_line_start = shown.ends_with('\n');
+        if self.markdown.is_none() {
+            let _ = write!(self.out, "{shown}");
+            self.at_line_start = shown.ends_with('\n');
+            return;
+        }
+
+        // A line is the unit every layout decision is taken over and no single
+        // chunk is a line, so the text accumulates until a `\n` completes one.
+        // What is left over stays held: the tail of a turn is emitted by
+        // `end_block()` from the event pump (ADR-3), never by this module
+        // guessing that the model has stopped talking.
+        let mut complete: Vec<String> = Vec::new();
+        if let Some(state) = self.markdown.as_mut() {
+            state.pending.push_str(&shown);
+            while let Some(at) = state.pending.find('\n') {
+                let rest = state.pending.split_off(at + 1);
+                let mut line = std::mem::replace(&mut state.pending, rest);
+                line.pop();
+                complete.push(line);
+            }
+        }
+        for line in complete {
+            self.render_source_line(&line);
+        }
     }
 
     /// Save the cursor, step up, clear that row, write, restore. `at_line_start`
@@ -324,6 +923,14 @@ impl<W: Write> Surface for PlainSurface<W> {
     /// bookkeeping that keeps a later `line()` from colliding with streamed
     /// output is still accurate.
     fn repaint_row_above(&mut self, rows_up: usize, kind: LineKind, text: &str) {
+        // Same rule as `line()`, for the same reason (BR-8): a repaint moves the
+        // cursor over rows that are already on screen, and buffered text is text
+        // that is not on screen yet. Emitting first also keeps `rows_up`
+        // measuring from the row the caller believes it is measuring from —
+        // scrolling the frame *after* the offset was chosen is what would put
+        // the indicator somewhere else.
+        self.emit_pending();
+
         let prefix = Self::prefix(kind);
         // A repaint claims exactly one row, and the cursor restore assumes it: a
         // newline here would scroll the frame out from under `\x1b[u` and leave
@@ -336,6 +943,51 @@ impl<W: Write> Surface for PlainSurface<W> {
             "\x1b[s\x1b[{rows_up}A\r\x1b[K{prefix}{single_row}\x1b[u"
         );
         let _ = self.out.flush();
+    }
+
+    /// The held rows, and nothing else — the same [`Self::emit_pending`] a
+    /// mid-stream `line()` runs, exposed for a caller that has no row of its own.
+    ///
+    /// The fence bit is deliberately *not* touched here. That is the entire
+    /// distinction from [`Surface::end_block`] below, and it is what makes this
+    /// verb safe to call from a poll loop: the idle drain runs eight times a
+    /// second, and a fence cleared at that rate reclassifies a broadcast code
+    /// block as prose from the next poll onward.
+    fn emit_held(&mut self) {
+        self.emit_pending();
+    }
+
+    /// Emit the held tail and forget the block state that produced it.
+    ///
+    /// Two halves, and the second is the one that is easy to leave out. The
+    /// buffers go out through the same [`Self::emit_pending`] a mid-stream
+    /// `line()` uses, in the same order and for the same reason. **Then the
+    /// fence bit is cleared**, which no other path in this module ever does: a
+    /// reply that opened a ` ``` ` and never closed it leaves `fence == true`,
+    /// and a bit that survives the turn makes every subsequent line of every
+    /// subsequent turn render verbatim — no wrap, no styling, for the rest of
+    /// the session. The renderer cannot clear it on its own, because inside a
+    /// fence "this line is not markup" is exactly what it is supposed to
+    /// believe; only a caller that knows the block is over can say otherwise,
+    /// which is what this verb is.
+    ///
+    /// Order matters: the tail is emitted **before** the bit is dropped, so a
+    /// partial last line inside a fence still goes out verbatim rather than
+    /// being classified on its way past a fence that had just been declared
+    /// shut.
+    ///
+    /// That the bit is dropped at all is why the trait's contract restricts this
+    /// verb to a turn boundary — see [`Surface::end_block`].
+    fn end_block(&mut self) {
+        self.emit_pending();
+        self.set_fence(false);
+    }
+
+    /// No renderer, no width: the `if let` is the whole of BR-7's answer here.
+    fn set_width(&mut self, width: usize) {
+        if let Some(state) = self.markdown.as_mut() {
+            state.width = width;
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -776,5 +1428,859 @@ mod tests {
         assert_eq!(surface.lines_of(LineKind::Notice), vec!["note one"]);
         assert!(surface.any_line_contains(LineKind::Error, "boom"));
         assert!(!surface.any_line_contains(LineKind::Notice, "boom"));
+    }
+
+    // ---- REQ-592: the markdown renderer -----------------------------------
+    //
+    // Every test below opts in through `with_markdown`. Every test *above*
+    // builds through `new`/`with_color` and is unchanged by this REQ, which is
+    // ADR-1's whole claim: the renderer is a third constructor, not a branch
+    // inside the two that already shipped.
+
+    /// Drive a markdown surface with a scripted sequence of streamed chunks.
+    ///
+    /// There is no flush here on purpose. `end_block()` and its call sites are
+    /// TASK-280's, and this module must never decide on its own that the model
+    /// has stopped talking — so a chunk sequence that does not end in a `\n`
+    /// leaves its tail held, and these tests say so where it matters.
+    fn markdown_out(color: bool, width: usize, chunks: &[&str]) -> String {
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::with_markdown(&mut buf, color, width);
+            for chunk in chunks {
+                surface.fragment(chunk);
+            }
+        }
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// [`markdown_out`] with the block declared over afterwards — what
+    /// `client.rs`'s pump does at the end of a turn (ADR-3).
+    ///
+    /// Deliberately identical to `markdown_out` but for the one extra call, so a
+    /// pair of assertions taken over both is a statement about `end_block` and
+    /// nothing else.
+    fn markdown_out_ended(color: bool, width: usize, chunks: &[&str]) -> String {
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::with_markdown(&mut buf, color, width);
+            for chunk in chunks {
+                surface.fragment(chunk);
+            }
+            surface.end_block();
+        }
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// Everything that is not whitespace, in order — what a construct's
+    /// characters are, independent of where the rows were broken.
+    fn ink(text: &str) -> String {
+        text.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// **AC-5.** The guard and the styling in the same chunk, which is the only
+    /// arrangement that proves which direction the bytes flow.
+    ///
+    /// A fetched page can steer assistant text (REQ-563), so an `\x1b[2K\x1b[1A`
+    /// arriving mid-sentence must reach the terminal as the visible characters
+    /// the page really contained — while `**bold**` in the *same* chunk still
+    /// comes out as a real SGR sequence. The two together are only possible if
+    /// the escape is authored here, after [`defused_multiline`], from
+    /// [`inline_sgr`]'s table: a renderer that passed the model's escapes
+    /// through would emit both, and one that let markdown style itself would
+    /// have had to stop defusing to do it ([[LESSON-517]]).
+    ///
+    /// Mutation-checked: drop the `defused_multiline` call in `fragment` and the
+    /// first two assertions fail on the cursor-motion sequences.
+    #[test]
+    fn a_rendered_fragment_defuses_escapes_and_still_authors_its_own_sgr() {
+        let out = markdown_out(true, 60, &["here is \x1b[2K\x1b[1A**bold** text\n"]);
+
+        assert!(
+            !out.contains("\x1b[2K"),
+            "an erase-line command survived the renderer: {out:?}"
+        );
+        assert!(
+            !out.contains("\x1b[1A"),
+            "a cursor-up command survived the renderer: {out:?}"
+        );
+        // Neutralized, not censored: the ESC became a space and the rest of the
+        // sequence is ordinary text, because the page really did contain it.
+        assert!(
+            out.contains("[2K"),
+            "the escape's remains are shown: {out:?}"
+        );
+        // Authored here, from the fixed table, over text that has no escapes
+        // left in it.
+        assert!(
+            out.contains("\x1b[1mbold\x1b[0m"),
+            "the strong run was not styled by the surface: {out:?}"
+        );
+        assert!(
+            !out.contains("**"),
+            "the markers were printed instead of drawn: {out:?}"
+        );
+    }
+
+    /// **AC-8, unit leg.** With colour off the surface authors no escape at all
+    /// — not an empty one, not a reset. The rows are still wrapped, because
+    /// wrapping is not styling: a terminal under `NO_COLOR` has exactly the same
+    /// width problem as one without it.
+    #[test]
+    fn an_uncolored_markdown_surface_wraps_and_emits_no_escapes() {
+        let source = "**strong** and *emphasis* and `code` in a paragraph long enough to wrap\n";
+
+        let plain = markdown_out(false, 20, &[source]);
+        assert!(
+            !plain.contains('\x1b'),
+            "colour is off and an escape was authored anyway: {plain:?}"
+        );
+        // Markers are still consumed — printing `**strong**` verbatim is the
+        // defect, and it is a defect at every colour setting.
+        assert!(!plain.contains("**") && !plain.contains('`'), "{plain:?}");
+        assert!(plain.contains("strong"), "{plain:?}");
+        for row in plain.lines() {
+            assert!(
+                markdown::display_width(row) <= 20,
+                "a row exceeded the width: {row:?}"
+            );
+        }
+
+        // The same input with colour on carries the AC-5 alphabet and nothing
+        // else.
+        let styled = markdown_out(true, 20, &[source]);
+        assert!(styled.contains("\x1b[1mstrong\x1b[0m"), "{styled:?}");
+        assert!(styled.contains("\x1b[3memphasis\x1b[0m"), "{styled:?}");
+        assert!(styled.contains("\x1b[36mcode\x1b[0m"), "{styled:?}");
+    }
+
+    /// **BR-3 and BR-5 at the same byte: an inline run that *straddles* a wrap
+    /// break.**
+    ///
+    /// Every other styling test here either styles a single unbreakable word or
+    /// wraps a paragraph that carries no markers, so none of them ever asks what
+    /// happens when a run is still open at the end of a row. A terminal has no
+    /// notion of "this attribute continues on the next line" — SGR is a stream,
+    /// and a row that leaves bold open leaks it onto whatever is written next,
+    /// including the entry frame and the next turn's notices. So the run has to
+    /// be closed at the break and re-opened on the row after it, which is a
+    /// property of [`styled_span`] being called once per wrapped span rather
+    /// than once per run.
+    ///
+    /// Asserted as exact bytes rather than as "contains bold somewhere",
+    /// because the failure this is aimed at is an *absent reset* — and a
+    /// `contains` for text that is present either way cannot see one.
+    ///
+    /// (Verified by mutation: making `styled_span`'s post-loop reset fire only
+    /// when `base.is_some()` — so an in-progress inline run is not closed at a
+    /// row boundary — leaves the rest of the suite green and fails here.)
+    #[test]
+    fn a_styled_run_that_straddles_a_wrap_break_is_closed_and_reopened_per_row() {
+        let out = markdown_out_ended(true, 20, &["**alpha bravo charlie delta echo**\n"]);
+
+        assert_eq!(
+            out, "\x1b[1malpha bravo charlie\x1b[0m\n\x1b[1mdelta echo\x1b[0m\n",
+            "a run open at a row boundary must be closed there and re-opened on \
+             the next row: {out:?}"
+        );
+
+        // Said again as the invariant rather than as the string, so the reason
+        // survives a future width change: no row ends inside an open attribute.
+        for row in out.lines() {
+            assert!(
+                !row.contains('\x1b') || row.ends_with(RESET),
+                "a row that opened an attribute did not close it, so the \
+                 attribute leaks onto the next thing written: {row:?}"
+            );
+        }
+    }
+
+    /// The two arms of `block_rows` — the surface assembling a styled row, and
+    /// `markdown.rs` returning an unstyled one — must agree about where a row
+    /// starts and where it ends. They share the wrap, but each builds its own
+    /// prefixes, so this is the assertion that keeps the marker and the hanging
+    /// indent from drifting apart.
+    #[test]
+    fn the_styled_and_unstyled_paths_lay_a_row_out_identically() {
+        for source in [
+            "a paragraph with no inline markers at all, long enough to wrap twice over\n",
+            "- a list item with no markers, long enough that it wraps under its own text\n",
+            "> a quoted line with no markers, long enough to need a second quoted row\n",
+            "    an indented line, which is a paragraph carrying its indentation\n",
+        ] {
+            assert_eq!(
+                markdown_out(true, 24, &[source]),
+                markdown_out(false, 24, &[source]),
+                "styled and unstyled disagreed on a line with nothing to style: {source:?}"
+            );
+        }
+    }
+
+    /// **AC-6.** Fence content is verbatim: original line breaks, no wrapping
+    /// even past the width, no styling, and the fence markers themselves are not
+    /// printed. A wrapped line of code is a wrong line of code, and a `*` in a
+    /// shell glob is not emphasis.
+    #[test]
+    fn fenced_code_is_verbatim_and_its_markers_are_not_printed() {
+        let code = "for f in *.rs; do echo \"$f\"; done  # **not bold**, and `not code`";
+        let out = markdown_out(
+            true,
+            20,
+            &["```sh\n", code, "\n", "```\n", "after the fence\n"],
+        );
+
+        assert!(
+            !out.contains("```"),
+            "the fence markers were printed: {out:?}"
+        );
+        assert!(
+            out.contains(&format!("{code}\n")),
+            "the code line was reflowed or restyled: {out:?}"
+        );
+        assert!(
+            markdown::display_width(code) > 20,
+            "the fixture stopped being wider than the width, so this proves nothing"
+        );
+        // Nothing inside the fence was styled — the only thing that could have
+        // authored an escape here is the inline table, and BR-6 turns it off.
+        assert!(!out.contains('\x1b'), "a fenced block was styled: {out:?}");
+        // The fence closed: the line after it is prose again, wrapped at 20.
+        assert!(out.ends_with("after the fence\n"), "{out:?}");
+    }
+
+    /// **BR-4.** A run of table rows is held until something that is not a row
+    /// ends it, then laid out as a block — columns lined up, the separator drawn
+    /// as a rule rather than printed, and the pipes gone.
+    ///
+    /// The first assertion is the buffering itself, which is BR-4's accepted
+    /// cost: a column's width is not knowable from one row, so nothing can be
+    /// emitted until the run is complete.
+    #[test]
+    fn a_table_run_is_buffered_until_it_ends_and_then_laid_out() {
+        let rows = [
+            "| Surface | Finding |\n",
+            "|---------|---------|\n",
+            "| render  | wraps   |\n",
+            "| prompt  | asks    |\n",
+        ];
+
+        let held = markdown_out(false, 40, &rows);
+        assert_eq!(
+            held, "",
+            "a table row reached the terminal before its run ended, so its \
+             column widths were measured against part of the table"
+        );
+
+        // A blank line is not a table row, so the run ends and the block is laid
+        // out.
+        let mut ended = rows.to_vec();
+        ended.push("\n");
+        assert_eq!(
+            markdown_out(false, 40, &ended),
+            "Surface  Finding\n\
+             ────────────────\n\
+             render   wraps\n\
+             prompt   asks\n\
+             \n"
+        );
+    }
+
+    /// The pending partial line is emitted **before** the table run is closed,
+    /// not after — it is the newest text in the stream, and it may itself be the
+    /// run's last row. Getting the order wrong splits one table into two, which
+    /// re-measures every column against half the rows.
+    #[test]
+    fn a_partial_last_row_joins_its_table_rather_than_starting_a_second_one() {
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::with_markdown(&mut buf, false, 40);
+            surface.fragment("| a | b |\n|---|---|\n");
+            // No trailing newline: this row is still the pending partial line
+            // when the notice forces the buffer out.
+            surface.fragment("| ccc | ddd |");
+            surface.line(LineKind::Notice, "routed to local");
+        }
+        let out = String::from_utf8(buf).unwrap();
+
+        // Columns measured across all three rows: three columns wide, not one.
+        // A split run would have laid the header out at width 1 and produced
+        // `a  b`.
+        assert_eq!(
+            out,
+            "a    b\n\
+             ────────\n\
+             ccc  ddd\n\
+             >> routed to local\n"
+        );
+    }
+
+    /// **BR-5's recorded limitation.** `layout_table` returns final display text
+    /// with the markers already removed and the padding computed from the
+    /// stripped widths, so the surface emits its rows untouched. A bold cell is
+    /// therefore unstyled at the right column rather than bold at the wrong one
+    /// — a second `parse_inline` pass here would walk every cell four columns
+    /// left per marker pair.
+    #[test]
+    fn a_table_cell_is_not_styled_and_is_not_shifted() {
+        let out = markdown_out(
+            true,
+            40,
+            &["| **aa** | b |\n", "|---|---|\n", "| cc | dd |\n", "\n"],
+        );
+        assert!(
+            !out.contains('\x1b'),
+            "a table cell was styled, which un-aligns the column it sits in: {out:?}"
+        );
+        assert!(!out.contains("**"), "the markers were printed: {out:?}");
+        assert_eq!(
+            out,
+            "aa  b\n\
+             ──────\n\
+             cc  dd\n\
+             \n"
+        );
+    }
+
+    /// **AC-9.** A notice arriving mid-stream emits *after* the pending buffer,
+    /// not through it: the streamed sentence is complete on its own row and the
+    /// notice starts clean below it. Held text is text the reader has not been
+    /// shown, and a notice printed over it puts the screen in the wrong order.
+    #[test]
+    fn a_line_emits_the_pending_buffer_before_claiming_its_row() {
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::with_markdown(&mut buf, false, 80);
+            surface.fragment("the finding is that the guard ");
+            surface.line(LineKind::Notice, "routed to local");
+            surface.fragment("holds.\n");
+        }
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(
+            out,
+            "the finding is that the guard\n>> routed to local\nholds.\n"
+        );
+    }
+
+    /// **AC-9, semantic leg.** The same ordering seen as `(kind, text)` pairs.
+    /// A `RecordingSurface` has no renderer and no buffer — which is the point:
+    /// BR-9's ordering is a property of the call sequence, so it must read the
+    /// same on a surface that transforms nothing.
+    #[test]
+    fn the_recorded_order_puts_a_mid_stream_notice_after_the_text_before_it() {
+        let mut surface = RecordingSurface::new();
+        surface.fragment("the finding is that the guard ");
+        surface.line(LineKind::Notice, "routed to local");
+        surface.fragment("holds.\n");
+
+        assert_eq!(
+            surface.calls,
+            vec![
+                Rendered::Fragment("the finding is that the guard ".to_owned()),
+                Rendered::Line(LineKind::Notice, "routed to local".to_owned()),
+                Rendered::Fragment("holds.\n".to_owned()),
+            ]
+        );
+    }
+
+    /// A repaint moves the cursor over rows that are already on screen, so
+    /// buffered text — which is not on screen — goes out ahead of it (BR-8).
+    /// Emitting first is also what keeps `rows_up` measuring from the row the
+    /// caller chose it against.
+    #[test]
+    fn a_repaint_emits_the_pending_buffer_before_moving_the_cursor() {
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::with_markdown(&mut buf, false, 80);
+            surface.fragment("partially streamed");
+            surface.repaint_row_above(2, LineKind::Notice, "model starting..");
+        }
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.starts_with("partially streamed\n\x1b[s"),
+            "the buffered row must be on screen before the cursor is saved: {out:?}"
+        );
+    }
+
+    /// The buffer is held until a `\n` completes the line, and **nothing in this
+    /// module ends it early**. No timer, no heuristic, no "the chunk looked
+    /// finished". The verb that empties the tail at end of turn is
+    /// `end_block()`, and every call site of it belongs to `client.rs`'s event
+    /// pump (ADR-3) — so a partial line with nothing after it stays held here,
+    /// deliberately.
+    #[test]
+    fn a_partial_line_is_held_until_a_newline_completes_it() {
+        assert_eq!(markdown_out(false, 40, &["half a "]), "");
+        assert_eq!(
+            markdown_out(false, 40, &["half a ", "sentence\n"]),
+            "half a sentence\n"
+        );
+    }
+
+    /// **AC-10, surface leg.** …and `end_block()` is what lets it go. A model
+    /// whose last chunk carries no `\n` is the common case, not the exotic one,
+    /// so "held forever" and "shown" differ by exactly this call.
+    ///
+    /// The two assertions differ only in that call — everything else about the
+    /// two fixtures is identical — which is what makes this a statement about
+    /// the verb rather than about the renderer.
+    #[test]
+    fn end_block_emits_a_tail_that_no_newline_ever_completed() {
+        assert_eq!(
+            markdown_out(false, 40, &["half a sentence"]),
+            "",
+            "without the verb the tail is held, deliberately"
+        );
+        assert_eq!(
+            markdown_out_ended(false, 40, &["half a sentence"]),
+            "half a sentence\n"
+        );
+    }
+
+    /// **AC-10, table leg (BR-4).** A run of rows is buffered until something
+    /// that is not a row ends it — and at the end of a turn, nothing does.
+    /// `end_block()` closes the run and lays it out, and it does so *after* the
+    /// held partial line has been classified, so the last row is part of the
+    /// same table rather than the start of a second one.
+    #[test]
+    fn end_block_closes_a_table_run_whose_last_row_is_still_pending() {
+        assert_eq!(
+            markdown_out(false, 40, &["| a | b |\n|---|---|\n", "| ccc | ddd |"]),
+            "",
+            "the whole run is still buffered while the turn is running"
+        );
+        assert_eq!(
+            markdown_out_ended(false, 40, &["| a | b |\n|---|---|\n", "| ccc | ddd |"]),
+            "a    b\n\
+             ────────\n\
+             ccc  ddd\n",
+            "columns measured across all three rows: a split run would have laid \
+             the header out at width 1"
+        );
+    }
+
+    /// **AC-10's fence clause, and the sharpest reason this verb exists.**
+    ///
+    /// A reply that opens a ` ``` ` and never closes it — a truncated answer, an
+    /// interrupted turn, a model that simply forgot — leaves `fence == true`.
+    /// Nothing else in this module clears it, on purpose: inside a fence "this
+    /// line is not markup" is exactly what the renderer is supposed to believe,
+    /// so it cannot decide on its own that the block is over. Without
+    /// `end_block()` clearing it, every subsequent line of every subsequent turn
+    /// renders verbatim — no wrap, no styling — for the rest of the session.
+    ///
+    /// Asserted across two turns on **one** surface, because a per-turn surface
+    /// would clear the bit by construction and prove nothing.
+    #[test]
+    fn an_unterminated_fence_does_not_swallow_the_next_turn() {
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::with_markdown(&mut buf, false, 20);
+            // Turn one: a fence opens and the turn ends inside it.
+            surface.fragment("```sh\ncargo test\n");
+            surface.end_block();
+            // Turn two: ordinary prose, wide enough to need wrapping — which is
+            // precisely what a surviving fence bit would suppress.
+            surface.fragment("alpha bravo charlie delta echo\n");
+            surface.end_block();
+        }
+        let out = String::from_utf8(buf).unwrap();
+
+        assert_eq!(
+            out,
+            "cargo test\n\
+             alpha bravo charlie\n\
+             delta echo\n",
+            "the second turn rendered verbatim, so the first turn's unterminated \
+             fence outlived it: {out:?}"
+        );
+    }
+
+    /// **BR-6, across a mid-turn interruption.** A permission prompt, a routing
+    /// notice, or an indicator repaint is a *pause* in a turn, not the end of
+    /// one — so the buffered tail goes out ahead of the interrupting row (BR-8)
+    /// and the fence bit **survives it**. Only `end_block()` drops that bit, and
+    /// only the event pump calls `end_block()`, at a turn boundary.
+    ///
+    /// Without this, code the model resumes after the prompt is classified as
+    /// markdown and **word-wrapped at the terminal width**, so one statement is
+    /// broken across three rows mid-token. That is the renderer mangling the one
+    /// thing BR-6 makes verbatim, and re-indenting a paste is the least of what
+    /// it costs — a wrapped shell command is a *different command*.
+    ///
+    /// REQ-592's architecture originally put an `end_block()` call site
+    /// immediately before `resolve_permission` (ADR-3 site 3, for ADR-4's
+    /// ordering property). It was dropped for exactly this. What stands there
+    /// now is [`Surface::emit_held`] — the flush without the block-ending half —
+    /// so the ordering is owned by the pump rather than by whatever
+    /// `resolve_permission` happens to render first, and this test still holds.
+    ///
+    /// The fixture is chosen to be *destroyed* by a cleared fence rather than
+    /// merely nudged by one: the resumed line is three times the width, so a
+    /// classified copy is unmistakably re-flowed rather than coincidentally
+    /// identical. (Verified by mutation — routing `line()` through `end_block()`
+    /// yields `let b = *p * *q; //\na deliberately long\ntrailing comment`.)
+    #[test]
+    fn a_mid_turn_interruption_emits_the_tail_but_does_not_end_the_fence() {
+        const RESUMED: &str = "let b = *p * *q; // a deliberately long trailing comment";
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::with_markdown(&mut buf, true, 20);
+            surface.fragment("```rust\nlet a = 1;\n");
+            // The interruption: a notice claims the row mid-fence, exactly as
+            // `resolve_permission` does through `line()` before it asks.
+            surface.line(LineKind::Notice, "permission requested: shell");
+            // The model resumes *inside* the fence.
+            surface.fragment(&format!("{RESUMED}\n"));
+            surface.end_block();
+        }
+        let out = String::from_utf8(buf).unwrap();
+
+        // The notice landed between the two code rows, not on top of either.
+        assert_eq!(
+            out,
+            format!("let a = 1;\n>> permission requested: shell\n{RESUMED}\n"),
+            "the fence did not survive the interruption"
+        );
+        // Colour is on, so an escape could only have been authored by the inline
+        // styling table — which BR-6 turns off inside a fence.
+        assert!(!out.contains('\x1b'), "a fenced line was styled: {out:?}");
+        assert!(
+            !out.contains("```"),
+            "the fence marker was printed: {out:?}"
+        );
+    }
+
+    /// **BR-7.** The piped path builds a surface with no renderer at all, and
+    /// the new verb must be as inert there as `flush` is — including the
+    /// newline it would otherwise add to a tail that never had one.
+    #[test]
+    fn end_block_writes_nothing_on_a_surface_with_no_renderer() {
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::new(&mut buf);
+            surface.fragment("a tail with no newline");
+            surface.end_block();
+        }
+        assert_eq!(String::from_utf8(buf).unwrap(), "a tail with no newline");
+    }
+
+    /// **OQ-4.** A resize takes effect on the next block, and the rows already
+    /// on screen keep the breaks they were laid out with.
+    ///
+    /// The same sentence twice, with a narrower width declared in between. The
+    /// first copy is a single 43-column row because it fits sixty; the second is
+    /// three rows because it does not fit twenty. Asserted as one exact string
+    /// rather than as two `contains`, because "the earlier output is untouched"
+    /// is a claim about bytes that are *no longer reachable* — once emitted they
+    /// cannot be re-flowed, and an equality is what says so.
+    ///
+    /// This is the defect the width-at-construction version shipped: a session
+    /// started at 200 columns and dragged down to 80 went on laying every
+    /// subsequent block out at 200, and the terminal then hard-wrapped those rows
+    /// mid-word — which is precisely the defect REQ-592 exists to remove,
+    /// returning for the rest of the session.
+    #[test]
+    fn set_width_lays_the_next_block_out_narrower_and_leaves_printed_rows_alone() {
+        let sentence = "the quick brown fox jumps over the lazy dog\n";
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::with_markdown(&mut buf, false, 60);
+            surface.fragment(sentence);
+            surface.set_width(20);
+            surface.fragment(sentence);
+        }
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "the quick brown fox jumps over the lazy dog\n\
+             the quick brown fox\n\
+             jumps over the lazy\n\
+             dog\n",
+            "the block after the resize must wrap at 20, and the one before it \
+             must still be the single row it was emitted as"
+        );
+    }
+
+    /// **BR-7, the other half of the new verb.** `set_width` on a surface with no
+    /// renderer changes nothing — it cannot switch one on.
+    ///
+    /// Worth its own test because the failure would be silent and would land
+    /// exactly where BR-7 promises it cannot: a piped session whose width
+    /// happened to be set would start wrapping the model's bytes. The `if let`
+    /// in the implementation is the whole guarantee, and this is what holds it
+    /// there.
+    #[test]
+    fn set_width_cannot_give_a_pipe_a_renderer() {
+        let sentence = "the quick brown fox jumps over the lazy dog\n";
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::with_color(&mut buf, false);
+            surface.set_width(20);
+            surface.fragment(sentence);
+        }
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            sentence,
+            "a surface with no renderer must pass the bytes through whatever it \
+             has been told about the terminal"
+        );
+    }
+
+    /// **BR-3 at the seam.** Breaks land on whitespace, never inside a word —
+    /// `defens-\ne-in-depth` is the defect this REQ exists to remove — and a
+    /// list item's continuation rows align under its text rather than under its
+    /// marker.
+    #[test]
+    fn prose_is_wrapped_at_word_boundaries_with_the_right_hanging_indent() {
+        assert_eq!(
+            markdown_out(false, 20, &["alpha bravo charlie delta echo\n"]),
+            "alpha bravo charlie\ndelta echo\n"
+        );
+        assert_eq!(
+            markdown_out(
+                false,
+                20,
+                &["- alpha bravo charlie delta echo foxtrot golf\n"]
+            ),
+            "- alpha bravo\n  charlie delta echo\n  foxtrot golf\n"
+        );
+        assert_eq!(
+            markdown_out(false, 20, &["10. alpha bravo charlie delta echo\n"]),
+            // Four columns of marker, so the continuation rows carry sixteen —
+            // a wide marker narrows the text rather than pushing the row past
+            // the edge.
+            "10. alpha bravo\n    charlie delta\n    echo\n"
+        );
+        // The quote marker is on every row: a continuation row without it reads
+        // as unquoted prose, which misattributes who said it.
+        assert_eq!(
+            markdown_out(false, 20, &["> alpha bravo charlie delta echo\n"]),
+            "> alpha bravo\n> charlie delta echo\n"
+        );
+        // A word wider than the terminal is emitted whole and over-wide rather
+        // than cut: a clipped row is a lie, and this is a security finding's
+        // sentence.
+        let long = "supercalifragilisticexpialidocious";
+        let out = markdown_out(false, 20, &[&format!("a {long} b\n")]);
+        assert!(out.contains(&format!("{long}\n")), "{out:?}");
+    }
+
+    /// Headings lose their `#` markers and gain the surface's own bold; a code
+    /// span inside one opens as a **combined** `bold;cyan` and re-opens the bold
+    /// after its reset, because one `\x1b[0m` ends everything that is open.
+    #[test]
+    fn a_heading_drops_its_markers_and_carries_the_surfaces_own_emphasis() {
+        assert_eq!(
+            markdown_out(false, 40, &["## Findings\n"]),
+            "Findings\n",
+            "the markers must not be printed at any colour setting"
+        );
+        assert_eq!(
+            markdown_out(true, 40, &["## Findings\n"]),
+            "\x1b[1mFindings\x1b[0m\n"
+        );
+        assert_eq!(
+            markdown_out(true, 40, &["# The `Surface` seam\n"]),
+            "\x1b[1mThe \x1b[1;36mSurface\x1b[0m\x1b[1m seam\x1b[0m\n"
+        );
+    }
+
+    /// Blank lines are paragraph separation and are never collapsed; a thematic
+    /// break is drawn as a rule at the width rather than printed as three
+    /// dashes.
+    #[test]
+    fn blank_lines_survive_and_a_thematic_break_is_drawn() {
+        assert_eq!(
+            markdown_out(false, 8, &["one\n", "\n", "\n", "---\n", "two\n"]),
+            "one\n\n\n────────\ntwo\n"
+        );
+    }
+
+    /// **AC-14, surface leg.** Every construct REQ-592 puts out of scope reaches
+    /// the terminal as literal text: no panic, no dropped characters, and no
+    /// partial styling. This is the mitigation the hand-rolled parser rests on
+    /// (OQ-2), so it is asserted rather than assumed — an unrecognized construct
+    /// that swallowed content would make that decision wrong.
+    #[test]
+    fn every_out_of_scope_construct_reaches_the_terminal_as_literal_text() {
+        for source in [
+            // A nested list: the indented line is a paragraph carrying its
+            // indent, by the same column-zero rule that makes an indented code
+            // block literal.
+            "- outer item\n  - inner item\n",
+            // A setext heading's `=====` underline. (The `-----` form is a
+            // thematic break by the recognized-construct table's own rule —
+            // recorded in AC-14's carve-out and asserted separately below.)
+            "Heading text\n=====\n",
+            // An indented code block.
+            "    let x = 1;\n",
+            // Nested emphasis: literal from the opening marker to the closing
+            // one, so no half of it is styled.
+            "**bold with *italic* inside**\n",
+        ] {
+            let plain = markdown_out(false, 40, &[source]);
+            assert_eq!(
+                ink(&plain),
+                ink(source),
+                "characters were dropped or invented rendering {source:?}: {plain:?}"
+            );
+            let styled = markdown_out(true, 40, &[source]);
+            assert!(
+                !styled.contains('\x1b'),
+                "an out-of-scope construct was partially styled: {styled:?}"
+            );
+        }
+
+        // The fifth construct — a `|` inside a code span inside a table cell —
+        // needs its own assertion rather than the sweep above, and the reason is
+        // worth stating. What is out of scope is reading it as a **table**, and
+        // that is exactly what does not happen: the classifier sees an odd
+        // backtick count in a cell, refuses the row, and it falls through to a
+        // paragraph. As a paragraph its code span is an ordinary code span, so
+        // the backticks are consumed by a construct that *is* recognized. That
+        // is not a dropped character in AC-14's sense — by that reading every
+        // `**bold**` would be one — and the pipes, which are what the cell
+        // boundary hazard is about, all survive as text.
+        assert_eq!(
+            markdown_out(false, 40, &["| `a|b` | c |\n"]),
+            "| a|b | c |\n",
+            "the row must stay prose: no rule, no column padding, every pipe intact"
+        );
+        assert_eq!(
+            markdown_out(true, 40, &["| `a|b` | c |\n"]),
+            "| \x1b[36ma|b\x1b[0m | c |\n",
+            "the code span is styled whole or not at all — never half of it"
+        );
+
+        // The carve-out, asserted rather than left to be discovered: a line of
+        // dashes is a thematic break here and in CommonMark alike, and a
+        // line-oriented streaming classifier has no lookahead to read it as a
+        // setext underline instead. The heading's *text* is untouched, so what
+        // lands is text followed by a rule — which reads as an underline.
+        assert_eq!(
+            markdown_out(false, 5, &["Heading text\n-----\n"]),
+            "Heading\ntext\n─────\n"
+        );
+    }
+
+    /// **BR-7, structurally.** The two constructors that shipped before REQ-592
+    /// attach no renderer, so a surface built through either one is byte-for-byte
+    /// what it was: markdown intact, nothing wrapped, nothing buffered. This is
+    /// why `cli_e2e`'s piped assertions do not move, and it is a property of
+    /// construction rather than of a conditional a later edit could invert.
+    #[test]
+    fn the_pre_existing_constructors_attach_no_renderer() {
+        let source = "| a | b |\n**bold** and a line that is very much longer than twenty columns";
+
+        let mut plain = Vec::new();
+        {
+            let mut surface = PlainSurface::new(&mut plain);
+            surface.fragment(source);
+        }
+        assert_eq!(String::from_utf8(plain).unwrap(), source);
+
+        // Colour on, renderer still absent: the two answers are independent, and
+        // only `with_markdown` turns the transform on.
+        let mut colored = Vec::new();
+        {
+            let mut surface = PlainSurface::with_color(&mut colored, true);
+            surface.fragment(source);
+        }
+        assert_eq!(String::from_utf8(colored).unwrap(), source);
+    }
+
+    /// **BR-7's other half: the renderer is chosen in exactly one place, and
+    /// that place has a terminal in hand** (REQ-592 confirmation review,
+    /// MAJOR 3).
+    ///
+    /// `requirement.md` says outright that AC-7 — one `cli_e2e` byte-comparison
+    /// on a piped turn — is *the entire guard* for BR-7, and it measured the
+    /// gap it was worried about: inverting the gate to always render leaves all
+    /// 75 pre-existing `cli_e2e` tests green. Meanwhile the far smaller rule
+    /// next door (which function may call `end_block`) had a source sweep with
+    /// counts and region checks. This is that shape applied where it is
+    /// actually load-bearing.
+    ///
+    /// Three properties, and each one is a real mutation:
+    ///
+    /// 1. **One** production call site. A second surface built with a renderer
+    ///    somewhere else — a subcommand, a walkthrough, a diagnostic — is a
+    ///    second answer to "is there a terminal", and half of them would be
+    ///    wrong on a pipe.
+    /// 2. It is in `main.rs`, the one edge that owns terminal facts (REQ-555,
+    ///    REQ-585 BR-11: a handler must never read `IsTerminal` itself).
+    /// 3. It is in a function that **also names `is_terminal`**, which is the
+    ///    weakest honest statement of "gated": a sweep cannot read a
+    ///    conditional, but a construction site that never mentions the terminal
+    ///    at all is unambiguously ungated.
+    #[test]
+    fn the_markdown_renderer_is_constructed_once_and_behind_a_terminal_check() {
+        let sources = crate::status::scan::production_sources();
+
+        // `fn with_markdown` is the declaration, and it lives here by design;
+        // every other occurrence is somebody choosing to render markdown.
+        let code_by_file: Vec<(String, String)> = sources
+            .iter()
+            .map(|(rel, src)| {
+                (
+                    rel.clone(),
+                    crate::status::scan::code_only(src).replace("fn with_markdown(", ""),
+                )
+            })
+            .collect();
+        let sites: Vec<&str> = code_by_file
+            .iter()
+            .flat_map(|(rel, code)| {
+                std::iter::repeat_n(rel.as_str(), code.matches("with_markdown(").count())
+            })
+            .collect();
+        assert_eq!(
+            sites.len(),
+            1,
+            "the markdown renderer is attached in exactly **one** production \
+             place, because BR-7 is the question \"is there a terminal to lay \
+             text out in\" and a second construction site is a second answer to \
+             it. Sites found: {sites:?}"
+        );
+        assert_eq!(
+            sites[0], "main.rs",
+            "the gate belongs to the one edge that reads terminal facts; a \
+             handler that decided this for itself would be a second, invisible \
+             seam (REQ-585 BR-11)"
+        );
+
+        // The enclosing function, taken as the span from the last `fn ` before
+        // the call to the next `fn ` after it. Coarse on purpose: it only has to
+        // be tight enough that "this function never mentions the terminal" is a
+        // true statement about the construction site.
+        let code = &code_by_file
+            .iter()
+            .find(|(rel, _)| rel == "main.rs")
+            .expect("main.rs is a production source")
+            .1;
+        let at = code.find("with_markdown(").expect("the site just counted");
+        let opens = code[..at]
+            .rfind("\nfn ")
+            .expect("the site sits in a function");
+        let closes = code[at..].find("\nfn ").map_or(code.len(), |off| at + off);
+        assert!(
+            code[opens..closes].contains("is_terminal"),
+            "the one construction site must sit in a function that has actually \
+             asked whether there is a terminal. This cannot read the conditional \
+             — but a site whose function never names `is_terminal` is ungated, \
+             and AC-7 is structurally blind to that: inverting the gate leaves \
+             every piped `cli_e2e` test green (measured, requirement.md AC-7)"
+        );
+
+        // Non-vacuity: the verb this sweep counts still exists to be counted.
+        let render = sources
+            .iter()
+            .find(|(rel, _)| rel == "render.rs")
+            .map(|(_, src)| crate::status::scan::code_only(src))
+            .expect("render.rs is a production source");
+        assert!(
+            render.contains("fn with_markdown("),
+            "this assertion is only meaningful while `render.rs` owns the \
+             renderer-attaching constructor"
+        );
     }
 }

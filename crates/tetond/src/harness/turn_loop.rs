@@ -2162,6 +2162,106 @@ fn effective_web_clause(tools: &ToolRegistry, config: &HarnessConfig) -> Option<
     }
 }
 
+/// Where the model's words land (REQ-592 BR-1) — the one fact about Teton's
+/// *surface* that no tool can tell it.
+///
+/// This is [BUG-181]'s shape in a new place. That defect was capability
+/// confabulation: the model answered from what it could see, and what it could
+/// see said nothing about Teton, so it invented. Here it answers from what it
+/// can see about the screen, and what it can see is nothing at all — so it
+/// writes what a chat surface would want. The 2026-08-26 dogfood audit is the
+/// evidence: two-column tables with cells of 155..243 characters, `**bold**`
+/// and backticks printed as literal punctuation, and every over-wide row
+/// hard-broken mid-word by the terminal. Reasonable output for a renderer that
+/// does not exist here.
+///
+/// **This clause is the improvement, not the guarantee.** The CLI's renderer is
+/// the guarantee; models honour formatting guidance unevenly across tiers, and
+/// nothing about a sentence makes a wide table legible on the day a 4B model
+/// emits one anyway. Neither half substitutes for the other, which is why the
+/// REQ ships both.
+///
+/// Why each sentence is here:
+///
+/// 1. **The surface fact, and the reason it matters.** Narrowness is the
+///    operative property — stated twice, once as a word the model can reason
+///    with (`narrow`) and once as a number it can measure against (`often only
+///    80 columns wide`), the same trick sentence 3 plays. `where a wide table
+///    is unreadable however it is laid out` is the *reason*, and it is there
+///    because a rule whose reason the model can see survives paraphrase better
+///    than a bare prohibition. `narrow terminal window` is also the anchor
+///    [`the_system_prompt_states_where_its_output_lands_exactly_once`] filters
+///    on, so it is load-bearing text and not decoration.
+/// 2. **What to write instead.** A prohibition on its own leaves the model no
+///    shape to fall back to, which is how "do not use tables" becomes a wall of
+///    prose. Naming the replacement — short paragraphs, bullet lists — is what
+///    turns the rule into an instruction it can follow.
+/// 3. **The table bound, as a number.** "Keep tables narrow" is not something a
+///    model can check itself against; "at most three short columns" and "never
+///    a sentence in a cell" are. Both halves earn their bytes from the audit
+///    above, whose table failed on *cell length* rather than on column count.
+/// 4. **`sparingly`, not `never`.** The renderer does style emphasis and does
+///    print fenced code verbatim (REQ-592 BR-5/BR-6), so a ban would trade a
+///    construct that renders for one that does not exist. What the audit showed
+///    is over-use, and that is what this asks against.
+///
+/// # Why this does not say "renders no Markdown"
+///
+/// It said exactly that until the product owner amended BR-1, and the amendment
+/// is the whole point of the clause. **As of this REQ the CLI *does* render
+/// markdown** — bold, emphasis, code spans, headings and tables all get laid
+/// out by `teton::markdown` — so a prompt sentence claiming otherwise would be
+/// false about Teton's own surface the moment the sibling tasks landed.
+///
+/// That is [BUG-181]'s defect class exactly, and it is the class this REQ
+/// exists to stop repeating: a resident sentence stating something untrue about
+/// Teton is worse than no sentence, because the model has no way to check it
+/// and every reason to trust the highest-trust region of its prompt. Fixing
+/// confabulation with a confabulation of our own would have been a poor trade.
+///
+/// So the clause keeps only what stays true after the renderer ships. **A wide
+/// table is unreadable in 80 columns however it is laid out** — transposition
+/// makes it readable, not good (ADR-8) — and that is an honest reason that
+/// outlives the CLI half. Narrowness is a property of the window; markdown
+/// support is a property of the client, and only the first is Teton's to
+/// promise.
+///
+/// Unconditional, by ADR-9's decision on OQ-3: a protocol hint letting the
+/// daemon key this on "my client is a terminal" would buy back ~350 bytes of a
+/// budget that has room, and the CLI is the only client that ships. Revisit
+/// when a second one exists.
+///
+/// # Constraints this wording is pinned by
+///
+/// **No flush-left `User:` or `Assistant:` label** (BR-2(c)):
+/// `harness::render::tests::a_harness_authored_system_prompt_is_byte_identical`
+/// requires `neutralize_frame_labels` to be a no-op on the whole prompt.
+///
+/// **347 bytes**, measured against *two* independent ceilings (ADR-6) — the
+/// spec named only the first:
+///
+/// | Budget | Before | After |
+/// |---|---|---|
+/// | [`REDACT_BODY_OVERHEAD_BYTES`](crate::egress::redact::REDACT_BODY_OVERHEAD_BYTES) margin | 476 | 129 |
+/// | `MIN_BUDGET_BYTES >= 2 ×` default prompt | 6,411 / 8,192 | 6,758 / 8,192 |
+///
+/// The redact margin binds first and is measured against a 48-byte floor, so
+/// the real room this clause had was **428 bytes, not the 710** the spec
+/// originally quoted from that constant's ledger: those figures were already
+/// 282 bytes stale when this REQ read them, and the spec now records the
+/// correction. 81 bytes remain above the floor. Neither constant moved.
+/// Re-measure rather than trusting the table above — that is the mistake it is
+/// a record of.
+///
+/// A note for whoever rewords this: prompt-adjacent behaviour is chaotic under
+/// byte-level changes ([BUG-168] flipped a reply shape with a 23-byte trim two
+/// sentences away), so no wording here is verified until it is A/B'd live.
+const OUTPUT_FORMAT_CLAUSE: &str =
+    "Your reply is printed into a narrow terminal window, often only 80 columns wide, where a \
+     wide table is unreadable however it is laid out. Prefer short paragraphs and bullet lists \
+     over tables. Use a table only when it is genuinely the clearest shape: at most three short \
+     columns, never a sentence in a cell. Use emphasis and fenced code sparingly.\n";
+
 /// The word this build's platform goes by in the environment block (REQ-583
 /// BR-1): a fact the model cannot learn from any tool, so it is stated.
 ///
@@ -2526,6 +2626,16 @@ pub fn build_system_prompt(tools: &ToolRegistry, config: &HarnessConfig) -> Stri
     if let Some(clause) = effective_web_clause(tools, config) {
         s.push_str(&clause);
     }
+    // REQ-592 BR-1: where the reply lands. The words live in
+    // `OUTPUT_FORMAT_CLAUSE`; what is decided here is only its place, and its
+    // place is *unconditional* — every caller gets it, because ADR-9 (OQ-3)
+    // declined to key it on a client hint the protocol does not carry.
+    //
+    // Last of the instruction clauses and immediately above the guide, so it
+    // sits beside the reply-shape rules in the opener rather than inside the
+    // capability region, where a reader would reasonably expect a condition to
+    // govern it.
+    s.push_str(OUTPUT_FORMAT_CLAUSE);
     s.push('\n');
     s.push_str(SELF_CONFIG_GUIDE);
     s.push_str("\nAvailable tools:\n");
@@ -5106,6 +5216,94 @@ mod tests {
                 system.contains(line),
                 "the capability fact is in self_config.md but not in the built system \
                  prompt for {config:?}"
+            );
+        }
+    }
+
+    /// **REQ-592 AC-1 / BR-1: the prompt says where its words land, and says it
+    /// once.**
+    ///
+    /// Two claims in one test, and the second is the one worth having.
+    ///
+    /// *Present* is the mutation guard: drop the `push_str` in
+    /// `build_system_prompt` and the model is back to writing for a chat
+    /// surface with nothing in CI to notice, because no other test in this
+    /// crate reads the prompt for formatting guidance.
+    ///
+    /// *Exactly once* is the guard against the failure mode this clause is most
+    /// likely to grow. Output format is the kind of instruction a later REQ adds
+    /// a sentence about wherever it happens to be working — the guide, a tool's
+    /// docs, a second clause — and two sentences about how to format a reply
+    /// are two chances to disagree with each other in the highest-trust region
+    /// of the prompt. So a second one is a *decision*: fold it into
+    /// [`OUTPUT_FORMAT_CLAUSE`] or amend this expectation deliberately, and do
+    /// not delete the assertion.
+    ///
+    /// Swept over both harness shapes for the reason the capability test above
+    /// gives: a clause resident in one config and not the other is a prompt
+    /// half the fleet does not have.
+    ///
+    /// The last assertion is the amended BR-1's teeth. The clause said "renders
+    /// no Markdown" until the CLI half of this same REQ made that false, and the
+    /// cheapest way for it to come back is somebody restoring the "clearer"
+    /// earlier wording without knowing why it went. A prompt sentence that is
+    /// false about Teton's own surface is [BUG-181]'s defect class, so the
+    /// prohibition is asserted rather than left to the doc comment.
+    #[test]
+    fn the_system_prompt_states_where_its_output_lands_exactly_once() {
+        for config in [HarnessConfig::default(), HarnessConfig::for_strong_model()] {
+            let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
+            let format: Vec<&str> = system
+                .lines()
+                .filter(|line| line.contains("narrow terminal window"))
+                .collect();
+            assert_eq!(
+                format.len(),
+                1,
+                "the prompt for {config:?} has {} lines telling the model it is writing \
+                 into a narrow terminal window, and exactly one may: the output-format \
+                 clause (REQ-592 BR-1). None means the model is writing for a screen it \
+                 cannot see — restore the `push_str` in `build_system_prompt`. More than \
+                 one means a second sentence about output format arrived from somewhere \
+                 else, and two of them are two chances to disagree; fold it into \
+                 `OUTPUT_FORMAT_CLAUSE` or amend this expectation deliberately. Do not \
+                 delete the assertion.\nlines: {format:?}",
+                format.len()
+            );
+            let line = format[0];
+            // The three instructions the clause exists to carry, each pinned by
+            // its own needle: the replacement shape, the column bound, and the
+            // cell bound. A rewording that dropped any one of them would keep
+            // the anchor above and pass — and the dogfood audit this REQ was
+            // opened on failed on the *cell* bound, not the column count, so
+            // that is the needle most worth having.
+            for anchor in [
+                "short paragraphs and bullet lists",
+                "at most three short columns",
+                "never a sentence in a cell",
+            ] {
+                assert!(
+                    line.contains(anchor),
+                    "the output-format clause no longer says `{anchor}`. It has to name what \
+                     to write instead of a table and bound the tables it does allow, or it \
+                     is a prohibition with no shape to fall back to (REQ-592 BR-1). If the \
+                     wording changed deliberately, re-word this needle with the \
+                     sentence.\nline: {line}"
+                );
+            }
+            // The amended BR-1: the clause may not claim the surface renders no
+            // markdown, because as of this REQ it does. Asserted against the
+            // whole prompt rather than the clause line, so the claim cannot
+            // reappear in the guide or a tool's docs either.
+            assert!(
+                !system.contains("no Markdown") && !system.contains("no markdown"),
+                "the system prompt for {config:?} tells the model the surface renders no \
+                 markdown. That was true when this clause was written and the CLI half of \
+                 REQ-592 made it false: `teton::markdown` lays out bold, emphasis, code \
+                 spans, headings and tables. A resident sentence that is false about \
+                 Teton's own surface is BUG-181's defect class, which this REQ exists to \
+                 stop repeating — say the window is narrow, which stays true, and give the \
+                 honest reason (a wide table is unreadable however it is laid out)."
             );
         }
     }
