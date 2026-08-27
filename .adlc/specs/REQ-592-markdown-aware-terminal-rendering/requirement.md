@@ -112,9 +112,16 @@ falls through to literal text rather than to a parse error.
 
 ### Events
 
-None. No protocol change, no new `SessionUpdatePayload` variant, no bus record. (Contrast
-BUG-189, where a decision the surface had to show carried no record — here the surface already
-receives every byte it needs.)
+None. No new `SessionUpdatePayload` variant, no bus record, **and nothing on the wire changes**.
+(Contrast BUG-189, where a decision the surface had to show carried no record — here the surface
+already receives every byte it needs.)
+
+*Precise as of the verify pass (2026-08-26): `crates/teton-protocol` **is** modified.* `RpcMethod`
+gained a defaulted `const ENDS_TURN: bool`, `true` only on `PromptTurnParams`, so that "does this
+call end a turn" is a property of the method rather than of ~30 call sites. It is compile-time
+metadata: no field is serialized, no payload shape moves, and `PROTOCOL_VERSION` is untouched. The
+original blanket "no protocol change" was true of the wire and imprecise about the crate, which is
+the distinction worth keeping.
 
 ### Permissions
 
