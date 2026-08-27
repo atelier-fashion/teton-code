@@ -45,6 +45,25 @@ teton-code/
   early, treat `BrokenPipe` on the stdin write as that outcome and keep every
   other write error fatal (LESSON-540). CI's ubuntu leg is where the macOS-only
   assumption fails.
+- **Show the test can fail before trusting that it passed.** Break the thing the
+  test guards and confirm it goes red; record the mutation in the test's doc
+  comment. REQ-592 shipped seven green assertions that could not have failed —
+  an oracle that called the code under test, a fixture built on the wrong
+  failure mechanism, and two ACs written against a test surface that lacks the
+  buffer they asserted about (LESSON-569). Three traps in order of how easy
+  they are to fall into: never let the expected value be computed by the
+  subject; verify the failure *mechanism* before building a fixture around it;
+  pick the test double by what property you are asserting, not by what is easy
+  to assert. When a test guards a gate or a structural rule, invert the gate,
+  count what fails, and write the number down — "the old tests still pass" is
+  not evidence the gate works.
+- **An invariant with more than one enforcement point needs a sweep, not a
+  fix.** Enumerate every site that can violate it before fixing the one in
+  front of you. A sweep that *counts* call sites is weaker than one that
+  *region-checks* them: relocating a required call keeps the count identical
+  (REQ-592, LESSON-568). Where the rule is a property of a method rather than of
+  its callers, put it on the method — `RpcMethod::ENDS_TURN` is the worked
+  example.
 
 ## Error Handling
 
