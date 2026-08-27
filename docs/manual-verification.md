@@ -64,6 +64,69 @@ observe each one, and record anything that differs from this list.
 
 ---
 
+## Agent-run findings, 2026-08-27 — evidence, not a sign-off
+
+An agent drove legs of this runbook through a real pty against a real remote
+model. **No box above or below is ticked**, because the judgement legs (a8, b5)
+ask whether the screen is *legible*, and that is a person's call. What follows is
+the mechanical evidence, so the human run can start from something.
+
+**Setup deviation, recorded.** The keychain item `keychain://teton/kimi` exists in
+the login keychain, but macOS keychain ACLs are per-executable, so a freshly built
+`target/release/teton-code` is not on the item's ACL and prompts on every read;
+dismissing that dialog produced `keychain backend error … User canceled the
+operation`. Rather than change a security setting, the run used a throwaway
+`TETON_CONFIG` whose `auth_ref` is `env:MOONSHOT_API_KEY`. The real config was not
+modified. **Credential source is irrelevant to what AC-13 measures** (rendering and
+reply shape), so this is a faithful substitute — but a human run should click
+*Always Allow* once and exercise the shipped keychain path.
+
+**The daemon under test was the right one** — `pgrep -fl teton-code` named
+`…/teton-code` in this repo's `target/release`, so the prompt-clause half was
+genuinely in play. The prerequisite trap was avoided. Note the build reports
+`v0.1.25` because REQ-592 is unreleased: **identify the daemon by path, never by
+version.**
+
+### What was demonstrated
+
+**BR-3/BR-5 work on the real shipped path, at 100 columns.** A reply containing
+`**bold**`, `` `code` `` and a deliberately over-wide sentence rendered as:
+
+```
+\x1b[1mbold\x1b[0m and \x1b[36mcode\x1b[0m and a long sentence that must wrap because it is considerably longer than one hundred
+columns of terminal width.
+```
+
+Markers gone, real SGR, and the break fell **between `hundred` and `columns` — a
+space**. Measured: the widest assistant row was **99 display columns against a
+100-column window**, and no assistant row exceeded the width. The `defens-` /
+`e-in-depth` mid-word signature that motivated this REQ is absent.
+
+### What was NOT demonstrated, and one new finding
+
+- **The clause half (BR-1) was not observed.** The audit prompt produced a real
+  investigation — 25 model calls across `server.rs`, `auth.rs`, `shell.rs`,
+  `egress/`, `lookup.rs`, `redact.rs` — and then ended the turn with **no prose
+  reply at all**. Whether the clause changes reply *shape* therefore remains
+  unmeasured. A smoke reply with no tool calls rendered perfectly, so this is not
+  a renderer fault; it is a turn that ended after its tool loop without composing
+  an answer, and it is worth investigating on its own.
+- **Legs (b), (c) and (d) were not run** — 200 columns, `NO_COLOR=1`, and the
+  redirect leg.
+- **NEW: `line()`-kind output is visibly over-wide, and OQ-5's deferral is
+  user-visible.** At a 100-column window the run produced rows of **166, 109, 103
+  and 299** display columns — the local-tier notice, the session-ready line, and
+  the cost summary, whose `(estimate)` paragraph is a single **299-column** row.
+  OQ-5 left `line()` kinds unwrapped and said to file a follow-up "if it still
+  reads badly in the field". It does. Assistant prose is now the best-laid-out
+  text on the screen and the notices around it are the worst.
+
+**Cost, for whoever runs this next:** the audit legs are expensive. This session's
+runs added roughly **$7.50** against a Kimi tier at `effort: high`, mostly in
+tool-loop input tokens. Budget for it, and do not re-run the audit prompt to get a
+nicer answer — BUG-168's rule applies and the sign-off asks how many times it was
+sent.
+
 ## Prerequisites
 
 - macOS on Apple Silicon **or** Linux (record which — do **not** report
@@ -3198,9 +3261,9 @@ Notes / findings                                     :
 
 # Manual verification runbook — REQ-592 AC-13 (a real audit at 100 and at 200 columns)
 
-**Status: OUTSTANDING — nothing below has been executed.** This is a runbook
-written for a person at a terminal; it is not a record of a run, and no box in it
-may be ticked from CI or by an agent. Leave AC-13 unticked in
+**Status: PARTIALLY EXERCISED, still OUTSTANDING.** This is a runbook written
+for a person at a terminal; it is not a record of a run, and no box in it may be
+ticked from CI or by an agent. Leave AC-13 unticked in
 `.adlc/specs/REQ-592-markdown-aware-terminal-rendering/requirement.md` until
 somebody has run the procedure below and filled in the sign-off.
 
