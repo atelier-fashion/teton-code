@@ -348,6 +348,52 @@ pub(crate) const REDACT_BODY_OVERHEAD_BYTES: usize = 11 * 1024;
 #[cfg(test)]
 pub(crate) const MIN_PROMPT_HEADROOM_BYTES: usize = 48;
 
+/// The margin the two headroom sweeps **currently measure**, pinned so that it
+/// cannot drift without someone deciding it should (BUG-193).
+///
+/// # Why a pin and not just a floor
+///
+/// [`MIN_PROMPT_HEADROOM_BYTES`] is an *inequality*, and an inequality holds
+/// identically at 710 bytes of margin, at 476, and at 49. That is exactly how
+/// this budget's own doc comment came to be wrong by ~234 bytes across six REQs
+/// (REQ-583, REQ-585, REQ-587, REQ-589, REQ-590, REQ-591) while the test stayed
+/// green the entire time: the number a human reads lived in prose, and nothing
+/// compared the prose to reality. REQ-592 was sized against the stale 710 and
+/// had to be corrected mid-task.
+///
+/// The floor answers "is there room at all". This answers "did the resident
+/// prompt move without anyone noticing", which is the question that actually
+/// went unasked.
+///
+/// # The cost, accepted deliberately
+///
+/// Every intentional prompt edit now fails a test until this number is updated.
+/// That is churn, and it is the point: with 129 bytes of margin against a
+/// 48-byte floor there are **81 bytes of usable room**, so an edit that costs 20
+/// of them is not a detail — it is a fifth of what is left, and it should
+/// announce itself. When the margin was 710 this pin would have been noise;
+/// at 81 it is the cheapest possible alarm.
+///
+/// # Updating it
+///
+/// Re-measure, do not reason — that correction is what reasoning about it cost
+/// last time. Add a ledger line to [`REDACT_BODY_OVERHEAD_BYTES`] saying which
+/// REQ spent the bytes, then move this number in the same diff.
+#[cfg(test)]
+pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 129;
+
+/// The same pin for the **web-enabled** prompt shape measured by
+/// `harness::tools::web::tests::the_web_tool_docs_clear_the_outbound_body_overhead`.
+///
+/// Two shapes, two numbers: with `[web] tier` above `off` the prompt carries the
+/// web tool's docs instead of REQ-563's opt-in clause, so it spends a different
+/// amount and must be pinned separately. It lives here rather than beside its
+/// test for the same reason [`REDACT_BODY_OVERHEAD_BYTES`] does — one place
+/// holds the budget vocabulary, so the two shapes cannot come to disagree about
+/// which constant they are measuring against.
+#[cfg(test)]
+pub(crate) const RECORDED_WEB_PROMPT_MARGIN_BYTES: usize = 176;
+
 /// How many per-chunk windows the total cap is worth — the multiple that turns
 /// [`REDACT_CHUNK_MAX_BYTES`] into [`REDACT_INPUT_MAX_BYTES`].
 ///
@@ -2269,9 +2315,25 @@ mod tests {
     /// text, the typed refusals and the echo line.
     ///
     /// Measured, not reasoned — the correction above is what reasoning about it
-    /// cost last time. Both sides of the figure were checked with the pad
-    /// method `docs/manual-verification.md` records: 710 bytes of filler leaves
-    /// this shape at exactly the 48-byte floor and passes, 711 fails.
+    /// cost last time.
+    ///
+    /// **Corrected 2026-08-26 (BUG-193). The figure this comment used to carry
+    /// was wrong by ~234 bytes and had been wrong for six REQs.** It read: "710
+    /// bytes of filler leaves this shape at exactly the 48-byte floor and
+    /// passes, 711 fails." That was true when written, at REQ-587. The prompt
+    /// then grew through REQ-583, REQ-585, REQ-587, REQ-589, REQ-590 and
+    /// REQ-591 without the constant moving, so nothing failed and nothing was
+    /// restated — the assertion below is `margin >= 48`, which holds identically
+    /// at 710, at 476, and at 49. REQ-592 sized a task against the stale 710 and
+    /// had to be corrected mid-implementation.
+    ///
+    /// **Measured now:** `worst` 7,859 + `escaping` 3,276 = `spent` 11,135
+    /// against an assumed 11,264, leaving a margin of **129** — that is
+    /// [`RECORDED_PROMPT_MARGIN_BYTES`], and it is now *asserted*, not narrated.
+    /// Against the 48-byte floor that is **81 bytes of usable room**.
+    ///
+    /// Do not restore a prose-only figure here. Prose drifts silently; the pin
+    /// is what makes the next drift a red test.
     #[test]
     fn the_total_cap_clears_the_harness_context_budget_with_margin() {
         use std::sync::Arc;
@@ -2420,6 +2482,26 @@ mod tests {
              Eroding the last of the margin is a decision, not a side effect: \
              shorten the bundled guide or a clause, or move \
              `MIN_PROMPT_HEADROOM_BYTES` deliberately."
+        );
+        // BUG-193. The floor above is an inequality and therefore cannot see
+        // drift: it held identically while the recorded figure went stale by
+        // ~234 bytes over six REQs. This pin is what turns "the prompt moved"
+        // from a comment nobody re-read into a failing test.
+        assert_eq!(
+            margin,
+            RECORDED_PROMPT_MARGIN_BYTES,
+            "the resident system prompt moved: the margin is now {margin} bytes \
+             where {RECORDED_PROMPT_MARGIN_BYTES} was recorded, a change of {}. \
+             This is not a failure — it is the alarm working. If you meant to \
+             spend (or reclaim) those bytes: re-measure, add a ledger line to \
+             `REDACT_BODY_OVERHEAD_BYTES`'s doc comment naming the REQ that \
+             spent them, and move `RECORDED_PROMPT_MARGIN_BYTES` in the same \
+             diff. With only {} bytes of usable room above the {MIN_PROMPT_HEADROOM_BYTES}-byte \
+             floor, a change this size is worth a deliberate decision. Do NOT \
+             widen this into an inequality — that is precisely the shape that \
+             let the figure drift for six REQs (BUG-193).",
+            (margin as i64) - (RECORDED_PROMPT_MARGIN_BYTES as i64),
+            RECORDED_PROMPT_MARGIN_BYTES.saturating_sub(MIN_PROMPT_HEADROOM_BYTES),
         );
 
         let body = budget + REDACT_BODY_OVERHEAD_BYTES;

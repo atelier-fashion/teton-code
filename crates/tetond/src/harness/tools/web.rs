@@ -2345,15 +2345,29 @@ mod tests {
     /// roster, for the reason ADR-9 gives: `SkillTool` is registered per turn
     /// from the session's registry, so neither sweep sees it unless it is put
     /// there, and a sweep that cannot see it passes while the resident prompt
-    /// grows. Both sides of the figure were checked with the pad method
-    /// `docs/manual-verification.md` records: 757 bytes of filler leaves this
-    /// shape at exactly the floor and passes, 758 fails.
+    /// grows.
+    ///
+    /// **Recorded headroom at REQ-592:** `spent` 11,088, margin **176**. The
+    /// REQ added a 347-byte output-format clause to the resident prompt; this
+    /// shape is still the looser of the two, now by 47 bytes exactly as before.
+    ///
+    /// **Corrected 2026-08-26 (BUG-193).** This paragraph used to end with a
+    /// pad-method figure — "757 bytes of filler leaves this shape at exactly
+    /// the floor and passes, 758 fails" — and its sibling in `egress::redact`
+    /// carried the same kind of claim, wrong by ~234 bytes for six REQs. The
+    /// ledger above is maintained per REQ and is genuinely useful; the *live*
+    /// figure was not, because nothing compared it to reality. The margin is
+    /// now pinned by
+    /// [`RECORDED_WEB_PROMPT_MARGIN_BYTES`](crate::egress::redact::RECORDED_WEB_PROMPT_MARGIN_BYTES)
+    /// and asserted below. Keep adding ledger lines; do not reintroduce a
+    /// prose-only figure for the current margin.
     #[tokio::test]
     async fn the_web_tool_docs_clear_the_outbound_body_overhead() {
         use teton_core::capability::{SearchGap, WebCapabilityState};
 
         use crate::egress::redact::{
-            MIN_PROMPT_HEADROOM_BYTES, REDACT_BODY_OVERHEAD_BYTES, REDACT_ESCAPING_DIVISOR,
+            MIN_PROMPT_HEADROOM_BYTES, RECORDED_WEB_PROMPT_MARGIN_BYTES,
+            REDACT_BODY_OVERHEAD_BYTES, REDACT_ESCAPING_DIVISOR,
         };
         use crate::harness::turn_loop::{
             build_system_prompt, worst_case_session_root, HarnessConfig, SkillToolDocs,
@@ -2486,6 +2500,21 @@ mod tests {
              a decision, not a side effect: shorten the bundled guide, the clause, \
              the description or the schema, or move `MIN_PROMPT_HEADROOM_BYTES` \
              deliberately."
+        );
+        // BUG-193, the web-enabled shape's half. Same reasoning as the twin in
+        // `egress::redact`: the floor above is an inequality and cannot see
+        // drift, which is how this file's own pad-method figure went stale.
+        assert_eq!(
+            margin,
+            RECORDED_WEB_PROMPT_MARGIN_BYTES,
+            "the web-enabled system prompt moved: the margin is now {margin} bytes \
+             where {RECORDED_WEB_PROMPT_MARGIN_BYTES} was recorded, a change of {}. \
+             Add a `Recorded headroom at REQ-xxx` line to this test's doc comment \
+             and move `RECORDED_WEB_PROMPT_MARGIN_BYTES` in the same diff. Note \
+             this shape and the opted-out one are measured separately and are \
+             expected to differ — check the twin in `egress::redact` moved too, \
+             and by the amount you expect.",
+            (margin as i64) - (RECORDED_WEB_PROMPT_MARGIN_BYTES as i64),
         );
         std::fs::remove_dir_all(&dir).ok();
     }
