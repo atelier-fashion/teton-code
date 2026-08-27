@@ -1,7 +1,7 @@
 ---
 id: REQ-592
 title: "Markdown-aware terminal rendering, and a system prompt that knows where its words land"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-26
 updated: 2026-08-26

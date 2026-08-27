@@ -24,25 +24,25 @@ Covers BR-5, BR-6, and the mid-turn half of BR-8.
 
 ## Acceptance Criteria
 
-- [ ] AC-5: a chunk containing `\x1b[2K\x1b[1A` renders as visible spaces, not cursor motion,
+- [x] AC-5: a chunk containing `\x1b[2K\x1b[1A` renders as visible spaces, not cursor motion,
       **with the renderer in the path**; mutation-checked by removing the defuse call and watching
       it fail. `**bold**` in the same chunk still emits SGR — proving styling comes from the fixed
       table, not from the input.
-- [ ] AC-6: fenced code emits verbatim — original line breaks, no wrapping, no SGR — including
+- [x] AC-6: fenced code emits verbatim — original line breaks, no wrapping, no SGR — including
       lines longer than the width. Fence markers are not printed.
-- [ ] AC-8 (unit leg): a surface built with `color = false` at a fixed width wraps its input and
+- [x] AC-8 (unit leg): a surface built with `color = false` at a fixed width wraps its input and
       emits **zero** `\x1b` bytes; the same input at `color = true` emits the SGR AC-5 pins.
-- [ ] AC-9: a `Notice`/`Tool` line arriving mid-stream emits **after** the pending buffer, not
+- [x] AC-9: a `Notice`/`Tool` line arriving mid-stream emits **after** the pending buffer, not
       through it. Asserted on `RecordingSurface` as an ordered `(kind, text)` sequence.
-- [ ] AC-14 (surface leg): each Out-of-Scope construct reaches the terminal as literal text.
-- [ ] **Every existing test in `render.rs` passes unmodified.** If any needs an edit, stop — the
+- [x] AC-14 (surface leg): each Out-of-Scope construct reaches the terminal as literal text.
+- [x] **Every existing test in `render.rs` passes unmodified.** If any needs an edit, stop — the
       opt-in constructor is not doing its job.
-- [ ] **Remove the `#![allow(dead_code)]` at the top of `markdown.rs`.** TASK-277 added it because
+- [x] **Remove the `#![allow(dead_code)]` at the top of `markdown.rs`.** TASK-277 added it because
       nothing called into the module yet, and named this task as the removal condition. If it
       survives the REQ, either the wiring never landed or a function in there has no caller —
       both are findings, and tetond's ADR-J is against lingering allows. Deleting the attribute
       and getting a clean `cargo clippy --workspace -- -D warnings` is the proof the wiring is real.
-- [ ] `cargo test -p teton` green; `cargo clippy --workspace -- -D warnings` clean.
+- [x] `cargo test -p teton` green; `cargo clippy --workspace -- -D warnings` clean.
 
 ## Technical Notes
 

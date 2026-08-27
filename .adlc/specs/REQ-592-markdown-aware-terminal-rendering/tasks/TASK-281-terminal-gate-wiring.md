@@ -1,7 +1,7 @@
 ---
 id: TASK-281
 title: "Gate the renderer on a terminal, and prove the pipe path is inert"
-status: draft
+status: complete
 parent: REQ-592
 created: 2026-08-26
 updated: 2026-08-26
@@ -23,17 +23,17 @@ BR-9.
 
 ## Acceptance Criteria
 
-- [ ] AC-7: piped output for a scripted turn carrying a table, bold text, and a code fence equals
+- [x] AC-7: piped output for a scripted turn carrying a table, bold text, and a code fence equals
       the concatenated raw chunks the daemon sent — the renderer is inert off a terminal.
-- [ ] AC-11: the REQ-579 setup hand-off, the REQ-581 connection hand-off, and the REQ-582 command
+- [x] AC-11: the REQ-579 setup hand-off, the REQ-581 connection hand-off, and the REQ-582 command
       hand-off each still fire on a turn whose reply contains the trigger text wrapped and styled.
-- [ ] Every existing `cli_e2e` assertion passes unmodified — including the exact occurrence count
+- [x] Every existing `cli_e2e` assertion passes unmodified — including the exact occurrence count
       at cli_e2e.rs:5512. If one needs editing, BR-7 is broken; fix the gate, not the test.
-- [ ] **Delete the `#[cfg_attr(not(test), expect(dead_code, ...))]` on `PlainSurface::with_markdown`**
+- [x] **Delete the `#[cfg_attr(not(test), expect(dead_code, ...))]` on `PlainSurface::with_markdown`**
       (render.rs ~263). TASK-279 placed it as a self-removing marker: wiring the `main.rs` caller
       turns it into an unfulfilled lint expectation, so `cargo clippy --workspace -- -D warnings`
       fails until it is removed. That failure is the proof the gate is really wired.
-- [ ] `terminal_width()` is read **at the construction site** and passed in; `markdown.rs` still
+- [x] `terminal_width()` is read **at the construction site** and passed in; `markdown.rs` still
       does not name it (TASK-277's sweep stays green).
 
 ## Technical Notes

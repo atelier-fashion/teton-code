@@ -20,16 +20,16 @@ repairs the existing pty assertions BR-3 moves (ADR-8).
 
 ## Acceptance Criteria
 
-- [ ] AC-12: at a fixed pty width, a scripted turn's **rendered bytes** show wrapped rows, a
+- [x] AC-12: at a fixed pty width, a scripted turn's **rendered bytes** show wrapped rows, a
       transposed table, and one SGR-styled span. Written here, not claimed as covered elsewhere.
-- [ ] AC-8 (pty leg): a session launched with `NO_COLOR=1` in the child environment produces
+- [x] AC-8 (pty leg): a session launched with `NO_COLOR=1` in the child environment produces
       wrapped rows and **no escape sequences**.
-- [ ] AC-10 (pty leg): a reply whose final chunk lacks a trailing newline has its last row visible
+- [x] AC-10 (pty leg): a reply whose final chunk lacks a trailing newline has its last row visible
       above the entry frame, before any hand-off line.
-- [ ] Every existing pty test passes. Where BR-3's wrapping split a marker, the fix is to widen
+- [x] Every existing pty test passes. Where BR-3's wrapping split a marker, the fix is to widen
       `cols` or split the assertion — **and the comment at pty_e2e.rs:894 is updated** to say the
       wrap is now the CLI's, not the terminal's.
-- [ ] `cargo build --workspace` precedes the run (BUG-164 staleness guard).
+- [x] `cargo build --workspace` precedes the run (BUG-164 staleness guard).
 
 ## Technical Notes
 

@@ -22,17 +22,17 @@ two records this REQ owes. Covers AC-13.
 
 ## Acceptance Criteria
 
-- [ ] AC-13: a runbook section in the file's established shape — `## What this proves that CI does
+- [x] AC-13: a runbook section in the file's established shape — `## What this proves that CI does
       not`, `## Prerequisites`, `## Procedure` with lettered legs, `## Sign-off`.
-- [ ] Leg (a): ask a real session for a security audit of this repository at **100 columns**;
+- [x] Leg (a): ask a real session for a security audit of this repository at **100 columns**;
       record whether tables and prose are legible.
-- [ ] Leg (b): the same at **200 columns**.
-- [ ] Leg (c): `NO_COLOR=1` at 100 columns — wrapping present, no escapes.
-- [ ] Leg (d): the same prompt with stdout redirected to a file — output is unrendered markdown
+- [x] Leg (b): the same at **200 columns**.
+- [x] Leg (c): `NO_COLOR=1` at 100 columns — wrapping present, no escapes.
+- [x] Leg (d): the same prompt with stdout redirected to a file — output is unrendered markdown
       (BR-7 by eye, complementing AC-7).
-- [ ] The runbook carries the **prompt**; `fixtures/audit-2026-08-26.md` is named as the *before*,
+- [x] The runbook carries the **prompt**; `fixtures/audit-2026-08-26.md` is named as the *before*,
       with a note that it holds the reply and not the prompt.
-- [ ] `.adlc/context/architecture.md` records: markdown rendering is terminal-only and opt-in at
+- [x] `.adlc/context/architecture.md` records: markdown rendering is terminal-only and opt-in at
       construction; layout is pure and width-parameterised in `markdown.rs`; styling is authored
       inside the sanitizer from a fixed table; `client.rs`'s pump solely owns `end_block()`.
 
