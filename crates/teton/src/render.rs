@@ -2187,4 +2187,100 @@ mod tests {
         }
         assert_eq!(String::from_utf8(colored).unwrap(), source);
     }
+
+    /// **BR-7's other half: the renderer is chosen in exactly one place, and
+    /// that place has a terminal in hand** (REQ-592 confirmation review,
+    /// MAJOR 3).
+    ///
+    /// `requirement.md` says outright that AC-7 — one `cli_e2e` byte-comparison
+    /// on a piped turn — is *the entire guard* for BR-7, and it measured the
+    /// gap it was worried about: inverting the gate to always render leaves all
+    /// 75 pre-existing `cli_e2e` tests green. Meanwhile the far smaller rule
+    /// next door (which function may call `end_block`) had a source sweep with
+    /// counts and region checks. This is that shape applied where it is
+    /// actually load-bearing.
+    ///
+    /// Three properties, and each one is a real mutation:
+    ///
+    /// 1. **One** production call site. A second surface built with a renderer
+    ///    somewhere else — a subcommand, a walkthrough, a diagnostic — is a
+    ///    second answer to "is there a terminal", and half of them would be
+    ///    wrong on a pipe.
+    /// 2. It is in `main.rs`, the one edge that owns terminal facts (REQ-555,
+    ///    REQ-585 BR-11: a handler must never read `IsTerminal` itself).
+    /// 3. It is in a function that **also names `is_terminal`**, which is the
+    ///    weakest honest statement of "gated": a sweep cannot read a
+    ///    conditional, but a construction site that never mentions the terminal
+    ///    at all is unambiguously ungated.
+    #[test]
+    fn the_markdown_renderer_is_constructed_once_and_behind_a_terminal_check() {
+        let sources = crate::status::scan::production_sources();
+
+        // `fn with_markdown` is the declaration, and it lives here by design;
+        // every other occurrence is somebody choosing to render markdown.
+        let code_by_file: Vec<(String, String)> = sources
+            .iter()
+            .map(|(rel, src)| {
+                (
+                    rel.clone(),
+                    crate::status::scan::code_only(src).replace("fn with_markdown(", ""),
+                )
+            })
+            .collect();
+        let sites: Vec<&str> = code_by_file
+            .iter()
+            .flat_map(|(rel, code)| {
+                std::iter::repeat_n(rel.as_str(), code.matches("with_markdown(").count())
+            })
+            .collect();
+        assert_eq!(
+            sites.len(),
+            1,
+            "the markdown renderer is attached in exactly **one** production \
+             place, because BR-7 is the question \"is there a terminal to lay \
+             text out in\" and a second construction site is a second answer to \
+             it. Sites found: {sites:?}"
+        );
+        assert_eq!(
+            sites[0], "main.rs",
+            "the gate belongs to the one edge that reads terminal facts; a \
+             handler that decided this for itself would be a second, invisible \
+             seam (REQ-585 BR-11)"
+        );
+
+        // The enclosing function, taken as the span from the last `fn ` before
+        // the call to the next `fn ` after it. Coarse on purpose: it only has to
+        // be tight enough that "this function never mentions the terminal" is a
+        // true statement about the construction site.
+        let code = &code_by_file
+            .iter()
+            .find(|(rel, _)| rel == "main.rs")
+            .expect("main.rs is a production source")
+            .1;
+        let at = code.find("with_markdown(").expect("the site just counted");
+        let opens = code[..at]
+            .rfind("\nfn ")
+            .expect("the site sits in a function");
+        let closes = code[at..].find("\nfn ").map_or(code.len(), |off| at + off);
+        assert!(
+            code[opens..closes].contains("is_terminal"),
+            "the one construction site must sit in a function that has actually \
+             asked whether there is a terminal. This cannot read the conditional \
+             — but a site whose function never names `is_terminal` is ungated, \
+             and AC-7 is structurally blind to that: inverting the gate leaves \
+             every piped `cli_e2e` test green (measured, requirement.md AC-7)"
+        );
+
+        // Non-vacuity: the verb this sweep counts still exists to be counted.
+        let render = sources
+            .iter()
+            .find(|(rel, _)| rel == "render.rs")
+            .map(|(_, src)| crate::status::scan::code_only(src))
+            .expect("render.rs is a production source");
+        assert!(
+            render.contains("fn with_markdown("),
+            "this assertion is only meaningful while `render.rs` owns the \
+             renderer-attaching constructor"
+        );
+    }
 }

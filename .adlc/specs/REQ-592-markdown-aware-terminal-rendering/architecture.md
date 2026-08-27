@@ -104,12 +104,37 @@ task briefs before a mutation test found it.
 **Decision: every flush call site lives in `client.rs`'s event pump** — the one place that owns
 both the surface and every path an event takes.
 
-**Final shape after verify (2026-08-26). The verb is two verbs, and this list is what shipped:**
+**Final shape after the confirmation review (2026-08-26). The verb is two verbs, and this list
+is what shipped:**
 
 | Verb | Does | Call sites |
 |---|---|---|
-| `end_block()` | emit held line, close table run, **clear the fence** | **one** — end of `Connection::call`, every return |
-| `emit_held()` | the first two only, fence untouched | **two** — end of `drain_events`; permission arm of `dispatch_event` |
+| `end_block()` | emit held line, close table run, **clear the fence** | **one** — the `P::ENDS_TURN` branch of `Connection::call` |
+| `emit_held()` | the first two only, fence untouched | **five** — the non-turn branch of `call`; end of `drain_events`; **each** of the three `dispatch_event` arms that reach a `Prompter` |
+
+**Third amendment: `call` is the RPC boundary, not the turn boundary.** The verify pass left this
+ADR asserting that `end_block()` at the end of `Connection::call` *is* a turn boundary. The
+confirmation review found it is not. `call` has roughly thirty non-turn callers — every slash
+handler in `main.rs` (`/cost`, `/model`, `/config`), `provider_setup_ui`, `provider_test_ui`, and
+`answer_outstanding_model_proposal`'s own `model/status` probe — so a user typing `/cost` while a
+second client is mid-```` ```rust ```` block cleared the fence and re-flowed the rest of that block
+as prose. That is BR-6's failure, the one site 2 was withdrawn for, arriving at **user-command
+frequency** instead of at the 120 ms poll rate.
+
+The fix is not a per-call-site rule. Thirty call sites are thirty chances to answer the same
+question wrongly, and this REQ has now had to unpick that shape twice. `RpcMethod` grew
+`const ENDS_TURN: bool`, defaulted `false` and true only for `PromptTurnParams` — so the answer
+lives beside the wire name, is written once, and a future turn-shaped RPC declares itself one
+where it declares everything else. `call` branches on it: turn → `end_block()`, anything else →
+`emit_held()`, because a non-turn RPC still pumped events while it waited and may still be
+holding a fragment.
+
+**Recorded, not fixed.** A client that only *watches* a co-driven session never makes a turn
+`call` at all, so a broadcast reply that ends inside an unterminated fence leaves that client's
+fence bit set forever. Nothing on the bus says a turn is over (`teton-protocol`'s `Event` has no
+turn-complete variant). Clearing it at the poll is the cure that is worse than the disease — see
+site 2. The real repair is a turn-boundary event, which is a protocol change and deliberately not
+invented here.
 
 The three-site list this ADR originally carried was wrong twice over, and both errors were found
 by the verify pass rather than by reading:
@@ -121,8 +146,12 @@ by the verify pass rather than by reading:
 - **Site 3 was withdrawn, then came back in the correct form.** See ADR-4.
 
 A reader who re-adds an `end_block()` call at *either* pause is re-adding a known bug. The
-ownership sweep fails with the reasoning attached, and region-checks the permission-arm call
-rather than merely counting.
+ownership sweep fails with the reasoning attached, and **region-checks every required call site**
+rather than merely counting. That last clause is also an amendment: the review found the sweep
+applying its own lesson asymmetrically — the permission arm was region-checked while
+`drain_events`' call was pinned by arithmetic alone, so relocating it anywhere in `client.rs`
+satisfied every assertion. The counts are kept only for what a region cannot see: a *sixth* call
+site appearing somewhere new.
 
 **Ownership is a pointer, not a description** ([[LESSON-547]]): **TASK-280 owns every
 `end_block()` call site.** `main.rs` must not add one, `hand_off_after_turn` must not call it,
@@ -184,8 +213,19 @@ invariant had none**, resting instead on the incidental fact that all five paths
 fence clear, which is exactly the distinction the withdrawal was groping for and did not have a
 verb for at the time. Backed by a **region check** in the ownership sweep: the slice of `client.rs`
 between the permission arm and the `resolve_permission(` call must contain the call. Moving it
-*after* `resolve_permission` keeps the total count at two and still fails — the mutation a count
-alone cannot see.
+*after* `resolve_permission` keeps the total count unchanged and still fails — the mutation a
+count alone cannot see.
+
+**Third amendment: there were three such arms, and the fix guarded one.** The confirmation review
+found `dispatch_event`'s two siblings still handing the terminal to a `Prompter` unguarded —
+`ModelProposal` via `model_ui::resolve_proposal`, and `AttachConsent` via
+`session_ui::resolve_attach_consent`. Both were safe only by the incidental property this ADR had
+just declared insufficient: the callee happens to call `surface.line(...)` first. `AttachConsent`
+is the sharper of the two — it is an access-control consent ("allow this client to watch EVERY
+session on this daemon?"), it fires exactly when a second client attaches **mid-turn**, which is
+when a fragment is most likely to be held, and `session_ui.rs` stated the ordering rule in a doc
+comment rather than owning it structurally. All three arms now call `emit_held()` immediately
+before delegating, and each has its own region check.
 
 The property test stays, for the reason this ADR already gave. It is now the behavioural half of a
 guarantee whose structural half is the sweep, rather than the whole of it.

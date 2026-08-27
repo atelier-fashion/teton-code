@@ -314,6 +314,14 @@ an AC that covers no rule, or a rule no AC names, is a finding against this list
       assertion still passes" criterion is worth keeping as a no-regression check but must not be
       read as coverage: the old tests passing was never evidence the gate works. A future reader
       tempted to delete AC-7 as redundant should note that nothing else fails when BR-7 breaks.
+
+      *Amended at the confirmation review (2026-08-26).* Something else does now:
+      `render::the_markdown_renderer_is_constructed_once_and_behind_a_terminal_check` sweeps the
+      production sources and asserts that `with_markdown(` has exactly **one** non-test call site,
+      that it is in `main.rs`, and that it sits in a function which also names `is_terminal`. AC-7
+      remains the only *behavioural* guard — a sweep cannot read a conditional — but "the entire
+      guard" is no longer true, and the structural half catches the two mutations AC-7 cannot: a
+      second construction site, and the one site drifting out of the gate's function.
 - [ ] **AC-8** *(BR-7, colour leg)*: The terminal-but-no-colour path is covered on both halves.
       **Unit**: a surface constructed with `color = false` at a fixed width wraps its input and
       emits **zero** `\x1b` bytes, while the same input at `color = true` emits the SGR AC-5 pins.

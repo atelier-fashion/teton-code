@@ -193,6 +193,22 @@ const NO_BREAK_BEFORE: &str =
 /// [`NO_BREAK_BEFORE`] closes.
 const NO_BREAK_AFTER: &str = "（［｛「『〈《【〔";
 
+/// Whether `c` is a Fitzpatrick skin-tone modifier, U+1F3FB..=U+1F3FF.
+///
+/// These are the one thing [`wide_break_allowed`]'s width test gets wrong on its
+/// own. They are East-Asian **Wide**, so they measure two columns and pass the
+/// test from either side, and they are in neither kinsoku set — so a row could
+/// end on a base emoji and the next row open with a bare colour swatch
+/// (`wrap("漢👍🏽abc", 5)` gave `["漢👍", "🏽abc"]`). Nothing is lost, but a
+/// modifier is not a character: it is the second half of one.
+///
+/// Kept as its own predicate rather than appended to [`NO_BREAK_BEFORE`]
+/// because that constant is documented as a kinsoku subset, and a Japanese
+/// line-breaking table is not where a later reader would look for emoji.
+fn is_skin_tone_modifier(c: char) -> bool {
+    matches!(c, '\u{1F3FB}'..='\u{1F3FF}')
+}
+
 /// Whether a row may break between `left` and `right`.
 ///
 /// Both sides must be **wide** — East-Asian W or F, which is exactly the
@@ -208,6 +224,11 @@ const NO_BREAK_AFTER: &str = "（［｛「『〈《【〔";
 ///   not wide — `understandable` still has no break opportunity inside it and is
 ///   still emitted whole and over-wide.
 ///
+/// The combining-mark argument does **not** reach every continuation character,
+/// which is why there is a fourth test: a skin-tone modifier measures two
+/// columns, not zero, so width alone would happily cut a base emoji away from
+/// its colour ([`is_skin_tone_modifier`]).
+///
 /// This is also the half of ADR-5 that the dependency was taken for and that had
 /// not been built: `unicode-width` was justified on measurement *and* break
 /// placement, and until this function existed it delivered only the first.
@@ -216,6 +237,7 @@ fn wide_break_allowed(left: char, right: char) -> bool {
         && char_display_width(right) == 2
         && !NO_BREAK_AFTER.contains(left)
         && !NO_BREAK_BEFORE.contains(right)
+        && !is_skin_tone_modifier(right)
 }
 
 /// Where to break inside `word` so that it fits `avail` columns, or `None` when
@@ -237,8 +259,17 @@ fn wide_break(word: &str, avail: usize) -> Option<usize> {
         if left.is_some_and(|prev| wide_break_allowed(prev, right)) {
             first.get_or_insert(at);
             if display_width(&word[..at]) > avail {
-                // Widths only grow along the word, so every later opportunity
-                // overflows too and there is nothing left to find.
+                // Said "widths only grow along the word" until review; that is
+                // not true of `display_width`, which measures a *string* and so
+                // lets one character re-measure the one before it —
+                // `display_width("⌚")` is 2 and `display_width("⌚\u{FE0E}")` is
+                // 1, a text-presentation selector shrinking its own prefix.
+                //
+                // The exit does not need monotonicity. Opportunities are visited
+                // left to right and `best` already holds the widest one that
+                // fit, so stopping early can only *fail to find* a later
+                // opportunity — the row goes out narrower than it had to, never
+                // wider than `avail`. The wrong direction is the safe one here.
                 break;
             }
             best = Some(at);
@@ -298,9 +329,19 @@ pub fn wrap_ranges(text: &str, first_avail: usize, cont_avail: usize) -> Vec<Ran
         let mut end = words[next].end;
         let mut last = next + 1;
         if display_width(&text[start..end]) > avail {
-            // The word does not fit, so filling with more words cannot help —
-            // widths only grow along the text. Either it divides between two
-            // wide characters or it goes out intact and over-wide.
+            // The word does not fit, so filling with more words cannot help.
+            // The reason is **not** "widths only grow along the text" — that was
+            // the claim here until review, and `display_width` measures a string,
+            // so an appended character can shrink the prefix it follows
+            // (`display_width("⌚\u{FE0E}")` is 1, one column *less* than the
+            // `⌚` alone). What holds is narrower and enough: the `else` branch
+            // below only ever extends across a **whitespace** boundary, and
+            // whitespace joins nothing — no variation selector, no ZWJ sequence,
+            // no combining run spans it — so the bytes already counted are
+            // re-measured identically and the candidate can only be wider.
+            //
+            // Either the word divides between two wide characters or it goes out
+            // intact and over-wide.
             if let Some(cut) = wide_break(&text[start..end], avail) {
                 rows.push(start..start + cut);
                 // `next` stays where it is: the rest of this word is the next
@@ -1298,6 +1339,61 @@ mod tests {
         assert_eq!(display_width("a日b"), 4);
     }
 
+    /// **"Widths only grow along the text" is false, and it was the stated
+    /// reason for two early exits** (REQ-592 confirmation review, MINOR).
+    ///
+    /// [`display_width`] measures a **string**, not a sum of characters, and
+    /// that is the point — it is why an emoji-modifier sequence measures two
+    /// columns instead of four. The price is that an appended character can
+    /// make the whole thing *narrower*: a text-presentation selector turns a
+    /// two-column watch face into a one-column glyph. `wide_break` and
+    /// `wrap_ranges` each justified an early exit with monotonicity that does
+    /// not hold; both now argue from what does, and this test is the counter-
+    /// example that made the old wording wrong plus the property that replaced
+    /// it.
+    ///
+    /// Nothing about the *behaviour* moved — the exits were already in the safe
+    /// direction — so this is the assertion that keeps the corrected comments
+    /// honest as the dependency moves under them.
+    ///
+    /// (Verified by mutation: making `display_width` a per-character sum, which
+    /// is exactly what would have made the old comment true, fails the second
+    /// assertion.)
+    #[test]
+    fn appending_a_character_can_narrow_a_string_but_appending_a_word_cannot() {
+        assert_eq!(display_width("\u{231A}"), 2, "a watch face is emoji-wide");
+        assert_eq!(
+            display_width("\u{231A}\u{FE0E}"),
+            1,
+            "a text-presentation selector re-measures the character before it, \
+             so a longer string is one column *narrower* than its own prefix"
+        );
+
+        // What `wrap_ranges`' greedy fill actually rests on: it only ever
+        // extends across **whitespace**, and whitespace joins nothing — no
+        // variation selector, no ZWJ sequence, no combining run spans it — so
+        // the bytes already counted re-measure identically and the candidate
+        // row can only be wider than the row it extends.
+        let head = "\u{231A}";
+        for tail in [
+            "\u{FE0E}",
+            "\u{FE0F}",
+            "\u{200D}",
+            "\u{3099}",
+            "\u{1F3FD}",
+            "abc",
+        ] {
+            let candidate = format!("{head} {tail}");
+            assert!(
+                display_width(&candidate) > display_width(head),
+                "appending {tail:?} across a space narrowed {head:?} from {} to {}, \
+                 which would make the greedy fill's early exit unsound",
+                display_width(head),
+                display_width(&candidate)
+            );
+        }
+    }
+
     /// A tab is charged a whole tab stop — the only direction that cannot put a
     /// row past the terminal's edge.
     #[test]
@@ -1566,6 +1662,49 @@ mod tests {
         // onto a row of its own.
         let marks = "か\u{3099}き\u{3099}く\u{3099}";
         assert_eq!(wrap(marks, 2), vec![marks.to_owned()]);
+    }
+
+    /// **A skin-tone modifier is the second half of a character, not a
+    /// character** (REQ-592 confirmation review, MINOR).
+    ///
+    /// The sibling test above rests on combining marks measuring **zero**
+    /// columns, which is what makes [`wide_break_allowed`]'s width test reject
+    /// them from either side. That argument does not reach U+1F3FB..U+1F3FF:
+    /// they are East-Asian **Wide**, they measure two, and they are in neither
+    /// kinsoku set — so width alone happily cut a base emoji away from its
+    /// colour and opened a row with a bare swatch. Cosmetic, since nothing is
+    /// lost; still wrong, and the doc comment's zero-column argument was being
+    /// read as if it covered this.
+    ///
+    /// (Verified by mutation: dropping the `is_skin_tone_modifier` test from
+    /// `wide_break_allowed` restores `["漢👍", "🏽abc"]`.)
+    #[test]
+    fn a_break_never_separates_an_emoji_from_its_skin_tone() {
+        // The fixture is only meaningful while the modifier passes the width
+        // test it has to be rejected *despite*.
+        assert_eq!(char_display_width('\u{1F3FD}'), 2);
+        assert!(!NO_BREAK_BEFORE.contains('\u{1F3FD}'));
+
+        let text = "漢👍🏽abc";
+        assert_eq!(
+            display_width(text),
+            7,
+            "the sequence measures as one two-column glyph, so this fixture must \
+             not fit the width below"
+        );
+
+        let rows = wrap(text, 5);
+        assert_eq!(
+            rows,
+            vec!["漢".to_owned(), "👍🏽abc".to_owned()],
+            "the break landed between the emoji and its modifier, so a row opens \
+             with a bare colour swatch"
+        );
+        assert_eq!(
+            rows.concat(),
+            text,
+            "nothing may be dropped or reordered by the break rule"
+        );
     }
 
     /// **AC-3's CJK sweep: no emitted row exceeds the width in display
