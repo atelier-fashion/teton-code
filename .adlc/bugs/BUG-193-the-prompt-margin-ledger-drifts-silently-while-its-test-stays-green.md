@@ -1,10 +1,10 @@
 ---
 id: BUG-193
 title: "The prompt-margin ledger drifts silently while its test stays green"
-status: open
+status: resolved
 severity: medium
 created: 2026-08-26
-updated: 2026-08-26
+updated: 2026-08-27
 component: "daemon/egress"
 domain: "harness"
 stack: ["rust", "daemon"]
@@ -93,3 +93,39 @@ Found during REQ-592 implementation (2026-08-26). REQ-592 corrected its own spec
 Related: [[LESSON-481]] (a gate that hides a feature also hides its tests) is the nearest sibling —
 here it is an *inequality* rather than a gate that hides the regression, but the shape is the
 same: the assertion that passes is not the assertion anyone believes is being made.
+
+
+## Resolution (2026-08-27)
+
+**Both halves fixed, and the second one is the fix that matters.**
+
+**Restated.** The measured figures, taken with a temporary probe and reverted:
+`worst` 7,859 + `escaping` 3,276 = `spent` 11,135 against 11,264 → margin **129**. The twin in
+`harness/tools/web.rs` measures the web-enabled shape: `spent` 11,088 → margin **176**. The stale
+"710 bytes of filler" sentence is replaced with the measurement plus the drift history; the twin's
+own stale "757 bytes of filler" sentence got the same treatment, and it gained the
+`Recorded headroom at REQ-592` ledger line that REQ-592 never added.
+
+**Pinned.** `RECORDED_PROMPT_MARGIN_BYTES = 129` and `RECORDED_WEB_PROMPT_MARGIN_BYTES = 176`, both
+asserted with `assert_eq!` beside the existing floor. The floor answers "is there room at all";
+the pin answers "did the resident prompt move without anyone noticing", which is the question that
+actually went unasked for six REQs.
+
+**The churn trade, decided rather than dodged.** Every intentional prompt edit now fails a test
+until the number is updated. That is the point: 129 against a 48-byte floor is **81 bytes of usable
+room**, so an edit costing 20 bytes is a fifth of what remains and should announce itself. At 710
+this pin would have been noise; at 81 it is the cheapest possible alarm. The failure message says
+what to do — re-measure, add a ledger line naming the REQ, move the constant in the same diff — and
+tells the reader explicitly **not** to widen it back into an inequality, since that is the shape
+that allowed the drift.
+
+**Mutation-checked, both directions.** Bumping the pin 129 → 130 fails with the full remediation
+message. More importantly, adding a **single byte** to the real `OUTPUT_FORMAT_CLAUSE` fires *both*
+pins, each reporting `a change of -1`. A one-byte drift is now caught; the 234-byte drift this bug
+is about would have been unmissable.
+
+**Scope note.** The bug named `redact.rs`. The twin in `web.rs` carried the same defect — a live
+figure in prose that nothing compared to reality — so both were fixed. Fixing one would have left
+the identical bug in the sibling surface (LESSON-525's cross product).
+
+1,910 `tetond` tests pass, clippy `--all-targets` and fmt clean.
