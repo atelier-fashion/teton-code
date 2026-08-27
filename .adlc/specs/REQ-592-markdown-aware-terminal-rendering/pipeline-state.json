@@ -2,7 +2,7 @@
   "req": "REQ-592",
   "branch": "feat/REQ-592-markdown-aware-terminal-rendering",
   "startedAt": "2026-08-26T00:00:00Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "phaseHistory": [
     {
@@ -54,6 +55,14 @@
       "phase": 7,
       "name": "PR Cleanup & CI",
       "completedAt": "2026-08-26T00:00:00Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup",
+      "completedAt": "2026-08-27T01:08:54Z",
+      "mergeCommit": "e6e1d2bc1a5f87f89b0374041dd81c4c52cda052",
+      "pr": 220,
+      "outcome": "merged"
     }
   ],
   "integrationBranch": "main",
@@ -66,7 +75,7 @@
       "touched": true,
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/220",
       "prNumber": 220,
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }
