@@ -106,7 +106,10 @@ named below.
 - Sandboxing the shell child's **network access** (e.g. `sandbox-exec` with no `network*` on macOS). That is the real fix for the egress bypass and deserves its own REQ with its own platform matrix; this REQ only stops the credential from being in the child's hands and makes the doc honest.
 - Command filtering or a network-shaped-command consent prompt.
 - Changing the MCP path, which already implements the target model.
-- The provider-side cleartext endpoint refusal (filed separately as BUG-202).
+- The provider-side cleartext endpoint refusal — **shipped separately as
+  BUG-202** (merged 2026-08-28). Its shape is precedent for this REQ: a secure
+  default with an explicit, greppable opt-out beat both a permissive default and
+  a heuristic (informed by LESSON-578).
 
 ## Retrieved Context
 
@@ -122,3 +125,4 @@ named below.
 - LESSON-497 (lesson, score 8): Plant sentinels, not lookalikes
 - REQ-571 (spec, score 14): Canonical provenance identity for privacy-boundary enforcement
 - REQ-591 (spec, score 7): The project-skill trust gate and its unattended allowlist
+- LESSON-578 (lesson, added post-retrieval): A rule attached to a UI flow guards one of the doors the record can come in through

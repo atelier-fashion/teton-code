@@ -67,7 +67,7 @@ belongs in its own decision.
 
 - [ ] BR-1: The daemon ships a builtin `local-only` boundary set covering at minimum: `**/.env`, `**/.env.*`, `**/.ssh/**`, `**/*.pem`, `**/*.key`, `**/id_rsa*`, `**/id_ed25519*`, `**/.aws/**`, `**/.npmrc`, `**/.netrc`, `**/.git-credentials`, `**/.docker/config.json`, `**/.kube/config`.
 - [ ] BR-2: The builtin set applies when the user has declared no `[[boundaries]]` rows **and** when they have declared some. A user-authored boundary list **adds to** the builtin set; it does not replace it. Silently losing the builtin protections by writing one unrelated boundary row is the failure this rule prevents.
-- [ ] BR-3: The builtin set is disabled only by an explicit `[privacy] disable_default_boundaries = true`. There is no implicit path to an empty boundary set.
+- [ ] BR-3: The builtin set is disabled only by an explicit `[privacy] disable_default_boundaries = true`. There is no implicit path to an empty boundary set. This is deliberately the shape BUG-202 settled on for `allow_cleartext`: a secure default plus one explicit, greppable opt-out, rather than a permissive default or a heuristic that guesses which cases are safe (informed by LESSON-578).
 - [ ] BR-4: A builtin boundary is indistinguishable from a user boundary **at enforcement time** — same matcher, same `privacy_block`, same session taint. `origin` exists for reporting and for BR-6, never to weaken enforcement.
 - [ ] BR-5: A session whose root is `Home` or `FilesystemRoot` **and** whose effective boundary set is empty (only reachable via BR-3) emits `unbounded_root_warning` once at session start, on a user-visible surface — not only the daemon log (informed by REQ-571 BR-4: an audit signal that reaches only the log can be suppressed by the party it indicts).
 - [ ] BR-6: `teton config show` (or the equivalent surface) reports the effective boundary set with each row's origin, so a user can tell what they are protected by without reading the source.
@@ -127,3 +127,4 @@ belongs in its own decision.
 - REQ-570 (spec, score 8): Human-attested attach consent
 - LESSON-497 (lesson, score 8): Plant sentinels, not lookalikes
 - REQ-591 (spec, score 7): The project-skill trust gate and its unattended allowlist
+- LESSON-578 (lesson, added post-retrieval): A rule attached to a UI flow guards one of the doors the record can come in through
