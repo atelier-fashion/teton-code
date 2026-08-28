@@ -249,11 +249,13 @@ refuse a config that had been working.
 
 ## Follow-up (not in this fix)
 
-`teton provider add` has no `--allow-cleartext` flag, so registering a LAN
-provider through the guided flow requires hand-editing `config.toml` once. The
-preview refusal names the field, so the path is discoverable, but a flag would
-close it. Filed as a note rather than folded in — it is a protocol and CLI
-surface change, not part of the security fix.
+**Filed as BUG-205.** `teton provider add` has no `--allow-cleartext` flag, so
+the refusal names a remedy the command that produced it cannot apply. Worse than
+first assessed: `provider add` is the *only* command that stores a keychain
+entry, so the manual path also requires an OS-specific `security
+add-generic-password` invocation — which pushes users toward an `env:` auth_ref
+instead, the exact form REQ-596 exists to fix. Kept out of this fix because it is
+a protocol and CLI surface change, not part of the security fix.
 
 ## Files Changed
 
