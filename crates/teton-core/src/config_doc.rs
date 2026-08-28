@@ -1379,6 +1379,7 @@ tier = "off"
             endpoint: Some("https://api.deepseek.com/v1".to_owned()),
             model: Some("deepseek-chat".to_owned()),
             auth_ref: Some("keychain:deepseek".to_owned()),
+            allow_cleartext: false,
             capabilities: crate::entities::ProviderCapabilities::default(),
         }
     }

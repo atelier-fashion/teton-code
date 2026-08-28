@@ -87,6 +87,14 @@ fn is_zero(v: &u32) -> bool {
     *v == 0
 }
 
+/// `skip_serializing_if` predicate for [`ModelProvider::allow_cleartext`]:
+/// `false` is the secure default, and a default is no line. A config that never
+/// opted in keeps no `allow_cleartext` key, so the field is greppable exactly
+/// where somebody deliberately turned the protection off (BUG-202).
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 /// Capability profile of a provider; consulted by the router and adapter layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ProviderCapabilities {
@@ -173,6 +181,28 @@ pub struct ModelProvider {
     /// values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_ref: Option<String>,
+    /// Permit an `auth_ref` beside a cleartext `http://` endpoint on a
+    /// non-loopback host (BUG-202).
+    ///
+    /// `false` — the default — means such a pair is a **validation error**:
+    /// the credential resolved from `auth_ref` is sent as a request header on
+    /// every turn, so a cleartext endpoint puts it on the wire for every hop
+    /// between here and that host to read. `[web]` has refused the identical
+    /// pair since REQ-563; this is that rule's provider half.
+    ///
+    /// The opt-out exists because provider topologies are broader than
+    /// `[web]`'s. A self-hosted model server on a trusted LAN
+    /// (`http://10.0.1.50:8000`) with a token in front of it is a legitimate
+    /// setup, and `is_cleartext_to_a_remote_host` exempts only *loopback* — it
+    /// cannot tell a LAN host from a public one, and no reliable rule can tell
+    /// `models.corp.example.com` from `models.example.com`. So the judgment is
+    /// handed to the person who knows their own network, in one explicit,
+    /// auditable line, rather than guessed at by a heuristic.
+    ///
+    /// Setting this does not silence the registration warning: `teton provider
+    /// add` still names the host the credential travels to.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_cleartext: bool,
     /// Capability profile (tool-call tier, parallel support, context window).
     #[serde(default)]
     pub capabilities: ProviderCapabilities,

@@ -947,6 +947,7 @@ mod tests {
                 // The window the recipe declares, registered the way the setup
                 // commit records it (REQ-586 BR-3) — so every recipe's figure
                 // is also a capabilities value `Config::validate` accepts.
+                allow_cleartext: false,
                 capabilities: ProviderCapabilities {
                     max_context: recipe.max_context,
                     ..ProviderCapabilities::default()
