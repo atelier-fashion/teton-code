@@ -1,7 +1,7 @@
 ---
 id: BUG-202
 title: "A provider credential over a cleartext endpoint is refused for [web] but only warned about for providers"
-status: in-review
+status: resolved
 severity: medium
 created: 2026-08-28
 updated: 2026-08-28
@@ -232,6 +232,13 @@ refuse a config that had been working.
 - Falsification is built into the opt-out test: every endpoint it permits with
   the flag on is asserted **refused** with the flag off, so it tests the flag
   rather than the endpoints.
+
+## Deployment
+
+- Merged to `main` as `0b8c1c7` via https://github.com/atelier-fashion/teton-code/pull/226 on 2026-08-28.
+- No service deploy applies: Teton Code is a CLI + daemon that ships via tagged
+  release, not a promoted revision. **Not yet in a tagged release** — the newest
+  tag is v0.1.26 (2026-08-27), so this fix reaches users with the next one.
 
 ## Lessons
 
