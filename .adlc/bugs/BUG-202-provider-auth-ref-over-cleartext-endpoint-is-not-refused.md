@@ -233,6 +233,13 @@ refuse a config that had been working.
   the flag on is asserted **refused** with the flag off, so it tests the flag
   rather than the endpoints.
 
+## Lessons
+
+- `.adlc/knowledge/lessons/LESSON-578-a-rule-on-a-ui-flow-guards-one-door.md` —
+  a rule attached to a UI flow guards one of the doors the record can come in
+  through; and before mirroring a sibling rule, check whether the sibling'''s
+  domain assumptions hold.
+
 ## Follow-up (not in this fix)
 
 `teton provider add` has no `--allow-cleartext` flag, so registering a LAN
