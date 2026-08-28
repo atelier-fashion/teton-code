@@ -1393,6 +1393,41 @@ pub enum ConfigError {
     )]
     WebSearchKeyOverCleartextEndpoint,
 
+    /// A provider's `auth_ref` sits beside a cleartext `http://` endpoint on a
+    /// non-loopback host, and the provider has not opted out (BUG-202).
+    ///
+    /// The sibling of [`ConfigError::WebSearchKeyOverCleartextEndpoint`]: the
+    /// credential resolved from that reference is sent as a request header on
+    /// every turn, so a cleartext endpoint puts it on the wire for every hop to
+    /// read. `[web]` has refused this pair since REQ-563; the provider half was
+    /// only ever a warning inside the guided `teton provider add` flow, which
+    /// left a hand-edited config and a migrated one with no check at all.
+    ///
+    /// Unlike the `[web]` rule this one is **escapable**, because provider
+    /// topologies are broader than `[web]`'s. A self-hosted model server on a
+    /// trusted LAN with a token in front of it is a legitimate setup, and
+    /// [`is_cleartext_to_a_remote_host`] exempts only *loopback* — it cannot
+    /// tell a LAN host from a public one, and no reliable rule tells
+    /// `models.corp.example.com` from `models.example.com`. So the default is
+    /// secure and the judgment is handed to the person who knows their own
+    /// network, via `allow_cleartext = true` on that provider.
+    #[error(
+        "provider '{provider_id}': auth_ref is set, but endpoint is a cleartext http:// URL — \
+         the credential would travel to {host} in the clear on every turn, for every hop \
+         between this machine and that host to read. Use https:// if {host} serves it, or a \
+         loopback address if the provider runs on this machine. If {host} is on a network you \
+         trust (a self-hosted model server on a LAN), set `allow_cleartext = true` on this \
+         provider to say so deliberately (BUG-202)."
+    )]
+    AuthRefOverCleartextEndpoint {
+        /// The offending provider's id.
+        provider_id: String,
+        /// The host the credential would travel to, named so the message is
+        /// actionable without a second lookup — the registration warning this
+        /// rule grew out of named it too.
+        host: String,
+    },
+
     /// `[web] search_endpoint` already carries a `q` query parameter (REQ-563
     /// BR-2, BR-8).
     ///
@@ -1584,6 +1619,30 @@ impl Config {
             }
             if p.kind.is_remote() && p.endpoint.as_deref().unwrap_or("").trim().is_empty() {
                 return Err(ConfigError::MissingEndpoint(p.id.clone()));
+            }
+            // BUG-202: the `[web]` rule's sibling, by the same predicate rather
+            // than a second spelling of it (LESSON-494). A credential beside a
+            // cleartext endpoint is refused as a *pair* — `http://` to a
+            // provider that wants no credential is the user's own call, exactly
+            // as it is for `[web]`.
+            //
+            // `allow_cleartext` is the deliberate escape hatch, and it is
+            // checked first so the opt-out costs nothing to read. See the
+            // variant's doc comment for why this rule is escapable where
+            // `[web]`'s is not.
+            //
+            // `is_cleartext_to_a_remote_host` answers `false` for anything that
+            // is not an absolute http(s) URL, so a `Custom`/`Local` endpoint
+            // that is not a URL at all passes through untouched.
+            if !p.allow_cleartext {
+                if let Some(endpoint) = p.endpoint.as_deref() {
+                    if p.auth_ref.is_some() && is_cleartext_to_a_remote_host(endpoint) {
+                        return Err(ConfigError::AuthRefOverCleartextEndpoint {
+                            provider_id: p.id.clone(),
+                            host: url_host(endpoint).unwrap_or(endpoint).to_owned(),
+                        });
+                    }
+                }
             }
         }
 
@@ -2647,6 +2706,7 @@ kind = "local"
                     endpoint: None,
                     model: None,
                     auth_ref: None,
+                    allow_cleartext: false,
                     capabilities: ProviderCapabilities::default(),
                 },
                 ModelProvider {
@@ -2655,6 +2715,7 @@ kind = "local"
                     endpoint: Some("https://api.anthropic.com/v1/messages".to_owned()),
                     model: None,
                     auth_ref: Some("keychain:anthropic".to_owned()),
+                    allow_cleartext: false,
                     capabilities: ProviderCapabilities::default(),
                 },
             ],
@@ -2691,6 +2752,7 @@ kind = "local"
                     endpoint: Some("https://api.example.com/v1".to_owned()),
                     model: Some(blank.to_owned()),
                     auth_ref: None,
+                    allow_cleartext: false,
                     capabilities: ProviderCapabilities::default(),
                 }],
                 ..Config::default()
@@ -3024,6 +3086,7 @@ effort_ladder = []
                     // Local: model is owned by the REQ-547 consent flow, not here.
                     model: None,
                     auth_ref: None,
+                    allow_cleartext: false,
                     capabilities: ProviderCapabilities {
                         tool_call_tier: ToolCallTier::Degraded,
                         parallel_calls: false,
@@ -3037,6 +3100,7 @@ effort_ladder = []
                     endpoint: Some("https://api.anthropic.com".to_owned()),
                     model: Some("claude-opus-5".to_owned()),
                     auth_ref: Some("keychain:anthropic-prod".to_owned()),
+                    allow_cleartext: false,
                     capabilities: ProviderCapabilities {
                         tool_call_tier: ToolCallTier::Native,
                         parallel_calls: true,
@@ -3050,6 +3114,7 @@ effort_ladder = []
                     endpoint: Some("https://api.deepseek.com".to_owned()),
                     model: Some("deepseek-chat".to_owned()),
                     auth_ref: Some("keychain:deepseek".to_owned()),
+                    allow_cleartext: false,
                     capabilities: ProviderCapabilities::default(),
                 },
             ],
@@ -3165,6 +3230,220 @@ effort_ladder = []
                 provider_id: "anthropic-prod".to_owned()
             }
         );
+    }
+
+    /// **A provider credential beside a cleartext endpoint is refused by
+    /// default, exactly as `[web]`'s is** (BUG-202).
+    ///
+    /// The pair is what is refused: `http://` to a provider that wants no
+    /// credential is the user's own call, and loopback is exempt because
+    /// nothing leaves the machine.
+    ///
+    /// **Mutation (run, not assumed):** disabling the guard in `validate`'s
+    /// provider loop turns **4** tests red — this one,
+    /// `allow_cleartext_permits_the_pair_it_is_set_on_and_nothing_else` (its
+    /// falsification half), `the_provider_cleartext_rule_folds_scheme_case`, and
+    /// `the_provider_cleartext_refusal_names_the_provider_and_the_escape_hatch`.
+    ///
+    /// The number that matters is the **fourth**:
+    /// `a_search_key_beside_a_cleartext_remote_endpoint_is_refused` stays
+    /// **green** under that mutation. The `[web]` rule and this one are separate
+    /// enforcement points of one invariant, and the web test never covered the
+    /// provider path — which is precisely how this hole survived to be found by
+    /// audit instead of by CI (conventions.md, "an invariant with more than one
+    /// enforcement point needs a sweep").
+    #[test]
+    fn a_provider_credential_beside_a_cleartext_remote_endpoint_is_refused() {
+        for remote in [
+            "http://api.example.com/v1/chat/completions",
+            "http://192.0.2.10:8888/v1/chat/completions",
+            "http://user@api.example.com/v1/chat/completions",
+            "http://[2001:db8::1]/v1/chat/completions",
+        ] {
+            let mut cfg = sample_config();
+            cfg.providers[2].endpoint = Some((*remote).to_owned());
+            cfg.providers[2].auth_ref = Some("keychain:deepseek".to_owned());
+            assert_eq!(
+                cfg.validate().unwrap_err(),
+                ConfigError::AuthRefOverCleartextEndpoint {
+                    provider_id: "deepseek".to_owned(),
+                    host: url_host(cfg.providers[2].endpoint.as_deref().expect("endpoint"))
+                        .expect("host")
+                        .to_owned(),
+                },
+                "a credential was allowed to travel in the clear to {remote}"
+            );
+        }
+
+        // Loopback is exempt: nothing leaves the machine, and refusing it would
+        // push a local Ollama or llama.cpp server toward a self-signed
+        // certificate for no gain.
+        for local in [
+            "http://localhost:11434/v1/chat/completions",
+            "http://LOCALHOST:11434/v1/chat/completions",
+            "http://127.0.0.1:11434/v1/chat/completions",
+            "http://127.9.9.9/v1/chat/completions",
+            "http://[::1]:11434/v1/chat/completions",
+        ] {
+            let mut cfg = sample_config();
+            cfg.providers[2].endpoint = Some((*local).to_owned());
+            cfg.providers[2].auth_ref = Some("keychain:deepseek".to_owned());
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{local} is loopback and needs no TLS: {e}"));
+        }
+
+        // https is fine anywhere, and cleartext with no credential is not this
+        // rule's business.
+        for (endpoint, auth) in [
+            (
+                "https://api.example.com/v1/chat/completions",
+                Some("keychain:deepseek"),
+            ),
+            ("http://api.example.com/v1/chat/completions", None),
+        ] {
+            let mut cfg = sample_config();
+            cfg.providers[2].endpoint = Some((*endpoint).to_owned());
+            cfg.providers[2].auth_ref = auth.map(str::to_owned);
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{endpoint} with auth {auth:?} must validate: {e}"));
+        }
+    }
+
+    /// **`allow_cleartext` is the deliberate escape hatch, and it works for the
+    /// case it exists for** (BUG-202): a self-hosted model server on a LAN,
+    /// which `is_cleartext_to_a_remote_host` cannot tell from a public host.
+    ///
+    /// Falsification is the second half: the same config with the flag back off
+    /// is refused, so this asserts the flag rather than asserting that these
+    /// endpoints were permitted all along.
+    #[test]
+    fn allow_cleartext_permits_the_pair_it_is_set_on_and_nothing_else() {
+        for lan in [
+            "http://10.0.1.50:8000/v1/chat/completions",
+            "http://192.168.1.20:8000/v1/chat/completions",
+            "http://models.corp.example.com/v1/chat/completions",
+        ] {
+            let mut cfg = sample_config();
+            cfg.providers[2].endpoint = Some((*lan).to_owned());
+            cfg.providers[2].auth_ref = Some("keychain:deepseek".to_owned());
+            cfg.providers[2].allow_cleartext = true;
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{lan} was opted in and must validate: {e}"));
+
+            // Falsification: the flag is what permitted it.
+            cfg.providers[2].allow_cleartext = false;
+            assert_eq!(
+                cfg.validate().unwrap_err(),
+                ConfigError::AuthRefOverCleartextEndpoint {
+                    provider_id: "deepseek".to_owned(),
+                    host: url_host(cfg.providers[2].endpoint.as_deref().expect("endpoint"))
+                        .expect("host")
+                        .to_owned(),
+                },
+                "{lan} passed without the opt-out, so the opt-out proved nothing"
+            );
+        }
+
+        // The opt-out is per provider, not global: setting it on one leaves
+        // another's cleartext pair refused.
+        let mut cfg = sample_config();
+        cfg.providers[2].endpoint = Some("http://10.0.1.50:8000/v1".to_owned());
+        cfg.providers[2].auth_ref = Some("keychain:deepseek".to_owned());
+        cfg.providers[2].allow_cleartext = true;
+        cfg.providers[1].endpoint = Some("http://api.example.com/v1".to_owned());
+        cfg.providers[1].auth_ref = Some("keychain:anthropic-prod".to_owned());
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ConfigError::AuthRefOverCleartextEndpoint {
+                provider_id: "anthropic-prod".to_owned(),
+                host: "api.example.com".to_owned(),
+            },
+            "one provider's opt-out excused another's cleartext credential"
+        );
+    }
+
+    /// The scheme fold that `[web]` pins for its own readers has to hold here
+    /// too: `HTTP://` is cleartext, and a rule reading `starts_with("http://")`
+    /// would send the credential out believing it was TLS (BUG-202).
+    #[test]
+    fn the_provider_cleartext_rule_folds_scheme_case() {
+        for shouty in [
+            "HTTP://api.example.com/v1/chat/completions",
+            "Http://api.example.com/v1/chat/completions",
+        ] {
+            let mut cfg = sample_config();
+            cfg.providers[2].endpoint = Some((*shouty).to_owned());
+            cfg.providers[2].auth_ref = Some("keychain:deepseek".to_owned());
+            assert_eq!(
+                cfg.validate().unwrap_err(),
+                ConfigError::AuthRefOverCleartextEndpoint {
+                    provider_id: "deepseek".to_owned(),
+                    host: url_host(cfg.providers[2].endpoint.as_deref().expect("endpoint"))
+                        .expect("host")
+                        .to_owned(),
+                },
+                "{shouty} was read as a URL by one check and not by the other"
+            );
+        }
+    }
+
+    /// The refusal names the provider, the remedy, and the escape hatch, and
+    /// echoes no credential (conventions.md: no credential in an error message;
+    /// LESSON-557: compose the sentence where the facts are).
+    #[test]
+    fn the_provider_cleartext_refusal_names_the_provider_and_the_escape_hatch() {
+        let mut cfg = sample_config();
+        cfg.providers[2].endpoint = Some("http://api.example.com/v1".to_owned());
+        cfg.providers[2].auth_ref = Some("keychain:deepseek".to_owned());
+        let msg = cfg.validate().unwrap_err().to_string();
+        assert!(msg.contains("deepseek"), "must name the provider: {msg}");
+        assert!(
+            msg.contains("api.example.com"),
+            "must name the host the credential travels to: {msg}"
+        );
+        assert!(msg.contains("https://"), "must name the remedy: {msg}");
+        assert!(
+            msg.contains("loopback"),
+            "must name the loopback exemption: {msg}"
+        );
+        assert!(
+            msg.contains("allow_cleartext"),
+            "must name the escape hatch, or the refusal is a dead end: {msg}"
+        );
+        assert!(
+            !msg.contains("keychain:deepseek"),
+            "the error echoed the credential reference: {msg}"
+        );
+    }
+
+    /// `allow_cleartext` stays out of a config that never opted in, and comes
+    /// back when it did (BUG-202).
+    ///
+    /// The absent half is the point: a security-relevant opt-out that
+    /// serialized as `allow_cleartext = false` into every provider table would
+    /// be unreadable noise, and the field is meant to be greppable exactly
+    /// where somebody deliberately turned the protection off.
+    #[test]
+    fn allow_cleartext_round_trips_and_defaults_to_absent() {
+        let cfg = sample_config();
+        let rendered = toml::to_string(&cfg).expect("serialize");
+        assert!(
+            !rendered.contains("allow_cleartext"),
+            "a config that never opted in carries no allow_cleartext line:\n{rendered}"
+        );
+        let back: Config = toml::from_str(&rendered).expect("round trip");
+        assert!(back.providers.iter().all(|p| !p.allow_cleartext));
+
+        let mut opted = sample_config();
+        opted.providers[2].allow_cleartext = true;
+        let rendered = toml::to_string(&opted).expect("serialize");
+        assert!(
+            rendered.contains("allow_cleartext = true"),
+            "the opt-in must survive a round trip:\n{rendered}"
+        );
+        let back: Config = toml::from_str(&rendered).expect("round trip");
+        assert!(back.providers[2].allow_cleartext);
+        assert!(!back.providers[1].allow_cleartext);
     }
 
     #[test]
@@ -4201,6 +4480,7 @@ provider_id = "on-device"
                     endpoint: Some("https://api.anthropic.com".to_owned()),
                     model: Some("claude-opus-5".to_owned()),
                     auth_ref: Some("keychain:anthropic".to_owned()),
+                    allow_cleartext: false,
                     capabilities: ProviderCapabilities::default(),
                 }],
                 legacy_routing: vec![LegacyRoutingRule {
@@ -4356,6 +4636,7 @@ provider_id = "my-llama"
             endpoint: Some("https://api.anthropic.com".to_owned()),
             model: Some("claude-opus-5".to_owned()),
             auth_ref: Some("keychain:anthropic".to_owned()),
+            allow_cleartext: false,
             capabilities: ProviderCapabilities::default(),
         });
         cfg.legacy_routing = vec![LegacyRoutingRule {

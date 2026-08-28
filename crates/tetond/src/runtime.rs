@@ -13896,6 +13896,19 @@ fn apply_update(config: &mut Config, update: ConfigUpdate) {
                 .iter()
                 .find(|p| p.id == id)
                 .map_or_else(ProviderCapabilities::default, |p| p.capabilities);
+            // BUG-202, and BUG-155's rule applied to the field added for it:
+            // `allow_cleartext` is likewise not settable over this RPC, so
+            // rebuilding the record wholesale would silently clear a
+            // hand-authored opt-out — and the next `Config::validate` would
+            // then refuse a config that had been working, on a re-registration
+            // the user made for an unrelated reason (`--model`, a window). It
+            // is preserved, never defaulted, for exactly the reason the
+            // capability profile above is.
+            let allow_cleartext = config
+                .providers
+                .iter()
+                .find(|p| p.id == id)
+                .is_some_and(|p| p.allow_cleartext);
             // REQ-586 ADR-7: the two window fields are the one exception to
             // "capabilities are not settable over this RPC", and they merge
             // **field-wise** — `Some(v)` writes (`0` included: it is the
@@ -13917,6 +13930,7 @@ fn apply_update(config: &mut Config, update: ConfigUpdate) {
                 endpoint: pc.endpoint,
                 model: pc.model,
                 auth_ref: pc.auth_ref,
+                allow_cleartext,
                 capabilities,
             };
             if let Some(existing) = config.providers.iter_mut().find(|p| p.id == provider.id) {
@@ -14904,6 +14918,7 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: Some("https://api.deepseek.com".to_owned()),
                 model: model.map(str::to_owned),
                 auth_ref: Some(format!("keychain:{id}")),
+                allow_cleartext: false,
                 capabilities: ProviderCapabilities::default(),
             };
             let mut config = Config {
@@ -15010,6 +15025,7 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: Some("https://api.deepseek.com".to_owned()),
                 model: Some("deepseek-chat".to_owned()),
                 auth_ref: Some("keychain:cheap".to_owned()),
+                allow_cleartext: false,
                 capabilities: ProviderCapabilities::default(),
             }],
             default_provider: Some("cheap".to_owned()),
@@ -15110,6 +15126,7 @@ permission_allow = [\"fetch_user_url\"]
             endpoint: Some("https://api.deepseek.com".to_owned()),
             model: Some("deepseek-chat".to_owned()),
             auth_ref: Some("keychain:cheap".to_owned()),
+            allow_cleartext: false,
             capabilities: ProviderCapabilities::default(),
         };
 
@@ -15171,6 +15188,7 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: Some("https://api.deepseek.com".to_owned()),
                 model: Some("deepseek-chat".to_owned()),
                 auth_ref: Some("keychain:cheap".to_owned()),
+                allow_cleartext: false,
                 capabilities: ProviderCapabilities::default(),
             }],
             tiers: vec![TierBinding {
@@ -15205,6 +15223,7 @@ permission_allow = [\"fetch_user_url\"]
             endpoint: Some("http://127.0.0.1:8080".to_owned()),
             model: None,
             auth_ref: None,
+            allow_cleartext: false,
             capabilities: ProviderCapabilities::default(),
         };
 
@@ -16141,6 +16160,7 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: Some("https://api.deepseek.com".to_owned()),
                 model: Some("deepseek-chat".to_owned()),
                 auth_ref: None,
+                allow_cleartext: false,
                 capabilities: ProviderCapabilities::default(),
             }],
             // The upgraded shape: a remote default, no `[[tiers]]` at all.
@@ -16336,6 +16356,7 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: None,
                 model: None,
                 auth_ref: None,
+                allow_cleartext: false,
                 capabilities: ProviderCapabilities::default(),
             }],
             ..Config::default()
@@ -16471,6 +16492,7 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: None,
                 model: None,
                 auth_ref: None,
+                allow_cleartext: false,
                 capabilities: ProviderCapabilities::default(),
             }],
             tiers: vec![TierBinding {
@@ -17089,6 +17111,7 @@ permission_allow = [\"fetch_user_url\"]
             endpoint: Some(endpoint.to_owned()),
             model: Some("test-model".to_owned()),
             auth_ref: auth_ref.map(str::to_owned),
+            allow_cleartext: false,
             capabilities: ProviderCapabilities::default(),
         }
     }
@@ -17264,6 +17287,7 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: Some("https://api.example.com/v1/chat/completions".to_owned()),
                 model: Some("deepseek-chat".to_owned()),
                 auth_ref: Some("keychain:remote".to_owned()),
+                allow_cleartext: false,
                 capabilities: ProviderCapabilities::default(),
             }],
             legacy_routing: Vec::new(),
@@ -17318,6 +17342,7 @@ permission_allow = [\"fetch_user_url\"]
                 // Normal for the local kind: REQ-547's consent flow owns it.
                 model: None,
                 auth_ref: None,
+                allow_cleartext: false,
                 capabilities: ProviderCapabilities::default(),
             }],
             tiers: vec![TierBinding {
@@ -17355,6 +17380,7 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: Some("https://api.example.com".to_owned()),
                 model: Some("some-model".to_owned()),
                 auth_ref: None,
+                allow_cleartext: false,
                 capabilities: ProviderCapabilities::default(),
             }
         }
@@ -17365,6 +17391,7 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: None,
                 model: None,
                 auth_ref: None,
+                allow_cleartext: false,
                 capabilities: ProviderCapabilities::default(),
             }
         }
@@ -17437,6 +17464,7 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: Some("https://api.example.com/v1/chat/completions".to_owned()),
                 model: Some("   ".to_owned()),
                 auth_ref: None,
+                allow_cleartext: false,
                 capabilities: ProviderCapabilities::default(),
             }],
             tiers: vec![TierBinding {
@@ -17468,6 +17496,7 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: Some("https://api.example.com/v1/chat/completions".to_owned()),
                 model: None,
                 auth_ref: None,
+                allow_cleartext: false,
                 capabilities: ProviderCapabilities::default(),
             }],
             ..Config::default()
@@ -17508,6 +17537,7 @@ permission_allow = [\"fetch_user_url\"]
                     endpoint: Some("https://api.example.com/v1".to_owned()),
                     model: Some("deepseek-chat".to_owned()),
                     auth_ref: None,
+                    allow_cleartext: false,
                     capabilities: ProviderCapabilities::default(),
                 },
                 ModelProvider {
@@ -17516,6 +17546,7 @@ permission_allow = [\"fetch_user_url\"]
                     endpoint: Some("https://api.other.com/v1".to_owned()),
                     model: None,
                     auth_ref: None,
+                    allow_cleartext: false,
                     capabilities: ProviderCapabilities::default(),
                 },
             ],
@@ -17583,6 +17614,7 @@ permission_allow = [\"fetch_user_url\"]
                     endpoint: Some("https://api.anthropic.com/v1/messages".to_owned()),
                     model: Some("claude-opus-5".to_owned()),
                     auth_ref: Some("keychain:anthropic".to_owned()),
+                    allow_cleartext: false,
                     capabilities: ProviderCapabilities::default(),
                 },
                 ModelProvider {
@@ -17591,6 +17623,7 @@ permission_allow = [\"fetch_user_url\"]
                     endpoint: Some("https://api.deepseek.com/v1/chat/completions".to_owned()),
                     model: Some("deepseek-chat".to_owned()),
                     auth_ref: Some("keychain:deepseek".to_owned()),
+                    allow_cleartext: false,
                     capabilities: ProviderCapabilities::default(),
                 },
             ],
@@ -17837,6 +17870,7 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: Some("https://api.example.com/v1/chat/completions".to_owned()),
                 model: Some(model.to_owned()),
                 auth_ref: None,
+                allow_cleartext: false,
                 capabilities: ProviderCapabilities::default(),
             }
         }
@@ -18342,6 +18376,7 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: None,
                 model: None,
                 auth_ref: None,
+                allow_cleartext: false,
                 capabilities: ProviderCapabilities::default(),
             });
             // `edit` inherits `build`; bind it to the local tier explicitly.
@@ -18450,6 +18485,7 @@ permission_allow = [\"fetch_user_url\"]
                     endpoint: None,
                     model: None,
                     auth_ref: None,
+                    allow_cleartext: false,
                     capabilities: ProviderCapabilities::default(),
                 }
             }
@@ -20368,6 +20404,7 @@ permission_allow = [\"fetch_user_url\"]
                         endpoint: None,
                         model: None,
                         auth_ref: None,
+                        allow_cleartext: false,
                         capabilities: ProviderCapabilities::default(),
                     }
                 }
@@ -22642,6 +22679,7 @@ permission_allow = [\"fetch_user_url\"]
                     endpoint: None,
                     model: None,
                     auth_ref: None,
+                    allow_cleartext: false,
                     capabilities: ProviderCapabilities {
                         tool_call_tier,
                         ..ProviderCapabilities::default()
@@ -24888,6 +24926,7 @@ search_key_ref = \"keychain://teton/web-search\"
                     endpoint: Some("https://api.example.com".to_owned()),
                     model: Some("m".to_owned()),
                     auth_ref: None,
+                    allow_cleartext: false,
                     capabilities: ProviderCapabilities::default(),
                 }],
                 default_provider: Some("remote".to_owned()),
@@ -25925,11 +25964,20 @@ fallback_id = \"local\"
             );
         }
 
-        /// A cleartext endpoint to a remote host is named, with the host the
-        /// key would travel to — and loopback is exempt, because nothing leaves
-        /// the machine.
+        /// **A cleartext endpoint to a remote host is refused, naming the host
+        /// the credential would travel to — and loopback is exempt, because
+        /// nothing leaves the machine** (BUG-202).
+        ///
+        /// This asserted a *warning* until BUG-202. It was not a stale test: it
+        /// documented a deliberate difference from `[web]`, which has refused
+        /// the identical pair since REQ-563. What settled the difference is that
+        /// the refusal is now **escapable** (`allow_cleartext`), so the secure
+        /// default costs no legitimate topology — see the third block.
+        ///
+        /// The refusal lands at *preview*, before a key is typed, which is the
+        /// half worth keeping from the warning it replaces.
         #[test]
-        fn a_cleartext_remote_endpoint_warns_and_a_loopback_one_does_not() {
+        fn a_cleartext_remote_endpoint_is_refused_and_a_loopback_one_is_not() {
             let (runtime, _path) = runtime_seeded("provider-setup-cleartext", SEEDED);
             let exposed = ProviderSetupCandidate {
                 id: ProviderId::from("selfhosted"),
@@ -25938,23 +25986,26 @@ fallback_id = \"local\"
                 bindings: Vec::new(),
                 ..kimi()
             };
-            let rendered = derive(&runtime, &exposed).expect("previews");
-            let note = rendered
-                .warnings
-                .iter()
-                .find(|w| w.contains("in the clear"))
-                .unwrap_or_else(|| panic!("no cleartext note: {:?}", rendered.warnings));
+            let err = refusal(&runtime, &exposed);
+            assert_eq!(err.code, error_code::PROVIDER_SETUP_INVALID);
             assert!(
-                note.contains("models.example.com"),
-                "the note names the host the key travels to: {note}"
+                err.message.contains("models.example.com"),
+                "the refusal names the host the credential travels to: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("allow_cleartext"),
+                "the refusal names its own escape hatch, or it is a dead end: {}",
+                err.message
             );
             // LESSON-517: plain sentences, styled by whatever renders them.
             assert!(
-                !rendered.warnings.iter().any(|w| w.contains('\u{1b}')),
-                "a warning carries no escape sequences: {:?}",
-                rendered.warnings
+                !err.message.contains('\u{1b}'),
+                "a refusal carries no escape sequences: {}",
+                err.message
             );
 
+            // Loopback puts nothing on a wire, so it previews without a note.
             let local = ProviderSetupCandidate {
                 id: ProviderId::from("ollama"),
                 endpoint: Some("http://localhost:11434/v1/chat/completions".to_owned()),
@@ -25962,14 +26013,79 @@ fallback_id = \"local\"
                 bindings: Vec::new(),
                 ..kimi()
             };
+            let rendered = derive(&runtime, &local).expect("previews");
             assert!(
-                !derive(&runtime, &local)
-                    .expect("previews")
+                !rendered.warnings.iter().any(|w| w.contains("in the clear")),
+                "a loopback endpoint puts nothing on a wire: {:?}",
+                rendered.warnings
+            );
+        }
+
+        /// **A provider that already carries `allow_cleartext = true` still
+        /// previews, and is still warned at** (BUG-202).
+        ///
+        /// Two properties in one fixture, because they share the one hard part
+        /// — a *seeded* opt-out that this RPC cannot set:
+        ///
+        /// 1. `apply_update` preserves `allow_cleartext` across a
+        ///    re-registration, exactly as it preserves the capability profile
+        ///    (BUG-155). Without that, a `--model` change would silently clear
+        ///    the opt-out and refuse a config that had been working.
+        /// 2. The opt-out suppresses the *refusal*, not the *warning*. Somebody
+        ///    who told the daemon they trust their LAN is still told what
+        ///    travels where.
+        ///
+        /// **Mutation (run, not assumed):** replacing `apply_update`'s
+        /// preservation lookup with `false` — i.e. defaulting the flag on
+        /// re-registration instead of carrying it — turns this test red. That is
+        /// the BUG-155 failure mode reproduced on the new field, and it is the
+        /// reason the lookup exists rather than a plain `false`.
+        #[test]
+        fn a_seeded_cleartext_opt_out_survives_re_registration_and_still_warns() {
+            const OPTED_IN: &str = "\
+[[providers]]
+id = \"lan\"
+kind = \"openai-compatible\"
+endpoint = \"http://models.corp.example.com/v1/chat/completions\"
+model = \"local-70b\"
+auth_ref = \"keychain://teton/lan\"
+allow_cleartext = true
+";
+            let (runtime, _path) = runtime_seeded("provider-setup-optedin", OPTED_IN);
+            let rereg = ProviderSetupCandidate {
+                id: ProviderId::from("lan"),
+                endpoint: Some("http://models.corp.example.com/v1/chat/completions".to_owned()),
+                model: "local-70b-instruct".to_owned(),
+                key_ref: "keychain://teton/lan".to_owned(),
+                bindings: Vec::new(),
+                ..kimi()
+            };
+            let rendered = derive(&runtime, &rereg)
+                .expect("a seeded opt-out must survive a re-registration and preview");
+            assert!(
+                rendered
                     .warnings
                     .iter()
-                    .any(|w| w.contains("in the clear")),
-                "a loopback endpoint puts nothing on a wire"
+                    .any(|w| w.contains("in the clear") && w.contains("models.corp.example.com")),
+                "the opt-out silences the refusal, never the warning: {:?}",
+                rendered.warnings
             );
+
+            // Falsification: the same candidate against a config *without* the
+            // opt-out is refused — so the block above is testing the seeded
+            // flag, not some property of this endpoint.
+            const NOT_OPTED_IN: &str = "\
+[[providers]]
+id = \"lan\"
+kind = \"openai-compatible\"
+endpoint = \"https://models.corp.example.com/v1/chat/completions\"
+model = \"local-70b\"
+auth_ref = \"keychain://teton/lan\"
+";
+            let (bare, _path) = runtime_seeded("provider-setup-notoptedin", NOT_OPTED_IN);
+            let err = refusal(&bare, &rereg);
+            assert_eq!(err.code, error_code::PROVIDER_SETUP_INVALID);
+            assert!(err.message.contains("allow_cleartext"), "{}", err.message);
         }
 
         // -- the refusals ------------------------------------------------------
@@ -27201,6 +27317,7 @@ provider_id = \"deepseek\"
                     endpoint: Some(endpoint.to_owned()),
                     model: Some(model.to_owned()),
                     auth_ref: Some(AUTH_REF.to_owned()),
+                    allow_cleartext: false,
                     capabilities: ProviderCapabilities::default(),
                 }];
             }
@@ -27408,6 +27525,7 @@ provider_id = \"deepseek\"
                     endpoint: None,
                     model: None,
                     auth_ref: None,
+                    allow_cleartext: false,
                     capabilities: ProviderCapabilities::default(),
                 }];
             }
@@ -28207,6 +28325,7 @@ provider_id = \"deepseek\"
                     endpoint: None,
                     model: None,
                     auth_ref: None,
+                    allow_cleartext: false,
                     capabilities: ProviderCapabilities::default(),
                 }],
                 tiers: Tier::ALL
@@ -30854,6 +30973,7 @@ provider_id = \"deepseek\"
                         endpoint: Some("https://example.invalid/v1/chat/completions".to_owned()),
                         model: Some("wide-model".to_owned()),
                         auth_ref: None,
+                        allow_cleartext: false,
                         capabilities: ProviderCapabilities {
                             max_context: 128_000,
                             ..ProviderCapabilities::default()
@@ -30935,6 +31055,7 @@ provider_id = \"deepseek\"
                         endpoint: Some("https://example.invalid/v1/chat/completions".to_owned()),
                         model: Some("wide-model".to_owned()),
                         auth_ref: None,
+                        allow_cleartext: false,
                         capabilities: ProviderCapabilities {
                             max_context: 200_000,
                             context_budget_cap: cap,
@@ -30998,6 +31119,7 @@ provider_id = \"deepseek\"
                     endpoint: Some(endpoint.to_owned()),
                     model: Some("kimi-k2".to_owned()),
                     auth_ref: None,
+                    allow_cleartext: false,
                     capabilities: ProviderCapabilities {
                         max_context: 128_000,
                         ..ProviderCapabilities::default()
@@ -31168,6 +31290,7 @@ provider_id = \"deepseek\"
                     endpoint: None,
                     model: None,
                     auth_ref: None,
+                    allow_cleartext: false,
                     capabilities: ProviderCapabilities::default(),
                 }],
                 tiers: Tier::ALL
@@ -31649,6 +31772,7 @@ provider_id = \"deepseek\"
                     endpoint: Some("http://127.0.0.1:9/v1/chat/completions".to_owned()),
                     model: Some("deepseek-chat".to_owned()),
                     auth_ref: None,
+                    allow_cleartext: false,
                     capabilities: ProviderCapabilities::default(),
                 }],
                 default_provider: Some("cheap".to_owned()),
@@ -31698,6 +31822,7 @@ provider_id = \"deepseek\"
                         endpoint: None,
                         model: None,
                         auth_ref: None,
+                        allow_cleartext: false,
                         capabilities: ProviderCapabilities::default(),
                     },
                     ModelProvider {
@@ -31706,6 +31831,7 @@ provider_id = \"deepseek\"
                         endpoint: Some("https://api.example.com/v1/chat/completions".to_owned()),
                         model: Some("deepseek-chat".to_owned()),
                         auth_ref: None,
+                        allow_cleartext: false,
                         capabilities: ProviderCapabilities::default(),
                     },
                 ],

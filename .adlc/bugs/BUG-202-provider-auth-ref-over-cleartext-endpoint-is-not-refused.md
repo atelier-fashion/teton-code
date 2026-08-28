@@ -1,7 +1,7 @@
 ---
 id: BUG-202
 title: "A provider credential over a cleartext endpoint is refused for [web] but only warned about for providers"
-status: open
+status: in-review
 severity: medium
 created: 2026-08-28
 updated: 2026-08-28
@@ -102,12 +102,12 @@ is a **structural** error — the record is coherent but unsafe by construction 
 which puts it on the fail-closed `Config::validate()` side, alongside the `[web]`
 rule, not in a non-fatal usability pass.
 
-## Investigation outcome — BLOCKED ON A PRODUCT DECISION
+## Investigation — the decision, and why it was needed
 
-A candidate fix was written, tested, and **reverted**. It is preserved verbatim
-at `.adlc/bugs/BUG-202-candidate-fix.patch` (187 lines: the `ConfigError`
-variant, the guard in `validate`'s provider loop, and three tests). The tree is
-green; nothing is half-applied.
+A first candidate was written, tested, and **reverted** because it would have
+broken a legitimate topology. Option **(D)** was then chosen and shipped. The
+superseded candidate is kept at `.adlc/bugs/BUG-202-candidate-fix.patch` for the
+record.
 
 ### What the candidate did
 
@@ -160,7 +160,7 @@ independently.
   hand-edited and migrated configs via the non-fatal usability pass, per the
   project's own validity-vs-usability convention. Non-breaking; leaves a
   credential reaching a public host in cleartext with only a warning.
-- **(D, recommended) Refuse by default with an explicit per-provider opt-out**
+- **(D — CHOSEN, shipped) Refuse by default with an explicit per-provider opt-out**
   (`allow_cleartext = true`). Secure by default for every config path including
   hand-edited ones, no DNS heuristic, and every legitimate setup stays possible
   behind one greppable, auditable line. Costs a user-facing config schema field,
@@ -187,12 +187,66 @@ independently.
 
 ## Resolution
 
-(pending the decision above)
+Option **(D)**. `Config::validate()` now refuses a provider that pairs an
+`auth_ref` with a cleartext `http://` endpoint on a non-loopback host — the
+`[web]` rule's provider half, using the same `is_cleartext_to_a_remote_host`
+predicate rather than a second spelling of it (LESSON-494).
+
+Unlike the `[web]` rule, this one is **escapable**. `ModelProvider` gains
+`allow_cleartext: bool` (default `false`, `skip_serializing_if` so a config that
+never opted in carries no line). The default is secure for every config path —
+including the hand-edited and migrated ones that had no check at all — while a
+self-hosted model server on a trusted LAN stays possible behind one explicit,
+greppable, auditable line. No DNS heuristic is involved, because none is
+reliable: nothing distinguishes `models.corp.example.com` from
+`models.example.com`.
+
+The refusal names the provider, the host the credential would travel to, the
+`https://`/loopback remedies, **and its own escape hatch** — a refusal that does
+not name its way out is a dead end.
+
+Two behaviours worth stating because they were deliberate:
+
+- **The refusal lands at preview**, before a key is typed. That is the property
+  worth keeping from the warning it replaces.
+- **The opt-out silences the refusal, never the warning.** Somebody who told the
+  daemon they trust their LAN is still told what travels where.
+
+`apply_update` preserves `allow_cleartext` across a re-registration rather than
+defaulting it, exactly as it preserves the capability profile (BUG-155).
+Without that, an unrelated `--model` change would silently clear the opt-out and
+refuse a config that had been working.
+
+### Verification
+
+- `cargo test --workspace --no-fail-fast`: **3,997 passed, 0 failed, 1 ignored**
+  across 69 targets; output grepped for `FAILED` (0), per conventions.md.
+- `cargo clippy --workspace --all-targets` clean; `cargo fmt --check` clean.
+- **Mutation 1 (run):** disabling the guard turns **4** tests red — and
+  `a_search_key_beside_a_cleartext_remote_endpoint_is_refused`, the `[web]`
+  sibling, stays **green**. That green is the evidence these are two enforcement
+  points of one invariant and the web test never covered this path.
+- **Mutation 2 (run):** replacing the `apply_update` preservation lookup with
+  `false` turns the re-registration test red — BUG-155's failure mode
+  reproduced on the new field.
+- Falsification is built into the opt-out test: every endpoint it permits with
+  the flag on is asserted **refused** with the flag off, so it tests the flag
+  rather than the endpoints.
+
+## Follow-up (not in this fix)
+
+`teton provider add` has no `--allow-cleartext` flag, so registering a LAN
+provider through the guided flow requires hand-editing `config.toml` once. The
+preview refusal names the field, so the path is discoverable, but a flag would
+close it. Filed as a note rather than folded in — it is a protocol and CLI
+surface change, not part of the security fix.
 
 ## Files Changed
 
-- `crates/teton-core/src/config.rs` — add the provider-side refusal in the provider validation loop; add the `ConfigError` variant and its message.
-- `crates/tetond/src/runtime.rs` — the guided-flow warning becomes redundant with a hard refusal; reconcile rather than leaving two divergent messages.
+- `crates/teton-core/src/entities.rs` — `ModelProvider::allow_cleartext` and its `is_false` skip predicate.
+- `crates/teton-core/src/config.rs` — `ConfigError::AuthRefOverCleartextEndpoint` (carrying provider id and host); the guard in `validate`'s provider loop; five tests.
+- `crates/tetond/src/runtime.rs` — preserve `allow_cleartext` across re-registration in `apply_update`; rewrite the cleartext preview test for refusal; add the seeded-opt-out test.
+- `crates/tetond/src/provider_recipes.rs` — fixture field.
 
 ## Fix Notes
 
