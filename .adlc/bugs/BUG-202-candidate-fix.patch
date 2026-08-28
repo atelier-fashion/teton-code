@@ -1,0 +1,187 @@
+diff --git a/crates/teton-core/src/config.rs b/crates/teton-core/src/config.rs
+index 8abac92..94a6c96 100644
+--- a/crates/teton-core/src/config.rs
++++ b/crates/teton-core/src/config.rs
+@@ -1393,6 +1393,35 @@ pub enum ConfigError {
+     )]
+     WebSearchKeyOverCleartextEndpoint,
+ 
++    /// A provider's `auth_ref` sits beside a cleartext `http://` endpoint on a
++    /// non-loopback host (BUG-202).
++    ///
++    /// The sibling of [`ConfigError::WebSearchKeyOverCleartextEndpoint`], and
++    /// deliberately worded and shaped the same way: the credential resolved from
++    /// that reference is sent as a request header on every turn, so an `http://`
++    /// endpoint puts it on the wire in the clear for every hop to read.
++    ///
++    /// `[web]` refused this pair from the start; the provider half was only ever
++    /// a warning inside the guided `teton provider add` flow, which left the two
++    /// other ways a provider record comes into being — a hand-edited config, and
++    /// a migrated one — with no check at all. Attaching the rule to the config
++    /// document rather than to one UI flow is the whole point of the fix.
++    ///
++    /// Loopback is exempt for the same reason it is exempt for `[web]`: there is
++    /// no wire. A local OpenAI-compatible server on `http://localhost:11434` is
++    /// an ordinary setup, and refusing it would push people toward a self-signed
++    /// certificate for no gain.
++    #[error(
++        "provider '{provider_id}': auth_ref is set, but endpoint is a cleartext http:// URL on \
++         a non-loopback host — the credential would be sent in the clear on every turn. Use \
++         https://, or point endpoint at a loopback address if the provider runs on this machine \
++         (BUG-202)."
++    )]
++    AuthRefOverCleartextEndpoint {
++        /// The offending provider's id.
++        provider_id: String,
++    },
++
+     /// `[web] search_endpoint` already carries a `q` query parameter (REQ-563
+     /// BR-2, BR-8).
+     ///
+@@ -1585,6 +1614,22 @@ impl Config {
+             if p.kind.is_remote() && p.endpoint.as_deref().unwrap_or("").trim().is_empty() {
+                 return Err(ConfigError::MissingEndpoint(p.id.clone()));
+             }
++            // BUG-202: the `[web]` rule's sibling, by the same predicate rather
++            // than a second spelling of it. A credential beside a cleartext
++            // endpoint is refused as a *pair* — `http://` to a provider that
++            // wants no credential is a user's own call, exactly as it is for
++            // `[web]`.
++            //
++            // `is_cleartext_to_a_remote_host` answers `false` for anything that
++            // is not an absolute http(s) URL, so a `Custom`/`Local` endpoint
++            // that is not a URL at all passes through here untouched.
++            if let Some(endpoint) = p.endpoint.as_deref() {
++                if p.auth_ref.is_some() && is_cleartext_to_a_remote_host(endpoint) {
++                    return Err(ConfigError::AuthRefOverCleartextEndpoint {
++                        provider_id: p.id.clone(),
++                    });
++                }
++            }
+         }
+ 
+         // REQ-557 BR-6: a `default_provider` naming an unregistered id is a
+@@ -3167,6 +3212,123 @@ effort_ladder = []
+         );
+     }
+ 
++    /// **A provider credential beside a cleartext endpoint is refused, exactly
++    /// as `[web]`'s is** (BUG-202).
++    ///
++    /// The pair is what is refused, not the endpoint alone: `http://` to a
++    /// provider that wants no credential is the user's own call, and loopback is
++    /// exempt because there is no wire.
++    ///
++    /// **Mutation (run, not assumed):** deleting the
++    /// `AuthRefOverCleartextEndpoint` guard from `validate`'s provider loop
++    /// turns **3** tests red — this one, `the_provider_cleartext_rule_folds_scheme_case`,
++    /// and `the_provider_cleartext_refusal_names_the_provider_and_not_the_secret`.
++    ///
++    /// The number that matters is the **fourth**: `a_search_key_beside_a_cleartext_remote_endpoint_is_refused`
++    /// stays **green** under that mutation. The `[web]` rule and this one are
++    /// separate enforcement points of one invariant, and the web test never
++    /// covered the provider path — which is precisely how this hole survived
++    /// to be found by audit instead of by CI (BUG-202; conventions.md, "an
++    /// invariant with more than one enforcement point needs a sweep").
++    #[test]
++    fn a_provider_credential_beside_a_cleartext_remote_endpoint_is_refused() {
++        for remote in [
++            "http://api.example.com/v1/chat/completions",
++            "http://192.0.2.10:8888/v1/chat/completions",
++            "http://user@api.example.com/v1/chat/completions",
++            "http://[2001:db8::1]/v1/chat/completions",
++        ] {
++            let mut cfg = sample_config();
++            cfg.providers[2].endpoint = Some((*remote).to_owned());
++            cfg.providers[2].auth_ref = Some("keychain:deepseek".to_owned());
++            assert_eq!(
++                cfg.validate().unwrap_err(),
++                ConfigError::AuthRefOverCleartextEndpoint {
++                    provider_id: "deepseek".to_owned(),
++                },
++                "a credential was allowed to travel in the clear to {remote}"
++            );
++        }
++
++        // Loopback is exempt: a local OpenAI-compatible server (Ollama,
++        // llama.cpp) on `http://localhost:11434` is an ordinary setup, and
++        // refusing it would push people toward a self-signed certificate for no
++        // gain. This block is the reason the rule cannot be a blanket
++        // `http://` ban.
++        for local in [
++            "http://localhost:11434/v1/chat/completions",
++            "http://LOCALHOST:11434/v1/chat/completions",
++            "http://127.0.0.1:11434/v1/chat/completions",
++            "http://127.9.9.9/v1/chat/completions",
++            "http://[::1]:11434/v1/chat/completions",
++        ] {
++            let mut cfg = sample_config();
++            cfg.providers[2].endpoint = Some((*local).to_owned());
++            cfg.providers[2].auth_ref = Some("keychain:deepseek".to_owned());
++            cfg.validate()
++                .unwrap_or_else(|e| panic!("{local} is loopback and needs no TLS: {e}"));
++        }
++
++        // https is fine anywhere, and cleartext with no credential is not this
++        // rule's business.
++        for (endpoint, auth) in [
++            (
++                "https://api.example.com/v1/chat/completions",
++                Some("keychain:deepseek"),
++            ),
++            ("http://api.example.com/v1/chat/completions", None),
++        ] {
++            let mut cfg = sample_config();
++            cfg.providers[2].endpoint = Some((*endpoint).to_owned());
++            cfg.providers[2].auth_ref = auth.map(str::to_owned);
++            cfg.validate()
++                .unwrap_or_else(|e| panic!("{endpoint} with auth {auth:?} must validate: {e}"));
++        }
++    }
++
++    /// The scheme fold that `[web]` pins for its own readers has to hold here
++    /// too: `HTTP://` is cleartext, and a rule that read `starts_with("http://")`
++    /// would send the credential out believing it was TLS (BUG-202).
++    #[test]
++    fn the_provider_cleartext_rule_folds_scheme_case() {
++        for shouty in [
++            "HTTP://api.example.com/v1/chat/completions",
++            "Http://api.example.com/v1/chat/completions",
++        ] {
++            let mut cfg = sample_config();
++            cfg.providers[2].endpoint = Some((*shouty).to_owned());
++            cfg.providers[2].auth_ref = Some("keychain:deepseek".to_owned());
++            assert_eq!(
++                cfg.validate().unwrap_err(),
++                ConfigError::AuthRefOverCleartextEndpoint {
++                    provider_id: "deepseek".to_owned(),
++                },
++                "{shouty} was read as a URL by one check and not by the other"
++            );
++        }
++    }
++
++    /// The refusal names the provider and the remedy, and echoes no credential
++    /// (conventions.md: no credential in an error message; LESSON-557: compose
++    /// the sentence where the facts are).
++    #[test]
++    fn the_provider_cleartext_refusal_names_the_provider_and_not_the_secret() {
++        let mut cfg = sample_config();
++        cfg.providers[2].endpoint = Some("http://api.example.com/v1".to_owned());
++        cfg.providers[2].auth_ref = Some("keychain:deepseek".to_owned());
++        let msg = cfg.validate().unwrap_err().to_string();
++        assert!(msg.contains("deepseek"), "must name the provider: {msg}");
++        assert!(msg.contains("https://"), "must name the remedy: {msg}");
++        assert!(
++            msg.contains("loopback"),
++            "must name the loopback escape hatch: {msg}"
++        );
++        assert!(
++            !msg.contains("keychain:deepseek"),
++            "the error echoed the credential reference: {msg}"
++        );
++    }
++
+     #[test]
+     fn rejection_message_points_at_keychain_and_never_echoes_the_secret() {
+         let secret = "sk-ant-api03-TOPSECRETshouldNeverLeak0000";
