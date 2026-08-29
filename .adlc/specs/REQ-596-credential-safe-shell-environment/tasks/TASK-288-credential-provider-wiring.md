@@ -40,6 +40,8 @@ second copy to go stale (Assumptions / LESSON-539).
 - [ ] AC-1: with `auth_ref = "env:DEEPSEEK_AUTH_SENTINEL"` configured and that var set, a `shell` run of `env` contains neither the name nor the value
 - [ ] AC-1.1: the same holds for `[web] search_key_ref = "env:WEB_SEARCH_SENTINEL"` — the second gated field. A suite green on the provider field alone is not evidence BR-1 covers the set it claims
 - [ ] AC-5 (BR-1 half): deleting composer step 5 makes AC-1 and AC-1.1 fail. Run the mutation, record it in the tests' doc comments with what failed and how many assertions went red
+- [ ] **Cross-crate drift guard (BR-1.1).** The enumeration lives in `tetond` while the fields live in `teton-core/src/config.rs`, so proximity cannot keep them in step. A test scans `config.rs` for every `is_recognized_auth_ref(` call site and asserts the count matches the number of fields `credential_env_names_of` reads. A third gated field added in `teton-core` fails this test until the enumeration follows it. Demonstrate the failure: add a throwaway third call site, watch it go red, remove it, record the mutation in the test's doc comment
+- [ ] The guard's expected count is written as a literal with the field names named in a comment beside it — never derived from the same function it is checking
 - [ ] `credential_env_names_of` ignores `keychain:` and `op://` refs, and a bare `env:` yields nothing
 - [ ] BR-5: no credential value and no withheld name appears in any log line, error text, or event payload on this path
 - [ ] AC-7: sentinel values only

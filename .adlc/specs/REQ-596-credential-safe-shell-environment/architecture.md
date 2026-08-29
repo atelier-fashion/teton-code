@@ -139,6 +139,8 @@ already absent. The residual is the pathological intersection — a user who
 writes `auth_ref = "env:HOME"` — and the daemon, which is the only context where
 that config exists, always has the provider installed.
 
+**Why `tetond` and not `teton-core`, and what pays for it.** The natural home for this enumeration is beside `is_recognized_auth_ref` in `teton-core/src/config.rs` — the fields and the function that classifies them would sit together. It goes in `tetond` instead for a scheduling reason (REQ-597 is editing `config.rs` concurrently), and a scheduling reason is not an architectural one, so it has to be paid for rather than waved through. Proximity was never much of a guarantee anyway: a third gated field could be added in `config.rs` without anyone updating a co-located enumeration either. TASK-288 therefore carries a derived guard — a scan of `config.rs` for `is_recognized_auth_ref(` call sites, asserted against the number of fields the enumeration reads. That is strictly stronger than co-location, and it is what makes BR-1.1's "covered without amending this rule" true rather than hoped for.
+
 **BR-1.1 derivation.** `child_env::credential_env_names_of(&Config)` enumerates
 both gated fields at one site — `providers[].auth_ref` and `web.search_key_ref`
 — strips the `env:` prefix, and ignores every other scheme. It lives in `tetond`
@@ -186,13 +188,13 @@ claim cannot silently revert.
 ## Task graph
 
 ```
-TASK-001 (child_env module)
-   ├── TASK-002 (MCP call site + AC-4.1 byte-identical guard)
-   ├── TASK-003 (shell call site, retire the denylist)
-   │      └── TASK-004 (provider wiring + AC-1/AC-1.1 integration)
-   └── TASK-006 (AC-8 source region check)
+TASK-285 (child_env module)
+   ├── TASK-286 (MCP call site + AC-4.1 byte-identical guard)
+   ├── TASK-287 (shell call site, retire the denylist)
+   │      └── TASK-288 (provider wiring + AC-1/AC-1.1 integration)
+   └── TASK-290 (AC-8 source region check)
 
-TASK-005 (BR-6 / AC-9 docs)   — independent
+TASK-289 (BR-6 / AC-9 docs)   — independent
 ```
 
 ## Files
@@ -213,13 +215,13 @@ TASK-005 (BR-6 / AC-9 docs)   — independent
 
 | AC | Where |
 |---|---|
-| AC-1, AC-1.1 | TASK-004 |
-| AC-2 | TASK-003 |
-| AC-3, AC-3.1, AC-3.2 | TASK-001 |
-| AC-4 | TASK-003 |
-| AC-4.1 | TASK-002 |
-| AC-4.2 | TASK-001 |
-| AC-5 | TASK-003 (BR-1 mutation), TASK-001 (BR-8 mutation) |
-| AC-6, AC-7 | TASK-003, TASK-004 |
-| AC-8 | TASK-006 |
-| AC-9 | TASK-005 |
+| AC-1, AC-1.1 | TASK-288 |
+| AC-2 | TASK-287 |
+| AC-3, AC-3.1, AC-3.2 | TASK-285 |
+| AC-4 | TASK-287 |
+| AC-4.1 | TASK-286 |
+| AC-4.2 | TASK-285 |
+| AC-5 | TASK-287 (BR-1 mutation), TASK-285 (BR-8 mutation) |
+| AC-6, AC-7 | TASK-287, TASK-288 |
+| AC-8 | TASK-290 |
+| AC-9 | TASK-289 |
