@@ -30784,7 +30784,61 @@ provider_id = \"deepseek\"
             /// The golden sequence, captured on the base commit.
             const FIXTURE: &str = include_str!("../tests/fixtures/req598_turn_event_order.txt");
 
-            /// Event names in order, with consecutive duplicates collapsed.
+            /// The one event this sequence must not pin the position of.
+            ///
+            /// `session_titled` is published by the **detached** naming task
+            /// (`spawn_title_session` spawns it and drops the handle), so where
+            /// it lands relative to the turn path's own events is decided by the
+            /// scheduler, not by the turn. Pinning it made this fixture green on
+            /// two machines and red on a third for the *same commit* — see
+            /// [`normalize`].
+            const DETACHED: &str = "session_titled";
+
+            /// The only event whose consecutive repeats are collapsed.
+            ///
+            /// `session_update` is emitted per streamed chunk, so recording every
+            /// one would pin the scripted engine's chunking — a fact this REQ
+            /// does not touch. Collapsing *only* this one is deliberate: the two
+            /// `route_decided` entries must stay two, because they are the title
+            /// duty's route and the turn's own and losing that distinction is
+            /// exactly what BR-1 forbids.
+            const CHUNKED: &str = "session_update";
+
+            /// Put a sequence into the form both sides are compared in.
+            ///
+            /// Applied identically to the recorded fixture and to the live run,
+            /// so this cannot quietly excuse a real ordering change — anything it
+            /// hides on one side it hides on the other.
+            ///
+            /// **Why this exists.** The fixture as captured in TASK-293 records
+            /// `route_decided, session_titled, route_decided, …`. That middle
+            /// entry is the detached naming task, and its position is a race: on
+            /// a slower runner it lands *after* the turn's own `route_decided`,
+            /// which makes the two `route_decided` entries adjacent — and under a
+            /// collapse-all rule they merged into one, shortening the sequence
+            /// and failing the comparison. That is what CI caught on
+            /// `macos-latest` while `ubuntu-latest` passed on the same commit,
+            /// with 40/40 green locally.
+            ///
+            /// The fixture file itself is **left exactly as captured**: its whole
+            /// value is that it predates `TurnContext`, and regenerating it now
+            /// would make it an oracle computed by the subject (LESSON-569). So
+            /// the normalization changes, not the golden data.
+            fn normalize(names: impl IntoIterator<Item = String>) -> Vec<String> {
+                let mut out: Vec<String> = Vec::new();
+                for name in names {
+                    if name == DETACHED {
+                        continue;
+                    }
+                    if name == CHUNKED && out.last().map(String::as_str) == Some(CHUNKED) {
+                        continue;
+                    }
+                    out.push(name);
+                }
+                out
+            }
+
+            /// Event names in publication order, normalized.
             ///
             /// Drained with `try_recv` rather than `recv` under a timeout:
             /// `EventBus::publish` is synchronous, so once the turn has returned
@@ -30792,25 +30846,91 @@ provider_id = \"deepseek\"
             /// assertion shape that goes flaky first under CI scheduler pressure
             /// (LESSON-450).
             fn drain_names(sub: &mut crate::broadcast::Subscription) -> Vec<String> {
-                let mut names: Vec<String> = Vec::new();
+                let mut raw: Vec<String> = Vec::new();
                 while let Some(env) = sub.try_recv() {
-                    let name = env.event_name().to_owned();
-                    if names.last().map(String::as_str) != Some(name.as_str()) {
-                        names.push(name);
-                    }
+                    raw.push(env.event_name().to_owned());
                 }
-                names
+                normalize(raw)
             }
 
             /// The fixture's expected entries — comment and blank lines stripped,
             /// so the golden file can carry its own provenance header.
             fn expected() -> Vec<String> {
-                FIXTURE
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                    .map(str::to_owned)
-                    .collect()
+                normalize(
+                    FIXTURE
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                        .map(str::to_owned),
+                )
+            }
+
+            /// **Both observed interleavings normalize to the same sequence.**
+            ///
+            /// The two inputs below are not invented: they are the sequences CI
+            /// actually produced for one commit. The first is what
+            /// `ubuntu-latest` and this developer's machine published (40/40
+            /// runs); the second is what `macos-latest` published, where the
+            /// detached naming task landed after the turn's own route decision.
+            /// Under the old collapse-everything rule the second lost a
+            /// `route_decided` to the merge and the comparison failed.
+            ///
+            /// This is the guard that the race cannot come back, and it is
+            /// deterministic — it needs no slow runner to reproduce.
+            #[test]
+            fn the_two_observed_interleavings_normalize_alike() {
+                let names = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+
+                let fast = normalize(names(&[
+                    "route_decided",
+                    "session_titled",
+                    "route_decided",
+                    "session_update",
+                    "session_update",
+                    "prefix_cache",
+                ]));
+                let slow = normalize(names(&[
+                    "route_decided",
+                    "route_decided",
+                    "session_titled",
+                    "session_update",
+                    "session_update",
+                    "prefix_cache",
+                ]));
+
+                assert_eq!(
+                    fast, slow,
+                    "the detached naming task's position must not change the recorded sequence"
+                );
+                assert_eq!(
+                    fast,
+                    names(&[
+                        "route_decided",
+                        "route_decided",
+                        "session_update",
+                        "prefix_cache"
+                    ]),
+                    "and both must keep BOTH route decisions — the title duty's and the \
+                     turn's own — while collapsing only the chunked event"
+                );
+            }
+
+            /// Transposing two adjacent distinct events still fails.
+            ///
+            /// `normalize` removes one event and merges repeats of another; this
+            /// pins that it does nothing else, so it cannot be quietly widened
+            /// into an excuse for a real reordering.
+            #[test]
+            fn normalization_does_not_hide_a_transposition() {
+                let names = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+                let ordered =
+                    normalize(names(&["route_decided", "session_update", "prefix_cache"]));
+                let swapped =
+                    normalize(names(&["route_decided", "prefix_cache", "session_update"]));
+                assert_ne!(
+                    ordered, swapped,
+                    "a real transposition must still be visible after normalization"
+                );
             }
 
             #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -30839,6 +30959,19 @@ provider_id = \"deepseek\"
                     "the fixture is empty — a golden file that records nothing \
                  cannot fail, which is the vacuity this test exists to avoid"
                 );
+                assert_eq!(
+                    expected.iter().filter(|n| *n == "route_decided").count(),
+                    2,
+                    "non-vacuity: normalization must leave the title duty's route and the \
+                     turn's own as TWO entries. Collapsing them would hide precisely the \
+                     ordering BR-1 protects, and would make this test pass against a turn \
+                     that stopped announcing one of them"
+                );
+                // `session_titled` is deliberately absent from both sides (see
+                // `normalize`). Its arrival is not left unguarded: the BR-2.1
+                // warming-hold test waits for it under a deadline, and the
+                // `dispatch::title` module asserts it lands with the right
+                // scope and at most once per session.
                 assert_eq!(
                 actual, expected,
                 "the turn's event ordering changed.\n  expected: {expected:?}\n    actual: {actual:?}"
