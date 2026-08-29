@@ -1416,8 +1416,9 @@ pub enum ConfigError {
          the credential would travel to {host} in the clear on every turn, for every hop \
          between this machine and that host to read. Use https:// if {host} serves it, or a \
          loopback address if the provider runs on this machine. If {host} is on a network you \
-         trust (a self-hosted model server on a LAN), set `allow_cleartext = true` on this \
-         provider to say so deliberately (BUG-202)."
+         trust (a self-hosted model server on a LAN), re-run with \
+         `teton provider add --allow-cleartext` — or set `allow_cleartext = true` on this \
+         provider's row — to say so deliberately (BUG-202, BUG-205)."
     )]
     AuthRefOverCleartextEndpoint {
         /// The offending provider's id.
@@ -3409,6 +3410,14 @@ effort_ladder = []
         assert!(
             msg.contains("allow_cleartext"),
             "must name the escape hatch, or the refusal is a dead end: {msg}"
+        );
+        // BUG-205: naming the config *field* was not enough — `provider add` is
+        // the only command that stores a keychain entry, so a refusal that names
+        // only a hand-edit leaves no supported way to register at all. The
+        // remedy has to be a command the user can run.
+        assert!(
+            msg.contains("teton provider add --allow-cleartext"),
+            "must name a remedy the CLI can actually perform: {msg}"
         );
         assert!(
             !msg.contains("keychain:deepseek"),

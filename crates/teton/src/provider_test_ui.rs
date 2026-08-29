@@ -866,6 +866,7 @@ mod tests {
             auth_ref: Some(format!("keychain://teton/{id}")),
             max_context: None,
             context_budget_cap: None,
+            allow_cleartext: None,
             floored_budget: None,
         }
     }

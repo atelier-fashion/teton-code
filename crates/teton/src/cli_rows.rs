@@ -1723,6 +1723,7 @@ mod tests {
                     auth_ref: Some("keychain://teton/kimi".to_owned()),
                     max_context: None,
                     context_budget_cap: None,
+                    allow_cleartext: None,
                     floored_budget: None,
                 }],
                 ..Default::default()

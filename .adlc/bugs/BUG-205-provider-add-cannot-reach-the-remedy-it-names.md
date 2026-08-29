@@ -1,7 +1,7 @@
 ---
 id: BUG-205
 title: "provider add refuses a cleartext LAN registration and names a remedy the command cannot reach"
-status: open
+status: in-review
 severity: medium
 created: 2026-08-28
 updated: 2026-08-28
@@ -112,14 +112,65 @@ way to satisfy it. BUG-202 fixed the first half.
 
 ## Resolution
 
-(filled after fix)
+Option **(a)** — the explicit flag. `teton provider add --allow-cleartext`
+registers a provider whose endpoint is cleartext on a non-loopback host, writing
+`allow_cleartext = true` on its row. Option (b), a consent prompt in the guided
+wizard, was **not** taken: a prompt there must not be answerable by a headless
+process (the BR-10(b) class), which is a design question of its own rather than
+part of closing this dead end.
+
+The refusal message now names the command, not only the config field — that was
+the actual defect. A remedy expressed as "hand-edit this TOML key" is not
+reachable when `provider add` is the only command that stores a keychain entry.
+
+**The merge is field-wise, and both halves are separately mutation-tested.**
+`ProviderConfig::allow_cleartext` and `ProviderSetupCandidate::allow_cleartext`
+are `Option<bool>` on the wire — `Some(v)` writes, `None` **preserves** — exactly
+as the two window fields merge (REQ-586 ADR-7). The CLI's `bool` becomes
+`then_some(true)`, so an untyped flag sends `None` and never `Some(false)`. That
+distinction is the whole fix's risk: `Some(false)` compiles, registers
+correctly, and then clears a hand-authored opt-out on the next
+`provider add --model` — BUG-155's failure mode arriving through a new door.
+
+`WindowFlags` became `RegistrationFlags` and gained the field, rather than
+`provider_add_on` gaining an eighth parameter. That function already carries
+`#[allow(clippy::too_many_arguments)]`, and widening it would deepen exactly the
+debt REQ-598 exists to pay down. The type is confined to `main.rs`.
+
+### Residual (stated, not hidden)
+
+The guided `/provider setup` wizard still has no way to *set* the flag — it asks
+no cleartext question, so its candidate sends `None`. It is no longer a dead end
+(its refusal names a command that exists), but registering a cleartext LAN
+provider through the wizard means dropping to `provider add --allow-cleartext`.
+The wire field is in place for the wizard to learn the question later; that is
+option (b), still open.
+
+### Verification
+
+- `cargo test --workspace --no-fail-fast`: **3,999 passed, 0 failed, 1 ignored**
+  across 69 targets; output grepped for `FAILED` (0).
+- `cargo clippy --workspace --all-targets` clean (0 warning/error lines);
+  `cargo fmt --check` clean.
+- `teton provider add --help` renders the flag.
+- **Mutation A (run):** reverting the daemon merge to the stored value alone —
+  what BUG-202 shipped — makes the flag inert; part 1 of the merge test fails.
+- **Mutation B (run):** `unwrap_or(false)` clears a stored opt-out; part 2 fails
+  with "an absent flag cleared a stored opt-out". Different assertion from A,
+  which is why one test covers both halves without either implying the other.
+- **Mutation C (run):** `then_some(true)` → `Some(...)` in the CLI makes an
+  untyped flag send `Some(false)`; the payload test fails.
+- Falsification in the merge test: with no opt-out ever supplied, the same
+  endpoint is still refused — so the passing halves test the flag, not the
+  endpoint.
 
 ## Files Changed
 
-- `crates/teton-protocol/src/methods.rs` — `ProviderConfig` gains the field (option (a)).
-- `crates/teton/src/main.rs` — the `provider add` flag and its plumbing.
-- `crates/tetond/src/runtime.rs` — `apply_update` takes the supplied value where present, still preserving the stored one when absent (the BUG-155 rule must survive: an omitted flag on re-registration must not clear a set one).
-- `crates/teton-core/src/config.rs` — the refusal message gains the command-level remedy.
+- `crates/teton-protocol/src/methods.rs` — `allow_cleartext: Option<bool>` on both `ProviderConfig` and `ProviderSetupCandidate`; wire-additive, so neither `PROTOCOL_VERSION` nor `PROTOCOL_VERSION_MIN` moves.
+- `crates/teton/src/main.rs` — `--allow-cleartext`; `WindowFlags` → `RegistrationFlags`; the `then_some(true)` widening; two tests.
+- `crates/teton/src/provider_setup_ui.rs` — the wizard candidate sends `None`, with the residual stated at the call site.
+- `crates/tetond/src/runtime.rs` — field-wise merge in `apply_update`; preserve on a field-wise remedy; populate on snapshot; the merge test.
+- `crates/teton-core/src/config.rs` — the refusal names the command; the message test pins it.
 
 ## Fix Notes
 

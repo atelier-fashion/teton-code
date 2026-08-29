@@ -1887,6 +1887,7 @@ async fn drive_named_skill_turn(
                 auth_ref: None,
                 max_context: Some(128_000),
                 context_budget_cap: None,
+                allow_cleartext: None,
                 floored_budget: None,
             }))
             .expect("registering a provider");

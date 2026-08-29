@@ -2076,6 +2076,9 @@ fn field_wise_registration(
         auth_ref: existing.auth_ref.clone(),
         max_context,
         context_budget_cap,
+        // A field-wise update says nothing about the cleartext posture, so it
+        // must not restate it: `None` preserves what is stored (BUG-205).
+        allow_cleartext: None,
         floored_budget: None,
     }
 }
@@ -8673,6 +8676,13 @@ impl DaemonRuntime {
                 // question this flow does not ask is not an answer of "none",
                 // and `None` leaves a hand-authored cap exactly where it was.
                 context_budget_cap: None,
+                // BUG-205: carried from the candidate. The guided wizard has no
+                // question that sets it, so in practice this is `None` there and
+                // its refusal points at `teton provider add --allow-cleartext`;
+                // the field exists so the wire can express the answer once the
+                // wizard learns to ask (the BUG-205 option (b) that was left
+                // open).
+                allow_cleartext: candidate.allow_cleartext,
                 // A snapshot field, never an update one: the daemon derives it
                 // and a client never declares it (TASK-194 2b).
                 floored_budget: None,
@@ -13720,6 +13730,12 @@ fn snapshot_from_config(
                 // so a live daemon never emits it.
                 max_context: Some(p.capabilities.max_context),
                 context_budget_cap: Some(p.capabilities.context_budget_cap),
+                // BUG-205: a snapshot states the posture rather than leaving it
+                // invisible, so `provider list` and `doctor` can show that a
+                // provider is deliberately talking in the clear. Always
+                // populated for the `max_context` reason directly above — `None`
+                // is reserved for a snapshot from a daemon predating the field.
+                allow_cleartext: Some(p.allow_cleartext),
                 // TASK-194 2b: whether this provider's declaration actually
                 // survives the derivation, answered by the **router's** budget
                 // for it — the same `budget_for` every route attempt runs
@@ -13904,11 +13920,20 @@ fn apply_update(config: &mut Config, update: ConfigUpdate) {
             // the user made for an unrelated reason (`--model`, a window). It
             // is preserved, never defaulted, for exactly the reason the
             // capability profile above is.
-            let allow_cleartext = config
-                .providers
-                .iter()
-                .find(|p| p.id == id)
-                .is_some_and(|p| p.allow_cleartext);
+            // BUG-202 stored it; BUG-205 made it settable. The merge is
+            // field-wise exactly like the two window fields above (REQ-586
+            // ADR-7): `Some(v)` writes, `None` **preserves**. Both halves are
+            // load-bearing and separately mutation-tested — a supplied flag that
+            // did not write would make `--allow-cleartext` inert, and an absent
+            // flag that did write would clear a hand-authored opt-out on any
+            // unrelated re-registration, which is BUG-155's class.
+            let allow_cleartext = pc.allow_cleartext.unwrap_or_else(|| {
+                config
+                    .providers
+                    .iter()
+                    .find(|p| p.id == id)
+                    .is_some_and(|p| p.allow_cleartext)
+            });
             // REQ-586 ADR-7: the two window fields are the one exception to
             // "capabilities are not settable over this RPC", and they merge
             // **field-wise** — `Some(v)` writes (`0` included: it is the
@@ -15635,6 +15660,77 @@ permission_allow = [\"fetch_user_url\"]
         assert!(!bare.contains("echoed from the demo MCP server"));
     }
 
+    /// **`allow_cleartext` merges field-wise: `Some` writes, `None` preserves**
+    /// (BUG-205).
+    ///
+    /// Both halves are load-bearing and neither implies the other, so each has
+    /// its own mutation:
+    ///
+    /// - Replacing the merge with the stored value alone (`.is_some_and(...)`,
+    ///   which is what BUG-202 shipped) makes `--allow-cleartext` **inert** —
+    ///   part 1 fails.
+    /// - Replacing it with `pc.allow_cleartext.unwrap_or(false)` clears a
+    ///   hand-authored opt-out on any unrelated re-registration — part 2 fails.
+    ///   That is BUG-155's failure mode, which the capability profile beside it
+    ///   already guards against.
+    ///
+    /// Both mutations were run.
+    #[test]
+    fn allow_cleartext_is_written_when_supplied_and_preserved_when_absent() {
+        fn register(config: &mut Config, model: &str, allow: Option<bool>) {
+            apply_update(
+                config,
+                ConfigUpdate::RegisterProvider(ProviderConfig {
+                    id: ProviderId::from("lan"),
+                    kind: ProtoProviderKind::OpenaiCompatible,
+                    endpoint: Some("http://10.0.1.50:8000/v1/chat/completions".to_owned()),
+                    model: Some(model.to_owned()),
+                    auth_ref: Some("keychain:lan".to_owned()),
+                    max_context: None,
+                    context_budget_cap: None,
+                    allow_cleartext: allow,
+                    floored_budget: None,
+                }),
+            );
+        }
+
+        // Part 1 — a supplied `true` writes, and the config it produces is one
+        // `validate` accepts. Asserting the flag alone would not show that the
+        // flag achieved anything.
+        let mut config = Config::default();
+        register(&mut config, "local-70b", Some(true));
+        assert!(config.providers[0].allow_cleartext);
+        config
+            .validate()
+            .expect("--allow-cleartext must produce a config that validates");
+
+        // Part 2 — a later re-registration that says nothing (the `--model`
+        // case) preserves it, and the config still validates. This is the half
+        // that turns a working install into a refusing one if it regresses.
+        register(&mut config, "local-70b-instruct", None);
+        assert!(
+            config.providers[0].allow_cleartext,
+            "an absent flag cleared a stored opt-out"
+        );
+        assert_eq!(
+            config.providers[0].model.as_deref(),
+            Some("local-70b-instruct")
+        );
+        config
+            .validate()
+            .expect("a --model re-registration must not break a working config");
+
+        // Falsification: with no opt-out ever supplied, the same endpoint is
+        // refused — so parts 1 and 2 are testing the flag, not the endpoint.
+        let mut bare = Config::default();
+        register(&mut bare, "local-70b", None);
+        assert!(!bare.providers[0].allow_cleartext);
+        assert!(
+            bare.validate().is_err(),
+            "a cleartext credential with no opt-out must still be refused"
+        );
+    }
+
     #[test]
     fn config_snapshot_round_trips_kinds_and_modes() {
         let mut config = Config::default();
@@ -15648,6 +15744,7 @@ permission_allow = [\"fetch_user_url\"]
                 auth_ref: Some("keychain:deepseek".to_owned()),
                 max_context: None,
                 context_budget_cap: None,
+                allow_cleartext: None,
                 floored_budget: None,
             }),
         );
@@ -15697,6 +15794,7 @@ permission_allow = [\"fetch_user_url\"]
                 auth_ref: Some("keychain:deepseek".to_owned()),
                 max_context: Some(131_072),
                 context_budget_cap: Some(65_536),
+                allow_cleartext: None,
                 floored_budget: None,
             }),
         );
@@ -15763,6 +15861,7 @@ permission_allow = [\"fetch_user_url\"]
                 auth_ref: None,
                 max_context: None,
                 context_budget_cap: None,
+                allow_cleartext: None,
                 floored_budget: None,
             }),
         );
@@ -15904,6 +16003,7 @@ permission_allow = [\"fetch_user_url\"]
                 auth_ref: None,
                 max_context: None,
                 context_budget_cap: None,
+                allow_cleartext: None,
                 floored_budget: None,
             }),
         );
@@ -15941,6 +16041,7 @@ permission_allow = [\"fetch_user_url\"]
                 auth_ref: None,
                 max_context: None,
                 context_budget_cap: None,
+                allow_cleartext: None,
                 floored_budget: None,
             }),
         );
@@ -16209,6 +16310,7 @@ permission_allow = [\"fetch_user_url\"]
                 auth_ref: None,
                 max_context: None,
                 context_budget_cap: None,
+                allow_cleartext: None,
                 floored_budget: None,
             })
         };
@@ -16246,6 +16348,7 @@ permission_allow = [\"fetch_user_url\"]
                 auth_ref: None,
                 max_context,
                 context_budget_cap: cap,
+                allow_cleartext: None,
                 floored_budget: None,
             })
         };
@@ -25098,6 +25201,7 @@ provider_id = \"deepseek\"
                     tier: WireTier::Think,
                     provider_id: ProviderId::from("kimi"),
                 }],
+                allow_cleartext: None,
                 max_context: None,
             }
         }
@@ -25855,6 +25959,7 @@ fallback_id = \"local\"
             );
 
             let candidate = ProviderSetupCandidate {
+                allow_cleartext: None,
                 max_context: Some(window),
                 ..kimi()
             };
@@ -25898,6 +26003,7 @@ fallback_id = \"local\"
 
             let candidate = ProviderSetupCandidate {
                 model: "kimi-k2.5-turbo".to_owned(),
+                allow_cleartext: None,
                 max_context: Some(window),
                 ..kimi()
             };

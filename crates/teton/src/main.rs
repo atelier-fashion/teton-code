@@ -229,6 +229,17 @@ pub(crate) enum ProviderAction {
         /// not invalid, and doctor says so.
         #[arg(long, value_name = "TOKENS")]
         context_budget_cap: Option<u32>,
+        /// Register even though `--endpoint` is a cleartext `http://` URL on a
+        /// non-loopback host, sending the credential where every hop can read
+        /// it (BUG-202). Without this the registration is refused.
+        ///
+        /// For a model server on a network you trust — a self-hosted box on a
+        /// LAN — where `https://` is not on offer and loopback does not apply.
+        /// It is recorded as `allow_cleartext = true` on the provider's row, so
+        /// the decision stays greppable in the config rather than living only in
+        /// the shell history that made it.
+        #[arg(long)]
+        allow_cleartext: bool,
     },
     /// List configured providers.
     List,
@@ -522,15 +533,17 @@ fn main() -> ExitCode {
                 model,
                 max_context,
                 context_budget_cap,
+                allow_cleartext,
             } => run_provider_add(
                 &paths,
                 &id,
                 kind.into(),
                 endpoint,
                 model,
-                WindowFlags {
+                RegistrationFlags {
                     max_context,
                     context_budget_cap,
+                    allow_cleartext,
                 },
             ),
             ProviderAction::List => run_provider_list(&paths),
@@ -637,6 +650,7 @@ pub(crate) fn run_mirrored_command(
                 model,
                 max_context,
                 context_budget_cap,
+                allow_cleartext,
             } => {
                 // ADR-3: the refusals are outcomes here, not `bail!`s — one
                 // Error line, and the session carries on. The consent mode is
@@ -656,9 +670,10 @@ pub(crate) fn run_mirrored_command(
                     kind.into(),
                     endpoint,
                     model,
-                    WindowFlags {
+                    RegistrationFlags {
                         max_context,
                         context_budget_cap,
+                        allow_cleartext,
                     },
                     consent,
                     keychain.as_ref(),
@@ -2339,7 +2354,7 @@ fn run_provider_add(
     kind: ProviderKind,
     endpoint: Option<String>,
     model: Option<String>,
-    window: WindowFlags,
+    window: RegistrationFlags,
 ) -> anyhow::Result<()> {
     // Before `ensure_connected`, because it always was: a `provider add` with no
     // `--model` has never started a daemon in order to refuse.
@@ -2400,7 +2415,7 @@ pub(crate) fn provider_add_on(
     kind: ProviderKind,
     endpoint: Option<String>,
     model: Option<String>,
-    window: WindowFlags,
+    window: RegistrationFlags,
     consent: AddConsent,
     keychain: &dyn Keychain,
 ) -> anyhow::Result<Result<(), ProviderAddRefusal>> {
@@ -3494,7 +3509,7 @@ struct SettledRegistration {
     endpoint: Option<String>,
     model: Option<String>,
     /// What the two REQ-586 flags declared, carried unread to the payload.
-    window: WindowFlags,
+    window: RegistrationFlags,
 }
 
 /// What `--max-context` / `--context-budget-cap` declared on this registration
@@ -3507,11 +3522,20 @@ struct SettledRegistration {
 /// travels as "unknown", which would let `provider add --model …` on an
 /// existing provider silently erase a window somebody had declared.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct WindowFlags {
+pub(crate) struct RegistrationFlags {
     /// `capabilities.max_context`, in tokens.
     pub(crate) max_context: Option<u32>,
     /// `capabilities.context_budget_cap`, in tokens.
     pub(crate) context_budget_cap: Option<u32>,
+    /// `--allow-cleartext`: register even though the endpoint is a cleartext
+    /// `http://` URL on a non-loopback host (BUG-205).
+    ///
+    /// A `bool` here and an `Option<bool>` on the wire, and the conversion is
+    /// the whole point: a flag that was **not** typed must send `None` so it
+    /// preserves a stored opt-out, never `Some(false)` — which would clear one
+    /// on any unrelated re-registration (BUG-155's class). The widening happens
+    /// once, in [`build_provider_registration`].
+    pub(crate) allow_cleartext: bool,
 }
 
 /// The registration and the keychain reference it carries.
@@ -3531,7 +3555,7 @@ fn settle_registration(
     kind: ProviderKind,
     endpoint: Option<String>,
     model: Option<String>,
-    window: WindowFlags,
+    window: RegistrationFlags,
     surface: &mut dyn Surface,
 ) -> anyhow::Result<SettledRegistration> {
     let endpoint = settle_endpoint(id, kind, endpoint, surface)?;
@@ -3687,7 +3711,7 @@ fn build_provider_registration(
     kind: ProviderKind,
     endpoint: Option<String>,
     model: Option<String>,
-    window: WindowFlags,
+    window: RegistrationFlags,
     keychain: &dyn Keychain,
     secret: Option<&str>,
 ) -> anyhow::Result<ProviderConfig> {
@@ -3706,6 +3730,12 @@ fn build_provider_registration(
         // re-registration that says nothing about the window cannot zero one.
         max_context: window.max_context,
         context_budget_cap: window.context_budget_cap,
+        // BUG-205: `true` writes the opt-out; a flag that was not typed sends
+        // `None`, which **preserves** whatever is stored. `Some(false)` is
+        // deliberately never sent — it would clear a hand-authored opt-out on a
+        // re-registration made for an unrelated reason, which is the BUG-155
+        // failure mode the daemon's merge is mutation-tested against.
+        allow_cleartext: window.allow_cleartext.then_some(true),
         floored_budget: None,
     })
 }
@@ -4402,6 +4432,7 @@ mod tests {
                         model,
                         max_context,
                         context_budget_cap,
+                        allow_cleartext,
                     },
             }) => {
                 assert_eq!(id, "deepseek");
@@ -4409,6 +4440,10 @@ mod tests {
                 // which is what preserves a stored window on a re-registration.
                 assert_eq!(max_context, None);
                 assert_eq!(context_budget_cap, None);
+                // BUG-205: likewise defaults to "not stated". A `provider add`
+                // that says nothing about the cleartext posture must not send an
+                // answer, or it would clear a stored opt-out.
+                assert!(!allow_cleartext);
                 assert!(matches!(kind, CliProviderKind::OpenaiCompatible));
                 assert_eq!(endpoint.as_deref(), Some("https://api.deepseek.com"));
                 assert_eq!(ProviderKind::from(kind), ProviderKind::OpenaiCompatible);
@@ -4476,6 +4511,7 @@ mod tests {
             auth_ref: None,
             max_context: None,
             context_budget_cap: None,
+            allow_cleartext: None,
             floored_budget: None,
         };
 
@@ -4529,6 +4565,7 @@ mod tests {
             auth_ref: None,
             max_context,
             context_budget_cap: None,
+            allow_cleartext: None,
             floored_budget: None,
         };
 
@@ -4613,6 +4650,7 @@ mod tests {
             auth_ref: None,
             max_context,
             context_budget_cap,
+            allow_cleartext: None,
             floored_budget: None,
         };
 
@@ -4700,6 +4738,7 @@ mod tests {
                 auth_ref: None,
                 max_context,
                 context_budget_cap,
+                allow_cleartext: None,
                 floored_budget,
             };
         let floor = Some(FlooredBudget {
@@ -4762,6 +4801,69 @@ mod tests {
     /// Driven through [`registration_params`] rather than through the flag
     /// struct alone, because the defect this forecloses is the payload builder
     /// dropping a field the parser accepted.
+    /// **`--allow-cleartext` reaches the payload as `Some(true)`, and its
+    /// absence as `None` — never `Some(false)`** (BUG-205).
+    ///
+    /// The `None`-vs-`Some(false)` half is the whole point and is invisible to
+    /// a test that only checks the happy path: `Some(false)` would compile,
+    /// register correctly, and then **clear a hand-authored opt-out** on the
+    /// next `provider add --model` — BUG-155's failure mode, arriving through a
+    /// new door. Driven through `registration_params` rather than the flag
+    /// struct alone, because the defect being foreclosed is the payload builder
+    /// mistranslating a field the parser accepted.
+    ///
+    /// **Mutation (run):** changing `then_some(true)` to `Some(...)` turns the
+    /// third assertion red.
+    #[test]
+    fn allow_cleartext_reaches_the_payload_as_some_true_and_its_absence_as_none() {
+        let keychain = MockKeychain::new();
+        let mut surface = RecordingSurface::new();
+
+        let settled = settle_registration(
+            "lan",
+            ProviderKind::OpenaiCompatible,
+            Some("http://10.0.1.50:8000/v1/chat/completions".to_owned()),
+            Some("local-70b".to_owned()),
+            RegistrationFlags {
+                max_context: None,
+                context_budget_cap: None,
+                allow_cleartext: true,
+            },
+            &mut surface,
+        )
+        .expect("a structurally complete registration settles");
+        let prepared = registration_params(&settled, &keychain, Some("sk-typed"))
+            .expect("the mock keychain stores");
+        let ConfigUpdate::RegisterProvider(config) = prepared.params.update else {
+            panic!("provider add registers a provider");
+        };
+        assert_eq!(config.allow_cleartext, Some(true));
+
+        let bare = settle_registration(
+            "lan",
+            ProviderKind::OpenaiCompatible,
+            Some("http://10.0.1.50:8000/v1/chat/completions".to_owned()),
+            Some("local-70b".to_owned()),
+            RegistrationFlags {
+                max_context: None,
+                context_budget_cap: None,
+                allow_cleartext: false,
+            },
+            &mut surface,
+        )
+        .expect("a structurally complete registration settles");
+        let prepared = registration_params(&bare, &keychain, Some("sk-typed"))
+            .expect("the mock keychain stores");
+        let ConfigUpdate::RegisterProvider(config) = prepared.params.update else {
+            panic!("provider add registers a provider");
+        };
+        assert_eq!(
+            config.allow_cleartext, None,
+            "an untyped flag must say nothing, not say false — `Some(false)` \
+             clears a stored opt-out on the next unrelated re-registration"
+        );
+    }
+
     #[test]
     fn the_declared_window_reaches_the_registration_payload_and_an_undeclared_one_stays_none() {
         let keychain = MockKeychain::new();
@@ -4772,9 +4874,10 @@ mod tests {
             ProviderKind::OpenaiCompatible,
             Some("https://api.moonshot.ai/v1/chat/completions".to_owned()),
             Some("kimi-k3".to_owned()),
-            WindowFlags {
+            RegistrationFlags {
                 max_context: Some(128_000),
                 context_budget_cap: Some(40_000),
+                allow_cleartext: false,
             },
             &mut surface,
         )
@@ -4792,7 +4895,7 @@ mod tests {
             ProviderKind::OpenaiCompatible,
             Some("https://api.moonshot.ai/v1/chat/completions".to_owned()),
             Some("kimi-k3".to_owned()),
-            WindowFlags::default(),
+            RegistrationFlags::default(),
             &mut surface,
         )
         .expect("settles");
@@ -5520,7 +5623,7 @@ mod tests {
             ProviderKind::Anthropic,
             Some("https://api.anthropic.com".to_owned()),
             Some("claude-opus-5".to_owned()),
-            WindowFlags::default(),
+            RegistrationFlags::default(),
             &keychain,
             Some("sk-super-secret"),
         )
@@ -5579,7 +5682,7 @@ mod tests {
             ProviderKind::Local,
             None,
             None,
-            WindowFlags::default(),
+            RegistrationFlags::default(),
             &keychain,
             None,
         )
@@ -6026,7 +6129,7 @@ mod tests {
                 ProviderKind::OpenaiCompatible,
                 Some(ADD_ENDPOINT.to_owned()),
                 Some(ADD_MODEL.to_owned()),
-                WindowFlags::default(),
+                RegistrationFlags::default(),
                 AddConsent::Session { assume_yes },
                 keychain,
             )
@@ -6361,7 +6464,7 @@ mod tests {
                 ProviderKind::OpenaiCompatible,
                 Some(ADD_ENDPOINT.to_owned()),
                 Some(ADD_MODEL.to_owned()),
-                WindowFlags::default(),
+                RegistrationFlags::default(),
                 AddConsent::Shell,
                 &kc,
             )
@@ -6800,7 +6903,7 @@ mod tests {
                 kind,
                 supplied.map(str::to_owned),
                 Some("a-model".to_owned()),
-                WindowFlags::default(),
+                RegistrationFlags::default(),
                 &mut surface,
             )
             .expect("a structurally complete registration settles");
@@ -7015,6 +7118,7 @@ mod tests {
             auth_ref: None,
             max_context: None,
             context_budget_cap: None,
+            allow_cleartext: None,
             floored_budget: None,
         })
         .expect("a bare `/v1` base URL is advised on");
@@ -7049,6 +7153,7 @@ mod tests {
             auth_ref: None,
             max_context: None,
             context_budget_cap: None,
+            allow_cleartext: None,
             floored_budget: None,
         };
 
@@ -7222,7 +7327,7 @@ mod tests {
             // fixture that spells a product fact by hand is a second copy of it.
             Some(ANTHROPIC_DEFAULT_ENDPOINT.to_owned()),
             Some("claude-opus-5".to_owned()),
-            WindowFlags::default(),
+            RegistrationFlags::default(),
             kc,
             Some(secret),
         )
