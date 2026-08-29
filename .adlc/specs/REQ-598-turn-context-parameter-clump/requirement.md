@@ -1,7 +1,7 @@
 ---
 id: REQ-598
 title: "TurnContext: dissolve the parameter clump the suppressions have been hiding"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-28
 updated: 2026-08-29
