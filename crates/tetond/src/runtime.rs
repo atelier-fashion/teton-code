@@ -4448,7 +4448,6 @@ impl DaemonRuntime {
             gate,
             invoker,
         } = tctx;
-        let gate: &PermissionGate = gate;
         let budget = &route.harness.budget;
         let measured = ContextManager::would_seed_fit(
             system,
@@ -6843,9 +6842,14 @@ impl DaemonRuntime {
                     router,
                 },
             gate,
+            // Discarded, and not an oversight: an attempt raises no consent of
+            // its own. The `skill` tool's addressee is bound into the registry
+            // when `build_tools` runs, once per turn, so by the time an attempt
+            // is running the invoker has already been baked in where it is
+            // needed. `run_one_attempt` took no invoker before this REQ either
+            // (BR-1).
             invoker: _,
         } = tctx;
-        let gate: &PermissionGate = gate;
         let mut hook = NoopProvenanceHook;
 
         // One read of the slot for the whole attempt: the engine this turn runs
