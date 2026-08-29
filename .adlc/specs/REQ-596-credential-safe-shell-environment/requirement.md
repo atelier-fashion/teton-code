@@ -60,7 +60,7 @@ named below.
 |--------|-------|------|-------------|
 | `ChildEnvPolicy` | `allow` | set of string | The only variable names admitted to a child by name. Membership is BR-2.1's recorded set. Per BR-7.1 this is a **parameter** of the shared composer, not a global: the shell and MCP call sites each pass their own constant, so widening one can never widen the other |
 | `ChildEnvPolicy` | `credential_value_rule` | predicate | `looks_like_credential_url`, applied to what `allow` admits (BR-8). Retained from today's scrub, not superseded by it — `allow` reasons about names, this reasons about values |
-| `ChildEnvPolicy` | `credential_env_names` | set of string | Resolved from every configured `auth_ref = "env:<NAME>"`; removed unconditionally |
+| `ChildEnvPolicy` | `credential_env_names` | set of string | Resolved from every configured `env:<NAME>` credential reference — **every** field `is_recognized_auth_ref` gates (BR-1.1), not only `[[providers]].auth_ref`; removed unconditionally |
 | `ChildEnvPolicy` | `path_floor` | string | The BUG-174 `PATH` floor, applied after composition |
 
 ### Events
@@ -77,7 +77,8 @@ named below.
 
 ## Business Rules
 
-- [ ] BR-1: Every environment variable named by a configured `auth_ref = "env:<NAME>"` is absent from the shell child's environment, regardless of whether its name matches any credential-shaped pattern. The credential set is derived from the loaded config, not guessed from the name (informed by LESSON-432 — derive from what a thing *is*, not from the shape of its name).
+- [ ] BR-1: Every environment variable named by a configured credential reference of the form `env:<NAME>` is absent from the shell child's environment, regardless of whether its name matches any credential-shaped pattern. The credential set is derived from the loaded config, not guessed from the name (informed by LESSON-432 — derive from what a thing *is*, not from the shape of its name).
+- [ ] BR-1.1: "Configured credential reference" means **every** field `is_recognized_auth_ref` gates, not only `[[providers]].auth_ref`. Today that is two: `[[providers]].auth_ref` and `[web] search_key_ref`. Both are validated by that one predicate and both resolve through the same `env:` arm of the secret resolver (`std::env::var`), so both name a live variable in the daemon's process environment. Covering only the provider half would ship the leak this REQ exists to close, in the field that merely happens to have been written second. The derivation enumerates the gated fields at one site, so a third such field added later is covered without amending this rule (informed by LESSON-568 — an invariant with more than one enforcement point needs a sweep, not a fix).
 - [ ] BR-2: The shell child's environment is composed by a **positive allowlist**. A variable not on the allowlist and not explicitly declared is absent. Adding a new variable to the daemon's own environment must not silently widen what the child sees.
 - [ ] BR-2.1: The allowlist has a **named starting set**, not an unstated one. It is the MCP path's twelve (`PATH`, `HOME`, `TMPDIR`, `TZ`, `TERM`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LANGUAGE`, `LC_ALL`, `LC_CTYPE`) plus any addition that meets this criterion and only this one: **a variable an ordinary development command needs in order to run at all, which cannot hold a credential.** `/architect` may extend the set under that criterion and must record each addition's justification; it may not leave the membership implicit. An allowlist nobody wrote down is a denylist with extra steps — the reviewer cannot tell an omission from a decision.
 - [ ] BR-3: BR-1 is enforced **after** BR-2, unconditionally. A credential env name that also appears on the allowlist is still removed — the allowlist cannot re-admit it.
@@ -91,6 +92,7 @@ named below.
 ## Acceptance Criteria
 
 - [ ] AC-1: With `auth_ref = "env:DEEPSEEK_AUTH"` configured and `DEEPSEEK_AUTH` set in the daemon's environment, a `shell` invocation of `env` produces output containing no occurrence of the variable name or its value.
+- [ ] AC-1.1: AC-1 holds for a credential configured as `[web] search_key_ref = "env:WEB_SEARCH_SENTINEL"` — the second field BR-1.1 names. Without this, a test suite green on the provider field alone is not evidence BR-1 is enforced over the set it claims.
 - [ ] AC-2: AC-1 holds for a name matching **no** denylist substring (`MY_LLM_CRED`, `GEMINI_PW`, `LLM_AUTH`) — proving the fix is not the old substring rule in new clothing.
 - [ ] AC-3: A variable that is neither on the allowlist nor a credential (`RANDOM_UNRELATED_VAR=1`) is absent from the child, proving BR-2's allowlist direction rather than an extended denylist.
 - [ ] AC-3.1: **The positive direction.** Every name in BR-2.1's starting set is *present* in the child with the daemon's value (`PATH` excepted — AC-4 owns it). Without this, AC-3 is satisfiable by an allowlist that admits nothing, and a shell tool that can run no ordinary command would pass every other criterion here.

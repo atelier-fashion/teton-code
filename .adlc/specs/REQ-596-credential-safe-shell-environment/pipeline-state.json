@@ -3,10 +3,18 @@
   "branch": "feat/REQ-596-credential-safe-shell-env",
   "startedAt": "2026-08-29T00:00:00Z",
   "completed": false,
-  "currentPhase": 0,
-  "completedPhases": [],
+  "currentPhase": 1,
+  "completedPhases": [
+    0
+  ],
   "integrationBranch": "main",
-  "phaseHistory": [],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree + Preflight",
+      "completedAt": "2026-08-29T00:00:00Z"
+    }
+  ],
   "repos": {
     "teton-code": {
       "primary": true,
@@ -14,15 +22,22 @@
       "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-596",
       "branch": "feat/REQ-596-credential-safe-shell-env",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/233",
+      "prNumber": 233,
       "merged": false,
       "snapshotBranch": null,
-      "snapshotPR": null
+      "snapshotPR": null,
+      "prCreatedAt": "2026-08-29T00:00:00Z"
     }
   },
-  "mergeOrder": ["teton-code"],
-  "phase4": { "currentTask": null, "completedTasks": [], "failedTasks": [] },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  },
   "blockers": [],
   "notes": []
 }
