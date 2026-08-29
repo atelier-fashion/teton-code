@@ -3,11 +3,12 @@
   "branch": "feat/REQ-598-turn-context-parameter-clump",
   "startedAt": "2026-08-29T10:00:00Z",
   "completed": false,
-  "currentPhase": 3,
+  "currentPhase": 4,
   "completedPhases": [
     0,
     1,
-    2
+    2,
+    3
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -29,6 +30,13 @@
       "completedAt": "2026-08-29T11:20:00Z",
       "tasks": 8,
       "note": "6 ADRs. ADR-3 answers OQ-1 (route stays a parameter - it is reassigned per fallback reroute inside run_one_attempt's 'turn loop). ADR-4 found that BR-2 names one instance of a class: the REQ-580 warming hold shadow-rebinds router after the claim, so a BR-2-compliant construction point can still capture a stale router. Added BR-2.1."
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture",
+      "completedAt": "2026-08-29T11:35:00Z",
+      "result": "approved",
+      "findings": "2 fixed inline: BR-3 (request-id minting) and BR-7 (cap-exempt tool visibility) had no task coverage. BR-4 had only an incidental grep hit; given explicit coverage in TASK-294 (construction does no I/O) and TASK-296."
     }
   ],
   "repos": {

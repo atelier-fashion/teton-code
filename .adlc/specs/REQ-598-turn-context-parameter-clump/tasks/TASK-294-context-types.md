@@ -36,6 +36,18 @@ diffs mechanical.
       path, which has no gate).
 - [ ] BR-6: a unit test constructs each type from test doubles and asserts the
       accessors return them, proving the seams survive.
+- [ ] BR-3: none of the three types acquires an id counter, sequence, or
+      allocator of any kind. Request-id minting for daemon-wide resources stays
+      centralized in `PendingPermissions`; a per-session counter handing out ids
+      in a daemon-wide namespace is what cross-authorized tool calls between
+      sessions in BUG-161. Verified by reading the struct definitions — these
+      types hold borrows and nothing else.
+- [ ] BR-4: construction performs **no filesystem I/O and no blocking call**.
+      All five fields are already-resolved borrows, so there is nothing for the
+      `block_in_place_if_multithread` seam to wrap. A test or doc comment states
+      this explicitly, so a later change that adds I/O to a constructor has to
+      confront the rule rather than slide past it (BUG-184 — synchronous skill
+      discovery on the reader loop stalled RPCs behind a TCC dialog).
 - [ ] No `#[allow]` of any kind is added in this task.
 - [ ] `cargo clippy --workspace --all-targets` clean; `cargo test --workspace
       --no-fail-fast` green with output grepped for `FAILED`.

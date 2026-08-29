@@ -36,6 +36,13 @@ BR-2.1.
       definition, not as a local workaround.
 - [ ] `run_one_attempt` takes the context and builds its `DutyContext` from it
       after the one `local_engine` slot read. `route` remains a parameter (ADR-3).
+- [ ] BR-7: `build_tools` builds the `ToolRegistry`, and the cap-exempt
+      (mandatory) versus optional tool distinction must stay **visible** after
+      the migration — not absorbed into the context where a reader stops seeing
+      it. LESSON-496 is what this guards: "cut first under pressure" became
+      "never available" when the limit equalled the mandatory count. Confirm the
+      ordering-dependent registry logic reads the same way it does now, and that
+      no part of the cap decision moves into `TurnContext`.
 - [ ] BR-9: no new suppression of any kind is introduced to make this compile.
 - [ ] BR-1: TASK-293's fixture test still passes unchanged.
 - [ ] BR-5: no `TurnContext` construction is inserted between a security gate
