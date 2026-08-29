@@ -75,16 +75,89 @@ criteria pin each one.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: The workspace `#[allow(clippy::too_many_arguments)]` count drops from 25 to a number recorded verbatim in the PR body, and a test asserts the count does not regress above that number.
-- [ ] AC-2: The doubled `#[allow(clippy::too_many_arguments)]` on `resolve_duty` and `build_duty_route` is gone (both sites, not one).
-- [ ] AC-3: `cargo clippy --workspace --all-targets` stays clean under the workspace's `clippy::all = deny`.
+- [ ] AC-1: The workspace `#[allow(clippy::too_many_arguments)]` count drops from
+  25 to a number recorded verbatim in the PR body, and a test asserts the count
+  does not regress above that number. The PR body MUST report the drop **split
+  into its two disjoint populations**, because a single number credits the
+  refactor with removals that required no refactor:
+  **(a) vestigial** — attributes that suppress nothing, removable with no
+  signature change; **(b) earned** — attributes on functions that genuinely
+  tripped the lint and stopped tripping it because the cluster became a
+  parameter. Phase 1 measured the baseline by stripping all 25 and re-running
+  clippy with the lint downgraded to a warning (under `all = deny` the build
+  aborts at the first crate and reports only one site): **16 of 25 fire, 9 are
+  vestigial** — the 2 AC-2 duplicates, the 5 `*_route` functions (exactly 7
+  arguments each, sitting *at* clippy's default threshold), and the 2 in
+  `engine.rs`. The count test greps the **source tree**, not clippy output, so
+  it also covers the feature-gated sites AC-3 cannot reach (see AC-3).
+- [ ] AC-2: Neither `resolve_duty` nor `build_duty_route` retains a **stacked
+  pair** of `#[allow(clippy::too_many_arguments)]` — the fix is applied to both
+  *functions*, not one. Because both collapse below the threshold once the duty
+  cluster becomes a parameter, each must end with **zero** such attributes, not
+  one; a lone surviving attribute on either is a vestigial suppression under
+  AC-1(a) and fails this criterion.
+- [ ] AC-3: `cargo clippy --workspace --all-targets` stays clean under the
+  workspace's `clippy::all = deny`. **Known coverage limit, recorded rather than
+  papered over**: this command does not compile `teton-inference`'s
+  `#[cfg(feature = "llama")]` block, so it never checks `engine.rs::serve` or
+  `engine.rs::run_generation`. Those two sites are out of scope per OQ-3 and are
+  covered only by AC-1's source-tree count. Do not read a green AC-3 as a
+  workspace-wide statement.
 - [ ] AC-4: `cargo test --workspace --no-fail-fast` is green, and the output is grepped for `FAILED` rather than trusting a summed pass count (conventions.md — an interrupted fail-fast run reports a floor, not a total).
-- [ ] AC-5: A test mutates `cwd` between turn spawn and turn claim and asserts `TurnContext` observes the **fresh** value — this is the BR-2 / LESSON-539 regression guard, and it must fail if `TurnContext` is constructed from a pre-claim snapshot.
+- [ ] AC-5: A test mutates `cwd` between turn spawn and turn claim and asserts
+  `TurnContext` observes the **fresh** value — the BR-2 / LESSON-539 regression
+  guard. **The existing test does not satisfy this criterion and reusing it is a
+  defect** (Phase 1 finding, LESSON-586's shape):
+  `a_turn_handed_a_stale_cwd_snapshot_runs_on_the_root_the_registry_holds_at_claim_time`
+  (`runtime.rs`) guards `run_prompt_turn`'s post-claim re-read of `session_cwd`,
+  which sits **upstream** of every point at which a `TurnContext` can be built.
+  A context constructed anywhere below that re-read inherits the fresh value for
+  free, so that test cannot distinguish a correctly-built `TurnContext` from one
+  built off the pre-claim snapshot — a broader guard standing in front of the
+  mutation this AC exists to catch.
+  Satisfying AC-5 therefore requires **all three**:
+  (a) the guard's subject is `TurnContext`'s **own** view of the root (assert on
+  what the constructed context carries, not only on the turn's downstream
+  behavior), so the assertion is not satisfiable by the upstream re-read alone;
+  (b) the mutation is **demonstrated**: build `TurnContext` from the
+  `session_cwd` *parameter* (the pre-claim snapshot) instead of the post-claim
+  re-read, confirm the test goes **red**, and revert;
+  (c) that mutation and its observed failure are recorded verbatim in the test's
+  doc comment, per conventions.md ("show the test can fail before trusting that
+  it passed").
 - [ ] AC-6: The existing `ParkingVerifier` reader-loop test still proves concurrent RPCs are served while a presence gate blocks (BR-4 guard; informed by LESSON-518 — routing tests alone cannot show this).
 - [ ] AC-7: The gate-before-parse refusal tests still use **valid, persistable** payloads paired with an acceptance case, so they remain non-vacuous after the move (BR-5 guard; informed by LESSON-520).
-- [ ] AC-8: **Traceability sweep** — a check enumerates REQ/ADR/LESSON/BUG ids present in the touched files before and after, and fails on any id that disappeared. This is a **region check**, not a count: a comment relocated to the wrong function keeps the count identical (informed by conventions.md / LESSON-568).
+- [ ] AC-8: **Traceability sweep — a true region check.** A per-file set diff of
+  REQ/ADR/LESSON/BUG ids is **not sufficient and does not satisfy this
+  criterion** (Phase 1 finding). Evidence: when REQ-597 rebased onto REQ-596,
+  a method was inserted between `config_snapshot`'s doc comment and its
+  attribute, orphaning the comment from the item it documents. No id left the
+  file — set identical, count identical, defect present. The check MUST bind
+  each id to the **item it annotates**, and fail on all three of:
+  (a) **Disappearance** — an id present in a touched file before the refactor is
+  absent after, anywhere in the workspace (an id may legitimately *move between
+  files*; the sweep is workspace-scoped so a genuine relocation is not a false
+  positive).
+  (b) **Re-association** — an id whose owning item changed. For every id, record
+  the set of item names (fn/struct/impl) whose attached doc-comment block
+  carries it; fail if that mapping changes, except where the PR body names the
+  rename explicitly.
+  (c) **Orphaning** — a doc-comment block that is no longer attached to any
+  item: a `///` run, or a `//` run immediately preceding an item, separated from
+  its item by a blank line or by an intervening item. This arm is what catches
+  the REQ-596/597 failure above, and it MUST be shown to catch it — reproduce
+  that exact insertion against `config_snapshot`, confirm the sweep goes red,
+  and revert (conventions.md's invert-the-gate rule).
 - [ ] AC-9: The three typed-outcome turn-path arms (`PrivacyBlocked`, `ContextLengthExceeded`, `SpendCeilingReached`) each still have both halves — `failure_class() -> None` **and** a dedicated arm ordered before the generic remote arm. A test inverts each arm and confirms the user-facing sentence changes (informed by conventions.md's both-halves rule and LESSON-557).
-- [ ] AC-10: Event ordering is asserted unchanged for at least one full turn, by comparing a recorded event sequence against a pre-refactor fixture (BR-1 guard).
+- [ ] AC-10: Event ordering is asserted unchanged for at least one full turn, by
+  comparing a recorded event sequence against a pre-refactor fixture (BR-1
+  guard). **Fixture provenance is load-bearing and pinned**: the golden sequence
+  is captured on the **base commit** (`origin/main`, before any refactor commit
+  lands on the branch) and committed as a checked-in file in the **first**
+  task's commit. A fixture regenerated after the refactor is an oracle computed
+  by the subject — conventions.md's first named trap — and does not satisfy this
+  criterion. The test must additionally be shown to fail when two events are
+  transposed; record that mutation in its doc comment.
 
 ## External Dependencies
 
@@ -100,7 +173,36 @@ criteria pin each one.
 
 - [ ] OQ-1: Does `TurnContext` own `route`, or is a routed turn a distinct type (`RoutedTurn`) so that "route not yet resolved" is unrepresentable rather than an `Option`? The typestate version is safer and a larger diff.
 - [ ] OQ-2: Should the struct be per-turn or per-session with a per-turn view? Per-session risks BR-2's staleness class returning by another door.
-- [ ] OQ-3: Do the non-`runtime.rs` sites (`engine.rs`, `category.rs`) share this cluster, or do they carry a different one that merely also trips the lint? If the latter, they are out of scope and their suppressions stay — and AC-1's target number must reflect that.
+- [x] OQ-3: **ANSWERED in Phase 1 — no, they do not share the cluster.** Measured
+  by reading all 25 signatures. Zero of the five cluster fields (`events`,
+  `session_id`, `config`, `router`, `gate`) appear in any of them:
+  `engine.rs::serve` takes `backend, model, n_ctx, resident, cache, cache_key,
+  prompt, params, out_tx, ctrl_rx`; `engine.rs::run_generation` takes `ctx,
+  model, tokens, start, params, out_tx, ctrl_rx`; `category.rs::resolve_fallback`
+  takes `category, tier, primary, rejected, source, fallback, health, usable`.
+  `category.rs` lives in `teton-core`, which by architecture performs no I/O and
+  therefore has no access to `EventBus` or `PermissionGate` at all — it *cannot*
+  take this cluster. Both `engine.rs` sites sit inside the
+  `#[cfg(feature = "llama")]` block and are compiled by neither AC-3's command
+  nor CI. **All three are out of scope; their suppressions stay.** Two further
+  sites fail the same test and are likewise out of scope:
+  `main.rs::provider_add_on` (CLI plumbing — `conn`, `ctx`, `keychain`) and
+  `budget.rs::skill_append_fit` (pure fit arithmetic).
+  `skill.rs::publish_invocation` is **precedent, not target**: its doc comment
+  records that it already reads session and bus *off the gate* rather than
+  taking them as parameters — the bundling this REQ generalizes.
+- [ ] OQ-4 (raised in Phase 1): `runtime.rs` holds **two** clusters, not one, and
+  `/architect` must decide whether that means two structs. The turn cluster
+  (`events, session_id, config, router, gate`, + `route`) appears in
+  `offer_or_refuse_over_budget`, `build_tools`, `run_one_attempt`. The
+  duty-routing cluster (`router, config, events, session_id` — **no gate** —
+  plus `local_engine` and `prompt_spend`, which travel with it at every site)
+  appears in `resolve_duty`, `build_duty_route`, `spawn_title_session`, and the
+  five `*_route` functions. `turn_loop.rs` carries a third, harness-layer
+  cluster (`tools, tool_ctx, gate, events: &SessionEvents, ctx, config:
+  &HarnessConfig, hook`) with no `session_id` and no `router`. The spec's own
+  Assumptions section already rules on the principle — "two small structs, not
+  one wide one" — and this is the discovery it anticipated.
 
 ## Out of Scope
 
