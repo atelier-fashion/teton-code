@@ -1,7 +1,7 @@
 ---
 id: TASK-289
 title: "Name the shell exception in the egress header and architecture.md"
-status: pending
+status: complete
 parent: REQ-596
 created: 2026-08-29
 updated: 2026-08-29
