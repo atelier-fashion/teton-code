@@ -3625,15 +3625,22 @@ impl DaemonRuntime {
         }
     }
 
-    /// A snapshot of the current configuration for `config/get`.
+    /// Every environment variable name a configured `env:<NAME>` credential
+    /// reference points at, read from the **live** config (REQ-596 BR-1).
     ///
-    /// The routing half of the snapshot is **resolved**, not merely echoed: it
-    /// is built by asking the same [`Router`] a turn would ask, with the same
-    /// live provider health, so `teton policy show` reports the decision the
-    /// next turn will actually make (BR-6, AC-11). Echoing the `[[tiers]]` and
-    /// `[[categories]]` rows back would have been less code and a different
-    /// answer — the rows say nothing about an unbound tier's inherited fill, a
-    /// provider that is down, or a remote provider that declares no model.
+    /// The daemon installs this as `child_env`'s credential-name source at
+    /// bootstrap, and it is called once per spawned `shell` child rather than
+    /// snapshotted, so a provider added mid-session is withheld from the very
+    /// next command instead of the next daemon start (LESSON-539).
+    ///
+    /// The derivation itself lives in [`crate::child_env`] beside the composer
+    /// that consumes it; this method is only the lock.
+    #[must_use]
+    pub fn credential_env_var_names(&self) -> std::collections::BTreeSet<String> {
+        let config = self.config.lock().expect("config mutex poisoned");
+        crate::child_env::credential_env_names_of(&config)
+    }
+
     /// What this daemon's boundary configuration amounts to right now, read
     /// once under one lock (REQ-597 BR-5 and the System Model's
     /// `boundary_defaults_applied`).
@@ -3652,6 +3659,15 @@ impl DaemonRuntime {
         }
     }
 
+    /// A snapshot of the current configuration for `config/get`.
+    ///
+    /// The routing half of the snapshot is **resolved**, not merely echoed: it
+    /// is built by asking the same [`Router`] a turn would ask, with the same
+    /// live provider health, so `teton policy show` reports the decision the
+    /// next turn will actually make (BR-6, AC-11). Echoing the `[[tiers]]` and
+    /// `[[categories]]` rows back would have been less code and a different
+    /// answer — the rows say nothing about an unbound tier's inherited fill, a
+    /// provider that is down, or a remote provider that declares no model.
     #[must_use]
     pub fn config_snapshot(&self) -> ConfigSnapshot {
         let config = self.config.lock().expect("config mutex poisoned");
@@ -4259,8 +4275,9 @@ impl DaemonRuntime {
 
         let outcomes = match door {
             // Consent given. Sequential, in document order, with the session
-            // root as cwd and the `shell` tool's jail, scrub, PATH floor,
-            // process group and deadline (ADR-14).
+            // root as cwd and the `shell` tool's jail, composed environment
+            // (REQ-596: an allowlist, not a scrub), PATH floor, process group
+            // and deadline (ADR-14).
             None if !commands.is_empty() => {
                 let root = root.to_path_buf();
                 let to_run = commands.clone();

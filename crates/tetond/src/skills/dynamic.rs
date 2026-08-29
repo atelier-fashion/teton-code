@@ -475,9 +475,13 @@ pub fn outcome_view(
     }
 }
 
-/// Run every command in order under the `shell` tool's jail, environment
-/// scrub, `PATH` floor, process group and deadline — the single I/O edge of
-/// this feature (BR-6, BR-14).
+/// Run every command in order under the `shell` tool's jail, composed
+/// environment, `PATH` floor, process group and deadline — the single I/O edge
+/// of this feature (BR-6, BR-14).
+///
+/// The environment is an allowlist, not a scrub, since REQ-596: these commands
+/// are as model-driven as a `shell` call and inherit the same policy, because
+/// they go through the same `run_bounded`.
 ///
 /// Sequential and in document order, because that is the order the user
 /// consented to and the order the body reads in. `timeout_ms` is per command,

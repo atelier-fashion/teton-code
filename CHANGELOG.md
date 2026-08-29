@@ -58,6 +58,40 @@ user having asked for it.
   at all** — reachable only by setting the opt-out — says so at startup rather
   than only in the daemon log.
 
+- **The egress choke point documents its one exception (REQ-596).** The module
+  header and `architecture.md` both claimed every byte leaving the machine passes
+  through egress. That was never true of `shell`, which can run `curl`. Both now
+  state the exact guarantee — provider and MCP traffic the daemon originates —
+  and record the shell residual explicitly. No behavior changed; the documented
+  claim now matches the code. Sandboxing the shell child's network access remains
+  out of scope and unimplemented.
+
+### Security
+
+- **The `shell` tool composes its child's environment from an allowlist
+  (REQ-596).** It previously filtered the daemon's environment with a
+  *denylist* of credential-shaped variable **names** — `SECRET`, `PASSWORD`,
+  `TOKEN`, `KEY`, `CREDENTIAL`, `PAT`. Any credential whose name missed all of
+  those survived into the model-supplied command, and `auth_ref = "env:<VAR>"`
+  means you can *tell* Teton a variable holds a provider key and it would still
+  be handed to `sh -c`. A single `echo $DEEPSEEK_AUTH` put the value in tool
+  output, bound for the next remote turn.
+
+  The child now receives only `PATH`, `HOME`, `TMPDIR`, `TZ`, `TERM`, `USER`,
+  `LOGNAME`, `SHELL`, `LANG`, `LANGUAGE`, `LC_ALL` and `LC_CTYPE` — the same
+  twelve a spawned MCP server has always received — and every variable named by
+  a configured `auth_ref` or `[web] search_key_ref` of the form `env:<VAR>` is
+  removed unconditionally on top of that.
+
+  **What this does to a machine that was already running:** a `shell` command
+  that relied on any *other* environment variable will now fail. `SSH_AUTH_SOCK`
+  is the one most likely to be missed — a `git push` over ssh from inside a shell
+  command no longer sees your agent, and fails looking like an ssh problem rather
+  than a Teton one. This is the deliberate trade: the alternative is silently
+  handing credentials to model-driven code execution. If you hit a variable you
+  genuinely need, that is worth reporting — the allowlist is meant to grow on
+  evidence.
+
 ## [0.1.26] - 2026-08-27
 
 ### Added

@@ -1,7 +1,7 @@
 //! The single egress choke point (architecture D-2).
 //!
-//! Every byte that leaves this machine for a remote provider — or, per ADR-003,
-//! a remote MCP server — passes through here. This is the *only* place in the
+//! Every byte the *daemon* sends to a remote provider — or, per ADR-003, a
+//! remote MCP server — passes through here. This is the *only* place in the
 //! whole workspace that constructs a real HTTP client ([`HttpTransport`], built
 //! on `reqwest`); a CI deny-check ([`deny_http_client`]) fails the build if any
 //! other crate declares an HTTP-client crate among its **direct** manifest
@@ -10,6 +10,29 @@
 //! crate carries no client of its own and only ever holds a `&dyn Transport`,
 //! "an adapter cannot reach the network except through egress" is a compile-time
 //! property, not a review convention.
+//!
+//! ## The `shell` exception (REQ-596 BR-6)
+//!
+//! The sentence above says *the daemon*, and it used to say "this machine". It
+//! was not true: the `shell` tool runs a model-supplied command through
+//! `sh -c`, and that command can be `curl`. A shell child reaches the network
+//! **outside** this choke point — no privacy-boundary check, no cost record, no
+//! `deny_http_client` (which scans *this workspace's* manifests, and `curl` is
+//! not one of our dependencies).
+//!
+//! So the guarantee this module provides is exact and narrower than it read:
+//! **provider and MCP traffic the daemon originates** flows through here, and
+//! that property is compile-time rather than a review convention. Traffic a
+//! shell child originates does not, and nothing here can see it.
+//!
+//! Sandboxing the shell child's network access — `sandbox-exec` with no
+//! `network*` on macOS, and its equivalents elsewhere — is the real fix and is
+//! deliberately **out of scope** for REQ-596, which has its own platform matrix
+//! to answer for. REQ-596 closed the half that could be closed cheaply: the
+//! child no longer holds the credentials it would need to make such a request
+//! interesting. The residual is recorded here rather than contradicted, because
+//! a documented guarantee that is false is worse than a narrower one that is
+//! true.
 //!
 //! Three responsibilities converge here:
 //! - **BR-1 (privacy boundary)** — a request whose content provenance intersects
@@ -1249,6 +1272,45 @@ fn classify_reqwest_error(error: &reqwest::Error) -> TransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AC-9 (BR-6). The `shell` exception is stated in **both** places that used
+    /// to overclaim, and this asserts the doc half — so the architecture record
+    /// cannot silently revert to the false form while the code comment keeps the
+    /// correction, or vice versa.
+    ///
+    /// Two claims are checked rather than one string: that the exception names
+    /// `shell`, and that it says the residual is out of scope rather than
+    /// unnoticed. A reader who finds only the first would not know whether the
+    /// gap is a decision or an oversight.
+    #[test]
+    fn the_architecture_record_names_the_shell_egress_exception() {
+        let doc = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.adlc/context/architecture.md");
+        let text = std::fs::read_to_string(&doc)
+            .unwrap_or_else(|e| panic!("architecture.md must be readable at {doc:?}: {e}"));
+
+        assert!(
+            text.contains("The `shell` tool\n  is the one exception"),
+            "architecture.md no longer names the `shell` exception to the egress choke \
+             point. The sentence it reverted to — that a tool reaching the network is \
+             always handed transport — is false of `shell`, which can run `curl` (REQ-596 \
+             BR-6)."
+        );
+        assert!(
+            text.contains("out of scope for\n  REQ-596"),
+            "architecture.md names the exception but no longer says the sandbox is out of \
+             scope, so a reader cannot tell a recorded residual from an oversight."
+        );
+
+        // The module header this file opens with must carry the same exception,
+        // or the two records have drifted apart.
+        let header = include_str!("mod.rs");
+        assert!(
+            header.contains("## The `shell` exception (REQ-596 BR-6)"),
+            "the egress module header dropped the exception that architecture.md still \
+             records"
+        );
+    }
     use crate::fixture_id;
     use std::sync::Mutex;
     use teton_protocol::events::ProvenanceRejection;
