@@ -1,7 +1,7 @@
 ---
 id: TASK-294
 title: "Introduce TurnCore, TurnContext, and DutyContext"
-status: draft
+status: complete
 parent: REQ-598
 created: 2026-08-29
 updated: 2026-08-29
