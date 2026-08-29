@@ -2,7 +2,7 @@
   "req": "REQ-596",
   "branch": "feat/REQ-596-credential-safe-shell-env",
   "startedAt": "2026-08-29T00:00:00Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -62,6 +63,12 @@
       "name": "PR Cleanup & CI",
       "completedAt": "2026-08-29T02:40:00Z",
       "result": "Diff clean (no TODO/debug/secrets); all 7 CI jobs green"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup and Merge",
+      "completedAt": "2026-08-29T15:32:11Z",
+      "result": "PR #233 squash-merged to main as 910bfe4; worktree torn down; LESSON-584/585/586 and ASSUME-024 captured"
     }
   ],
   "repos": {
@@ -73,10 +80,12 @@
       "touched": true,
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/233",
       "prNumber": 233,
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null,
-      "prCreatedAt": "2026-08-29T00:00:00Z"
+      "prCreatedAt": "2026-08-29T00:00:00Z",
+      "mergedAt": "2026-08-29T15:32:11Z",
+      "mergeCommit": "910bfe4"
     }
   },
   "mergeOrder": [
