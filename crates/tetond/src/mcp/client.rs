@@ -754,12 +754,7 @@ where
     // the `shell` child, and changing the MCP path is out of this REQ's scope;
     // an empty set is what makes the byte-identical guard below true rather than
     // aspirational. The MCP path already excludes provider keys by allowlist.
-    crate::child_env::compose_child_env(
-        daemon_vars,
-        MCP_BASE_ENV_ALLOW,
-        &BTreeSet::new(),
-        declared,
-    )
+    crate::child_env::compose_child_env(daemon_vars, MCP_BASE_ENV_ALLOW, &BTreeSet::new(), declared)
 }
 
 /// A local MCP server spawned as a subprocess, speaking newline-delimited
@@ -1415,7 +1410,10 @@ mod tests {
             ("TERM".to_owned(), "xterm-256color".to_owned()),
             ("LANG".to_owned(), "en_US.UTF-8".to_owned()),
             ("TMPDIR".to_owned(), "/tmp/SENTINEL".to_owned()),
-            ("ANTHROPIC_API_KEY".to_owned(), "SENTINEL-not-a-key".to_owned()),
+            (
+                "ANTHROPIC_API_KEY".to_owned(),
+                "SENTINEL-not-a-key".to_owned(),
+            ),
             ("RANDOM_DAEMON_VAR".to_owned(), "SENTINEL-nope".to_owned()),
         ];
         let declared = BTreeMap::from([

@@ -80,13 +80,15 @@ pub(crate) const SHELL_ENV_ALLOW: &[&str] = &[
 /// Five steps, and the order is load-bearing:
 ///
 /// 1. Keep only `daemon_vars` whose **name** is in `allow` (BR-2).
-/// 2. Drop what survives if its **value** is a credential-bearing URL (BR-8).
-///    Base slice only — never `declared`. A user who declares
-///    `MY_DB=postgres://u:p@h` for their own MCP server declared it on purpose;
-///    this step catches what the *daemon's* environment leaks in.
-/// 3. Floor `PATH` (BR-4). Before `declared`, so a child that declares its own
+/// 2. Floor `PATH` (BR-4). Before `declared`, so a child that declares its own
 ///    `PATH` overrides the floor untouched — the existing MCP semantics,
 ///    preserved.
+/// 3. Drop what survives if its **value** is a credential-bearing URL (BR-8) —
+///    *after* the floor, because the floor unconditionally re-adds a `PATH` and
+///    would otherwise put back the one name on the allowlist this rule is most
+///    likely to have to reach. Base slice only, never `declared`: a user who
+///    declares `MY_DB=postgres://u:p@h` for their own MCP server declared it on
+///    purpose; this step catches what the *daemon's* environment leaks in.
 /// 4. Layer `declared` on top; a declared var overrides a base one.
 /// 5. Remove every name in `credential_env_names`, **unconditionally and last**
 ///    (BR-1, BR-3).
@@ -106,9 +108,14 @@ where
     let mut base: Vec<(String, String)> = daemon_vars
         .into_iter()
         .filter(|(k, _)| allow.contains(&k.as_str()))
-        .filter(|(_, v)| !looks_like_credential_url(v))
         .collect();
     crate::env_path::apply_path_floor(&mut base);
+    // After the floor, not before. `apply_path_floor` *unconditionally* pushes a
+    // `PATH`, so a `PATH` withheld by this rule before the floor ran would be
+    // put straight back — and `PATH` is on the allowlist, which is exactly the
+    // case BR-8 is about. Filtering afterwards leaves no name the rule cannot
+    // reach.
+    base.retain(|(_, v)| !looks_like_credential_url(v));
 
     let mut env: BTreeMap<String, String> = base.into_iter().collect();
     for (k, v) in declared {
@@ -210,7 +217,9 @@ where
 /// the daemon, the one context where such a config exists at all, always
 /// installs the provider.
 pub(crate) fn credential_env_names() -> BTreeSet<String> {
-    CREDENTIAL_ENV_NAMES.get().map_or_else(BTreeSet::new, |f| f())
+    CREDENTIAL_ENV_NAMES
+        .get()
+        .map_or_else(BTreeSet::new, |f| f())
 }
 
 #[cfg(test)]
@@ -229,9 +238,7 @@ mod tests {
     }
 
     fn value_of<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
-        env.iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.as_str())
+        env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     }
 
     fn no_credentials() -> BTreeSet<String> {
@@ -324,7 +331,10 @@ mod tests {
     #[test]
     fn an_allowlisted_name_holding_a_credential_url_is_withheld() {
         let withheld = compose_child_env(
-            vars(&[("TMPDIR", "postgres://SENTINELUSER:SENTINELPASS@db.invalid/x")]),
+            vars(&[(
+                "TMPDIR",
+                "postgres://SENTINELUSER:SENTINELPASS@db.invalid/x",
+            )]),
             SHELL_ENV_ALLOW,
             &no_credentials(),
             &BTreeMap::new(),
@@ -346,6 +356,39 @@ mod tests {
             Some("/tmp/SENTINEL"),
             "the same name with an ordinary value is admitted — so the rule above read the \
              value, not the name"
+        );
+    }
+
+    /// The value rule reaches `PATH` too, which it only does because it runs
+    /// **after** the floor. Written before the floor, this case passes
+    /// vacuously: `apply_path_floor` unconditionally pushes a `PATH` back, so
+    /// the withheld variable reappears with the credential still in it. `PATH`
+    /// is on the allowlist, so BR-8 has to hold for it like any other name.
+    ///
+    /// **Mutation run.** Moving `base.retain(...)` back above
+    /// `apply_path_floor` fails this test, and the observed failure is more
+    /// interesting than the predicted one: left
+    /// `Some("/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin")`, right
+    /// `None`. The variable comes back — which is the assertion — but the
+    /// credential text did *not* survive, because `floored_path` happened to
+    /// drop an inherited entry that names no directory. That is precisely why
+    /// the rule must not sit above the floor: whether a credential leaks would
+    /// then depend on a *usability* helper's incidental treatment of a malformed
+    /// entry, and a security property resting on that is a property nobody can
+    /// state. Nothing else moves.
+    #[test]
+    fn the_value_rule_reaches_path_because_it_runs_after_the_floor() {
+        let composed = compose_child_env(
+            vars(&[("PATH", "ldap://SENTINELUSER:SENTINELPASS@dir.invalid")]),
+            SHELL_ENV_ALLOW,
+            &no_credentials(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            value_of(&composed, "PATH"),
+            None,
+            "a credential-bearing PATH must be withheld like any other value; the floor \
+             must not put it back"
         );
     }
 
@@ -471,8 +514,7 @@ mod tests {
                 // must be *near* — a call in another function does not vouch.
                 let from = i.saturating_sub(COMPOSER_REGION_LINES);
                 let bound_by_composer = lines[from..i].iter().any(|l| {
-                    l.contains(&format!("let {arg} ="))
-                        && l.contains("compose_child_env")
+                    l.contains(&format!("let {arg} =")) && l.contains("compose_child_env")
                 });
                 assert!(
                     bound_by_composer,
@@ -488,6 +530,64 @@ mod tests {
             checked >= 2,
             "the scan found {checked} `.envs(` sites; it must see at least the shell and \
              MCP spawn paths, or it is passing vacuously"
+        );
+    }
+
+    /// AC-8's other half, and the hole the `.envs(` check alone leaves.
+    ///
+    /// The check above asks whether an environment *handed to a child* was
+    /// composed. It says nothing about a spawn that hands the child no
+    /// environment at all — and a `Command` without `env_clear()` inherits the
+    /// daemon's whole environment, credentials included. That spawn has no
+    /// `.envs(` for the region check to find, so it would pass in silence: the
+    /// worst possible failure mode for a guard whose job is to notice a second
+    /// way in.
+    ///
+    /// So every process spawn in production source must clear first. A spawn is
+    /// identified by `.spawn()` appearing in the same builder chain rather than
+    /// by the imported type name — `skills::dynamic::Command` is a parsed
+    /// dynamic-context command that never becomes a process, and the two are
+    /// spelled identically at the call site. The first draft of this test keyed
+    /// on the import instead and silently saw only one of the two real spawns;
+    /// the vacuity floor below is what caught that, which is the whole reason it
+    /// is here.
+    ///
+    /// **Mutation run.** Deleting `.env_clear()` from `run_bounded` fails with
+    /// `harness/tools/shell.rs: a process spawn does not call env_clear()`.
+    #[test]
+    fn every_process_spawn_clears_the_inherited_environment_first() {
+        /// How much of the builder chain after `Command::new(` is considered
+        /// part of the same spawn.
+        const BUILDER_CHAIN_CHARS: usize = 1_200;
+
+        let mut spawns = 0_usize;
+
+        for (path, source) in crate::call_sites::scan::production_sources() {
+            let code = crate::call_sites::scan::code_only(&source);
+
+            for (at, _) in code.match_indices("Command::new(") {
+                let chain = &code[at..code.len().min(at + BUILDER_CHAIN_CHARS)];
+                // Not a process spawn — `skills::dynamic::Command` shares the
+                // name and never reaches the OS.
+                if !chain.contains(".spawn()") {
+                    continue;
+                }
+                spawns += 1;
+                assert!(
+                    chain.contains("env_clear()"),
+                    "{path}: a process spawn does not call env_clear(), so the child \
+                     inherits the daemon's entire environment — every configured credential \
+                     included. Compose it with child_env::compose_child_env instead (AC-8)."
+                );
+            }
+        }
+
+        assert_eq!(
+            spawns, 2,
+            "the scan must see exactly the two known process spawns (the `shell` tool and \
+             the MCP stdio server). A third is a new way for a child to inherit the \
+             daemon's environment and needs its own answer to AC-8; zero or one means the \
+             scan stopped seeing a file and every assertion above it passed vacuously."
         );
     }
 
@@ -530,7 +630,11 @@ search_key_ref = "env:SENTINEL_WEB_ENV"
              leak this REQ exists to close, in the field that happens to have been written \
              second (BR-1.1)"
         );
-        assert_eq!(names.len(), 2, "a keychain: ref names no environment variable");
+        assert_eq!(
+            names.len(),
+            2,
+            "a keychain: ref names no environment variable"
+        );
     }
 
     /// Schemes that name no environment variable contribute nothing, and a
@@ -571,8 +675,8 @@ auth_ref = "op://vault/item"
     /// child_env::credential_env_names_of reads 2` — left `3`, right `2`.
     #[test]
     fn the_enumeration_covers_every_field_teton_core_gates() {
-        let config_rs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../teton-core/src/config.rs");
+        let config_rs =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../teton-core/src/config.rs");
         let source = crate::call_sites::scan::production_source(&config_rs);
         let code = crate::call_sites::scan::code_only(&source);
 
@@ -597,9 +701,7 @@ auth_ref = "op://vault/item"
     /// (BR-8): the value signal survived the rewrite, and so did its test.
     #[test]
     fn credential_url_detection() {
-        assert!(looks_like_credential_url(
-            "postgres://user:pass@host/db"
-        ));
+        assert!(looks_like_credential_url("postgres://user:pass@host/db"));
         assert!(looks_like_credential_url("redis://:password@host:6379"));
         assert!(!looks_like_credential_url("https://example.com/path"));
         assert!(!looks_like_credential_url("postgres://host/db"));

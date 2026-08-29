@@ -131,6 +131,11 @@ fn main() -> anyhow::Result<ExitCode> {
         // than a value, because the answer must be the *live* config's at the
         // moment of the spawn — a snapshot taken here would not know about a
         // provider added later in the session (LESSON-539).
+        //
+        // The closure keeps an `Arc<DaemonRuntime>` for the life of the
+        // process. That is not a teardown hazard: the ordered shutdown below is
+        // an explicit `shutdown(...)` call, not a `Drop` impl, so nothing is
+        // skipped by the runtime outliving this scope.
         {
             let runtime_for_credentials = Arc::clone(&daemon_runtime);
             tetond::child_env::set_credential_env_names_provider(move || {

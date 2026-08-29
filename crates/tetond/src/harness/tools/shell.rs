@@ -81,6 +81,7 @@
 //! bound duty is *refused* on any machine with a privacy boundary configured;
 //! see [`shell_duty`] for why that is the design working rather than a gap.
 
+use std::collections::BTreeMap;
 use std::io::Result as IoResult;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -95,7 +96,6 @@ use teton_protocol::methods::RootKind;
 use super::{
     opt_str_arg, opt_u64_arg, str_arg, RefinedOutcome, Tool, ToolContext, ToolDuties, ToolOutcome,
 };
-use std::collections::BTreeMap;
 use crate::harness::digest::tool_result_provenance;
 use crate::harness::shell_duty;
 
@@ -797,6 +797,20 @@ mod tests {
     /// It also pins the "exactly one `PATH`" half: `apply_path_floor` rewrites
     /// the variable rather than appending a second one, and `env_clear` plus
     /// `envs` would happily carry two.
+    /// Serializes the tests below that mutate the **process** environment and
+    /// then read it back through a spawned child.
+    ///
+    /// `std::env::set_var` races `std::env::vars()` — that is why the former is
+    /// `unsafe` — and `run_bounded` calls the latter. Two such tests running on
+    /// different threads of the same binary is exactly the racing pair, and the
+    /// symptom would be a rare, unreproducible absence assertion firing on a
+    /// variable the *other* test planted. Serializing them costs a few
+    /// milliseconds and removes a flake nobody would ever diagnose.
+    ///
+    /// Poisoning is ignored: a panic in one of these tests must fail that test,
+    /// not cascade into an unrelated failure in the next one.
+    static ENV_MUTATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// AC-1 and AC-1.1, end to end: a credential the daemon was *told* about
     /// through `auth_ref = "env:<VAR>"` never reaches a `shell` child — and that
     /// holds for **both** fields `is_recognized_auth_ref` gates, not only
@@ -827,6 +841,9 @@ mod tests {
     /// report: the allowlist alone already withheld them.
     #[test]
     fn a_configured_credential_never_reaches_the_child_from_either_gated_field() {
+        let _serialized = ENV_MUTATION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_root("credential-env");
         let unique = std::process::id();
         let provider_var = format!("DEEPSEEK_AUTH_SENTINEL_{unique}");
@@ -913,6 +930,9 @@ search_key_ref = "env:{web_var}"
     /// withholds by default, not only for things that look like secrets.
     #[test]
     fn a_credential_named_nothing_like_a_credential_never_reaches_the_child() {
+        let _serialized = ENV_MUTATION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_root("env-allowlist");
         let unique = std::process::id();
         // SAFETY: process-unique names, set and removed around one spawn.
