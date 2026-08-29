@@ -1,7 +1,7 @@
 ---
 id: TASK-300
 title: "Final verification sweep and PR body numbers"
-status: draft
+status: complete
 parent: REQ-598
 created: 2026-08-29
 updated: 2026-08-29
