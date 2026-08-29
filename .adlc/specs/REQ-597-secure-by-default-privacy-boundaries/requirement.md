@@ -108,6 +108,23 @@ belongs in its own decision.
 - [ ] OQ-2: Should BR-5's warning escalate to a **refusal** when the root is `FilesystemRoot` with an empty boundary set? A refusal is safer; it also makes `disable_default_boundaries` a partial trap.
 - [ ] OQ-3: Does the builtin set belong in the config document as commented-out rows on first write (discoverable, editable) or purely in code (cannot be silently deleted)? BR-3 currently implies code.
 - [ ] OQ-4: BR-2.1 lets a user row take precedence over a builtin for the same path, and BR-2.2 accepts the residual that this can select a weaker mode. Should the composition instead **refuse** a user row that weakens a builtin — or warn on it — rather than honoring it silently? Answering "honor it" keeps BR-7 simple and trusts the config author; answering "refuse" makes the builtin set a floor rather than a default, which is a stronger promise but a second implicit way for a config to fail to load. This is inert until a substituting redactor exists (BR-2.2), so it can be decided late — but it should be decided, not inherited by accident.
+- [ ] OQ-5: **The reach of the default set is wider than its glob list, and that
+      was discovered in implementation rather than specified.** `context_is_sensitive`
+      short-circuits when the boundary list is empty, so REQ-585's *unpinnable*
+      provenance — content a skill's command produced, or a skill file outside the
+      session root — never reached the inspector on a stock machine. With the
+      builtin set always present it does, and such turns now fail closed on every
+      machine rather than only for users who had configured boundaries. BR-4
+      ("same session taint") makes this correct rather than accidental, and on an
+      install with the shipped local tier it is a reroute rather than a refusal.
+      But it means *anything the daemon cannot pin* is now covered, not just the
+      thirteen patterns, and it is the part of this REQ a user is most likely to
+      feel without being able to name. Should the unpinnable path key on
+      user-declared boundaries specifically, keeping the builtin set to the paths
+      it names — or is treating unattributable content as sensitive exactly what a
+      secure default should mean? Pinned by
+      `skill_turn::a_skill_that_ran_a_command_is_pinned_by_the_default_boundaries`
+      either way, so the decision is reversible with a test to hold it.
 
 ## Out of Scope
 
