@@ -1,7 +1,7 @@
 ---
 id: REQ-596
 title: "Architecture — a credential-safe environment for the shell tool"
-status: draft
+status: complete
 created: 2026-08-29
 updated: 2026-08-29
 ---
