@@ -47,7 +47,9 @@ criteria pin each one.
 | `TurnContext` | `config` | snapshot or handle | **Read after the turn claim**, never before (BR-4) |
 | `TurnContext` | `router` | `&Router` / handle | Present for every turn |
 | `TurnContext` | `gate` | `Arc<PermissionGate>` | Present for every turn |
-| `TurnContext` | `route` | `Route` | Set once routing has resolved; absent before |
+| ~~`TurnContext`~~ | ~~`route`~~ | ~~`Route`~~ | **Removed in Phase 2 (ADR-3, answering OQ-1).** `route` is reassigned on every fallback reroute inside `run_one_attempt`'s `'turn:` loop, so a context owning it would go stale or need rebuilding each iteration. It stays an explicit parameter — which also keeps the reroute visible in the signature, per BR-7. |
+| `DutyContext` | `local_engine` | `Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>` | Added in Phase 2 (ADR-1); travels with every duty resolution |
+| `DutyContext` | `prompt_spend` | `Option<&Arc<PromptSpend>>` | Added in Phase 2 (ADR-1); travels with every duty resolution |
 
 ### Events
 
@@ -65,6 +67,19 @@ criteria pin each one.
 
 - [ ] BR-1: The refactor is **behavior-preserving**. No event payload, event ordering, error code, refusal sentence, or dispatch decision changes. A user cannot tell this REQ shipped.
 - [ ] BR-2: `TurnContext` construction happens **after** the turn is claimed, and reads session state (`cwd`, `session_root`) from the registry at that point. It must not accept a snapshot taken in `spawn_prompt_turn` before the claim (informed by LESSON-539, REQ-583 — the pre-claim snapshot is a TOCTOU race that was already fixed once).
+- [ ] BR-2.1 (added in Phase 2 — ADR-4): BR-2 names **one instance of a class**.
+  The class is: *a context must not be constructed before any point that rebinds
+  a field it captures.* The turn claim is one such point. **The REQ-580 warming
+  hold is another, and BR-2 does not cover it**: when the local tier is warming,
+  `run_prompt_turn` shadow-rebinds `router` after the hold wakes, building a
+  fresh one from the settled tier state and re-dispatching the route. A
+  `TurnContext` constructed after the claim but *before* the hold satisfies BR-2
+  and still carries a stale `router` to every downstream consumer — silently
+  breaking REQ-580's guarantee that "a turn served after the wait must be built
+  from the route it is served *by*." Construction happens after the **last**
+  rebinding of every captured field, and a test asserts the captured `router` is
+  the post-hold one on a warming-tier turn (informed by LESSON-586 — a rule that
+  names one field of a validated class is a rule about the class).
 - [ ] BR-3: Request-id minting for daemon-wide resources stays centralized in `PendingPermissions`. `TurnContext` must not acquire a per-session counter for a daemon-wide namespace (informed by BUG-161 — that collision cross-authorized tool calls across sessions).
 - [ ] BR-4: Any filesystem I/O reachable from `TurnContext` construction stays off the connection reader loop, via the existing `block_in_place_if_multithread` seam (informed by BUG-184 — synchronous skill discovery on the reader loop stalled RPCs behind a TCC dialog).
 - [ ] BR-5: Security gates that currently run **before** deserialization continue to run before it. `TurnContext` construction must not be inserted between a gate and the parse it guards (informed by LESSON-520 — a gate that moves after the parse makes its own refusal test vacuous).

@@ -3,10 +3,11 @@
   "branch": "feat/REQ-598-turn-context-parameter-clump",
   "startedAt": "2026-08-29T10:00:00Z",
   "completed": false,
-  "currentPhase": 2,
+  "currentPhase": 3,
   "completedPhases": [
     0,
-    1
+    1,
+    2
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -21,6 +22,13 @@
       "completedAt": "2026-08-29T10:40:00Z",
       "result": "approved",
       "findings": "2 blockers fixed inline: AC-8 was a set-diff claiming to be a region check (misses the REQ-596/597 orphaned-comment defect); AC-5 was vacuous (existing test guards run_prompt_turn's post-claim re-read, upstream of any TurnContext). 4 warnings fixed: AC-1 split into vestigial vs earned, AC-2 disambiguated, AC-10 fixture provenance pinned, AC-3 llama feature-gate limit recorded. OQ-3 answered (no shared cluster; engine.rs/category.rs/main.rs/budget.rs out of scope). OQ-4 raised: two clusters in runtime.rs, not one."
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Tasks",
+      "completedAt": "2026-08-29T11:20:00Z",
+      "tasks": 8,
+      "note": "6 ADRs. ADR-3 answers OQ-1 (route stays a parameter - it is reassigned per fallback reroute inside run_one_attempt's 'turn loop). ADR-4 found that BR-2 names one instance of a class: the REQ-580 warming hold shadow-rebinds router after the claim, so a BR-2-compliant construction point can still capture a stale router. Added BR-2.1."
     }
   ],
   "repos": {
@@ -48,6 +56,7 @@
   },
   "blockers": [],
   "notes": [
-    "Phase 1 empirical baseline: 25 attributes, but only 16 suppress a firing lint. 9 vestigial = 2 AC-2 duplicates + 5 *_route fns (exactly 7 args, at threshold) + 2 engine.rs (llama feature-gated, never compiled by CI or AC-3)."
+    "Phase 1 empirical baseline: 25 attributes, but only 16 suppress a firing lint. 9 vestigial = 2 AC-2 duplicates + 5 *_route fns (exactly 7 args, at threshold) + 2 engine.rs (llama feature-gated, never compiled by CI or AC-3).",
+    "Phase 2 ADR-4: highest-risk finding. run_prompt_turn shadow-rebinds `router` at the REQ-580 warming hold (after the claim). A TurnContext built at the first router binding satisfies BR-2 and still breaks REQ-580's guarantee. Construction point is after the hold's match resolves."
   ]
 }
