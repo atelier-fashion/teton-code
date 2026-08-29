@@ -1,7 +1,7 @@
 ---
 id: REQ-597
 title: "Secure-by-default privacy boundaries: the product's central promise, on by default"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-28
 updated: 2026-08-29
