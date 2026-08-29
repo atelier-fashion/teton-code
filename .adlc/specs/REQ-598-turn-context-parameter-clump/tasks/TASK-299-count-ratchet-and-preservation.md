@@ -1,7 +1,7 @@
 ---
 id: TASK-299
 title: "Suppression count ratchet and the preservation checks"
-status: draft
+status: complete
 parent: REQ-598
 created: 2026-08-29
 updated: 2026-08-29
