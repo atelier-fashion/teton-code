@@ -705,6 +705,7 @@ mod tests {
         let boundaries = vec![PrivacyBoundary {
             path_glob: "secrets/**".to_owned(),
             mode: BoundaryMode::LocalOnly,
+            origin: Default::default(),
         }];
         let (route, sent) = remote_route(boundaries, "Rotate the production key", 1);
         let secret_bearing = "Rotate the key in secrets/prod.env — it is sk-live-DO-NOT-LEAK.";

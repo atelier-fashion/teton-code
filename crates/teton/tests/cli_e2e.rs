@@ -4841,9 +4841,14 @@ fn the_write_rows_change_the_config_their_shell_twins_read_back() {
         "the fixture must start with `build` bound somewhere other than \
          deepseek, or the assertion below proves nothing; output:\n{policy_before}"
     );
+    // REQ-597: the fixture starts with the *builtin* set in force, so "no
+    // boundaries" is no longer the premise — and was never the one this test
+    // needs. What the assertion below requires is that `src/**` is not already
+    // there; otherwise it would pass without the write row doing anything.
     assert!(
-        boundary_before.contains("no privacy boundaries configured"),
-        "the fixture must start with no boundaries; output:\n{boundary_before}"
+        !boundary_before.contains("src/** [local-only]"),
+        "the fixture must not already carry the boundary this test adds, or the \
+         assertion below proves nothing; output:\n{boundary_before}"
     );
 
     let session = daemon.run_cli_seamed(
@@ -4970,7 +4975,12 @@ fn on_a_pipe_every_write_row_names_its_shell_twin_and_changes_nothing() {
     for answered in [
         "providers:",
         "tiers — the primary surface",
-        "no privacy boundaries configured",
+        // REQ-597: the marker that `/boundary list` *answered*. It used to be
+        // the empty-set sentence, because the stock config had no boundaries;
+        // the builtin set now makes the populated header the evidence. The
+        // assertion is unchanged — this row is still about the read answering
+        // on a pipe, not about what the list contains.
+        "privacy boundaries:",
     ] {
         assert!(
             session.contains(answered),

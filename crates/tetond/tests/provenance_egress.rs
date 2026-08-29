@@ -172,6 +172,7 @@ fn boundaries() -> Vec<PrivacyBoundary> {
     vec![PrivacyBoundary {
         path_glob: "secrets/**".to_owned(),
         mode: BoundaryMode::LocalOnly,
+        origin: Default::default(),
     }]
 }
 
@@ -1471,6 +1472,7 @@ async fn a_model_invoked_project_skill_under_a_boundary_pins_the_turn_and_nothin
     let guarded = vec![PrivacyBoundary {
         path_glob: ".claude/skills/guarded/**".to_owned(),
         mode: BoundaryMode::LocalOnly,
+        origin: Default::default(),
     }];
 
     // The control: a project skill outside the boundary.
@@ -1830,6 +1832,7 @@ fn claude_tree_is_local_only() -> Vec<PrivacyBoundaryConfig> {
     vec![PrivacyBoundaryConfig {
         path_glob: ".claude/**".to_owned(),
         mode: PrivacyMode::LocalOnly,
+        origin: Default::default(),
     }]
 }
 

@@ -398,6 +398,32 @@
   normal case and produces no diagnostic, while everything found and not
   registered is named with a typed reason (REQ-585 ADR-4, LESSON-481).
 
+- **A secure default is one composition site plus one greppable opt-out — and
+  its reach is wider than its list** — REQ-597 turned the `local-only` boundary
+  set on by default, and the shape it took is the one BUG-202 settled for
+  `allow_cleartext` (LESSON-578): a safe default, exactly one explicit key that
+  turns it off (`[privacy] disable_default_boundaries`), and no heuristic
+  guessing which machines are safe. Three properties make it hold. (a) The
+  builtin rows are composed **on read**, in `Config::effective_boundaries` and
+  nowhere else — never stored in `Config.boundaries`, because `config_doc`
+  diffs a `Config` against the user's real TOML and a builtin row living there
+  would be written into their file on the next unrelated `config/set`. A
+  source-level *region* check pins the single site; a count would not, since
+  relocating a call keeps it identical (LESSON-568). (b) Builtins are
+  **appended after** user rows, because `BoundaryMatcher::match_path` resolves
+  overlaps by earliest-declaration-wins — appending is what makes "a user row
+  keeps its own behaviour" true by construction rather than by a tie-break
+  written on top. (c) The reporting field (`origin`) skips serialization for a
+  user row on disk and is mandatory on the wire: the config file must not grow
+  keys the user never wrote, while a report whose whole job is distinguishing
+  two origins must state both. **The consequence to carry forward**: switching
+  a default on activates every path that was gated on "does any boundary
+  exist?" — `context_is_sensitive` short-circuits on an empty list, so REQ-585's
+  *unpinnable* provenance (a skill's command output, a skill file outside the
+  root) went from failing closed only for users who had configured boundaries
+  to failing closed for everyone. The reach of a default is not its list; it is
+  every predicate that read the list's emptiness (REQ-597 ADR-1/ADR-2/ADR-3).
+
 ## ADRs
 
 ### ADR-001: Daemon and CLI in Rust (2026-07-17)

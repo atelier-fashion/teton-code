@@ -217,6 +217,7 @@ mod tests {
         PrivacyBoundary {
             path_glob: glob.to_owned(),
             mode,
+            origin: Default::default(),
         }
     }
 

@@ -379,6 +379,7 @@ async fn remote_turn_over_boundary_context_is_blocked_and_never_billed() {
     let boundaries = vec![teton_core::entities::PrivacyBoundary {
         path_glob: "secrets/**".to_owned(),
         mode: teton_core::entities::BoundaryMode::LocalOnly,
+        origin: Default::default(),
     }];
     let egress = Egress::new(transport, boundaries, bus.clone()).with_cost_meter(cost.clone());
 

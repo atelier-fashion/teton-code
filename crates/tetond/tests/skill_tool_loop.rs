@@ -488,7 +488,12 @@ impl Harness {
     fn with_window(window: Option<u32>) -> Self {
         fixture_home();
         let vendor = Vendor::start();
-        let runtime = Arc::new(DaemonRuntime::minimal());
+        // REQ-597: this binary's subject is the skill tool loop, not privacy.
+        // The shipped boundary set makes REQ-585's unpinnable provenance (a
+        // skill's command output) pin every turn to a local tier this runtime
+        // has not got, so the opt-out keeps these assertions about the loop.
+        // The interaction itself is pinned in `skill_turn.rs`.
+        let runtime = Arc::new(DaemonRuntime::minimal().with_default_boundaries_disabled());
         runtime
             .apply_config_update(ConfigUpdate::RegisterProvider(ProviderConfig {
                 id: ProviderId::from("mock"),
@@ -553,7 +558,13 @@ impl Harness {
         base.write(
             "config.toml",
             &format!(
-                "[[providers]]\nid = \"mock\"\nkind = \"openai-compatible\"\n\
+                // REQ-597: the opt-out, written the way a config author would
+                // write it (BR-3) — this harness's subject is the degraded
+                // tool-call loop, and the shipped boundary set would otherwise
+                // pin every command-bearing skill turn to a local tier this
+                // daemon has not got.
+                "[privacy]\ndisable_default_boundaries = true\n\n\
+                 [[providers]]\nid = \"mock\"\nkind = \"openai-compatible\"\n\
                  endpoint = \"{}\"\nmodel = \"mock-1\"\n\n\
                  [providers.capabilities]\ntool_call_tier = \"degraded\"\n\
                  max_context = 128000\n\n{tiers}",

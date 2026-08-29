@@ -112,9 +112,10 @@ use tokio::task::JoinHandle;
 
 use teton_protocol::events::{
     bytes_figure, thousands, AttachConsentRequested, AttachRefused, AttachRefusedReason,
-    ConsentScope, DaemonClientAttach, Event, EventEnvelope, PermissionRequest, PhaseTransition,
-    ProviderSetupCompleted, ProviderSetupRejected, RouteDecided, SessionGrantMinted,
-    WebSetupRejected, EVENT_METHOD, SUBSCRIPTION_LAGGED_METHOD,
+    BoundaryDefaultsApplied, ConsentScope, DaemonClientAttach, Event, EventEnvelope,
+    PermissionRequest, PhaseTransition, ProviderSetupCompleted, ProviderSetupRejected,
+    RouteDecided, SessionGrantMinted, UnboundedRootWarning, WebSetupRejected, EVENT_METHOD,
+    SUBSCRIPTION_LAGGED_METHOD,
 };
 use teton_protocol::handshake::{self, HandshakeParams, HandshakeResult};
 use teton_protocol::jsonrpc::{error_code, Id, Notification, Response, RpcError};
@@ -124,10 +125,10 @@ use teton_protocol::methods::{
     ModelListParams, ModelSetParams, ModelStatusParams, PermissionRespondParams,
     PermissionRespondResult, ProjectsListParams, ProjectsListResult, PromptBlock, PromptTurnParams,
     ProviderSetupCommitParams, ProviderSetupPlanParams, ProviderSetupPreviewParams,
-    ProviderTestParams, RpcMethod, SessionAttachParams, SessionAttachResult, SessionClearParams,
-    SessionCreateParams, SessionCreateResult, SessionListParams, SessionListResult,
-    SessionPermissionsParams, SessionSetCwdParams, SessionSummary, SkillSkipped, SkillView,
-    SkillsListParams, SkillsListResult, SkillsPreflightParams, SkillsPreflightResult,
+    ProviderTestParams, RootKind, RpcMethod, SessionAttachParams, SessionAttachResult,
+    SessionClearParams, SessionCreateParams, SessionCreateResult, SessionListParams,
+    SessionListResult, SessionPermissionsParams, SessionSetCwdParams, SessionSummary, SkillSkipped,
+    SkillView, SkillsListParams, SkillsListResult, SkillsPreflightParams, SkillsPreflightResult,
     WebOverrideParams, WebRefreshParams, WebSetupCommitParams, WebSetupPlanParams,
     WebSetupPreviewParams,
 };
@@ -152,7 +153,7 @@ use crate::harness::tools::ToolRegistry;
 use crate::harness::turn_loop::{build_system_prompt, HarnessConfig};
 use crate::lifetime::LifetimeSupervisor;
 use crate::peer::{is_descendant_of, Ancestry, KernelParentOf, MAX_ANCESTRY_DEPTH};
-use crate::runtime::{ClientPresence, DaemonRuntime};
+use crate::runtime::{BoundaryPosture, ClientPresence, DaemonRuntime};
 use crate::sessions::{self, validate_session_cwd, SessionCreateError, SessionRegistry};
 use crate::skills::{expand, DirLister, RealFs, Skill, SkillRegistry};
 
@@ -3358,6 +3359,43 @@ fn handle_cost_query(daemon: &Daemon, conn: &ConnState, id: Id) -> String {
 
 /// Create a session (`session/create`), attaching the creating connection to it
 /// (REQ-568 BR-1).
+/// Which boundary events a starting session owes its watchers (REQ-597 BR-5 and
+/// the System Model's `boundary_defaults_applied`).
+///
+/// Pure, over plain data, so the *rule* can be tested exhaustively without a
+/// daemon, a socket, or a home directory — the shape this codebase already uses
+/// for decisions whose mechanism is awkward to reach. The caller publishes what
+/// this returns and decides nothing itself.
+///
+/// # The warning's condition is a conjunction, and both halves carry weight
+///
+/// A broad root with the shipped set in force is the ordinary case and says
+/// nothing. An empty set at a `project` root is a deliberate choice about a
+/// directory the user chose. Only together do they mean *nothing is protected,
+/// and this session can reach everything you own*.
+///
+/// The empty-set half reads the **effective** set, never the
+/// `disable_default_boundaries` flag. After REQ-597 the flag alone is not the
+/// condition: a config that opts out but declares one row of its own is still
+/// protected by that row, and warning there would be crying wolf. Keying on the
+/// flag would also fire this on every stock machine if the composer ever
+/// regressed, turning the alarm into noise precisely when it started being
+/// wrong.
+fn session_start_boundary_events(posture: BoundaryPosture, kind: RootKind) -> Vec<Event> {
+    let mut events = Vec::new();
+    if posture.effective_is_empty && matches!(kind, RootKind::Home | RootKind::FilesystemRoot) {
+        events.push(Event::UnboundedRootWarning(UnboundedRootWarning {
+            root_kind: kind,
+        }));
+    }
+    if posture.builtin_count > 0 {
+        events.push(Event::BoundaryDefaultsApplied(BoundaryDefaultsApplied {
+            count: posture.builtin_count,
+        }));
+    }
+    events
+}
+
 fn handle_session_create(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
     // BR-10(a) / BUG-162: the odd one of the seven. This handler already
     // *receives* the connection and simply never consulted the gate, so a daemon
@@ -3427,6 +3465,24 @@ fn handle_session_create(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
             // what the CLI's banner and launch notice render is what the tools
             // will enforce (ADR-1: one derivation, on the side that enforces).
             let root = daemon.runtime.session_root_for(summary.cwd.as_deref()).view;
+
+            // REQ-597 BR-5 / System Model. Both derived from one reading of the
+            // config, and published here — before the response, alongside the
+            // phase transition above — so a client reading the create result
+            // cannot receive the session's first event after it.
+            //
+            // Published on the bus, session-scoped, rather than routed to the
+            // creating connection: every attached client learns. Routing the
+            // warning to the one connection would reproduce the failure
+            // REQ-571 BR-4 names — an audit signal reaching only the party it
+            // indicts.
+            for event in session_start_boundary_events(daemon.runtime.boundary_posture(), root.kind)
+            {
+                daemon
+                    .events
+                    .publish(Some(summary.session_id.clone()), event);
+            }
+
             ok_string(
                 id,
                 &SessionCreateResult {
@@ -11867,6 +11923,183 @@ mod tests {
         assert!(
             routes.claim_observer(),
             "the next prompt turn must be able to start a fresh observer"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-597 BR-5 — which boundary events a starting session owes
+    // -----------------------------------------------------------------------
+
+    use crate::runtime::BoundaryPosture;
+
+    /// Every combination of the two inputs, so the rule is stated once and
+    /// exhaustively rather than sampled.
+    ///
+    /// The rows that matter most are the two that must NOT warn: a broad root
+    /// with the shipped set in force (the stock machine — warning there would
+    /// fire on everyone), and an opted-out config that still declares a row of
+    /// its own (protected by that row — warning there would be crying wolf).
+    ///
+    /// **Mutation**: key the warning on the opt-out flag instead of the empty
+    /// effective set, or drop either half of the conjunction, and a row here
+    /// fails.
+    #[test]
+    fn the_unbounded_root_warning_needs_an_empty_set_and_a_broad_root() {
+        let stock = BoundaryPosture {
+            effective_is_empty: false,
+            builtin_count: 13,
+        };
+        // Opted out, and nothing of the user's own left: the only way to an
+        // empty set (BR-3).
+        let bare = BoundaryPosture {
+            effective_is_empty: true,
+            builtin_count: 0,
+        };
+        // Opted out, but one unrelated user row survives. Not empty, so no
+        // warning — this is the row that pins the condition to the *set*
+        // rather than to the flag.
+        let opted_out_with_own_row = BoundaryPosture {
+            effective_is_empty: false,
+            builtin_count: 0,
+        };
+
+        for (posture, kind, want_warning, why) in [
+            (
+                bare,
+                RootKind::Home,
+                true,
+                "nothing protected, rooted at $HOME",
+            ),
+            (
+                bare,
+                RootKind::FilesystemRoot,
+                true,
+                "nothing protected, rooted at /",
+            ),
+            (
+                bare,
+                RootKind::Project,
+                false,
+                "a project root is a directory the user chose",
+            ),
+            (
+                bare,
+                RootKind::Plain,
+                false,
+                "a plain root is narrow enough not to warn",
+            ),
+            (
+                stock,
+                RootKind::Home,
+                false,
+                "the shipped set is in force — the stock machine",
+            ),
+            (
+                stock,
+                RootKind::FilesystemRoot,
+                false,
+                "likewise at the filesystem root",
+            ),
+            (
+                opted_out_with_own_row,
+                RootKind::Home,
+                false,
+                "opted out but still protected by the user's own row",
+            ),
+        ] {
+            let events = session_start_boundary_events(posture, kind);
+            let warned = events
+                .iter()
+                .any(|e| matches!(e, Event::UnboundedRootWarning(_)));
+            assert_eq!(
+                warned, want_warning,
+                "{why} (kind {kind:?}, posture {posture:?})"
+            );
+        }
+    }
+
+    /// The warning carries the root it is about, so a client can say *where*
+    /// rather than only *that*.
+    #[test]
+    fn the_warning_names_the_root_kind_that_raised_it() {
+        for kind in [RootKind::Home, RootKind::FilesystemRoot] {
+            let events = session_start_boundary_events(
+                BoundaryPosture {
+                    effective_is_empty: true,
+                    builtin_count: 0,
+                },
+                kind,
+            );
+            let warning = events
+                .iter()
+                .find_map(|e| match e {
+                    Event::UnboundedRootWarning(w) => Some(w),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{kind:?} must warn"));
+            assert_eq!(warning.root_kind, kind);
+        }
+    }
+
+    /// The companion event reports the count, and is silent when the opt-out
+    /// left nothing to report.
+    ///
+    /// **Mutation**: publish it unconditionally and the opted-out row fails.
+    #[test]
+    fn the_defaults_applied_event_reports_its_count_and_is_silent_when_opted_out() {
+        let applied = session_start_boundary_events(
+            BoundaryPosture {
+                effective_is_empty: false,
+                builtin_count: 13,
+            },
+            RootKind::Project,
+        );
+        let count = applied
+            .iter()
+            .find_map(|e| match e {
+                Event::BoundaryDefaultsApplied(a) => Some(a.count),
+                _ => None,
+            })
+            .expect("a stock session reports the defaults it applied");
+        assert_eq!(count, 13);
+
+        let opted_out = session_start_boundary_events(
+            BoundaryPosture {
+                effective_is_empty: true,
+                builtin_count: 0,
+            },
+            RootKind::Project,
+        );
+        assert!(
+            !opted_out
+                .iter()
+                .any(|e| matches!(e, Event::BoundaryDefaultsApplied(_))),
+            "no builtin rows were applied, so there is nothing to report"
+        );
+    }
+
+    /// Both events name themselves on the wire exactly as the spec's Events
+    /// table spells them.
+    #[test]
+    fn the_two_session_start_events_carry_their_spec_names() {
+        let events = session_start_boundary_events(
+            BoundaryPosture {
+                effective_is_empty: true,
+                builtin_count: 0,
+            },
+            RootKind::Home,
+        );
+        assert_eq!(events[0].name(), "unbounded_root_warning");
+        assert_eq!(
+            session_start_boundary_events(
+                BoundaryPosture {
+                    effective_is_empty: false,
+                    builtin_count: 13,
+                },
+                RootKind::Project,
+            )[0]
+            .name(),
+            "boundary_defaults_applied"
         );
     }
 }

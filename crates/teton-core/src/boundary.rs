@@ -104,10 +104,7 @@ mod tests {
     use crate::entities::BoundaryMode;
 
     fn boundary(glob: &str, mode: BoundaryMode) -> PrivacyBoundary {
-        PrivacyBoundary {
-            path_glob: glob.to_owned(),
-            mode,
-        }
+        PrivacyBoundary::user(glob, mode)
     }
 
     #[test]

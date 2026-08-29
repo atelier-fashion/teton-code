@@ -20,6 +20,52 @@ user having asked for it.
 
 ## [Unreleased]
 
+### Changed
+
+- **Privacy boundaries are on by default (REQ-597).** Teton's second headline
+  promise is that paths marked `local-only` never leave the machine. On a stock
+  install nothing was marked, so the promise held over an empty set: a session
+  started in a home directory would read `~/.ssh/id_rsa`, `~/.aws/credentials`
+  or a project's `.env` with no prompt and no boundary check, and send the
+  contents to whichever remote provider was bound.
+
+  The daemon now ships a `local-only` set covering thirteen credential-shaped
+  path patterns — `**/.env`, `**/.env.*`, `**/.ssh/**`, `**/*.pem`, `**/*.key`,
+  `**/id_rsa*`, `**/id_ed25519*`, `**/.aws/**`, `**/.npmrc`, `**/.netrc`,
+  `**/.git-credentials`, `**/.docker/config.json`, `**/.kube/config` — and every
+  session enforces them without anyone configuring anything.
+
+  **What this changes on a machine that was already running.** Content matching
+  those patterns no longer reaches a remote provider. Where a turn previously
+  went to a frontier model, it is now pinned to the local tier, or refused if no
+  local tier is available. That includes some cases you may not expect: `*.pem`
+  and `*.key` match ordinary test fixtures, and anything the daemon cannot
+  attribute to a repo-relative path — a skill that runs a command, a skill file
+  outside the session root — is now treated as unpinnable and kept local too.
+  This is the trade the change is *for*: a false positive comes with a message
+  and a way out, and a silent credential leak does not.
+
+  **If a boundary is in your way**, add a narrower rule of your own with
+  `teton boundary add`, or switch the shipped set off entirely with
+  `[privacy] disable_default_boundaries = true`. Your own `[[boundaries]]` rows
+  are unaffected either way: they are **added to** the shipped set, not replaced
+  by it, and they take precedence where the two cover the same path. Upgrading
+  does not rewrite your config file.
+
+  `teton boundary list` and `/boundary list` now label each row as `(yours)` or
+  `(built-in)`, so you can see what is protecting you without reading the
+  source. A session rooted at your home directory or at `/` **with no boundaries
+  at all** — reachable only by setting the opt-out — says so at startup rather
+  than only in the daemon log.
+
+- **The egress choke point documents its one exception (REQ-596).** The module
+  header and `architecture.md` both claimed every byte leaving the machine passes
+  through egress. That was never true of `shell`, which can run `curl`. Both now
+  state the exact guarantee — provider and MCP traffic the daemon originates —
+  and record the shell residual explicitly. No behavior changed; the documented
+  claim now matches the code. Sandboxing the shell child's network access remains
+  out of scope and unimplemented.
+
 ### Security
 
 - **The `shell` tool composes its child's environment from an allowlist
@@ -45,16 +91,6 @@ user having asked for it.
   handing credentials to model-driven code execution. If you hit a variable you
   genuinely need, that is worth reporting — the allowlist is meant to grow on
   evidence.
-
-### Changed
-
-- **The egress choke point documents its one exception (REQ-596).** The module
-  header and `architecture.md` both claimed every byte leaving the machine passes
-  through egress. That was never true of `shell`, which can run `curl`. Both now
-  state the exact guarantee — provider and MCP traffic the daemon originates —
-  and record the shell residual explicitly. No behavior changed; the documented
-  claim now matches the code. Sandboxing the shell child's network access remains
-  out of scope and unimplemented.
 
 ## [0.1.26] - 2026-08-27
 

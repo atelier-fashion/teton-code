@@ -1814,6 +1814,29 @@ fn undisclosed_content_class() -> ContentClass {
     ContentClass::TurnContext
 }
 
+/// Where a boundary row came from — the wire view of
+/// `teton_core::entities::BoundaryOrigin` (REQ-597 BR-6).
+///
+/// Mirrors the core enum by **name** rather than importing it, the same
+/// no-drift-across-the-wire-boundary technique [`ProviderKind`] uses.
+///
+/// **`snake_case`, following [`crate::PrivacyMode`] — its sibling in this
+/// struct — and deliberately not the core enum's `kebab-case`.** The two sides
+/// already disagree about spelling rule for the *mode* (`local-only` on disk,
+/// `local_only` on the wire), so the rule that keeps a reader right is "match
+/// the enum you travel with", not "match the type you mirror". Both variants
+/// here are single words, so today the two rules emit identical bytes; the
+/// declaration is what stops a future two-word variant from diverging silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoundaryOriginConfig {
+    /// A row the user wrote in their own `[[boundaries]]` table.
+    #[default]
+    User,
+    /// A row from the daemon's shipped default set.
+    Builtin,
+}
+
 /// A privacy boundary over a path glob (spec entity `PrivacyBoundary`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PrivacyBoundaryConfig {
@@ -1821,6 +1844,20 @@ pub struct PrivacyBoundaryConfig {
     pub path_glob: String,
     /// Enforcement mode.
     pub mode: PrivacyMode,
+    /// Whether this row is user-authored or shipped (REQ-597 BR-6).
+    ///
+    /// **Additive on the wire**: `#[serde(default)]`, so a snapshot from a
+    /// daemon predating REQ-597 — which has no builtin rows to report — reads
+    /// as [`BoundaryOriginConfig::User`]. That is the conservative reading, and
+    /// it is what AC-9.1 pins.
+    ///
+    /// Deliberately **not** `skip_serializing_if`, unlike its on-disk
+    /// counterpart. The snapshot is a report whose whole job is to distinguish
+    /// the two origins; omitting `user` would make the surface asymmetric. The
+    /// on-disk entity skips it for the opposite reason — a user's config file
+    /// must not grow keys they never wrote (AC-10).
+    #[serde(default)]
+    pub origin: BoundaryOriginConfig,
 }
 
 /// Read the daemon's current configuration snapshot.
@@ -3997,6 +4034,7 @@ mod tests {
                 privacy: vec![PrivacyBoundaryConfig {
                     path_glob: "secrets/**".to_owned(),
                     mode: PrivacyMode::LocalOnly,
+                    origin: Default::default(),
                 }],
                 redact_enabled: true,
                 web_capability: Some(WebCapabilityState::Ready {
@@ -4102,6 +4140,7 @@ mod tests {
             privacy: vec![PrivacyBoundaryConfig {
                 path_glob: "secrets/**".to_owned(),
                 mode: PrivacyMode::LocalOnly,
+                origin: Default::default(),
             }],
             web_capability: Some(WebCapabilityState::OffAvailable),
             ..ConfigSnapshot::default()
@@ -4140,6 +4179,7 @@ mod tests {
             privacy: vec![PrivacyBoundaryConfig {
                 path_glob: "secrets/**".to_owned(),
                 mode: PrivacyMode::LocalOnly,
+                origin: Default::default(),
             }],
             judgment_default: Some(Category::Edit),
             redact_enabled: true,
@@ -4446,6 +4486,7 @@ mod tests {
             ConfigUpdate::SetPrivacyBoundary(PrivacyBoundaryConfig {
                 path_glob: "*.env".to_owned(),
                 mode: PrivacyMode::RedactThenRemote,
+                origin: Default::default(),
             }),
         ] {
             round_trip(&ConfigSetParams { update });
@@ -6357,5 +6398,77 @@ mod tests {
             "REQ-589 adds one subject variant, four option ids and three events — all \
              additive on the daemon-to-client side — so the negotiated version does not move"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-597 — boundary origin on the wire (AC-9.1)
+    // -----------------------------------------------------------------------
+
+    /// AC-9.1, the round trip: a snapshot carrying rows of **both** origins
+    /// preserves each row's origin across serialize/deserialize.
+    ///
+    /// **Mutation**: drop `origin` from `PrivacyBoundaryConfig`, or give it a
+    /// `skip_serializing_if`, and this fails.
+    #[test]
+    fn boundary_origin_survives_the_wire_round_trip() {
+        let rows = vec![
+            PrivacyBoundaryConfig {
+                path_glob: "src/vendor/**".to_owned(),
+                mode: PrivacyMode::LocalOnly,
+                origin: BoundaryOriginConfig::User,
+            },
+            PrivacyBoundaryConfig {
+                path_glob: "**/.env".to_owned(),
+                mode: PrivacyMode::LocalOnly,
+                origin: BoundaryOriginConfig::Builtin,
+            },
+        ];
+
+        let json = serde_json::to_string(&rows).expect("rows serialize");
+        assert!(
+            json.contains("\"origin\":\"user\""),
+            "user origin is on the wire: {json}"
+        );
+        assert!(
+            json.contains("\"origin\":\"builtin\""),
+            "builtin origin is on the wire: {json}"
+        );
+
+        let back: Vec<PrivacyBoundaryConfig> = serde_json::from_str(&json).expect("rows parse");
+        assert_eq!(back, rows);
+    }
+
+    /// AC-9.1, the additive-field contract: a snapshot from a daemon predating
+    /// REQ-597 omits `origin` entirely, and must read as `User`.
+    ///
+    /// `User` is the conservative reading rather than a filler value — a daemon
+    /// that old has no builtin set to report, so every row it sends really is
+    /// the user's.
+    ///
+    /// **Mutation**: remove `#[serde(default)]` from the field and this fails
+    /// to deserialize at all.
+    #[test]
+    fn a_boundary_row_without_an_origin_reads_as_a_user_row() {
+        let row: PrivacyBoundaryConfig =
+            serde_json::from_str(r#"{"path_glob":"secrets/**","mode":"local_only"}"#)
+                .expect("a pre-REQ-597 row still parses");
+        assert_eq!(row.origin, BoundaryOriginConfig::User);
+        assert_eq!(row.path_glob, "secrets/**");
+    }
+
+    /// The wire spelling follows `PrivacyMode`'s `snake_case`, not the core
+    /// `BoundaryOrigin`'s `kebab-case`. The mode already differs across that
+    /// seam (`local-only` on disk, `local_only` on the wire), so the origin
+    /// matches the enum it travels with. Both variants are single words today,
+    /// which is exactly why the rule needs stating rather than inferring.
+    #[test]
+    fn boundary_origin_spells_itself_like_its_wire_sibling() {
+        for (value, spelling) in [
+            (BoundaryOriginConfig::User, "\"user\""),
+            (BoundaryOriginConfig::Builtin, "\"builtin\""),
+        ] {
+            assert_eq!(serde_json::to_string(&value).expect("serializes"), spelling);
+        }
+        assert_eq!(BoundaryOriginConfig::default(), BoundaryOriginConfig::User);
     }
 }

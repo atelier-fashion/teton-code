@@ -97,11 +97,14 @@ use std::sync::Arc;
 
 use teton_core::category::Tier;
 use teton_core::config::{Config, WebTier};
+use teton_core::entities::BoundaryOrigin;
 use teton_protocol::events::{BudgetBound, WebTier as WireWebTier};
 use teton_protocol::jsonrpc::error_code;
 use teton_protocol::methods::{
-    ConfigUpdate, ProviderConfig, TierBindingConfig, WebSetupCommitParams, WebSetupPreviewParams,
+    BoundaryOriginConfig, ConfigUpdate, PrivacyBoundaryConfig, ProviderConfig, TierBindingConfig,
+    WebSetupCommitParams, WebSetupPreviewParams,
 };
+use teton_protocol::PrivacyMode;
 use teton_protocol::{ProviderId, ProviderKind, SessionId, Tier as WireTier};
 use tetond::broadcast::EventBus;
 use tetond::harness::budget::{self, BudgetInputs, OverBudgetOffer, ProposedWindow, SkillStage};
@@ -1987,5 +1990,174 @@ fn the_window_written_to_disk_is_the_one_the_offer_named_with_its_date() {
         repaired.budget_tokens,
         repaired.budget_bytes
     );
+    daemon.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// REQ-597 AC-10 — an existing config gains the builtin set without a rewrite
+// ---------------------------------------------------------------------------
+
+/// A config authored before REQ-597: two boundary rows, a comment inside the
+/// block, and no `[privacy]` table at all.
+fn pre_req597_config() -> String {
+    "\
+[[providers]]
+id = \"cheap\"
+kind = \"openai-compatible\"
+endpoint = \"https://api.deepseek.com\"
+model = \"deepseek-chat\"
+
+# the one thing I actually care about keeping private
+[[boundaries]]
+path_glob = \"secrets/**\"
+mode = \"local-only\"
+
+[[boundaries]]
+path_glob = \"docs/**\"
+mode = \"redact-then-remote\"
+"
+    .to_owned()
+}
+
+/// **REQ-597 AC-10.** A machine that already declared boundaries gains the
+/// builtin set on upgrade **without a config rewrite**, and its own rows stay
+/// byte-unchanged on disk.
+///
+/// The write is driven by an **unrelated** `config/set` — a provider
+/// registration — because that is the shape of the real risk. Simply reading
+/// the config back would prove nothing about the writer; what could go wrong
+/// here is that the *next* thing the user does, about something else entirely,
+/// quietly rewrites their boundaries table.
+///
+/// Two mechanisms protect the file, and this test covers them in two legs
+/// because — measured, not assumed — one leg does not reach both:
+///
+/// - **Leg 1 (an unrelated write)**: builtin rows never enter
+///   `Config.boundaries` (ADR-1), or `canonical_document` would diff them as
+///   rows the user is missing and write all thirteen into their file.
+/// - **Leg 2 (a write that touches the block)**: `origin` skips serialization
+///   for a `User` row (ADR-3), or a newly added `[[boundaries]]` entry carries
+///   an `origin = "user"` line the user never wrote.
+///
+/// Leg 2 exists because leg 1 turned out not to guard ADR-3 at all. Removing
+/// `skip_serializing_if` leaves leg 1 green: `apply_config_delta` diffs an
+/// array of tables element-wise, so an element nothing changed is never
+/// re-rendered and never gains the key. Only a write that actually emits a
+/// boundary element can surface it — which is the difference between a test
+/// that guards a mechanism and one that merely runs near it (LESSON-569).
+///
+/// The assertion is on the file's **bytes**, not on a parsed round trip: a
+/// parsed comparison would read `origin = "user"` back as the same value it
+/// already had and report no change at all.
+///
+/// **Mutations**: populate `Config.boundaries` with the builtin set at load →
+/// leg 1 fails. Remove `skip_serializing_if` from `PrivacyBoundary::origin` →
+/// leg 2 fails.
+#[test]
+fn an_existing_config_gains_the_builtin_set_without_rewriting_its_own_rows() {
+    let before = pre_req597_config();
+    let daemon = Daemon::start("req597-upgrade", Some(&before));
+
+    // The upgrade half: this machine is protected by its own two rows *and* by
+    // the shipped set, without having been asked to change anything.
+    let effective = daemon.reload().effective_boundaries();
+    assert_eq!(
+        effective.len(),
+        2 + teton_core::config::DEFAULT_BOUNDARIES.len(),
+        "an upgraded machine keeps its rows and gains the builtin set"
+    );
+    assert_eq!(
+        effective[0].path_glob, "secrets/**",
+        "the user's rows come first"
+    );
+    assert_eq!(effective[1].path_glob, "docs/**");
+    assert!(
+        effective
+            .iter()
+            .any(|b| b.path_glob == "**/.ssh/**" && b.origin == BoundaryOrigin::Builtin),
+        "the builtin rows are present and labelled"
+    );
+
+    // The no-rewrite half: an unrelated write touches only its own keys.
+    daemon
+        .runtime
+        .apply_config_update(register("second"))
+        .expect("the registration lands");
+    let after = daemon.document();
+
+    assert_only_these_lines_changed(
+        &before,
+        &after,
+        // Nothing is deleted: an append reads nothing of what is already there.
+        &[],
+        // The registration and nothing else: the whole new `[[providers]]`
+        // element as the canonical rendering emits it, blank separators
+        // included. Every line of the `[[boundaries]]` block is absent from
+        // this list, which is the assertion — the write did not touch it.
+        &[
+            "[[providers]]",
+            r#"id = "second""#,
+            r#"kind = "openai-compatible""#,
+            r#"endpoint = "https://api.deepseek.com""#,
+            r#"model = "deepseek-chat""#,
+            r#"auth_ref = "keychain:cheap""#,
+            "",
+            "[providers.capabilities]",
+            "tool_call_tier = \"native\"",
+            "parallel_calls = false",
+            "max_context = 0",
+            "",
+        ],
+    );
+
+    // Said again directly, because it is the failure mode with teeth and a
+    // reader should not have to derive it from the list above.
+    assert!(
+        !after.contains("origin"),
+        "a user's boundary rows must not grow an `origin` key on disk:\n{after}"
+    );
+    for glob in teton_core::config::DEFAULT_BOUNDARIES {
+        assert!(
+            !after.contains(glob),
+            "builtin {glob} was written into the user's config file:\n{after}"
+        );
+    }
+    assert!(
+        after.contains("# the one thing I actually care about keeping private"),
+        "the comment inside the boundaries block survived:\n{after}"
+    );
+
+    // Leg 2: a write that really does emit a boundary element. This is the only
+    // shape in which `origin`'s serialization can reach the file, so it is the
+    // only shape that can guard ADR-3.
+    daemon
+        .runtime
+        .apply_config_update(ConfigUpdate::SetPrivacyBoundary(PrivacyBoundaryConfig {
+            path_glob: "vendor/**".to_owned(),
+            mode: PrivacyMode::LocalOnly,
+            // What `config/set` carries for a row a user just added. The daemon
+            // must not persist it.
+            origin: BoundaryOriginConfig::User,
+        }))
+        .expect("adding a boundary lands");
+    let written = daemon.document();
+
+    assert!(
+        written.contains(r#"path_glob = "vendor/**""#),
+        "the added row must actually be written, or the assertion below is \
+         about nothing:\n{written}"
+    );
+    assert!(
+        !written.contains("origin"),
+        "a boundary row written through `config/set` must carry no `origin` \
+         key — it is a reporting field, not a config one:\n{written}"
+    );
+    for glob in teton_core::config::DEFAULT_BOUNDARIES {
+        assert!(
+            !written.contains(glob),
+            "builtin {glob} reached the user's file through a boundary write:\n{written}"
+        );
+    }
+
     daemon.cleanup();
 }

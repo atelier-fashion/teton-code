@@ -102,7 +102,8 @@ use teton_core::category::{
 use teton_core::config::{Config, LocalModelConfig, RoutingMigration, WebConfig, WebTier};
 use teton_core::config_doc::document_is_effectively_empty;
 use teton_core::entities::{
-    BoundaryMode, ModelProvider, PrivacyBoundary, ProviderCapabilities, ProviderKind,
+    BoundaryMode, BoundaryOrigin, ModelProvider, PrivacyBoundary, ProviderCapabilities,
+    ProviderKind,
 };
 use teton_core::phase::Phase as CorePhase;
 use teton_core::policy::ProviderHealth;
@@ -127,17 +128,18 @@ use teton_protocol::events::{
 };
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
-    CategoryRouteView, ConfigSnapshot, ConfigUpdate, ContentClass, CostGroupView, CostQueryResult,
-    CostReportView, ExistingProvider, ModelConfirmOutcome, ModelConfirmParams, ModelConfirmResult,
-    ModelListResult, ModelSetResult, ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult,
-    ProviderConfig, ProviderHealth as WireProviderHealth, ProviderSetupCandidate,
-    ProviderSetupCommitResult, ProviderSetupPlanResult, ProviderSetupPreviewResult,
-    ProviderTestOutcome, ProviderTestResult, SessionClearParams, SessionClearResult,
-    SessionPermissionsParams, SessionPermissionsResult, SessionSetCwdParams, SessionSetCwdResult,
-    SkillInvocation, TierBinding as WireTierBinding, TierBindingConfig, TierRouteView, TierSummary,
-    WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams, WebRefreshResult,
-    WebSetupCommitParams, WebSetupCommitResult, WebSetupPlanResult, WebSetupPreviewParams,
-    WebSetupPreviewResult, WebTableSummary, WebTotalsView,
+    BoundaryOriginConfig, CategoryRouteView, ConfigSnapshot, ConfigUpdate, ContentClass,
+    CostGroupView, CostQueryResult, CostReportView, ExistingProvider, ModelConfirmOutcome,
+    ModelConfirmParams, ModelConfirmResult, ModelListResult, ModelSetResult, ModelStatusResult,
+    PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig, ProviderHealth as WireProviderHealth,
+    ProviderSetupCandidate, ProviderSetupCommitResult, ProviderSetupPlanResult,
+    ProviderSetupPreviewResult, ProviderTestOutcome, ProviderTestResult, SessionClearParams,
+    SessionClearResult, SessionPermissionsParams, SessionPermissionsResult, SessionSetCwdParams,
+    SessionSetCwdResult, SkillInvocation, TierBinding as WireTierBinding, TierBindingConfig,
+    TierRouteView, TierSummary, WebOverrideParams, WebOverrideResult, WebRefreshOutcome,
+    WebRefreshParams, WebRefreshResult, WebSetupCommitParams, WebSetupCommitResult,
+    WebSetupPlanResult, WebSetupPreviewParams, WebSetupPreviewResult, WebTableSummary,
+    WebTotalsView,
 };
 use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::{
@@ -2762,6 +2764,35 @@ impl DaemonRuntime {
         self
     }
 
+    /// Switch off REQ-597's shipped boundary set on this runtime — the seam for
+    /// a test whose subject is **not** privacy.
+    ///
+    /// It exists because the default set has a second-order reach that is easy
+    /// to mistake for a broken harness. `context_is_sensitive` short-circuits on
+    /// an empty boundary list; with the builtin set always present that
+    /// short-circuit is gone, so REQ-585's *unpinnable* provenance — a user
+    /// skill outside the session root, or any content a skill's command
+    /// produced — now fails closed and pins the turn to the local tier on every
+    /// machine, where before it did so only for users who had configured
+    /// boundaries of their own. On a runtime with no local tier that pin is a
+    /// refusal, which is what a skill-mechanics test sees.
+    ///
+    /// **Reach for this only when the test would otherwise be asserting about
+    /// privacy by accident.** It is the config author's opt-out (BR-3), spelled
+    /// the same way here as in a config file, and using it on a test that is
+    /// genuinely about egress would delete the coverage REQ-597 exists to add.
+    /// The interaction itself is pinned by
+    /// `skill_turn::a_skill_that_ran_a_command_is_pinned_by_the_default_boundaries`.
+    #[must_use]
+    pub fn with_default_boundaries_disabled(self) -> Self {
+        self.config
+            .lock()
+            .expect("config mutex poisoned")
+            .privacy
+            .disable_default_boundaries = true;
+        self
+    }
+
     /// [`Self::minimal`] with a **real config file** behind it, loaded (REQ-579
     /// TASK-154).
     ///
@@ -3594,15 +3625,6 @@ impl DaemonRuntime {
         }
     }
 
-    /// A snapshot of the current configuration for `config/get`.
-    ///
-    /// The routing half of the snapshot is **resolved**, not merely echoed: it
-    /// is built by asking the same [`Router`] a turn would ask, with the same
-    /// live provider health, so `teton policy show` reports the decision the
-    /// next turn will actually make (BR-6, AC-11). Echoing the `[[tiers]]` and
-    /// `[[categories]]` rows back would have been less code and a different
-    /// answer — the rows say nothing about an unbound tier's inherited fill, a
-    /// provider that is down, or a remote provider that declares no model.
     /// Every environment variable name a configured `env:<NAME>` credential
     /// reference points at, read from the **live** config (REQ-596 BR-1).
     ///
@@ -3619,6 +3641,33 @@ impl DaemonRuntime {
         crate::child_env::credential_env_names_of(&config)
     }
 
+    /// What this daemon's boundary configuration amounts to right now, read
+    /// once under one lock (REQ-597 BR-5 and the System Model's
+    /// `boundary_defaults_applied`).
+    ///
+    /// Both session-start events are derived from **this one value** rather than
+    /// each taking its own reading of the config. Two readings could disagree
+    /// across a concurrent `config/set` and produce the pair that cannot both be
+    /// true — "the defaults applied" beside "there are no boundaries" — which is
+    /// the failure the one-derivation rule exists to prevent.
+    #[must_use]
+    pub fn boundary_posture(&self) -> BoundaryPosture {
+        let config = self.config.lock().expect("config mutex poisoned");
+        BoundaryPosture {
+            effective_is_empty: config.effective_boundaries().is_empty(),
+            builtin_count: config.builtin_boundary_count(),
+        }
+    }
+
+    /// A snapshot of the current configuration for `config/get`.
+    ///
+    /// The routing half of the snapshot is **resolved**, not merely echoed: it
+    /// is built by asking the same [`Router`] a turn would ask, with the same
+    /// live provider health, so `teton policy show` reports the decision the
+    /// next turn will actually make (BR-6, AC-11). Echoing the `[[tiers]]` and
+    /// `[[categories]]` rows back would have been less code and a different
+    /// answer — the rows say nothing about an unbound tier's inherited fill, a
+    /// provider that is down, or a remote provider that declares no model.
     #[must_use]
     pub fn config_snapshot(&self) -> ConfigSnapshot {
         let config = self.config.lock().expect("config mutex poisoned");
@@ -5481,7 +5530,7 @@ impl DaemonRuntime {
             system,
             &route.harness,
             Arc::clone(&self.session_taint),
-            config.boundaries.clone(),
+            config.effective_boundaries(),
             prompt,
             // REQ-585 BR-7: a typed prompt is drawn from no file; a skill turn
             // carries the skill file's id, or the unpinnable marker for a user
@@ -6742,7 +6791,7 @@ impl DaemonRuntime {
         // neither add to the prompt's spend nor be measured against it. Wiring a
         // ceiling in would advertise a check that could never fire. MCP tool
         // traffic is outside the dollar ceiling; the spec says so explicitly.
-        let mut egress = Egress::new(transport, config.boundaries.clone(), sink)
+        let mut egress = Egress::new(transport, config.effective_boundaries(), sink)
             .with_cost_meter(Arc::new(self.ledger.clone()));
         if let Some(gate) = self.redaction_gate(router, config, events, session_id) {
             egress = egress.with_redaction_gate(gate);
@@ -6882,7 +6931,7 @@ impl DaemonRuntime {
         // transport, exactly as before. The injected header rides only requests
         // to this endpoint's origin — never MCP, never another provider.
         let transport = build_remote_transport(provider_cfg, &self.secret_resolver)?;
-        let boundaries = config.boundaries.clone();
+        let boundaries = config.effective_boundaries();
         let mut egress = Egress::new(transport, boundaries, events.clone())
             .with_cost_meter(Arc::new(self.ledger.clone()))
             // REQ-588 BR-1/ADR-6: the user's ceiling, when they set one. Absent
@@ -7356,7 +7405,7 @@ impl DaemonRuntime {
         // `privacy_block` at all, and a sink that taints would be a loaded gun
         // pointed at the rule the lookup path is built to keep.
         let sink: Arc<dyn crate::egress::PrivacyEventSink> = events.clone();
-        let mut egress = Egress::new(transport, config.boundaries.clone(), sink)
+        let mut egress = Egress::new(transport, config.effective_boundaries(), sink)
             .with_lookup_recorder(self.lookup_recorder(events));
         if let Some(gate) = self.search_redaction_gate(router, config, events, session_id) {
             egress = egress.with_search_redaction_gate(gate);
@@ -9081,7 +9130,7 @@ impl DaemonRuntime {
                     ),
                 ));
             };
-            (provider.clone(), model, config.boundaries.clone())
+            (provider.clone(), model, config.effective_boundaries())
         };
 
         // (7) The dial host, read by the parser that **dials** (LESSON-529), so
@@ -9613,7 +9662,7 @@ impl DaemonRuntime {
             events.clone(),
             Arc::clone(&self.session_taint),
         ));
-        let mut egress = Egress::new(transport, config.boundaries.clone(), sink)
+        let mut egress = Egress::new(transport, config.effective_boundaries(), sink)
             .with_cost_meter(Arc::new(self.ledger.clone()))
             // REQ-588 BR-1/ADR-6: the user's ceiling, when they set one. Absent
             // leaves the choke point exactly as it was — no check, no pricing
@@ -13385,6 +13434,20 @@ pub(crate) fn context_is_sensitive(ctx: &ContextManager, boundaries: &[PrivacyBo
     }
 }
 
+/// The two facts REQ-597's session-start events report, derived together.
+///
+/// A struct rather than two accessors so a caller cannot read one and forget the
+/// other, and so the pair is guaranteed to describe the same instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundaryPosture {
+    /// Whether the effective set is empty — reachable only via
+    /// `[privacy] disable_default_boundaries` with no user rows (BR-3). This,
+    /// not the opt-out flag, is what BR-5's warning keys on.
+    pub effective_is_empty: bool,
+    /// How many builtin rows the effective set carries; `0` when opted out.
+    pub builtin_count: usize,
+}
+
 // ---------------------------------------------------------------------------
 // Config <-> protocol conversions
 // ---------------------------------------------------------------------------
@@ -13785,12 +13848,20 @@ fn snapshot_from_config(
         judgment_default: Some(to_protocol_category(Category::from(
             router.judgment_default(),
         ))),
+        // REQ-597 BR-6: the **effective** set, not the user's table — a report
+        // that named only the rows the user wrote would be answering a
+        // different question from the one the enforcement path asks, which is
+        // exactly the drift `boundary list` exists to prevent. Composed order
+        // is preserved (user rows first, builtins appended), and each row
+        // carries its origin so a reader can tell which of their protections
+        // they authored and which they were shipped.
         privacy: config
-            .boundaries
+            .effective_boundaries()
             .iter()
             .map(|b| PrivacyBoundaryConfig {
                 path_glob: b.path_glob.clone(),
                 mode: to_proto_mode(b.mode),
+                origin: to_proto_origin(b.origin),
             })
             .collect(),
         // REQ-562: the `[privacy] redact` opt-in, projected so `policy show`
@@ -14017,6 +14088,7 @@ fn apply_update(config: &mut Config, update: ConfigUpdate) {
             let boundary = PrivacyBoundary {
                 path_glob: pb.path_glob,
                 mode: to_core_mode(pb.mode),
+                origin: Default::default(),
             };
             if let Some(existing) = config
                 .boundaries
@@ -14149,6 +14221,19 @@ fn to_core_configurable_category(category: ProtoConfigurableCategory) -> Configu
         ProtoConfigurableCategory::Design => ConfigurableCategory::Design,
         ProtoConfigurableCategory::Debug => ConfigurableCategory::Debug,
         ProtoConfigurableCategory::Review => ConfigurableCategory::Review,
+    }
+}
+
+/// Project a boundary's origin onto the wire (REQ-597 BR-6).
+///
+/// A total match rather than a `From` blanket, for `to_proto_mode`'s reason:
+/// the two enums are mirrored by name across the crate seam, and a match is
+/// what makes adding a variant to one a compile error in the other rather than
+/// a silent default.
+fn to_proto_origin(origin: BoundaryOrigin) -> BoundaryOriginConfig {
+    match origin {
+        BoundaryOrigin::User => BoundaryOriginConfig::User,
+        BoundaryOrigin::Builtin => BoundaryOriginConfig::Builtin,
     }
 }
 
@@ -15778,6 +15863,7 @@ permission_allow = [\"fetch_user_url\"]
             ConfigUpdate::SetPrivacyBoundary(PrivacyBoundaryConfig {
                 path_glob: "secrets/**".to_owned(),
                 mode: PrivacyMode::LocalOnly,
+                origin: Default::default(),
             }),
         );
         config.validate().expect("valid");
@@ -15850,7 +15936,10 @@ permission_allow = [\"fetch_user_url\"]
 
         // And the opt-in, on the same projection.
         let opted_in = Config {
-            privacy: teton_core::config::PrivacyConfig { redact: true },
+            privacy: teton_core::config::PrivacyConfig {
+                redact: true,
+                ..Default::default()
+            },
             ..Config::default()
         };
         assert!(
@@ -17181,6 +17270,7 @@ permission_allow = [\"fetch_user_url\"]
         let boundaries = vec![PrivacyBoundary {
             path_glob: "secrets/**".to_owned(),
             mode: BoundaryMode::LocalOnly,
+            origin: Default::default(),
         }];
 
         // A read of a boundary file taints (REQ-544 C-2).
@@ -18075,6 +18165,7 @@ permission_allow = [\"fetch_user_url\"]
             config.boundaries = vec![PrivacyBoundary {
                 path_glob: "secrets/**".to_owned(),
                 mode: BoundaryMode::LocalOnly,
+                origin: Default::default(),
             }];
             let runtime = runtime(config.clone(), &engine, true);
             let router = router_for(&runtime);
@@ -20221,7 +20312,10 @@ permission_allow = [\"fetch_user_url\"]
 
             /// `config` with the `[privacy]` opt-in switched on.
             fn opted_in(mut config: Config) -> Config {
-                config.privacy = PrivacyConfig { redact: true };
+                config.privacy = PrivacyConfig {
+                    redact: true,
+                    ..Default::default()
+                };
                 config
             }
 
@@ -20850,6 +20944,7 @@ permission_allow = [\"fetch_user_url\"]
                     config.boundaries = vec![PrivacyBoundary {
                         path_glob: "secrets/**".to_owned(),
                         mode: BoundaryMode::LocalOnly,
+                        origin: Default::default(),
                     }];
                     config
                 }
@@ -29159,6 +29254,7 @@ provider_id = \"deepseek\"
                 boundaries: vec![PrivacyBoundary {
                     path_glob: "secrets/**".to_owned(),
                     mode: BoundaryMode::LocalOnly,
+                    origin: Default::default(),
                 }],
                 ..local_config()
             }
@@ -31103,7 +31199,10 @@ provider_id = \"deepseek\"
                         },
                     }],
                     default_provider: Some("wide".to_owned()),
-                    privacy: PrivacyConfig { redact },
+                    privacy: PrivacyConfig {
+                        redact,
+                        ..Default::default()
+                    },
                     web: WebConfig {
                         tier,
                         ..WebConfig::default()
@@ -36233,6 +36332,7 @@ provider_id = \"deepseek\"
                 .push(PrivacyBoundary {
                     path_glob: ".claude/**".to_owned(),
                     mode: teton_core::entities::BoundaryMode::LocalOnly,
+                    origin: Default::default(),
                 });
             fx.engine.refuse_the_expansion();
 
