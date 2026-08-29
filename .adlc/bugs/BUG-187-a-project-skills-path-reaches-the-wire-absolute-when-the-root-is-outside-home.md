@@ -1,7 +1,7 @@
 ---
 id: BUG-187
 title: "A project skill's `path_display` is absolute when the session root is outside `$HOME`, so the working tree's path rides the wire event and the prompt"
-status: fixed
+status: resolved
 severity: medium
 created: 2026-08-21
 updated: 2026-08-21

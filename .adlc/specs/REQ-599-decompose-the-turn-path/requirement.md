@@ -1,10 +1,10 @@
 ---
 id: REQ-599
 title: "Decompose the turn path and split runtime.rs, without losing the traceability that makes it readable"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-28
-updated: 2026-08-28
+updated: 2026-08-29
 component: "daemon/session"
 domain: "harness"
 stack: ["rust", "daemon"]
