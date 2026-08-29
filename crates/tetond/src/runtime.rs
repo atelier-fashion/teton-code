@@ -3634,6 +3634,24 @@ impl DaemonRuntime {
     /// `[[categories]]` rows back would have been less code and a different
     /// answer — the rows say nothing about an unbound tier's inherited fill, a
     /// provider that is down, or a remote provider that declares no model.
+    /// What this daemon's boundary configuration amounts to right now, read
+    /// once under one lock (REQ-597 BR-5 and the System Model's
+    /// `boundary_defaults_applied`).
+    ///
+    /// Both session-start events are derived from **this one value** rather than
+    /// each taking its own reading of the config. Two readings could disagree
+    /// across a concurrent `config/set` and produce the pair that cannot both be
+    /// true — "the defaults applied" beside "there are no boundaries" — which is
+    /// the failure the one-derivation rule exists to prevent.
+    #[must_use]
+    pub fn boundary_posture(&self) -> BoundaryPosture {
+        let config = self.config.lock().expect("config mutex poisoned");
+        BoundaryPosture {
+            effective_is_empty: config.effective_boundaries().is_empty(),
+            builtin_count: config.builtin_boundary_count(),
+        }
+    }
+
     #[must_use]
     pub fn config_snapshot(&self) -> ConfigSnapshot {
         let config = self.config.lock().expect("config mutex poisoned");
@@ -13397,6 +13415,20 @@ pub(crate) fn context_is_sensitive(ctx: &ContextManager, boundaries: &[PrivacyBo
         Ok(matcher) => inspect(&provenance, &matcher, PrivacyAction::ReroutedToLocal).is_blocked(),
         Err(_) => true,
     }
+}
+
+/// The two facts REQ-597's session-start events report, derived together.
+///
+/// A struct rather than two accessors so a caller cannot read one and forget the
+/// other, and so the pair is guaranteed to describe the same instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundaryPosture {
+    /// Whether the effective set is empty — reachable only via
+    /// `[privacy] disable_default_boundaries` with no user rows (BR-3). This,
+    /// not the opt-out flag, is what BR-5's warning keys on.
+    pub effective_is_empty: bool,
+    /// How many builtin rows the effective set carries; `0` when opted out.
+    pub builtin_count: usize,
 }
 
 // ---------------------------------------------------------------------------

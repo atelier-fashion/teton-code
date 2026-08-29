@@ -1,7 +1,7 @@
 ---
 id: TASK-288
 title: "Publish the unbounded-root warning and the defaults-applied notice at session start"
-status: pending
+status: complete
 parent: REQ-597
 repo: teton-code
 created: 2026-08-29
