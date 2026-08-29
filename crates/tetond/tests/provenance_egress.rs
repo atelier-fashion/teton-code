@@ -1832,6 +1832,7 @@ fn claude_tree_is_local_only() -> Vec<PrivacyBoundaryConfig> {
     vec![PrivacyBoundaryConfig {
         path_glob: ".claude/**".to_owned(),
         mode: PrivacyMode::LocalOnly,
+        origin: Default::default(),
     }]
 }
 

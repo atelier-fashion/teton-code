@@ -13774,6 +13774,7 @@ fn snapshot_from_config(
             .map(|b| PrivacyBoundaryConfig {
                 path_glob: b.path_glob.clone(),
                 mode: to_proto_mode(b.mode),
+                origin: Default::default(),
             })
             .collect(),
         // REQ-562: the `[privacy] redact` opt-in, projected so `policy show`
@@ -15762,6 +15763,7 @@ permission_allow = [\"fetch_user_url\"]
             ConfigUpdate::SetPrivacyBoundary(PrivacyBoundaryConfig {
                 path_glob: "secrets/**".to_owned(),
                 mode: PrivacyMode::LocalOnly,
+                origin: Default::default(),
             }),
         );
         config.validate().expect("valid");

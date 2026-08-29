@@ -1,7 +1,7 @@
 ---
 id: TASK-286
 title: "The wire half: boundary origin on config/get, and the two session-start events"
-status: pending
+status: complete
 parent: REQ-597
 repo: teton-code
 created: 2026-08-29

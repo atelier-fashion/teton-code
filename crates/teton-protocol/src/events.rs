@@ -49,7 +49,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::effort::ResolvedEffort;
-use crate::methods::{ProviderHealth, ProviderTestOutcome, SessionRoot, SkillSource, TierBinding};
+use crate::methods::{
+    ProviderHealth, ProviderTestOutcome, RootKind, SessionRoot, SkillSource, TierBinding,
+};
 use crate::{
     Category, ClientKind, Phase, ProtocolVersion, ProviderId, ProviderKind, RequestId, SessionId,
     Tier, TurnId,
@@ -210,6 +212,12 @@ pub enum Event {
     /// An over-budget offer's going-forward remedy was written through
     /// `config/set` (REQ-589 BR-7, BR-8).
     SkillOverBudgetRemedyApplied(SkillOverBudgetRemedyApplied),
+    /// A session started at a root worth warning about with **no** boundaries
+    /// in force (REQ-597 BR-5).
+    UnboundedRootWarning(UnboundedRootWarning),
+    /// The shipped default boundary set contributed rows to a starting
+    /// session's effective set (REQ-597 System Model).
+    BoundaryDefaultsApplied(BoundaryDefaultsApplied),
 }
 
 impl Event {
@@ -254,6 +262,8 @@ impl Event {
             Event::SkillOverBudgetOffered(_) => "skill_over_budget_offered",
             Event::SkillOverBudgetAccepted(_) => "skill_over_budget_accepted",
             Event::SkillOverBudgetRemedyApplied(_) => "skill_over_budget_remedy_applied",
+            Event::UnboundedRootWarning(_) => "unbounded_root_warning",
+            Event::BoundaryDefaultsApplied(_) => "boundary_defaults_applied",
         }
     }
 }
@@ -8031,4 +8041,40 @@ mod tests {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// unbounded_root_warning / boundary_defaults_applied (REQ-597)
+// ---------------------------------------------------------------------------
+
+/// A session started with **no** privacy boundaries in force, at a root broad
+/// enough for that to matter (REQ-597 BR-5).
+///
+/// After REQ-597 the empty effective set is reachable only through
+/// `[privacy] disable_default_boundaries = true` (BR-3), so this event does not
+/// mean "you have not configured boundaries yet" — it means *you turned the
+/// shipped ones off, and this session is rooted at your home directory or the
+/// filesystem root*.
+///
+/// Published on the bus rather than routed to the creating connection, and
+/// rendered ungated by the CLI. REQ-571 BR-4 is the reason for both: an audit
+/// signal that reaches only the party it indicts can be suppressed by them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnboundedRootWarning {
+    /// What kind of place the session's root is — `home` or `filesystem_root`.
+    /// The two other [`RootKind`]s never raise this.
+    pub root_kind: RootKind,
+}
+
+/// The shipped default boundary set contributed rows to a starting session
+/// (REQ-597 System Model).
+///
+/// The quiet counterpart to [`UnboundedRootWarning`]: it reports that the
+/// protection is **on**, which is the ordinary case, so the CLI gates it behind
+/// verbose. Its value is in a transcript or a bug report, where "was the
+/// default set in force?" is otherwise unanswerable after the fact.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoundaryDefaultsApplied {
+    /// How many builtin rows were composed into the effective set.
+    pub count: usize,
 }

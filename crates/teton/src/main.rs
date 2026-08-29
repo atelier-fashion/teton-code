@@ -2704,6 +2704,7 @@ pub(crate) fn boundary_add_on(
         update: ConfigUpdate::SetPrivacyBoundary(PrivacyBoundaryConfig {
             path_glob: glob.to_owned(),
             mode,
+            origin: Default::default(),
         }),
     };
     match conn.call(params, ctx)? {
