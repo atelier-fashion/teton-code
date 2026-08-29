@@ -4210,8 +4210,9 @@ impl DaemonRuntime {
 
         let outcomes = match door {
             // Consent given. Sequential, in document order, with the session
-            // root as cwd and the `shell` tool's jail, scrub, PATH floor,
-            // process group and deadline (ADR-14).
+            // root as cwd and the `shell` tool's jail, composed environment
+            // (REQ-596: an allowlist, not a scrub), PATH floor, process group
+            // and deadline (ADR-14).
             None if !commands.is_empty() => {
                 let root = root.to_path_buf();
                 let to_run = commands.clone();

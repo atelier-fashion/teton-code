@@ -1,7 +1,7 @@
 ---
 id: TASK-287
 title: "Compose the shell child's environment by allowlist; retire the name denylist"
-status: pending
+status: complete
 parent: REQ-596
 created: 2026-08-29
 updated: 2026-08-29
