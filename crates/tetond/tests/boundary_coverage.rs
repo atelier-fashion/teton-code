@@ -1019,3 +1019,75 @@ fn the_builtin_boundary_set_is_composed_in_exactly_one_region() {
         );
     }
 }
+
+/// **REQ-597 verify.** The test seam that switches the shipped boundary set off
+/// is never called from production code.
+///
+/// `DaemonRuntime::with_default_boundaries_disabled` has to be `pub`: the
+/// harnesses that need it are *integration* tests, which compile against the
+/// library without `cfg(test)`, so the gating
+/// `minimal_with_config_file` uses is not available to it. That leaves a public
+/// method on a shipped library whose whole effect is to disable this REQ's
+/// central protection — precisely the shape that module's own doc comment calls
+/// "not something production should be able to call".
+///
+/// Since it cannot be made unreachable, it is made *audited*: a call from
+/// anywhere under `src/` fails here, naming the file and line.
+///
+/// This is a **sweep, not a count** — it walks every `.rs` under the crate's own
+/// `src/`, so a new file cannot slip in beneath an enumerated list. The root is
+/// `CARGO_MANIFEST_DIR`, which cargo fixes at compile time to the crate being
+/// built, so this cannot end up reading a different checkout the way BUG-159's
+/// relative runtime read did.
+///
+/// **Mutation**: call `with_default_boundaries_disabled()` anywhere in
+/// `crates/tetond/src/` and this fails naming the site.
+#[test]
+fn the_boundary_opt_out_seam_has_no_production_caller() {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries =
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    const SEAM: &str = "with_default_boundaries_disabled";
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    walk(&src, &mut files);
+    assert!(
+        files.len() > 10,
+        "the sweep found only {} files under {} — it is not walking the crate",
+        files.len(),
+        src.display()
+    );
+
+    let mut offenders = Vec::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file).expect("reading a source file");
+        for (i, line) in text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            // The definition itself, doc comments about it, and ordinary
+            // comments are not call sites.
+            if trimmed.starts_with("//") || trimmed.contains("pub fn ") {
+                continue;
+            }
+            if line.contains(SEAM) {
+                offenders.push(format!("{}:{}: {}", file.display(), i + 1, trimmed));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "REQ-597: `{SEAM}` disables the shipped privacy boundary set and must be \
+         reached only from tests. Production call sites found:\n{}",
+        offenders.join("\n")
+    );
+}

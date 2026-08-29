@@ -8565,6 +8565,92 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // REQ-597 BR-5 — the warning reaches a person; the confirmation does not
+    // -----------------------------------------------------------------------
+
+    /// **BR-5.** The unbounded-root warning renders **without** verbose, and
+    /// says what is wrong, where, and how to fix it.
+    ///
+    /// The gate is the assertion. BR-5 requires a user-visible surface, and
+    /// REQ-571 BR-4 gives the reason: an audit signal that reaches only the
+    /// party it indicts can be suppressed by them. `verbose` is a setting the
+    /// same config author controls, so gating this line behind it would hand
+    /// the switch to exactly the wrong person.
+    ///
+    /// **Mutation**: wrap the arm in `if state.verbose` — as its neighbour
+    /// `capability_dead_end` legitimately is — and the default-state leg fails.
+    #[test]
+    fn the_unbounded_root_warning_is_never_verbose_gated() {
+        for kind in [RootKind::Home, RootKind::FilesystemRoot] {
+            let mut surface = RecordingSurface::new();
+            let mut state = SessionState::new();
+            assert!(!state.verbose, "the default state is what a user has");
+
+            render_event(
+                &envelope(Event::UnboundedRootWarning(UnboundedRootWarning {
+                    root_kind: kind,
+                })),
+                &mut surface,
+                &mut state,
+            );
+
+            let notice = surface.lines_of(LineKind::Notice).join("\n");
+            assert!(
+                !notice.is_empty(),
+                "{kind:?}: the warning must draw without verbose"
+            );
+            assert!(
+                notice.contains("disable_default_boundaries"),
+                "{kind:?}: the line must name the key that caused this, or the \
+                 reader cannot act on it: {notice}"
+            );
+            let place = match kind {
+                RootKind::Home => "home directory",
+                _ => "filesystem root",
+            };
+            assert!(
+                notice.contains(place),
+                "{kind:?}: the line must say where: {notice}"
+            );
+        }
+    }
+
+    /// The mirror image: the *confirmation* that the shipped set is in force is
+    /// verbose-gated, because it says the ordinary thing happened.
+    ///
+    /// The asymmetry is the design, not an oversight. An ungated line on every
+    /// session start is chrome, and chrome is what teaches people to stop
+    /// reading notices — which would cost the warning above its audience.
+    ///
+    /// **Mutation**: ungate the arm and the default-state leg fails.
+    #[test]
+    fn the_defaults_applied_confirmation_is_verbose_gated() {
+        let applied = || {
+            envelope(Event::BoundaryDefaultsApplied(BoundaryDefaultsApplied {
+                count: 13,
+            }))
+        };
+
+        let mut quiet = RecordingSurface::new();
+        let mut state = SessionState::new();
+        render_event(&applied(), &mut quiet, &mut state);
+        assert!(
+            quiet.lines_of(LineKind::Notice).is_empty(),
+            "an ordinary session start draws no boundary chrome"
+        );
+
+        let mut loud = RecordingSurface::new();
+        let mut verbose = SessionState::new();
+        verbose.verbose = true;
+        render_event(&applied(), &mut loud, &mut verbose);
+        let notice = loud.lines_of(LineKind::Notice).join("\n");
+        assert!(
+            notice.contains("13"),
+            "under verbose it reports how many rows are in force: {notice}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
