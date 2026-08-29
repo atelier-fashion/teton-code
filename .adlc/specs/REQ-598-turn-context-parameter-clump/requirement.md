@@ -47,7 +47,9 @@ criteria pin each one.
 | `TurnContext` | `config` | snapshot or handle | **Read after the turn claim**, never before (BR-4) |
 | `TurnContext` | `router` | `&Router` / handle | Present for every turn |
 | `TurnContext` | `gate` | `Arc<PermissionGate>` | Present for every turn |
-| `TurnContext` | `route` | `Route` | Set once routing has resolved; absent before |
+| ~~`TurnContext`~~ | ~~`route`~~ | ~~`Route`~~ | **Removed in Phase 2 (ADR-3, answering OQ-1).** `route` is reassigned on every fallback reroute inside `run_one_attempt`'s `'turn:` loop, so a context owning it would go stale or need rebuilding each iteration. It stays an explicit parameter — which also keeps the reroute visible in the signature, per BR-7. |
+| `DutyContext` | `local_engine` | `Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>` | Added in Phase 2 (ADR-1); travels with every duty resolution |
+| `DutyContext` | `prompt_spend` | `Option<&Arc<PromptSpend>>` | Added in Phase 2 (ADR-1); travels with every duty resolution |
 
 ### Events
 
@@ -63,28 +65,190 @@ criteria pin each one.
 
 ## Business Rules
 
-- [ ] BR-1: The refactor is **behavior-preserving**. No event payload, event ordering, error code, refusal sentence, or dispatch decision changes. A user cannot tell this REQ shipped.
-- [ ] BR-2: `TurnContext` construction happens **after** the turn is claimed, and reads session state (`cwd`, `session_root`) from the registry at that point. It must not accept a snapshot taken in `spawn_prompt_turn` before the claim (informed by LESSON-539, REQ-583 — the pre-claim snapshot is a TOCTOU race that was already fixed once).
-- [ ] BR-3: Request-id minting for daemon-wide resources stays centralized in `PendingPermissions`. `TurnContext` must not acquire a per-session counter for a daemon-wide namespace (informed by BUG-161 — that collision cross-authorized tool calls across sessions).
-- [ ] BR-4: Any filesystem I/O reachable from `TurnContext` construction stays off the connection reader loop, via the existing `block_in_place_if_multithread` seam (informed by BUG-184 — synchronous skill discovery on the reader loop stalled RPCs behind a TCC dialog).
-- [ ] BR-5: Security gates that currently run **before** deserialization continue to run before it. `TurnContext` construction must not be inserted between a gate and the parse it guards (informed by LESSON-520 — a gate that moves after the parse makes its own refusal test vacuous).
-- [ ] BR-6: Injectable test seams survive. `TurnContext` is constructible with test doubles (`AlwaysFailsVerifier`, counting gates) and honors the `TETON_PRESENCE_ACCEPT=fail` env seam (informed by LESSON-519).
-- [ ] BR-7: The distinction between cap-exempt (mandatory) and optional tools is not absorbed into `TurnContext` in a way that hides it. Ordering-dependent registry logic stays visible (informed by LESSON-496 — "cut first under pressure" became "never available" when a limit equalled the mandatory count).
-- [ ] BR-8: Every REQ / ADR / LESSON / BUG reference in a moved doc comment moves **with** the code it annotates. A relocated function that loses its `REQ-588 BR-3 / ADR-4` header is a defect under this REQ, not an acceptable cost.
-- [ ] BR-9: The net count of `#[allow(clippy::too_many_arguments)]` in the workspace strictly decreases, and no new suppression of any kind is introduced to make the refactor compile.
+- [x] BR-1: The refactor is **behavior-preserving**. No event payload, event ordering, error code, refusal sentence, or dispatch decision changes. A user cannot tell this REQ shipped.
+- [x] BR-2: `TurnContext` construction happens **after** the turn is claimed, and reads session state (`cwd`, `session_root`) from the registry at that point. It must not accept a snapshot taken in `spawn_prompt_turn` before the claim (informed by LESSON-539, REQ-583 — the pre-claim snapshot is a TOCTOU race that was already fixed once).
+  **Ticked with a caveat, stated rather than buried.** The first clause holds and
+  is what BR-2.1 generalizes. The second — "reads session state (`cwd`,
+  `session_root`)" — is **vacuously** true: ADR-1 measured the recurring cluster
+  and it contains no cwd-derived field, so the context reads no session state
+  and none can go stale. BR-2 was written before that measurement. The clause is
+  not implemented, it is *inapplicable*, and AC-5's amendment plus the
+  compile-time field guard record why so the distinction cannot quietly become a
+  claim that it was.
+- [x] BR-2.1 (added in Phase 2 — ADR-4): BR-2 names **one instance of a class**.
+  The class is: *a context must not be constructed before any point that rebinds
+  a field it captures.* The turn claim is one such point. **The REQ-580 warming
+  hold is another, and BR-2 does not cover it**: when the local tier is warming,
+  `run_prompt_turn` shadow-rebinds `router` after the hold wakes, building a
+  fresh one from the settled tier state and re-dispatching the route. A
+  `TurnContext` constructed after the claim but *before* the hold satisfies BR-2
+  and still carries a stale `router` to every downstream consumer — silently
+  breaking REQ-580's guarantee that "a turn served after the wait must be built
+  from the route it is served *by*." Construction happens after the **last**
+  rebinding of every captured field, and a test asserts the captured `router` is
+  the post-hold one on a warming-tier turn (informed by LESSON-586 — a rule that
+  names one field of a validated class is a rule about the class).
+- [x] BR-3: Request-id minting for daemon-wide resources stays centralized in `PendingPermissions`. `TurnContext` must not acquire a per-session counter for a daemon-wide namespace (informed by BUG-161 — that collision cross-authorized tool calls across sessions).
+- [x] BR-4: Any filesystem I/O reachable from `TurnContext` construction stays off the connection reader loop, via the existing `block_in_place_if_multithread` seam (informed by BUG-184 — synchronous skill discovery on the reader loop stalled RPCs behind a TCC dialog).
+- [x] BR-5: Security gates that currently run **before** deserialization continue to run before it. `TurnContext` construction must not be inserted between a gate and the parse it guards (informed by LESSON-520 — a gate that moves after the parse makes its own refusal test vacuous).
+- [x] BR-6: Injectable test seams survive. `TurnContext` is constructible with test doubles (`AlwaysFailsVerifier`, counting gates) and honors the `TETON_PRESENCE_ACCEPT=fail` env seam (informed by LESSON-519).
+- [x] BR-7: The distinction between cap-exempt (mandatory) and optional tools is not absorbed into `TurnContext` in a way that hides it. Ordering-dependent registry logic stays visible (informed by LESSON-496 — "cut first under pressure" became "never available" when a limit equalled the mandatory count).
+- [x] BR-8: Every REQ / ADR / LESSON / BUG reference in a moved doc comment moves **with** the code it annotates. A relocated function that loses its `REQ-588 BR-3 / ADR-4` header is a defect under this REQ, not an acceptable cost.
+- [x] BR-9: The net count of `#[allow(clippy::too_many_arguments)]` in the workspace strictly decreases, and no new suppression of any kind is introduced to make the refactor compile.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: The workspace `#[allow(clippy::too_many_arguments)]` count drops from 25 to a number recorded verbatim in the PR body, and a test asserts the count does not regress above that number.
-- [ ] AC-2: The doubled `#[allow(clippy::too_many_arguments)]` on `resolve_duty` and `build_duty_route` is gone (both sites, not one).
-- [ ] AC-3: `cargo clippy --workspace --all-targets` stays clean under the workspace's `clippy::all = deny`.
-- [ ] AC-4: `cargo test --workspace --no-fail-fast` is green, and the output is grepped for `FAILED` rather than trusting a summed pass count (conventions.md — an interrupted fail-fast run reports a floor, not a total).
-- [ ] AC-5: A test mutates `cwd` between turn spawn and turn claim and asserts `TurnContext` observes the **fresh** value — this is the BR-2 / LESSON-539 regression guard, and it must fail if `TurnContext` is constructed from a pre-claim snapshot.
-- [ ] AC-6: The existing `ParkingVerifier` reader-loop test still proves concurrent RPCs are served while a presence gate blocks (BR-4 guard; informed by LESSON-518 — routing tests alone cannot show this).
-- [ ] AC-7: The gate-before-parse refusal tests still use **valid, persistable** payloads paired with an acceptance case, so they remain non-vacuous after the move (BR-5 guard; informed by LESSON-520).
-- [ ] AC-8: **Traceability sweep** — a check enumerates REQ/ADR/LESSON/BUG ids present in the touched files before and after, and fails on any id that disappeared. This is a **region check**, not a count: a comment relocated to the wrong function keeps the count identical (informed by conventions.md / LESSON-568).
-- [ ] AC-9: The three typed-outcome turn-path arms (`PrivacyBlocked`, `ContextLengthExceeded`, `SpendCeilingReached`) each still have both halves — `failure_class() -> None` **and** a dedicated arm ordered before the generic remote arm. A test inverts each arm and confirms the user-facing sentence changes (informed by conventions.md's both-halves rule and LESSON-557).
-- [ ] AC-10: Event ordering is asserted unchanged for at least one full turn, by comparing a recorded event sequence against a pre-refactor fixture (BR-1 guard).
+- [x] AC-1: The workspace `#[allow(clippy::too_many_arguments)]` count drops from
+  25 to a number recorded verbatim in the PR body, and a test asserts the count
+  does not regress above that number. The PR body MUST report the drop **split
+  into its two disjoint populations**, because a single number credits the
+  refactor with removals that required no refactor:
+  **(a) vestigial** — attributes that suppress nothing, removable with no
+  signature change; **(b) earned** — attributes on functions that genuinely
+  tripped the lint and stopped tripping it because the cluster became a
+  parameter. Phase 1 measured the baseline by stripping all 25 and re-running
+  clippy with the lint downgraded to a warning (under `all = deny` the build
+  aborts at the first crate and reports only one site): **16 of 25 fire, 9 are
+  vestigial** — the 2 AC-2 duplicates, the 5 `*_route` functions (exactly 7
+  arguments each, sitting *at* clippy's default threshold), and the 2 in
+  `engine.rs`. The count test greps the **source tree**, not clippy output, so
+  it also covers the feature-gated sites AC-3 cannot reach (see AC-3).
+- [x] AC-2: Neither `resolve_duty` nor `build_duty_route` retains a **stacked
+  pair** of `#[allow(clippy::too_many_arguments)]` — the fix is applied to both
+  *functions*, not one. Because both collapse below the threshold once the duty
+  cluster becomes a parameter, each must end with **zero** such attributes, not
+  one; a lone surviving attribute on either is a vestigial suppression under
+  AC-1(a) and fails this criterion.
+- [x] AC-3: `cargo clippy --workspace --all-targets` stays clean under the
+  workspace's `clippy::all = deny`. **Known coverage limit, recorded rather than
+  papered over**: this command does not compile `teton-inference`'s
+  `#[cfg(feature = "llama")]` block, so it never checks `engine.rs::serve` or
+  `engine.rs::run_generation`. Those two sites are out of scope per OQ-3 and are
+  covered only by AC-1's source-tree count. Do not read a green AC-3 as a
+  workspace-wide statement.
+- [x] AC-4: `cargo test --workspace --no-fail-fast` is green, and the output is grepped for `FAILED` rather than trusting a summed pass count (conventions.md — an interrupted fail-fast run reports a floor, not a total).
+- [x] AC-5: A test mutates `cwd` between turn spawn and turn claim and asserts
+  `TurnContext` observes the **fresh** value — the BR-2 / LESSON-539 regression
+  guard. **The existing test does not satisfy this criterion and reusing it is a
+  defect** (Phase 1 finding, LESSON-586's shape):
+  `a_turn_handed_a_stale_cwd_snapshot_runs_on_the_root_the_registry_holds_at_claim_time`
+  (`runtime.rs`) guards `run_prompt_turn`'s post-claim re-read of `session_cwd`,
+  which sits **upstream** of every point at which a `TurnContext` can be built.
+  A context constructed anywhere below that re-read inherits the fresh value for
+  free, so that test cannot distinguish a correctly-built `TurnContext` from one
+  built off the pre-claim snapshot — a broader guard standing in front of the
+  mutation this AC exists to catch.
+  **Amended in Phase 4 — (a) and (b) as written are unsatisfiable, and the
+  reason is a finding, not a technicality.** They presume `TurnContext` carries
+  the session root. It does not, and by this REQ's own decisions it must not:
+  the entity table above lists exactly `events`, `session_id`, `config`,
+  `router`, `gate`, and ADR-1 measured the recurring cluster without any
+  cwd-derived member. Three independent checks confirm nothing the context holds
+  is built from `session_cwd`: `turn_router(&config, &session_id)` does not take
+  it; `config` comes off the daemon mutex; and the one `probed` root feeds the
+  jail (`ToolContext::for_root`), the prompt's environment block
+  (`route.harness.session_root`) and REQ-585's skill pin — none of which is on
+  the context. So there is no field to "build from the pre-claim snapshot", and
+  (b)'s mutation cannot be performed at all.
+  This is the same shape as the two vacuous ACs Phase 1 corrected: BR-2 was
+  written before ADR-1 measured the cluster, and it names a hazard for a field
+  the design then (correctly) did not adopt.
+  **What replaces it**, so the hazard class is still guarded rather than
+  waved through:
+  (a) the cwd staleness class stays guarded where it actually lives — by
+  `a_turn_handed_a_stale_cwd_snapshot_runs_on_the_root_the_registry_holds_at_claim_time`,
+  which remains correct for `run_prompt_turn`'s re-read. It is a **preservation**
+  check here, not evidence about this diff;
+  (b) the context's *own* staleness class is real and is guarded by BR-2.1's
+  warming-hold test (below), where a field the context does carry — `router` —
+  genuinely is rebound after a point that satisfies BR-2. That test carries the
+  mutation demonstration this AC asked for, against a mutation that can actually
+  be performed;
+  (c) a structural guard pins the premise: a test asserts `TurnContext` exposes
+  no cwd- or root-derived field, so the hazard cannot re-enter by someone later
+  adding one built from the pre-claim parameter.
+- [x] AC-6: The existing `ParkingVerifier` reader-loop test still proves concurrent RPCs are served while a presence gate blocks (BR-4 guard; informed by LESSON-518 — routing tests alone cannot show this).
+- [x] AC-7: The gate-before-parse refusal tests still use **valid, persistable** payloads paired with an acceptance case, so they remain non-vacuous after the move (BR-5 guard; informed by LESSON-520).
+- [x] AC-8: **Traceability sweep — a true region check.** A per-file set diff of
+  REQ/ADR/LESSON/BUG ids is **not sufficient and does not satisfy this
+  criterion** (Phase 1 finding). Evidence: when REQ-597 rebased onto REQ-596,
+  a method was inserted between `config_snapshot`'s doc comment and its
+  attribute, orphaning the comment from the item it documents. No id left the
+  file — set identical, count identical, defect present. The check MUST bind
+  each id to the **item it annotates**, and fail on all three of:
+  (a) **Disappearance** — an id present in a touched file before the refactor is
+  absent after, anywhere in the workspace (an id may legitimately *move between
+  files*; the sweep is workspace-scoped so a genuine relocation is not a false
+  positive).
+  (b) **Re-association** — an id whose owning item changed. For every id, record
+  the set of item names (fn/struct/impl) whose attached doc-comment block
+  carries it; fail if that mapping changes, except where the PR body names the
+  rename explicitly.
+  (c) **Orphaning** — a doc-comment block that is no longer attached to any
+  item: a `///` run, or a `//` run immediately preceding an item, separated from
+  its item by a blank line or by an intervening item. This arm is what catches
+  the REQ-596/597 failure above, and it MUST be shown to catch it — reproduce
+  that exact insertion against `config_snapshot`, confirm the sweep goes red,
+  and revert (conventions.md's invert-the-gate rule).
+- [x] AC-9: The three typed-outcome turn-path arms (`PrivacyBlocked`, `ContextLengthExceeded`, `SpendCeilingReached`) each still have both halves — `failure_class() -> None` **and** a dedicated arm ordered before the generic remote arm. A test inverts each arm and confirms the user-facing sentence changes (informed by conventions.md's both-halves rule and LESSON-557).
+- [x] AC-10: Event ordering is asserted unchanged for at least one full turn, by
+  comparing a recorded event sequence against a pre-refactor fixture (BR-1
+  guard). **Fixture provenance is load-bearing and pinned**: the golden sequence
+  is captured on the **base commit** (`origin/main`, before any refactor commit
+  lands on the branch) and committed as a checked-in file in the **first**
+  task's commit. A fixture regenerated after the refactor is an oracle computed
+  by the subject — conventions.md's first named trap — and does not satisfy this
+  criterion. The test must additionally be shown to fail when two events are
+  transposed; record that mutation in its doc comment.
+
+## Verification (TASK-300)
+
+Measured on the finished branch, not predicted.
+
+| AC | Evidence |
+|---|---|
+| AC-1 | 25 -> **13**. `runtime.rs` 14 -> 2. Split below. |
+| AC-2 | Both stacked duplicates gone — `resolve_duty` and `build_duty_route` carry **zero**. |
+| AC-3 | `cargo clippy --workspace --all-targets` clean under `clippy::all = deny`. **Known limit**: it does not compile the `llama` block, so `engine.rs`'s 2 sites are unseen by it — which is why AC-1's ratchet walks source instead (ADR-6). |
+| AC-4 | `cargo test --workspace --no-fail-fast`: **4,058 passed, 0 failed**, 71 targets `ok`, `EXIT=0`. Output captured and **grepped for `FAILED`** (0 occurrences) rather than trusting the summed count. |
+| AC-5 | **Amended** — (a) and (b) were unsatisfiable; see the AC. Replaced by the BR-2.1 warming-hold guard (mutation-demonstrated) and a compile-time field guard. |
+| AC-6 | `the_reader_loop_keeps_serving_while_a_consent_is_pending` green. **Preservation only** — this REQ adds no I/O on the construction path, so it could not have failed for a reason this REQ created. |
+| AC-7 | Confirmed by **reading** `cli_e2e.rs` / `pty_e2e.rs`: each refusal leg is paired with an acceptance leg, payloads re-parsed via `Config::load`. **Preservation only.** BR-5 also holds structurally: no construction sits between a gate and its parse. |
+| AC-8 | `traceability_sweep.rs`, 3 arms, both mutations run and recorded. |
+| AC-9 | `suppression_ratchet.rs` both-halves check; mutation run (classifying `SpendCeilingReached` as `Transport`) and recorded. |
+| AC-10 | `one_full_turn_publishes_its_events_in_the_order_the_fixture_records` green against the fixture captured at base `17c39ec` **before `TurnContext` existed** — so the oracle is not computed by the subject. |
+
+### AC-1 arithmetic, measured
+
+12 sites removed, all from `runtime.rs`:
+
+- **7 vestigial** (suppressed nothing): the 2 stacked duplicates on `resolve_duty`
+  and `build_duty_route`, plus the 5 `*_route` functions sitting at exactly 7
+  parameters — clippy's threshold is *more than* 7, so the lint never fired on them.
+- **5 earned** (the lint was firing): `offer_or_refuse_over_budget` (12 params),
+  `resolve_duty` (9), `build_duty_route` (9), `build_tools` (8),
+  `spawn_title_session` (8).
+
+That is exactly the architecture's predicted split (7 vestigial; earned bounded
+at 5–7), landing at the bottom of the earned range.
+
+**Kept, deliberately**: `run_prompt_turn` (the constructor site — its parameters
+arrive off the wire, there is no bundle to collapse) and `run_one_attempt` (10
+parameters after dropping 5; `route` stays explicit per ADR-3).
+
+### Found and deliberately not fixed
+
+Per the Out of Scope rule that incidental findings are filed rather than folded in:
+
+- **A lock-guard deadlock the refactor itself introduced** was in scope and
+  fixed (a `config.lock()` temporary passed as an argument outliving a second
+  lock in the same statement). It is called out here because it is the clearest
+  instance of the risk this REQ names, and it warrants a LESSON at wrapup.
+- **`turn_loop.rs`'s 4 suppressions** stay (ADR-2, a third cluster at a
+  different layer). REQ-599 inherits the question.
+- **The traceability sweep's base-dependent arms skip on a shallow clone.** Real
+  coverage gap, announced loudly rather than passed silently. Closing it is a CI
+  fetch-depth change this REQ deliberately did not make.
 
 ## External Dependencies
 
@@ -100,7 +264,36 @@ criteria pin each one.
 
 - [ ] OQ-1: Does `TurnContext` own `route`, or is a routed turn a distinct type (`RoutedTurn`) so that "route not yet resolved" is unrepresentable rather than an `Option`? The typestate version is safer and a larger diff.
 - [ ] OQ-2: Should the struct be per-turn or per-session with a per-turn view? Per-session risks BR-2's staleness class returning by another door.
-- [ ] OQ-3: Do the non-`runtime.rs` sites (`engine.rs`, `category.rs`) share this cluster, or do they carry a different one that merely also trips the lint? If the latter, they are out of scope and their suppressions stay — and AC-1's target number must reflect that.
+- [x] OQ-3: **ANSWERED in Phase 1 — no, they do not share the cluster.** Measured
+  by reading all 25 signatures. Zero of the five cluster fields (`events`,
+  `session_id`, `config`, `router`, `gate`) appear in any of them:
+  `engine.rs::serve` takes `backend, model, n_ctx, resident, cache, cache_key,
+  prompt, params, out_tx, ctrl_rx`; `engine.rs::run_generation` takes `ctx,
+  model, tokens, start, params, out_tx, ctrl_rx`; `category.rs::resolve_fallback`
+  takes `category, tier, primary, rejected, source, fallback, health, usable`.
+  `category.rs` lives in `teton-core`, which by architecture performs no I/O and
+  therefore has no access to `EventBus` or `PermissionGate` at all — it *cannot*
+  take this cluster. Both `engine.rs` sites sit inside the
+  `#[cfg(feature = "llama")]` block and are compiled by neither AC-3's command
+  nor CI. **All three are out of scope; their suppressions stay.** Two further
+  sites fail the same test and are likewise out of scope:
+  `main.rs::provider_add_on` (CLI plumbing — `conn`, `ctx`, `keychain`) and
+  `budget.rs::skill_append_fit` (pure fit arithmetic).
+  `skill.rs::publish_invocation` is **precedent, not target**: its doc comment
+  records that it already reads session and bus *off the gate* rather than
+  taking them as parameters — the bundling this REQ generalizes.
+- [ ] OQ-4 (raised in Phase 1): `runtime.rs` holds **two** clusters, not one, and
+  `/architect` must decide whether that means two structs. The turn cluster
+  (`events, session_id, config, router, gate`, + `route`) appears in
+  `offer_or_refuse_over_budget`, `build_tools`, `run_one_attempt`. The
+  duty-routing cluster (`router, config, events, session_id` — **no gate** —
+  plus `local_engine` and `prompt_spend`, which travel with it at every site)
+  appears in `resolve_duty`, `build_duty_route`, `spawn_title_session`, and the
+  five `*_route` functions. `turn_loop.rs` carries a third, harness-layer
+  cluster (`tools, tool_ctx, gate, events: &SessionEvents, ctx, config:
+  &HarnessConfig, hook`) with no `session_id` and no `router`. The spec's own
+  Assumptions section already rules on the principle — "two small structs, not
+  one wide one" — and this is the discovery it anticipated.
 
 ## Out of Scope
 
