@@ -117,7 +117,7 @@ named below.
 
 ## Open Questions
 
-- [ ] OQ-1: Should `shell_env_withheld` be emitted at all? It tells a user why their command lost a variable, but a count alone may be too vague to act on, and anything more specific risks naming a credential.
+- [x] OQ-1: **Settled by /architect (ADR-D): no — the event is not emitted.** OQ-1's own two halves are the reason: a bare count is not actionable, and BR-5 forbids the only payload that would make it actionable. An event that cannot say anything useful is a surface that can only ever leak. Under ADR-B the withheld set is also large and boring by construction — every variable the daemon holds that is not one of twelve — so a count would be noise on every call. The System Model's `shell_env_withheld` row is therefore specified but deliberately not implemented; if a "why did my command lose $FOO" answer is wanted later, the right shape is a documented allowlist, not a runtime event.
 - [ ] OQ-2: Should the allowlist be user-extensible (`[shell] extra_env = [...]`)? **Partly settled:** a user who allowlists a *configured* credential name cannot defeat BR-1, because BR-3's removal is unconditional and runs last; and a user who allowlists a name holding a credential *URL* is caught by BR-8. What remains genuinely open is the residual neither rule covers — a user allowlisting a name that holds a bare-token secret the daemon was never told about. That is the same class this REQ closes for `auth_ref` credentials, reopened by hand at the user's request, which may be the correct trade. Extensibility is deferred, not refused; if it ships, this residual is what its own ACs must speak to.
 
 ## Out of Scope

@@ -3,9 +3,11 @@
   "branch": "feat/REQ-596-credential-safe-shell-env",
   "startedAt": "2026-08-29T00:00:00Z",
   "completed": false,
-  "currentPhase": 1,
+  "currentPhase": 3,
   "completedPhases": [
-    0
+    0,
+    1,
+    2
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -13,6 +15,18 @@
       "phase": 0,
       "name": "Create Worktree + Preflight",
       "completedAt": "2026-08-29T00:00:00Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-08-29T00:10:00Z",
+      "result": "APPROVED after 1 fix loop: BR-1.1 + AC-1.1 added (credential set must cover every is_recognized_auth_ref field, not just providers[].auth_ref)"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Tasks",
+      "completedAt": "2026-08-29T00:30:00Z",
+      "result": "6 ADRs (A-F), 6 tasks TASK-285..290, single-repo; OQ-1 settled (no event)"
     }
   ],
   "repos": {
