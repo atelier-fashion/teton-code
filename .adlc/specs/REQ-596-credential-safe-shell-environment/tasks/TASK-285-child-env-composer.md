@@ -1,7 +1,7 @@
 ---
 id: TASK-285
 title: "The child_env module: one composer, policy as parameters"
-status: pending
+status: complete
 parent: REQ-596
 created: 2026-08-29
 updated: 2026-08-29

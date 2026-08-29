@@ -91,6 +91,7 @@ pub mod auth;
 pub mod broadcast;
 pub mod call_sites;
 pub mod carry;
+pub mod child_env;
 pub mod classify;
 pub mod consent;
 pub mod cost;

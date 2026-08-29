@@ -56,7 +56,9 @@
   ],
   "phase4": {
     "currentTask": null,
-    "completedTasks": [],
+    "completedTasks": [
+      "TASK-285"
+    ],
     "failedTasks": []
   },
   "blockers": [],
