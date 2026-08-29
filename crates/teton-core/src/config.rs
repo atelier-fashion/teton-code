@@ -29,7 +29,7 @@ use crate::category::{
     categories_for_phase, CategoryOverride, ConfigurableCategory, JudgmentCategory, Tier,
     TierBinding,
 };
-use crate::entities::{ModelProvider, PrivacyBoundary};
+use crate::entities::{BoundaryOrigin, ModelProvider, PrivacyBoundary};
 use crate::mcp::{McpServerConfig, McpTransport};
 use crate::phase::Phase;
 use serde::{Deserialize, Serialize};
@@ -1652,16 +1652,21 @@ impl Config {
     /// How many builtin rows [`Self::effective_boundaries`] contributed — the
     /// `count` payload of `boundary_defaults_applied` (REQ-597 System Model).
     ///
-    /// Derived from the same condition the composer uses rather than by
-    /// subtracting two lengths, so the event cannot come to disagree with the
-    /// set it reports on.
+    /// Counted **from the composed set itself**, not by re-deriving the opt-out
+    /// condition beside it. The first version of this did re-derive it, and
+    /// AC-8's region check caught it: two readings of `DEFAULT_BOUNDARIES` are
+    /// two places the rule lives, and the day one changes, this event starts
+    /// reporting a number the enforced set does not have. Reading the composer's
+    /// own output makes that unrepresentable rather than merely unlikely.
+    ///
+    /// The cost is one composed `Vec` per call, and the caller is session
+    /// creation.
     #[must_use]
     pub fn builtin_boundary_count(&self) -> usize {
-        if self.privacy.disable_default_boundaries {
-            0
-        } else {
-            DEFAULT_BOUNDARIES.len()
-        }
+        self.effective_boundaries()
+            .iter()
+            .filter(|b| b.origin == BoundaryOrigin::Builtin)
+            .count()
     }
 
     /// Parse a config document from a TOML string. Does not validate — call

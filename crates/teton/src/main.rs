@@ -8375,4 +8375,90 @@ mod tests {
         let rendered = surface.lines_of(LineKind::Info).join("\n");
         assert!(rendered.contains("secrets/** [local-only] (yours)"), "{rendered}");
     }
+
+    /// **AC-9, the shared-body half.** `teton boundary list` and the in-session
+    /// `/boundary list` are still served by one function.
+    ///
+    /// BR-6 names both surfaces, and AC-9 asserts the rendering once. That is
+    /// only legitimate while they share a body — the day one grows its own
+    /// listing, a single assertion would be covering one surface and silently
+    /// claiming both, and a user could be shown a boundary set the other
+    /// surface does not report.
+    ///
+    /// A source scan because the property is structural: there is no runtime
+    /// value that says "these two dispatch to the same place". Read at compile
+    /// time via `include_str!`, never `read_to_string`, so the scan cannot end
+    /// up reading a different checkout than the one it was built from
+    /// (BUG-159).
+    ///
+    /// **Mutation**: give either dispatch its own listing loop instead of
+    /// calling `boundary_list_on`, and this fails.
+    #[test]
+    fn both_boundary_list_surfaces_share_one_body() {
+        const MAIN_RS: &str = include_str!("main.rs");
+
+        // The production half only. Without this the scan counts its own filter
+        // lines and reports one surface too many — a self-referential source
+        // check is the reliable way to write a test that is wrong about the
+        // thing it is looking at.
+        let production = match MAIN_RS.find("\n#[cfg(test)]\nmod tests {") {
+            Some(at) => &MAIN_RS[..at],
+            None => panic!("main.rs must keep its `#[cfg(test)] mod tests` marker"),
+        };
+
+        let calls = production
+            .lines()
+            .filter(|line| {
+                let t = line.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .filter(|line| line.contains("boundary_list_on("))
+            .count();
+
+        // Three: the slash-command dispatch, the `teton boundary list`
+        // subcommand, and the definition itself.
+        assert_eq!(
+            calls, 3,
+            "expected the two dispatches and one definition of \
+             `boundary_list_on`; a different count means a surface grew its own \
+             listing, or gained one"
+        );
+
+        // And exactly one place renders rows, so the labels cannot diverge.
+        //
+        // Matched on a word boundary, not as a substring: `tier_origin_label`
+        // is a different function about a different kind of origin, and a naive
+        // `contains` counts it. The looser scan reported a violation that was
+        // not one, which is the false positive a structural test can least
+        // afford.
+        let mentions_origin_label = |line: &str| {
+            let mut from = 0;
+            while let Some(at) = line[from..].find("origin_label(") {
+                let at = from + at;
+                let preceded_by_ident = at > 0
+                    && line[..at]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                if !preceded_by_ident {
+                    return true;
+                }
+                from = at + "origin_label(".len();
+            }
+            false
+        };
+        let renderers = production
+            .lines()
+            .filter(|line| {
+                let t = line.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .filter(|line| mentions_origin_label(line))
+            .count();
+        assert_eq!(
+            renderers, 2,
+            "`origin_label` must have exactly one call site plus its definition \
+             — a second renderer is a second answer to what protects the user"
+        );
+    }
 }
