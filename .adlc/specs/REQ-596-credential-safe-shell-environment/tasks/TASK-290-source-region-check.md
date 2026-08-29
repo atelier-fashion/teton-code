@@ -1,7 +1,7 @@
 ---
 id: TASK-290
 title: "AC-8: a region check that the child env has one construction site"
-status: pending
+status: complete
 parent: REQ-596
 created: 2026-08-29
 updated: 2026-08-29

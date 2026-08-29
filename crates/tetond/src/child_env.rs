@@ -418,6 +418,79 @@ mod tests {
         assert!(value_of(&composed, "SENTINEL_DB").is_some());
     }
 
+    /// How far above a `.envs(` the composer call may sit and still count as the
+    /// same region. Wide enough for a multi-line binding, narrow enough that a
+    /// composer call in a *different* function cannot vouch for this one.
+    const COMPOSER_REGION_LINES: usize = 30;
+
+    /// AC-8. A spawned child's environment has exactly one construction site,
+    /// and it is [`compose_child_env`].
+    ///
+    /// # Why this is a region check and not a count
+    ///
+    /// Counting `.envs(` call sites, or counting `compose_child_env` calls,
+    /// proves nothing about whether they are the *same* code: relocating a
+    /// required call keeps every count identical (conventions.md, LESSON-568).
+    /// So each `.envs(` is checked against its own neighbourhood — either its
+    /// argument is a direct `compose_child_env(...)` call, or it is an
+    /// identifier bound by one within [`COMPOSER_REGION_LINES`] above it. A
+    /// hand-built vector fails wherever it is written.
+    ///
+    /// **Mutation run.** Adding to `run_bounded`
+    /// `let sneaky: Vec<(String, String)> = vec![]; cmd.envs(sneaky);`
+    /// fails this test with `harness/tools/shell.rs: the environment passed to
+    /// .envs(sneaky) is not composed by compose_child_env`. Deleting the
+    /// `let child_env = ... compose_child_env(` binding while leaving
+    /// `.envs(child_env)` fails it the same way. Both were run and both went
+    /// red; the site was then removed.
+    #[test]
+    fn a_childs_environment_has_exactly_one_construction_site() {
+        let mut checked = 0_usize;
+
+        for (path, source) in crate::call_sites::scan::production_sources() {
+            let code = crate::call_sites::scan::code_only(&source);
+            let lines: Vec<&str> = code.lines().collect();
+
+            for (i, line) in lines.iter().enumerate() {
+                let Some(at) = line.find(".envs(") else {
+                    continue;
+                };
+                checked += 1;
+
+                let arg = line[at + ".envs(".len()..]
+                    .rsplit_once(')')
+                    .map_or("", |(before, _)| before)
+                    .trim();
+
+                // Direct form: `.envs(compose_child_env(...))`.
+                if arg.contains("compose_child_env") {
+                    continue;
+                }
+
+                // Identifier form: the binding must be a composer call, and it
+                // must be *near* — a call in another function does not vouch.
+                let from = i.saturating_sub(COMPOSER_REGION_LINES);
+                let bound_by_composer = lines[from..i].iter().any(|l| {
+                    l.contains(&format!("let {arg} ="))
+                        && l.contains("compose_child_env")
+                });
+                assert!(
+                    bound_by_composer,
+                    "{path}: the environment passed to .envs({arg}) is not composed by \
+                     compose_child_env. A second construction site is a second policy, and \
+                     the two drift — which is how the `shell` tool and the MCP spawn path \
+                     ended up disagreeing about credentials in the first place (AC-8)."
+                );
+            }
+        }
+
+        assert!(
+            checked >= 2,
+            "the scan found {checked} `.envs(` sites; it must see at least the shell and \
+             MCP spawn paths, or it is passing vacuously"
+        );
+    }
+
     /// BR-1.1. Both fields `is_recognized_auth_ref` gates contribute, and only
     /// the `env:` scheme names a variable at all. Built through `Config::from_toml`
     /// rather than by hand so the derivation is exercised over the shape the
