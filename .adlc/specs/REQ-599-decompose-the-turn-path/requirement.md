@@ -14,15 +14,29 @@ tags: ["refactor", "god-module", "decomposition", "run-prompt-turn", "traceabili
 
 ## Description
 
-`crates/tetond/src/runtime.rs` is 36,085 lines — **14,126 of them production
-code**, the remainder in-file `#[cfg(test)]` bodies. Even discounting tests
-correctly, that is roughly 47× the ~300-line splitting threshold, holding 64
-`pub fn`s and 38 types spanning session lifecycle, routing, skill dispatch,
-model consent, provider setup and migration, cost-ledger wiring, and MCP egress.
-Within it, `run_prompt_turn` is ~1,088 lines with ~109 branch points: session
-claiming, skill expansion, routing, budget checks, consent, dispatch, and commit
-in one `async fn`. `harness/turn_loop.rs::run_session_turn_with_pressure_policy`
-is a second ~762-line function with genuine 8–9 level nesting.
+`crates/tetond/src/runtime.rs` is a god module. **Measured on `main` at
+`fedcab1`, 2026-08-29** — a snapshot that drifts by tens of lines a day, which
+is why AC-1 records its target in the architecture doc rather than hard-coding
+one here:
+
+| | |
+|---|---|
+| `runtime.rs` total | 36,747 |
+| …of which **production** | **14,183** |
+| …in-file `#[cfg(test)]` | 22,564 (61%) |
+| `pub fn` in production | 67 |
+| `run_prompt_turn` | **1,084 lines** |
+| `turn_loop.rs::run_session_turn_with_pressure_policy` | **762 lines**, 8–9 levels of nesting |
+
+Even discounting tests correctly, the production half is roughly 47× the
+~300-line splitting threshold, spanning session lifecycle, routing, skill
+dispatch, model consent, provider setup and migration, cost-ledger wiring, and
+MCP egress. `run_prompt_turn` alone carries ~109 branch points — session
+claiming, skill expansion, routing, budget checks, consent, dispatch and commit
+in one `async fn`.
+
+The original draft cited 36,085 / 14,126 / 1,088 / 64, measured 2026-08-28.
+REQ-598 has since landed; the figures moved, the shape of the problem did not.
 
 The honest counter-argument, and it is a real one: this file is *heavily and
 deliberately documented*. Its comments carry REQ, ADR, LESSON, and BUG ids that
@@ -95,7 +109,22 @@ makes any extraction produce 10-argument functions.
 
 ## Assumptions
 
-- The documentation's REQ/ADR/LESSON ids are a usable proxy for the real seams. Where a stage's rationale ids cluster cleanly, that is a boundary; where they interleave across a proposed boundary, the boundary is wrong. This assumption is the REQ's central bet and should be validated early in `/architect`.
+- ~~The documentation's REQ/ADR/LESSON ids are a usable proxy for the real seams.~~
+  **REFUTED in Phase 2 — see architecture.md ADR-1.** Measured: of 19 REQ ids
+  appearing on 3+ production items, **1 is clustered and 13 are scattered across
+  the whole file** (REQ-561 spans 13,547 of 14,183 lines). Inside
+  `run_prompt_turn`, only 4 of 13 ids are local to one stage while 5 span the
+  entire function. A REQ id marks *a change*, and changes to a turn path are
+  overwhelmingly cross-cutting; it records which decision a line serves, not
+  which subsystem it belongs to. Read literally, the rule "where they interleave
+  across a proposed boundary, the boundary is wrong" would condemn every
+  possible boundary and make this REQ unimplementable — which is the tell that
+  the rule was wrong, not the file. The ids remain an asset to **preserve**
+  (BR-2, enforced by the sweep REQ-598 shipped) rather than a signal to
+  **navigate by**. ADR-2 replaces the method: seams come from the type/`impl`
+  structure, where the measurement is unambiguous — one `impl DaemonRuntime`
+  block of ~7,143 lines is the god module, and duty routing is the one grouping
+  already cohesive by position.
 - The 61% test fraction in `runtime.rs` means most of the raw line count moves mechanically with BR-7, and the genuinely hard part is the 14,126 production lines.
 - No in-flight REQ is concurrently rewriting `run_prompt_turn`. If one is, this REQ waits — a rebase across a 14k-line move is worse than a delay.
 
@@ -109,7 +138,7 @@ makes any extraction produce 10-argument functions.
 ## Out of Scope
 
 - Any behavior change. Defects noticed during the move are filed as BUGs, not fixed in-flight (conventions.md; a behavior fix hidden inside a 14k-line move is unreviewable).
-- Splitting `server.rs` (5,113 production lines), `session_ui.rs` (4,083), `main.rs` (4,145), `events.rs` (3,805), `permissions.rs` (3,521), or `budget.rs` (2,951). Each deserves the same treatment and its own REQ; doing them together reproduces the unreviewable-diff problem at workspace scale.
+- Splitting `server.rs` (5,169 production lines), `session_ui.rs` (4,132), `main.rs` (4,210), `events.rs` (3,815), `permissions.rs` (3,521), or `budget.rs` (2,951) — re-measured at `fedcab1`. Each deserves the same treatment and its own REQ; doing them together reproduces the unreviewable-diff problem at workspace scale.
 - Introducing new abstractions beyond what the extraction requires.
 
 ## Retrieved Context
