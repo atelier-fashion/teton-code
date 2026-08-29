@@ -1,7 +1,7 @@
 ---
 id: TASK-298
 title: "Traceability sweep: disappearance, re-association, and orphaning"
-status: draft
+status: complete
 parent: REQ-598
 created: 2026-08-29
 updated: 2026-08-29
