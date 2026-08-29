@@ -1,7 +1,7 @@
 ---
 id: TASK-286
 title: "Move the MCP spawn path onto the shared composer, provably unchanged"
-status: pending
+status: complete
 parent: REQ-596
 created: 2026-08-29
 updated: 2026-08-29

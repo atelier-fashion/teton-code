@@ -22,7 +22,7 @@
 //! the result that enters context. Either way, a boundary path a tool touched is
 //! never laundered to a remote provider (BR-1).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -744,16 +744,22 @@ fn compose_child_env<I>(
 where
     I: IntoIterator<Item = (String, String)>,
 {
-    let mut base: Vec<(String, String)> = daemon_vars
-        .into_iter()
-        .filter(|(k, _)| MCP_BASE_ENV_ALLOW.contains(&k.as_str()))
-        .collect();
-    crate::env_path::apply_path_floor(&mut base);
-    let mut env: BTreeMap<String, String> = base.into_iter().collect();
-    for (k, v) in declared {
-        env.insert(k.clone(), v.clone());
-    }
-    env.into_iter().collect()
+    // REQ-596: the composition itself moved to `crate::child_env`, shared with
+    // the `shell` tool so the two spawn paths cannot drift apart again. This
+    // stays as a named function because the *allowlist* is this path's own —
+    // passing it as a parameter is what keeps a change made for the shell tool
+    // from silently widening what a third-party MCP server inherits (BR-7.1).
+    //
+    // The credential set is deliberately **empty** here. BR-1 is a rule about
+    // the `shell` child, and changing the MCP path is out of this REQ's scope;
+    // an empty set is what makes the byte-identical guard below true rather than
+    // aspirational. The MCP path already excludes provider keys by allowlist.
+    crate::child_env::compose_child_env(
+        daemon_vars,
+        MCP_BASE_ENV_ALLOW,
+        &BTreeSet::new(),
+        declared,
+    )
 }
 
 /// A local MCP server spawned as a subprocess, speaking newline-delimited
@@ -785,9 +791,10 @@ impl StdioConnection {
     /// PATH/HOME/locale essentials from the daemon's environment, plus the
     /// per-server `env` the config declares. The daemon's provider API keys are
     /// **never** inherited — a third-party `npx`/`uvx` package cannot read them.
-    /// (This is stricter than the `shell` tool's denylist scrub: an MCP server is
-    /// a user-declared program, but it still has no business seeing provider
-    /// credentials it did not declare.)
+    /// (Since REQ-596 the `shell` tool composes its child the same way, through
+    /// the same function; this path's allowlist was the model for it rather than
+    /// the exception to it. An MCP server is a user-declared program, but it
+    /// still has no business seeing provider credentials it did not declare.)
     ///
     /// # Errors
     /// Returns [`McpError::Startup`] if the process cannot be spawned or its pipes
@@ -1372,6 +1379,74 @@ mod tests {
         assert!(!names.contains(&"RANDOM_DAEMON_VAR"));
         // And the secret value appears nowhere.
         assert!(!env.iter().any(|(_, v)| v.contains("should-not-leak")));
+    }
+
+    /// AC-4.1a (BR-7.1). `MCP_BASE_ENV_ALLOW`'s membership, asserted against a
+    /// **literal** list rather than against itself — REQ-596 moved this path onto
+    /// a composer shared with the `shell` tool, and the one thing that must not
+    /// have happened is the shell's needs widening this constant. A name added
+    /// here hands every third-party `npx`/`uvx` server the increment.
+    #[test]
+    fn req_596_did_not_widen_the_mcp_allowlist() {
+        let expected = [
+            "PATH", "HOME", "TMPDIR", "TZ", "TERM", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE",
+            "LC_ALL", "LC_CTYPE",
+        ];
+        assert_eq!(
+            MCP_BASE_ENV_ALLOW, &expected,
+            "widening this is a security regression in the path that was already correct; \
+             the shell tool has its own constant (child_env::SHELL_ENV_ALLOW)"
+        );
+    }
+
+    /// AC-4.1b. Sharing the composer must be provably free for the MCP path, not
+    /// merely intended to be — so this pins the *whole composed result* for a
+    /// fixed daemon environment and a fixed declared map, byte for byte, against
+    /// a literal written out here.
+    ///
+    /// `PATH` is asserted separately because the floor asks the filesystem which
+    /// package-manager prefixes exist, so its value is a property of the machine
+    /// rather than of this function. Everything else is pinned exactly.
+    #[test]
+    fn the_composed_mcp_environment_is_byte_identical_to_its_pre_req_596_form() {
+        let daemon_vars = vec![
+            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+            ("HOME".to_owned(), "/home/SENTINEL".to_owned()),
+            ("TERM".to_owned(), "xterm-256color".to_owned()),
+            ("LANG".to_owned(), "en_US.UTF-8".to_owned()),
+            ("TMPDIR".to_owned(), "/tmp/SENTINEL".to_owned()),
+            ("ANTHROPIC_API_KEY".to_owned(), "SENTINEL-not-a-key".to_owned()),
+            ("RANDOM_DAEMON_VAR".to_owned(), "SENTINEL-nope".to_owned()),
+        ];
+        let declared = BTreeMap::from([
+            ("MY_SERVER_SETTING".to_owned(), "on".to_owned()),
+            ("TERM".to_owned(), "dumb".to_owned()),
+        ]);
+
+        let env = compose_child_env(daemon_vars, &declared);
+        let without_path: Vec<(String, String)> =
+            env.iter().filter(|(k, _)| k != "PATH").cloned().collect();
+
+        let expected: Vec<(String, String)> = [
+            ("HOME", "/home/SENTINEL"),
+            ("LANG", "en_US.UTF-8"),
+            ("MY_SERVER_SETTING", "on"),
+            ("TERM", "dumb"),
+            ("TMPDIR", "/tmp/SENTINEL"),
+        ]
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+
+        assert_eq!(
+            without_path, expected,
+            "REQ-596 shared the composer with the shell tool; the MCP path's composed \
+             environment must be exactly what it was before"
+        );
+        assert!(
+            env.iter().filter(|(k, _)| k == "PATH").count() == 1,
+            "exactly one PATH, as the floor leaves behind"
+        );
     }
 
     #[test]
