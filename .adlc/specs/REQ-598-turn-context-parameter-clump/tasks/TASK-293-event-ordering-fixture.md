@@ -1,7 +1,7 @@
 ---
 id: TASK-293
 title: "Capture the pre-refactor event-ordering fixture on the base commit"
-status: draft
+status: complete
 parent: REQ-598
 created: 2026-08-29
 updated: 2026-08-29

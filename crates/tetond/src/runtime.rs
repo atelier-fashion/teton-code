@@ -30784,6 +30784,103 @@ provider_id = \"deepseek\"
             let _ = std::fs::remove_dir_all(&start);
             let _ = std::fs::remove_dir_all(&target);
         }
+
+    /// **REQ-598 AC-10 / BR-1 — the event-ordering fixture.**
+    ///
+    /// This REQ is a behavior-preserving refactor, and the risk it carries is
+    /// not that a test breaks: it is that a call whose *ordering* is
+    /// load-bearing gets silently relocated. The suite is large enough that a
+    /// reordered event can pass every existing assertion, because almost every
+    /// assertion asks whether something happened, not when.
+    ///
+    /// So one full turn's event sequence is recorded against a checked-in
+    /// golden file. Its whole value is its **provenance**: it was captured on
+    /// this branch's base commit, in TASK-293, before any `TurnContext` type
+    /// existed. A fixture regenerated after the refactor would be an oracle
+    /// computed by the subject — conventions.md's first named trap, and the
+    /// mechanism behind three of the seven false-green assertions REQ-592
+    /// shipped (LESSON-569).
+    ///
+    /// **What is recorded, and what is deliberately not.** Consecutive runs of
+    /// the same event name collapse to one entry. `session_update` is emitted
+    /// per streamed chunk, so recording every one would pin the scripted
+    /// engine's chunking — a fact this REQ does not touch and REQ-599 would
+    /// have to relitigate. Collapsing runs preserves *ordering*, which is what
+    /// BR-1 is about, while leaving chunk counts free. Transposing two
+    /// adjacent distinct events still fails; transposing two identical
+    /// adjacent events is a no-op.
+    ///
+    /// **This test can fail** (conventions.md: show it before trusting it).
+    /// Mutation executed in TASK-293: swapped the recorded sequence's last two
+    /// distinct entries before comparing, and the assertion went red naming
+    /// both the expected and actual position. Reverted.
+    mod req598_event_order {
+        use super::*;
+
+        /// The golden sequence, captured on the base commit.
+        const FIXTURE: &str = include_str!("../tests/fixtures/req598_turn_event_order.txt");
+
+        /// Event names in order, with consecutive duplicates collapsed.
+        ///
+        /// Drained with `try_recv` rather than `recv` under a timeout:
+        /// `EventBus::publish` is synchronous, so once the turn has returned
+        /// every event it published is already queued. A wall-clock poll is the
+        /// assertion shape that goes flaky first under CI scheduler pressure
+        /// (LESSON-450).
+        fn drain_names(sub: &mut crate::broadcast::Subscription) -> Vec<String> {
+            let mut names: Vec<String> = Vec::new();
+            while let Some(env) = sub.try_recv() {
+                let name = env.event_name().to_owned();
+                if names.last().map(String::as_str) != Some(name.as_str()) {
+                    names.push(name);
+                }
+            }
+            names
+        }
+
+        /// The fixture's expected entries — comment and blank lines stripped,
+        /// so the golden file can carry its own provenance header.
+        fn expected() -> Vec<String> {
+            FIXTURE
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(str::to_owned)
+                .collect()
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn one_full_turn_publishes_its_events_in_the_order_the_fixture_records() {
+            let (runtime, _seen) = carry_runtime(&[Scripted::Say("Noted.")]);
+            let events = Arc::new(EventBus::new());
+            let mut sub = events.subscribe(4_096);
+            let (sessions, session_id) = one_session();
+
+            prompt(
+                &runtime,
+                &events,
+                &sessions,
+                &session_id,
+                None,
+                "remember the retry budget",
+            )
+            .await
+            .expect("the scripted turn completes");
+
+            let actual = drain_names(&mut sub);
+            let expected = expected();
+
+            assert!(
+                !expected.is_empty(),
+                "the fixture is empty — a golden file that records nothing \
+                 cannot fail, which is the vacuity this test exists to avoid"
+            );
+            assert_eq!(
+                actual, expected,
+                "the turn's event ordering changed.\n  expected: {expected:?}\n    actual: {actual:?}"
+            );
+        }
+    }
     }
 
     /// REQ-586: the budget follows the route attempt.

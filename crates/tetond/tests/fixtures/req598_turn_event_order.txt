@@ -1,0 +1,20 @@
+# REQ-598 AC-10 / BR-1 golden event sequence for one full prompt turn.
+#
+# PROVENANCE (load-bearing): captured in TASK-293 on this branch base commit,
+# before any TurnContext type existed. A fixture regenerated after the refactor
+# would be an oracle computed by the subject (conventions.md; LESSON-569).
+#
+# base commit: 17c39ec4f26432fae22bfb4d266159ce8afb614f
+#
+# Consecutive runs of the same event name are collapsed to one entry - see the
+# module doc comment for why chunk counts are deliberately not pinned.
+#
+# The two route_decided entries are not a duplicate: the first is the title
+# duty's announced route, the second the turn's own. REQ-561 TASK-062 puts the
+# naming ahead of the turn, and REQ-580 puts it after the warming hold - so this
+# ordering is exactly the load-bearing kind BR-1 forbids relocating.
+route_decided
+session_titled
+route_decided
+session_update
+prefix_cache
