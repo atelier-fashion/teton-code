@@ -1,7 +1,7 @@
 ---
 id: TASK-289
 title: "The CLI half: boundary list reports origin, and the warning reaches a person"
-status: pending
+status: complete
 parent: REQ-597
 repo: teton-code
 created: 2026-08-29

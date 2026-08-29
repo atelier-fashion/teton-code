@@ -29,7 +29,8 @@ use teton_protocol::effort::EffortLevel;
 use teton_protocol::handshake::HandshakeResult;
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
-    CategoryBindingConfig, ConfigGetParams, ConfigSetParams, ConfigSetResult, ConfigSnapshot,
+    BoundaryOriginConfig, CategoryBindingConfig, ConfigGetParams, ConfigSetParams,
+    ConfigSetResult, ConfigSnapshot,
     ConfigUpdate, ContentClass, CostQueryParams, CostQueryResult, CostReportView, ModelListParams,
     ModelListResult, ModelSetParams, ModelStatusParams, ModelStatusResult, PrivacyBoundaryConfig,
     PromptTurnParams, ProviderConfig, SessionCreateParams, SessionPermissionsParams,
@@ -2748,26 +2749,7 @@ pub(crate) fn boundary_list_on(
     ctx: &mut UiContext<'_>,
 ) -> anyhow::Result<()> {
     match conn.call(ConfigGetParams::default(), ctx)? {
-        Ok(cfg) => {
-            if cfg.snapshot.privacy.is_empty() {
-                ctx.surface.line(
-                    LineKind::Info,
-                    "no privacy boundaries configured. Add one with `teton boundary add`.",
-                );
-            } else {
-                ctx.surface.line(LineKind::Info, "privacy boundaries:");
-                for boundary in &cfg.snapshot.privacy {
-                    ctx.surface.line(
-                        LineKind::Info,
-                        &format!(
-                            "  {} [{}]",
-                            boundary.path_glob,
-                            privacy_label(boundary.mode)
-                        ),
-                    );
-                }
-            }
-        }
+        Ok(cfg) => render_boundaries(&cfg.snapshot.privacy, ctx.surface),
         Err(err) if err.code == error_code::METHOD_NOT_FOUND => ctx.surface.line(
             LineKind::Notice,
             "this daemon build does not implement config/get yet (wiring in progress).",
@@ -4166,6 +4148,59 @@ pub(crate) fn kind_label(kind: ProviderKind) -> &'static str {
 }
 
 /// Wire-name label for a privacy mode.
+/// Render the effective boundary set (REQ-597 BR-6).
+///
+/// Pure over the rows and the surface, like [`render_config`], so AC-9 can
+/// assert on the **lines a person sees** rather than on an exit code
+/// (LESSON-519). `teton boundary list` and the in-session `/boundary list`
+/// share `boundary_list_on`, which is this function's only caller, so one
+/// assertion here covers both surfaces.
+fn render_boundaries(rows: &[PrivacyBoundaryConfig], surface: &mut dyn Surface) {
+    if rows.is_empty() {
+        // REQ-597 BR-3: after this REQ an empty list has exactly one cause, so
+        // the sentence names it. "Add one with `teton boundary add`" alone
+        // would be true and useless — it invites the user to rebuild by hand a
+        // set they already had and switched off, without mentioning the switch.
+        surface.line(
+            LineKind::Notice,
+            "no privacy boundaries are in force. The shipped default set is off \
+             (`[privacy] disable_default_boundaries = true`); remove that key to \
+             restore it, or add your own with `teton boundary add`.",
+        );
+        return;
+    }
+    surface.line(LineKind::Info, "privacy boundaries:");
+    // Composed order, rendered as it is: user rows first, then the builtins
+    // (BR-2.1). A user row that collides with a builtin prints twice,
+    // deliberately — that is what shadowing looks like, and someone reading
+    // this list to check what protects them needs to see which row governs.
+    for boundary in rows {
+        surface.line(
+            LineKind::Info,
+            &format!(
+                "  {} [{}] ({})",
+                boundary.path_glob,
+                privacy_label(boundary.mode),
+                origin_label(boundary.origin)
+            ),
+        );
+    }
+}
+
+/// How a boundary's origin is named on the `boundary list` surface (REQ-597
+/// BR-6).
+///
+/// Rendered from the wire value rather than inferred from the row's position:
+/// position happens to be a reliable proxy today (user rows sort first), and
+/// that is exactly why reading it would be a latent bug — the day composition
+/// order changes, the labels would silently start lying.
+fn origin_label(origin: BoundaryOriginConfig) -> &'static str {
+    match origin {
+        BoundaryOriginConfig::User => "yours",
+        BoundaryOriginConfig::Builtin => "built-in",
+    }
+}
+
 fn privacy_label(mode: PrivacyMode) -> &'static str {
     match mode {
         PrivacyMode::LocalOnly => "local-only",
@@ -8230,5 +8265,114 @@ mod tests {
             "an unattended above-floor install happened silently: {:?}",
             surface.calls
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-597 AC-9 — `boundary list` reports what protects you, and whose it is
+    // -----------------------------------------------------------------------
+
+    fn boundary_row(
+        glob: &str,
+        mode: PrivacyMode,
+        origin: BoundaryOriginConfig,
+    ) -> PrivacyBoundaryConfig {
+        PrivacyBoundaryConfig {
+            path_glob: glob.to_owned(),
+            mode,
+            origin,
+        }
+    }
+
+    /// **AC-9.** Every row is labelled with its origin, asserted on the rendered
+    /// lines rather than inferred from an exit code (LESSON-519).
+    ///
+    /// **Mutation**: drop `origin_label` from the format string and the two
+    /// label assertions fail.
+    #[test]
+    fn every_boundary_row_is_labelled_with_its_origin() {
+        let mut surface = RecordingSurface::new();
+        render_boundaries(
+            &[
+                boundary_row("src/vendor/**", PrivacyMode::LocalOnly, BoundaryOriginConfig::User),
+                boundary_row("**/.env", PrivacyMode::LocalOnly, BoundaryOriginConfig::Builtin),
+                boundary_row("**/.ssh/**", PrivacyMode::LocalOnly, BoundaryOriginConfig::Builtin),
+            ],
+            &mut surface,
+        );
+        let lines = surface.lines_of(LineKind::Info);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("src/vendor/** [local-only] (yours)"), "{rendered}");
+        assert!(rendered.contains("**/.env [local-only] (built-in)"), "{rendered}");
+        assert!(rendered.contains("**/.ssh/** [local-only] (built-in)"), "{rendered}");
+        // Composed order survives the renderer: the user's row is listed first.
+        let user_at = rendered.find("src/vendor/**").expect("the user row renders");
+        let builtin_at = rendered.find("**/.env").expect("the builtin row renders");
+        assert!(user_at < builtin_at, "user rows precede builtins:\n{rendered}");
+    }
+
+    /// A user row that shadows a builtin renders **twice**, user first.
+    ///
+    /// The listing reports the composed set as it is. Deduping for tidiness
+    /// would hide the shadowing, which is the one thing a person reading this
+    /// list to check their protection actually needs to see.
+    ///
+    /// **Mutation**: dedupe by `path_glob` in the renderer and this fails.
+    #[test]
+    fn a_shadowing_user_row_and_its_builtin_both_render() {
+        let mut surface = RecordingSurface::new();
+        render_boundaries(
+            &[
+                boundary_row("**/.env", PrivacyMode::RedactThenRemote, BoundaryOriginConfig::User),
+                boundary_row("**/.env", PrivacyMode::LocalOnly, BoundaryOriginConfig::Builtin),
+            ],
+            &mut surface,
+        );
+        let rendered = surface.lines_of(LineKind::Info).join("\n");
+
+        assert!(rendered.contains("**/.env [redact-then-remote] (yours)"), "{rendered}");
+        assert!(rendered.contains("**/.env [local-only] (built-in)"), "{rendered}");
+        assert_eq!(
+            rendered.matches("**/.env").count(),
+            2,
+            "both the shadowing row and the row it shadows are listed:\n{rendered}"
+        );
+    }
+
+    /// **BR-3.** The empty list has exactly one cause after REQ-597, so the
+    /// sentence names it — and names it as a `Notice`, because "nothing is
+    /// protecting you" is not neutral information.
+    ///
+    /// **Mutation**: restore the old "no privacy boundaries configured. Add one
+    /// with `teton boundary add`." and both assertions fail.
+    #[test]
+    fn an_empty_boundary_list_names_the_key_that_emptied_it() {
+        let mut surface = RecordingSurface::new();
+        render_boundaries(&[], &mut surface);
+
+        let rendered = surface.lines_of(LineKind::Notice).join("\n");
+        assert!(
+            rendered.contains("disable_default_boundaries"),
+            "an empty list must name the switch that caused it: {rendered}"
+        );
+        assert!(
+            surface.lines_of(LineKind::Info).is_empty(),
+            "the empty case draws no listing"
+        );
+    }
+
+    /// **AC-9.1, at this surface.** A row from a daemon that predates REQ-597
+    /// carries no origin, and must render as the user's rather than panicking
+    /// or printing a placeholder.
+    #[test]
+    fn a_row_from_an_older_daemon_renders_as_a_user_row() {
+        let row: PrivacyBoundaryConfig =
+            serde_json::from_str(r#"{"path_glob":"secrets/**","mode":"local_only"}"#)
+                .expect("a pre-REQ-597 row parses");
+        let mut surface = RecordingSurface::new();
+        render_boundaries(&[row], &mut surface);
+
+        let rendered = surface.lines_of(LineKind::Info).join("\n");
+        assert!(rendered.contains("secrets/** [local-only] (yours)"), "{rendered}");
     }
 }
