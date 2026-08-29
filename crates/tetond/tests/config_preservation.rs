@@ -379,6 +379,7 @@ fn register(id: &str) -> ConfigUpdate {
         // what it was (`max_context = 0`, no cap line).
         max_context: None,
         context_budget_cap: None,
+        allow_cleartext: None,
         floored_budget: None,
     })
 }
@@ -924,6 +925,7 @@ max_context = 200000
             auth_ref: Some("keychain:anthropic".to_owned()),
             max_context,
             context_budget_cap: cap,
+            allow_cleartext: None,
             floored_budget: None,
         })
     };
@@ -1585,6 +1587,7 @@ fn declare_kimis_window(max_context: u32) -> ConfigUpdate {
         auth_ref: Some("keychain:kimi".to_owned()),
         max_context: Some(max_context),
         context_budget_cap: None,
+        allow_cleartext: None,
         floored_budget: None,
     })
 }

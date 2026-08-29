@@ -666,6 +666,7 @@ fn provider_runtime_with_fallback(
             auth_ref: None,
             max_context: window,
             context_budget_cap: None,
+            allow_cleartext: None,
             floored_budget: None,
         }))
         .expect("registering a provider");
@@ -679,6 +680,7 @@ fn provider_runtime_with_fallback(
                 auth_ref: None,
                 max_context: Some(fallback_window),
                 context_budget_cap: None,
+                allow_cleartext: None,
                 floored_budget: None,
             }))
             .expect("registering the fallback provider");

@@ -1485,6 +1485,19 @@ pub struct ProviderConfig {
     /// spelling covers them.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub floored_budget: Option<FlooredBudget>,
+    /// Permit an `auth_ref` beside a cleartext `http://` endpoint on a
+    /// non-loopback host — `ModelProvider::allow_cleartext` (BUG-202, BUG-205).
+    ///
+    /// Field-wise on a `RegisterProvider` update, exactly like `max_context`:
+    /// `Some(v)` writes, **`None` preserves whatever is stored**. That asymmetry
+    /// is load-bearing — a client predating the field, or a re-registration made
+    /// for an unrelated reason (`--model`, a window), must not clear an opt-out
+    /// the user set deliberately.
+    ///
+    /// On a snapshot the daemon populates it, so `provider list` can show the
+    /// posture rather than leaving it invisible.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub allow_cleartext: Option<bool>,
 }
 
 /// The budget a provider whose declaration fell **below the floor** actually
@@ -2906,6 +2919,22 @@ pub struct ProviderSetupCandidate {
     /// predating the field sends; absent from the wire when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_context: Option<u32>,
+    /// Register this provider even though its endpoint is a cleartext
+    /// `http://` URL on a non-loopback host — `allow_cleartext` on the written
+    /// row (BUG-202, BUG-205).
+    ///
+    /// The flag `teton provider add --allow-cleartext` sets. Without it the
+    /// daemon refuses such a candidate at **preview**, before a key is stored;
+    /// BUG-205 was that the refusal named a remedy no command could reach, and
+    /// `provider add` is the only command that writes a keychain entry, so a
+    /// closed door here was a closed door to registering at all.
+    ///
+    /// `None` is not `false` — it is "this client said nothing", which leaves a
+    /// stored opt-out untouched on a re-registration. The `max_context` rule,
+    /// one field over, for the same reason: an older client that predates the
+    /// field must not clear it (BUG-155's class, mutation-tested).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_cleartext: Option<bool>,
 }
 
 /// Show exactly what registering the candidate would write, without writing it
@@ -3943,6 +3972,7 @@ mod tests {
                     // the declared window, and no cap.
                     max_context: Some(200_000),
                     context_budget_cap: None,
+                    allow_cleartext: None,
                     floored_budget: None,
                 }],
                 tiers: vec![TierRouteView {
@@ -4205,6 +4235,7 @@ mod tests {
                 auth_ref: Some("keychain://teton/kimi".to_owned()),
                 max_context: Some(131_072),
                 context_budget_cap: Some(65_536),
+                allow_cleartext: None,
                 floored_budget: None,
             }],
             redact_enabled: true,
@@ -4399,6 +4430,7 @@ mod tests {
                 // with the absent default.
                 max_context: Some(128_000),
                 context_budget_cap: Some(64_000),
+                allow_cleartext: None,
                 floored_budget: None,
             }),
             ConfigUpdate::SetTierBinding(TierBindingConfig {
@@ -5499,6 +5531,7 @@ mod tests {
             }],
             // REQ-586: the recipe's window, carried silently into the
             // candidate so the registration records one (BR-3).
+            allow_cleartext: None,
             max_context: Some(131_072),
         }
     }
@@ -5650,6 +5683,7 @@ mod tests {
                 bindings: vec![],
                 // A candidate built from no recipe: the window stays unknown,
                 // and the key stays off the wire (REQ-586).
+                allow_cleartext: None,
                 max_context: None,
             },
         });

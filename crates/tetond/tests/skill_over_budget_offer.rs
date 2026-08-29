@@ -2322,6 +2322,7 @@ async fn a_provider_changed_while_the_offer_waits_is_not_reverted_by_the_remedy(
                 auth_ref: None,
                 max_context: None,
                 context_budget_cap: None,
+                allow_cleartext: None,
                 floored_budget: None,
             }))
             .expect("the user's own re-registration lands");

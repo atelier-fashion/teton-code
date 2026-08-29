@@ -301,6 +301,16 @@ impl Answers {
             // flow asks no question about it, and the daemon decides whether
             // the pinned model is the one it describes.
             max_context: Some(self.max_context),
+            // BUG-205: the guided wizard asks no cleartext question, so it
+            // contributes no answer — the `context_budget_cap` reasoning, one
+            // field over. `None` preserves a stored opt-out rather than
+            // clearing it, and a wizard registration of a *new* cleartext
+            // provider is still refused at preview, pointing at
+            // `teton provider add --allow-cleartext`, which is a command that
+            // exists. Teaching the wizard to ask is BUG-205's option (b), left
+            // open because a prompt here must not be answerable by a headless
+            // process (the BR-10(b) class).
+            allow_cleartext: None,
         }
     }
 

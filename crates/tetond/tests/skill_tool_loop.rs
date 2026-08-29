@@ -498,6 +498,7 @@ impl Harness {
                 auth_ref: None,
                 max_context: window,
                 context_budget_cap: None,
+                allow_cleartext: None,
                 floored_budget: None,
             }))
             .expect("registering a provider");

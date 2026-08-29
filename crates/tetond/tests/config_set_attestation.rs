@@ -615,6 +615,7 @@ fn the_remedys_gate_sits_at_its_own_door_and_not_in_the_shared_config_body() {
             auth_ref: Some("env:TETON_REQ589_TEST_CREDENTIAL_ABSENT".to_owned()),
             max_context: Some(1_000_000),
             context_budget_cap: None,
+            allow_cleartext: None,
             floored_budget: None,
         }))
         .expect(
