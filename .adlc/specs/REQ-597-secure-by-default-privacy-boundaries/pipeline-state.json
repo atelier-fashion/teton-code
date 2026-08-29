@@ -2,7 +2,7 @@
   "req": "REQ-597",
   "branch": "feat/REQ-597-secure-by-default-boundaries",
   "startedAt": "2026-08-29T00:00:00Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -67,6 +68,18 @@
       "name": "PR Cleanup & CI",
       "completedAt": "2026-08-29T16:10:00Z",
       "note": "Rebase/merge onto REQ-596 (already merged). 2 conflicts resolved: runtime.rs (both added a method before config_snapshot; kept both and returned config_snapshot's orphaned doc comment to it) and CHANGELOG.md (both added an Unreleased section; merged, Changed before Security). All 7 CI checks green."
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup and Merge",
+      "completedAt": "2026-08-29T16:20:00Z",
+      "mergeCommit": "6e7a554723ca07ab2a4db965a612a96082d98427",
+      "knowledge": [
+        "LESSON-587",
+        "LESSON-588",
+        "LESSON-589",
+        "ASSUME-025"
+      ]
     }
   ],
   "repos": {
@@ -78,10 +91,11 @@
       "touched": true,
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/234",
       "prNumber": 234,
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null,
-      "prCreatedAt": "2026-08-29T00:00:00Z"
+      "prCreatedAt": "2026-08-29T00:00:00Z",
+      "mergeCommit": "6e7a554723ca07ab2a4db965a612a96082d98427"
     }
   },
   "mergeOrder": [
@@ -102,5 +116,9 @@
     "failedTasks": []
   },
   "blockers": [],
-  "notes": []
+  "notes": [
+    "Single-repo topology: this runner owned the merge. PR #234 squash-merged as 6e7a554.",
+    "Rebase note: REQ-596 merged first; conflicts in runtime.rs and CHANGELOG.md resolved by keeping both sides. The runtime.rs resolution also returned config_snapshot's doc comment to config_snapshot -- both REQs had inserted a new method between that doc comment and its attribute.",
+    "OQ-5 recorded: the default set's reach extends past its glob list to all unpinnable provenance (LESSON-587)."
+  ]
 }
