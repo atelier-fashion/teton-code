@@ -3,11 +3,12 @@
   "branch": "feat/REQ-597-secure-by-default-boundaries",
   "startedAt": "2026-08-29T00:00:00Z",
   "completed": false,
-  "currentPhase": 3,
+  "currentPhase": 4,
   "completedPhases": [
     0,
     1,
-    2
+    2,
+    3
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -27,6 +28,13 @@
       "name": "Architect & Tasks",
       "completedAt": "2026-08-29T00:40:00Z",
       "tasks": 8
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture",
+      "completedAt": "2026-08-29T00:50:00Z",
+      "result": "approved",
+      "findings": "1 fixed inline: composer dedupe semantics unstated"
     }
   ],
   "repos": {

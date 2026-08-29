@@ -35,6 +35,10 @@ BR-6's rendering and BR-5's user-visible surface. Both `teton boundary list` and
       happened, and an ungated line on every session start is chrome.
 - [ ] An unknown/absent origin from an older daemon renders as a user row rather than panicking
       or printing a placeholder.
+- [ ] A user row whose glob collides with a builtin renders as **two** lines, user first. The
+      listing reports the composed set as it is, so a reader can see that their row shadows a
+      builtin. Do not dedupe in the renderer for tidiness — that hides the shadowing, which is
+      the one thing a person reading this list to check their protection needs to see.
 
 ## Technical Notes
 

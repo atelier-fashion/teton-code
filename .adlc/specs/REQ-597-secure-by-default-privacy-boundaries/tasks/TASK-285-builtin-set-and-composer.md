@@ -41,6 +41,12 @@ seven call sites depend on them.
       yields the composition. There is no other path to an empty result when user rows exist.
 - [ ] BR-7: with a user row `**/.env` declared, `BoundaryMatcher::new(&effective).match_path(".env")`
       returns the **user's** row — asserted on `origin` and `mode`, not on `is_some()`.
+- [ ] **No deduplication.** A user row whose glob is byte-identical to a builtin leaves *both*
+      rows in the composed list, user first. A unit test asserts the composed length is
+      `users + 13` even when a glob collides. BR-7's "one block, not two" is a statement about
+      enforcement, which `match_path` already guarantees by returning exactly one row —
+      collapsing the pair in the composer instead would break AC-4.1 (which needs both rows
+      present to prove which one wins) and would hide a builtin from `boundary list`.
 - [ ] A table-driven unit test asserts each of the thirteen globs matches at least one
       repo-root-relative path it is meant to catch (`.ssh/id_rsa`, `.env`, `.env.local`,
       `.aws/credentials`, `.netrc`, `.npmrc`, `.git-credentials`, `.docker/config.json`,
