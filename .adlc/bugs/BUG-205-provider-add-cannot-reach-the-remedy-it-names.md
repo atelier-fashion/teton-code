@@ -1,7 +1,7 @@
 ---
 id: BUG-205
 title: "provider add refuses a cleartext LAN registration and names a remedy the command cannot reach"
-status: in-review
+status: resolved
 severity: medium
 created: 2026-08-28
 updated: 2026-08-28
@@ -163,6 +163,20 @@ option (b), still open.
 - Falsification in the merge test: with no opt-out ever supplied, the same
   endpoint is still refused — so the passing halves test the flag, not the
   endpoint.
+
+## Deployment
+
+- Merged to `main` as `0b055d9` via https://github.com/atelier-fashion/teton-code/pull/230 on 2026-08-28.
+- No service deploy applies — ships via tagged release. **Not yet in a tagged
+  release** (newest tag v0.1.26), which means BUG-202's dead end never reaches a
+  released build: both landed in the same unreleased window.
+
+## Lessons
+
+- `.adlc/knowledge/lessons/LESSON-583-a-refusal-must-name-a-reachable-remedy.md`
+  — naming a remedy is not the same as making one reachable; plus the
+  `Option<bool>` / never-`Some(false)` rule for making an internal field
+  settable.
 
 ## Files Changed
 
