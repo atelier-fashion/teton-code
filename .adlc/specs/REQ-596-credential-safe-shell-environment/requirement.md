@@ -1,7 +1,7 @@
 ---
 id: REQ-596
 title: "A credential-safe environment for the shell tool, and an honest egress claim"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-28
 updated: 2026-08-29
