@@ -1,7 +1,7 @@
 ---
 id: REQ-596
 title: "A credential-safe environment for the shell tool, and an honest egress claim"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-28
 updated: 2026-08-29
@@ -60,7 +60,7 @@ named below.
 |--------|-------|------|-------------|
 | `ChildEnvPolicy` | `allow` | set of string | The only variable names admitted to a child by name. Membership is BR-2.1's recorded set. Per BR-7.1 this is a **parameter** of the shared composer, not a global: the shell and MCP call sites each pass their own constant, so widening one can never widen the other |
 | `ChildEnvPolicy` | `credential_value_rule` | predicate | `looks_like_credential_url`, applied to what `allow` admits (BR-8). Retained from today's scrub, not superseded by it — `allow` reasons about names, this reasons about values |
-| `ChildEnvPolicy` | `credential_env_names` | set of string | Resolved from every configured `auth_ref = "env:<NAME>"`; removed unconditionally |
+| `ChildEnvPolicy` | `credential_env_names` | set of string | Resolved from every configured `env:<NAME>` credential reference — **every** field `is_recognized_auth_ref` gates (BR-1.1), not only `[[providers]].auth_ref`; removed unconditionally |
 | `ChildEnvPolicy` | `path_floor` | string | The BUG-174 `PATH` floor, applied after composition |
 
 ### Events
@@ -77,7 +77,8 @@ named below.
 
 ## Business Rules
 
-- [ ] BR-1: Every environment variable named by a configured `auth_ref = "env:<NAME>"` is absent from the shell child's environment, regardless of whether its name matches any credential-shaped pattern. The credential set is derived from the loaded config, not guessed from the name (informed by LESSON-432 — derive from what a thing *is*, not from the shape of its name).
+- [ ] BR-1: Every environment variable named by a configured credential reference of the form `env:<NAME>` is absent from the shell child's environment, regardless of whether its name matches any credential-shaped pattern. The credential set is derived from the loaded config, not guessed from the name (informed by LESSON-432 — derive from what a thing *is*, not from the shape of its name).
+- [ ] BR-1.1: "Configured credential reference" means **every** field `is_recognized_auth_ref` gates, not only `[[providers]].auth_ref`. Today that is two: `[[providers]].auth_ref` and `[web] search_key_ref`. Both are validated by that one predicate and both resolve through the same `env:` arm of the secret resolver (`std::env::var`), so both name a live variable in the daemon's process environment. Covering only the provider half would ship the leak this REQ exists to close, in the field that merely happens to have been written second. The derivation enumerates the gated fields at one site, so a third such field added later is covered without amending this rule (informed by LESSON-568 — an invariant with more than one enforcement point needs a sweep, not a fix).
 - [ ] BR-2: The shell child's environment is composed by a **positive allowlist**. A variable not on the allowlist and not explicitly declared is absent. Adding a new variable to the daemon's own environment must not silently widen what the child sees.
 - [ ] BR-2.1: The allowlist has a **named starting set**, not an unstated one. It is the MCP path's twelve (`PATH`, `HOME`, `TMPDIR`, `TZ`, `TERM`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LANGUAGE`, `LC_ALL`, `LC_CTYPE`) plus any addition that meets this criterion and only this one: **a variable an ordinary development command needs in order to run at all, which cannot hold a credential.** `/architect` may extend the set under that criterion and must record each addition's justification; it may not leave the membership implicit. An allowlist nobody wrote down is a denylist with extra steps — the reviewer cannot tell an omission from a decision.
 - [ ] BR-3: BR-1 is enforced **after** BR-2, unconditionally. A credential env name that also appears on the allowlist is still removed — the allowlist cannot re-admit it.
@@ -91,6 +92,7 @@ named below.
 ## Acceptance Criteria
 
 - [ ] AC-1: With `auth_ref = "env:DEEPSEEK_AUTH"` configured and `DEEPSEEK_AUTH` set in the daemon's environment, a `shell` invocation of `env` produces output containing no occurrence of the variable name or its value.
+- [ ] AC-1.1: AC-1 holds for a credential configured as `[web] search_key_ref = "env:WEB_SEARCH_SENTINEL"` — the second field BR-1.1 names. Without this, a test suite green on the provider field alone is not evidence BR-1 is enforced over the set it claims.
 - [ ] AC-2: AC-1 holds for a name matching **no** denylist substring (`MY_LLM_CRED`, `GEMINI_PW`, `LLM_AUTH`) — proving the fix is not the old substring rule in new clothing.
 - [ ] AC-3: A variable that is neither on the allowlist nor a credential (`RANDOM_UNRELATED_VAR=1`) is absent from the child, proving BR-2's allowlist direction rather than an extended denylist.
 - [ ] AC-3.1: **The positive direction.** Every name in BR-2.1's starting set is *present* in the child with the daemon's value (`PATH` excepted — AC-4 owns it). Without this, AC-3 is satisfiable by an allowlist that admits nothing, and a shell tool that can run no ordinary command would pass every other criterion here.
@@ -98,7 +100,7 @@ named below.
 - [ ] AC-4: `PATH` in the child names the machine's package-manager prefixes (BUG-174 regression guard).
 - [ ] AC-4.1: **BR-7.1 guard** — a test asserts `MCP_BASE_ENV_ALLOW` is unchanged by this REQ, and that the MCP child's composed environment is byte-identical to its pre-REQ form for a fixed daemon environment. Sharing the composer must be provably free for the MCP path, not merely intended to be.
 - [ ] AC-4.2: **BR-8 guard** — a variable on the allowlist whose value is `scheme://user:pass@host` is withheld from the child, proving the value signal still runs after the allowlist. Paired with a same-named variable holding an ordinary non-URL value, which *is* admitted — so the test pins the value rule and not the name.
-- [ ] AC-5: **Mutation test** — deleting the BR-1 credential-removal step causes AC-1 and AC-2 to fail; separately, deleting the BR-8 value check causes AC-4.2 to fail. Both mutations are recorded in the tests' doc comments. A test that passes with the guard removed is not evidence the guard works (informed by LESSON-550 — assert the defect's absence, not the remedy's presence; and conventions.md "show the test can fail").
+- [x] AC-5: **Mutation test** — both mutations are run and recorded in the tests' doc comments with the count and text of what went red. **Amended during implementation, and the amendment is the finding.** As written, AC-5 claimed deleting the BR-1 removal step would fail AC-1 and AC-2. It does not, and cannot: under BR-2 a credential whose name is not on the allowlist was never admitted, so two guards stand between it and the child and removing one changes nothing observable. AC-5 was written for a world where BR-1 is the only guard, which BR-2 stopped being true. The mutation is therefore pinned where BR-1 *is* load-bearing — an **allowlisted** name the config declares a credential, which is BR-3's scenario — and deleting the removal step fails exactly 3 assertions there. The two named-credential assertions stay green, and the test says so rather than claiming a coverage it does not have. Separately, deleting the BR-8 value check fails AC-4.2 (1 assertion). A test that passes with the guard removed is not evidence the guard works (LESSON-550), and neither is an AC that asserts a mutation nobody ran.
 - [ ] AC-6: The test asserts the **absence of the value in captured child output**, not the presence of a scrub call.
 - [ ] AC-7: Test fixtures use obviously synthetic sentinels containing `SENTINEL`, never realistic provider key shapes (informed by LESSON-497).
 - [ ] AC-8: A source-level check asserts that the shell child's environment is constructed only by the shared composer — a second construction site fails the check. This is a **region check over the source**, not a count of call sites (informed by LESSON-568 as recorded in conventions.md; a relocated call keeps a count identical).
@@ -115,7 +117,7 @@ named below.
 
 ## Open Questions
 
-- [ ] OQ-1: Should `shell_env_withheld` be emitted at all? It tells a user why their command lost a variable, but a count alone may be too vague to act on, and anything more specific risks naming a credential.
+- [x] OQ-1: **Settled by /architect (ADR-D): no — the event is not emitted.** OQ-1's own two halves are the reason: a bare count is not actionable, and BR-5 forbids the only payload that would make it actionable. An event that cannot say anything useful is a surface that can only ever leak. Under ADR-B the withheld set is also large and boring by construction — every variable the daemon holds that is not one of twelve — so a count would be noise on every call. The System Model's `shell_env_withheld` row is therefore specified but deliberately not implemented; if a "why did my command lose $FOO" answer is wanted later, the right shape is a documented allowlist, not a runtime event.
 - [ ] OQ-2: Should the allowlist be user-extensible (`[shell] extra_env = [...]`)? **Partly settled:** a user who allowlists a *configured* credential name cannot defeat BR-1, because BR-3's removal is unconditional and runs last; and a user who allowlists a name holding a credential *URL* is caught by BR-8. What remains genuinely open is the residual neither rule covers — a user allowlisting a name that holds a bare-token secret the daemon was never told about. That is the same class this REQ closes for `auth_ref` credentials, reopened by hand at the user's request, which may be the correct trade. Extensibility is deferred, not refused; if it ships, this residual is what its own ACs must speak to.
 
 ## Out of Scope

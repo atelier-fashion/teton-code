@@ -1,4 +1,4 @@
-//! The `shell` tool: run a command under a timeout, a cwd jail, and a scrubbed
+//! The `shell` tool: run a command under a timeout, a cwd jail, and a composed
 //! environment.
 //!
 //! Three hard constraints, each a security property (AC) — plus one usability
@@ -7,12 +7,21 @@
 //! - **cwd jail** — the command runs with the session root as its working
 //!   directory. (Absolute paths a command constructs itself are outside the
 //!   tool's reach; the jail is the default surface an agent operates on.)
-//! - **env scrub** — every variable whose *name* matches a credential substring
-//!   (`SECRET`, `PASSWORD`, `PASSWD`, `TOKEN`, `KEY`, `CREDENTIAL`, or a `PAT`
-//!   token) or whose *value* is a credential-bearing URL (`scheme://user:pass@…`)
-//!   is removed before the child starts, so a secret in the daemon's environment
-//!   can never leak into a model-driven `env`/`printenv` (BR-7). `HOME` and the
-//!   rest pass through so ordinary commands still work.
+//! - **env allowlist** — the child's environment is *composed*, not filtered
+//!   (REQ-596). Only the names on [`crate::child_env::SHELL_ENV_ALLOW`] are
+//!   admitted from the daemon's environment, so a variable nobody thought about
+//!   is absent by default and adding one to the daemon can never silently widen
+//!   what the child sees (BR-2). What the allowlist admits is then checked by
+//!   *value* — a `scheme://user:pass@…` URL is withheld whatever it is called
+//!   (BR-8) — and finally every variable a configured `auth_ref = "env:<VAR>"`
+//!   names is removed unconditionally, so the allowlist cannot re-admit a
+//!   credential the user told the daemon about (BR-1, BR-3).
+//!
+//!   This replaced a name-shaped denylist, which missed any credential whose
+//!   variable name contained none of its substrings — `env:DEEPSEEK_AUTH` and
+//!   `env:MY_LLM_CRED` among them — and one `echo $VAR` put such a value in tool
+//!   output bound for the next remote turn. The composer is shared with the MCP
+//!   spawn path, which had the right model first.
 //! - **PATH floor** — `PATH` passes through *and is then floored* with the
 //!   package-manager prefixes in [`PATH_FLOOR`](crate::env_path::PATH_FLOOR). Inheriting it unmodified was
 //!   the BUG-174 defect: the daemon's `PATH` is only as good as whatever started
@@ -29,7 +38,7 @@
 //!
 //! ## Three functions, because the spawn body has two callers and one is not a tool
 //!
-//! [`run_bounded`] is the spawn body — jail, scrub, `PATH` floor, process
+//! [`run_bounded`] is the spawn body — jail, env composition, `PATH` floor, process
 //! group, deadline, group kill — and it hands back the **raw** streams as a
 //! typed [`BoundedRun`]. [`cap_output`] is the ceiling, applied over the
 //! *merged* stdout/stderr body. `render_output` is this tool's presentation: it
@@ -72,6 +81,7 @@
 //! bound duty is *refused* on any machine with a privacy boundary configured;
 //! see [`shell_duty`] for why that is the design working rather than a gap.
 
+use std::collections::BTreeMap;
 use std::io::Result as IoResult;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -86,7 +96,6 @@ use teton_protocol::methods::RootKind;
 use super::{
     opt_str_arg, opt_u64_arg, str_arg, RefinedOutcome, Tool, ToolContext, ToolDuties, ToolOutcome,
 };
-use crate::env_path::apply_path_floor;
 use crate::harness::digest::tool_result_provenance;
 use crate::harness::shell_duty;
 
@@ -121,7 +130,7 @@ pub(crate) const MAX_OUTPUT_CHARS: usize = 8_000;
 /// one deadline (LESSON-528).
 pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
-/// Runs shell commands under a timeout, cwd jail, and scrubbed environment.
+/// Runs shell commands under a timeout, cwd jail, and composed environment.
 #[derive(Debug, Clone, Copy)]
 pub struct ShellTool {
     /// Timeout applied when the call does not specify one.
@@ -364,7 +373,7 @@ pub(crate) enum BoundedRun {
     Lost(String),
 }
 
-/// Run `command` under the shell tool's jail, scrubbed environment, `PATH`
+/// Run `command` under the shell tool's jail, composed environment, `PATH`
 /// floor, process group and deadline — and hand back the **raw** result.
 ///
 /// This is the whole of the spawn body and the single home of every guarantee
@@ -385,18 +394,28 @@ pub(crate) fn run_bounded(root: &Path, command: &str, timeout_ms: u64) -> Bounde
         Err(e) => return BoundedRun::SpawnFailed(spawn_failure(&e)),
     };
 
-    let mut scrubbed = scrub(std::env::vars());
-    // BUG-174: the daemon's own `PATH` is only as good as whatever started
-    // it, and launchd starts it with a bare one. Floor it before the child
-    // inherits it, or every user-installed command is unreachable.
-    apply_path_floor(&mut scrubbed);
+    // REQ-596: a positive allowlist, not a denylist. The composer is shared with
+    // the MCP spawn path and takes this path's own allowlist as a parameter, so
+    // the two can never widen each other (BR-7.1). It also applies the BUG-174
+    // `PATH` floor — the daemon's own `PATH` is only as good as whatever started
+    // it, and launchd starts it with a bare one — and removes every variable a
+    // configured `auth_ref = "env:<VAR>"` names, unconditionally and last (BR-1,
+    // BR-3). This is the single construction site for a shell child's
+    // environment; the region check in `child_env`'s tests fails the build if a
+    // second one appears (AC-8).
+    let child_env = crate::child_env::compose_child_env(
+        std::env::vars(),
+        crate::child_env::SHELL_ENV_ALLOW,
+        &crate::child_env::credential_env_names(),
+        &BTreeMap::new(),
+    );
 
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
         .arg(command)
         .current_dir(&root)
         .env_clear()
-        .envs(scrubbed)
+        .envs(child_env)
         // REQ-544 L-2: make the child its own process-group leader (pgid ==
         // child pid) so that on timeout we can SIGKILL the whole group and no
         // backgrounded grandchild survives the deadline.
@@ -532,59 +551,6 @@ fn render_interpreted(interpretation: &str, output: &str) -> String {
     format!("[shell: {interpretation}]\n{output}")
 }
 
-/// Remove credential-bearing variables from an environment, keeping everything
-/// else. Pure so it can be tested without mutating the process environment.
-pub(crate) fn scrub<I>(vars: I) -> Vec<(String, String)>
-where
-    I: IntoIterator<Item = (String, String)>,
-{
-    vars.into_iter()
-        .filter(|(k, v)| !is_secret_var(k, v))
-        .collect()
-}
-
-/// Whether an environment entry carries a credential and must be scrubbed before
-/// the model-driven `shell` child sees it (BR-7). Two signals: a secret-shaped
-/// *name*, or a credential-bearing *value* (a `scheme://user:pass@host` URL).
-pub(crate) fn is_secret_var(key: &str, value: &str) -> bool {
-    is_secret_key(key) || looks_like_credential_url(value)
-}
-
-/// Whether an environment variable name looks like it holds a credential.
-///
-/// A case-insensitive substring denylist (REQ-544 MED-1). The old suffix rule
-/// (`*_KEY` / `*_TOKEN`) missed `*_SECRET`, `*PASSWORD*`, `PGPASSWORD`, and the
-/// like. `PAT` (a GitHub personal-access token) is matched only as a whole,
-/// delimiter-bounded token, so essential names like `PATH` — and words like
-/// `COMPATIBLE` — are not swept up.
-pub(crate) fn is_secret_key(key: &str) -> bool {
-    const SECRET_SUBSTRINGS: &[&str] =
-        &["SECRET", "PASSWORD", "PASSWD", "TOKEN", "KEY", "CREDENTIAL"];
-    let up = key.to_ascii_uppercase();
-    if SECRET_SUBSTRINGS.iter().any(|s| up.contains(s)) {
-        return true;
-    }
-    up.split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|token| token == "PAT")
-}
-
-/// Whether `value` is a URL that embeds a credential in its userinfo, e.g.
-/// `postgres://user:pass@host/db` — the shape `DATABASE_URL` often takes, which
-/// a name-only check cannot catch (REQ-544 MED-1).
-fn looks_like_credential_url(value: &str) -> bool {
-    let Some((_scheme, after)) = value.split_once("://") else {
-        return false;
-    };
-    // The authority ends at the first '/', '?', or '#'.
-    let authority = after.split(['/', '?', '#']).next().unwrap_or("");
-    match authority.split_once('@') {
-        // A ':' in the userinfo before the '@' is an embedded password
-        // (`user:pass@` or `:pass@`).
-        Some((userinfo, _host)) => userinfo.contains(':'),
-        None => false,
-    }
-}
-
 /// Apply the [`MAX_OUTPUT_CHARS`] ceiling to a merged stdout+stderr body, and
 /// report the length it had **before** the cap.
 ///
@@ -676,6 +642,7 @@ fn render_output(command: &str, status: ExitStatus, stdout: &[u8], stderr: &[u8]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::env_path::apply_path_floor;
     use std::path::{Path, PathBuf};
 
     /// The counter, not the timestamp, guarantees uniqueness: `SystemTime::now()`
@@ -694,70 +661,6 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    #[test]
-    fn scrub_removes_credential_bearing_vars_and_keeps_essentials() {
-        let input = vec![
-            ("PATH".to_owned(), "/usr/bin".to_owned()),
-            ("HOME".to_owned(), "/home/x".to_owned()),
-            ("ANTHROPIC_API_KEY".to_owned(), "sk-secret".to_owned()),
-            ("openai_api_key".to_owned(), "lower-secret".to_owned()),
-            ("GITHUB_TOKEN".to_owned(), "ghp_secret".to_owned()),
-            // REQ-544 MED-1: the shapes the old suffix rule let through.
-            ("PGPASSWORD".to_owned(), "hunter2".to_owned()),
-            ("STRIPE_SECRET".to_owned(), "sk_live_x".to_owned()),
-            ("MY_CREDENTIAL".to_owned(), "c".to_owned()),
-            ("GITHUB_PAT".to_owned(), "ghp_x".to_owned()),
-            (
-                "DATABASE_URL".to_owned(),
-                "postgres://user:pass@db.example.com/app".to_owned(),
-            ),
-        ];
-        let kept: Vec<String> = scrub(input).into_iter().map(|(k, _)| k).collect();
-        // Essentials survive.
-        assert!(kept.contains(&"PATH".to_owned()));
-        assert!(kept.contains(&"HOME".to_owned()));
-        // Every credential-bearing var is gone.
-        for scrubbed in [
-            "ANTHROPIC_API_KEY",
-            "openai_api_key",
-            "GITHUB_TOKEN",
-            "PGPASSWORD",
-            "STRIPE_SECRET",
-            "MY_CREDENTIAL",
-            "GITHUB_PAT",
-            "DATABASE_URL",
-        ] {
-            assert!(!kept.contains(&scrubbed.to_owned()), "leaked: {scrubbed}");
-        }
-    }
-
-    #[test]
-    fn is_secret_key_matches_substrings_but_not_essential_names() {
-        // Case-insensitive substrings.
-        assert!(is_secret_key("FOO_KEY"));
-        assert!(is_secret_key("foo_token"));
-        assert!(is_secret_key("PGPASSWORD"));
-        assert!(is_secret_key("db_passwd"));
-        assert!(is_secret_key("MY_SECRET_THING"));
-        assert!(is_secret_key("aws_credential_file"));
-        // `PAT` as a whole token, but not inside another word.
-        assert!(is_secret_key("GITHUB_PAT"));
-        assert!(!is_secret_key("PATH"));
-        assert!(!is_secret_key("COMPATIBLE"));
-        // A benign name with no secret substring survives.
-        assert!(!is_secret_key("EDITOR"));
-    }
-
-    #[test]
-    fn credential_urls_are_scrubbed_by_value() {
-        assert!(looks_like_credential_url("postgres://user:pass@host/db"));
-        assert!(looks_like_credential_url("redis://:password@host:6379"));
-        // No embedded credential -> kept.
-        assert!(!looks_like_credential_url("https://example.com/path"));
-        assert!(!looks_like_credential_url("postgres://host/db"));
-        assert!(!looks_like_credential_url("/usr/local/bin"));
     }
 
     #[test]
@@ -894,11 +797,202 @@ mod tests {
     /// It also pins the "exactly one `PATH`" half: `apply_path_floor` rewrites
     /// the variable rather than appending a second one, and `env_clear` plus
     /// `envs` would happily carry two.
+    /// Serializes the tests below that mutate the **process** environment and
+    /// then read it back through a spawned child.
+    ///
+    /// `std::env::set_var` races `std::env::vars()` — that is why the former is
+    /// `unsafe` — and `run_bounded` calls the latter. Two such tests running on
+    /// different threads of the same binary is exactly the racing pair, and the
+    /// symptom would be a rare, unreproducible absence assertion firing on a
+    /// variable the *other* test planted. Serializing them costs a few
+    /// milliseconds and removes a flake nobody would ever diagnose.
+    ///
+    /// Poisoning is ignored: a panic in one of these tests must fail that test,
+    /// not cascade into an unrelated failure in the next one.
+    static ENV_MUTATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// AC-1 and AC-1.1, end to end: a credential the daemon was *told* about
+    /// through `auth_ref = "env:<VAR>"` never reaches a `shell` child — and that
+    /// holds for **both** fields `is_recognized_auth_ref` gates, not only
+    /// `providers[].auth_ref` (BR-1.1).
+    ///
+    /// # What the AC-5 mutation actually shows, and where it does not
+    ///
+    /// AC-5 asks that deleting the BR-1 removal step (composer step 5) makes
+    /// AC-1 fail. Run against the two *named* credentials below it does **not**,
+    /// and the reason is structural rather than a gap in the test: under BR-2's
+    /// allowlist, `DEEPSEEK_AUTH_SENTINEL_*` was never admitted in the first
+    /// place, so two guards stand between it and the child and removing one
+    /// changes nothing observable. The AC was written for a world where BR-1 is
+    /// the only guard.
+    ///
+    /// So this test pins the case where step 5 **is** load-bearing: `LANGUAGE`
+    /// is on the allowlist, so nothing but the unconditional credential removal
+    /// keeps it out once a config names it. That is BR-3's scenario exactly —
+    /// the allowlist cannot re-admit a configured credential.
+    ///
+    /// **Mutation run (AC-5, BR-1 half).** Deleting the
+    /// `for name in credential_env_names { env.remove(name); }` loop from
+    /// `compose_child_env` fails the `LANGUAGE` assertion here — "an allowlisted
+    /// name the config declared a credential reached the child" — and fails
+    /// `child_env::tests::a_credential_name_on_the_allowlist_is_still_removed`
+    /// and `a_declared_var_cannot_re_admit_a_credential_name`, 3 assertions in
+    /// all. The two named-credential assertions stay green, which is the honest
+    /// report: the allowlist alone already withheld them.
+    #[test]
+    fn a_configured_credential_never_reaches_the_child_from_either_gated_field() {
+        let _serialized = ENV_MUTATION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_root("credential-env");
+        let unique = std::process::id();
+        let provider_var = format!("DEEPSEEK_AUTH_SENTINEL_{unique}");
+        let web_var = format!("WEB_SEARCH_SENTINEL_{unique}");
+
+        let config = teton_core::config::Config::from_toml(&format!(
+            r#"
+[[providers]]
+id = "deepseek"
+kind = "openai-compatible"
+endpoint = "https://deepseek.invalid/v1"
+model = "m"
+auth_ref = "env:{provider_var}"
+
+[web]
+search_key_ref = "env:{web_var}"
+"#
+        ))
+        .expect("the fixture config parses");
+
+        // `LANGUAGE` is allowlisted, so it is the one name here that composer
+        // step 5 alone keeps out. Declared as a credential by a second config so
+        // the assertion is about the rule, not about this provider.
+        let mut names = crate::child_env::credential_env_names_of(&config);
+        names.insert("LANGUAGE".to_owned());
+        crate::child_env::set_credential_env_names_provider(move || names.clone());
+
+        let secrets = [
+            (provider_var.clone(), format!("SENTINEL-provider-{unique}")),
+            (web_var.clone(), format!("SENTINEL-web-{unique}")),
+            ("LANGUAGE".to_owned(), format!("SENTINEL-language-{unique}")),
+        ];
+        // SAFETY: process-unique names apart from `LANGUAGE`, which nothing in
+        // this suite reads; set and removed around one spawn.
+        for (k, v) in &secrets {
+            unsafe { std::env::set_var(k, v) };
+        }
+
+        let stdout = match run_bounded(&root, "env", 5_000) {
+            BoundedRun::Completed { stdout, .. } => stdout,
+            other => panic!("the fixture must run to completion: {other:?}"),
+        };
+        for (k, _) in &secrets {
+            unsafe { std::env::remove_var(k) };
+        }
+        let printed = String::from_utf8_lossy(&stdout);
+
+        // AC-1: the provider field.
+        assert!(
+            !printed.contains(provider_var.as_str()) && !printed.contains(&secrets[0].1),
+            "a providers[].auth_ref credential reached the child"
+        );
+        // AC-1.1: the web field, which BR-1.1 exists for.
+        assert!(
+            !printed.contains(web_var.as_str()) && !printed.contains(&secrets[1].1),
+            "a [web] search_key_ref credential reached the child — covering only the \
+             provider half is the leak this REQ closes, in the field written second"
+        );
+        // BR-3, and the assertion the AC-5 mutation moves.
+        assert!(
+            !printed.contains("LANGUAGE=") && !printed.contains(&secrets[2].1),
+            "an allowlisted name the config declared a credential reached the child"
+        );
+        assert!(
+            printed.contains("PATH="),
+            "the child received no environment at all, so this fixture proved nothing"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// AC-2 and AC-6. The names that motivated REQ-596: each matches **none** of
+    /// the retired denylist's substrings (`SECRET`, `PASSWORD`, `PASSWD`,
+    /// `TOKEN`, `KEY`, `CREDENTIAL`, `PAT`), so under the old rule every one of
+    /// them reached `sh -c` intact and a single `echo $VAR` put the value into
+    /// tool output bound for the next remote turn. They are gone now because the
+    /// allowlist never admitted them — not because a longer denylist caught
+    /// them, which is the distinction the REQ exists to make.
+    ///
+    /// The assertion is over **captured child output** (AC-6): the child really
+    /// runs `env`, and what it printed is what is searched. Asserting that a
+    /// composer was called would prove only that a call happened.
+    ///
+    /// `RANDOM_UNRELATED_VAR` rides along to pin AC-3 end-to-end: the allowlist
+    /// withholds by default, not only for things that look like secrets.
+    #[test]
+    fn a_credential_named_nothing_like_a_credential_never_reaches_the_child() {
+        let _serialized = ENV_MUTATION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_root("env-allowlist");
+        let unique = std::process::id();
+        // SAFETY: process-unique names, set and removed around one spawn.
+        let planted: Vec<(String, String)> = [
+            "MY_LLM_CRED",
+            "GEMINI_PW",
+            "LLM_AUTH",
+            "RANDOM_UNRELATED_VAR",
+        ]
+        .iter()
+        .map(|n| {
+            (
+                format!("{n}_{unique}"),
+                format!("SENTINEL-value-{n}-{unique}"),
+            )
+        })
+        .collect();
+        for (k, v) in &planted {
+            unsafe { std::env::set_var(k, v) };
+        }
+
+        let stdout = match run_bounded(&root, "env", 5_000) {
+            BoundedRun::Completed { stdout, .. } => stdout,
+            other => panic!("the fixture must run to completion: {other:?}"),
+        };
+        for (k, _) in &planted {
+            unsafe { std::env::remove_var(k) };
+        }
+
+        let printed = String::from_utf8_lossy(&stdout);
+        for (name, value) in &planted {
+            assert!(
+                !printed.contains(name.as_str()),
+                "the child's environment still names {name}"
+            );
+            assert!(
+                !printed.contains(value.as_str()),
+                "a planted value reached the child under {name}"
+            );
+        }
+        // The floor still ran, so this is not vacuously green on an empty
+        // environment.
+        assert!(
+            printed.contains("PATH="),
+            "the child received no PATH at all, so this fixture proved nothing"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn the_bounded_runner_floors_the_childs_path() {
         let root = temp_root("path-floor");
 
-        let mut expected_env = scrub(std::env::vars());
+        // The oracle is the floor rule applied to the daemon's own `PATH`, NOT
+        // `compose_child_env` — the subject must not compute its own expected
+        // value (conventions.md, LESSON-569). Taking `PATH` straight from the
+        // daemon environment mirrors what the allowlist admits without asking
+        // the composer anything.
+        let mut expected_env: Vec<(String, String)> =
+            std::env::vars().filter(|(k, _)| k == "PATH").collect();
         apply_path_floor(&mut expected_env);
         let expected: Vec<&String> = expected_env
             .iter()

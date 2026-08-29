@@ -86,7 +86,16 @@
   refusal, redirect bounds, scan gates, timeouts, and one-row-one-event
   accounting are properties of the seam rather than of each caller. A tool that
   reaches the network is handed transport; it never constructs one, and the
-  tree-wide `deny_http_client` check keeps that mechanical.
+  tree-wide `deny_http_client` check keeps that mechanical. **The `shell` tool
+  is the one exception, and it is named rather than glossed (REQ-596 BR-6):** a
+  model-supplied command can be `curl`, so a shell child reaches the network
+  outside the choke point — no boundary check, no cost record. The guarantee is
+  therefore exact as *provider and MCP traffic the daemon originates*, which is
+  compile-time; a shell child's traffic is not covered and nothing in egress can
+  see it. Sandboxing that child's network is the real fix and is out of scope for
+  REQ-596, which closed the cheaper half — the child no longer holds a configured
+  credential. A documented guarantee that is false is worse than a narrower one
+  that is true.
 - **Policy is pure, mechanism is gated** — when a subsystem's interesting logic
   sits behind a non-default cargo feature CI never compiles, the *decision* is
   extracted into a feature-free module over plain data and the gated module is
