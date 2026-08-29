@@ -102,7 +102,8 @@ use teton_core::category::{
 use teton_core::config::{Config, LocalModelConfig, RoutingMigration, WebConfig, WebTier};
 use teton_core::config_doc::document_is_effectively_empty;
 use teton_core::entities::{
-    BoundaryMode, ModelProvider, PrivacyBoundary, ProviderCapabilities, ProviderKind,
+    BoundaryMode, BoundaryOrigin, ModelProvider, PrivacyBoundary, ProviderCapabilities,
+    ProviderKind,
 };
 use teton_core::phase::Phase as CorePhase;
 use teton_core::policy::ProviderHealth;
@@ -129,7 +130,8 @@ use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
     CategoryRouteView, ConfigSnapshot, ConfigUpdate, ContentClass, CostGroupView, CostQueryResult,
     CostReportView, ExistingProvider, ModelConfirmOutcome, ModelConfirmParams, ModelConfirmResult,
-    ModelListResult, ModelSetResult, ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult,
+    BoundaryOriginConfig, ModelListResult, ModelSetResult, ModelStatusResult,
+    PrivacyBoundaryConfig, PromptTurnResult,
     ProviderConfig, ProviderHealth as WireProviderHealth, ProviderSetupCandidate,
     ProviderSetupCommitResult, ProviderSetupPlanResult, ProviderSetupPreviewResult,
     ProviderTestOutcome, ProviderTestResult, SessionClearParams, SessionClearResult,
@@ -2759,6 +2761,35 @@ impl DaemonRuntime {
     #[must_use]
     pub fn with_skill_command_timeout(mut self, timeout_ms: u64) -> Self {
         self.skill_command_timeout_ms = timeout_ms;
+        self
+    }
+
+    /// Switch off REQ-597's shipped boundary set on this runtime — the seam for
+    /// a test whose subject is **not** privacy.
+    ///
+    /// It exists because the default set has a second-order reach that is easy
+    /// to mistake for a broken harness. `context_is_sensitive` short-circuits on
+    /// an empty boundary list; with the builtin set always present that
+    /// short-circuit is gone, so REQ-585's *unpinnable* provenance — a user
+    /// skill outside the session root, or any content a skill's command
+    /// produced — now fails closed and pins the turn to the local tier on every
+    /// machine, where before it did so only for users who had configured
+    /// boundaries of their own. On a runtime with no local tier that pin is a
+    /// refusal, which is what a skill-mechanics test sees.
+    ///
+    /// **Reach for this only when the test would otherwise be asserting about
+    /// privacy by accident.** It is the config author's opt-out (BR-3), spelled
+    /// the same way here as in a config file, and using it on a test that is
+    /// genuinely about egress would delete the coverage REQ-597 exists to add.
+    /// The interaction itself is pinned by
+    /// `skill_turn::a_skill_that_ran_a_command_is_pinned_by_the_default_boundaries`.
+    #[must_use]
+    pub fn with_default_boundaries_disabled(self) -> Self {
+        self.config
+            .lock()
+            .expect("config mutex poisoned")
+            .privacy
+            .disable_default_boundaries = true;
         self
     }
 
@@ -5464,7 +5495,7 @@ impl DaemonRuntime {
             system,
             &route.harness,
             Arc::clone(&self.session_taint),
-            config.boundaries.clone(),
+            config.effective_boundaries(),
             prompt,
             // REQ-585 BR-7: a typed prompt is drawn from no file; a skill turn
             // carries the skill file's id, or the unpinnable marker for a user
@@ -6725,7 +6756,7 @@ impl DaemonRuntime {
         // neither add to the prompt's spend nor be measured against it. Wiring a
         // ceiling in would advertise a check that could never fire. MCP tool
         // traffic is outside the dollar ceiling; the spec says so explicitly.
-        let mut egress = Egress::new(transport, config.boundaries.clone(), sink)
+        let mut egress = Egress::new(transport, config.effective_boundaries(), sink)
             .with_cost_meter(Arc::new(self.ledger.clone()));
         if let Some(gate) = self.redaction_gate(router, config, events, session_id) {
             egress = egress.with_redaction_gate(gate);
@@ -6865,7 +6896,7 @@ impl DaemonRuntime {
         // transport, exactly as before. The injected header rides only requests
         // to this endpoint's origin — never MCP, never another provider.
         let transport = build_remote_transport(provider_cfg, &self.secret_resolver)?;
-        let boundaries = config.boundaries.clone();
+        let boundaries = config.effective_boundaries();
         let mut egress = Egress::new(transport, boundaries, events.clone())
             .with_cost_meter(Arc::new(self.ledger.clone()))
             // REQ-588 BR-1/ADR-6: the user's ceiling, when they set one. Absent
@@ -7339,7 +7370,7 @@ impl DaemonRuntime {
         // `privacy_block` at all, and a sink that taints would be a loaded gun
         // pointed at the rule the lookup path is built to keep.
         let sink: Arc<dyn crate::egress::PrivacyEventSink> = events.clone();
-        let mut egress = Egress::new(transport, config.boundaries.clone(), sink)
+        let mut egress = Egress::new(transport, config.effective_boundaries(), sink)
             .with_lookup_recorder(self.lookup_recorder(events));
         if let Some(gate) = self.search_redaction_gate(router, config, events, session_id) {
             egress = egress.with_search_redaction_gate(gate);
@@ -9064,7 +9095,7 @@ impl DaemonRuntime {
                     ),
                 ));
             };
-            (provider.clone(), model, config.boundaries.clone())
+            (provider.clone(), model, config.effective_boundaries())
         };
 
         // (7) The dial host, read by the parser that **dials** (LESSON-529), so
@@ -9596,7 +9627,7 @@ impl DaemonRuntime {
             events.clone(),
             Arc::clone(&self.session_taint),
         ));
-        let mut egress = Egress::new(transport, config.boundaries.clone(), sink)
+        let mut egress = Egress::new(transport, config.effective_boundaries(), sink)
             .with_cost_meter(Arc::new(self.ledger.clone()))
             // REQ-588 BR-1/ADR-6: the user's ceiling, when they set one. Absent
             // leaves the choke point exactly as it was — no check, no pricing
@@ -13768,13 +13799,20 @@ fn snapshot_from_config(
         judgment_default: Some(to_protocol_category(Category::from(
             router.judgment_default(),
         ))),
+        // REQ-597 BR-6: the **effective** set, not the user's table — a report
+        // that named only the rows the user wrote would be answering a
+        // different question from the one the enforcement path asks, which is
+        // exactly the drift `boundary list` exists to prevent. Composed order
+        // is preserved (user rows first, builtins appended), and each row
+        // carries its origin so a reader can tell which of their protections
+        // they authored and which they were shipped.
         privacy: config
-            .boundaries
+            .effective_boundaries()
             .iter()
             .map(|b| PrivacyBoundaryConfig {
                 path_glob: b.path_glob.clone(),
                 mode: to_proto_mode(b.mode),
-                origin: Default::default(),
+                origin: to_proto_origin(b.origin),
             })
             .collect(),
         // REQ-562: the `[privacy] redact` opt-in, projected so `policy show`
@@ -14134,6 +14172,19 @@ fn to_core_configurable_category(category: ProtoConfigurableCategory) -> Configu
         ProtoConfigurableCategory::Design => ConfigurableCategory::Design,
         ProtoConfigurableCategory::Debug => ConfigurableCategory::Debug,
         ProtoConfigurableCategory::Review => ConfigurableCategory::Review,
+    }
+}
+
+/// Project a boundary's origin onto the wire (REQ-597 BR-6).
+///
+/// A total match rather than a `From` blanket, for `to_proto_mode`'s reason:
+/// the two enums are mirrored by name across the crate seam, and a match is
+/// what makes adding a variant to one a compile error in the other rather than
+/// a silent default.
+fn to_proto_origin(origin: BoundaryOrigin) -> BoundaryOriginConfig {
+    match origin {
+        BoundaryOrigin::User => BoundaryOriginConfig::User,
+        BoundaryOrigin::Builtin => BoundaryOriginConfig::Builtin,
     }
 }
 

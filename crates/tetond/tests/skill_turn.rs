@@ -474,6 +474,33 @@ impl Harness {
     /// duty is started before any budget exists, and binding it here would put
     /// a bounded copy of the expansion on the wire for a turn BR-8 refuses.
     fn with_window(window: u32) -> Self {
+        Self::assembled(Some(window), Self::not_about_privacy())
+    }
+
+    /// [`DaemonRuntime::minimal`] with REQ-597's shipped boundary set switched
+    /// off, which is what nearly every harness in this file wants.
+    ///
+    /// Spelled out here rather than buried inside `provider_runtime_with_fallback`
+    /// so that a reader of any constructor can see the runtime is not enforcing
+    /// the default boundaries, and so that [`Harness::with_default_boundaries`]
+    /// is visibly the one that is.
+    ///
+    /// The reason it is needed: with the builtin set present,
+    /// `context_is_sensitive` no longer short-circuits on an empty boundary
+    /// list, so REQ-585's unpinnable provenance — a skill's command output —
+    /// pins the turn to a local tier `minimal()` has not got. Every assertion in
+    /// this file about what the *loop* did would become an assertion about
+    /// privacy instead.
+    fn not_about_privacy() -> DaemonRuntime {
+        DaemonRuntime::minimal().with_default_boundaries_disabled()
+    }
+
+    /// [`Self::with_window`] with the shipped boundary set left **on** — the
+    /// stock posture of every machine after REQ-597.
+    ///
+    /// Exactly one test uses it, and that is the point: it is the instrument
+    /// for the interaction the opt-out above would otherwise hide.
+    fn with_default_boundaries(window: u32) -> Self {
         Self::assembled(Some(window), DaemonRuntime::minimal())
     }
 
@@ -486,7 +513,7 @@ impl Harness {
     /// the threshold scales up past any expansion a fixture can write, so a
     /// test there would pass on a build with no bypass at all.
     fn with_default_budget() -> Self {
-        Self::assembled(None, DaemonRuntime::minimal())
+        Self::assembled(None, Self::not_about_privacy())
     }
 
     /// [`Self::with_window`] with a shortened dynamic-context deadline, so
@@ -495,7 +522,7 @@ impl Harness {
     fn with_command_timeout(window: u32, timeout_ms: u64) -> Self {
         Self::assembled(
             Some(window),
-            DaemonRuntime::minimal().with_skill_command_timeout(timeout_ms),
+            Self::not_about_privacy().with_skill_command_timeout(timeout_ms),
         )
     }
 
@@ -507,11 +534,7 @@ impl Harness {
     /// fallback is both named and registered, and it is that route the reroute
     /// guard measures against.
     fn with_fallback(window: u32, fallback_window: u32) -> Self {
-        Self::assembled_with(
-            Some(window),
-            Some(fallback_window),
-            DaemonRuntime::minimal(),
-        )
+        Self::assembled_with(Some(window), Some(fallback_window), Self::not_about_privacy())
     }
 
     fn assembled(window: Option<u32>, runtime: DaemonRuntime) -> Self {
@@ -2339,6 +2362,70 @@ async fn ran_output_enters_inside_the_untrusted_envelope_with_its_markers_neutra
 /// that never happened rather than a turn whose command did not run — and the
 /// control has to be the same skill from the same file, or it stops controlling
 /// for the thing it is here to control for.
+/// **REQ-597: the shipped boundary set reaches the unpinnable path, and that is
+/// the consequence nobody asked for by name.**
+///
+/// Every other harness in this file switches the default boundaries off
+/// ([`Harness::not_about_privacy`]), because otherwise their skill assertions
+/// would quietly become privacy assertions. This test is the reason that opt-out
+/// does not delete coverage: it is the one that leaves the stock posture on.
+///
+/// The mechanism, which is second-order and easy to mistake for a broken
+/// harness: `context_is_sensitive` returns `false` immediately when the boundary
+/// list is empty. Before REQ-597 a stock machine's list *was* empty, so
+/// REQ-585's `Unknown` provenance — what a skill's command output carries,
+/// having no path to mint an identity from — never reached the inspector. With
+/// the builtin set always present that short-circuit is gone, the `Unknown`
+/// block fails closed, and the turn is pinned to the local tier.
+///
+/// So the reach of REQ-597 is wider than its glob list: it is not only that
+/// `.env` and `.ssh/` are now covered, it is that **anything the daemon cannot
+/// pin is now covered too, on every machine**. On a real install that is a
+/// reroute to the local tier the product ships with; on this runtime, which has
+/// no local tier, it is the refusal asserted below. Both are the same decision.
+///
+/// The control is the same skill with its command declined: no command runs, the
+/// block carries only the skill file's own pinnable identity, and the turn
+/// proceeds. Without it this would be a statement about skill turns in general
+/// rather than about *unpinnable output*.
+///
+/// **Mutation**: give the harness `with_default_boundaries_disabled()` — i.e.
+/// use `Harness::with_window` like its neighbours — and the refusal below stops
+/// happening.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_skill_that_ran_a_command_is_pinned_by_the_default_boundaries() {
+    let repo = Tree::new("dfltbnd");
+    repo.write(
+        ".claude/skills/ran/SKILL.md",
+        &skill_file("runs one command", "Out: !`echo hello`\n"),
+    );
+    // The stock posture: no user boundaries declared, and the builtin set on.
+    let h = Harness::with_default_boundaries(128_000);
+
+    // The command runs, its output has no identity, and the turn cannot be
+    // served — there is no local tier here to reroute to.
+    let ran = h.session_at(repo.path());
+    h.at_level(&ran, PermissionLevel::Full);
+    let err = h
+        .turn(&ran, "", Harness::invoke("ran", ""))
+        .await
+        .expect_err("unpinnable output under the default boundaries pins the turn");
+    assert!(
+        err.message.contains("local-only privacy boundary"),
+        "the refusal must name the boundary that caused it, not a generic \
+         provider failure; got: {:?}",
+        err.message
+    );
+
+    // The control: the fixture client declines the command, so nothing
+    // unpinnable enters the turn and the same skill, from the same file, under
+    // the same boundaries, runs.
+    let did_not_run = h.session_at(repo.path());
+    h.turn(&did_not_run, "", Harness::invoke("ran", ""))
+        .await
+        .expect("a command-free expansion is pinnable and still runs");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_invocation_that_ran_a_command_seeds_a_block_that_cannot_be_pinned() {
     let repo = Tree::new("unpinned");
@@ -2764,7 +2851,13 @@ async fn a_skill_consent_reaches_the_client_that_typed_it_and_is_answerable_by_i
         ".claude/skills/wired/SKILL.md",
         &skill_file("one command", "Out: !`echo wired-through`\n"),
     );
-    let (runtime, vendor) = provider_runtime(Some(128_000), DaemonRuntime::minimal());
+    // REQ-597: the subject is the addressed-delivery seam, not privacy — the
+    // shipped boundary set would pin this command-bearing turn to a local tier
+    // this runtime has not got. Same reasoning as `Harness::not_about_privacy`.
+    let (runtime, vendor) = provider_runtime(
+        Some(128_000),
+        DaemonRuntime::minimal().with_default_boundaries_disabled(),
+    );
     let events = Arc::new(EventBus::new());
     let socket = temp_socket("skill-consent-wiring");
     let listener = server::bind_listener(&socket).unwrap();

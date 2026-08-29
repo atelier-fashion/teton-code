@@ -1,7 +1,7 @@
 ---
 id: TASK-287
 title: "Route every daemon boundary reader through the composer"
-status: pending
+status: complete
 parent: REQ-597
 repo: teton-code
 created: 2026-08-29
