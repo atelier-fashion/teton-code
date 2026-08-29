@@ -418,6 +418,108 @@ mod tests {
         assert!(value_of(&composed, "SENTINEL_DB").is_some());
     }
 
+    /// BR-1.1. Both fields `is_recognized_auth_ref` gates contribute, and only
+    /// the `env:` scheme names a variable at all. Built through `Config::from_toml`
+    /// rather than by hand so the derivation is exercised over the shape the
+    /// parser actually produces.
+    #[test]
+    fn both_gated_fields_contribute_their_env_names() {
+        let config = Config::from_toml(
+            r#"
+[[providers]]
+id = "a"
+kind = "openai-compatible"
+endpoint = "https://a.invalid/v1"
+model = "m"
+auth_ref = "env:SENTINEL_PROVIDER_ENV"
+
+[[providers]]
+id = "b"
+kind = "openai-compatible"
+endpoint = "https://b.invalid/v1"
+model = "m"
+auth_ref = "keychain:teton/b"
+
+[web]
+search_key_ref = "env:SENTINEL_WEB_ENV"
+"#,
+        )
+        .expect("the fixture config parses");
+
+        let names = credential_env_names_of(&config);
+        assert!(
+            names.contains("SENTINEL_PROVIDER_ENV"),
+            "providers[].auth_ref must contribute"
+        );
+        assert!(
+            names.contains("SENTINEL_WEB_ENV"),
+            "web.search_key_ref must contribute — covering only the provider half is the \
+             leak this REQ exists to close, in the field that happens to have been written \
+             second (BR-1.1)"
+        );
+        assert_eq!(names.len(), 2, "a keychain: ref names no environment variable");
+    }
+
+    /// Schemes that name no environment variable contribute nothing, and a
+    /// malformed bare `env:` names nothing either — it is not a recognized
+    /// reference at all, so it never reaches the prefix strip.
+    #[test]
+    fn non_env_and_malformed_refs_contribute_nothing() {
+        let config = Config::from_toml(
+            r#"
+[[providers]]
+id = "a"
+kind = "openai-compatible"
+endpoint = "https://a.invalid/v1"
+model = "m"
+auth_ref = "op://vault/item"
+"#,
+        )
+        .expect("the fixture config parses");
+        assert!(credential_env_names_of(&config).is_empty());
+    }
+
+    /// **The cross-crate drift guard (BR-1.1).**
+    ///
+    /// `credential_env_names_of` lives in `tetond`; the fields it reads live in
+    /// `teton-core/src/config.rs`. Proximity cannot keep the two in step — and
+    /// would not have even if they were co-located, since a third gated field
+    /// could be added without anyone updating a neighbouring enumeration. So the
+    /// guard is derived: count the `is_recognized_auth_ref` call sites in
+    /// `config.rs` and assert the enumeration reads that many fields.
+    ///
+    /// A third gated field in `teton-core` fails this test until
+    /// `credential_env_names_of` follows it, which is what makes BR-1.1's
+    /// "covered without amending this rule" true rather than hoped for.
+    ///
+    /// **Mutation run (BR-1.1).** Adding a third
+    /// `if !is_recognized_auth_ref(x) { }` to `config.rs`'s production region
+    /// fails this test: `teton-core gates 3 credential-reference fields but
+    /// child_env::credential_env_names_of reads 2` — left `3`, right `2`.
+    #[test]
+    fn the_enumeration_covers_every_field_teton_core_gates() {
+        let config_rs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../teton-core/src/config.rs");
+        let source = crate::call_sites::scan::production_source(&config_rs);
+        let code = crate::call_sites::scan::code_only(&source);
+
+        let call_sites = crate::call_sites::scan::count(&code, "is_recognized_auth_ref(")
+            - crate::call_sites::scan::count(&code, "pub fn is_recognized_auth_ref(");
+
+        assert!(
+            call_sites > 0,
+            "the scan found no call sites at all, so it would pass vacuously — \
+             config.rs moved or the predicate was renamed"
+        );
+        assert_eq!(
+            call_sites, CREDENTIAL_REF_FIELDS,
+            "teton-core gates {call_sites} credential-reference fields but \
+             child_env::credential_env_names_of reads {CREDENTIAL_REF_FIELDS}. A new field \
+             carrying an auth_ref must be added to that enumeration, or its `env:<VAR>` \
+             survives into every shell child (BR-1.1)."
+        );
+    }
+
     /// Retained from the retired `shell` scrub along with the rule it guards
     /// (BR-8): the value signal survived the rewrite, and so did its test.
     #[test]

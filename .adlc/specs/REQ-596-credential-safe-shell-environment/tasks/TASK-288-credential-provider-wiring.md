@@ -1,7 +1,7 @@
 ---
 id: TASK-288
 title: "Pull the credential env names from live config at spawn time"
-status: pending
+status: complete
 parent: REQ-596
 created: 2026-08-29
 updated: 2026-08-29

@@ -3603,6 +3603,22 @@ impl DaemonRuntime {
     /// `[[categories]]` rows back would have been less code and a different
     /// answer — the rows say nothing about an unbound tier's inherited fill, a
     /// provider that is down, or a remote provider that declares no model.
+    /// Every environment variable name a configured `env:<NAME>` credential
+    /// reference points at, read from the **live** config (REQ-596 BR-1).
+    ///
+    /// The daemon installs this as `child_env`'s credential-name source at
+    /// bootstrap, and it is called once per spawned `shell` child rather than
+    /// snapshotted, so a provider added mid-session is withheld from the very
+    /// next command instead of the next daemon start (LESSON-539).
+    ///
+    /// The derivation itself lives in [`crate::child_env`] beside the composer
+    /// that consumes it; this method is only the lock.
+    #[must_use]
+    pub fn credential_env_var_names(&self) -> std::collections::BTreeSet<String> {
+        let config = self.config.lock().expect("config mutex poisoned");
+        crate::child_env::credential_env_names_of(&config)
+    }
+
     #[must_use]
     pub fn config_snapshot(&self) -> ConfigSnapshot {
         let config = self.config.lock().expect("config mutex poisoned");

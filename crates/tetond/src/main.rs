@@ -124,6 +124,19 @@ fn main() -> anyhow::Result<ExitCode> {
         daemon_runtime
             .consent()
             .set_work_claim(Arc::new(LifetimeWorkClaim::new(Arc::clone(&supervisor))));
+
+        // REQ-596 BR-1: tell the child-environment composer which variable names
+        // hold configured credentials, so a `shell` command can never read one
+        // back out of its own environment. A closure over the runtime rather
+        // than a value, because the answer must be the *live* config's at the
+        // moment of the spawn — a snapshot taken here would not know about a
+        // provider added later in the session (LESSON-539).
+        {
+            let runtime_for_credentials = Arc::clone(&daemon_runtime);
+            tetond::child_env::set_credential_env_names_provider(move || {
+                runtime_for_credentials.credential_env_var_names()
+            });
+        }
         eprintln!(
             "teton-code: shutdown policy {} (from {})",
             lifetime::policy_label(policy),

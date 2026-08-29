@@ -797,6 +797,106 @@ mod tests {
     /// It also pins the "exactly one `PATH`" half: `apply_path_floor` rewrites
     /// the variable rather than appending a second one, and `env_clear` plus
     /// `envs` would happily carry two.
+    /// AC-1 and AC-1.1, end to end: a credential the daemon was *told* about
+    /// through `auth_ref = "env:<VAR>"` never reaches a `shell` child — and that
+    /// holds for **both** fields `is_recognized_auth_ref` gates, not only
+    /// `providers[].auth_ref` (BR-1.1).
+    ///
+    /// # What the AC-5 mutation actually shows, and where it does not
+    ///
+    /// AC-5 asks that deleting the BR-1 removal step (composer step 5) makes
+    /// AC-1 fail. Run against the two *named* credentials below it does **not**,
+    /// and the reason is structural rather than a gap in the test: under BR-2's
+    /// allowlist, `DEEPSEEK_AUTH_SENTINEL_*` was never admitted in the first
+    /// place, so two guards stand between it and the child and removing one
+    /// changes nothing observable. The AC was written for a world where BR-1 is
+    /// the only guard.
+    ///
+    /// So this test pins the case where step 5 **is** load-bearing: `LANGUAGE`
+    /// is on the allowlist, so nothing but the unconditional credential removal
+    /// keeps it out once a config names it. That is BR-3's scenario exactly —
+    /// the allowlist cannot re-admit a configured credential.
+    ///
+    /// **Mutation run (AC-5, BR-1 half).** Deleting the
+    /// `for name in credential_env_names { env.remove(name); }` loop from
+    /// `compose_child_env` fails the `LANGUAGE` assertion here — "an allowlisted
+    /// name the config declared a credential reached the child" — and fails
+    /// `child_env::tests::a_credential_name_on_the_allowlist_is_still_removed`
+    /// and `a_declared_var_cannot_re_admit_a_credential_name`, 3 assertions in
+    /// all. The two named-credential assertions stay green, which is the honest
+    /// report: the allowlist alone already withheld them.
+    #[test]
+    fn a_configured_credential_never_reaches_the_child_from_either_gated_field() {
+        let root = temp_root("credential-env");
+        let unique = std::process::id();
+        let provider_var = format!("DEEPSEEK_AUTH_SENTINEL_{unique}");
+        let web_var = format!("WEB_SEARCH_SENTINEL_{unique}");
+
+        let config = teton_core::config::Config::from_toml(&format!(
+            r#"
+[[providers]]
+id = "deepseek"
+kind = "openai-compatible"
+endpoint = "https://deepseek.invalid/v1"
+model = "m"
+auth_ref = "env:{provider_var}"
+
+[web]
+search_key_ref = "env:{web_var}"
+"#
+        ))
+        .expect("the fixture config parses");
+
+        // `LANGUAGE` is allowlisted, so it is the one name here that composer
+        // step 5 alone keeps out. Declared as a credential by a second config so
+        // the assertion is about the rule, not about this provider.
+        let mut names = crate::child_env::credential_env_names_of(&config);
+        names.insert("LANGUAGE".to_owned());
+        crate::child_env::set_credential_env_names_provider(move || names.clone());
+
+        let secrets = [
+            (provider_var.clone(), format!("SENTINEL-provider-{unique}")),
+            (web_var.clone(), format!("SENTINEL-web-{unique}")),
+            ("LANGUAGE".to_owned(), format!("SENTINEL-language-{unique}")),
+        ];
+        // SAFETY: process-unique names apart from `LANGUAGE`, which nothing in
+        // this suite reads; set and removed around one spawn.
+        for (k, v) in &secrets {
+            unsafe { std::env::set_var(k, v) };
+        }
+
+        let stdout = match run_bounded(&root, "env", 5_000) {
+            BoundedRun::Completed { stdout, .. } => stdout,
+            other => panic!("the fixture must run to completion: {other:?}"),
+        };
+        for (k, _) in &secrets {
+            unsafe { std::env::remove_var(k) };
+        }
+        let printed = String::from_utf8_lossy(&stdout);
+
+        // AC-1: the provider field.
+        assert!(
+            !printed.contains(provider_var.as_str()) && !printed.contains(&secrets[0].1),
+            "a providers[].auth_ref credential reached the child"
+        );
+        // AC-1.1: the web field, which BR-1.1 exists for.
+        assert!(
+            !printed.contains(web_var.as_str()) && !printed.contains(&secrets[1].1),
+            "a [web] search_key_ref credential reached the child — covering only the \
+             provider half is the leak this REQ closes, in the field written second"
+        );
+        // BR-3, and the assertion the AC-5 mutation moves.
+        assert!(
+            !printed.contains("LANGUAGE=") && !printed.contains(&secrets[2].1),
+            "an allowlisted name the config declared a credential reached the child"
+        );
+        assert!(
+            printed.contains("PATH="),
+            "the child received no environment at all, so this fixture proved nothing"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// AC-2 and AC-6. The names that motivated REQ-596: each matches **none** of
     /// the retired denylist's substrings (`SECRET`, `PASSWORD`, `PASSWD`,
     /// `TOKEN`, `KEY`, `CREDENTIAL`, `PAT`), so under the old rule every one of
