@@ -361,4 +361,46 @@ mod tests {
         assert!(std::ptr::eq(tctx.core.router, dctx.core.router));
         assert!(std::ptr::eq(tctx.core.session_id, dctx.core.session_id));
     }
+
+    /// **REQ-598 AC-5 (c) — the context carries nothing derived from `cwd`.**
+    ///
+    /// AC-5's original (a) and (b) asked for a test on `TurnContext`'s view of
+    /// the session root, and a mutation building it from the pre-claim
+    /// `session_cwd` parameter. Neither is performable: the context has no
+    /// cwd-derived field, by ADR-1's measurement and the requirement's own
+    /// entity table. The one probed root feeds the jail, the prompt's
+    /// environment block and REQ-585's skill pin — never this type.
+    ///
+    /// That makes BR-2's cwd clause vacuously true today, and a vacuous truth
+    /// is exactly what stops being true without anyone noticing. This test is
+    /// the premise's guard rather than the hazard's: the destructuring below is
+    /// **exhaustive**, with no `..` rest pattern, so adding any field to either
+    /// struct fails to compile *here*. Whoever adds one has to come to this
+    /// comment and decide whether it can go stale between the claim and the
+    /// construction point — which is the question AC-5 was really asking.
+    ///
+    /// It is a compile-time guard, so it has no runtime mutation to record; the
+    /// mutation *is* "add a field", and the compiler is what goes red.
+    #[test]
+    fn the_context_holds_exactly_these_facts_and_none_derived_from_cwd() {
+        let events = Arc::new(EventBus::new());
+        let session_id = SessionId::from("session-req598-fields");
+        let config = Config::default();
+        let router = router();
+        let gate = gate_for(&events, &session_id);
+        let tctx = TurnContext::new(&events, &session_id, &config, &router, &gate, None);
+
+        // Exhaustive on purpose — see the doc comment. Do not add `..`.
+        let TurnContext {
+            core:
+                TurnCore {
+                    events: _,
+                    session_id: _,
+                    config: _,
+                    router: _,
+                },
+            gate: _,
+            invoker: _,
+        } = tctx;
+    }
 }

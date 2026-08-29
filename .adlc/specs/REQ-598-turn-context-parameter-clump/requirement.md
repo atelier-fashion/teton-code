@@ -130,16 +130,35 @@ criteria pin each one.
   free, so that test cannot distinguish a correctly-built `TurnContext` from one
   built off the pre-claim snapshot — a broader guard standing in front of the
   mutation this AC exists to catch.
-  Satisfying AC-5 therefore requires **all three**:
-  (a) the guard's subject is `TurnContext`'s **own** view of the root (assert on
-  what the constructed context carries, not only on the turn's downstream
-  behavior), so the assertion is not satisfiable by the upstream re-read alone;
-  (b) the mutation is **demonstrated**: build `TurnContext` from the
-  `session_cwd` *parameter* (the pre-claim snapshot) instead of the post-claim
-  re-read, confirm the test goes **red**, and revert;
-  (c) that mutation and its observed failure are recorded verbatim in the test's
-  doc comment, per conventions.md ("show the test can fail before trusting that
-  it passed").
+  **Amended in Phase 4 — (a) and (b) as written are unsatisfiable, and the
+  reason is a finding, not a technicality.** They presume `TurnContext` carries
+  the session root. It does not, and by this REQ's own decisions it must not:
+  the entity table above lists exactly `events`, `session_id`, `config`,
+  `router`, `gate`, and ADR-1 measured the recurring cluster without any
+  cwd-derived member. Three independent checks confirm nothing the context holds
+  is built from `session_cwd`: `turn_router(&config, &session_id)` does not take
+  it; `config` comes off the daemon mutex; and the one `probed` root feeds the
+  jail (`ToolContext::for_root`), the prompt's environment block
+  (`route.harness.session_root`) and REQ-585's skill pin — none of which is on
+  the context. So there is no field to "build from the pre-claim snapshot", and
+  (b)'s mutation cannot be performed at all.
+  This is the same shape as the two vacuous ACs Phase 1 corrected: BR-2 was
+  written before ADR-1 measured the cluster, and it names a hazard for a field
+  the design then (correctly) did not adopt.
+  **What replaces it**, so the hazard class is still guarded rather than
+  waved through:
+  (a) the cwd staleness class stays guarded where it actually lives — by
+  `a_turn_handed_a_stale_cwd_snapshot_runs_on_the_root_the_registry_holds_at_claim_time`,
+  which remains correct for `run_prompt_turn`'s re-read. It is a **preservation**
+  check here, not evidence about this diff;
+  (b) the context's *own* staleness class is real and is guarded by BR-2.1's
+  warming-hold test (below), where a field the context does carry — `router` —
+  genuinely is rebound after a point that satisfies BR-2. That test carries the
+  mutation demonstration this AC asked for, against a mutation that can actually
+  be performed;
+  (c) a structural guard pins the premise: a test asserts `TurnContext` exposes
+  no cwd- or root-derived field, so the hazard cannot re-enter by someone later
+  adding one built from the pre-claim parameter.
 - [ ] AC-6: The existing `ParkingVerifier` reader-loop test still proves concurrent RPCs are served while a presence gate blocks (BR-4 guard; informed by LESSON-518 — routing tests alone cannot show this).
 - [ ] AC-7: The gate-before-parse refusal tests still use **valid, persistable** payloads paired with an acceptance case, so they remain non-vacuous after the move (BR-5 guard; informed by LESSON-520).
 - [ ] AC-8: **Traceability sweep — a true region check.** A per-file set diff of

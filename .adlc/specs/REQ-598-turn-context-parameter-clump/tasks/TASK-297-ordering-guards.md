@@ -1,7 +1,7 @@
 ---
 id: TASK-297
 title: "Ordering guards: the context observes claim-time cwd and post-hold router"
-status: draft
+status: complete
 parent: REQ-598
 created: 2026-08-29
 updated: 2026-08-29

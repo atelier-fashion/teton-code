@@ -31802,6 +31802,26 @@ provider_id = \"deepseek\"
             crate::broadcast::Subscription,
             SessionId,
         ) {
+            start_turn_saying(runtime, presence, "hi")
+        }
+
+        /// [`start_turn`] with the prompt spelled out.
+        ///
+        /// The default `"hi"` is below [`title::worth_titling`]'s bar on
+        /// purpose, so the hold fixtures do not drag the naming duty in. A test
+        /// that wants the duty to actually run — the BR-2.1 one below does,
+        /// because the duty is what reads the context's router — passes
+        /// something substantive.
+        fn start_turn_saying(
+            runtime: &Arc<DaemonRuntime>,
+            presence: ClientPresence,
+            prompt: &str,
+        ) -> (
+            tokio::task::JoinHandle<Result<PromptTurnResult, RpcError>>,
+            crate::broadcast::Subscription,
+            SessionId,
+        ) {
+            let prompt = prompt.to_owned();
             let events = Arc::new(EventBus::new());
             let sub = events.subscribe(64);
             let sessions = SessionRegistry::new();
@@ -31819,7 +31839,7 @@ provider_id = \"deepseek\"
                         session.mode,
                         None,
                         None,
-                        "hi".to_owned(),
+                        prompt,
                         None,
                         None,
                         presence,
@@ -31897,6 +31917,105 @@ provider_id = \"deepseek\"
                 queued_so_far(&mut sub),
                 0,
                 "announced once, not once per wake"
+            );
+        }
+
+        /// **REQ-598 BR-2.1 / ADR-4 — the context carries the POST-hold router.**
+        ///
+        /// BR-2 asks that a `TurnContext` be built after the turn is claimed.
+        /// That is necessary and not sufficient, and this test is the mechanical
+        /// guard for the gap. `router` is bound before `dispatch_route` and then
+        /// **shadow-rebound inside the warming hold**, rebuilt from the settled
+        /// tier state. A context built at the first binding satisfies BR-2 and
+        /// passes every other test in this file.
+        ///
+        /// ## What it observes, and why that is the context's own view
+        ///
+        /// `spawn_title_session` is the one consumer that reads the router
+        /// *only* through `tctx.core` — it takes a `TurnCore` and has no router
+        /// parameter of its own. So the `title` duty's resolution is a direct
+        /// reading of what the context carries. On this fixture the two routers
+        /// disagree exactly where it matters: the pre-hold router is built with
+        /// `local_tier_available() == false`, which leaves `reflex` — and so
+        /// `title` — with nowhere to resolve; the post-hold router is built with
+        /// the tier open and resolves it to the local engine. A title therefore
+        /// lands if and only if the context carries the post-hold router.
+        ///
+        /// The prompt is substantive on purpose: `"hi"` is below
+        /// `worth_titling`'s bar and would skip the duty entirely, making this
+        /// test vacuous.
+        ///
+        /// ## Mutations, run and recorded as observed (conventions.md)
+        ///
+        /// **The obvious mutation does not compile, and that is a finding.**
+        /// Moving the `TurnContext::new(...)` line to immediately before the
+        /// hold — the construction point that still satisfies BR-2 — is rejected
+        /// by the borrow checker:
+        ///
+        /// ```text
+        /// error[E0505]: cannot move out of `router` because it is borrowed
+        ///   None => router,   // move out of `router` occurs here
+        ///   tctx.core,        // borrow later used here
+        /// ```
+        ///
+        /// The hold's `None` arm *moves* the pre-hold router into the rebound
+        /// binding, so a context borrowing it cannot outlive that move. On this
+        /// path the construction point is therefore enforced by the type system,
+        /// not merely by this test — a stronger guarantee than ADR-4 claimed,
+        /// and one worth knowing before someone "simplifies" the hold into a
+        /// form that clones instead of moving, which would quietly remove it.
+        ///
+        /// **So the guard was forced instead**, to show this test can fail
+        /// rather than resting on the compiler. Cloning the pre-hold router and
+        /// building the context from the clone compiles, and turns this red:
+        ///
+        /// ```text
+        /// the title duty resolved through the context's router, so a title must
+        /// land once the tier is open: the context is carrying the pre-hold router
+        /// ```
+        ///
+        /// Both reverted after observing. Note what this test would *miss*: it says
+        /// nothing about `config` or `gate`, neither of which is rebound on this
+        /// path, and nothing about a context built before the *claim* — that is
+        /// AC-5's class, which this REQ's design puts out of reach because the
+        /// context carries no cwd-derived field (see AC-5 as amended).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_turn_context_carries_the_router_rebound_by_the_hold() {
+            let runtime = loading_runtime();
+            let engine = CountingEngine::answering("Retry the download client");
+            let (task, mut sub, _session_id) = start_turn_saying(
+                &runtime,
+                ClientPresence::unwatched(),
+                "please summarize the download retry logic for me",
+            );
+
+            // The hold fired: the router the turn started with is about to be
+            // replaced, which is the precondition this test needs.
+            let (_scoped, announced) = queued(&mut sub).await;
+            assert_eq!(announced.waiting_on, TierWarming::Loading);
+
+            tier_opens(&runtime, &engine);
+
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("the held turn runs once the tier opens")
+                .expect("the task did not panic")
+                .expect("the turn is served, not refused");
+
+            // The naming duty is detached, so it may land after the turn's own
+            // reply. Wait for it rather than sampling once.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let mut titled = false;
+            while let Ok(Some(env)) = tokio::time::timeout_at(deadline, sub.recv()).await {
+                if matches!(env.event, Event::SessionTitled(_)) {
+                    titled = true;
+                    break;
+                }
+            }
+            assert!(
+                titled,
+                "the title duty resolved through the context's router, so a title must \
+                 land once the tier is open: the context is carrying the pre-hold router"
             );
         }
 
