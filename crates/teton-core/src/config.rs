@@ -118,7 +118,73 @@ pub struct PrivacyConfig {
     /// at all states its posture rather than leaving it to be inferred.
     #[serde(default)]
     pub redact: bool,
+
+    /// Turn off the shipped default boundary set (REQ-597 BR-3).
+    ///
+    /// **Defaults to `false`**, which is the whole point of REQ-597: on a stock
+    /// install the thirteen [`DEFAULT_BOUNDARIES`] globs are in force, so
+    /// `~/.ssh/id_rsa`, a project `.env`, and `~/.aws/credentials` are
+    /// `local-only` without the user having marked anything.
+    ///
+    /// This is the one and only route to an empty boundary set — there is no
+    /// implicit path, and no heuristic that guesses which machines are safe.
+    /// That shape is deliberate: it is what BUG-202 settled on for
+    /// `allow_cleartext`, a secure default plus one explicit, greppable opt-out
+    /// (LESSON-578).
+    ///
+    /// Setting it accepts a real consequence, which is why it is a key and not
+    /// a flag: with no user rows declared it leaves the session with **no**
+    /// boundaries at all, and a session rooted at `$HOME` or `/` in that state
+    /// emits `unbounded_root_warning` (BR-5).
+    #[serde(default)]
+    pub disable_default_boundaries: bool,
 }
+
+/// The shipped `local-only` boundary set (REQ-597 BR-1).
+///
+/// Thirteen repo-root-relative globs covering the credential-shaped paths an
+/// agent reads by accident: SSH and signing keys, `.env` files, cloud and
+/// registry credentials, and container/cluster configs.
+///
+/// # Why these match at the repo root
+///
+/// Every entry is `**/`-prefixed, and under `globset` with
+/// `literal_separator(true)` a leading `**/` matches **zero** or more leading
+/// directories. So `**/.ssh/**` covers `.ssh/id_rsa` at the root as well as
+/// `vendor/fixtures/.ssh/id_rsa` beneath it. This was verified against the real
+/// crate before the list was fixed, because the whole REQ rests on it.
+///
+/// # What they deliberately do not match
+///
+/// `src/main.rs`, `README.md`, a file literally named `env`, and `notes/.envrc`
+/// — pinned by [`tests::default_boundaries_match_credentials_and_spare_sources`].
+///
+/// # The accepted false positive
+///
+/// `**/*.pem` and `**/*.key` are broad, and they will match ordinary test
+/// fixtures. That is the spec's central judgment, not an oversight: a blocked
+/// `.env` that the user wanted to send comes with a clear message and an
+/// opt-out ([`PrivacyConfig::disable_default_boundaries`]), and a silent
+/// credential leak does not.
+///
+/// Order matters only relative to the user's rows, never within this list: a
+/// path matching two builtins resolves to the earlier one, and both are
+/// `local-only`, so the outcome is identical either way.
+pub const DEFAULT_BOUNDARIES: &[&str] = &[
+    "**/.env",
+    "**/.env.*",
+    "**/.ssh/**",
+    "**/*.pem",
+    "**/*.key",
+    "**/id_rsa*",
+    "**/id_ed25519*",
+    "**/.aws/**",
+    "**/.npmrc",
+    "**/.netrc",
+    "**/.git-credentials",
+    "**/.docker/config.json",
+    "**/.kube/config",
+];
 
 /// Opt-in spend behaviour (`[cost]`) — today, REQ-588's per-prompt ceiling.
 ///
@@ -1533,6 +1599,71 @@ pub enum ConfigError {
 }
 
 impl Config {
+    /// The boundary set this config actually enforces: the user's rows, then
+    /// the shipped defaults (REQ-597 BR-2, BR-2.1, BR-3).
+    ///
+    /// **This is the one place the builtin set is composed** (AC-8). Every
+    /// reader of a boundary list — the egress choke point, the session-taint
+    /// check, `config/get`'s report — calls this. The single *writer*
+    /// (`config/set`'s `SetPrivacyBoundary`) deliberately does not: it appends
+    /// to [`Self::boundaries`], the user's own table, which is what keeps a
+    /// user's config file free of rows they never wrote (AC-10).
+    ///
+    /// # Why the builtins are appended rather than prepended
+    ///
+    /// [`crate::boundary::BoundaryMatcher::match_path`] resolves an overlap by
+    /// **earliest declaration wins** (it takes `.min()` over the matched
+    /// indices). Appending therefore leaves every user row strictly ahead of
+    /// every builtin, so a user row that already matches a builtin path keeps
+    /// its own mode and its own identity — which is BR-7, true by construction
+    /// rather than by a tie-break rule written on top. Prepending would make a
+    /// builtin override the user's own row, the direct contradiction of BR-7
+    /// (BR-2.1).
+    ///
+    /// The residual BR-2.2 accepts: a user row *can* therefore select a weaker
+    /// mode for a builtin path. It can never remove the protection — the
+    /// composed set still matches — and the residual is inert today because
+    /// both [`BoundaryMode`] arms fail closed at the egress inspector.
+    ///
+    /// # No deduplication
+    ///
+    /// A user glob byte-identical to a builtin leaves **both** rows in the
+    /// result. BR-7's "one block, not two" is a statement about enforcement,
+    /// which `match_path` already guarantees by returning exactly one row;
+    /// collapsing the pair here would instead hide the builtin from
+    /// `boundary list` and destroy the only evidence of which row governs.
+    ///
+    /// # Returns a fresh list, and never mutates
+    ///
+    /// The builtin rows must not exist inside a [`Config`] value, because
+    /// [`crate::config_doc::apply_config_delta`] diffs a `Config` against the
+    /// user's real TOML document. A builtin row living in [`Self::boundaries`]
+    /// would be diffed as a row the user is missing and written to their file
+    /// on the next unrelated `config/set`.
+    #[must_use]
+    pub fn effective_boundaries(&self) -> Vec<PrivacyBoundary> {
+        let mut composed = self.boundaries.clone();
+        if !self.privacy.disable_default_boundaries {
+            composed.extend(DEFAULT_BOUNDARIES.iter().map(|g| PrivacyBoundary::builtin(*g)));
+        }
+        composed
+    }
+
+    /// How many builtin rows [`Self::effective_boundaries`] contributed — the
+    /// `count` payload of `boundary_defaults_applied` (REQ-597 System Model).
+    ///
+    /// Derived from the same condition the composer uses rather than by
+    /// subtracting two lengths, so the event cannot come to disagree with the
+    /// set it reports on.
+    #[must_use]
+    pub fn builtin_boundary_count(&self) -> usize {
+        if self.privacy.disable_default_boundaries {
+            0
+        } else {
+            DEFAULT_BOUNDARIES.len()
+        }
+    }
+
     /// Parse a config document from a TOML string. Does not validate — call
     /// [`Config::validate`] afterwards (or use [`Config::load`]).
     ///
@@ -2600,7 +2731,8 @@ mod tests {
     use super::*;
     use crate::category::{Category, ParseCategoryError};
     use crate::entities::{
-        BoundaryMode, ModelProvider, ProviderCapabilities, ProviderKind, ToolCallTier,
+        BoundaryMode, BoundaryOrigin, ModelProvider, ProviderCapabilities, ProviderKind,
+        ToolCallTier,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -3167,14 +3299,8 @@ effort_ladder = []
                 },
             ],
             boundaries: vec![
-                PrivacyBoundary {
-                    path_glob: "secrets/**".to_owned(),
-                    mode: BoundaryMode::LocalOnly,
-                },
-                PrivacyBoundary {
-                    path_glob: "docs/**".to_owned(),
-                    mode: BoundaryMode::RedactThenRemote,
-                },
+                PrivacyBoundary::user("secrets/**", BoundaryMode::LocalOnly),
+                PrivacyBoundary::user("docs/**", BoundaryMode::RedactThenRemote),
             ],
             mcp_server: vec![
                 McpServerConfig {
@@ -6587,5 +6713,226 @@ cache_ttl_secs = 60
         )
         .expect("a well-formed list loads");
         assert_eq!(ok.skills.trusted_project_roots.len(), 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-597 — the builtin boundary set and its one composition site
+    // -----------------------------------------------------------------------
+
+    /// BR-1. The shipped list is exactly the thirteen globs the spec names, in
+    /// the spec's order, every one `local-only` and `builtin`.
+    ///
+    /// **Mutation**: drop or reorder any entry of `DEFAULT_BOUNDARIES`, or give
+    /// one a non-`LocalOnly` mode, and this fails.
+    #[test]
+    fn default_boundaries_are_the_thirteen_specified_globs() {
+        assert_eq!(
+            DEFAULT_BOUNDARIES,
+            [
+                "**/.env",
+                "**/.env.*",
+                "**/.ssh/**",
+                "**/*.pem",
+                "**/*.key",
+                "**/id_rsa*",
+                "**/id_ed25519*",
+                "**/.aws/**",
+                "**/.npmrc",
+                "**/.netrc",
+                "**/.git-credentials",
+                "**/.docker/config.json",
+                "**/.kube/config",
+            ]
+        );
+        let cfg = Config::default();
+        let effective = cfg.effective_boundaries();
+        // Count first. Without this the loop below is vacuous over an empty set
+        // and the test survives the very mutation it exists to catch.
+        assert_eq!(
+            effective.len(),
+            DEFAULT_BOUNDARIES.len(),
+            "a stock config carries every builtin row"
+        );
+        for (b, expected) in effective.iter().zip(DEFAULT_BOUNDARIES) {
+            assert_eq!(&b.path_glob, expected, "composed order follows the spec's order");
+            assert_eq!(b.mode, BoundaryMode::LocalOnly, "{} is not local-only", b.path_glob);
+            assert_eq!(b.origin, BoundaryOrigin::Builtin, "{} is not builtin", b.path_glob);
+        }
+    }
+
+    /// BR-1, and the assumption the whole REQ rests on: a leading `**/` matches
+    /// **zero** leading directories under `globset` with `literal_separator`,
+    /// so every glob catches its target at the repo root — and none of them
+    /// catches an ordinary source file.
+    ///
+    /// **Mutation**: strip the `**/` prefix from any glob (making it root-only)
+    /// or widen `**/.env` to `**/.env*` (which would swallow `notes/.envrc`)
+    /// and this fails.
+    #[test]
+    fn default_boundaries_match_credentials_and_spare_sources() {
+        let cfg = Config::default();
+        let effective = cfg.effective_boundaries();
+        let matcher = BoundaryMatcher::new(&effective).expect("builtin globs compile");
+
+        for caught in [
+            ".ssh/id_rsa",
+            ".ssh/keys/id_rsa",
+            "vendor/fixtures/.ssh/id_rsa",
+            ".env",
+            ".env.local",
+            "sub/.env",
+            ".aws/credentials",
+            ".netrc",
+            ".npmrc",
+            ".git-credentials",
+            ".docker/config.json",
+            ".kube/config",
+            "certs/server.pem",
+            "a/b/c.key",
+            "id_rsa",
+            "id_ed25519.pub",
+        ] {
+            assert!(
+                matcher.match_path(caught).is_some(),
+                "{caught} should be covered by the builtin set"
+            );
+        }
+
+        for spared in ["src/main.rs", "README.md", "env", "notes/.envrc", "Cargo.toml"] {
+            assert!(
+                matcher.match_path(spared).is_none(),
+                "{spared} must not be caught by the builtin set"
+            );
+        }
+    }
+
+    /// BR-2 / BR-2.1. User rows come first and builtin rows are appended after
+    /// — asserted **by index**, because the position is what makes BR-7 true
+    /// and set membership would pass under either ordering.
+    ///
+    /// **Mutation**: prepend the builtins instead of extending, and this fails.
+    #[test]
+    fn user_rows_precede_appended_builtin_rows() {
+        let mut cfg = Config::default();
+        cfg.boundaries = vec![
+            PrivacyBoundary::user("src/vendor/**", BoundaryMode::LocalOnly),
+            PrivacyBoundary::user("docs/**", BoundaryMode::RedactThenRemote),
+        ];
+
+        let effective = cfg.effective_boundaries();
+        assert_eq!(effective.len(), 2 + DEFAULT_BOUNDARIES.len());
+        assert_eq!(effective[0].path_glob, "src/vendor/**");
+        assert_eq!(effective[0].origin, BoundaryOrigin::User);
+        assert_eq!(effective[1].path_glob, "docs/**");
+        assert_eq!(effective[1].origin, BoundaryOrigin::User);
+        assert_eq!(effective[2].path_glob, DEFAULT_BOUNDARIES[0]);
+        assert_eq!(effective[2].origin, BoundaryOrigin::Builtin);
+    }
+
+    /// BR-3. The opt-out is the only route to a set without builtins, and it
+    /// leaves the user's own rows untouched.
+    ///
+    /// **Mutation**: ignore `disable_default_boundaries` in the composer and
+    /// this fails.
+    #[test]
+    fn the_opt_out_is_the_only_route_to_no_builtins() {
+        let mut cfg = Config::default();
+        assert_eq!(
+            cfg.effective_boundaries().len(),
+            DEFAULT_BOUNDARIES.len(),
+            "a stock config is protected by the builtin set"
+        );
+        assert_eq!(cfg.builtin_boundary_count(), DEFAULT_BOUNDARIES.len());
+
+        cfg.privacy.disable_default_boundaries = true;
+        assert!(
+            cfg.effective_boundaries().is_empty(),
+            "the opt-out with no user rows is the empty set BR-5 keys on"
+        );
+        assert_eq!(cfg.builtin_boundary_count(), 0);
+
+        cfg.boundaries = vec![PrivacyBoundary::user("src/vendor/**", BoundaryMode::LocalOnly)];
+        let effective = cfg.effective_boundaries();
+        assert_eq!(effective.len(), 1, "the opt-out drops builtins, not user rows");
+        assert_eq!(effective[0].path_glob, "src/vendor/**");
+    }
+
+    /// BR-7 + BR-2.2. A user row that collides with a builtin **governs** the
+    /// path, keeping its own mode and origin.
+    ///
+    /// The assertion is on the governing row's identity, not on whether the
+    /// path matched: both `BoundaryMode` arms fail closed at egress today, so
+    /// an outcome assertion cannot distinguish the two orderings (LESSON-550).
+    ///
+    /// **Mutation**: prepend the builtins, and the returned row becomes the
+    /// builtin `local-only` one.
+    #[test]
+    fn a_colliding_user_row_governs_and_keeps_its_own_mode() {
+        let mut cfg = Config::default();
+        cfg.boundaries = vec![PrivacyBoundary::user("**/.env", BoundaryMode::RedactThenRemote)];
+
+        let effective = cfg.effective_boundaries();
+        let matcher = BoundaryMatcher::new(&effective).expect("globs compile");
+        let governing = matcher.match_path(".env").expect(".env is governed");
+
+        assert_eq!(governing.origin, BoundaryOrigin::User, "the user's row wins");
+        assert_eq!(governing.mode, BoundaryMode::RedactThenRemote);
+    }
+
+    /// BR-7's other half: the collision leaves **both** rows in the composed
+    /// set. Deduping would hide the builtin from `boundary list` and destroy
+    /// the evidence of which row governs.
+    ///
+    /// **Mutation**: dedupe by `path_glob` in the composer, and this fails.
+    #[test]
+    fn a_colliding_user_row_does_not_remove_the_builtin() {
+        let mut cfg = Config::default();
+        cfg.boundaries = vec![PrivacyBoundary::user("**/.env", BoundaryMode::RedactThenRemote)];
+
+        let effective = cfg.effective_boundaries();
+        assert_eq!(effective.len(), 1 + DEFAULT_BOUNDARIES.len());
+        let env_rows: Vec<_> = effective.iter().filter(|b| b.path_glob == "**/.env").collect();
+        assert_eq!(env_rows.len(), 2, "the user's row and the builtin both survive");
+        assert_eq!(env_rows[0].origin, BoundaryOrigin::User);
+        assert_eq!(env_rows[1].origin, BoundaryOrigin::Builtin);
+    }
+
+    /// AC-10's protection, asserted at the type rather than only end to end: a
+    /// user row must serialize with **no** `origin` key, or every config that
+    /// takes an unrelated `config/set` grows `origin = "user"` lines.
+    ///
+    /// **Mutation**: remove `skip_serializing_if` from `PrivacyBoundary::origin`
+    /// and this fails.
+    #[test]
+    fn a_user_row_serializes_without_an_origin_key() {
+        let mut cfg = Config::default();
+        cfg.boundaries = vec![PrivacyBoundary::user("secrets/**", BoundaryMode::LocalOnly)];
+
+        let toml = cfg.to_toml().expect("a well-formed config serializes");
+        assert!(toml.contains("secrets/**"), "the user's row is written");
+        assert!(
+            !toml.contains("origin"),
+            "a user row must not grow an `origin` key on disk:\n{toml}"
+        );
+
+        // And the builtin set never reaches the writer at all (ADR-1).
+        for glob in DEFAULT_BOUNDARIES {
+            assert!(
+                !toml.contains(glob),
+                "builtin {glob} must never be serialized into a user's config"
+            );
+        }
+    }
+
+    /// The additive-field contract on disk: a config written before REQ-597 has
+    /// no `origin` key, and must load as a user row.
+    #[test]
+    fn a_pre_req_config_loads_its_boundaries_as_user_rows() {
+        let cfg = Config::from_toml(
+            "[[boundaries]]\npath_glob = \"secrets/**\"\nmode = \"local-only\"\n",
+        )
+        .expect("a pre-REQ config still loads");
+        assert_eq!(cfg.boundaries.len(), 1);
+        assert_eq!(cfg.boundaries[0].origin, BoundaryOrigin::User);
     }
 }

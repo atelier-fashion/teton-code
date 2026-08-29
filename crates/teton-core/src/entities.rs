@@ -267,15 +267,83 @@ pub enum BoundaryMode {
     RedactThenRemote,
 }
 
+/// Where a [`PrivacyBoundary`] came from (System Model: `PrivacyBoundary.origin`,
+/// REQ-597).
+///
+/// Exists for **reporting** (BR-6) and for the composition order BR-2.1 names.
+/// It is never read at enforcement time: [`crate::boundary::BoundaryMatcher`]
+/// does not branch on it, and neither does the egress inspector. A builtin
+/// boundary blocks exactly as a user boundary does (BR-4).
+///
+/// [`Self::User`] is the default, and that is load-bearing rather than
+/// arbitrary: the only rows that can reach the config *writer* are the user's
+/// own (the builtin set is composed on read and never enters
+/// [`crate::Config::boundaries`] — REQ-597 ADR-1), and every config authored
+/// before this REQ has no `origin` key at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BoundaryOrigin {
+    /// A row the user wrote in their own `[[boundaries]]` table.
+    #[default]
+    User,
+    /// A row from the shipped default set ([`crate::config::DEFAULT_BOUNDARIES`]).
+    Builtin,
+}
+
+impl BoundaryOrigin {
+    /// Whether this is a user-authored row.
+    ///
+    /// Used as `skip_serializing_if` on [`PrivacyBoundary::origin`]. Without
+    /// that skip, `config_doc::canonical_document` emits `origin = "user"` into
+    /// every `[[boundaries]]` table and the next unrelated `config/set` writes
+    /// those lines into the user's file — the AC-10 failure this predicate
+    /// exists to prevent.
+    #[must_use]
+    pub fn is_user(&self) -> bool {
+        matches!(self, Self::User)
+    }
+}
+
 /// A repo-relative glob marking files under a privacy rule (System Model:
 /// `PrivacyBoundary`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrivacyBoundary {
     /// Repo-relative glob (e.g. `secrets/**`).
     pub path_glob: String,
     /// The privacy mode for matching files. Defaults to `local-only`.
     #[serde(default)]
     pub mode: BoundaryMode,
+    /// Whether this row is user-authored or shipped (REQ-597 BR-4/BR-6).
+    ///
+    /// Skipped on serialize when [`BoundaryOrigin::User`] so a user's config
+    /// file never grows an `origin` key it did not write (AC-10).
+    #[serde(default, skip_serializing_if = "BoundaryOrigin::is_user")]
+    pub origin: BoundaryOrigin,
+}
+
+impl PrivacyBoundary {
+    /// A user-authored boundary — the shape every config row and every caller
+    /// outside the builtin set has.
+    #[must_use]
+    pub fn user(path_glob: impl Into<String>, mode: BoundaryMode) -> Self {
+        Self {
+            path_glob: path_glob.into(),
+            mode,
+            origin: BoundaryOrigin::User,
+        }
+    }
+
+    /// A row from the shipped default set. Always [`BoundaryMode::LocalOnly`]
+    /// (BR-1) — the builtin set names no other mode, so this constructor does
+    /// not take one.
+    #[must_use]
+    pub fn builtin(path_glob: impl Into<String>) -> Self {
+        Self {
+            path_glob: path_glob.into(),
+            mode: BoundaryMode::LocalOnly,
+            origin: BoundaryOrigin::Builtin,
+        }
+    }
 }
 
 /// Where a [`ModelSelection`] came from (System Model: `ModelSelection.source`).

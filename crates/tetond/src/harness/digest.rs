@@ -129,6 +129,7 @@ mod tests {
         vec![PrivacyBoundary {
             path_glob: "secrets/**".to_owned(),
             mode: BoundaryMode::LocalOnly,
+            origin: Default::default(),
         }]
     }
 

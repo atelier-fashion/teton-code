@@ -225,6 +225,7 @@ fn boundaries(glob: &str) -> Vec<PrivacyBoundary> {
     vec![PrivacyBoundary {
         path_glob: glob.to_owned(),
         mode: BoundaryMode::LocalOnly,
+        origin: Default::default(),
     }]
 }
 

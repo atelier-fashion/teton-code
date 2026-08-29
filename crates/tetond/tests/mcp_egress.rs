@@ -59,6 +59,7 @@ fn local_only_boundaries() -> Vec<PrivacyBoundary> {
     vec![PrivacyBoundary {
         path_glob: "secrets/**".to_owned(),
         mode: BoundaryMode::LocalOnly,
+        origin: Default::default(),
     }]
 }
 

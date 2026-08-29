@@ -763,6 +763,7 @@ async fn routed_remote_call_produces_cost_record_and_passes_boundary_inspection(
         vec![PrivacyBoundary {
             path_glob: "secrets/**".to_owned(),
             mode: BoundaryMode::LocalOnly,
+            origin: Default::default(),
         }],
     );
 

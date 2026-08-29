@@ -14000,6 +14000,7 @@ fn apply_update(config: &mut Config, update: ConfigUpdate) {
             let boundary = PrivacyBoundary {
                 path_glob: pb.path_glob,
                 mode: to_core_mode(pb.mode),
+                origin: Default::default(),
             };
             if let Some(existing) = config
                 .boundaries
@@ -15833,7 +15834,7 @@ permission_allow = [\"fetch_user_url\"]
 
         // And the opt-in, on the same projection.
         let opted_in = Config {
-            privacy: teton_core::config::PrivacyConfig { redact: true },
+            privacy: teton_core::config::PrivacyConfig { redact: true, ..Default::default() },
             ..Config::default()
         };
         assert!(
@@ -17164,6 +17165,7 @@ permission_allow = [\"fetch_user_url\"]
         let boundaries = vec![PrivacyBoundary {
             path_glob: "secrets/**".to_owned(),
             mode: BoundaryMode::LocalOnly,
+            origin: Default::default(),
         }];
 
         // A read of a boundary file taints (REQ-544 C-2).
@@ -18058,6 +18060,7 @@ permission_allow = [\"fetch_user_url\"]
             config.boundaries = vec![PrivacyBoundary {
                 path_glob: "secrets/**".to_owned(),
                 mode: BoundaryMode::LocalOnly,
+                origin: Default::default(),
             }];
             let runtime = runtime(config.clone(), &engine, true);
             let router = router_for(&runtime);
@@ -20204,7 +20207,7 @@ permission_allow = [\"fetch_user_url\"]
 
             /// `config` with the `[privacy]` opt-in switched on.
             fn opted_in(mut config: Config) -> Config {
-                config.privacy = PrivacyConfig { redact: true };
+                config.privacy = PrivacyConfig { redact: true, ..Default::default() };
                 config
             }
 
@@ -20833,6 +20836,7 @@ permission_allow = [\"fetch_user_url\"]
                     config.boundaries = vec![PrivacyBoundary {
                         path_glob: "secrets/**".to_owned(),
                         mode: BoundaryMode::LocalOnly,
+                        origin: Default::default(),
                     }];
                     config
                 }
@@ -29142,6 +29146,7 @@ provider_id = \"deepseek\"
                 boundaries: vec![PrivacyBoundary {
                     path_glob: "secrets/**".to_owned(),
                     mode: BoundaryMode::LocalOnly,
+                    origin: Default::default(),
                 }],
                 ..local_config()
             }
@@ -31086,7 +31091,7 @@ provider_id = \"deepseek\"
                         },
                     }],
                     default_provider: Some("wide".to_owned()),
-                    privacy: PrivacyConfig { redact },
+                    privacy: PrivacyConfig { redact, ..Default::default() },
                     web: WebConfig {
                         tier,
                         ..WebConfig::default()
@@ -36216,6 +36221,7 @@ provider_id = \"deepseek\"
                 .push(PrivacyBoundary {
                     path_glob: ".claude/**".to_owned(),
                     mode: teton_core::entities::BoundaryMode::LocalOnly,
+                    origin: Default::default(),
                 });
             fx.engine.refuse_the_expansion();
 

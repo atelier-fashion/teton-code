@@ -1320,6 +1320,7 @@ mod tests {
         let boundaries = vec![PrivacyBoundary {
             path_glob: "secrets/**".to_owned(),
             mode: BoundaryMode::LocalOnly,
+            origin: Default::default(),
         }];
         let (route, sent) = remote_route(boundaries, "FORGET: 1\nSUMMARY: x", 1);
 

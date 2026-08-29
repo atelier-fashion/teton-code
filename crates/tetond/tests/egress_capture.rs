@@ -117,6 +117,7 @@ fn local_only_boundaries() -> Vec<PrivacyBoundary> {
     vec![PrivacyBoundary {
         path_glob: "secrets/**".to_owned(),
         mode: BoundaryMode::LocalOnly,
+        origin: Default::default(),
     }]
 }
 
@@ -1005,6 +1006,7 @@ async fn a_project_skill_under_a_boundary_pins_the_turn_and_nothing_leaves() {
         vec![PrivacyBoundary {
             path_glob: ".claude/skills/secret/**".to_owned(),
             mode: BoundaryMode::LocalOnly,
+            origin: Default::default(),
         }],
         sink.clone(),
     );
@@ -1082,6 +1084,7 @@ async fn a_user_skill_outside_the_root_pins_the_turn_wherever_any_boundary_exist
         // Names nothing this test touches: the point is that it does not have to.
         path_glob: "secrets/**".to_owned(),
         mode: BoundaryMode::LocalOnly,
+        origin: Default::default(),
     }];
     let capture = CaptureTransport::default();
     let sink = Arc::new(CapturingSink::default());
@@ -1290,6 +1293,7 @@ async fn an_accepted_over_budget_expansion_still_answers_to_the_boundary() {
         vec![PrivacyBoundary {
             path_glob: ".claude/skills/bigsecret/**".to_owned(),
             mode: BoundaryMode::LocalOnly,
+            origin: Default::default(),
         }],
         sink.clone(),
     );

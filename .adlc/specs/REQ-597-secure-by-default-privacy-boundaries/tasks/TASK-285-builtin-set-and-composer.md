@@ -1,7 +1,7 @@
 ---
 id: TASK-285
 title: "The builtin boundary set and the one function that composes it"
-status: pending
+status: complete
 parent: REQ-597
 repo: teton-code
 created: 2026-08-29

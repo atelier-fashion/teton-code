@@ -222,6 +222,7 @@ async fn a_privacy_blocked_call_is_never_billed() {
     let boundaries = vec![PrivacyBoundary {
         path_glob: "secrets/**".to_owned(),
         mode: BoundaryMode::LocalOnly,
+        origin: Default::default(),
     }];
     let egress =
         Egress::new(transport, boundaries, Arc::new(NoopSink)).with_cost_meter(ledger.clone());
