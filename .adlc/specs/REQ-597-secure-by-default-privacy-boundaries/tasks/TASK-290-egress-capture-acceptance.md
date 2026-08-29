@@ -1,7 +1,7 @@
 ---
 id: TASK-290
 title: "Egress-capture proof that the stock install keeps the promise"
-status: pending
+status: complete
 parent: REQ-597
 repo: teton-code
 created: 2026-08-29

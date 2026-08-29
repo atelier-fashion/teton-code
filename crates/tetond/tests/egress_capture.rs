@@ -1351,3 +1351,335 @@ async fn an_accepted_over_budget_expansion_still_answers_to_the_boundary() {
     assert_eq!(sink.events().len(), 1, "one privacy_block for one refusal");
     std::fs::remove_dir_all(root.parent().unwrap()).ok();
 }
+
+// ---------------------------------------------------------------------------
+// REQ-597 — the stock install keeps the promise
+//
+// Every test below builds its boundary set from `Config::effective_boundaries()`
+// rather than from a hand-written list. That is deliberate: a literal copy of
+// the thirteen globs here would test that two lists agree with each other, not
+// that the composer the daemon actually calls puts them in force (LESSON-499's
+// shape — a double with its own copy of the rule tests only that two
+// implementations share each other's bugs).
+// ---------------------------------------------------------------------------
+
+/// Obviously-synthetic sentinels (AC-6). Each contains `SENTINEL` and none is
+/// shaped like a real provider credential — a lookalike trips scanners and
+/// teaches the next reader the wrong lesson (LESSON-497).
+const SENTINEL_SSH: &str = "SENTINEL-REQ597-SSH-PRIVATE-KEY-NOT-A-REAL-KEY";
+const SENTINEL_ENV: &str = "SENTINEL-REQ597-DOTENV-VALUE-NOT-A-REAL-KEY";
+const SENTINEL_AWS: &str = "SENTINEL-REQ597-AWS-CREDENTIAL-NOT-A-REAL-KEY";
+const SENTINEL_NETRC: &str = "SENTINEL-REQ597-NETRC-PASSWORD-NOT-A-REAL-KEY";
+
+/// A temp repo whose credential-shaped paths are covered by the **builtin** set
+/// and whose source file is not.
+fn stock_repo(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "teton-req597-{tag}-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(root.join(".ssh")).unwrap();
+    std::fs::create_dir_all(root.join(".aws")).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join(".ssh/id_rsa"), SENTINEL_SSH).unwrap();
+    std::fs::write(root.join(".env"), SENTINEL_ENV).unwrap();
+    std::fs::write(root.join(".aws/credentials"), SENTINEL_AWS).unwrap();
+    std::fs::write(root.join(".netrc"), SENTINEL_NETRC).unwrap();
+    std::fs::write(root.join("src/main.rs"), PUBLIC_CONTENT).unwrap();
+    root
+}
+
+/// The boundary set a machine with `config` actually enforces — through the
+/// composer, never a copy of the glob list.
+fn effective(config: &teton_core::Config) -> Vec<PrivacyBoundary> {
+    config.effective_boundaries()
+}
+
+/// Read `path` through the real `read` tool and send the resulting turn, giving
+/// back what the choke point decided.
+async fn send_read(
+    egress: &Egress<CaptureTransport>,
+    ctx: &tetond::harness::ToolContext,
+    egress_ctx: &EgressContext,
+    path: &str,
+    expect_marker: &str,
+) -> Result<(), EgressError> {
+    use tetond::harness::tools::ReadTool;
+    use tetond::harness::Tool;
+
+    let out = ReadTool.run(ctx, &serde_json::json!({ "path": path }));
+    assert!(!out.is_error, "reading {path:?}: {}", out.content);
+    assert!(
+        out.content.contains(expect_marker),
+        "fixture: {path:?} must actually surface {expect_marker:?}, or the \
+         assertion about it is about nothing"
+    );
+    let (req, prov) = turn_from(&out, expect_marker);
+    egress.send(req, &prov, egress_ctx).await.map(|_| ())
+}
+
+/// **AC-1 and AC-2.** On a config with **no** `[[boundaries]]` table, the bytes
+/// of each planted credential sentinel reach no captured payload, and each
+/// raises a `privacy_block`.
+///
+/// This is the whole REQ in one assertion: the config is the stock one, nothing
+/// is marked, and the promise holds anyway.
+///
+/// The public read runs **first**, as a positive control: without it, "no
+/// sentinel bytes were captured" would also be satisfied by an egress that
+/// forwarded nothing at all (LESSON-479).
+///
+/// **Mutation (AC-5)**: remove `DEFAULT_BOUNDARIES` from
+/// `Config::effective_boundaries`'s composition and every sentinel below is
+/// forwarded instead of blocked.
+#[tokio::test]
+async fn a_stock_config_blocks_every_planted_credential_sentinel() {
+    let root = stock_repo("stock");
+    let ctx = tetond::harness::ToolContext::new(&root);
+    let capture = CaptureTransport::default();
+    let sink = Arc::new(CapturingSink::default());
+    // The stock machine: a default config, no `[[boundaries]]` table at all.
+    let config = teton_core::Config::default();
+    assert!(
+        config.boundaries.is_empty(),
+        "the fixture must declare no user boundaries — that is the premise"
+    );
+    let egress = Egress::new(capture.clone(), effective(&config), sink.clone());
+    let egress_ctx = EgressContext::new("anthropic").with_session("sess-req597-stock");
+
+    // Positive control.
+    assert!(
+        send_read(&egress, &ctx, &egress_ctx, "src/main.rs", "PUBLIC-MARKER-9f3a")
+            .await
+            .is_ok(),
+        "an ordinary source file must still reach the wire, or the blocks below \
+         say nothing about boundaries"
+    );
+
+    // AC-1 (`.ssh/id_rsa`) and AC-2 (`.env`, `.aws/credentials`, `.netrc`).
+    for (path, sentinel) in [
+        (".ssh/id_rsa", SENTINEL_SSH),
+        (".env", SENTINEL_ENV),
+        (".aws/credentials", SENTINEL_AWS),
+        (".netrc", SENTINEL_NETRC),
+    ] {
+        match send_read(&egress, &ctx, &egress_ctx, path, sentinel).await {
+            Err(EgressError::PrivacyBlocked { path: blocked, .. }) => {
+                assert_eq!(blocked, path, "{path} was blocked under another identity");
+            }
+            other => panic!("{path} reached the wire on a stock config: {other:?}"),
+        }
+    }
+
+    // Zero bytes, checked against the captured payloads rather than inferred
+    // from the refusals above.
+    let captured = capture.captured();
+    assert_eq!(captured.len(), 1, "only the public read may be forwarded");
+    assert!(
+        contains_bytes(&captured[0].body, "PUBLIC-MARKER-9f3a"),
+        "the positive control never went out, so the zero-leak claim is vacuous"
+    );
+    for req in &captured {
+        for sentinel in [SENTINEL_SSH, SENTINEL_ENV, SENTINEL_AWS, SENTINEL_NETRC] {
+            assert!(
+                !contains_bytes(&req.body, sentinel),
+                "sentinel bytes reached the wire: {sentinel}"
+            );
+        }
+    }
+    assert_eq!(sink.events().len(), 4, "one privacy_block per sentinel");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **AC-3.** One unrelated user row does not cost the machine its builtin
+/// protections — BR-2's additive semantics.
+///
+/// This is the failure the rule exists to prevent: before REQ-597 a user who
+/// wrote a single `[[boundaries]]` row had exactly that row, and someone adding
+/// their first boundary would have had no reason to think they were choosing
+/// between it and everything else.
+///
+/// **Mutation (AC-5)**: make the composer *replace* the builtins when the user
+/// declares any row, and the sentinel below is forwarded.
+#[tokio::test]
+async fn an_unrelated_user_row_does_not_displace_the_builtin_set() {
+    let root = stock_repo("additive");
+    let ctx = tetond::harness::ToolContext::new(&root);
+    let capture = CaptureTransport::default();
+    let sink = Arc::new(CapturingSink::default());
+
+    let mut config = teton_core::Config::default();
+    config.boundaries = vec![PrivacyBoundary::user(
+        "src/vendor/**",
+        BoundaryMode::LocalOnly,
+    )];
+    let egress = Egress::new(capture.clone(), effective(&config), sink.clone());
+    let egress_ctx = EgressContext::new("anthropic").with_session("sess-req597-additive");
+
+    match send_read(&egress, &ctx, &egress_ctx, ".ssh/id_rsa", SENTINEL_SSH).await {
+        Err(EgressError::PrivacyBlocked { .. }) => {}
+        other => panic!("one unrelated user row silently dropped the builtin set: {other:?}"),
+    }
+    assert!(
+        capture.captured().is_empty(),
+        "nothing should have reached the wire"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **AC-4.** The opt-out genuinely works: with `disable_default_boundaries` and
+/// no user rows, the sentinel **is** forwarded.
+///
+/// An opt-out nobody verifies is worse than none — it is a key users will set
+/// believing it did something. The warning half of AC-4 is asserted where the
+/// decision lives (`server::tests::the_unbounded_root_warning_needs_an_empty_set_and_a_broad_root`),
+/// including the paired case that pins it to the empty set rather than to this
+/// flag.
+///
+/// **Mutation**: ignore `disable_default_boundaries` in the composer and the
+/// send below is blocked instead of forwarded.
+#[tokio::test]
+async fn the_opt_out_really_forwards_what_the_defaults_would_have_blocked() {
+    let root = stock_repo("optout");
+    let ctx = tetond::harness::ToolContext::new(&root);
+    let capture = CaptureTransport::default();
+    let sink = Arc::new(CapturingSink::default());
+
+    let mut config = teton_core::Config::default();
+    config.privacy.disable_default_boundaries = true;
+    assert!(
+        effective(&config).is_empty(),
+        "the opt-out with no user rows is the empty set BR-5 keys on"
+    );
+    let egress = Egress::new(capture.clone(), effective(&config), sink.clone());
+    let egress_ctx = EgressContext::new("anthropic").with_session("sess-req597-optout");
+
+    assert!(
+        send_read(&egress, &ctx, &egress_ctx, ".ssh/id_rsa", SENTINEL_SSH)
+            .await
+            .is_ok(),
+        "the opt-out must genuinely switch the protection off, or it is a key \
+         that lies to whoever sets it"
+    );
+    let captured = capture.captured();
+    assert_eq!(captured.len(), 1);
+    assert!(
+        contains_bytes(&captured[0].body, SENTINEL_SSH),
+        "the forwarded payload must actually carry the sentinel, or this test \
+         proves only that something was sent"
+    );
+    assert!(sink.events().is_empty(), "nothing was blocked, so nothing is reported");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **AC-4.1.** A user row for a path the builtin set also covers **governs** it,
+/// keeping its own mode — BR-2.1's append position and BR-7 together.
+///
+/// The assertion is on the governing row's `origin` and `mode`, never on the
+/// block outcome. Both `BoundaryMode` arms fail closed at the inspector today,
+/// so an outcome assertion passes under *either* composition order and would
+/// prove nothing about which row won (LESSON-550: assert the thing that would
+/// change if the guard were wrong).
+///
+/// **Mutation**: prepend the builtins instead of appending, and the governing
+/// row becomes the builtin `local-only` one.
+#[tokio::test]
+async fn a_user_row_governs_a_path_the_builtin_set_also_covers() {
+    use teton_core::boundary::BoundaryMatcher;
+    use teton_core::entities::BoundaryOrigin;
+
+    let mut config = teton_core::Config::default();
+    config.boundaries = vec![PrivacyBoundary::user(
+        "**/.env",
+        BoundaryMode::RedactThenRemote,
+    )];
+    let composed = effective(&config);
+    let matcher = BoundaryMatcher::new(&composed).expect("the composed globs compile");
+
+    let governing = matcher.match_path(".env").expect(".env is governed");
+    assert_eq!(
+        governing.origin,
+        BoundaryOrigin::User,
+        "the user's row must win — builtins are appended after it"
+    );
+    assert_eq!(
+        governing.mode,
+        BoundaryMode::RedactThenRemote,
+        "and it keeps its own mode, which is what BR-7 promises"
+    );
+
+    // The builtin is still there, shadowed rather than removed: BR-3 stays the
+    // only route to no builtin coverage at all.
+    assert!(
+        composed
+            .iter()
+            .any(|b| b.path_glob == "**/.env" && b.origin == BoundaryOrigin::Builtin),
+        "the shadowed builtin must survive in the composed set"
+    );
+}
+
+/// **AC-7 / BR-8.** The builtin globs are matched against the **canonical**
+/// provenance form, not the string a model typed.
+///
+/// A symlink and a `..`-traversing spelling both reach `.ssh/id_rsa`, and both
+/// are blocked under the same identity as the plain spelling. Non-canonical
+/// spellings are how boundaries were evaded before REQ-571, and a shipped
+/// default set that could be walked around by writing the path differently
+/// would be decoration.
+///
+/// **Mutation**: match against the raw argument rather than the resolved
+/// identity and the symlink leg is forwarded.
+#[tokio::test]
+async fn every_spelling_of_a_builtin_covered_path_is_blocked_under_one_identity() {
+    let root = stock_repo("spellings");
+    // A symlink inside the root pointing at the covered file. Its own name
+    // matches no builtin glob, so only canonicalization can catch it.
+    let linked = root.join("src/looks-ordinary.txt");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(root.join(".ssh/id_rsa"), &linked).unwrap();
+
+    let ctx = tetond::harness::ToolContext::new(&root);
+    let capture = CaptureTransport::default();
+    let sink = Arc::new(CapturingSink::default());
+    let config = teton_core::Config::default();
+    let egress = Egress::new(capture.clone(), effective(&config), sink.clone());
+    let egress_ctx = EgressContext::new("anthropic").with_session("sess-req597-spellings");
+
+    let mut blocked_as = Vec::new();
+    let mut spellings = vec![
+        ".ssh/id_rsa".to_owned(),
+        "./.ssh/id_rsa".to_owned(),
+        "src/../.ssh/id_rsa".to_owned(),
+    ];
+    if cfg!(unix) {
+        spellings.push("src/looks-ordinary.txt".to_owned());
+    }
+
+    for spelling in &spellings {
+        match send_read(&egress, &ctx, &egress_ctx, spelling, SENTINEL_SSH).await {
+            Err(EgressError::PrivacyBlocked { path, .. }) => blocked_as.push(path),
+            other => panic!("spelling {spelling:?} was not blocked: {other:?}"),
+        }
+    }
+
+    assert_eq!(blocked_as.len(), spellings.len());
+    for (spelling, id) in spellings.iter().zip(&blocked_as) {
+        assert_eq!(
+            id, ".ssh/id_rsa",
+            "spelling {spelling:?} was blocked under a divergent identity — the \
+             glob matched something other than the canonical form"
+        );
+    }
+    assert!(
+        capture.captured().is_empty(),
+        "no spelling may reach the wire"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
