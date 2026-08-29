@@ -29,12 +29,11 @@ use teton_protocol::effort::EffortLevel;
 use teton_protocol::handshake::HandshakeResult;
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
-    BoundaryOriginConfig, CategoryBindingConfig, ConfigGetParams, ConfigSetParams,
-    ConfigSetResult, ConfigSnapshot,
-    ConfigUpdate, ContentClass, CostQueryParams, CostQueryResult, CostReportView, ModelListParams,
-    ModelListResult, ModelSetParams, ModelStatusParams, ModelStatusResult, PrivacyBoundaryConfig,
-    PromptTurnParams, ProviderConfig, SessionCreateParams, SessionPermissionsParams,
-    SkillInvocation, SkillsPreflightParams, TierBindingConfig,
+    BoundaryOriginConfig, CategoryBindingConfig, ConfigGetParams, ConfigSetParams, ConfigSetResult,
+    ConfigSnapshot, ConfigUpdate, ContentClass, CostQueryParams, CostQueryResult, CostReportView,
+    ModelListParams, ModelListResult, ModelSetParams, ModelStatusParams, ModelStatusResult,
+    PrivacyBoundaryConfig, PromptTurnParams, ProviderConfig, SessionCreateParams,
+    SessionPermissionsParams, SkillInvocation, SkillsPreflightParams, TierBindingConfig,
 };
 use teton_protocol::SessionId;
 use teton_protocol::{
@@ -8293,22 +8292,48 @@ mod tests {
         let mut surface = RecordingSurface::new();
         render_boundaries(
             &[
-                boundary_row("src/vendor/**", PrivacyMode::LocalOnly, BoundaryOriginConfig::User),
-                boundary_row("**/.env", PrivacyMode::LocalOnly, BoundaryOriginConfig::Builtin),
-                boundary_row("**/.ssh/**", PrivacyMode::LocalOnly, BoundaryOriginConfig::Builtin),
+                boundary_row(
+                    "src/vendor/**",
+                    PrivacyMode::LocalOnly,
+                    BoundaryOriginConfig::User,
+                ),
+                boundary_row(
+                    "**/.env",
+                    PrivacyMode::LocalOnly,
+                    BoundaryOriginConfig::Builtin,
+                ),
+                boundary_row(
+                    "**/.ssh/**",
+                    PrivacyMode::LocalOnly,
+                    BoundaryOriginConfig::Builtin,
+                ),
             ],
             &mut surface,
         );
         let lines = surface.lines_of(LineKind::Info);
         let rendered = lines.join("\n");
 
-        assert!(rendered.contains("src/vendor/** [local-only] (yours)"), "{rendered}");
-        assert!(rendered.contains("**/.env [local-only] (built-in)"), "{rendered}");
-        assert!(rendered.contains("**/.ssh/** [local-only] (built-in)"), "{rendered}");
+        assert!(
+            rendered.contains("src/vendor/** [local-only] (yours)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("**/.env [local-only] (built-in)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("**/.ssh/** [local-only] (built-in)"),
+            "{rendered}"
+        );
         // Composed order survives the renderer: the user's row is listed first.
-        let user_at = rendered.find("src/vendor/**").expect("the user row renders");
+        let user_at = rendered
+            .find("src/vendor/**")
+            .expect("the user row renders");
         let builtin_at = rendered.find("**/.env").expect("the builtin row renders");
-        assert!(user_at < builtin_at, "user rows precede builtins:\n{rendered}");
+        assert!(
+            user_at < builtin_at,
+            "user rows precede builtins:\n{rendered}"
+        );
     }
 
     /// A user row that shadows a builtin renders **twice**, user first.
@@ -8323,15 +8348,29 @@ mod tests {
         let mut surface = RecordingSurface::new();
         render_boundaries(
             &[
-                boundary_row("**/.env", PrivacyMode::RedactThenRemote, BoundaryOriginConfig::User),
-                boundary_row("**/.env", PrivacyMode::LocalOnly, BoundaryOriginConfig::Builtin),
+                boundary_row(
+                    "**/.env",
+                    PrivacyMode::RedactThenRemote,
+                    BoundaryOriginConfig::User,
+                ),
+                boundary_row(
+                    "**/.env",
+                    PrivacyMode::LocalOnly,
+                    BoundaryOriginConfig::Builtin,
+                ),
             ],
             &mut surface,
         );
         let rendered = surface.lines_of(LineKind::Info).join("\n");
 
-        assert!(rendered.contains("**/.env [redact-then-remote] (yours)"), "{rendered}");
-        assert!(rendered.contains("**/.env [local-only] (built-in)"), "{rendered}");
+        assert!(
+            rendered.contains("**/.env [redact-then-remote] (yours)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("**/.env [local-only] (built-in)"),
+            "{rendered}"
+        );
         assert_eq!(
             rendered.matches("**/.env").count(),
             2,
@@ -8373,7 +8412,10 @@ mod tests {
         render_boundaries(&[row], &mut surface);
 
         let rendered = surface.lines_of(LineKind::Info).join("\n");
-        assert!(rendered.contains("secrets/** [local-only] (yours)"), "{rendered}");
+        assert!(
+            rendered.contains("secrets/** [local-only] (yours)"),
+            "{rendered}"
+        );
     }
 
     /// **AC-9, the shared-body half.** `teton boundary list` and the in-session

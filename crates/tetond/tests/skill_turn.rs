@@ -534,7 +534,11 @@ impl Harness {
     /// fallback is both named and registered, and it is that route the reroute
     /// guard measures against.
     fn with_fallback(window: u32, fallback_window: u32) -> Self {
-        Self::assembled_with(Some(window), Some(fallback_window), Self::not_about_privacy())
+        Self::assembled_with(
+            Some(window),
+            Some(fallback_window),
+            Self::not_about_privacy(),
+        )
     }
 
     fn assembled(window: Option<u32>, runtime: DaemonRuntime) -> Self {

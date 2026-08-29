@@ -2066,7 +2066,10 @@ fn an_existing_config_gains_the_builtin_set_without_rewriting_its_own_rows() {
         2 + teton_core::config::DEFAULT_BOUNDARIES.len(),
         "an upgraded machine keeps its rows and gains the builtin set"
     );
-    assert_eq!(effective[0].path_glob, "secrets/**", "the user's rows come first");
+    assert_eq!(
+        effective[0].path_glob, "secrets/**",
+        "the user's rows come first"
+    );
     assert_eq!(effective[1].path_glob, "docs/**");
     assert!(
         effective

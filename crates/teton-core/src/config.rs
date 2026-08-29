@@ -1644,7 +1644,11 @@ impl Config {
     pub fn effective_boundaries(&self) -> Vec<PrivacyBoundary> {
         let mut composed = self.boundaries.clone();
         if !self.privacy.disable_default_boundaries {
-            composed.extend(DEFAULT_BOUNDARIES.iter().map(|g| PrivacyBoundary::builtin(*g)));
+            composed.extend(
+                DEFAULT_BOUNDARIES
+                    .iter()
+                    .map(|g| PrivacyBoundary::builtin(*g)),
+            );
         }
         composed
     }
@@ -6759,9 +6763,22 @@ cache_ttl_secs = 60
             "a stock config carries every builtin row"
         );
         for (b, expected) in effective.iter().zip(DEFAULT_BOUNDARIES) {
-            assert_eq!(&b.path_glob, expected, "composed order follows the spec's order");
-            assert_eq!(b.mode, BoundaryMode::LocalOnly, "{} is not local-only", b.path_glob);
-            assert_eq!(b.origin, BoundaryOrigin::Builtin, "{} is not builtin", b.path_glob);
+            assert_eq!(
+                &b.path_glob, expected,
+                "composed order follows the spec's order"
+            );
+            assert_eq!(
+                b.mode,
+                BoundaryMode::LocalOnly,
+                "{} is not local-only",
+                b.path_glob
+            );
+            assert_eq!(
+                b.origin,
+                BoundaryOrigin::Builtin,
+                "{} is not builtin",
+                b.path_glob
+            );
         }
     }
 
@@ -6803,7 +6820,13 @@ cache_ttl_secs = 60
             );
         }
 
-        for spared in ["src/main.rs", "README.md", "env", "notes/.envrc", "Cargo.toml"] {
+        for spared in [
+            "src/main.rs",
+            "README.md",
+            "env",
+            "notes/.envrc",
+            "Cargo.toml",
+        ] {
             assert!(
                 matcher.match_path(spared).is_none(),
                 "{spared} must not be caught by the builtin set"
@@ -6818,11 +6841,13 @@ cache_ttl_secs = 60
     /// **Mutation**: prepend the builtins instead of extending, and this fails.
     #[test]
     fn user_rows_precede_appended_builtin_rows() {
-        let mut cfg = Config::default();
-        cfg.boundaries = vec![
-            PrivacyBoundary::user("src/vendor/**", BoundaryMode::LocalOnly),
-            PrivacyBoundary::user("docs/**", BoundaryMode::RedactThenRemote),
-        ];
+        let cfg = Config {
+            boundaries: vec![
+                PrivacyBoundary::user("src/vendor/**", BoundaryMode::LocalOnly),
+                PrivacyBoundary::user("docs/**", BoundaryMode::RedactThenRemote),
+            ],
+            ..Default::default()
+        };
 
         let effective = cfg.effective_boundaries();
         assert_eq!(effective.len(), 2 + DEFAULT_BOUNDARIES.len());
@@ -6856,9 +6881,16 @@ cache_ttl_secs = 60
         );
         assert_eq!(cfg.builtin_boundary_count(), 0);
 
-        cfg.boundaries = vec![PrivacyBoundary::user("src/vendor/**", BoundaryMode::LocalOnly)];
+        cfg.boundaries = vec![PrivacyBoundary::user(
+            "src/vendor/**",
+            BoundaryMode::LocalOnly,
+        )];
         let effective = cfg.effective_boundaries();
-        assert_eq!(effective.len(), 1, "the opt-out drops builtins, not user rows");
+        assert_eq!(
+            effective.len(),
+            1,
+            "the opt-out drops builtins, not user rows"
+        );
         assert_eq!(effective[0].path_glob, "src/vendor/**");
     }
 
@@ -6873,14 +6905,23 @@ cache_ttl_secs = 60
     /// builtin `local-only` one.
     #[test]
     fn a_colliding_user_row_governs_and_keeps_its_own_mode() {
-        let mut cfg = Config::default();
-        cfg.boundaries = vec![PrivacyBoundary::user("**/.env", BoundaryMode::RedactThenRemote)];
+        let cfg = Config {
+            boundaries: vec![PrivacyBoundary::user(
+                "**/.env",
+                BoundaryMode::RedactThenRemote,
+            )],
+            ..Default::default()
+        };
 
         let effective = cfg.effective_boundaries();
         let matcher = BoundaryMatcher::new(&effective).expect("globs compile");
         let governing = matcher.match_path(".env").expect(".env is governed");
 
-        assert_eq!(governing.origin, BoundaryOrigin::User, "the user's row wins");
+        assert_eq!(
+            governing.origin,
+            BoundaryOrigin::User,
+            "the user's row wins"
+        );
         assert_eq!(governing.mode, BoundaryMode::RedactThenRemote);
     }
 
@@ -6891,13 +6932,25 @@ cache_ttl_secs = 60
     /// **Mutation**: dedupe by `path_glob` in the composer, and this fails.
     #[test]
     fn a_colliding_user_row_does_not_remove_the_builtin() {
-        let mut cfg = Config::default();
-        cfg.boundaries = vec![PrivacyBoundary::user("**/.env", BoundaryMode::RedactThenRemote)];
+        let cfg = Config {
+            boundaries: vec![PrivacyBoundary::user(
+                "**/.env",
+                BoundaryMode::RedactThenRemote,
+            )],
+            ..Default::default()
+        };
 
         let effective = cfg.effective_boundaries();
         assert_eq!(effective.len(), 1 + DEFAULT_BOUNDARIES.len());
-        let env_rows: Vec<_> = effective.iter().filter(|b| b.path_glob == "**/.env").collect();
-        assert_eq!(env_rows.len(), 2, "the user's row and the builtin both survive");
+        let env_rows: Vec<_> = effective
+            .iter()
+            .filter(|b| b.path_glob == "**/.env")
+            .collect();
+        assert_eq!(
+            env_rows.len(),
+            2,
+            "the user's row and the builtin both survive"
+        );
         assert_eq!(env_rows[0].origin, BoundaryOrigin::User);
         assert_eq!(env_rows[1].origin, BoundaryOrigin::Builtin);
     }
@@ -6910,8 +6963,10 @@ cache_ttl_secs = 60
     /// and this fails.
     #[test]
     fn a_user_row_serializes_without_an_origin_key() {
-        let mut cfg = Config::default();
-        cfg.boundaries = vec![PrivacyBoundary::user("secrets/**", BoundaryMode::LocalOnly)];
+        let cfg = Config {
+            boundaries: vec![PrivacyBoundary::user("secrets/**", BoundaryMode::LocalOnly)],
+            ..Default::default()
+        };
 
         let toml = cfg.to_toml().expect("a well-formed config serializes");
         assert!(toml.contains("secrets/**"), "the user's row is written");

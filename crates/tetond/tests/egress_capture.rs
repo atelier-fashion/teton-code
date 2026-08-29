@@ -1456,9 +1456,15 @@ async fn a_stock_config_blocks_every_planted_credential_sentinel() {
 
     // Positive control.
     assert!(
-        send_read(&egress, &ctx, &egress_ctx, "src/main.rs", "PUBLIC-MARKER-9f3a")
-            .await
-            .is_ok(),
+        send_read(
+            &egress,
+            &ctx,
+            &egress_ctx,
+            "src/main.rs",
+            "PUBLIC-MARKER-9f3a"
+        )
+        .await
+        .is_ok(),
         "an ordinary source file must still reach the wire, or the blocks below \
          say nothing about boundaries"
     );
@@ -1515,11 +1521,13 @@ async fn an_unrelated_user_row_does_not_displace_the_builtin_set() {
     let capture = CaptureTransport::default();
     let sink = Arc::new(CapturingSink::default());
 
-    let mut config = teton_core::Config::default();
-    config.boundaries = vec![PrivacyBoundary::user(
-        "src/vendor/**",
-        BoundaryMode::LocalOnly,
-    )];
+    let config = teton_core::Config {
+        boundaries: vec![PrivacyBoundary::user(
+            "src/vendor/**",
+            BoundaryMode::LocalOnly,
+        )],
+        ..Default::default()
+    };
     let egress = Egress::new(capture.clone(), effective(&config), sink.clone());
     let egress_ctx = EgressContext::new("anthropic").with_session("sess-req597-additive");
 
@@ -1575,7 +1583,10 @@ async fn the_opt_out_really_forwards_what_the_defaults_would_have_blocked() {
         "the forwarded payload must actually carry the sentinel, or this test \
          proves only that something was sent"
     );
-    assert!(sink.events().is_empty(), "nothing was blocked, so nothing is reported");
+    assert!(
+        sink.events().is_empty(),
+        "nothing was blocked, so nothing is reported"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -1595,11 +1606,13 @@ async fn a_user_row_governs_a_path_the_builtin_set_also_covers() {
     use teton_core::boundary::BoundaryMatcher;
     use teton_core::entities::BoundaryOrigin;
 
-    let mut config = teton_core::Config::default();
-    config.boundaries = vec![PrivacyBoundary::user(
-        "**/.env",
-        BoundaryMode::RedactThenRemote,
-    )];
+    let config = teton_core::Config {
+        boundaries: vec![PrivacyBoundary::user(
+            "**/.env",
+            BoundaryMode::RedactThenRemote,
+        )],
+        ..Default::default()
+    };
     let composed = effective(&config);
     let matcher = BoundaryMatcher::new(&composed).expect("the composed globs compile");
 

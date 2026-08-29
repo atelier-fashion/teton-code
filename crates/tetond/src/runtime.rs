@@ -128,18 +128,18 @@ use teton_protocol::events::{
 };
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
-    CategoryRouteView, ConfigSnapshot, ConfigUpdate, ContentClass, CostGroupView, CostQueryResult,
-    CostReportView, ExistingProvider, ModelConfirmOutcome, ModelConfirmParams, ModelConfirmResult,
-    BoundaryOriginConfig, ModelListResult, ModelSetResult, ModelStatusResult,
-    PrivacyBoundaryConfig, PromptTurnResult,
-    ProviderConfig, ProviderHealth as WireProviderHealth, ProviderSetupCandidate,
-    ProviderSetupCommitResult, ProviderSetupPlanResult, ProviderSetupPreviewResult,
-    ProviderTestOutcome, ProviderTestResult, SessionClearParams, SessionClearResult,
-    SessionPermissionsParams, SessionPermissionsResult, SessionSetCwdParams, SessionSetCwdResult,
-    SkillInvocation, TierBinding as WireTierBinding, TierBindingConfig, TierRouteView, TierSummary,
-    WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams, WebRefreshResult,
-    WebSetupCommitParams, WebSetupCommitResult, WebSetupPlanResult, WebSetupPreviewParams,
-    WebSetupPreviewResult, WebTableSummary, WebTotalsView,
+    BoundaryOriginConfig, CategoryRouteView, ConfigSnapshot, ConfigUpdate, ContentClass,
+    CostGroupView, CostQueryResult, CostReportView, ExistingProvider, ModelConfirmOutcome,
+    ModelConfirmParams, ModelConfirmResult, ModelListResult, ModelSetResult, ModelStatusResult,
+    PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig, ProviderHealth as WireProviderHealth,
+    ProviderSetupCandidate, ProviderSetupCommitResult, ProviderSetupPlanResult,
+    ProviderSetupPreviewResult, ProviderTestOutcome, ProviderTestResult, SessionClearParams,
+    SessionClearResult, SessionPermissionsParams, SessionPermissionsResult, SessionSetCwdParams,
+    SessionSetCwdResult, SkillInvocation, TierBinding as WireTierBinding, TierBindingConfig,
+    TierRouteView, TierSummary, WebOverrideParams, WebOverrideResult, WebRefreshOutcome,
+    WebRefreshParams, WebRefreshResult, WebSetupCommitParams, WebSetupCommitResult,
+    WebSetupPlanResult, WebSetupPreviewParams, WebSetupPreviewResult, WebTableSummary,
+    WebTotalsView,
 };
 use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::{
@@ -15919,7 +15919,10 @@ permission_allow = [\"fetch_user_url\"]
 
         // And the opt-in, on the same projection.
         let opted_in = Config {
-            privacy: teton_core::config::PrivacyConfig { redact: true, ..Default::default() },
+            privacy: teton_core::config::PrivacyConfig {
+                redact: true,
+                ..Default::default()
+            },
             ..Config::default()
         };
         assert!(
@@ -20292,7 +20295,10 @@ permission_allow = [\"fetch_user_url\"]
 
             /// `config` with the `[privacy]` opt-in switched on.
             fn opted_in(mut config: Config) -> Config {
-                config.privacy = PrivacyConfig { redact: true, ..Default::default() };
+                config.privacy = PrivacyConfig {
+                    redact: true,
+                    ..Default::default()
+                };
                 config
             }
 
@@ -31176,7 +31182,10 @@ provider_id = \"deepseek\"
                         },
                     }],
                     default_provider: Some("wide".to_owned()),
-                    privacy: PrivacyConfig { redact, ..Default::default() },
+                    privacy: PrivacyConfig {
+                        redact,
+                        ..Default::default()
+                    },
                     web: WebConfig {
                         tier,
                         ..WebConfig::default()

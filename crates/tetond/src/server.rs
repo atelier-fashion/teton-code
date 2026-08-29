@@ -126,10 +126,9 @@ use teton_protocol::methods::{
     PermissionRespondResult, ProjectsListParams, ProjectsListResult, PromptBlock, PromptTurnParams,
     ProviderSetupCommitParams, ProviderSetupPlanParams, ProviderSetupPreviewParams,
     ProviderTestParams, RootKind, RpcMethod, SessionAttachParams, SessionAttachResult,
-    SessionClearParams,
-    SessionCreateParams, SessionCreateResult, SessionListParams, SessionListResult,
-    SessionPermissionsParams, SessionSetCwdParams, SessionSummary, SkillSkipped, SkillView,
-    SkillsListParams, SkillsListResult, SkillsPreflightParams, SkillsPreflightResult,
+    SessionClearParams, SessionCreateParams, SessionCreateResult, SessionListParams,
+    SessionListResult, SessionPermissionsParams, SessionSetCwdParams, SessionSummary, SkillSkipped,
+    SkillView, SkillsListParams, SkillsListResult, SkillsPreflightParams, SkillsPreflightResult,
     WebOverrideParams, WebRefreshParams, WebSetupCommitParams, WebSetupPlanParams,
     WebSetupPreviewParams,
 };
@@ -3477,10 +3476,8 @@ fn handle_session_create(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
             // warning to the one connection would reproduce the failure
             // REQ-571 BR-4 names — an audit signal reaching only the party it
             // indicts.
-            for event in session_start_boundary_events(
-                daemon.runtime.boundary_posture(),
-                root.kind,
-            ) {
+            for event in session_start_boundary_events(daemon.runtime.boundary_posture(), root.kind)
+            {
                 daemon
                     .events
                     .publish(Some(summary.session_id.clone()), event);
@@ -11967,12 +11964,42 @@ mod tests {
         };
 
         for (posture, kind, want_warning, why) in [
-            (bare, RootKind::Home, true, "nothing protected, rooted at $HOME"),
-            (bare, RootKind::FilesystemRoot, true, "nothing protected, rooted at /"),
-            (bare, RootKind::Project, false, "a project root is a directory the user chose"),
-            (bare, RootKind::Plain, false, "a plain root is narrow enough not to warn"),
-            (stock, RootKind::Home, false, "the shipped set is in force — the stock machine"),
-            (stock, RootKind::FilesystemRoot, false, "likewise at the filesystem root"),
+            (
+                bare,
+                RootKind::Home,
+                true,
+                "nothing protected, rooted at $HOME",
+            ),
+            (
+                bare,
+                RootKind::FilesystemRoot,
+                true,
+                "nothing protected, rooted at /",
+            ),
+            (
+                bare,
+                RootKind::Project,
+                false,
+                "a project root is a directory the user chose",
+            ),
+            (
+                bare,
+                RootKind::Plain,
+                false,
+                "a plain root is narrow enough not to warn",
+            ),
+            (
+                stock,
+                RootKind::Home,
+                false,
+                "the shipped set is in force — the stock machine",
+            ),
+            (
+                stock,
+                RootKind::FilesystemRoot,
+                false,
+                "likewise at the filesystem root",
+            ),
             (
                 opted_out_with_own_row,
                 RootKind::Home,
@@ -11984,7 +12011,10 @@ mod tests {
             let warned = events
                 .iter()
                 .any(|e| matches!(e, Event::UnboundedRootWarning(_)));
-            assert_eq!(warned, want_warning, "{why} (kind {kind:?}, posture {posture:?})");
+            assert_eq!(
+                warned, want_warning,
+                "{why} (kind {kind:?}, posture {posture:?})"
+            );
         }
     }
 

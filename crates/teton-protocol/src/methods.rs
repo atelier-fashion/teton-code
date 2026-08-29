@@ -6425,8 +6425,14 @@ mod tests {
         ];
 
         let json = serde_json::to_string(&rows).expect("rows serialize");
-        assert!(json.contains("\"origin\":\"user\""), "user origin is on the wire: {json}");
-        assert!(json.contains("\"origin\":\"builtin\""), "builtin origin is on the wire: {json}");
+        assert!(
+            json.contains("\"origin\":\"user\""),
+            "user origin is on the wire: {json}"
+        );
+        assert!(
+            json.contains("\"origin\":\"builtin\""),
+            "builtin origin is on the wire: {json}"
+        );
 
         let back: Vec<PrivacyBoundaryConfig> = serde_json::from_str(&json).expect("rows parse");
         assert_eq!(back, rows);

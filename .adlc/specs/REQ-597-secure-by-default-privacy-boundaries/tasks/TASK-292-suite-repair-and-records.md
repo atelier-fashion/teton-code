@@ -1,7 +1,7 @@
 ---
 id: TASK-292
 title: "Suite repair, CHANGELOG, and the architecture record"
-status: pending
+status: complete
 parent: REQ-597
 repo: teton-code
 created: 2026-08-29

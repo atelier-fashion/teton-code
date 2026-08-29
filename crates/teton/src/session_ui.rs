@@ -28,19 +28,17 @@ use std::collections::{HashMap, HashSet};
 use teton_protocol::events;
 use teton_protocol::events::{
     AttachConsentRequested, BlockCause, BoundaryDefaultsApplied, BudgetBound, CapabilityDeadEnd,
-    ConsentScope,
-    ContextPressure, ContextPressureKind, DaemonClientAttach, DaemonLifetimeStage, DynamicOutcome,
-    DynamicOutcomeView, Event, EventEnvelope, EvictionReason, FailureClass, ModelLifecycle,
-    ModelSelectionProposed, NotRunReason, PermissionOption, PermissionOptionKind,
+    ConsentScope, ContextPressure, ContextPressureKind, DaemonClientAttach, DaemonLifetimeStage,
+    DynamicOutcome, DynamicOutcomeView, Event, EventEnvelope, EvictionReason, FailureClass,
+    ModelLifecycle, ModelSelectionProposed, NotRunReason, PermissionOption, PermissionOptionKind,
     PermissionRequest, PermissionSubject, PhaseTransition, PrefixCache, PrefixCacheMiss,
     PrefixCacheOutcome, PrivacyAction, PrivacyBlock, ProvenanceRejected, ProvenanceRejection,
-    UnboundedRootWarning,
     ProviderDegraded, ProviderSetupCompleted, ProviderSetupRejected, ProviderTested, RemedyKind,
     RouteDecided, SessionGrantMinted, SessionUpdatePayload, SkillInvoked, SkillOverBudgetAccepted,
     SkillOverBudgetOffered, SkillOverBudgetRemedyApplied, SkillStage, TierWarming, ToolCallStatus,
-    TurnQueued, WebCapabilityState, WebConsentDecided, WebConsentScope, WebLookup, WebLookupKind,
-    WebLookupOutcome, WebSetupCompleted, WebSetupRejected, WebTier, WindowVerdict,
-    OPTION_ID_ENABLE_PERMANENT,
+    TurnQueued, UnboundedRootWarning, WebCapabilityState, WebConsentDecided, WebConsentScope,
+    WebLookup, WebLookupKind, WebLookupOutcome, WebSetupCompleted, WebSetupRejected, WebTier,
+    WindowVerdict, OPTION_ID_ENABLE_PERMANENT,
 };
 use teton_protocol::methods::{
     AttachConsentOutcome, AttachConsentParams, PermissionOutcome, PermissionRespondParams,
