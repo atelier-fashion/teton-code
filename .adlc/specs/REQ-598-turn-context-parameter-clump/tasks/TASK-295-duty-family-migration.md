@@ -1,7 +1,7 @@
 ---
 id: TASK-295
 title: "Migrate the duty-routing family to DutyContext and clear the vestigial suppressions"
-status: draft
+status: complete
 parent: REQ-598
 created: 2026-08-29
 updated: 2026-08-29

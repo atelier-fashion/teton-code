@@ -77,6 +77,7 @@ use teton_inference::{ChatFormat, Engine};
 use teton_protocol::SessionId;
 
 use crate::broadcast::EventBus;
+use crate::grants::ConnectionId;
 use crate::harness::permissions::PermissionGate;
 use crate::router::Router;
 
@@ -156,6 +157,17 @@ pub struct TurnContext<'a> {
     /// `Arc` while the others want the bare reference. The `Arc` form serves
     /// both; the narrower type would force a clone at the one site.
     pub gate: &'a Arc<PermissionGate>,
+    /// The connection that submitted this turn, when one did.
+    ///
+    /// Carried here rather than passed alongside because it is a per-turn fact
+    /// with the same lifetime as the rest: bound from `run_prompt_turn`'s own
+    /// parameters and never rebound. It is the addressee of any consent a tool
+    /// raises mid-turn (REQ-587 ADR-3), which is why it belongs to the *turn*
+    /// context and not to [`TurnCore`] — a duty route asks nobody anything, and
+    /// `spawn_title_session` has no connection to name.
+    ///
+    /// `ConnectionId` is `Copy`, so consumers still take their own.
+    pub invoker: Option<ConnectionId>,
 }
 
 /// The duty-routing context: [`TurnCore`] plus the two facts that travel with
@@ -183,8 +195,31 @@ pub struct DutyContext<'a> {
     pub prompt_spend: Option<&'a Arc<PromptSpend>>,
 }
 
+impl<'a> TurnCore<'a> {
+    /// The duty context these four facts support, given the two that travel
+    /// with a duty resolution.
+    ///
+    /// Lives on [`TurnCore`] rather than only on [`TurnContext`] because the
+    /// caller that needs it most has no gate to build a [`TurnContext`] from:
+    /// `spawn_title_session` resolves the `title` duty on a detached task. It
+    /// takes a `TurnCore` for exactly that reason, and reaches a `DutyContext`
+    /// through here.
+    #[must_use]
+    pub fn duties(
+        self,
+        local_engine: Option<&'a LocalEngineSlot>,
+        prompt_spend: Option<&'a Arc<PromptSpend>>,
+    ) -> DutyContext<'a> {
+        DutyContext {
+            core: self,
+            local_engine,
+            prompt_spend,
+        }
+    }
+}
+
 impl<'a> TurnContext<'a> {
-    /// The turn path's context, from its five already-resolved parts.
+    /// The turn path's context, from its already-resolved parts.
     #[must_use]
     pub fn new(
         events: &'a Arc<EventBus>,
@@ -192,6 +227,7 @@ impl<'a> TurnContext<'a> {
         config: &'a Config,
         router: &'a Router,
         gate: &'a Arc<PermissionGate>,
+        invoker: Option<ConnectionId>,
     ) -> Self {
         Self {
             core: TurnCore {
@@ -201,6 +237,7 @@ impl<'a> TurnContext<'a> {
                 router,
             },
             gate,
+            invoker,
         }
     }
 
@@ -208,17 +245,17 @@ impl<'a> TurnContext<'a> {
     /// and its spend accumulator.
     ///
     /// The gate is dropped rather than carried: see [`DutyContext`].
+    ///
+    /// Delegates to [`TurnCore::duties`] rather than building a `DutyContext`
+    /// of its own, so there is one place that knows how a duty context is
+    /// assembled.
     #[must_use]
     pub fn duties(
         &self,
         local_engine: Option<&'a LocalEngineSlot>,
         prompt_spend: Option<&'a Arc<PromptSpend>>,
     ) -> DutyContext<'a> {
-        DutyContext {
-            core: self.core,
-            local_engine,
-            prompt_spend,
-        }
+        self.core.duties(local_engine, prompt_spend)
     }
 }
 
@@ -288,7 +325,7 @@ mod tests {
         let router = router();
         let gate = gate_for(&events, &session_id);
 
-        let tctx = TurnContext::new(&events, &session_id, &config, &router, &gate);
+        let tctx = TurnContext::new(&events, &session_id, &config, &router, &gate, None);
         assert_eq!(tctx.core.session_id, &session_id);
         assert!(Arc::ptr_eq(tctx.core.events, &events));
         assert!(Arc::ptr_eq(tctx.gate, &gate));
@@ -317,7 +354,7 @@ mod tests {
         let router = router();
         let gate = gate_for(&events, &session_id);
 
-        let tctx = TurnContext::new(&events, &session_id, &config, &router, &gate);
+        let tctx = TurnContext::new(&events, &session_id, &config, &router, &gate, None);
         let dctx = tctx.duties(None, None);
 
         assert!(std::ptr::eq(tctx.core.config, dctx.core.config));

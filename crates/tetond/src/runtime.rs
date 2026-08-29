@@ -204,6 +204,7 @@ use crate::session_root::{home, ProbedRoot};
 use crate::sessions::{validate_session_cwd, SessionRegistry, TurnClaimError};
 use crate::skills::dynamic::{closed_door, door_outcome, outcome_view};
 use crate::skills::{DynamicOutcome, Expansion, Pending, SkillRegistry, SkillSource};
+use crate::turn_context::{DutyContext, TurnContext, TurnCore};
 use crate::web::{UserUrls, WebCache};
 // The module rather than the function: `suggestion_catalog()` on its own would
 // read, in a file this size, as something the runtime computes.
@@ -4424,21 +4425,30 @@ impl DaemonRuntime {
     /// caller* before a dispatch: no provider is reached, no `context_pressure`
     /// is emitted, no health changes, and — at Stage A — the session-naming duty
     /// is still below the gate, so a refused turn has not spent it.
-    #[allow(clippy::too_many_arguments)]
     async fn offer_or_refuse_over_budget(
         &self,
-        events: &Arc<EventBus>,
-        session_id: &SessionId,
-        config: &Config,
-        router: &Router,
+        tctx: TurnContext<'_>,
         route: &crate::router::Route,
-        gate: &PermissionGate,
-        invoker: Option<ConnectionId>,
         stage: SkillStage,
         skill: &SkillTurn,
         system: &str,
         already_accepted: Option<&str>,
     ) -> SkillStageVerdict {
+        // Destructured to the names the REQ-589 body below already used, so
+        // that body stays byte-identical (BR-1). `gate` narrows to
+        // `&PermissionGate` here — this consumer never needed the `Arc`.
+        let TurnContext {
+            core:
+                TurnCore {
+                    events,
+                    session_id,
+                    config,
+                    router,
+                },
+            gate,
+            invoker,
+        } = tctx;
+        let gate: &PermissionGate = gate;
         let budget = &route.harness.budget;
         let measured = ContextManager::would_seed_fit(
             system,
@@ -5099,6 +5109,26 @@ impl DaemonRuntime {
             None => router,
         };
 
+        // REQ-598 ADR-4 / BR-2.1: **this** is the earliest point a
+        // `TurnContext` may be built, and the line above is why.
+        //
+        // BR-2 asks for construction after the turn is claimed, and the claim is
+        // ~150 lines above. That is necessary and not sufficient. BR-2 names one
+        // instance of a class: *a context must not be constructed before any
+        // point that rebinds a field it captures.* `router` is bound before
+        // `dispatch_route`, and then **shadow-rebound by the hold above** when
+        // the local tier was still warming — rebuilt from the settled tier state
+        // so the classifier that was bypassed while the tier was down runs for
+        // real.
+        //
+        // A context built at the first `router` binding satisfies BR-2, passes
+        // this file's whole suite, and hands every consumer below a router
+        // describing a tier state that no longer exists — silently breaking
+        // REQ-580's guarantee that a turn served after the wait is built from
+        // the route it is served *by*. The guard is mechanical, not this
+        // comment: see the BR-2.1 warming-tier test in this module.
+        let tctx = TurnContext::new(events, &session_id, &config, &router, &gate, invoker);
+
         // REQ-561 TASK-062: name the session, at most once for its whole life.
         // Ahead of the turn rather than after it, for two reasons: the name is
         // derived from the prompt, which is already in hand, so a client can
@@ -5134,11 +5164,8 @@ impl DaemonRuntime {
         // that is not a skill invocation.
         if skill_turn.is_none() {
             let _ = self.spawn_title_session(
-                events,
+                tctx.core,
                 sessions,
-                &router,
-                &config,
-                &session_id,
                 routed_text,
                 // A typed prompt is the user's own bytes, read from no file, so
                 // there is nothing for a boundary to be compared against. This
@@ -5189,18 +5216,11 @@ impl DaemonRuntime {
         // next turn instead of leaving this one's prompt disagreeing with its
         // own tool set (REQ-572 verify).
         let tools = self
-            .build_tools(
-                &router,
-                events,
-                &session_id,
-                &gate,
-                &config,
-                Arc::clone(&skills),
-                // REQ-587 ADR-3: the connection that submitted this turn is the
-                // addressee of any consent the `skill` tool raises. `ConnectionId`
-                // is `Copy`, so the seam below still consumes its own.
-                invoker,
-            )
+            // REQ-587 ADR-3: the connection that submitted this turn is the
+            // addressee of any consent the `skill` tool raises — it now travels
+            // on `tctx` with the rest of the turn's facts (REQ-598). `ConnectionId`
+            // is `Copy`, so the seam below still consumes its own.
+            .build_tools(tctx, Arc::clone(&skills))
             .await;
         // BUG-147: jail this session's tools to the CLIENT's working directory.
         // The daemon-global `repo_root` is only a fallback for clients that did
@@ -5303,13 +5323,8 @@ impl DaemonRuntime {
         if let Some(skill) = &skill_turn {
             match self
                 .offer_or_refuse_over_budget(
-                    events,
-                    &session_id,
-                    &config,
-                    &router,
+                    tctx,
                     &route,
-                    &gate,
-                    invoker,
                     SkillStage::Body,
                     skill,
                     &system,
@@ -5362,11 +5377,8 @@ impl DaemonRuntime {
         // applied to a longer string — not a second reading of this one.
         if let Some(skill) = skill_turn.as_ref() {
             let _ = self.spawn_title_session(
-                events,
+                tctx.core,
                 sessions,
-                &router,
-                &config,
-                &session_id,
                 routed_text,
                 expansion_provenance(&skill.sources, skill.unknown),
             );
@@ -5418,13 +5430,8 @@ impl DaemonRuntime {
         if let Some(skill) = &skill_turn {
             match self
                 .offer_or_refuse_over_budget(
-                    events,
-                    &session_id,
-                    &config,
-                    &router,
+                    tctx,
                     &route,
-                    &gate,
-                    invoker,
                     SkillStage::WithDynamicContext,
                     skill,
                     &system,
@@ -5576,15 +5583,14 @@ impl DaemonRuntime {
 
             let result = self
                 .run_one_attempt(
-                    events,
-                    &config,
-                    &router,
+                    tctx,
+                    // Passed apart from `tctx` on purpose: `route` is reassigned
+                    // by the reroute arms at the foot of this loop, and a
+                    // context owning it would go stale (ADR-3).
                     &route,
-                    &session_id,
                     phase,
                     &tools,
                     &tool_ctx,
-                    &gate,
                     &stream_events,
                     conversation.ctx_mut(),
                     prompt_spend.as_ref(),
@@ -6417,17 +6423,27 @@ impl DaemonRuntime {
     /// that said the capability was off while the registry it was handed had the
     /// tool in it. One turn, one snapshot — which is also what makes ADR-1's
     /// "the config **is** the flow state" true per turn rather than per read.
-    #[allow(clippy::too_many_arguments)]
     async fn build_tools(
         self: &Arc<Self>,
-        router: &Router,
-        events: &Arc<EventBus>,
-        session_id: &SessionId,
-        gate: &Arc<PermissionGate>,
-        config: &Config,
+        tctx: TurnContext<'_>,
         skills: Arc<SkillRegistry>,
-        invoker: Option<ConnectionId>,
     ) -> ToolRegistry {
+        // Destructured to the six names the body already used, rather than
+        // reaching through `tctx` at each site: everything below is REQ-571 /
+        // REQ-572 / REQ-585 registry logic this REQ must leave byte-identical
+        // (BR-1), and in particular the cap-exempt versus optional ordering
+        // BR-7 asks to keep visible.
+        let TurnContext {
+            core:
+                TurnCore {
+                    events,
+                    session_id,
+                    config,
+                    router,
+                },
+            gate,
+            invoker,
+        } = tctx;
         let mut tools = ToolRegistry::with_builtins();
         if !self.mcp_servers.is_empty() {
             if let Ok(transport) = HttpTransport::new() {
@@ -6803,20 +6819,33 @@ impl DaemonRuntime {
     #[allow(clippy::too_many_arguments)]
     async fn run_one_attempt(
         &self,
-        events: &Arc<EventBus>,
-        config: &Config,
-        router: &Router,
+        tctx: TurnContext<'_>,
         route: &crate::router::Route,
-        session_id: &SessionId,
         phase: Option<ProtoPhase>,
         tools: &ToolRegistry,
         tool_ctx: &ToolContext,
-        gate: &PermissionGate,
         stream_events: &SessionEvents,
         ctx: &mut ContextManager,
         prompt_spend: Option<&Arc<teton_core::cost_ceiling::PromptSpend>>,
         pressure: PressurePolicy,
     ) -> Result<crate::harness::TurnOutcome, HarnessError> {
+        // Destructured to the names the body already used, so the REQ-558 /
+        // REQ-561 / REQ-589 logic below stays byte-identical (BR-1). `route` is
+        // deliberately **not** on the context: it is reassigned on every
+        // fallback reroute in the caller's `'turn:` loop, and keeping it a
+        // parameter is what keeps that reroute visible (ADR-3, BR-7).
+        let TurnContext {
+            core:
+                TurnCore {
+                    events,
+                    session_id,
+                    config,
+                    router,
+                },
+            gate,
+            invoker: _,
+        } = tctx;
+        let gate: &PermissionGate = gate;
         let mut hook = NoopProvenanceHook;
 
         // One read of the slot for the whole attempt: the engine this turn runs
@@ -6826,56 +6855,36 @@ impl DaemonRuntime {
         // at install time, so no engine lock is needed on this async path
         // (LESSON-448, REQ-554 verify).
         let local_engine = self.engine.get_with_format();
+        // REQ-598 ADR-1: the duty bundle for this attempt, derived from the
+        // turn's own context plus the two facts that travel with every duty
+        // resolution — the one engine-slot read above, and the prompt's spend
+        // accumulator. The four calls below passed these six arguments
+        // identically before this REQ; that repetition is what named the bundle.
+        // The gate is dropped on the way through: a duty route authorizes
+        // nothing.
+        let dctx = tctx.duties(local_engine.as_ref(), prompt_spend);
 
         // REQ-558 TASK-054: the `digest` duty resolves through its **own**
         // category, independently of the turn's. A turn on a frontier `think`
         // provider still summarizes through whatever `scan` is bound to, and a
         // turn on the local tier can digest remotely — the two decisions are not
         // the same decision, which is the whole premise of dispatching on purpose.
-        let digest = self.digest_route(
-            router,
-            config,
-            events,
-            session_id,
-            local_engine.as_ref(),
-            prompt_spend,
-        );
+        let digest = self.digest_route(dctx);
         // REQ-561 TASK-060: and so does `triage`, the duty the `grep` tool owns.
         // Resolved here beside `digest` because both need the engine slot read
         // once for the attempt, and independently of it because two categories
         // are two decisions.
-        let triage = self.triage_route(
-            router,
-            config,
-            events,
-            session_id,
-            local_engine.as_ref(),
-            prompt_spend,
-        );
+        let triage = self.triage_route(dctx);
         // REQ-561 TASK-061: and so does `shell`, the duty the `shell` tool owns.
         // It is a `build` duty where `triage` is a `scan` one, which is the point
         // of resolving them separately: interpreting a failed build is worth a
         // stronger model than ordering a list of grep hits.
-        let shell = self.shell_route(
-            router,
-            config,
-            events,
-            session_id,
-            local_engine.as_ref(),
-            prompt_spend,
-        );
+        let shell = self.shell_route(dctx);
         // REQ-561 TASK-063: and `compact`, which belongs to no tool at all — the
         // thing that knows a conversation no longer fits is the context manager.
         // Resolved here with the others and passed separately, because
         // `ToolDuties` is the tools' own struct.
-        let compact = self.compact_route(
-            router,
-            config,
-            events,
-            session_id,
-            local_engine.as_ref(),
-            prompt_spend,
-        );
+        let compact = self.compact_route(dctx);
         let duties = ToolDuties {
             triage: &triage,
             shell: &shell,
@@ -7037,31 +7046,14 @@ impl DaemonRuntime {
     /// `digest` is unreached while it is fully wired, and the test would fail
     /// pointing at the marker rather than at the receiver. So the shared helper
     /// sits **behind** the literal, not in front of it.
-    #[allow(clippy::too_many_arguments)]
-    fn digest_route(
-        &self,
-        router: &Router,
-        config: &Config,
-        events: &Arc<EventBus>,
-        session_id: &SessionId,
-        local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
-        prompt_spend: Option<&Arc<teton_core::cost_ceiling::PromptSpend>>,
-    ) -> DutyRoute {
+    fn digest_route(&self, dctx: DutyContext<'_>) -> DutyRoute {
+        let (router, session_id) = (dctx.core.router, dctx.core.session_id);
         let route = if self.session_taint.is_tainted(session_id) {
             router.resolve_local_pin(taint_pin_reason("the `digest` duty"))
         } else {
             router.resolve(Category::Digest)
         };
-        self.resolve_duty(
-            DIGEST_DUTY,
-            router,
-            &route,
-            config,
-            events,
-            session_id,
-            local_engine,
-            prompt_spend,
-        )
+        self.resolve_duty(DIGEST_DUTY, &route, dctx)
     }
 
     /// Resolve the `triage` category for this turn (REQ-561 TASK-060).
@@ -7078,31 +7070,14 @@ impl DaemonRuntime {
     /// working as configured; what holds the line is BR-7's scoping at the
     /// egress choke point, by the provenance of the matched files rather than of
     /// the turn.
-    #[allow(clippy::too_many_arguments)]
-    fn triage_route(
-        &self,
-        router: &Router,
-        config: &Config,
-        events: &Arc<EventBus>,
-        session_id: &SessionId,
-        local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
-        prompt_spend: Option<&Arc<teton_core::cost_ceiling::PromptSpend>>,
-    ) -> DutyRoute {
+    fn triage_route(&self, dctx: DutyContext<'_>) -> DutyRoute {
+        let (router, session_id) = (dctx.core.router, dctx.core.session_id);
         let route = if self.session_taint.is_tainted(session_id) {
             router.resolve_local_pin(taint_pin_reason("the `triage` duty"))
         } else {
             router.resolve(Category::Triage)
         };
-        self.resolve_duty(
-            TRIAGE_DUTY,
-            router,
-            &route,
-            config,
-            events,
-            session_id,
-            local_engine,
-            prompt_spend,
-        )
+        self.resolve_duty(TRIAGE_DUTY, &route, dctx)
     }
 
     /// Resolve the `shell` category for this turn (REQ-561 TASK-061).
@@ -7119,31 +7094,14 @@ impl DaemonRuntime {
     /// so the choke point fail-closes on it wherever a boundary is configured,
     /// and a remotely bound `shell` duty simply degrades. That is BR-3 working;
     /// see [`crate::harness::shell_duty`].
-    #[allow(clippy::too_many_arguments)]
-    fn shell_route(
-        &self,
-        router: &Router,
-        config: &Config,
-        events: &Arc<EventBus>,
-        session_id: &SessionId,
-        local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
-        prompt_spend: Option<&Arc<teton_core::cost_ceiling::PromptSpend>>,
-    ) -> DutyRoute {
+    fn shell_route(&self, dctx: DutyContext<'_>) -> DutyRoute {
+        let (router, session_id) = (dctx.core.router, dctx.core.session_id);
         let route = if self.session_taint.is_tainted(session_id) {
             router.resolve_local_pin(taint_pin_reason("the `shell` duty"))
         } else {
             router.resolve(Category::Shell)
         };
-        self.resolve_duty(
-            SHELL_DUTY,
-            router,
-            &route,
-            config,
-            events,
-            session_id,
-            local_engine,
-            prompt_spend,
-        )
+        self.resolve_duty(SHELL_DUTY, &route, dctx)
     }
 
     /// Resolve the `title` category for this session (REQ-561 TASK-062).
@@ -7163,31 +7121,14 @@ impl DaemonRuntime {
     /// through the same table every other category reads (LESSON-484). A user who
     /// binds `reflex` remotely on purpose gets what they asked for, scoped and
     /// metered by the shared seam like any other duty.
-    #[allow(clippy::too_many_arguments)]
-    fn title_route(
-        &self,
-        router: &Router,
-        config: &Config,
-        events: &Arc<EventBus>,
-        session_id: &SessionId,
-        local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
-        prompt_spend: Option<&Arc<teton_core::cost_ceiling::PromptSpend>>,
-    ) -> DutyRoute {
+    fn title_route(&self, dctx: DutyContext<'_>) -> DutyRoute {
+        let (router, session_id) = (dctx.core.router, dctx.core.session_id);
         let route = if self.session_taint.is_tainted(session_id) {
             router.resolve_local_pin(taint_pin_reason("the `title` duty"))
         } else {
             router.resolve(Category::Title)
         };
-        self.resolve_duty(
-            TITLE_DUTY,
-            router,
-            &route,
-            config,
-            events,
-            session_id,
-            local_engine,
-            prompt_spend,
-        )
+        self.resolve_duty(TITLE_DUTY, &route, dctx)
     }
 
     /// Resolve the `compact` category for this turn (REQ-561 TASK-063).
@@ -7205,31 +7146,14 @@ impl DaemonRuntime {
     /// BR-7's scoping at the egress choke point: the conversation's own merged
     /// provenance, so a session that read a `local-only` file compacts locally or
     /// not at all, while the turn proceeds either way.
-    #[allow(clippy::too_many_arguments)]
-    fn compact_route(
-        &self,
-        router: &Router,
-        config: &Config,
-        events: &Arc<EventBus>,
-        session_id: &SessionId,
-        local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
-        prompt_spend: Option<&Arc<teton_core::cost_ceiling::PromptSpend>>,
-    ) -> DutyRoute {
+    fn compact_route(&self, dctx: DutyContext<'_>) -> DutyRoute {
+        let (router, session_id) = (dctx.core.router, dctx.core.session_id);
         let route = if self.session_taint.is_tainted(session_id) {
             router.resolve_local_pin(taint_pin_reason("the `compact` duty"))
         } else {
             router.resolve(Category::Compact)
         };
-        self.resolve_duty(
-            COMPACT_DUTY,
-            router,
-            &route,
-            config,
-            events,
-            session_id,
-            local_engine,
-            prompt_spend,
-        )
+        self.resolve_duty(COMPACT_DUTY, &route, dctx)
     }
 
     /// The redaction scanner this turn's egress carries, or `None` when the
@@ -9451,21 +9375,17 @@ impl DaemonRuntime {
     /// Returns the spawned task so a test can await it. **Production drops it**:
     /// a title that has not landed yet is a session with no title, which is BR-3's
     /// degraded state and costs the turn nothing.
-    #[allow(clippy::too_many_arguments)]
     fn spawn_title_session(
         &self,
-        events: &Arc<EventBus>,
+        core: TurnCore<'_>,
         sessions: &SessionRegistry,
-        router: &Router,
-        config: &Config,
-        session_id: &SessionId,
         prompt: &str,
         provenance: Provenance,
     ) -> Option<tokio::task::JoinHandle<()>> {
         if !crate::harness::title::worth_titling(prompt) {
             return None;
         }
-        if !sessions.claim_title(session_id) {
+        if !sessions.claim_title(core.session_id) {
             return None;
         }
         let local_engine = self.engine.get_with_format();
@@ -9476,18 +9396,16 @@ impl DaemonRuntime {
         // background job spend against a total nobody is watching any more, and
         // would race the next prompt's. Titling is cheap and outside the
         // ceiling, stated here rather than left to be inferred.
-        let route = self.title_route(
-            router,
-            config,
-            events,
-            session_id,
-            local_engine.as_ref(),
-            None,
-        );
+        //
+        // Derived from a `TurnCore`, not a `TurnContext`: this duty holds no
+        // gate, and there is none here to give it — which is why `DutyContext`
+        // is gate-free and why this function takes the core rather than the
+        // turn context (ADR-1).
+        let route = self.title_route(core.duties(local_engine.as_ref(), None));
 
-        let events = Arc::clone(events);
+        let events = Arc::clone(core.events);
         let sessions = sessions.clone();
-        let session_id = session_id.clone();
+        let session_id = core.session_id.clone();
         let prompt = prompt.to_owned();
         Some(tokio::spawn(async move {
             let Ok(title) = crate::harness::title::name_session(&route, &prompt, &provenance).await
@@ -9541,30 +9459,17 @@ impl DaemonRuntime {
     /// not resolve fails the **turn** on the turn path (a config error the user
     /// must fix), but only the **duty** here — a duty is never fatal, and the
     /// failure is reported on the duty's own outcome instead.
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn resolve_duty(
         &self,
         duty: DutyKind,
-        router: &Router,
         route: &crate::router::Route,
-        config: &Config,
-        events: &Arc<EventBus>,
-        session_id: &SessionId,
-        local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
-        prompt_spend: Option<&Arc<teton_core::cost_ceiling::PromptSpend>>,
+        dctx: DutyContext<'_>,
     ) -> DutyRoute {
-        self.build_duty_route(
-            duty,
-            router,
-            route,
-            config,
-            events,
-            session_id,
-            local_engine,
-            prompt_spend,
+        self.build_duty_route(duty, route, dctx).announcing(
+            dctx.core.events,
+            Some(dctx.core.session_id.clone()),
+            route.route_decided(),
         )
-        .announcing(events, Some(session_id.clone()), route.route_decided())
     }
 
     /// Build the [`DutyRoute`] `route` calls for, without announcing anything.
@@ -9580,19 +9485,27 @@ impl DaemonRuntime {
     /// worth knowing that after REQ-557's migration (`default_provider` set to the
     /// first remote provider, no `[[tiers]]` rows) an unbound tier inherits that
     /// provider, so this is the *ordinary* upgraded config and not an exotic one.
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn build_duty_route(
         &self,
         duty: DutyKind,
-        router: &Router,
         route: &crate::router::Route,
-        config: &Config,
-        events: &Arc<EventBus>,
-        session_id: &SessionId,
-        local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
-        prompt_spend: Option<&Arc<teton_core::cost_ceiling::PromptSpend>>,
+        dctx: DutyContext<'_>,
     ) -> DutyRoute {
+        // Destructured rather than reached through `dctx.core.*` at each use:
+        // the body below is REQ-557/REQ-561 routing logic that this REQ must
+        // not touch, and rebinding the six names here keeps that body
+        // byte-identical (BR-1).
+        let DutyContext {
+            core:
+                TurnCore {
+                    events,
+                    session_id,
+                    config,
+                    router,
+                },
+            local_engine,
+            prompt_spend,
+        } = dctx;
         // The category's own name, read off the duty rather than spelled again:
         // two surfaces describing one routing state must not be able to drift.
         let name = duty.category().as_str();
@@ -18175,7 +18088,14 @@ permission_allow = [\"fetch_user_url\"]
             let blocked = SessionId::from("blocked");
             let bystander = SessionId::from("bystander");
             let slot = runtime.engine.get_with_format();
-            let route = runtime.title_route(&router, &config, &bus, &blocked, slot.as_ref(), None);
+            let route = runtime.title_route(DutyContext::detached(
+                &bus,
+                &blocked,
+                &config,
+                &router,
+                slot.as_ref(),
+                None,
+            ));
 
             // Non-vacuity, both halves: the route really is remote — so there
             // really was a transport a byte could have left through — and the
@@ -18795,14 +18715,14 @@ permission_allow = [\"fetch_user_url\"]
                 let router =
                     build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
                 let slot = runtime.engine.get_with_format();
-                runtime.digest_route(
-                    &router,
-                    &config,
+                runtime.digest_route(DutyContext::detached(
                     &Arc::new(EventBus::new()),
                     session,
+                    &config,
+                    &router,
                     slot.as_ref(),
                     None,
-                )
+                ))
             }
 
             /// **BR-1 for a harness-known category.** `digest` is a `scan` duty,
@@ -18946,7 +18866,14 @@ permission_allow = [\"fetch_user_url\"]
                 let router =
                     build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
                 let slot = runtime.engine.get_with_format();
-                runtime.digest_route(&router, &config, bus, session, slot.as_ref(), None)
+                runtime.digest_route(DutyContext::detached(
+                    bus,
+                    session,
+                    &config,
+                    &router,
+                    slot.as_ref(),
+                    None,
+                ))
             }
 
             /// **REQ-561 BR-2, the positive half.** A `digest` that actually runs
@@ -19062,14 +18989,14 @@ permission_allow = [\"fetch_user_url\"]
                 let router =
                     build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
                 let slot = runtime.engine.get_with_format();
-                runtime.triage_route(
-                    &router,
-                    &config,
+                runtime.triage_route(DutyContext::detached(
                     &Arc::new(EventBus::new()),
                     session,
+                    &config,
+                    &router,
                     slot.as_ref(),
                     None,
-                )
+                ))
             }
 
             /// **BR-1.** `triage` is a `scan` duty, so binding `scan` sends the
@@ -19182,14 +19109,14 @@ permission_allow = [\"fetch_user_url\"]
                 let router =
                     build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
                 let slot = runtime.engine.get_with_format();
-                runtime.shell_route(
-                    &router,
-                    &config,
+                runtime.shell_route(DutyContext::detached(
                     &Arc::new(EventBus::new()),
                     session,
+                    &config,
+                    &router,
                     slot.as_ref(),
                     None,
-                )
+                ))
             }
 
             /// **BR-1.** `shell` is a `build` duty, so it follows the `build`
@@ -19312,7 +19239,14 @@ permission_allow = [\"fetch_user_url\"]
                 let router =
                     build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
                 let slot = runtime.engine.get_with_format();
-                runtime.shell_route(&router, &config, bus, session, slot.as_ref(), None)
+                runtime.shell_route(DutyContext::detached(
+                    bus,
+                    session,
+                    &config,
+                    &router,
+                    slot.as_ref(),
+                    None,
+                ))
             }
 
             /// `ShellTool::run` then `ShellTool::refine` over `route`, in `root`.
@@ -19446,14 +19380,14 @@ permission_allow = [\"fetch_user_url\"]
                 let router =
                     build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
                 let slot = runtime.engine.get_with_format();
-                runtime.title_route(
-                    &router,
-                    &config,
+                runtime.title_route(DutyContext::detached(
                     &Arc::new(EventBus::new()),
                     session,
+                    &config,
+                    &router,
                     slot.as_ref(),
                     None,
-                )
+                ))
             }
 
             /// A registry holding one freeform session, and its id.
@@ -19482,11 +19416,13 @@ permission_allow = [\"fetch_user_url\"]
                 let router =
                     build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
                 if let Some(handle) = runtime.spawn_title_session(
-                    bus,
+                    TurnCore {
+                        events: bus,
+                        session_id: session,
+                        config: &config,
+                        router: &router,
+                    },
                     sessions,
-                    &router,
-                    &config,
-                    session,
                     prompt,
                     // These fixtures name a session after a **typed** prompt,
                     // which is the call site the empty value belongs to.
@@ -19538,16 +19474,33 @@ permission_allow = [\"fetch_user_url\"]
                     "`reflex` never inherits `default_provider`, so `title` never leaves \
                      the machine"
                 );
+                // Bound to locals rather than built inline as arguments, and
+                // that is load-bearing, not style. `config.lock()`'s temporary
+                // guard lives to the end of the *enclosing statement*, so as an
+                // argument it is still held when a later argument evaluates
+                // `router_for`, which locks the same mutex — and
+                // `std::sync::Mutex` is not reentrant, so the thread deadlocks
+                // against itself.
+                //
+                // The old signature ordered `router` before `config`, so the
+                // two never overlapped; `DutyContext`'s field order is the
+                // reverse, and reordering the arguments was enough to introduce
+                // the hang (REQ-598 — an ordering the refactor could relocate
+                // without any test naming it). Every other duty fixture in this
+                // module already binds first; this one now matches them.
+                let cfg = runtime.config.lock().expect("config mutex").clone();
+                let router = router_for(&runtime);
+                let slot = runtime.engine.get_with_format();
                 assert_eq!(
                     runtime
-                        .shell_route(
-                            &router_for(&runtime),
-                            &runtime.config.lock().expect("config mutex").clone(),
+                        .shell_route(DutyContext::detached(
                             &Arc::new(EventBus::new()),
                             &SessionId::from("sess"),
-                            runtime.engine.get_with_format().as_ref(),
+                            &cfg,
+                            &router,
+                            slot.as_ref(),
                             None,
-                        )
+                        ))
                         .provider(),
                     Some("cheap"),
                     "non-vacuity: this config really does route other duties off the machine"
@@ -20042,11 +19995,13 @@ permission_allow = [\"fetch_user_url\"]
 
                 let handle = runtime
                     .spawn_title_session(
-                        &bus,
+                        TurnCore {
+                            events: &bus,
+                            session_id: &session,
+                            config: &cfg,
+                            router: &router,
+                        },
                         &sessions,
-                        &router,
-                        &cfg,
-                        &session,
                         REQUEST,
                         Provenance::empty(),
                     )
@@ -20115,7 +20070,14 @@ permission_allow = [\"fetch_user_url\"]
                 let router =
                     build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
                 let slot = runtime.engine.get_with_format();
-                runtime.compact_route(&router, &config, bus, session, slot.as_ref(), None)
+                runtime.compact_route(DutyContext::detached(
+                    bus,
+                    session,
+                    &config,
+                    &router,
+                    slot.as_ref(),
+                    None,
+                ))
             }
 
             /// A conversation over its byte budget, with a decision in it.
@@ -20431,14 +20393,14 @@ permission_allow = [\"fetch_user_url\"]
                 let slot = runtime.engine.get_with_format();
                 assert_eq!(
                     runtime
-                        .title_route(
-                            &router,
-                            &config,
+                        .title_route(DutyContext::detached(
                             &Arc::new(EventBus::new()),
                             &session,
+                            &config,
+                            &router,
                             slot.as_ref(),
                             None,
-                        )
+                        ))
                         .provider(),
                     Some("frontier"),
                     "the reflex binding is live for the duty that reads it"
@@ -20473,13 +20435,27 @@ permission_allow = [\"fetch_user_url\"]
                 // The sibling: taint moves it from the frontier to the tier.
                 assert_eq!(
                     runtime
-                        .title_route(&router, &config, &bus, &clean, slot.as_ref(), None)
+                        .title_route(DutyContext::detached(
+                            &bus,
+                            &clean,
+                            &config,
+                            &router,
+                            slot.as_ref(),
+                            None,
+                        ))
                         .provider(),
                     Some("frontier")
                 );
                 assert_eq!(
                     runtime
-                        .title_route(&router, &config, &bus, &tainted, slot.as_ref(), None)
+                        .title_route(DutyContext::detached(
+                            &bus,
+                            &tainted,
+                            &config,
+                            &router,
+                            slot.as_ref(),
+                            None,
+                        ))
                         .provider(),
                     Some(LOCAL_PROVIDER_ID)
                 );
@@ -23192,18 +23168,14 @@ permission_allow = [\"fetch_user_url\"]
                 ));
 
                 let tools = runtime
+                    // No skills and nobody to ask: these fixtures are about the
+                    // MCP and web halves of the registry, and an invented
+                    // `ConnectionId` here would prove nothing about the addressee
+                    // (TASK-217's own test drives a real one through the loop).
+                    // The invoker travels on the context now (REQ-598).
                     .build_tools(
-                        &router,
-                        &events,
-                        &session,
-                        &gate,
-                        &config,
-                        // No skills and nobody to ask: these fixtures are about the
-                        // MCP and web halves of the registry, and an invented
-                        // `ConnectionId` here would prove nothing about the addressee
-                        // (TASK-217's own test drives a real one through the loop).
+                        TurnContext::new(&events, &session, &config, &router, &gate, None),
                         Arc::new(crate::skills::SkillRegistry::default()),
-                        None,
                     )
                     .await;
 
@@ -23278,18 +23250,14 @@ permission_allow = [\"fetch_user_url\"]
             };
             assert!(
                 runtime
+                    // No skills and nobody to ask: these fixtures are about the
+                    // MCP and web halves of the registry, and an invented
+                    // `ConnectionId` here would prove nothing about the addressee
+                    // (TASK-217's own test drives a real one through the loop).
+                    // The invoker travels on the context now (REQ-598).
                     .build_tools(
-                        &router,
-                        &events,
-                        &session,
-                        &gate,
-                        &snapshot,
-                        // No skills and nobody to ask: these fixtures are about the
-                        // MCP and web halves of the registry, and an invented
-                        // `ConnectionId` here would prove nothing about the addressee
-                        // (TASK-217's own test drives a real one through the loop).
+                        TurnContext::new(&events, &session, &snapshot, &router, &gate, None),
                         Arc::new(crate::skills::SkillRegistry::default()),
-                        None,
                     )
                     .await
                     .get(WEB_TOOL_NAME)
@@ -23301,18 +23269,14 @@ permission_allow = [\"fetch_user_url\"]
             // this, so the same call with the live snapshot has no web tool.
             assert!(
                 runtime
+                    // No skills and nobody to ask: these fixtures are about the
+                    // MCP and web halves of the registry, and an invented
+                    // `ConnectionId` here would prove nothing about the addressee
+                    // (TASK-217's own test drives a real one through the loop).
+                    // The invoker travels on the context now (REQ-598).
                     .build_tools(
-                        &router,
-                        &events,
-                        &session,
-                        &gate,
-                        &live,
-                        // No skills and nobody to ask: these fixtures are about the
-                        // MCP and web halves of the registry, and an invented
-                        // `ConnectionId` here would prove nothing about the addressee
-                        // (TASK-217's own test drives a real one through the loop).
+                        TurnContext::new(&events, &session, &live, &router, &gate, None),
                         Arc::new(crate::skills::SkillRegistry::default()),
-                        None,
                     )
                     .await
                     .get(WEB_TOOL_NAME)
@@ -23694,18 +23658,14 @@ max_page_bytes_from_the_future = 4096
                     Arc::clone(&runtime.pending),
                 ));
                 runtime
+                    // No skills and nobody to ask: these fixtures are about the
+                    // MCP and web halves of the registry, and an invented
+                    // `ConnectionId` here would prove nothing about the addressee
+                    // (TASK-217's own test drives a real one through the loop).
+                    // The invoker travels on the context now (REQ-598).
                     .build_tools(
-                        &router,
-                        &events,
-                        &session,
-                        &gate,
-                        &config,
-                        // No skills and nobody to ask: these fixtures are about the
-                        // MCP and web halves of the registry, and an invented
-                        // `ConnectionId` here would prove nothing about the addressee
-                        // (TASK-217's own test drives a real one through the loop).
+                        TurnContext::new(&events, &session, &config, &router, &gate, None),
                         Arc::new(crate::skills::SkillRegistry::default()),
-                        None,
                     )
                     .await
                     .get(WEB_TOOL_NAME)
@@ -30785,102 +30745,102 @@ provider_id = \"deepseek\"
             let _ = std::fs::remove_dir_all(&target);
         }
 
-    /// **REQ-598 AC-10 / BR-1 — the event-ordering fixture.**
-    ///
-    /// This REQ is a behavior-preserving refactor, and the risk it carries is
-    /// not that a test breaks: it is that a call whose *ordering* is
-    /// load-bearing gets silently relocated. The suite is large enough that a
-    /// reordered event can pass every existing assertion, because almost every
-    /// assertion asks whether something happened, not when.
-    ///
-    /// So one full turn's event sequence is recorded against a checked-in
-    /// golden file. Its whole value is its **provenance**: it was captured on
-    /// this branch's base commit, in TASK-293, before any `TurnContext` type
-    /// existed. A fixture regenerated after the refactor would be an oracle
-    /// computed by the subject — conventions.md's first named trap, and the
-    /// mechanism behind three of the seven false-green assertions REQ-592
-    /// shipped (LESSON-569).
-    ///
-    /// **What is recorded, and what is deliberately not.** Consecutive runs of
-    /// the same event name collapse to one entry. `session_update` is emitted
-    /// per streamed chunk, so recording every one would pin the scripted
-    /// engine's chunking — a fact this REQ does not touch and REQ-599 would
-    /// have to relitigate. Collapsing runs preserves *ordering*, which is what
-    /// BR-1 is about, while leaving chunk counts free. Transposing two
-    /// adjacent distinct events still fails; transposing two identical
-    /// adjacent events is a no-op.
-    ///
-    /// **This test can fail** (conventions.md: show it before trusting it).
-    /// Mutation executed in TASK-293: swapped the recorded sequence's last two
-    /// distinct entries before comparing, and the assertion went red naming
-    /// both the expected and actual position. Reverted.
-    mod req598_event_order {
-        use super::*;
-
-        /// The golden sequence, captured on the base commit.
-        const FIXTURE: &str = include_str!("../tests/fixtures/req598_turn_event_order.txt");
-
-        /// Event names in order, with consecutive duplicates collapsed.
+        /// **REQ-598 AC-10 / BR-1 — the event-ordering fixture.**
         ///
-        /// Drained with `try_recv` rather than `recv` under a timeout:
-        /// `EventBus::publish` is synchronous, so once the turn has returned
-        /// every event it published is already queued. A wall-clock poll is the
-        /// assertion shape that goes flaky first under CI scheduler pressure
-        /// (LESSON-450).
-        fn drain_names(sub: &mut crate::broadcast::Subscription) -> Vec<String> {
-            let mut names: Vec<String> = Vec::new();
-            while let Some(env) = sub.try_recv() {
-                let name = env.event_name().to_owned();
-                if names.last().map(String::as_str) != Some(name.as_str()) {
-                    names.push(name);
+        /// This REQ is a behavior-preserving refactor, and the risk it carries is
+        /// not that a test breaks: it is that a call whose *ordering* is
+        /// load-bearing gets silently relocated. The suite is large enough that a
+        /// reordered event can pass every existing assertion, because almost every
+        /// assertion asks whether something happened, not when.
+        ///
+        /// So one full turn's event sequence is recorded against a checked-in
+        /// golden file. Its whole value is its **provenance**: it was captured on
+        /// this branch's base commit, in TASK-293, before any `TurnContext` type
+        /// existed. A fixture regenerated after the refactor would be an oracle
+        /// computed by the subject — conventions.md's first named trap, and the
+        /// mechanism behind three of the seven false-green assertions REQ-592
+        /// shipped (LESSON-569).
+        ///
+        /// **What is recorded, and what is deliberately not.** Consecutive runs of
+        /// the same event name collapse to one entry. `session_update` is emitted
+        /// per streamed chunk, so recording every one would pin the scripted
+        /// engine's chunking — a fact this REQ does not touch and REQ-599 would
+        /// have to relitigate. Collapsing runs preserves *ordering*, which is what
+        /// BR-1 is about, while leaving chunk counts free. Transposing two
+        /// adjacent distinct events still fails; transposing two identical
+        /// adjacent events is a no-op.
+        ///
+        /// **This test can fail** (conventions.md: show it before trusting it).
+        /// Mutation executed in TASK-293: swapped the recorded sequence's last two
+        /// distinct entries before comparing, and the assertion went red naming
+        /// both the expected and actual position. Reverted.
+        mod req598_event_order {
+            use super::*;
+
+            /// The golden sequence, captured on the base commit.
+            const FIXTURE: &str = include_str!("../tests/fixtures/req598_turn_event_order.txt");
+
+            /// Event names in order, with consecutive duplicates collapsed.
+            ///
+            /// Drained with `try_recv` rather than `recv` under a timeout:
+            /// `EventBus::publish` is synchronous, so once the turn has returned
+            /// every event it published is already queued. A wall-clock poll is the
+            /// assertion shape that goes flaky first under CI scheduler pressure
+            /// (LESSON-450).
+            fn drain_names(sub: &mut crate::broadcast::Subscription) -> Vec<String> {
+                let mut names: Vec<String> = Vec::new();
+                while let Some(env) = sub.try_recv() {
+                    let name = env.event_name().to_owned();
+                    if names.last().map(String::as_str) != Some(name.as_str()) {
+                        names.push(name);
+                    }
                 }
+                names
             }
-            names
-        }
 
-        /// The fixture's expected entries — comment and blank lines stripped,
-        /// so the golden file can carry its own provenance header.
-        fn expected() -> Vec<String> {
-            FIXTURE
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                .map(str::to_owned)
-                .collect()
-        }
+            /// The fixture's expected entries — comment and blank lines stripped,
+            /// so the golden file can carry its own provenance header.
+            fn expected() -> Vec<String> {
+                FIXTURE
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                    .map(str::to_owned)
+                    .collect()
+            }
 
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn one_full_turn_publishes_its_events_in_the_order_the_fixture_records() {
-            let (runtime, _seen) = carry_runtime(&[Scripted::Say("Noted.")]);
-            let events = Arc::new(EventBus::new());
-            let mut sub = events.subscribe(4_096);
-            let (sessions, session_id) = one_session();
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn one_full_turn_publishes_its_events_in_the_order_the_fixture_records() {
+                let (runtime, _seen) = carry_runtime(&[Scripted::Say("Noted.")]);
+                let events = Arc::new(EventBus::new());
+                let mut sub = events.subscribe(4_096);
+                let (sessions, session_id) = one_session();
 
-            prompt(
-                &runtime,
-                &events,
-                &sessions,
-                &session_id,
-                None,
-                "remember the retry budget",
-            )
-            .await
-            .expect("the scripted turn completes");
+                prompt(
+                    &runtime,
+                    &events,
+                    &sessions,
+                    &session_id,
+                    None,
+                    "remember the retry budget",
+                )
+                .await
+                .expect("the scripted turn completes");
 
-            let actual = drain_names(&mut sub);
-            let expected = expected();
+                let actual = drain_names(&mut sub);
+                let expected = expected();
 
-            assert!(
-                !expected.is_empty(),
-                "the fixture is empty — a golden file that records nothing \
+                assert!(
+                    !expected.is_empty(),
+                    "the fixture is empty — a golden file that records nothing \
                  cannot fail, which is the vacuity this test exists to avoid"
-            );
-            assert_eq!(
+                );
+                assert_eq!(
                 actual, expected,
                 "the turn's event ordering changed.\n  expected: {expected:?}\n    actual: {actual:?}"
             );
+            }
         }
-    }
     }
 
     /// REQ-586: the budget follows the route attempt.

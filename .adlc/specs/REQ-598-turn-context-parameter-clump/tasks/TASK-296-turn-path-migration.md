@@ -1,7 +1,7 @@
 ---
 id: TASK-296
 title: "Migrate the turn path to TurnContext, constructed after the last rebinding"
-status: draft
+status: complete
 parent: REQ-598
 created: 2026-08-29
 updated: 2026-08-29

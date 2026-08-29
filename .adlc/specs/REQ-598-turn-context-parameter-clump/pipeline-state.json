@@ -42,8 +42,8 @@
   "repos": {
     "teton-code": {
       "primary": true,
-      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
-      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-598",
+      "path": "/Users/brettluelling/Library/Mobile Documents/com~apple~CloudDocs/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Library/Mobile Documents/com~apple~CloudDocs/Documents/GitHub/teton-code/.worktrees/REQ-598",
       "branch": "feat/REQ-598-turn-context-parameter-clump",
       "touched": true,
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/237",
@@ -61,7 +61,9 @@
     "currentTask": null,
     "completedTasks": [
       "TASK-293",
-      "TASK-294"
+      "TASK-294",
+      "TASK-295",
+      "TASK-296"
     ],
     "failedTasks": []
   },
