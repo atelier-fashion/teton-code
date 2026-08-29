@@ -22,6 +22,20 @@ user having asked for it.
 
 ### Changed
 
+- **Internal: the turn path's parameter cluster is named (REQ-598).** No
+  user-visible change — this is a behavior-preserving refactor, and it is listed
+  only because it touches the turn path that every prompt runs through. The
+  workspace's `#[allow(clippy::too_many_arguments)]` count drops 25 -> 13 (14 ->
+  2 in `runtime.rs`) as a side effect; the point is that adding a per-turn fact
+  no longer requires editing a dozen signatures, which is what makes the
+  forthcoming decomposition of `runtime.rs` tractable.
+
+  One defect was found and fixed **in this change's own work**: bundling the
+  parameters reordered them, which extended a `config.lock()` temporary's life
+  across a second acquisition of the same mutex and deadlocked a test fixture.
+  It affected no shipped path — the fixture was test-only — but it is recorded
+  because the mechanism is not specific to tests (LESSON-590).
+
 - **Privacy boundaries are on by default (REQ-597).** Teton's second headline
   promise is that paths marked `local-only` never leave the machine. On a stock
   install nothing was marked, so the promise held over an empty set: a session

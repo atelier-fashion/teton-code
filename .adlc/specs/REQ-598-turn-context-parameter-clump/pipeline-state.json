@@ -2,15 +2,18 @@
   "req": "REQ-598",
   "branch": "feat/REQ-598-turn-context-parameter-clump",
   "startedAt": "2026-08-29T10:00:00Z",
-  "completed": false,
-  "currentPhase": 6,
+  "completed": true,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
     2,
     3,
     4,
-    5
+    5,
+    6,
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -50,7 +53,7 @@
       "touched": true,
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/237",
       "prNumber": 237,
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null,
       "prCreatedAt": "2026-08-29T10:05:00Z"
