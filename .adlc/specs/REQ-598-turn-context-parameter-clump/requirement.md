@@ -1,10 +1,10 @@
 ---
 id: REQ-598
 title: "TurnContext: dissolve the parameter clump the suppressions have been hiding"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-28
-updated: 2026-08-28
+updated: 2026-08-29
 component: "daemon/session"
 domain: "harness"
 stack: ["rust", "daemon"]
