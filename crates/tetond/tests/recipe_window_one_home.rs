@@ -71,14 +71,14 @@ const KNOWN_UNRELATED_HOMES: &[(u32, &str, usize, &str)] = &[
     ),
     (
         1_000_000,
-        "runtime.rs",
+        "runtime/mod.rs",
         2,
         "the bytes-per-megabyte half of `500_000 * 1_000_000`, the free-disk \
          figure the install preflight assumes",
     ),
     (
         500_000,
-        "runtime.rs",
+        "runtime/mod.rs",
         2,
         "the megabytes half of that same free-disk figure",
     ),

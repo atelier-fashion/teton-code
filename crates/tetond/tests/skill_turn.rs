@@ -3657,31 +3657,68 @@ async fn two_typed_invocations_with_different_arguments_do_not_share_one_answer(
 // the order itself, read off the source
 // ---------------------------------------------------------------------------
 
-/// `path`'s production half — everything above its first `#[cfg(test)]` item.
+/// `relative`'s production half — everything above its first `#[cfg(test)]`
+/// item. Accepts a **file or a directory**.
 ///
 /// The instrument `call_sites.rs` uses, for its reason: every module in this
 /// crate puts test items last, so truncating there is exact today and
 /// *conservative* if that changes — it can only shrink what a scan sees, which
-/// makes an assertion fail loudly rather than pass wrongly. A file that is
+/// makes an assertion fail loudly rather than pass wrongly. A path that is
 /// missing is fatal rather than empty, so a rename cannot make these pass
 /// vacuously.
+///
+/// **Directories are accepted because of REQ-599.** `runtime.rs` became
+/// `runtime/`, and a helper that only took files would have forced every caller
+/// to name one module — quietly shrinking the corpus each time another slice is
+/// extracted, which is the "a sweep sees less" failure (LESSON-585). Passing the
+/// directory keeps the corpus whole no matter how many modules the split
+/// produces. Concatenation is in sorted order so the result is stable.
 fn production_source(relative: &str) -> String {
+    fn production_half(text: &str) -> &str {
+        match text.find("\n#[cfg(test)]") {
+            Some(at) => &text[..at],
+            None => text,
+        }
+    }
+
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("src")
         .join(relative);
+
+    if path.is_dir() {
+        let mut files: Vec<_> = std::fs::read_dir(&path)
+            .unwrap_or_else(|err| panic!("unreadable source dir {}: {err}", path.display()))
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+            .collect();
+        files.sort();
+        assert!(
+            !files.is_empty(),
+            "vacuity floor: no sources under {} — a scan over nothing can only pass",
+            path.display()
+        );
+        return files
+            .iter()
+            .map(|p| {
+                let text = std::fs::read_to_string(p)
+                    .unwrap_or_else(|err| panic!("unreadable source file {}: {err}", p.display()));
+                production_half(&text).to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("unreadable source file {}: {err}", path.display()));
-    match text.find("\n#[cfg(test)]") {
-        Some(at) => text[..at].to_owned(),
-        None => text,
-    }
+    production_half(&text).to_owned()
 }
 
 /// The body of `run_prompt_turn`, from its signature to the start of the next
 /// item — so a marker that also appears elsewhere in this very large file
 /// cannot satisfy an ordering claim about *this* function.
 fn run_prompt_turn_body() -> String {
-    let src = production_source("runtime.rs");
+    let src = production_source("runtime");
     let start = src
         .find("pub async fn run_prompt_turn(")
         .expect("`run_prompt_turn` is where the turn ordering lives");
@@ -3959,7 +3996,7 @@ fn the_digest_duty_has_one_production_call_site_and_the_turn_path_is_not_it() {
         call_at - guard_at
     );
 
-    let runtime = production_source("runtime.rs");
+    let runtime = production_source("runtime");
     assert_eq!(
         runtime.matches("summarize_if_large(").count(),
         0,
@@ -3971,7 +4008,7 @@ fn the_digest_duty_has_one_production_call_site_and_the_turn_path_is_not_it() {
 /// The body of `settle_dynamic_context`, by the same instrument
 /// [`run_prompt_turn_body`] uses and for the same reason.
 fn settle_dynamic_context_body() -> String {
-    let src = production_source("runtime.rs");
+    let src = production_source("runtime");
     let start = src
         .find("    async fn settle_dynamic_context(")
         .expect("`settle_dynamic_context` is where the consent seam lives");
@@ -3996,7 +4033,7 @@ fn settle_dynamic_context_body() -> String {
 /// is: the only way to observe it behaviourally is to have the bug.
 #[test]
 fn no_model_call_happens_at_expansion_time() {
-    let runtime = production_source("runtime.rs");
+    let runtime = production_source("runtime");
     assert_eq!(
         runtime.matches(".refine(").count(),
         0,

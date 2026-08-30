@@ -1276,7 +1276,7 @@ mod tests {
     fn the_duty_path_has_one_egress_scoping_call_and_one_ceiling_site() {
         assert_eq!(
             files_with(".scoped("),
-            vec!["harness/completion.rs", "harness/duty.rs", "runtime.rs"],
+            vec!["harness/completion.rs", "harness/duty.rs", "runtime/mod.rs"],
             "the turn path, the duty path and the connection test, and nothing \
              else, reach a transport"
         );
@@ -1817,7 +1817,7 @@ mod tests {
 
         // And nothing on the duty path has grown one.
         for (rel, src) in code() {
-            if !(rel.starts_with("harness/") || rel == "runtime.rs" || rel == "router.rs") {
+            if !(rel.starts_with("harness/") || rel.starts_with("runtime/") || rel == "router.rs") {
                 continue;
             }
             for line in src.lines() {

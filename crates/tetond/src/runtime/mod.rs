@@ -21958,22 +21958,47 @@ permission_allow = [\"fetch_user_url\"]
 
         /// **The override is unreachable from tool dispatch — by construction.**
         ///
-        /// `WebTaintOverride::lift` carries no `pub`, so nothing outside
-        /// `runtime.rs` can call it, and this reads the daemon's own source to
-        /// pin the second half: inside `runtime.rs` there is exactly one call
-        /// site, and it is the `web/override` RPC handler. The source scan
-        /// follows [`crate::call_sites`]'s precedent — a marker nobody derives
-        /// is a marker that rots — and it fails in both directions: add a
-        /// second caller and it fires, delete the one there is and it fires
-        /// too.
+        /// `WebTaintOverride::lift` carries no `pub`, so nothing outside this
+        /// module tree can call it, and this reads the daemon's own source to
+        /// pin the second half: there is exactly one call site, and it is the
+        /// `web/override` RPC handler. The source scan follows
+        /// [`crate::call_sites`]'s precedent — a marker nobody derives is a
+        /// marker that rots — and it fails in both directions: add a second
+        /// caller and it fires, delete the one there is and it fires too.
+        ///
+        /// **Scans the whole `runtime/` directory, not one file (REQ-599).**
+        /// Before the split this was `include_str!("runtime.rs")`. A file-scoped
+        /// scan would have kept passing while the call site moved to a sibling
+        /// module — reporting zero, which this test reads as "the RPC handler no
+        /// longer sets it" — or worse, missed a *second* call site added in a
+        /// module the scan cannot see. A sweep's failure mode is seeing less
+        /// (LESSON-585), and a decomposition is exactly the event that makes a
+        /// single-file corpus stop being the corpus.
         #[test]
         fn the_taint_override_flag_has_exactly_one_setter_call_site() {
             // The needle is assembled at run time from fragments, so this
             // function's own source does not contain the string it searches for
             // — otherwise the scan finds itself and the test can only ever
-            // measure its own text.
+            // measure its own text (LESSON-589).
             let needle = format!("self.web_{}.{}(", "override", "lift");
-            let lines: Vec<&str> = include_str!("runtime.rs").lines().collect();
+
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime");
+            let mut sources: Vec<String> = std::fs::read_dir(&dir)
+                .expect("the runtime module directory is readable")
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+                .map(|p| std::fs::read_to_string(&p).expect("a runtime source is readable"))
+                .collect();
+            sources.sort();
+            assert!(
+                !sources.is_empty(),
+                "vacuity floor: the scan found no sources under {}, so it could only pass",
+                dir.display()
+            );
+            let joined = sources.join("\n");
+            let lines: Vec<&str> = joined.lines().collect();
+
             let sites: Vec<usize> = lines
                 .iter()
                 .enumerate()
@@ -30782,7 +30807,7 @@ provider_id = \"deepseek\"
             use super::*;
 
             /// The golden sequence, captured on the base commit.
-            const FIXTURE: &str = include_str!("../tests/fixtures/req598_turn_event_order.txt");
+            const FIXTURE: &str = include_str!("../../tests/fixtures/req598_turn_event_order.txt");
 
             /// The one event this sequence must not pin the position of.
             ///
@@ -36503,7 +36528,37 @@ provider_id = \"deepseek\"
             // And the typed path calls it exactly twice — BR-8's two stages —
             // so a third check is a decision someone has to make here rather
             // than a call site that quietly appeared.
-            let runtime = production("runtime.rs");
+            //
+            // REQ-599: read over the whole `runtime/` directory, not one file.
+            // Before the split this was `production("runtime.rs")`; once the
+            // god-impl is sliced, a file-scoped count would fall to zero as the
+            // call sites move and read as "the offer is unreachable" — the
+            // failure this assertion exists to catch, produced by the scan
+            // rather than by the code (LESSON-585).
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime");
+            let mut modules: Vec<_> = std::fs::read_dir(&dir)
+                .expect("the runtime module directory is readable")
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+                .collect();
+            modules.sort();
+            assert!(
+                !modules.is_empty(),
+                "vacuity floor: no sources under {} — the count below could only pass",
+                dir.display()
+            );
+            let runtime: String = modules
+                .iter()
+                .map(|p| {
+                    let text = std::fs::read_to_string(p).expect("a runtime source is readable");
+                    match text.find("\n#[cfg(test)]") {
+                        Some(at) => text[..at].to_owned(),
+                        None => text,
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
             assert_eq!(
                 runtime.matches(".offer_or_refuse_over_budget(").count(),
                 2,

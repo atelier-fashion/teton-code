@@ -57,6 +57,11 @@ const BASE: &str = "17c39ec4f26432fae22bfb4d266159ce8afb614f";
 /// The files this REQ touched, repo-relative.
 const TOUCHED: &[&str] = &["crates/tetond/src/runtime.rs", "crates/tetond/src/lib.rs"];
 
+/// Where `runtime.rs`'s content lives **now**, after REQ-599 split it into a
+/// directory. [`TOUCHED`] names the paths as they were at [`BASE`], which is
+/// what `git show` needs; this names the present-day corpus the floor measures.
+const RUNTIME_DIR: &str = "crates/tetond/src/runtime";
+
 /// **Globally unique** ids. A `REQ-597` means the same thing everywhere, so
 /// "this id annotates nothing in the workspace any more" is a sound claim about
 /// it. Arm 1 uses these and only these.
@@ -441,8 +446,26 @@ fn an_id_still_annotates_the_item_it_explained_at_the_base() {
 /// turns "saw less" from a quiet pass into a failure. Reverted after observing.
 #[test]
 fn the_sweep_sees_enough_of_the_corpus_to_be_meaningful() {
-    let runtime = std::fs::read_to_string(workspace_root().join("crates/tetond/src/runtime.rs"))
-        .expect("runtime.rs is readable");
+    // REQ-599: the corpus is a directory now. Reading one file would let the
+    // floor fall as slices are extracted and read as "the docs shrank".
+    let dir = workspace_root().join(RUNTIME_DIR);
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .expect("the runtime module directory is readable")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+        .collect();
+    files.sort();
+    assert!(
+        !files.is_empty(),
+        "vacuity floor: no sources under {}",
+        dir.display()
+    );
+    let runtime: String = files
+        .iter()
+        .map(|p| std::fs::read_to_string(p).expect("a runtime source is readable"))
+        .collect::<Vec<_>>()
+        .join("\n");
     let items = parse(&runtime, ALL_IDS);
     let ids: BTreeSet<&String> = items.iter().flat_map(|i| i.ids.iter()).collect();
 
