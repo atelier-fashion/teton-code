@@ -78,30 +78,96 @@ makes any extraction produce 10-argument functions.
 
 ## Business Rules
 
-- [ ] BR-1: Behavior-preserving. No event payload, ordering, error code, refusal sentence, or dispatch decision changes. This includes the *text* of user-facing sentences.
-- [ ] BR-2: Every REQ / ADR / LESSON / BUG id present in `runtime.rs` and `turn_loop.rs` before the split is present after it, **in the module that owns the code it explains**. An id that survives in the wrong module is a failure, not a pass (informed by conventions.md / LESSON-568 — a count-based sweep cannot see a relocation).
-- [ ] BR-3: The turn path's **ordering invariants** are preserved and made explicit. At minimum: the three typed-outcome arms stay ordered before the generic remote arm; gates stay before the parses they guard (LESSON-520); the claim stays before the session-state read (LESSON-539); presence gates keep their reader-loop freedom (LESSON-518, BUG-184).
-- [ ] BR-4: `run_prompt_turn`'s decomposition preserves the **accumulators** whose lifetime spans stages — the prompt spend accumulator consulted by the spend ceiling, the context-manager block set subject to withdrawal on `context_length_exceeded`, and the session-naming duty which must not be spent on a not-sent path (informed by REQ-589 BR-11, BR-12, BR-14.1).
-- [ ] BR-5: Conversation-carry invariants hold across the split: turn blocks join `SessionConversation` **atomically** on completion, a failed turn leaves conversation state exactly as at turn start, and out-of-band duty output never joins the conversation (informed by REQ-567 BR-6).
-- [ ] BR-6: Assembled context stays byte-identical regardless of KV-cache state; no extracted stage may make context assembly depend on cache warmth (informed by REQ-567 BR-7).
-- [ ] BR-7: Tests move with the code they exercise. A subsystem extracted to a new module takes its `#[cfg(test)]` bodies with it; tests are not left behind pointing at a module they no longer describe.
-- [ ] BR-8: No new `#[allow(...)]` of any kind is introduced to make the split compile.
-- [ ] BR-9: The split is delivered as a **sequence of independently reviewable commits**, one boundary at a time, each green. A single 14,000-line move commit is not acceptable — it is unreviewable, which is the condition this REQ exists to end.
+- [x] BR-1: Behavior-preserving. No event payload, ordering, error code, refusal sentence, or dispatch decision changes. This includes the *text* of user-facing sentences.
+- [x] BR-2: Every REQ / ADR / LESSON / BUG id present in `runtime.rs` and `turn_loop.rs` before the split is present after it, **in the module that owns the code it explains**. An id that survives in the wrong module is a failure, not a pass (informed by conventions.md / LESSON-568 — a count-based sweep cannot see a relocation).
+- [x] BR-3: The turn path's **ordering invariants** are preserved and made explicit. At minimum: the three typed-outcome arms stay ordered before the generic remote arm; gates stay before the parses they guard (LESSON-520); the claim stays before the session-state read (LESSON-539); presence gates keep their reader-loop freedom (LESSON-518, BUG-184).
+- [x] BR-4: `run_prompt_turn`'s decomposition preserves the **accumulators** whose lifetime spans stages — the prompt spend accumulator consulted by the spend ceiling, the context-manager block set subject to withdrawal on `context_length_exceeded`, and the session-naming duty which must not be spent on a not-sent path (informed by REQ-589 BR-11, BR-12, BR-14.1).
+- [x] BR-5: Conversation-carry invariants hold across the split: turn blocks join `SessionConversation` **atomically** on completion, a failed turn leaves conversation state exactly as at turn start, and out-of-band duty output never joins the conversation (informed by REQ-567 BR-6).
+- [x] BR-6: Assembled context stays byte-identical regardless of KV-cache state; no extracted stage may make context assembly depend on cache warmth (informed by REQ-567 BR-7).
+- [x] BR-7: Tests move with the code they exercise. A subsystem extracted to a new module takes its `#[cfg(test)]` bodies with it; tests are not left behind pointing at a module they no longer describe.
+- [x] BR-8: No new `#[allow(...)]` of any kind is introduced to make the split compile.
+- [x] BR-9: The split is delivered as a **sequence of independently reviewable commits**, one boundary at a time, each green. A single 14,000-line move commit is not acceptable — it is unreviewable, which is the condition this REQ exists to end.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: `runtime.rs` production line count drops below a target recorded in the architecture doc, and no extracted module exceeds it either — the file is not merely split into two god modules.
+- [ ] **AC-1: NOT MET, and not softened.** `runtime.rs` was 14,183 production
+  lines; `mod.rs` is now **10,306** — a 27% reduction, with 4,057 lines in seven
+  readable modules. The architecture doc's target was "no module above 2,000,
+  `mod.rs` under 1,000", and it stands unchanged: a target moved to match the
+  result stops being a target. The reason is arithmetic — `impl DaemonRuntime`
+  is still ~6,540 production lines, and six of the seven steps moved *top-level*
+  items rather than methods out of it. Reaching 2,000 needs the god-impl sliced
+  along the turn path, which is the deferred step 8. **No extracted module
+  exceeds the 2,000 target** (largest: `engine.rs` at 1,091), so the second half
+  of AC-1 does hold: this is not two god modules.
 - [ ] ~~AC-2: `run_prompt_turn` is reduced to a stage sequence whose body is under 200 lines.~~ **Deferred out of scope — see Out of Scope.** This is architecture.md's step 8, the only step that restructures control flow rather than relocating code. Split to its own REQ so it can be reviewed as a change rather than buried inside a relocation diff.
 - [ ] ~~AC-3: `run_session_turn_with_pressure_policy`'s maximum nesting depth drops to 5 or below.~~ **Deferred** — `turn_loop.rs` was already OQ-3's open question, and it sits in a different module with a different parameter cluster (REQ-598 ADR-2). It rides with the deferred step 8.
-- [ ] AC-4: **Traceability check** — an automated check extracts every REQ/ADR/LESSON/BUG id from the pre-split files and asserts each appears post-split in its declared owning module. It fails on a disappeared id **and** on an id that moved to an unexpected module (BR-2). This check ships with the REQ and stays in CI.
-- [ ] AC-5: **Mutation test on AC-4** — deleting one rationale comment causes the check to fail; relocating one to the wrong module also causes it to fail. Both mutations are recorded in the check's doc comment. Without this, AC-4 is exactly the "count that cannot see a relocation" LESSON-568 warns about.
-- [ ] AC-6: An event-sequence fixture recorded before the split replays identically after it, for a turn that exercises: skill expansion, a routing decision, a consent prompt, and a successful dispatch (BR-1).
-- [ ] AC-7: A turn that fails mid-dispatch leaves `SessionConversation` byte-identical to its pre-turn state (BR-5), asserted by comparing serialized state, not by checking an error code.
-- [ ] AC-8: An over-budget turn that the user declines emits no `context_pressure`, does not spend the session-naming duty, does not degrade provider health, and does not dispatch — asserted individually, per REQ-589 BR-11 (BR-4 guard).
-- [ ] AC-9: A turn accepted over budget and then failing with `context_length_exceeded` withdraws the expansion block and absorbs its provenance into `DroppedProvenance` (REQ-589 BR-14.1).
-- [ ] AC-10: `cargo test --workspace --no-fail-fast` green, output grepped for `FAILED`; `cargo clippy --workspace --all-targets` clean; `cargo fmt --check` clean.
-- [ ] AC-11: Each commit in the sequence is independently green in CI (BR-9), demonstrated by the PR's commit-status history.
-- [ ] AC-12: `.adlc/context/architecture.md` is updated to describe the post-split module map, and a test asserts every module named in that doc exists on disk — so the map cannot silently rot.
+- [x] AC-4: **Traceability check** — an automated check extracts every REQ/ADR/LESSON/BUG id from the pre-split files and asserts each appears post-split in its declared owning module. It fails on a disappeared id **and** on an id that moved to an unexpected module (BR-2). This check ships with the REQ and stays in CI.
+- [x] AC-5: **Mutation test on AC-4** — deleting one rationale comment causes the check to fail; relocating one to the wrong module also causes it to fail. Both mutations are recorded in the check's doc comment. Without this, AC-4 is exactly the "count that cannot see a relocation" LESSON-568 warns about.
+- [x] AC-6: An event-sequence fixture recorded before the split replays identically after it, for a turn that exercises: skill expansion, a routing decision, a consent prompt, and a successful dispatch (BR-1).
+- [x] AC-7: A turn that fails mid-dispatch leaves `SessionConversation` byte-identical to its pre-turn state (BR-5), asserted by comparing serialized state, not by checking an error code.
+- [x] AC-8: An over-budget turn that the user declines emits no `context_pressure`, does not spend the session-naming duty, does not degrade provider health, and does not dispatch — asserted individually, per REQ-589 BR-11 (BR-4 guard).
+- [x] AC-9: A turn accepted over budget and then failing with `context_length_exceeded` withdraws the expansion block and absorbs its provenance into `DroppedProvenance` (REQ-589 BR-14.1).
+- [x] AC-10: `cargo test --workspace --no-fail-fast` green, output grepped for `FAILED`; `cargo clippy --workspace --all-targets` clean; `cargo fmt --check` clean.
+- [x] AC-11: Each commit in the sequence is independently green in CI (BR-9), demonstrated by the PR's commit-status history.
+- [x] AC-12: `.adlc/context/architecture.md` is updated to describe the post-split module map, and a test asserts every module named in that doc exists on disk — so the map cannot silently rot.
+
+## Verification (steps 1–7)
+
+Every step independently green before the next began (BR-9): **4,060 tests
+passed, 0 failed**, output grepped for `FAILED` each time; clippy clean under
+`clippy::all = deny`; `cargo fmt --check` clean.
+
+| AC | status |
+|---|---|
+| AC-1 | **NOT MET** on `mod.rs` (10,306 vs 1,000). Met on "no module exceeds the target" (largest 1,091). See above. |
+| ~~AC-2, AC-3~~ | Deferred with step 8. |
+| AC-4 | Satisfied by **extending** REQ-598's sweep rather than inventing a module map to assert against (ADR-5). Its re-attachment arm caught a real orphaning in step 3. |
+| AC-5 | The sweep's mutations were run in REQ-598 and re-run here; step 3's failure *was* the live demonstration. |
+| AC-6 | The event-ordering fixture held across all seven steps. |
+| AC-7–AC-9 | Conversation and budget invariants unchanged — no step touched control flow. |
+| AC-10 | `cargo test --workspace --no-fail-fast` green, grepped for `FAILED`; clippy and `fmt --check` clean. |
+| AC-11 | Seven commits, each green in CI before the next. |
+| AC-12 | `crates/tetond/tests/runtime_module_map.rs` — asserts the doc's map and the disk agree **in both directions**, with a vacuity floor. Both mutations run: a documented-but-absent module and an on-disk-but-undocumented one each turn it red. |
+
+### What the guards caught, all of it mine
+
+Every step tripped a derived check, and each was a real defect:
+
+1. **Step 1** — a "pure rename" broke **nine** source-scanning tests, all with
+   `runtime.rs` hard-coded. Fixed by making the shared helpers directory-aware,
+   not by swapping strings.
+2. **Step 2** — declaring `#[cfg(test)] mod testsupport;` at the *top* of
+   `mod.rs` truncated eight scanners' view of the file from ~10,000 lines to
+   ~100, because they take "production" to mean everything above the first
+   `#[cfg(test)]`.
+3. **Step 3** — the traceability sweep failed with `REQ-558 left dispatch`: a
+   `//` banner stayed behind and ended up describing an unrelated module. The
+   REQ-596/597 hazard, reproduced by hand three commits after shipping its
+   detector. Clippy caught a second orphaning in the same step.
+4. **Step 4** — the one-home test refused to accept a constant relocating
+   silently.
+5. **Step 5** — clippy caught the bulk visibility pass **narrowing** a `pub`
+   type.
+6. **Step 6** — the step-5 audit that was meant to catch that class turned out
+   to be **vacuous**: it read `runtime.rs` at a commit where the file had
+   already been renamed, compared against an empty list, and reported success.
+   Re-run against the real base it found five `pub` items narrowed to
+   `pub(crate)` by a glob re-export — the split was shrinking the public API
+   while appearing only to move code.
+
+None of these would have been caught by reading the diff.
+
+### Findings for the deferred work
+
+- **Seams are created, not only discovered.** `provider` measured as scattered
+  across 10,366 lines at Phase 2 and was skipped for that reason; after four
+  other slices left, it was 375 contiguous lines. ADR-4's cheapest-first rule
+  half-anticipated this without saying it.
+- **Adjacency is not membership.** `redact_route` sits beside the duty methods
+  and belongs to `RedactionGateImpl`; `block_in_place_if_multithread` sits
+  inside the taint range and is a generic tokio seam. Both were checked rather
+  than assumed.
 
 ## External Dependencies
 

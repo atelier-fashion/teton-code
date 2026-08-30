@@ -156,25 +156,42 @@ inventing a module map to assert against. AC-12 (the architecture doc names
 every module and a test asserts each exists) keeps the map honest without
 pretending it can be derived.
 
-## OQ-1 answered — the module map
+## OQ-1 answered — the module map, as built
 
-`crates/tetond/src/runtime/` with `mod.rs` holding `DaemonRuntime`'s definition
-and the turn entry point:
+Measured on the finished branch. Production lines exclude in-file
+`#[cfg(test)]` bodies.
 
-| module | holds |
-|---|---|
-| `mod.rs` | `DaemonRuntime` struct, its construction, and re-exports |
-| `types.rs` | the self-contained types and their impls |
-| `turn.rs` | `run_prompt_turn`'s stage sequence and `run_one_attempt` |
-| `duty.rs` | the five `*_route` fns, `resolve_duty`, `build_duty_route`, `spawn_title_session` |
-| `provider.rs` | registration, setup, migration, connection test |
-| `consent.rs` | model consent, engine activation, probe |
-| `session.rs` | session lifecycle, attach/surfaces |
-| `egress.rs` | MCP egress construction and redaction wiring |
+| module | production | holds |
+|---|---:|---|
+| `mod.rs` | 10,306 | `DaemonRuntime`, the ~6,540-line god-impl, the turn path, and everything not yet sliced |
+| `engine.rs` | 1,091 | probe, installer, engine loaders, `EngineSlot`, `StagedEngines` |
+| `config_document.rs` | 888 | rendering and persisting the config document |
+| `duty.rs` | 632 | the five `*_route` resolvers, `resolve_duty`, `spawn_title_session`, `RedactionGateImpl` |
+| `taint.rs` | 535 | `SessionTaint`, the lookup seam, `TaintingPrivacySink` |
+| `views.rs` | 501 | `config/get`'s snapshot and the web-setup views |
+| `provider.rs` | 410 | transport, credentials, connection probe |
+| `testsupport.rs` | 42 | scratch-dir helpers shared by the tree's tests |
 
-AC-1's target: **no module above 2,000 production lines**, and `mod.rs` under
-1,000. Recorded here per AC-4/OQ-4 rather than in the CI check alone; the check
-reads this number so the two cannot disagree.
+`runtime.rs` was **14,183** production lines at `fedcab1`. `mod.rs` is now
+**10,306** — a reduction of 3,877 (27%), with 4,057 lines living in seven
+modules that can be read on their own.
+
+### AC-1's target is NOT met, and this records why
+
+This document set the target at "no module above 2,000 production lines, and
+`mod.rs` under 1,000". `mod.rs` is 10,306. The target was written assuming all
+eight steps; step 8 was deferred by decision on 2026-08-30, and it is the step
+that reaches the god-impl.
+
+The arithmetic is the explanation: `impl DaemonRuntime` is still ~6,540
+production lines. Steps 2, 4, 5, 6 and 7 moved **top-level** items — types,
+free functions, constants — and only step 3 took methods out of the impl itself.
+Six of the seven steps could not have reduced it. Reaching 2,000 requires
+slicing the god-impl along the turn path, which is exactly what the deferred
+step is.
+
+Restating rather than lowering the number: a target moved to match the result
+stops being a target.
 
 ## Risks
 
