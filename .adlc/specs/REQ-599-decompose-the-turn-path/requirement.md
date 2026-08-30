@@ -91,8 +91,8 @@ makes any extraction produce 10-argument functions.
 ## Acceptance Criteria
 
 - [ ] AC-1: `runtime.rs` production line count drops below a target recorded in the architecture doc, and no extracted module exceeds it either — the file is not merely split into two god modules.
-- [ ] AC-2: `run_prompt_turn` is reduced to a stage sequence whose body is under 200 lines, with each stage independently nameable and testable.
-- [ ] AC-3: `run_session_turn_with_pressure_policy`'s maximum nesting depth drops to 5 or below, measured and recorded.
+- [ ] ~~AC-2: `run_prompt_turn` is reduced to a stage sequence whose body is under 200 lines.~~ **Deferred out of scope — see Out of Scope.** This is architecture.md's step 8, the only step that restructures control flow rather than relocating code. Split to its own REQ so it can be reviewed as a change rather than buried inside a relocation diff.
+- [ ] ~~AC-3: `run_session_turn_with_pressure_policy`'s maximum nesting depth drops to 5 or below.~~ **Deferred** — `turn_loop.rs` was already OQ-3's open question, and it sits in a different module with a different parameter cluster (REQ-598 ADR-2). It rides with the deferred step 8.
 - [ ] AC-4: **Traceability check** — an automated check extracts every REQ/ADR/LESSON/BUG id from the pre-split files and asserts each appears post-split in its declared owning module. It fails on a disappeared id **and** on an id that moved to an unexpected module (BR-2). This check ships with the REQ and stays in CI.
 - [ ] AC-5: **Mutation test on AC-4** — deleting one rationale comment causes the check to fail; relocating one to the wrong module also causes it to fail. Both mutations are recorded in the check's doc comment. Without this, AC-4 is exactly the "count that cannot see a relocation" LESSON-568 warns about.
 - [ ] AC-6: An event-sequence fixture recorded before the split replays identically after it, for a turn that exercises: skill expansion, a routing decision, a consent prompt, and a successful dispatch (BR-1).
@@ -136,6 +136,16 @@ makes any extraction produce 10-argument functions.
 - [ ] OQ-4: Does AC-1's target line number belong in the architecture doc (visible, reviewable) or in the CI check (enforced)? Both, probably — but then they can disagree.
 
 ## Out of Scope
+
+- **`run_prompt_turn`'s restructure into a stage sequence (architecture.md step
+  8), and `turn_loop.rs`'s nesting — deferred to their own REQ.** Steps 1–7
+  *relocate* code; step 8 *changes control flow* on the path every prompt runs
+  through. Landing them together would bury the one genuine behavior risk inside
+  a diff dominated by relocation — and with tests at 61% of the file, that diff
+  is several times the size of the change hiding in it. Deferring keeps every
+  commit in this REQ reviewable as what it is: a move. The deferred work
+  inherits AC-2, AC-3, and BR-3's ordering invariants, and is the natural
+  follow-on once `runtime/turn.rs` is small enough to read.
 
 - Any behavior change. Defects noticed during the move are filed as BUGs, not fixed in-flight (conventions.md; a behavior fix hidden inside a 14k-line move is unreviewable).
 - Splitting `server.rs` (5,169 production lines), `session_ui.rs` (4,132), `main.rs` (4,210), `events.rs` (3,815), `permissions.rs` (3,521), or `budget.rs` (2,951) — re-measured at `fedcab1`. Each deserves the same treatment and its own REQ; doing them together reproduces the unreviewable-diff problem at workspace scale.

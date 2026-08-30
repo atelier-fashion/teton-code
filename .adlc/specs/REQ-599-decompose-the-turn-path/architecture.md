@@ -120,11 +120,14 @@ Each step is its own commit, independently green (BR-9):
 | 5 | model consent + engine activation -> `runtime/consent.rs` | ~1,200 | medium |
 | 6 | MCP egress + redaction wiring -> `runtime/egress.rs` | ~600 | low |
 | 7 | session lifecycle -> `runtime/session.rs` | ~900 | medium |
-| 8 | `run_prompt_turn` -> a stage sequence in `runtime/turn.rs` | ~1,100 | **high** |
+| ~~8~~ | ~~`run_prompt_turn` -> a stage sequence~~ | ~1,100 | **DEFERRED to its own REQ** |
 
-Step 8 is the one that can change behavior and is deliberately **last**, after
-every mechanical move has landed and the file it lives in is small enough to
-read. Steps 1–7 are moves; only step 8 restructures control flow.
+**Step 8 is deferred to its own REQ** (decided 2026-08-30). Steps 1–7 relocate
+code; step 8 restructures control flow on the path every prompt runs through.
+Landing them together would bury the one genuine behavior risk inside a diff
+dominated by relocation. This REQ therefore delivers the moves, leaving
+`runtime/turn.rs` small enough that the deferred restructure can be reviewed as
+a change rather than as a diff.
 
 `#[cfg(test)]` bodies move with their code (BR-7). Because tests are 61% of the
 file, each step's diff is dominated by test relocation — which is why the
