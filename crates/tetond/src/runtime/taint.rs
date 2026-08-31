@@ -31,7 +31,7 @@ use super::*;
 /// session (BR-4).
 #[derive(Debug, Default)]
 pub struct SessionTaint {
-    pub(crate) tainted: Mutex<HashSet<SessionId>>,
+    tainted: Mutex<HashSet<SessionId>>,
 }
 
 impl SessionTaint {
@@ -125,7 +125,7 @@ impl SessionTaint {
 /// no writer to config.
 #[derive(Debug, Default)]
 pub struct WebTaintOverride {
-    pub(crate) lifted: Mutex<HashSet<SessionId>>,
+    lifted: Mutex<HashSet<SessionId>>,
 }
 
 impl WebTaintOverride {
@@ -143,7 +143,7 @@ impl WebTaintOverride {
     /// already-lifted session is not a second lifting.
     ///
     /// **Intentionally not `pub`** — see the type docs.
-    pub(crate) fn lift(&self, session: &SessionId) -> bool {
+    pub(super) fn lift(&self, session: &SessionId) -> bool {
         self.lifted
             .lock()
             .expect("web override mutex poisoned")

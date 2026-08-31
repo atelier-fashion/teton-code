@@ -486,11 +486,43 @@ mod tests {
     /// Fails **open** on a read error rather than panicking (BUG-159).
     #[test]
     fn nothing_on_the_session_create_path_reaches_the_scanner() {
-        let Ok(runtime) =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/runtime.rs"))
-        else {
-            return;
-        };
+        // REQ-599 split `runtime.rs` into `runtime/`. This read used to name the
+        // old file, and after the split it returned `NotFound` — so the
+        // let-else below took the early return and this test passed **without
+        // asserting anything**, permanently and silently. Failing open on a
+        // read error (BUG-159) is right for a transient I/O fault and wrong for
+        // a path that no longer exists, so the two are now distinguished: a
+        // missing corpus is a hard failure, a per-file read error still skips.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime");
+        let mut modules: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "the runtime module tree is unreadable at {}: {err}",
+                    dir.display()
+                )
+            })
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+            .collect();
+        modules.sort();
+        assert!(
+            !modules.is_empty(),
+            "vacuity floor: no sources under {} — this scan would pass against nothing, \
+             which is exactly how it silently stopped guarding BR-3 after REQ-599",
+            dir.display()
+        );
+        let runtime: String = modules
+            .iter()
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            runtime.contains("pub(crate) fn store_session_skills("),
+            "the scan's subject is gone: `store_session_skills` was not found anywhere under \
+             {}. If it was renamed, rename it here too rather than letting this pass",
+            dir.display()
+        );
         let Some(store_fn) = runtime.split("pub(crate) fn store_session_skills(").nth(1) else {
             return;
         };
