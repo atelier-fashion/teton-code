@@ -2,15 +2,18 @@
   "req": "REQ-600",
   "branch": "feat/REQ-600-decompose-run-prompt-turn",
   "startedAt": "2026-08-31T21:45:00Z",
-  "completed": false,
-  "currentPhase": 6,
+  "completed": true,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
     2,
     3,
     4,
-    5
+    5,
+    6,
+    7,
+    8
   ],
   "phaseHistory": [
     {
@@ -42,6 +45,21 @@
       "phase": 5,
       "name": "Verify + Review",
       "completedAt": "2026-09-01T04:00:00Z"
+    },
+    {
+      "phase": 6,
+      "name": "PR",
+      "completedAt": "2026-09-01T06:00:00Z"
+    },
+    {
+      "phase": 7,
+      "name": "CI",
+      "completedAt": "2026-09-01T06:00:00Z"
+    },
+    {
+      "phase": 8,
+      "name": "Merge + Wrapup",
+      "completedAt": "2026-09-01T06:00:00Z"
     }
   ],
   "integrationBranch": "main",
@@ -54,7 +72,7 @@
       "touched": true,
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/249",
       "prNumber": 249,
-      "merged": false
+      "merged": true
     }
   },
   "mergeOrder": [
