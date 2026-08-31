@@ -1,11 +1,11 @@
 ---
 id: LESSON-593
-title: "A rationale id marks a change, not a subsystem — it cannot locate a seam"
+title: "A max-span metric cannot see a cluster with one outlier — and that is how a usable signal got discarded"
 component: "adlc/architecture"
 domain: "refactoring"
 stack: ["rust"]
 concerns: ["developer-experience", "maintainability"]
-tags: ["decomposition", "god-module", "traceability", "seams", "refuted-assumption"]
+tags: ["decomposition", "seams", "measurement", "robust-statistics", "corrected", "refuted-assumption"]
 req: REQ-599
 created: 2026-08-31
 updated: 2026-08-31
@@ -13,57 +13,82 @@ updated: 2026-08-31
 
 ## What Happened
 
-REQ-599 set out to split a 14,183-line god module and proposed a method: the
-file is densely annotated with REQ/ADR/LESSON/BUG ids explaining why each branch
-exists, so let those ids reveal the seams. Where a stage's ids cluster, that is
-a boundary; where they interleave across a proposed boundary, the boundary is
-wrong. The requirement named this its **central bet** and asked that it be
-validated early.
+**This lesson was corrected on 2026-08-31 after an adversarial review. Its
+original title was "A rationale id marks a change, not a subsystem — it cannot
+locate a seam", and that conclusion was wrong.** The correction is the lesson.
 
-Measured, by parsing every production item with its attached doc block:
+REQ-599 set out to split a 14,183-line god module. The requirement proposed
+finding seams by clustering the file's dense REQ/ADR/LESSON annotations, and
+named this its central bet. Phase 2 measured each id's **span** —
+`max(position) − min(position)` — and reported **1 of 19 ids clustered, 13
+scattered**. The bet was declared refuted and the method discarded.
 
-- Of 19 REQ ids appearing on three or more items, **1 was clustered and 13 were
-  scattered across essentially the whole file.** REQ-561 spanned 13,547 lines of
-  14,183.
-- Inside the 1,084-line function to be decomposed, of 13 ids appearing more than
-  once, only **4 were local to one stage** and **5 spanned the entire function**.
+The measurement was reproducible and the parser was sound. The *statistic* was
+not. `max − min` has zero breakdown resistance: for an id on 5–21 items in a
+14k-line file, **one** outlying annotation forces the "scattered" verdict.
 
-Read literally, the rule condemned every possible boundary and made the REQ
-unimplementable.
+Re-measured on the same data with a robust statistic — the smallest window
+holding 70% of an id's items:
+
+| statistic | clustered | scattered |
+|---|---:|---:|
+| max-span (as published) | **1 / 19** | 13 |
+| 70%-window | **5 / 19** | — |
+
+And trimming a single extreme item per id moves max-span's own count from 1 to
+5.
+
+The decisive case is **REQ-581**: max-span 3,515 → filed as "loose, not a seam".
+Its 70%-window is **219 lines**, holding 4 of its 5 items — and that window is
+`ProbeAnswer`, `probe_outcome`, `to_protocol_health`, `stream_probe`, which is
+*exactly* the set that became `runtime/provider.rs`. The id predicted the module
+and the metric could not see it.
+
+The sharpest part: REQ-599's own findings record that `provider` "measured as
+scattered across 10,366 lines and was skipped for that reason." On that seam the
+discarded proxy beat the census that replaced it.
 
 ## Lesson
 
-**A rationale id records which decision a line serves, not which subsystem it
-belongs to.** Those coincide only when a change introduced a self-contained
-subsystem — one of nineteen cases here. Changes to a well-trodden path are
-overwhelmingly cross-cutting: a single REQ adds a budget check, a dispatch arm,
-a commit-path branch and a failure arm, and stamps its id on all four.
+**Two distinct claims got collapsed into one, and only the first was true.**
 
-Seams come from **structure**: which types exist, which `impl` blocks hold what,
-what is contiguous once unrelated neighbours leave. In this file the census that
-did work was blunt — 43 types, 28 impl blocks, and one `impl` block of ~7,000
-lines that was the actual problem.
+- **True, and still the useful half.** The requirement's *literal rule* — "where
+  ids interleave across a proposed boundary, the boundary is wrong" — is fatal
+  as written. In a file where changes are cross-cutting, every boundary has
+  interleaving ids, so the rule condemns all of them and cannot be used to
+  choose.
+- **False, and asserted anyway.** That ids therefore "cannot locate a seam."
+  Under a robust statistic several do: five of nineteen sit in tight windows, and
+  those windows name real modules.
 
-Traceability ids remain worth preserving through a move — that is a separate
-rule with its own enforcement. Preserving them and navigating by them are
-different jobs, and the second one does not work.
+The right conclusion is narrower and more useful: rationale ids are a **weak
+positive signal** — good for generating candidate boundaries, useless as a
+rejection rule. Use them to propose; use structure to decide.
+
+**And the method lesson, which generalises further than the subject:** when a
+measurement is about to overturn a plan, check the statistic's breakdown point
+before trusting the headline. A max, a min, or a full range answers "is there any
+outlier" — which is rarely the question. "Where is the mass" needs a quantile or
+a densest-window.
 
 ## Why It Matters
 
-The bet was reasonable, which is what makes it worth recording: dense
-documentation *looks* like a map. Following it would have produced boundaries
-that split cohesive code and joined unrelated code, defended by the fact that a
-rule in the requirement endorsed them.
+The original conclusion was written into REQ-599's ADR-1, its Assumptions, this
+lesson's title, and — most expensively — into REQ-600 as settled guidance not to
+re-propose the method. A follow-on REQ was being told to discard a signal that
+partly works, on the strength of one fragile statistic.
 
-The general form: when a plan proposes a **proxy** for the thing it actually
-needs — ids for seams, line counts for complexity, test counts for coverage —
-measure the proxy against the real thing before building on it. The requirement
-was right to demand this be validated early; the cost of the whole exercise was
-one afternoon's measurement, and it changed the entire approach.
+It survived because everything downstream of the number was sound. The parse was
+correct, the census reproducible, the reasoning about cross-cutting changes
+genuinely true. Nothing in the chain was careless except the choice of
+statistic, and no reviewer questions a number that reproduces.
 
 ## Applies When
 
-Planning a decomposition of any large module; proposing a heuristic for where
-boundaries lie; writing a requirement whose method rests on an assumption about
-the code's shape — name the assumption and say how it will be checked, as this
-one did.
+Any measurement that decides whether to abandon an approach; computing "spread"
+or "locality" over positions (prefer a densest-window or interquartile measure to
+a range); writing a requirement whose method rests on a checkable assumption —
+name the assumption *and the instrument*, because this one named the assumption
+and got the instrument wrong; and reviewing a claim that a plan has been refuted,
+where the reproducibility of the number is not evidence that the number answers
+the question.

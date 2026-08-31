@@ -176,7 +176,15 @@ None of these would have been caught by reading the diff.
 ## Assumptions
 
 - ~~The documentation's REQ/ADR/LESSON ids are a usable proxy for the real seams.~~
-  **REFUTED in Phase 2 — see architecture.md ADR-1.** Measured: of 19 REQ ids
+  **PARTLY refuted in Phase 2, and the refutation was itself over-claimed —
+  corrected 2026-08-31; see architecture.md ADR-1 and LESSON-593.** The literal
+  rule below is fatal and the method was rightly not used as a decision
+  procedure. The stronger claim that ids cannot locate a seam at all rests on a
+  max-span statistic with no breakdown resistance; under a robust measure 5 of
+  19 ids cluster, and REQ-581's 219-line window is exactly `runtime/provider.rs`.
+  Original text follows.
+
+  ~~REFUTED in Phase 2.~~ Measured: of 19 REQ ids
   appearing on 3+ production items, **1 is clustered and 13 are scattered across
   the whole file** (REQ-561 spans 13,547 of 14,183 lines). Inside
   `run_prompt_turn`, only 4 of 13 ids are local to one stage while 5 span the

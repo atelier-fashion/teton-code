@@ -14,6 +14,37 @@ not, and ADR-2 replaces it.
 
 ### ADR-1: The central bet is REFUTED by measurement
 
+> **CORRECTED 2026-08-31 after adversarial review — read this before the ADR
+> below.** The measurement is reproducible and the parser is sound, but the
+> *statistic* is not. Span was computed as `max − min`, which has zero breakdown
+> resistance: one outlying annotation forces the "scattered" verdict. Re-measured
+> with the smallest window holding 70% of an id's items, **5 of 19 cluster, not
+> 1** — and trimming a single extreme item per id moves the max-span count from 1
+> to 5 as well.
+>
+> The decisive counterexample is **REQ-581**: max-span 3,515, filed below as
+> "loose, not a seam". Its 70%-window is **219 lines** holding 4 of 5 items, and
+> that window is `ProbeAnswer` / `probe_outcome` / `to_protocol_health` /
+> `stream_probe` — exactly the set that became `runtime/provider.rs`. The id
+> predicted the module; the metric could not see it. Note that the "Findings for
+> the deferred work" section below records `provider` as "measured as scattered
+> across 10,366 lines and was skipped for that reason" — on that seam the
+> discarded proxy beat the census that replaced it.
+>
+> **What survives:** the requirement's *literal rule* — "where they interleave
+> across a proposed boundary, the boundary is wrong" — really is fatal, because
+> in a cross-cutting file every boundary has interleaving ids and the rule
+> condemns all of them. That is enough to reject the rule as a **decision
+> procedure**.
+>
+> **What does not survive:** the generalisation that ids "cannot locate a seam."
+> They are a weak *positive* signal — usable to propose candidate boundaries,
+> not to reject them. ADR-2's structural method remains the right way to decide;
+> it was not, as this ADR claimed, the only source of signal available.
+>
+> See LESSON-593, rewritten with the correction.
+
+
 The requirement's Assumptions say:
 
 > The documentation's REQ/ADR/LESSON ids are a usable proxy for the real seams.
