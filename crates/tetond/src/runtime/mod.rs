@@ -214,7 +214,7 @@ mod config_document;
 mod duty;
 mod engine;
 mod provider;
-pub(crate) use provider::*;
+use provider::*;
 mod taint;
 pub(crate) use taint::*;
 mod views;

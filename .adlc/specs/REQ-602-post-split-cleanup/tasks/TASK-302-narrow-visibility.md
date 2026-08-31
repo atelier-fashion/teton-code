@@ -1,7 +1,7 @@
 ---
 id: TASK-302
 title: "Narrow every pub(crate) under runtime/ that nothing outside needs"
-status: draft
+status: complete
 parent: REQ-602
 created: 2026-08-31
 updated: 2026-08-31

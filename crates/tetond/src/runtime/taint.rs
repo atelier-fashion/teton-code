@@ -168,8 +168,8 @@ impl WebTaintOverride {
 /// production implementation, and it only ever *reads*: the lookup gate has no
 /// path to `mark` or to `lift`.
 pub struct SessionTaintView {
-    pub(crate) taint: Arc<SessionTaint>,
-    pub(crate) overridden: Arc<WebTaintOverride>,
+    pub(super) taint: Arc<SessionTaint>,
+    pub(super) overridden: Arc<WebTaintOverride>,
 }
 
 impl TaintView for SessionTaintView {
@@ -199,9 +199,9 @@ impl TaintView for SessionTaintView {
 /// about the context this session is holding. Taint semantics stay owned by that
 /// sink's rules (REQ-544 C-2, REQ-562's cause gate); the lookup path observes
 /// them and never writes them.
-pub(crate) struct WebLookupRecorder {
-    pub(crate) ledger: CostLedger,
-    pub(crate) events: Arc<EventBus>,
+pub(super) struct WebLookupRecorder {
+    pub(super) ledger: CostLedger,
+    pub(super) events: Arc<EventBus>,
 }
 
 impl LookupRecorder for WebLookupRecorder {
@@ -255,12 +255,12 @@ impl LookupRecorder for WebLookupRecorder {
 /// `run_one_attempt` gives its own `config`, because the registry is rebuilt on
 /// every prompt turn. The *credential* is not snapshotted: it is resolved
 /// inside `web_lookup_egress` as the choke point is built, per lookup (ADR-007).
-pub(crate) struct RuntimeLookupSeam {
-    pub(crate) runtime: Arc<DaemonRuntime>,
-    pub(crate) router: Router,
-    pub(crate) config: Config,
-    pub(crate) events: Arc<EventBus>,
-    pub(crate) session_id: SessionId,
+pub(super) struct RuntimeLookupSeam {
+    pub(super) runtime: Arc<DaemonRuntime>,
+    pub(super) router: Router,
+    pub(super) config: Config,
+    pub(super) events: Arc<EventBus>,
+    pub(super) session_id: SessionId,
 }
 
 #[async_trait::async_trait]
@@ -336,21 +336,21 @@ impl WebLookupSeam for RuntimeLookupSeam {
 /// point uses rather than reaching for one. The two constructors below are the
 /// whole of the difference, and they sit next to each other so a reader who
 /// finds one is told the other exists.
-pub(crate) struct TaintingPrivacySink {
-    pub(crate) events: Arc<EventBus>,
-    pub(crate) taint: Arc<SessionTaint>,
+pub(super) struct TaintingPrivacySink {
+    pub(super) events: Arc<EventBus>,
+    pub(super) taint: Arc<SessionTaint>,
     /// Which causes pin, for the choke point this sink was built for.
-    pub(crate) taints: CauseGate,
+    pub(super) taints: CauseGate,
 }
 
 /// Which block causes pin their session — a rule a [`TaintingPrivacySink`] is
 /// handed rather than one it chooses.
-pub(crate) type CauseGate = fn(&BlockCause) -> bool;
+pub(super) type CauseGate = fn(&BlockCause) -> bool;
 
 impl TaintingPrivacySink {
     /// The sink for a **turn or duty** send: [`cause_taints_the_session`], where
     /// a boundary block and a redaction block both pin.
-    pub(crate) fn for_turn_path(events: Arc<EventBus>, taint: Arc<SessionTaint>) -> Self {
+    pub(super) fn for_turn_path(events: Arc<EventBus>, taint: Arc<SessionTaint>) -> Self {
         Self {
             events,
             taint,
@@ -361,7 +361,7 @@ impl TaintingPrivacySink {
     /// The sink for the **MCP** choke point: [`mcp_cause_taints_the_session`],
     /// where a redaction block pins and a boundary block keeps REQ-544's
     /// fold-without-pinning posture (user decision, 2026-08-08).
-    pub(crate) fn for_mcp_path(events: Arc<EventBus>, taint: Arc<SessionTaint>) -> Self {
+    pub(super) fn for_mcp_path(events: Arc<EventBus>, taint: Arc<SessionTaint>) -> Self {
         Self {
             events,
             taint,
@@ -425,7 +425,7 @@ impl crate::egress::PrivacyEventSink for TaintingPrivacySink {
 /// point, and answers it differently for `Boundary`. Two functions rather than
 /// one with a flag: the difference is a decision about two surfaces, taken by
 /// two different REQs, and a parameter would present it as a caller's option.
-pub(crate) fn cause_taints_the_session(cause: &BlockCause) -> bool {
+pub(super) fn cause_taints_the_session(cause: &BlockCause) -> bool {
     match cause {
         BlockCause::Boundary | BlockCause::Redaction { .. } => true,
         BlockCause::ScanUnavailable => false,
@@ -463,7 +463,7 @@ pub(crate) fn cause_taints_the_session(cause: &BlockCause) -> bool {
 /// `the_mcp_gate_pins_redaction_and_diverges_from_the_turn_path_on_boundary`
 /// pins it *as* an asymmetry — so a later "make these consistent" edit turns a
 /// test red instead of quietly re-deciding REQ-544.
-pub(crate) fn mcp_cause_taints_the_session(cause: &BlockCause) -> bool {
+pub(super) fn mcp_cause_taints_the_session(cause: &BlockCause) -> bool {
     match cause {
         BlockCause::Redaction { .. } => true,
         BlockCause::Boundary | BlockCause::ScanUnavailable => false,
@@ -483,7 +483,7 @@ pub(crate) fn mcp_cause_taints_the_session(cause: &BlockCause) -> bool {
 /// *not* a third spelling of this rule: it answers the same question for a
 /// different choke point and gives a different answer for `Boundary`. It is
 /// therefore outside the agreement these two are held to.
-pub(crate) fn taints_the_session(detail: BlockDetail) -> bool {
+pub(super) fn taints_the_session(detail: BlockDetail) -> bool {
     match detail {
         BlockDetail::Boundary | BlockDetail::Redaction => true,
         BlockDetail::ScanUnavailable => false,
@@ -491,9 +491,9 @@ pub(crate) fn taints_the_session(detail: BlockDetail) -> bool {
 }
 
 /// A `local-only` boundary was crossed — REQ-544 C-2's original cause.
-pub(crate) const TAINT_BY_BOUNDARY: &str = "a `local-only` privacy boundary was crossed";
+pub(super) const TAINT_BY_BOUNDARY: &str = "a `local-only` privacy boundary was crossed";
 /// The redaction scan found something in an outbound payload (REQ-562).
-pub(crate) const TAINT_BY_REDACTION: &str =
+pub(super) const TAINT_BY_REDACTION: &str =
     "the redaction scan found sensitive content in an outbound payload";
 /// This turn's assembled context carried boundary or unknown-provenance content.
 pub(crate) const TAINT_BY_CONTEXT: &str = "this turn read boundary or unknown-provenance content";
@@ -502,7 +502,7 @@ pub(crate) const TAINT_BY_CONTEXT: &str = "this turn read boundary or unknown-pr
 /// for it. Present so the maps below are total, and worded so that a future
 /// change which *does* pin on it produces a puzzling line rather than a panic in
 /// the daemon.
-pub(crate) const TAINT_BY_UNSTATED_CAUSE: &str = "a blocked outbound payload";
+pub(super) const TAINT_BY_UNSTATED_CAUSE: &str = "a blocked outbound payload";
 
 pub(crate) fn taint_pin_line(cause: &'static str) -> String {
     format!(
@@ -512,7 +512,7 @@ pub(crate) fn taint_pin_line(cause: &'static str) -> String {
 }
 
 /// The class word a [`BlockCause`] announces its pin with.
-pub(crate) fn taint_cause_word(cause: &BlockCause) -> &'static str {
+pub(super) fn taint_cause_word(cause: &BlockCause) -> &'static str {
     match cause {
         BlockCause::Boundary => TAINT_BY_BOUNDARY,
         BlockCause::Redaction { .. } => TAINT_BY_REDACTION,
@@ -522,7 +522,7 @@ pub(crate) fn taint_cause_word(cause: &BlockCause) -> &'static str {
 
 /// The same word, from the turn path's [`BlockDetail`] vocabulary — the second
 /// spelling [`taints_the_session`] already exists in, for the same reason.
-pub(crate) fn taint_detail_word(detail: BlockDetail) -> &'static str {
+pub(super) fn taint_detail_word(detail: BlockDetail) -> &'static str {
     match detail {
         BlockDetail::Boundary => TAINT_BY_BOUNDARY,
         BlockDetail::Redaction => TAINT_BY_REDACTION,

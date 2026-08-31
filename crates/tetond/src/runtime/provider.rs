@@ -16,12 +16,12 @@ use super::*;
 
 /// The `model_id` a lifecycle event carries when the machine has no model to
 /// name — a below-the-floor probe, or a catalog with nothing that fits.
-pub(crate) const LOCAL_TIER_ID: &str = "local";
+pub(super) const LOCAL_TIER_ID: &str = "local";
 
 /// The Anthropic Messages API version header value the credential layer injects
 /// alongside `x-api-key` (mirrors the adapter's protocol header; the injected
 /// copy wins so no duplicate reaches the wire).
-pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
+pub(super) const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Build the endpoint-bound HTTP transport for a remote provider turn (BR-7,
 /// REQ-544 M-3).
@@ -33,7 +33,7 @@ pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// cross-provider request. A resolution failure is a typed
 /// [`HarnessError::Credential`] — never a panic, and its message never carries
 /// the secret.
-pub(crate) fn build_remote_transport(
+pub(super) fn build_remote_transport(
     provider: &ModelProvider,
     resolver: &SecretResolver,
 ) -> Result<HttpTransport, HarnessError> {
@@ -75,7 +75,7 @@ pub(crate) fn build_remote_transport(
 /// local tier never authenticates. Header *names* are safe to construct here; the
 /// secret value lives only in the returned headers and is dropped after the
 /// endpoint-bound transport is built — it never reaches a log or `CostRecord`.
-pub(crate) fn provider_auth_headers(kind: ProviderKind, secret: &str) -> Vec<(String, String)> {
+pub(super) fn provider_auth_headers(kind: ProviderKind, secret: &str) -> Vec<(String, String)> {
     match kind {
         ProviderKind::Anthropic => vec![
             ("x-api-key".to_owned(), secret.to_owned()),
@@ -90,7 +90,7 @@ pub(crate) fn provider_auth_headers(kind: ProviderKind, secret: &str) -> Vec<(St
 }
 
 /// Build a concrete [`Provider`] adapter from a config provider entry.
-pub(crate) fn build_provider(
+pub(super) fn build_provider(
     provider: &ModelProvider,
     caps: CapabilityProfile,
 ) -> Box<dyn Provider> {
@@ -124,7 +124,7 @@ pub(crate) fn build_provider(
 /// predictable enough to preview before the user consents (BR-2). It asks for
 /// one word so that the reply is worthless and the fact of a reply is the whole
 /// signal.
-pub(crate) const PROBE_PROMPT: &str = "Reply with the single word OK.";
+pub(super) const PROBE_PROMPT: &str = "Reply with the single word OK.";
 
 /// The generation budget one connection test asks for (REQ-581 BR-1).
 ///
@@ -133,7 +133,7 @@ pub(crate) const PROBE_PROMPT: &str = "Reply with the single word OK.";
 /// spend on a user's key. `max_tokens` is a request and not a guarantee — a
 /// provider that overruns it is billed for what it sent, which the ledger row
 /// and the reported token counts both say.
-pub(crate) const PROBE_MAX_TOKENS: u32 = 8;
+pub(super) const PROBE_MAX_TOKENS: u32 = 8;
 
 /// How long one connection test waits for the vendor before it stops (REQ-581
 /// verify F3).
@@ -149,7 +149,7 @@ pub(crate) const PROBE_MAX_TOKENS: u32 = 8;
 /// a cold TLS handshake to a distant region on a slow link and still be a bound
 /// a person will wait out; and because the cost of being wrong is asymmetric —
 /// a deadline hit early reports `unreachable` about a provider that works.
-pub(crate) const PROBE_DEADLINE: Duration = Duration::from_secs(30);
+pub(super) const PROBE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// What draining one probe stream turned out to have been (REQ-581 verify F1).
 ///
@@ -166,7 +166,7 @@ pub(crate) const PROBE_DEADLINE: Duration = Duration::from_secs(30);
 /// [`ProviderTestOutcome::NotACompletion`] and not as an `unreachable`: a host
 /// that answered is a different fact, and a different next move, from one that
 /// never did (BR-3).
-pub(crate) enum ProbeAnswer {
+pub(super) enum ProbeAnswer {
     /// The vendor streamed a completion — text, a tool call, or a non-zero
     /// usage reading. The token counts it reported, which may be zero when a
     /// provider streams text and declines to say what it billed.
@@ -187,7 +187,7 @@ pub(crate) enum ProbeAnswer {
 ///
 /// A mid-stream error ends the drain. There is no retry here (ADR-1): a stream
 /// that broke has already told the test what it asked.
-pub(crate) async fn stream_probe(
+pub(super) async fn stream_probe(
     adapter: &dyn Provider,
     request: TurnRequest,
     transport: &dyn Transport,
@@ -257,7 +257,7 @@ pub(crate) async fn stream_probe(
 /// classified anyway rather than swept into a `_` arm: a `_ => fixed_string` is
 /// a decision to discard evidence, and the day one of them *does* arrive the
 /// fixed string would be actively false rather than merely vague (LESSON-456).
-pub(crate) fn probe_outcome(
+pub(super) fn probe_outcome(
     err: &ProviderError,
     host: &str,
     model: &str,
@@ -385,7 +385,7 @@ pub(crate) fn probe_outcome(
 /// Declared here rather than as a `From` on either type for the reason the two
 /// enums are two types at all: `teton-protocol` depends on no other teton
 /// crate, so the daemon owns the mapping, exhaustively and in one place.
-pub(crate) fn to_protocol_health(health: ProviderHealth) -> WireProviderHealth {
+pub(super) fn to_protocol_health(health: ProviderHealth) -> WireProviderHealth {
     match health {
         ProviderHealth::Healthy => WireProviderHealth::Healthy,
         ProviderHealth::Degraded => WireProviderHealth::Degraded,

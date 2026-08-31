@@ -473,9 +473,9 @@ pub(crate) struct RenderedProviderSetup {
     /// Sliced rather than re-rendered ([`teton_core::array_element_section`]),
     /// so a comment the user wrote above their own `[[providers]]` row appears
     /// in the preview of the edit to it.
-    pub(crate) toml: String,
+    pub(super) toml: String,
     /// The whole edited document — byte-for-byte what the commit writes.
-    pub(crate) full_text: String,
+    pub(super) full_text: String,
     /// `sha256(full_text)`.
     ///
     /// The **whole document** and not the section, for
@@ -485,26 +485,26 @@ pub(crate) struct RenderedProviderSetup {
     /// user is still reading. A hand edit anywhere in the file therefore changes
     /// this, and the commit refuses to write bytes that no longer digest to what
     /// was confirmed.
-    pub(crate) digest: String,
+    pub(super) digest: String,
     /// Whether `full_text` is byte-identical to the document on disk — the file
     /// half of the commit's no-op rule. See [`EditedDocument::unchanged`].
-    pub(crate) unchanged: bool,
+    pub(super) unchanged: bool,
     /// The host the endpoint parsed to under the **dial-time** parser
     /// (LESSON-529). The host alone: never userinfo, path, or query, because a
     /// pasted URL can carry a credential in its authority.
-    pub(crate) dial_host: String,
+    pub(super) dial_host: String,
     /// Non-fatal notes about the candidate, as plain sentences (LESSON-517).
-    pub(crate) warnings: Vec<String>,
+    pub(super) warnings: Vec<String>,
     /// The provider this candidate replaces, when its id is already taken
     /// (BR-14), or `None` for a fresh registration.
-    pub(crate) replaces: Option<ExistingProvider>,
+    pub(super) replaces: Option<ExistingProvider>,
     /// The tier rows that actually landed in `candidate_config` — what the
     /// commit reports, and what the preview's `toml` shows.
-    pub(crate) bindings: Vec<WireTierBinding>,
+    pub(super) bindings: Vec<WireTierBinding>,
     /// The candidate config itself: what the commit compares against the live
     /// one for its no-op decision, and what it swaps into memory so routing is
     /// live in-session without a restart (BR-15).
-    pub(crate) candidate_config: Config,
+    pub(super) candidate_config: Config,
 }
 
 /// One configured provider, as the flow describes it before offering to replace

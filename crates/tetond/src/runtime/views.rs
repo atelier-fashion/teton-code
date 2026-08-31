@@ -44,11 +44,11 @@ pub struct BoundaryPosture {
 /// is one state, not two"), so trimming to `None` here means the document the
 /// flow writes says it the same way — rather than persisting `search_endpoint = ""`,
 /// which validates and then reads as nothing.
-pub(crate) struct WebSetupAnswers<'a> {
-    pub(crate) tier: WebTier,
-    pub(crate) search_endpoint: Option<&'a str>,
-    pub(crate) search_key_ref: Option<&'a str>,
-    pub(crate) search_auth: Option<&'a str>,
+pub(super) struct WebSetupAnswers<'a> {
+    pub(super) tier: WebTier,
+    pub(super) search_endpoint: Option<&'a str>,
+    pub(super) search_key_ref: Option<&'a str>,
+    pub(super) search_auth: Option<&'a str>,
 }
 
 impl<'a> WebSetupAnswers<'a> {
@@ -60,7 +60,7 @@ impl<'a> WebSetupAnswers<'a> {
     /// separate (the commit re-asks rather than trusting a preview's blob), but
     /// what they do with those fields was byte-identical prose in two places —
     /// which is one place for a trim rule to be tightened and missed.
-    pub(crate) fn new(
+    pub(super) fn new(
         tier: WireWebTier,
         search_endpoint: Option<&'a str>,
         search_key_ref: Option<&'a str>,
@@ -74,7 +74,7 @@ impl<'a> WebSetupAnswers<'a> {
         }
     }
 
-    pub(crate) fn from_preview(params: &'a WebSetupPreviewParams) -> Self {
+    pub(super) fn from_preview(params: &'a WebSetupPreviewParams) -> Self {
         Self::new(
             params.tier,
             params.search_endpoint.as_deref(),
@@ -83,7 +83,7 @@ impl<'a> WebSetupAnswers<'a> {
         )
     }
 
-    pub(crate) fn from_commit(params: &'a WebSetupCommitParams) -> Self {
+    pub(super) fn from_commit(params: &'a WebSetupCommitParams) -> Self {
         Self::new(
             params.tier,
             params.search_endpoint.as_deref(),
@@ -98,7 +98,7 @@ impl<'a> WebSetupAnswers<'a> {
 /// Names the fact and the remedy and **echoes nothing** — not the digests, not
 /// the field that changed, not the document: a client renders this into a
 /// transcript, and the thing that moved may be another session's answer.
-pub(crate) const SETUP_DIGEST_STALE: &str =
+pub(super) const SETUP_DIGEST_STALE: &str =
     "the configuration changed since the preview, so this would write bytes you did not \
      confirm — run `/web setup` again";
 
@@ -111,13 +111,13 @@ pub(crate) const SETUP_DIGEST_STALE: &str =
 /// the digests, not the field that changed, not the document, and above all not
 /// the candidate: the thing that moved may be another session's answer, and the
 /// candidate carries a credential reference.
-pub(crate) const PROVIDER_SETUP_DIGEST_STALE: &str =
+pub(super) const PROVIDER_SETUP_DIGEST_STALE: &str =
     "the preview you confirmed no longer matches what this daemon would write, so committing \
      would write bytes you did not see — run `/provider setup` again";
 
 /// One setup answer, trimmed, with blank read as absent — see
 /// [`WebSetupAnswers`] for why.
-pub(crate) fn setup_answer(value: Option<&str>) -> Option<&str> {
+pub(super) fn setup_answer(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
@@ -128,7 +128,7 @@ pub(crate) fn setup_answer(value: Option<&str>) -> Option<&str> {
 /// gap's sentence comes from [`SearchGap::as_str`] rather than being written
 /// again, so the status line, the prompt clause and the setup flow cannot each
 /// invent a phrasing of one fact (BR-3, LESSON-456).
-pub(crate) fn to_protocol_capability_state(state: WebCapabilityState) -> WireWebCapabilityState {
+pub(super) fn to_protocol_capability_state(state: WebCapabilityState) -> WireWebCapabilityState {
     match state {
         WebCapabilityState::Ready(tier) => WireWebCapabilityState::Ready {
             tier: to_protocol_web_tier(tier),
@@ -149,7 +149,7 @@ pub(crate) fn to_protocol_capability_state(state: WebCapabilityState) -> WireWeb
 /// **host** only (REQ-563 BR-7, the rule the whole web event family follows),
 /// and the key appears as the reference config holds rather than the value the
 /// keychain holds (BR-6).
-pub(crate) fn web_table_summary(web: &WebConfig) -> WebTableSummary {
+pub(super) fn web_table_summary(web: &WebConfig) -> WebTableSummary {
     WebTableSummary {
         tier: to_protocol_web_tier(web.tier),
         search_host: web
@@ -173,7 +173,7 @@ pub(crate) fn web_table_summary(web: &WebConfig) -> WebTableSummary {
 /// [`endpoint_query_names_a_credential`] — the whole function, not just this
 /// list, so the extraction cannot drift either (REQ-573 verify: a `://`-gated
 /// re-derivation of the split let scheme-less shapes sweep clean).
-pub(crate) const CREDENTIAL_QUERY_KEYS: [&str; 4] = ["api_key", "apikey", "key", "token"];
+pub(super) const CREDENTIAL_QUERY_KEYS: [&str; 4] = ["api_key", "apikey", "key", "token"];
 
 /// Whether `endpoint`'s query string carries a parameter whose **name** says it
 /// holds a credential (REQ-572 verify).
@@ -223,7 +223,7 @@ pub(crate) fn endpoint_query_names_a_credential(endpoint: &str) -> bool {
 /// removal note is about is the document the answer is being applied to: with
 /// the live table instead, a file that had drifted drew a sentence contradicting
 /// the bytes printed directly beside it.
-pub(crate) fn web_setup_warnings(current: &WebConfig, candidate: &WebConfig) -> Vec<String> {
+pub(super) fn web_setup_warnings(current: &WebConfig, candidate: &WebConfig) -> Vec<String> {
     let mut warnings: Vec<String> = Vec::new();
     if candidate.tier < WebTier::Search && candidate.search_endpoint.is_some() {
         warnings.push(format!(
@@ -328,7 +328,7 @@ pub(crate) fn web_setup_warnings(current: &WebConfig, candidate: &WebConfig) -> 
 /// and by the dead-end announcement that keys on the same fact — two readings
 /// of one question is how the message and the event come to disagree about
 /// which state the machine is in (LESSON-456).
-pub(crate) fn has_remote_provider(config: &Config) -> bool {
+pub(super) fn has_remote_provider(config: &Config) -> bool {
     config.providers.iter().any(|p| p.kind.is_remote())
 }
 
@@ -346,7 +346,7 @@ pub(crate) fn has_remote_provider(config: &Config) -> bool {
 /// live (REQ-563 BR-14), and that lives in the daemon's engine slot. Passed in
 /// rather than reached for, so the whole projection stays a function of its
 /// arguments and every cell of it is testable without a daemon.
-pub(crate) fn snapshot_from_config(
+pub(super) fn snapshot_from_config(
     config: &Config,
     router: &Router,
     local_model_present: bool,
@@ -460,7 +460,7 @@ pub(crate) fn snapshot_from_config(
 }
 
 /// One tier row of the snapshot.
-pub(crate) fn tier_route_view(report: &TierReport) -> TierRouteView {
+pub(super) fn tier_route_view(report: &TierReport) -> TierRouteView {
     TierRouteView {
         tier: to_protocol_tier(report.tier),
         provider_id: report.provider_id.as_deref().map(ProviderId::from),
@@ -483,7 +483,7 @@ pub(crate) fn tier_route_view(report: &TierReport) -> TierRouteView {
 /// [`crate::call_sites::has_call_site`] (ADR-A); and
 /// [`CategoryRouteView::content_class`], what the category sends to a model,
 /// from [`ContentClass::for_category`] (REQ-561 BR-11).
-pub(crate) fn category_route_view(resolution: &CategoryResolution) -> CategoryRouteView {
+pub(super) fn category_route_view(resolution: &CategoryResolution) -> CategoryRouteView {
     CategoryRouteView {
         category: to_protocol_category(resolution.category),
         tier: to_protocol_tier(resolution.tier),

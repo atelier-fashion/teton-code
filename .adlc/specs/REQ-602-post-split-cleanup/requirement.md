@@ -84,9 +84,14 @@ _None. No new types; this REQ removes surface rather than adding it._
       search.** Three prior estimates — 61 (a review sample), 48–52 (a bare-name
       grep), 73 (a qualified-path rule) — were all wrong, in both directions.
       The method that works is the definition itself: demote every `pub(crate)`
-      under `runtime/` to `pub(super)`, build, and read the errors. Measured:
-      **143 sites → 8** (5 item declarations plus 3 glob re-exports), with
-      `pub(super)` going 40 → 175.
+      under `runtime/` to `pub(super)`, build, and read the errors.
+      **The figure, with its rule: submodule `pub(crate)` declarations go
+      130 → 5.** `mod.rs` is excluded and deliberately untouched, because
+      `pub(super)` there *is* `pub(crate)` — `mod.rs` is the `runtime` module and
+      its parent is the crate root, so rewriting its qualifiers is a semantic
+      no-op that only inflates the diff. An earlier draft of this AC said
+      "143 → 8"; that counted `mod.rs`'s no-ops as work, which is the fourth
+      wrong answer this one question has produced.
       The five that genuinely need crate reach, with their consumers:
       `LOCAL_ENGINE_N_CTX` (`egress/redact.rs`, `harness/budget.rs`,
       `harness/compact.rs`), `TAINT_BY_CONTEXT` and `taint_pin_line`
