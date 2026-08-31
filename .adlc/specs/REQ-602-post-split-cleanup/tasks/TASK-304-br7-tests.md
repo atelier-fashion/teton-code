@@ -1,7 +1,7 @@
 ---
 id: TASK-304
 title: "Move the tests that describe moved code, or record why they stay"
-status: draft
+status: complete
 parent: REQ-602
 created: 2026-08-31
 updated: 2026-08-31

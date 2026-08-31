@@ -10,13 +10,20 @@
 //! `provider` scattered across 10,366 lines and this cluster across 987. ADR-4
 //! said cheapest seam first, and cheapest is measured, not assumed.
 //!
-//! **On BR-7 and which tests came along.** Only two test functions exercise
-//! this code as their subject — `template_fallback_line` and `seam_policy` —
-//! and they moved. Several others construct an `EngineSlot` or a
-//! `StagedEngines` as a *fixture* while testing something else; those stayed
-//! with the code they are about. BR-7 asks that tests not be left "pointing at
-//! a module they no longer describe", which is a claim about what a test
-//! describes, not about which symbols it happens to name.
+//! **On BR-7 and which tests came along.** Three test functions exercise this
+//! code as their subject and live here: `template_fallback_line` and
+//! `seam_policy` came with the original split, and
+//! `only_a_scripted_engine_exempts_the_local_tier_from_the_consent_gate`
+//! followed in REQ-602 TASK-304 — its subject is the scripted-engine exemption
+//! defined in this module, not the gate that consults it.
+//!
+//! Several other tests construct an `EngineSlot` or a `StagedEngines` as a
+//! *fixture* while testing something else; those stayed with the code they are
+//! about. BR-7 asks that tests not be left "pointing at a module they no longer
+//! describe", which is a claim about what a test describes, not about which
+//! symbols it happens to name. The eight `mod.rs` tests naming `scripted` or
+//! `local_tier` are that case: their subject is `Runtime`'s own tier handling,
+//! and a scripted engine is how they arrange it.
 
 use super::*;
 
@@ -1093,6 +1100,11 @@ impl crate::model_consent::LocalEngineLoader for LlamaEngineLoader {
 mod tests {
     use super::*;
 
+    // REQ-602 TASK-304: moved here with its subject. It calls `local_tier_gated`
+    // four times and nothing else — the module's own header already records
+    // which tests deliberately stayed in `mod.rs` as fixtures; this one was not
+    // one of them, it was simply left behind (BR-7).
+
     #[test]
     fn the_template_fallback_line_names_the_model_and_the_cause() {
         // REQ-554 BR-2/AC-3: the downgrade report's shape is pinned here even
@@ -1125,5 +1137,26 @@ mod tests {
         // Turning the seams off explicitly is not a mistake to refuse over.
         assert_eq!(seam_policy(false, Some("0")), SeamPolicy::Ignore);
         assert_eq!(seam_policy(false, None), SeamPolicy::Ignore);
+    }
+
+    /// E-5: the consent gate must not switch itself off the moment a real engine
+    /// appears — which is exactly when downloading weights starts to mean
+    /// something.
+    #[test]
+    fn only_a_scripted_engine_exempts_the_local_tier_from_the_consent_gate() {
+        // The ordinary first run on a production build: withheld until answered.
+        assert!(local_tier_gated(false, true));
+        // Decided and installed: open.
+        assert!(!local_tier_gated(false, false));
+        // A `TETON_LOCAL_SCRIPT` engine fetches nothing, so it is never gated.
+        assert!(!local_tier_gated(true, true));
+        assert!(!local_tier_gated(true, false));
+        // And the regression this pins: a build that HAS a weights-loading engine
+        // (`scripted_engine == false`) and an outstanding decision is withheld.
+        // The old `engine.is_none() && …` spelling made that case un-gated.
+        assert!(
+            local_tier_gated(false, true),
+            "a real engine must not un-gate the tier before the user has decided"
+        );
     }
 }
