@@ -1,7 +1,7 @@
 ---
 id: REQ-600
 title: "Decompose run_prompt_turn into a stage sequence, and slice the god-impl"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-31
 updated: 2026-08-31
