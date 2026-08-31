@@ -4,7 +4,7 @@ title: "Extract the session-lifecycle slice REQ-599 planned and never shipped"
 status: draft
 deployable: false
 created: 2026-08-31
-updated: 2026-08-31
+updated: 2026-09-01
 component: "daemon/runtime"
 domain: "refactoring"
 stack: ["rust", "daemon"]
@@ -26,9 +26,22 @@ tracked home rather than living in a paragraph of a closed spec.
 The reason it did not ship is not that it stopped being worth doing. The seven
 steps were taken cheapest-seam-first from the impl structure (ADR-2), session
 lifecycle was the most entangled of the candidates, and the REQ ran out of steps
-before it ran out of seams. `crates/tetond/src/runtime/mod.rs` is still **10,306
-production lines** — REQ-599's AC-1 is recorded NOT MET — so the slice has lost
-none of its value.
+before it ran out of seams.
+
+**The baseline, measured at `4a2238b`.** `crates/tetond/src/runtime/mod.rs` is
+**7,420 production lines** — not the 10,306 REQ-599 closed on. REQ-600 moved the
+turn path out to `runtime/turn.rs`, and REQ-599's own module map already records
+the correction: *"Was 10,306 at REQ-599's close; REQ-600 moved the turn path
+out."* **Counting rule:** everything above the first column-0 `#[cfg(test)]`,
+which is the rule `runtime_module_map.rs` enforces against that table and the
+rule every figure in this REQ uses.
+
+The architecture doc's target is unchanged — no module above 2,000, `mod.rs`
+under 1,000 — so REQ-599's AC-1 is still recorded NOT MET, and `mod.rs` is still
+more than seven times the target. The slice has lost none of its value; if
+anything the ~900 lines ADR-4 estimated are now a larger fraction of what is
+left, which is a reason to re-measure the slice rather than to trust the
+estimate.
 
 This is deliberately **not** REQ-600. REQ-600 restructures `run_prompt_turn`'s
 control flow; this relocates session-lifecycle code without changing behaviour.

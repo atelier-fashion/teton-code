@@ -14,12 +14,39 @@ tags: ["refactor", "parameter-bundle", "req-600-followup", "turn-path"]
 
 ## Description
 
-REQ-600 decomposed `run_prompt_turn` into eight stages and introduced **thirteen**
+REQ-600 decomposed `run_prompt_turn` into eight stages and introduced **fourteen**
 parameter bundles to keep their signatures under clippy's limit without adding
 `too_many_arguments` suppressions — which `suppression_ratchet.rs` refuses by
 design ("a new suppression is a new unnamed parameter cluster; name it instead").
 
-Naming them was right. Thirteen is more than the job needs. Review judged that
+**The set, enumerated.** Review reported "thirteen"; the diff of `9ec2a17`
+against `9232fac` introduces fourteen. The set is listed here rather than left
+as a count, because AC-1's deliverable is a classification and a classification
+of an unnamed set cannot be checked:
+
+| # | Type | Module |
+|---|------|--------|
+| 1 | `ClaimedTurn` | `runtime/turn.rs` |
+| 2 | `AssembledHarness` | `runtime/turn.rs` |
+| 3 | `AttemptInputs<'a>` | `runtime/turn.rs` |
+| 4 | `AttemptState` | `runtime/turn.rs` |
+| 5 | `ResolvedRoute` | `runtime/turn.rs` |
+| 6 | `PreparedAttempts` | `runtime/turn.rs` |
+| 7 | `SessionFacts<'a>` | `runtime/turn.rs` |
+| 8 | `TurnRequest<'a>` | `runtime/turn.rs` |
+| 9 | `ExpansionInputs<'a>` | `runtime/turn.rs` |
+| 10 | `TurnProducts` | `runtime/turn.rs` |
+| 11 | `LoopContext<'a>` | `harness/turn_loop.rs` |
+| 12 | `ToolCallSite<'a>` | `harness/turn_loop.rs` |
+| 13 | `ModelReply<'a>` | `harness/turn_loop.rs` |
+| 14 | `TurnLatches` | `harness/turn_loop.rs` |
+
+`SkillToolDocs` is deliberately excluded: it is `pub(crate)`, it carries bundled
+documentation rather than a call's parameters, and it is not a signature-width
+device. If `/architect` judges any of the fourteen out on the same grounds, it
+says so and why — the set shrinks on a stated rule, never on a recount.
+
+Naming them was right. Fourteen is more than the job needs. Review judged that
 roughly five earn a name and the rest are transport:
 
 - **`PreparedAttempts`** is constructed on the last line of
@@ -38,21 +65,37 @@ roughly five earn a name and the rest are transport:
 
 ## Acceptance Criteria
 
-- [ ] Each of the thirteen is classified: **carries an invariant** (keep),
-      **transport** (collapse), or **deliberate duplication with a stated
-      reason** (keep, and say the reason in the type's doc). The classification
-      is the deliverable; the count that results is not a target.
-- [ ] No `#[allow(clippy::too_many_arguments)]` is added.
+- [ ] AC-1: Each of the fourteen named in the Description's table is
+      classified: **carries an invariant** (keep), **transport** (collapse), or
+      **deliberate duplication with a stated reason** (keep, and say the reason
+      in the type's doc). The classification is the deliverable; the count that
+      results is not a target.
+- [ ] AC-2: No `#[allow(clippy::too_many_arguments)]` is added.
       `suppression_ratchet.rs` stays green at its recorded figure, or the figure
       moves deliberately with what collapsed named.
-- [ ] `run_prompt_turn`'s body stays under 200 lines (REQ-600 AC-1) and
+- [ ] AC-3: `run_prompt_turn`'s body stays under 200 lines (REQ-600 AC-1) and
       `run_session_turn_with_pressure_policy` stays at brace depth 5 or below
       (REQ-600 AC-3), both under the rules those ACs state.
-- [ ] Behaviour unchanged: the REQ-598 event fixture replays unregenerated, and
-      every BR-3 ordering guard still fails on its inversion — **re-run, not
-      re-asserted.** REQ-600 shipped a guard that silently stopped covering its
-      subject when code moved, and only re-running the mutation found it.
-- [ ] Suite green, grepped for `FAILED`; clippy 0 under `deny`; fmt clean.
+- [ ] AC-4: Behaviour unchanged: the REQ-598 event fixture replays unregenerated, and
+      **each of REQ-600 BR-3's three testable ordering invariants — 1, 3 and 5 —
+      still fails on its inversion, re-run rather than re-asserted.** REQ-600
+      shipped a guard that silently stopped covering its subject when code
+      moved, and only re-running the mutation found it.
+  - **Why three and not five.** REQ-600's own verification records **its** AC-4
+    as *four of five*, and the two that are not pinned by inversion cannot be: invariant
+    2's ordering is enforced by the compiler (`accept_invocation` takes the gate
+    as a parameter, so the test pins the adjacent property that the gate is
+    constructed exactly once inside the memoizing `permission_gate_for`), and
+    invariant 4 "has no inversion test either and cannot have one on this path"
+    — there is no presence gate to park in, and its substitute pins that no
+    blocking wait is introduced. An AC that demands five inversions cannot be
+    met, and an unmeetable AC is the shape that gets ticked without checking.
+  - **What covers 2 and 4 instead.** Their substitutes are re-run under the same
+    rule: the gate-construction count for invariant 2, the no-blocking-wait
+    assertion for invariant 4. If this REQ's collapse changes a signature such
+    that invariant 2's ordering stops being compiler-enforced, that is a finding
+    to record, not a substitution to make quietly.
+- [ ] AC-5: Suite green, grepped for `FAILED`; clippy 0 under `deny`; fmt clean.
 
 ## Assumptions
 
