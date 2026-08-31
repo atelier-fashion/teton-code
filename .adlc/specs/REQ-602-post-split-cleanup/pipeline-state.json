@@ -1,0 +1,32 @@
+{
+  "req": "REQ-602",
+  "branch": "feat/REQ-602-post-split-cleanup",
+  "startedAt": "2026-08-31T18:05:17Z",
+  "completed": false,
+  "currentPhase": 0,
+  "completedPhases": [],
+  "phaseHistory": [],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-602",
+      "branch": "feat/REQ-602-post-split-cleanup",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  }
+}
