@@ -42,7 +42,1622 @@
 
 use super::*;
 
+/// What [`DaemonRuntime::claim_the_turn`] establishes before anything else runs.
+///
+/// A parameter bundle, not a stage object: it holds no behaviour, mints no ids,
+/// and performs no I/O — the same three rules `turn_context.rs` states for
+/// `TurnContext`, and for the same reason. A type that starts answering
+/// questions becomes a second place for turn logic to live.
+struct ClaimedTurn {
+    /// This turn's id, minted before the claim because the claim is keyed on it.
+    turn_id: teton_protocol::TurnId,
+    /// Held by `run_prompt_turn` for the whole turn — see the stage's docs.
+    claim: crate::sessions::TurnClaim,
+    /// The turn's ONE probe of that root (REQ-583 ADR-1).
+    probed: ProbedRoot,
+}
+
+/// What the harness stage produces: the turn's tools and the prompt built from
+/// them. A parameter bundle — no behaviour, no I/O, no ids.
+struct AssembledHarness {
+    tools: ToolRegistry,
+    tool_ctx: ToolContext,
+    stream_events: SessionEvents,
+    system: String,
+}
+
+/// The facts the attempt loop reads and never changes.
+///
+/// A parameter bundle. `TurnContext` already carries the four core facts plus
+/// the gate and invoker, so this is deliberately the *rest* — the second small
+/// struct REQ-598 ADR-1 anticipated ("if a subset of the sites turns out to
+/// want a different bundle, the answer is two small structs, not one wide
+/// one"), not a widening of the first.
+#[derive(Clone, Copy)]
+struct AttemptInputs<'a> {
+    turn_id: &'a teton_protocol::TurnId,
+    phase: Option<ProtoPhase>,
+    tools: &'a ToolRegistry,
+    tool_ctx: &'a ToolContext,
+    stream_events: &'a SessionEvents,
+    refit_system: &'a str,
+    typed_refit: usize,
+    prompt_spend: Option<&'a Arc<teton_core::cost_ceiling::PromptSpend>>,
+}
+
+/// The state the attempt loop carries *across* attempts.
+///
+/// Separate from [`AttemptInputs`] because the split is the point: everything
+/// here is rebound by a reroute arm, and everything there is not. `route` lives
+/// in this half for the reason `turn_context.rs` ADR-3 keeps it out of
+/// `TurnContext` — it is reassigned on every fallback reroute, and a bundle
+/// that owned it alongside immutable facts would hide that.
+///
+/// `run_prompt_turn` owns the value and lends it, so the fields survive the
+/// loop: the commit protocol below reads `conversation` and `route` after the
+/// last attempt has returned.
+struct AttemptState {
+    attempts: u32,
+    rerouted_local: bool,
+    withdrew_accepted_expansion: bool,
+    accepted: Option<AcceptedExpansion>,
+    skill_refit: Vec<(String, String, String)>,
+    conversation: CarriedTurn,
+    route: crate::router::Route,
+}
+
+/// What the routing stage decides, before any `TurnContext` exists.
+///
+/// A parameter bundle carried across the pivot. It cannot *be* a `TurnContext`
+/// and that is the invariant, not an inconvenience: `TurnContext::new` must run
+/// after the warming hold rebinds `router` (REQ-598 BR-2.1), and every field
+/// here is settled before that point.
+struct ResolvedRoute {
+    skills: Arc<SkillRegistry>,
+    skill_turn: Option<SkillTurn>,
+    routed_text: String,
+    router: Router,
+    route: crate::router::Route,
+}
+
+/// What [`DaemonRuntime::prepare_the_attempts`] hands the loop.
+///
+/// The loop's carried state, plus the two facts the refit arms read and never
+/// change. They are produced together because they are derived from the same
+/// expansion decision, and separating them would make a caller re-derive one
+/// from the other.
+struct PreparedAttempts {
+    state: AttemptState,
+    refit_system: String,
+    typed_refit: usize,
+}
+
+/// The session facts that are settled before routing begins.
+///
+/// Named because the alternative was a `#[allow(clippy::too_many_arguments)]`,
+/// and `suppression_ratchet.rs` refused it in as many words: "a new
+/// `too_many_arguments` suppression is a new unnamed parameter cluster; name it
+/// instead." It was right — these six travel together everywhere before the
+/// pivot, which is the definition of a cluster.
+#[derive(Clone, Copy)]
+struct SessionFacts<'a> {
+    events: &'a Arc<EventBus>,
+    sessions: &'a SessionRegistry,
+    session_id: &'a SessionId,
+    config: &'a Config,
+    gate: &'a Arc<PermissionGate>,
+    probed: &'a ProbedRoot,
+}
+
+/// What this particular prompt asked for.
+///
+/// Separate from [`SessionFacts`] because the split is real: everything here
+/// arrived on the wire with this one request, and everything there belongs to
+/// the session and outlives it.
+#[derive(Clone, Copy)]
+struct TurnRequest<'a> {
+    turn_id: &'a teton_protocol::TurnId,
+    prompt: &'a str,
+    skill: Option<&'a SkillInvocation>,
+    mode: SessionMode,
+    phase: Option<ProtoPhase>,
+    invoker: Option<ConnectionId>,
+}
+
+/// What the expansion stage needs beyond the turn context.
+///
+/// Named rather than suppressed: `suppression_ratchet.rs` treats a new
+/// `too_many_arguments` allow as a new unnamed parameter cluster, and it is
+/// right that these five travel together.
+#[derive(Clone, Copy)]
+struct ExpansionInputs<'a> {
+    sessions: &'a SessionRegistry,
+    probed: &'a ProbedRoot,
+    route: &'a crate::router::Route,
+    routed_text: &'a str,
+    system: &'a str,
+}
+
+/// What the routing and expansion stages produced, moved into the loop.
+struct TurnProducts {
+    route: crate::router::Route,
+    skill_turn: Option<SkillTurn>,
+    prompt: String,
+    accepted: Option<AcceptedExpansion>,
+}
+
 impl DaemonRuntime {
+    /// Run one prompt turn for `session`, streaming events over `events` and
+    /// returning the turn result.
+    ///
+    /// This is the daemon-side integration seam: it resolves the route (structured
+    /// phase policy or freeform heuristic), builds the appropriate
+    /// [`crate::harness::CompletionSource`] (local engine or a remote provider
+    /// through the egress choke point), runs the unified turn loop, and — on a
+    /// remote failure — falls back per the router (AC-7).
+    ///
+    /// ## A turn that meets a warming tier waits for it (REQ-580)
+    ///
+    /// A turn whose route has nowhere to run **only** because the local tier is
+    /// still coming up — its weights downloading, or installed and mid-load —
+    /// is held here until the tier settles, then routed afresh and run exactly
+    /// as if it had been sent that moment. The hold is announced on the bus as
+    /// `turn_queued` and taken *before* the turn's tools, head or conversation
+    /// exist, so a held turn has spent nothing; a settled absence is refused
+    /// immediately, exactly as before. `presence` is what ends a hold early: a
+    /// client that disconnects while its turn waits gets no ghost turn run on
+    /// its behalf once the tier opens (see [`ClientPresence`]).
+    ///
+    /// ## A `/name` invocation is expanded here, and expanded FIRST (REQ-585)
+    ///
+    /// `skill` is the invocation as it crossed the wire — a name and the rest of
+    /// the typed line, never an expansion (ADR-3) — and `prompt` is empty
+    /// whenever it is `Some`. The expansion is built before
+    /// [`Self::dispatch_route`] and before [`Self::spawn_title_session`],
+    /// because both of those read the prompt *text*: a skill turn expanded after
+    /// them would be classified from `""` and would spend the session's one
+    /// naming attempt on `""`. From there the order is BR-8's, and BR-8(c) is a
+    /// statement about a single line — [`CarriedTurn::begin`] both pushes the
+    /// user block and arms the drop-commit, so a check placed after it has
+    /// already committed the expansion:
+    ///
+    /// ```text
+    /// probe root → expand → route + route.budget → Stage A
+    ///            → (TASK-205: consent + commands) → Stage B → CarriedTurn::begin
+    /// ```
+    ///
+    /// # Errors
+    /// Returns a [`RpcError`] when no provider can serve the turn, an
+    /// unrecoverable provider failure occurs, the named skill is not one this
+    /// session dispatches ([`error_code::INVALID_PARAMS`]), or its expansion does
+    /// not fit the route's budget ([`error_code::SKILL_EXPANSION_TOO_LARGE`]).
+    // The parameters are the session's own facts, passed individually because
+    // that is how the caller reads them off `session/prompt` — the same shape
+    // `run_one_attempt` already carries below. `session_cwd` is the caller's
+    // pre-claim snapshot of the root; the turn re-reads the registry once it
+    // holds the claim and uses the snapshot only if the session is gone.
+    //
+    // `invoker` is the connection that sent this prompt, and it is carried for
+    // exactly one purpose: a skill's dynamic-context consent is **addressed** to
+    // it and answerable by nobody else (REQ-585 ADR-7). `None` is a caller with
+    // no connection at all — an internal driver or a fixture — and it asks
+    // nobody, which is the gate's own fail-closed answer rather than a fallback
+    // to the bus.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_prompt_turn(
+        self: &Arc<Self>,
+        events: &Arc<EventBus>,
+        sessions: &SessionRegistry,
+        session_id: SessionId,
+        mode: SessionMode,
+        phase: Option<ProtoPhase>,
+        session_cwd: Option<PathBuf>,
+        prompt: String,
+        skill: Option<SkillInvocation>,
+        invoker: Option<ConnectionId>,
+        mut presence: ClientPresence,
+    ) -> Result<PromptTurnResult, RpcError> {
+        let ClaimedTurn {
+            turn_id,
+            claim: _claim,
+            probed,
+        } = self.claim_the_turn(sessions, &session_id, session_cwd)?;
+
+        // REQ-585 BR-4/ADR-3: **expand before routing.** A skill turn's `prompt`
+        // is empty by ADR-3 — the invocation crosses the wire as a name — and
+        // both readers of the prompt text are below this line: `dispatch_route`
+        // runs the freeform classifier over it, and `spawn_title_session` spends
+        // the session's one naming attempt on it. Expanding after either would
+        // classify and name every invocation from `""`: on a machine with
+        // per-category bindings that is a route chosen from nothing, and it is a
+        // session left unnamed for its whole life.
+        //
+        // Refusing here is free in BR-8(c)'s sense: nothing has been seeded, no
+        // route has been decided, and no event has been published.
+
+        // This turn's ONE config snapshot, taken before the expansion rather
+        // than after it because the gate below reads it and the expansion below
+        // needs the gate (REQ-589 ADR-10). Handed on rather than re-read: the
+        // route, the gate, the registry and the capability clause further down
+        // are then four readings of one config, so a commit that lands mid-turn
+        // moves the next turn instead of leaving this one's prompt disagreeing
+        // with its own tool set (REQ-572 verify).
+        let config = self.config.lock().expect("config mutex poisoned").clone();
+        // Fetched before the tools, because the web tool holds it: that tool
+        // raises its own per-tier prompt inside its run rather than being
+        // authorized by name at dispatch (REQ-563 BR-3/BR-12). Fetched rather
+        // than built, because a gate rebuilt per turn forgets every
+        // "allow for this session" answer at the end of the turn that earned it.
+        //
+        // **And now before the expansion too** (REQ-589 BR-6 / ADR-10): a typed
+        // project skill's trust question is asked inside `accept_invocation`,
+        // which is the first thing this turn does with the invocation. The fetch
+        // is a per-session cache lookup, so asking for it earlier reads the same
+        // gate with the same remembered answers — only sooner.
+        let gate = self.permission_gate_for(&session_id, events, &config);
+        let ResolvedRoute {
+            skills,
+            mut skill_turn,
+            routed_text,
+            router,
+            mut route,
+        } = self
+            .resolve_the_route(
+                SessionFacts {
+                    events,
+                    sessions,
+                    session_id: &session_id,
+                    config: &config,
+                    gate: &gate,
+                    probed: &probed,
+                },
+                TurnRequest {
+                    turn_id: &turn_id,
+                    prompt: &prompt,
+                    skill: skill.as_ref(),
+                    mode,
+                    phase,
+                    invoker,
+                },
+                &mut presence,
+            )
+            .await?;
+        let tctx = TurnContext::new(events, &session_id, &config, &router, &gate, invoker);
+
+        self.spawn_the_naming_duty(tctx, sessions, &skill_turn, &prompt, &routed_text);
+        self.record_user_prompt_urls(&session_id, &prompt);
+        // The gate is the one fetched above the expansion (REQ-589 ADR-10). It
+        // is still fetched before the tools, which is what the web tool needs:
+        // that tool raises its own per-tier prompt inside its run rather than
+        // being authorized by name at dispatch (REQ-563 BR-3/BR-12).
+        //
+        // This turn's config snapshot is handed on rather than re-read: the
+        // route, the gate, the registry and the capability clause below are then
+        // four readings of ONE config, so a commit that lands mid-turn moves the
+        // next turn instead of leaving this one's prompt disagreeing with its
+        // own tool set (REQ-572 verify).
+        let AssembledHarness {
+            tools,
+            tool_ctx,
+            stream_events,
+            system,
+        } = self
+            .assemble_harness(tctx, &skills, &probed, &mut route)
+            .await;
+
+        let accepted = self
+            .settle_expansion(
+                tctx,
+                ExpansionInputs {
+                    sessions,
+                    probed: &probed,
+                    route: &route,
+                    routed_text: &routed_text,
+                    system: &system,
+                },
+                &mut skill_turn,
+            )
+            .await?;
+        let PreparedAttempts {
+            state: mut st,
+            refit_system,
+            typed_refit,
+        } = self.prepare_the_attempts(
+            sessions,
+            &session_id,
+            &config,
+            &system,
+            TurnProducts {
+                route,
+                skill_turn,
+                prompt,
+                accepted,
+            },
+        );
+        // Whether an accepted expansion was withdrawn from this conversation
+        // because the tier refused it at the window (REQ-589 BR-14.1).
+        //
+        // It travels out of the loop rather than being acted on inside it
+        // because it decides which of the two outcomes below this turn takes,
+        // and the loop's whole shape is that every ending funnels through that
+        // one seam. See the commit/abandon match for what it changes and why.
+        // The loop is labelled and its endings `break` a value rather than
+        // returning one, so every one of them funnels through the single
+        // commit/abandon below instead of each exit remembering to disarm —
+        // BR-6's atomicity is a property of the shape, not of ten call sites
+        // agreeing.
+        // REQ-588 ADR-1: the prompt's spend accumulator, created **here** —
+        // before the attempt loop — because "per prompt" is its lifetime, not a
+        // key looked up somewhere. Every attempt, every fallback reroute and
+        // every duty of this prompt is handed this same `Arc`, so they add into
+        // one total; the next prompt gets a new one and therefore starts at
+        // zero, without anything having to remember to reset it.
+        //
+        // `None` when no ceiling is configured, which is what makes the whole
+        // feature cost nothing when it is off (ADR-6): the check at the choke
+        // point needs both this and a ceiling, so neither the accumulator nor
+        // the pricing lookup exists on an un-opted-in machine.
+        let prompt_spend = config
+            .cost
+            .ceiling_micro_cents()
+            .map(|_| Arc::new(teton_core::cost_ceiling::PromptSpend::default()));
+
+        let outcome = self
+            .run_attempts(
+                tctx,
+                AttemptInputs {
+                    turn_id: &turn_id,
+                    phase,
+                    tools: &tools,
+                    tool_ctx: &tool_ctx,
+                    stream_events: &stream_events,
+                    refit_system: &refit_system,
+                    typed_refit,
+                    prompt_spend: prompt_spend.as_ref(),
+                },
+                &mut st,
+            )
+            .await;
+
+        self.commit_or_abandon(outcome, st, &stream_events)
+    }
+
+    /// **Stage 1 — claim the turn, then read the session state under it.**
+    ///
+    /// The claim is *returned* rather than held here, and that is the whole
+    /// subtlety of this stage: `run_prompt_turn` binds it as its first local so
+    /// it outlives the conversation guard bound later, because locals drop in
+    /// reverse. A stage that held the claim would release it at its own `}`,
+    /// and a waiting client could slip a turn between this turn's commit and
+    /// its release.
+    ///
+    /// The ordering inside — claim, *then* re-read — is LESSON-539 and is
+    /// pinned by `the_claim_is_taken_before_the_registry_is_re_read`, which
+    /// scopes itself to this function.
+    fn claim_the_turn(
+        &self,
+        sessions: &SessionRegistry,
+        session_id: &SessionId,
+        session_cwd: Option<PathBuf>,
+    ) -> Result<ClaimedTurn, RpcError> {
+        let turn_id = teton_protocol::TurnId::from(format!(
+            "turn-{}",
+            self.turn_counter.fetch_add(1, Ordering::SeqCst)
+        ));
+
+        // REQ-567 BR-5 / D-3: claim the session before ANY of this turn's work.
+        // Two `session/prompt` calls on one session can be in flight at once —
+        // each runs on its own task — and both would replay the same snapshot
+        // and both commit, so the second commit would erase the first turn's
+        // blocks wholesale. Refused rather than queued, with the turn already
+        // running named in the sentence.
+        //
+        // Placed first so a refused prompt spends nothing: no classifier call,
+        // no title duty, no tool registry. The claim releases on drop, so every
+        // exit below — including the task abort that has no code to run — frees
+        // the session.
+        //
+        // Bound for the whole function on purpose, and declared BEFORE the
+        // conversation guard below so it outlives it: locals drop in reverse,
+        // which means the commit happens while this session is still claimed and
+        // a waiting client cannot slip a turn between the write and the release.
+        let _claim = sessions
+            .try_begin_turn(session_id, &turn_id)
+            .map_err(|err| refused_claim_error(&err))?;
+
+        // REQ-583 verify: the `session_cwd` parameter was read off the registry
+        // BEFORE the claim above was taken (`spawn_prompt_turn` snapshots the
+        // summary, then spawns). A `session/set_cwd` that landed in that window
+        // moved the root and cleared the conversation — and a turn built on the
+        // stale snapshot would run jailed to the old root, state that root in
+        // its environment block, and commit its blocks into the just-cleared
+        // conversation. Now that the claim is held no move can land, so the
+        // registry's path is authoritative for the whole turn and is re-read
+        // here; the snapshot stands in only for a session the registry no
+        // longer has, which the claim a moment ago says is not this one.
+        let session_cwd = sessions
+            .get(session_id)
+            .map(|summary| summary.cwd)
+            .unwrap_or(session_cwd);
+
+        // REQ-583 ADR-1: the root is probed once per turn, from the registry's
+        // path, and the ONE probe feeds every consumer — the jail
+        // (`ToolContext::for_root`), the prompt's environment block
+        // (`route.harness.session_root`) and, since REQ-585, the identity a
+        // skill turn's user block is pinned to. (The skill file's *display*
+        // spelling is discovery's, not this probe's — it needs the skill's
+        // source as well, which only the registry has; BUG-187.)
+        // It is read here rather than beside the jail below because the
+        // expansion needs it and the expansion runs before the route (see the
+        // comment at `accept_invocation`'s call site).
+        let probed = self.session_root_for(session_cwd.as_deref());
+        Ok(ClaimedTurn {
+            turn_id,
+            claim: _claim,
+            probed,
+        })
+    }
+
+    /// **Stage — resolve the route, expanding any skill first.**
+    ///
+    /// Everything here happens *before* `TurnContext` exists, because the
+    /// warming hold at the end of it rebinds `router` and BR-2.1 requires the
+    /// context be built after the last rebinding of every field it captures.
+    /// The stage therefore takes its inputs explicitly; that asymmetry with the
+    /// stages after the pivot is the invariant showing through the types.
+    async fn resolve_the_route(
+        self: &Arc<Self>,
+        facts: SessionFacts<'_>,
+        request: TurnRequest<'_>,
+        presence: &mut ClientPresence,
+    ) -> Result<ResolvedRoute, RpcError> {
+        let SessionFacts {
+            events,
+            sessions,
+            session_id,
+            config,
+            gate,
+            probed,
+        } = facts;
+        let TurnRequest {
+            turn_id,
+            prompt,
+            skill,
+            mode,
+            phase,
+            invoker,
+        } = request;
+        // **The turn's one registry snapshot**, taken here under the claim and
+        // read by both consumers: the `/name` resolution just below, and the
+        // `skill` tool `build_tools` registers further down (REQ-587 ADR-3,
+        // ADR-5). An `Arc` clone off the session registry, not a discovery —
+        // `discovery_is_paid_at_create_and_at_cd_and_never_per_turn` pins that
+        // no turn opens a directory, and this opens none.
+        //
+        // One turn, one snapshot, for the reason the config above is one
+        // snapshot: a `/cd` landing between two reads would leave the roster
+        // the model was shown and the registry its call resolves against
+        // describing two different roots. The claim is held, so no move can
+        // land — which makes the single read a *statement* rather than a race
+        // this happens to win.
+        let skills = sessions.skills(session_id);
+        let skill_turn = match &skill {
+            // `invoker` is carried in for REQ-589 ADR-10's acknowledgment: the
+            // question is **addressed** to the connection that typed the `/name`
+            // and answerable by nobody else, exactly as the dynamic-context
+            // question below it is (REQ-585 ADR-7).
+            Some(invocation) => Some(
+                self.accept_invocation(&skills, probed, invocation, gate, invoker)
+                    .await?,
+            ),
+            None => None,
+        };
+        // The one reading of "this turn's prompt text". For a skill turn it is
+        // the **body-only** expansion — the dynamic-context output is not folded
+        // in yet, and that is deliberate rather than incidental: the classifier
+        // reads the skill's instructions, and the alternative would make the
+        // route depend on output that the route's own permission level decides
+        // whether to produce.
+        // Owned rather than borrowed: `settle_expansion` below lends
+        // `skill_turn` mutably, and a `&str` into it would hold an immutable
+        // borrow across that call. One `String` per turn, and it buys the seam.
+        let routed_text: String = skill_turn
+            .as_ref()
+            .map_or_else(|| prompt.to_owned(), |skill| skill.text.clone());
+
+        let router = self.turn_router(config, session_id);
+
+        let core_phase = phase.map(to_core_phase);
+        let mut route = self
+            .dispatch_route(&router, session_id, mode, core_phase, &routed_text)
+            .await;
+
+        // REQ-580 BR-1/BR-3: a turn with nowhere to run *only* because the
+        // local tier is still coming up is held here, and then routed afresh.
+        //
+        // Here and not at the `NoTierAvailable` arm below, because everything
+        // between — the tools, the system head, the carried conversation — is
+        // built from the route, and a turn served after the wait must be
+        // built from the route it is served *by* (REQ-567 BR-7 for a single
+        // turn: the head is this turn's, not a stale one's). Nothing above this
+        // line has spent anything a held turn should not spend: the session
+        // claim (which is the point — a second prompt on this session while
+        // this one waits is `SESSION_BUSY`, naming it), and a `dispatch_route`
+        // that the warming tier caused to bypass its classifier.
+        //
+        // The predicate is the attempt's own (`attempt_source`, the reading
+        // `run_one_attempt` refuses on) crossed with the tier's state
+        // (`local_tier_hold`, the reading `unserved_turn_error` codes
+        // `TIER_WARMING` on) — so a turn is held on exactly the two facts that
+        // would otherwise have refused it with "retry in a moment", and no
+        // other. A route the router sent somewhere that can serve (a remote
+        // provider) is not held: the tier's state is not that turn's concern
+        // (REQ-547 D-3 — the gate withholds the tier, never the session).
+        let router = match self.hold_for(config, &route) {
+            Some((waiting_on, model_id)) => {
+                events.publish(
+                    Some(session_id.clone()),
+                    Event::TurnQueued(TurnQueued {
+                        turn_id: turn_id.clone(),
+                        model_id,
+                        waiting_on,
+                    }),
+                );
+                tokio::select! {
+                    () = self.await_local_tier() => {}
+                    // The client left while the turn was still held. Nothing
+                    // was spent and nobody is listening: end the turn with the
+                    // refusal it would have carried without the hold — the same
+                    // classifier, the same sentence — rather than run a ghost
+                    // turn on the tier when it opens (ADR-3).
+                    () = presence.gone() => {
+                        let category = route.resolution.as_ref().map(|r| r.category);
+                        return Err(unserved_turn_sentence(
+                            &route,
+                            self.unserved_turn_error(config, category),
+                        ));
+                    }
+                }
+                // Fresh, from the tier's settled state: the router now sees the
+                // tier as it is, and the classifier — bypassed while the tier
+                // was down — runs for real. If the tier failed instead of
+                // opening, this route lands on the `NoTierAvailable` arm below,
+                // where the classifier now says something settled.
+                let router = self.turn_router(config, session_id);
+                route = self
+                    .dispatch_route(&router, session_id, mode, core_phase, &routed_text)
+                    .await;
+                router
+            }
+            None => router,
+        };
+
+        // REQ-598 ADR-4 / BR-2.1: **this** is the earliest point a
+        // `TurnContext` may be built, and the line above is why.
+        //
+        // BR-2 asks for construction after the turn is claimed, and the claim is
+        // ~150 lines above. That is necessary and not sufficient. BR-2 names one
+        // instance of a class: *a context must not be constructed before any
+        // point that rebinds a field it captures.* `router` is bound before
+        // `dispatch_route`, and then **shadow-rebound by the hold above** when
+        // the local tier was still warming — rebuilt from the settled tier state
+        // so the classifier that was bypassed while the tier was down runs for
+        // real.
+        //
+        // A context built at the first `router` binding satisfies BR-2, passes
+        // this file's whole suite, and hands every consumer below a router
+        // describing a tier state that no longer exists — silently breaking
+        // REQ-580's guarantee that a turn served after the wait is built from
+        // the route it is served *by*. The guard is mechanical, not this
+        // comment: see the BR-2.1 warming-tier test in this module.
+
+        Ok(ResolvedRoute {
+            skills,
+            skill_turn,
+            routed_text,
+            router,
+            route,
+        })
+    }
+
+    /// **Stage — spend the session's one naming attempt, on a detached task.**
+    ///
+    /// Only for a typed turn: a skill invocation crosses the wire as a name and
+    /// would have the session named from `""`.
+    ///
+    /// The duty it spawns publishes its own `route_decided` from inside
+    /// `tokio::spawn`, which is why the golden event fixture discriminates that
+    /// event by category rather than by position (LESSON-591).
+    fn spawn_the_naming_duty(
+        self: &Arc<Self>,
+        tctx: TurnContext<'_>,
+        sessions: &SessionRegistry,
+        skill_turn: &Option<SkillTurn>,
+        _prompt: &str,
+        routed_text: &str,
+    ) {
+        // REQ-561 TASK-062: name the session, at most once for its whole life.
+        // Ahead of the turn rather than after it, for two reasons: the name is
+        // derived from the prompt, which is already in hand, so a client can
+        // label the session the moment the user hits enter rather than a whole
+        // answer later; and this is a point on the path that every turn
+        // reaches, where the turn's own maze of early returns is still ahead.
+        //
+        // After the hold rather than before it (REQ-580): the title's route
+        // reads the same tier state the turn's does, and a title requested of a
+        // tier that is still loading spends the session's one naming attempt on
+        // a duty that cannot run — the first prompt of every session that
+        // started during a load stayed untitled for its whole life. One
+        // classification's latency later is the price, and it is paid on the
+        // local model.
+        //
+        // **Started here, not awaited here.** The turn proceeds while the
+        // naming runs on its own task; the handle is dropped because nothing
+        // below reads a title, and a session that is not named yet is a session
+        // with no title — BR-3's degraded state. It cannot fail the turn — see
+        // `spawn_title_session`.
+        //
+        // REQ-585: `routed_text`, not `prompt` — the naming attempt is spent
+        // once per session, and a skill turn's `prompt` is empty.
+        //
+        // **A skill turn names later**, below Stage A. The naming duty is a
+        // model call: on a machine with `reflex` bound remotely it puts a
+        // bounded copy of its input on the wire. Spending it here would make
+        // BR-8's refusal sentence — *"Nothing was sent and no provider saw this
+        // turn"* — true of the turn and false of the machine, and would spend
+        // the session's one naming attempt on an expansion that never ran. A
+        // typed prompt still names exactly here, so REQ-561's "label the
+        // session the moment the user hits enter" is unchanged for every turn
+        // that is not a skill invocation.
+        if skill_turn.is_none() {
+            let _ = self.spawn_title_session(
+                tctx.core,
+                sessions,
+                routed_text,
+                // A typed prompt is the user's own bytes, read from no file, so
+                // there is nothing for a boundary to be compared against. This
+                // is the one call site for which the empty value is a statement
+                // rather than an omission — the skill call site below is the
+                // other one, and it says something different.
+                Provenance::empty(),
+            );
+        }
+
+        // Assemble the harness context, tools, and the permission gate once; a
+        // fallback re-runs the loop against the same accumulated context.
+        //
+        // REQ-544 (known limitation, deliberately deferred): the retry/fallback
+        // path below re-runs the loop against this *same* `ctx`, which by design
+        // preserves completed work (file reads/edits done before a mid-turn
+        // transient failure). The trade-off is that the accumulated context is
+        // re-sent to the retry/fallback provider and thus re-billed as input
+        // tokens — a mid-turn transient failure re-bills the partial progress.
+        // A clean fix (snapshot `ctx` here and restore it before a retry, or drive
+        // retries at single-call granularity so only the failed call is re-issued)
+        // changes the "continue vs. restart" semantics and needs a product call on
+        // whether a fallback should preserve or discard partial work; it is out of
+        // scope for this correctness pass. `ContextManager` is `Clone`, so the
+        // snapshot itself is cheap when that decision is made.
+        // TODO(REQ-544 followup): make retries cost-neutral once continue-vs-restart
+        // semantics are decided.
+        // REQ-563 BR-3: every URL in this prompt joins the session's user-pasted
+        // set **before** the turn runs, so a message that pastes a link and asks
+        // about it in one breath classifies as `UserPasted` — the ordinary
+        // shape of the request. This is the one ingestion point, and the text it
+        // reads is the user's own (see `record_user_prompt_urls`).
+        //
+        // REQ-585: `prompt`, deliberately — **not** `routed_text`. A skill body
+        // is file-authored, and feeding it here would let a file on disk author
+        // its own authorization by writing a URL into the set the web tool then
+        // trusts. A skill turn's `prompt` is empty, so an invocation contributes
+        // nothing, which is the correct answer: nobody pasted anything.
+    }
+
+    /// **Stage — assemble the harness: tools, jail, stream and system prompt.**
+    ///
+    /// Everything here reads the turn's single `ProbedRoot` and its single
+    /// config snapshot. It mutates `route.harness` in place rather than
+    /// returning a new one, because `route` is rebound on every fallback
+    /// reroute and a stage that returned a fresh harness would hand the loop a
+    /// second thing to keep in step (`turn_context.rs` ADR-3).
+    async fn assemble_harness(
+        self: &Arc<Self>,
+        tctx: TurnContext<'_>,
+        skills: &Arc<SkillRegistry>,
+        probed: &ProbedRoot,
+        route: &mut crate::router::Route,
+    ) -> AssembledHarness {
+        // `events`, `session_id` and `config` come off the context rather than
+        // being passed again beside it — three parameters that were already in
+        // the bundle sitting next to them.
+        let (events, session_id, config) =
+            (tctx.core.events, tctx.core.session_id, tctx.core.config);
+        let tools = self
+            // REQ-587 ADR-3: the connection that submitted this turn is the
+            // addressee of any consent the `skill` tool raises — it now travels
+            // on `tctx` with the rest of the turn's facts (REQ-598). `ConnectionId`
+            // is `Copy`, so the seam below still consumes its own.
+            .build_tools(tctx, Arc::clone(skills))
+            .await;
+        // BUG-147: jail this session's tools to the CLIENT's working directory.
+        // The daemon-global `repo_root` is only a fallback for clients that did
+        // not send one — under launchd it is `/`, which is what had every tool
+        // call running against the filesystem root.
+        //
+        // REQ-583 ADR-1: the root is probed here, per turn, from the registry's
+        // path — never cached, never client-derived — and the ONE probe feeds
+        // both consumers: the jail (`ToolContext::for_root`, whose refusals name
+        // the display) and the prompt (`route.harness.session_root`, the
+        // environment block). Both are built from one `ProbedRoot`, so the jail
+        // path and the probed view cannot come from two readings. Probing per
+        // turn is what keeps the branch honest after a checkout between turns
+        // and moves every consumer the turn after a `/cd` rewrote the path.
+        //
+        // REQ-585 moved the probe itself to the top of the turn — the expansion
+        // needs it, and the expansion runs before the route — so `probed` here
+        // is that same single reading, not a second one.
+        let tool_ctx = ToolContext::for_root(probed);
+        let stream_events = SessionEvents::new(events.clone(), session_id.clone());
+
+        // REQ-572 BR-3: the prompt's capability clause reads the same classifier
+        // that decides tool exposure — stated here, where both inputs live, so
+        // the SearchUnavailable clause can reach a session (the registry
+        // fallback alone cannot distinguish it from Ready).
+        route.harness.web_capability = Some(web_capability_state(
+            &config.web,
+            self.local_model_present(),
+        ));
+        // REQ-583 BR-1: the same probed root the jail above was built from — so
+        // the environment block and the jail's refusals print one spelling.
+        route.harness.session_root = Some(probed.view.clone());
+        // REQ-584 BR-7: known project names for a NON-project root, ranked by
+        // `last_seen` and bounded here, where the registry is. The composer
+        // places them and decides how many fit; deriving them there would put a
+        // filesystem-backed read inside a pure renderer.
+        //
+        // **Reads the stored snapshot only — it never scans** (BR-3): this runs
+        // on every turn, and a turn that did not ask for projects must not pay
+        // for a directory walk, let alone raise the macOS Documents dialog.
+        route.harness.known_projects =
+            if probed.view.kind == teton_protocol::methods::RootKind::Project {
+                Vec::new()
+            } else {
+                self.projects
+                    .snapshot()
+                    .rank(None)
+                    .iter()
+                    .map(|p| {
+                        teton_core::session_root::bounded_field(
+                            &p.name,
+                            teton_core::session_root::NAME_MAX_CHARS,
+                        )
+                    })
+                    .collect()
+            };
+        let system = build_system_prompt(&tools, &route.harness);
+        AssembledHarness {
+            tools,
+            tool_ctx,
+            stream_events,
+            system,
+        }
+    }
+
+    /// **Stage — settle the skill expansion against the budget.**
+    ///
+    /// Stage A asks whether the body fits, the consent tctx.gate asks the user, and
+    /// stage B folds the dynamic context in. All three read the same `system`
+    /// prompt and the same route, and all three may leave `skill_turn` changed —
+    /// which is why it is lent mutably rather than returned: a stage that
+    /// returned a new `SkillTurn` would give the caller two versions to keep in
+    /// step.
+    async fn settle_expansion(
+        self: &Arc<Self>,
+        tctx: TurnContext<'_>,
+        inputs: ExpansionInputs<'_>,
+        skill_turn: &mut Option<SkillTurn>,
+    ) -> Result<Option<AcceptedExpansion>, RpcError> {
+        let ExpansionInputs {
+            sessions,
+            probed,
+            route,
+            routed_text,
+            system,
+        } = inputs;
+        // ── REQ-585 BR-8 / ADR-11: Stage A — does the BODY fit? ──────────────
+        //
+        // Before the user is asked to approve anything (BR-8d), and before
+        // `CarriedTurn::begin` below, which both pushes the user block and arms
+        // the drop-commit — so a check placed after it would have committed the
+        // very expansion it is refusing (BR-8c). Nothing is derived here: the
+        // budget is the one `Router::budget_for` stamped on this route, and the
+        // measurement is `ContextManager::would_seed_fit`, the estimators the
+        // pressure path itself runs on.
+        //
+        // A refused turn returns from here: no `context_pressure` of any kind,
+        // no health change, no degradation, no retry — none of the machinery
+        // below has run.
+        //
+        // ── REQ-589 BR-2/BR-3: and the refusal is now a *question* ───────────
+        //
+        // Over budget no longer ends the turn on its own. On the user-typed path
+        // — this one, and only this one — the measurement is put to the person
+        // who typed the name, who may send it anyway, take a durable fix, or
+        // decline. Declining is byte-for-byte the refusal above it replaced
+        // (AC-3), and every not-sent arm still returns from here with BR-11
+        // intact: the naming duty is below this line, so a refused turn has
+        // spent no model call.
+        //
+        // `SkillCaller::User` is not passed because it cannot be anything else:
+        // `skill_turn` is `Some` only for a typed `/name`, and
+        // `OverBudgetOffer`'s composer hardcodes it (BR-2). The model's own
+        // expansions are measured by the loop's `skill_append_fit` and are never
+        // offered a choice.
+        //
+        // The one place this turn's pressure policy can be decided, because it
+        // is the one place an over-budget send is consented to (BR-12).
+        //
+        // **One variable, not a flag beside a payload** (REQ-589 BR-14.1). This
+        // was a `bool` and an `Option<String>` set on the same two arms; the
+        // withdrawal below needs the skill's *name* as well, and a third local
+        // that three arms have to remember to keep in step is how one of them
+        // comes to say a turn was accepted while another cannot say what was
+        // accepted. `Some` **is** "this turn's over-budget send was consented
+        // to", and everything downstream reads it from here.
+        let mut accepted: Option<AcceptedExpansion> = None;
+        if let Some(skill) = skill_turn.as_ref() {
+            match self
+                .offer_or_refuse_over_budget(
+                    tctx,
+                    route,
+                    SkillStage::Body,
+                    skill,
+                    system,
+                    // Nothing has been accepted yet: this is the turn's first
+                    // question.
+                    None,
+                )
+                .await
+            {
+                SkillStageVerdict::Fits => {}
+                SkillStageVerdict::Accepted => {
+                    // The exact bytes the answer was about, carried to Stage B
+                    // so an unchanged expansion is not put to the user twice —
+                    // and to the failure path below, which has to find this
+                    // block in the conversation to withdraw it (BR-14.1).
+                    accepted = Some(AcceptedExpansion {
+                        skill: skill.name.clone(),
+                        text: skill.text.clone(),
+                    });
+                }
+                SkillStageVerdict::NotSent(message) => {
+                    return Err(RpcError::new(
+                        error_code::SKILL_EXPANSION_TOO_LARGE,
+                        message,
+                    ));
+                }
+            }
+        }
+
+        // Stage A said the body fits, so this turn is going to happen and the
+        // session may be named after it. Deferred to here rather than run with
+        // the typed prompts above, because the naming duty is a model call and
+        // a refused turn must not have reached one (BR-8).
+        //
+        // **With the expansion's own provenance** (REQ-587 verify). `routed_text`
+        // here is `SkillTurn::text` — the skill file's bytes — and the duty sends
+        // a bounded copy of it to a route `title_route` resolves *remotely*
+        // unless the session is already tainted, which on the session's first
+        // substantive prompt it is not. `Provenance::empty()` short-circuits
+        // `Egress::send` before any boundary check, so passing it here would ship
+        // a `local-only` skill body (or a user skill's fail-closed `unknown`) off
+        // the machine through the one duty the turn does not wait for.
+        //
+        // The values are read off the turn rather than recomputed, and they are
+        // this text's provenance *at this point in the function*: the commands
+        // have not run yet, so `routed_text` still carries
+        // `PENDING_PLACEHOLDER` where their output will go and no command has
+        // contributed anything for `unknown` to account for. The seam below OR's
+        // in `spawned` before the user block is seeded, which is the same rule
+        // applied to a longer string — not a second reading of this one.
+        if let Some(skill) = skill_turn.as_ref() {
+            let _ = self.spawn_title_session(
+                tctx.core,
+                sessions,
+                routed_text,
+                expansion_provenance(&skill.sources, skill.unknown),
+            );
+        }
+
+        // ── REQ-585 BR-6 / BR-12: dynamic-context consent and execution ──────
+        //
+        // The TASK-205 seam. One `authorize_skill` for the whole invocation,
+        // `run_all` in document order with the session root as cwd, the outcomes
+        // folded back into `skill_turn.text`, and BR-12's `skill_invoked`
+        // published — in that order, and all of it **between** the two budget
+        // stages.
+        //
+        // Stage A is above this and must stay there: a body that cannot fit is
+        // refused *before* a user is walked through approving four commands,
+        // watching them run, and then being told the turn was refused (BR-8d).
+        // Stage B is below it and must stay there: until this seam runs, the
+        // slots hold `skills::PENDING_PLACEHOLDER` — exactly what Stage A
+        // measured — and it is the fold that makes the second measurement a
+        // different one.
+        // ─────────────────────────────────────────────────────────────────────
+        if let Some(skill) = skill_turn.as_mut() {
+            self.settle_dynamic_context(
+                tctx.core.events,
+                tctx.core.session_id,
+                tctx.gate,
+                &probed.path,
+                tctx.invoker,
+                skill,
+            )
+            .await;
+        }
+
+        // ── REQ-585 BR-8 / ADR-11: Stage B — does it still fit with the
+        // dynamic-context output folded in? ──────────────────────────────────
+        //
+        // Reached only once Stage A has answered `Fits` **or was accepted**,
+        // which is what entitles this stage's sentence to say the body itself
+        // fit. Still before `CarriedTurn::begin`, for Stage A's reason.
+        //
+        // REQ-589: this stage offers too, and the wire carries which stage
+        // spoke precisely so it can. The two are different questions and the
+        // sentence says so — Stage A's is about the body, Stage B's has to say
+        // that the dynamic-context output is what spent the room, which is a
+        // different thing for the user to act on. Leaving this one a hard
+        // refusal would mean a skill with one oversized `` !`command` `` output
+        // could never be sent even by someone who understood exactly what they
+        // were asking for, and would leave `SkillStage::WithDynamicContext`
+        // unreachable on every surface TASK-241 put it on.
+        //
+        // BR-11 reads differently here, and the difference is not new: the
+        // naming duty and the dynamic-context commands are both *above* this
+        // line, so a Stage B refusal has spent them — exactly as it did before
+        // REQ-589. What is unchanged is the invariant that matters for
+        // `-32023`: no provider has seen this turn.
+        if let Some(skill) = skill_turn.as_ref() {
+            match self
+                .offer_or_refuse_over_budget(
+                    tctx,
+                    route,
+                    SkillStage::WithDynamicContext,
+                    skill,
+                    system,
+                    // What Stage A's answer was about, if there was one. An
+                    // expansion the fold left untouched is the same question,
+                    // already answered a few lines up — asking again would let
+                    // a second refusal kill a turn the user had just approved.
+                    accepted.as_ref().map(|a| a.text.as_str()),
+                )
+                .await
+            {
+                SkillStageVerdict::Fits => {}
+                // Recorded with **this** stage's bytes, which is the point of
+                // re-assigning rather than only raising a flag: the fold may
+                // have grown the expansion since Stage A, and it is the folded
+                // text that becomes the block a failure has to withdraw
+                // (BR-14.1). A Stage-B-only acceptance — Stage A said `Fits`,
+                // the dynamic-context output is what spent the room — leaves
+                // this `None` if it does not write here, and the withdrawal
+                // would then have nothing to look for.
+                SkillStageVerdict::Accepted => {
+                    accepted = Some(AcceptedExpansion {
+                        skill: skill.name.clone(),
+                        text: skill.text.clone(),
+                    });
+                }
+                SkillStageVerdict::NotSent(message) => {
+                    return Err(RpcError::new(
+                        error_code::SKILL_EXPANSION_TOO_LARGE,
+                        message,
+                    ));
+                }
+            }
+        }
+
+        // The seed, and its provenance (BR-7, ADR-9): the expansion for a skill
+        // turn, the typed text otherwise. One block either way — `push_user_from`
+        // with an empty set and `unknown: false` is byte-identical to the
+        // `push_user` every typed turn has always taken.
+        // What a **reroute** has to re-ask, carried past the move below.
+        //
+        // Both stages measured against the budget of the route this turn
+        // started on. A mid-turn reroute — the privacy pin, or a provider
+        // fallback — swaps in a smaller one, and `refit_for_reroute` then
+        // *clamps* the conversation: `truncate_to_budget` drops history until
+        // one block is left and middle-elides that block, which by then is the
+        // skill expansion. BR-8 says a skill turn is never middle-elided into
+        // something the user did not invoke, and BR-4 says carried whole or
+        // refused.
+        //
+        // It is not a corner: BR-7 makes the privacy pin the *expected* path
+        // for any invocation that ran a dynamic command on a boundary-configured
+        // machine, which is every ADLC skill. The name and the text are cloned
+        // because the seed below consumes them, and a clone of one expansion is
+        // the price of not shortening it behind the user's back.
+        // The system prompt rides along for the same reason: it is consumed by
+        // `CarriedTurn::begin` below, and the refusal has to measure the same
+        // pair Stage A and Stage B did — system plus expansion.
+        //
+        // **REQ-587 BR-7: there is more than one of them, and REQ-585's guard
+        // could not see any of the others.** This list was a single `Option`
+        // built from `skill_turn`, which is `Some` only for a user-typed
+        // `/name` — so `skill_would_not_survive_refit` answered `None` for
+        // *every* model invocation and `refit_for_reroute` middle-elided the
+        // expansion, at the one seam REQ-585 built the guard for. On a
+        // boundary-configured machine that privacy pin is the expected path for
+        // any invocation that ran a dynamic command, so this was the common
+        // case, not a corner. The typed turn seeds the list; every expansion
+        // the model commits inside the loop joins it below, and the guard
+        // refuses on the first that would not survive.
+
+        Ok(accepted)
+    }
+
+    /// **Stage — assemble the prompt and arm the conversation for attempts.**
+    ///
+    /// The last thing before the loop. `CarriedTurn::begin` pushes the user
+    /// block and arms the guard, so nothing here may fail afterwards without
+    /// the commit protocol below deciding what to do about it.
+    fn prepare_the_attempts(
+        self: &Arc<Self>,
+        sessions: &SessionRegistry,
+        session_id: &SessionId,
+        config: &Config,
+        system: &str,
+        products: TurnProducts,
+    ) -> PreparedAttempts {
+        let TurnProducts {
+            route,
+            skill_turn,
+            prompt,
+            accepted,
+        } = products;
+        let refit_system = system.to_owned();
+        let skill_refit: Vec<(String, String, String)> = skill_turn
+            .as_ref()
+            .map(|skill| (skill.name.clone(), skill.text.clone(), refit_system.clone()))
+            .into_iter()
+            .collect();
+        // Where the typed seed ends and the loop's own expansions begin, so a
+        // second attempt rebuilds the tail rather than appending a duplicate of
+        // it: the tool's per-turn state accumulates across attempts.
+        let typed_refit = skill_refit.len();
+
+        // The seed, and its provenance (BR-7, ADR-9): the expansion for a skill
+        // turn, the typed text otherwise. One block either way — `push_user_from`
+        // with an empty set and `unknown: false` is byte-identical to the
+        // `push_user` every typed turn has always taken.
+        let (prompt, prompt_sources, prompt_unknown) = match skill_turn {
+            Some(skill) => (skill.text, skill.sources, skill.unknown),
+            None => (prompt, BTreeSet::new(), false),
+        };
+
+        // REQ-567 BR-1: this turn begins from what the session has already said.
+        // The head was rebuilt from *this* turn's tools and route, and the
+        // carried blocks are replayed under it — so a mid-session head change
+        // re-renders the same conversation rather than fossilizing an old head
+        // (BR-7). From here the manager is the conversation-in-progress:
+        // whichever outcome arrives — completed, failed, the task being dropped,
+        // or a panic — decides what the session keeps (see [`CarriedTurn`]),
+        // and there is exactly ONE place below where a turn's outcome becomes
+        // that decision.
+        let conversation = CarriedTurn::begin(
+            sessions,
+            session_id,
+            system,
+            &route.harness,
+            Arc::clone(&self.session_taint),
+            config.effective_boundaries(),
+            prompt,
+            // REQ-585 BR-7: a typed prompt is drawn from no file; a skill turn
+            // carries the skill file's id, or the unpinnable marker for a user
+            // skill outside the root. It is the same block either way.
+            prompt_sources,
+            prompt_unknown,
+        );
+
+        // The loop's carried state, bundled so the stage below takes three
+        // parameters instead of twenty (REQ-598 ADR-1: "two small structs, not
+        // one wide one"). `run_prompt_turn` owns it, so `conversation` and
+        // `route` survive the last attempt for the commit protocol to read.
+        let st = AttemptState {
+            attempts: 0,
+            rerouted_local: false,
+            withdrew_accepted_expansion: false,
+            accepted,
+            skill_refit,
+            conversation,
+            route,
+        };
+
+        PreparedAttempts {
+            state: st,
+            refit_system,
+            typed_refit,
+        }
+    }
+
+    /// **Stage — the attempt loop.**
+    ///
+    /// One `run_one_attempt` per iteration, with the reroute arms at the bottom
+    /// deciding whether to try again. Extracted whole rather than in pieces:
+    /// its `break 'turn` exits are the turn's exits, and splitting the loop
+    /// from the arms that break out of it would replace a label the compiler
+    /// checks with a convention a reader has to hold.
+    async fn run_attempts(
+        self: &Arc<Self>,
+        tctx: TurnContext<'_>,
+        inputs: AttemptInputs<'_>,
+        st: &mut AttemptState,
+    ) -> Result<PromptTurnResult, RpcError> {
+        'turn: loop {
+            tctx.core.router.emit_route_decided(
+                tctx.core.events,
+                Some(tctx.core.session_id.clone()),
+                &st.route,
+            );
+            let provider_id = st.route.provider_id.clone();
+
+            let result = self
+                .run_one_attempt(
+                    tctx,
+                    // Passed apart from `tctx` on purpose: `st.route` is reassigned
+                    // by the reroute arms at the foot of this loop, and a
+                    // context owning it would go stale (ADR-3).
+                    &st.route,
+                    inputs.phase,
+                    inputs.tools,
+                    inputs.tool_ctx,
+                    inputs.stream_events,
+                    st.conversation.ctx_mut(),
+                    inputs.prompt_spend,
+                    // REQ-589 BR-12 / ADR-8: the one turn whose top-of-loop
+                    // pressure gate is suspended is the one whose over-budget
+                    // measurement a human was shown and st.accepted. Built fresh
+                    // per attempt because `PressurePolicy` is consumed by the
+                    // call — which is the type carrying the "exactly one
+                    // iteration" rule rather than a flag someone has to reset —
+                    // and because a fallback attempt re-assembles the *same*
+                    // consented prompt, so it is owed the same suspension.
+                    if st.accepted.is_some() {
+                        PressurePolicy::SuspendedForAcceptedTurn
+                    } else {
+                        PressurePolicy::Enforced
+                    },
+                )
+                .await;
+
+            // REQ-587 BR-7: what the *loop* committed is only knowable now.
+            // Both reroute arms below sit under this `Err`, so the list is
+            // refreshed here — once, from the tool's own per-turn record of
+            // what it folded — rather than at each guard. The tail is rebuilt
+            // from `inputs.typed_refit` because that state accumulates across st.attempts.
+            if result.is_err() {
+                st.skill_refit.truncate(inputs.typed_refit);
+                st.skill_refit
+                    .extend(model_invoked_expansions(inputs.tools, inputs.refit_system));
+            }
+
+            // REQ-544 M-1: a privacy block is NOT a transient failure. It must
+            // never be retried against the blocked provider (which would emit
+            // duplicate `privacy_block` tctx.core.events and never reroute). Taint the
+            // session and re-run this same turn on the local tier — reusing the
+            // C-2 taint→local mechanism — so there is exactly one block event and
+            // one reroute. The egress choke point already emitted the single
+            // authoritative `privacy_block`.
+            if let Err(err) = &result {
+                // REQ-562 BR-3: the *cause* travels with the signal, so all
+                // three sentences below name which inspection refused the turn.
+                // Read as one value rather than asked twice — a block with no
+                // detail is not a block (see `HarnessError::privacy_block_detail`).
+                if let Some(detail) = err.privacy_block_detail() {
+                    if taints_the_session(detail) && self.session_taint.mark(tctx.core.session_id) {
+                        eprintln!("{}", taint_pin_line(taint_detail_word(detail)));
+                    }
+                    if !self.engine.present() {
+                        break 'turn Err(RpcError::new(
+                            error_code::PRIVACY_BLOCKED,
+                            unrerouteable_block_sentence(detail),
+                        ));
+                    }
+                    if st.rerouted_local {
+                        // Already rerouted to local (which has no egress and so
+                        // cannot privacy-block) — never loop.
+                        break 'turn Err(RpcError::new(
+                            error_code::PRIVACY_BLOCKED,
+                            failed_reroute_block_sentence(detail),
+                        ));
+                    }
+                    // REQ-586 BR-1: the budget follows the st.route. The local
+                    // pin's window is a fraction of the remote one this turn
+                    // was assembled against, so the context is re-fitted here —
+                    // after the st.route is chosen, before the retry — rather than
+                    // arriving over-window at a tier that has no fallback left.
+                    let previous = st.route.budget.clone();
+                    st.route = tctx
+                        .core
+                        .router
+                        .resolve_local_pin(reroute_after_block_reason(detail));
+                    if let Some(refusal) = skill_would_not_survive_refit(
+                        &st.skill_refit,
+                        inputs.typed_refit,
+                        &st.route,
+                    ) {
+                        if !relay_refit_refusal(
+                            &refusal,
+                            &mut st.conversation,
+                            inputs.tools,
+                            &mut st.skill_refit,
+                        ) {
+                            break 'turn Err(RpcError::new(
+                                error_code::SKILL_EXPANSION_TOO_LARGE,
+                                refusal.message,
+                            ));
+                        }
+                    }
+                    refit_for_reroute(
+                        &mut st.conversation,
+                        inputs.stream_events,
+                        &previous,
+                        &st.route.budget,
+                    );
+                    st.rerouted_local = true;
+                    continue;
+                }
+            }
+
+            // ── REQ-589 BR-14.1 / D-8: an approval must not leave the session
+            // hitting the same wall ──────────────────────────────────────────
+            //
+            // The tier refused the very bytes a human just approved. The turn
+            // is over either way — nothing about resending them can succeed —
+            // but the *session* must not be left holding the expansion that
+            // earned the refusal, because the budget the next turn is measured
+            // against is the one that already said these bytes fit. A window
+            // that disagrees with the stamped budget disagrees with it again on
+            // the next turn, and the next, which is the circle the reported
+            // `/analyze` failure walked.
+            //
+            // **Read through `context_refusal`, never by matching the two
+            // variants** (ADR-3). The local engine's refusal is its own variant
+            // and it is the tier the reported failure ran on; a predicate that
+            // matched `ContextLengthExceeded` here would handle the remote half
+            // and quietly miss the one that matters, exactly as the arm below
+            // used to.
+            //
+            // Sited here rather than in that arm for the same reason the
+            // privacy block above is: this is where `result` is still a
+            // `HarnessError` and `st.conversation` is still writable. The arm
+            // below composes the user's sentence from the same projection, so
+            // the words the model reads in the withdrawn block and the words
+            // the user reads in the error are one composer's (BR-5).
+            if let (Some(accepted), Some(refusal)) = (
+                st.accepted.as_ref(),
+                result
+                    .as_ref()
+                    .err()
+                    .and_then(HarnessError::context_refusal),
+            ) {
+                let sentence = refusal.sentence(&st.route.budget.window_label);
+                // BR-14.2, and it is marked whether or not the withdrawal below
+                // finds its block: the rejection is a thing this daemon
+                // *watched happen*, and the next offer for this pair is owed it
+                // regardless of what the st.conversation turned out to look like.
+                // Keyed off the st.route that actually refused — a fallback may
+                // have moved the turn since the offer was made, and it is the
+                // refusing window the next offer's lead is a claim about.
+                self.window_rejections.mark(
+                    tctx.core.session_id,
+                    &accepted.skill,
+                    &RouteWindow::of(&st.route.harness.budget),
+                );
+                st.withdrew_accepted_expansion =
+                    withdraw_accepted_expansion(&mut st.conversation, &accepted.text, &sentence);
+            }
+
+            match result {
+                Ok(outcome) => {
+                    // REQ-544 M-5: a provider that just served a turn is healthy
+                    // again — clear any earlier downgrade (including a half-open
+                    // re-probe that just succeeded) so a recovered provider returns
+                    // to full rotation on the next turn.
+                    if let Some(pid) = st.route.provider_id.as_ref() {
+                        self.record_health(&pid.0, HealthRecord::healthy());
+                    }
+                    // REQ-544 C-2's pin — "this turn's context intersects a
+                    // local-only boundary, so every later turn stays local" —
+                    // is evaluated at the commit seam rather than here. It has
+                    // to be: the cancellation path commits too, and a pin
+                    // written only in this arm left an aborted turn's boundary
+                    // content carried into the next prompt with nothing pinning
+                    // the session (see [`CarriedTurn::commit_now`]).
+                    break 'turn Ok(PromptTurnResult {
+                        turn_id: inputs.turn_id.clone(),
+                        stop_reason: outcome.stop_reason,
+                    });
+                }
+                // REQ-586 BR-2 / ADR-8: the tier answered that the request does
+                // not fit its window. A **typed outcome**, and therefore ahead
+                // of every `Remote` arm below: this is not a provider failure
+                // and must not be run through the machinery that treats one.
+                //
+                // No `record_health` — a provider that correctly reported its
+                // own limit is not unhealthy, and downgrading it would move
+                // *later* turns off a provider that is working. No
+                // `on_provider_failure` — a fallback would send the same bytes
+                // to a window that may be smaller, and would emit a
+                // `provider_degraded` blaming the provider for the daemon's
+                // sizing. And no retry, because nothing about resending
+                // unchanged bytes can succeed.
+                //
+                // The sentence carries the three numbers a user can act on and
+                // no response body (BR-11): who refused, what was assembled,
+                // and the budget the st.route was running under. A wide gap
+                // between the last two says the declared window is wrong; a
+                // narrow one says this content tokenizes denser than the
+                // estimator assumed.
+                //
+                // REQ-589 ADR-3: **both** window refusals arrive here, on one
+                // arm. The local engine has no provider to name, so it is its
+                // own variant; giving it its own arm as well would be a second
+                // place for the same sentence to be edited, and the local tier
+                // is precisely the one whose report was found wrong. Before
+                // this, a local over-window turn fell through to the
+                // `HarnessError::Engine` arm below and reached the user as
+                // `INTERNAL_ERROR "the local engine could not serve the turn"`.
+                Err(
+                    err @ (HarnessError::ContextLengthExceeded { .. }
+                    | HarnessError::LocalContextLengthExceeded { .. }),
+                ) => {
+                    break 'turn Err(RpcError::new(
+                        error_code::CONTEXT_LENGTH_EXCEEDED,
+                        // `Display` is the total fallback rather than an
+                        // `expect`: the pattern above admits only the two
+                        // variants `window_refusal_sentence` answers for, so
+                        // the fallback is unreachable, and a future third
+                        // window refusal degrades to a true sentence instead of
+                        // panicking the daemon.
+                        err.window_refusal_sentence(&st.route.budget.window_label)
+                            .unwrap_or_else(|| err.to_string()),
+                    ));
+                }
+                // REQ-588 BR-3 / ADR-4: the spend ceiling, answered here and
+                // **before** the generic remote arm below. That arm asks for a
+                // `failure_class`, and this error deliberately has none, so
+                // without this branch a budget stop would fall through to
+                // "provider failed unrecoverably" — a sentence that is wrong
+                // about the cause, silent about the money, and names no remedy.
+                //
+                // The sentence is composed here rather than carried up from the
+                // choke point because `TransportError` is `Copy` and cannot hold
+                // one — and because every fact it needs is already in scope at
+                // this point: the accumulator this prompt has been adding to,
+                // the ceiling the same tctx.core.config supplied to the choke point, and
+                // the st.route's provider and model. Composed through the one
+                // composer the `/verbose` clause uses, so the two surfaces
+                // cannot come to name different ceilings (BR-2).
+                Err(HarnessError::Remote(perr)) if perr.is_spend_ceiling_reached() => {
+                    use teton_core::cost_ceiling::{ceiling_refusal, unpriced_refusal, SpendBound};
+                    let bound = SpendBound::PromptCeiling;
+                    let ceiling = tctx.core.config.cost.ceiling_micro_cents().unwrap_or(0);
+                    let spent = inputs.prompt_spend.as_ref().map_or(0, |s| s.spent());
+                    // Two different problems with two different remedies, told
+                    // apart by what the prompt recorded: an unpriceable call is
+                    // not an overspend, and telling a user to raise a ceiling
+                    // when the real fix is a missing price would send them to
+                    // the wrong file.
+                    let message = if inputs
+                        .prompt_spend
+                        .as_ref()
+                        .is_some_and(|s| s.saw_unpriced())
+                    {
+                        unpriced_refusal(
+                            provider_id.as_ref().map_or("", |p| p.0.as_str()),
+                            st.route.model.as_deref().unwrap_or("(unknown model)"),
+                            bound,
+                        )
+                    } else {
+                        ceiling_refusal(spent, ceiling, bound)
+                    };
+                    break 'turn Err(RpcError::new(error_code::SPEND_CEILING_REACHED, message));
+                }
+                Err(HarnessError::Remote(perr)) if st.attempts < 2 => {
+                    st.attempts += 1;
+                    let Some(pid) = provider_id.as_ref() else {
+                        break 'turn Err(RpcError::new(
+                            error_code::INTERNAL_ERROR,
+                            "remote turn failed with no provider to fall back from",
+                        ));
+                    };
+                    let Some(class) = perr.failure_class() else {
+                        break 'turn Err(RpcError::new(
+                            error_code::INTERNAL_ERROR,
+                            "provider failed unrecoverably",
+                        ));
+                    };
+                    // REQ-544 M-5: persist the failed provider's health so the
+                    // downgrade survives into the next turn's routing. A transient
+                    // failure (Retry) leaves health untouched; a persistent one is
+                    // stamped with a half-open cooldown so it recovers on its own.
+                    if let Some(record) = health_record_after_failure(class, Instant::now()) {
+                        self.record_health(&pid.0, record);
+                    }
+                    let fo = tctx
+                        .core
+                        .router
+                        .on_provider_failure(&st.route, &pid.0, class);
+                    if let Some(degraded) = fo.degraded {
+                        tctx.core.router.emit_provider_degraded(
+                            tctx.core.events,
+                            Some(tctx.core.session_id.clone()),
+                            degraded,
+                        );
+                    }
+                    match fo.route {
+                        Some(next) => {
+                            // REQ-586 BR-1/ADR-2: a fallback provider may
+                            // declare a smaller window than the one that just
+                            // failed, so the same refit runs here. An in-place
+                            // degrade arrives through this arm too and is
+                            // silent by construction — it keeps the failed
+                            // provider's pair (see `refit_for_reroute`).
+                            let previous = st.route.budget.clone();
+                            st.route = next;
+                            if let Some(refusal) = skill_would_not_survive_refit(
+                                &st.skill_refit,
+                                inputs.typed_refit,
+                                &st.route,
+                            ) {
+                                if !relay_refit_refusal(
+                                    &refusal,
+                                    &mut st.conversation,
+                                    inputs.tools,
+                                    &mut st.skill_refit,
+                                ) {
+                                    break 'turn Err(RpcError::new(
+                                        error_code::SKILL_EXPANSION_TOO_LARGE,
+                                        refusal.message,
+                                    ));
+                                }
+                            }
+                            refit_for_reroute(
+                                &mut st.conversation,
+                                inputs.stream_events,
+                                &previous,
+                                &st.route.budget,
+                            );
+                            continue;
+                        }
+                        None => {
+                            break 'turn Err(RpcError::new(
+                                error_code::UNKNOWN_PROVIDER,
+                                "provider failed and no fallback is configured",
+                            ));
+                        }
+                    }
+                }
+                Err(HarnessError::Remote(_)) => {
+                    break 'turn Err(RpcError::new(
+                        error_code::INTERNAL_ERROR,
+                        "remote turn failed after exhausting fallbacks",
+                    ));
+                }
+                // BUG-146: name what actually failed. The reason is the
+                // engine's own sentence, which on this path is always a static
+                // literal or an already-scrubbed backend message — never a
+                // path or prompt text (BR-11).
+                Err(HarnessError::Engine(e)) => {
+                    break 'turn Err(RpcError::new(
+                        error_code::INTERNAL_ERROR,
+                        format!("the local engine could not serve the turn: {e}"),
+                    ));
+                }
+                // BUG-146: nothing could serve the turn. The daemon knows
+                // exactly why — it published the same fact on the lifecycle
+                // stream moments earlier — so it says so, with the action.
+                // BUG-152: and with the code that says whether there is an
+                // action at all, or only a wait.
+                Err(HarnessError::NoTierAvailable) => {
+                    // The category the turn was routed by — read off the
+                    // resolution rather than recomputed, and `None` for the taint
+                    // pin, which resolved no category at all (BR-7).
+                    let category = st.route.resolution.as_ref().map(|r| r.category);
+                    // REQ-572 ADR-4: the same classification, plus the
+                    // `capability_dead_end` announcement for the one cause that
+                    // names an absent capability rather than a broken one.
+                    break 'turn Err(unserved_turn_sentence(
+                        &st.route,
+                        self.unserved_turn_error_announcing(
+                            tctx.core.config,
+                            category,
+                            tctx.core.events,
+                            tctx.core.session_id,
+                        ),
+                    ));
+                }
+                // REQ-544 M-3: a credential that will not resolve is a tctx.core.config
+                // problem, not a transient fault — surface it clearly (the
+                // message names the reference and reason, never the secret) and
+                // do not retry the same broken credential.
+                Err(HarnessError::Credential(msg)) => {
+                    break 'turn Err(RpcError::new(error_code::CONFIG_REJECTED, msg));
+                }
+            }
+        }
+    }
+
+    /// **Stage — commit what the turn produced, or abandon it whole.**
+    ///
+    /// Every ending of the attempt loop funnels here, which is what makes BR-6's
+    /// atomicity a property of the shape rather than of ten exits each
+    /// remembering to disarm.
+    fn commit_or_abandon(
+        &self,
+        outcome: Result<PromptTurnResult, RpcError>,
+        st: AttemptState,
+        stream_events: &SessionEvents,
+    ) -> Result<PromptTurnResult, RpcError> {
+        // REQ-567 D-1, the whole commit protocol in one place. A turn that
+        // completed hands the session what its manager holds — the retained
+        // view, post cut and post compaction, moved rather than re-derived. A
+        // turn that failed writes nothing at all, which is what makes BR-6's
+        // "byte-identical to the failed turn never having run" true by
+        // construction: the pre-turn vector was never touched.
+        //
+        // # The one failure that writes, and why (REQ-589 BR-14.1 / D-8)
+        //
+        // BR-14.1 asks for an st.accepted expansion to be *withdrawn* from the
+        // session when the tier refuses it at the window, so the next turn
+        // assembles without it. Under abandon alone that withdrawal is
+        // unobservable: the manager it edited is dropped, the pre-turn vector
+        // is what the session keeps, and nothing any test can drive would tell
+        // the withdrawal apart from its deletion (LESSON-544's exact shape —
+        // a producer with no consumer, invisible to a green suite). So the
+        // withdrawal is what this turn commits, and BR-6's "no trace" is
+        // narrowed by exactly one path: an over-budget send a human approved,
+        // that the tier then refused at the window, whose block was found.
+        //
+        // What it writes is **smaller than what it was handed** — the same
+        // st.conversation with the expansion replaced by the refusal that killed
+        // it, and the block's provenance absorbed rather than shed (BUG-188).
+        // A user who approved once is left with a session that can take
+        // another turn, which is D-8's whole ask; the alternative is a
+        // withdrawal that is a comment.
+        //
+        // **This is a deviation from REQ-567 BR-6 and is flagged as one.** The
+        // narrowness is the mitigation: every other failure — every retry
+        // class, every reroute, every panic — still abandons.
+        match outcome {
+            Ok(result) => {
+                // REQ-586 BR-10: the commit re-asserts the budget one last
+                // time, and what it took is news like any other clamp. Written
+                // as one call rather than two lines so that the fixture
+                // standing in for this dispatch runs the same protocol — see
+                // [`commit_and_publish`].
+                commit_and_publish(st.conversation, stream_events, &st.route.budget);
+                Ok(result)
+            }
+            Err(err) if st.withdrew_accepted_expansion => {
+                // The withdrawal, and the turn's error, both. The commit runs
+                // the same protocol the success arm does — it re-asserts the
+                // budget and evaluates the taint pin — because what is being
+                // handed over is a st.conversation the session will assemble from
+                // next, not a special case of one.
+                commit_and_publish(st.conversation, stream_events, &st.route.budget);
+                Err(err)
+            }
+            Err(err) => {
+                st.conversation.abandon();
+                Err(err)
+            }
+        }
+    }
+
     /// Why no tier could serve a turn, said so the user can act on it
     /// (BUG-146) — and coded so a client can tell "wait" from "fix something"
     /// (BUG-152).
@@ -1236,1148 +2851,6 @@ impl DaemonRuntime {
                  the limit still stands",
                 provider_id.0, err.message, applied
             ),
-        }
-    }
-
-    /// Run one prompt turn for `session`, streaming events over `events` and
-    /// returning the turn result.
-    ///
-    /// This is the daemon-side integration seam: it resolves the route (structured
-    /// phase policy or freeform heuristic), builds the appropriate
-    /// [`crate::harness::CompletionSource`] (local engine or a remote provider
-    /// through the egress choke point), runs the unified turn loop, and — on a
-    /// remote failure — falls back per the router (AC-7).
-    ///
-    /// ## A turn that meets a warming tier waits for it (REQ-580)
-    ///
-    /// A turn whose route has nowhere to run **only** because the local tier is
-    /// still coming up — its weights downloading, or installed and mid-load —
-    /// is held here until the tier settles, then routed afresh and run exactly
-    /// as if it had been sent that moment. The hold is announced on the bus as
-    /// `turn_queued` and taken *before* the turn's tools, head or conversation
-    /// exist, so a held turn has spent nothing; a settled absence is refused
-    /// immediately, exactly as before. `presence` is what ends a hold early: a
-    /// client that disconnects while its turn waits gets no ghost turn run on
-    /// its behalf once the tier opens (see [`ClientPresence`]).
-    ///
-    /// ## A `/name` invocation is expanded here, and expanded FIRST (REQ-585)
-    ///
-    /// `skill` is the invocation as it crossed the wire — a name and the rest of
-    /// the typed line, never an expansion (ADR-3) — and `prompt` is empty
-    /// whenever it is `Some`. The expansion is built before
-    /// [`Self::dispatch_route`] and before [`Self::spawn_title_session`],
-    /// because both of those read the prompt *text*: a skill turn expanded after
-    /// them would be classified from `""` and would spend the session's one
-    /// naming attempt on `""`. From there the order is BR-8's, and BR-8(c) is a
-    /// statement about a single line — [`CarriedTurn::begin`] both pushes the
-    /// user block and arms the drop-commit, so a check placed after it has
-    /// already committed the expansion:
-    ///
-    /// ```text
-    /// probe root → expand → route + route.budget → Stage A
-    ///            → (TASK-205: consent + commands) → Stage B → CarriedTurn::begin
-    /// ```
-    ///
-    /// # Errors
-    /// Returns a [`RpcError`] when no provider can serve the turn, an
-    /// unrecoverable provider failure occurs, the named skill is not one this
-    /// session dispatches ([`error_code::INVALID_PARAMS`]), or its expansion does
-    /// not fit the route's budget ([`error_code::SKILL_EXPANSION_TOO_LARGE`]).
-    // The parameters are the session's own facts, passed individually because
-    // that is how the caller reads them off `session/prompt` — the same shape
-    // `run_one_attempt` already carries below. `session_cwd` is the caller's
-    // pre-claim snapshot of the root; the turn re-reads the registry once it
-    // holds the claim and uses the snapshot only if the session is gone.
-    //
-    // `invoker` is the connection that sent this prompt, and it is carried for
-    // exactly one purpose: a skill's dynamic-context consent is **addressed** to
-    // it and answerable by nobody else (REQ-585 ADR-7). `None` is a caller with
-    // no connection at all — an internal driver or a fixture — and it asks
-    // nobody, which is the gate's own fail-closed answer rather than a fallback
-    // to the bus.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn run_prompt_turn(
-        self: &Arc<Self>,
-        events: &Arc<EventBus>,
-        sessions: &SessionRegistry,
-        session_id: SessionId,
-        mode: SessionMode,
-        phase: Option<ProtoPhase>,
-        session_cwd: Option<PathBuf>,
-        prompt: String,
-        skill: Option<SkillInvocation>,
-        invoker: Option<ConnectionId>,
-        mut presence: ClientPresence,
-    ) -> Result<PromptTurnResult, RpcError> {
-        let turn_id = teton_protocol::TurnId::from(format!(
-            "turn-{}",
-            self.turn_counter.fetch_add(1, Ordering::SeqCst)
-        ));
-
-        // REQ-567 BR-5 / D-3: claim the session before ANY of this turn's work.
-        // Two `session/prompt` calls on one session can be in flight at once —
-        // each runs on its own task — and both would replay the same snapshot
-        // and both commit, so the second commit would erase the first turn's
-        // blocks wholesale. Refused rather than queued, with the turn already
-        // running named in the sentence.
-        //
-        // Placed first so a refused prompt spends nothing: no classifier call,
-        // no title duty, no tool registry. The claim releases on drop, so every
-        // exit below — including the task abort that has no code to run — frees
-        // the session.
-        //
-        // Bound for the whole function on purpose, and declared BEFORE the
-        // conversation guard below so it outlives it: locals drop in reverse,
-        // which means the commit happens while this session is still claimed and
-        // a waiting client cannot slip a turn between the write and the release.
-        let _claim = sessions
-            .try_begin_turn(&session_id, &turn_id)
-            .map_err(|err| refused_claim_error(&err))?;
-
-        // REQ-583 verify: the `session_cwd` parameter was read off the registry
-        // BEFORE the claim above was taken (`spawn_prompt_turn` snapshots the
-        // summary, then spawns). A `session/set_cwd` that landed in that window
-        // moved the root and cleared the conversation — and a turn built on the
-        // stale snapshot would run jailed to the old root, state that root in
-        // its environment block, and commit its blocks into the just-cleared
-        // conversation. Now that the claim is held no move can land, so the
-        // registry's path is authoritative for the whole turn and is re-read
-        // here; the snapshot stands in only for a session the registry no
-        // longer has, which the claim a moment ago says is not this one.
-        let session_cwd = sessions
-            .get(&session_id)
-            .map(|summary| summary.cwd)
-            .unwrap_or(session_cwd);
-
-        // REQ-583 ADR-1: the root is probed once per turn, from the registry's
-        // path, and the ONE probe feeds every consumer — the jail
-        // (`ToolContext::for_root`), the prompt's environment block
-        // (`route.harness.session_root`) and, since REQ-585, the identity a
-        // skill turn's user block is pinned to. (The skill file's *display*
-        // spelling is discovery's, not this probe's — it needs the skill's
-        // source as well, which only the registry has; BUG-187.)
-        // It is read here rather than beside the jail below because the
-        // expansion needs it and the expansion runs before the route (see the
-        // comment at `accept_invocation`'s call site).
-        let probed = self.session_root_for(session_cwd.as_deref());
-
-        // REQ-585 BR-4/ADR-3: **expand before routing.** A skill turn's `prompt`
-        // is empty by ADR-3 — the invocation crosses the wire as a name — and
-        // both readers of the prompt text are below this line: `dispatch_route`
-        // runs the freeform classifier over it, and `spawn_title_session` spends
-        // the session's one naming attempt on it. Expanding after either would
-        // classify and name every invocation from `""`: on a machine with
-        // per-category bindings that is a route chosen from nothing, and it is a
-        // session left unnamed for its whole life.
-        //
-        // Refusing here is free in BR-8(c)'s sense: nothing has been seeded, no
-        // route has been decided, and no event has been published.
-
-        // This turn's ONE config snapshot, taken before the expansion rather
-        // than after it because the gate below reads it and the expansion below
-        // needs the gate (REQ-589 ADR-10). Handed on rather than re-read: the
-        // route, the gate, the registry and the capability clause further down
-        // are then four readings of one config, so a commit that lands mid-turn
-        // moves the next turn instead of leaving this one's prompt disagreeing
-        // with its own tool set (REQ-572 verify).
-        let config = self.config.lock().expect("config mutex poisoned").clone();
-        // Fetched before the tools, because the web tool holds it: that tool
-        // raises its own per-tier prompt inside its run rather than being
-        // authorized by name at dispatch (REQ-563 BR-3/BR-12). Fetched rather
-        // than built, because a gate rebuilt per turn forgets every
-        // "allow for this session" answer at the end of the turn that earned it.
-        //
-        // **And now before the expansion too** (REQ-589 BR-6 / ADR-10): a typed
-        // project skill's trust question is asked inside `accept_invocation`,
-        // which is the first thing this turn does with the invocation. The fetch
-        // is a per-session cache lookup, so asking for it earlier reads the same
-        // gate with the same remembered answers — only sooner.
-        let gate = self.permission_gate_for(&session_id, events, &config);
-        // **The turn's one registry snapshot**, taken here under the claim and
-        // read by both consumers: the `/name` resolution just below, and the
-        // `skill` tool `build_tools` registers further down (REQ-587 ADR-3,
-        // ADR-5). An `Arc` clone off the session registry, not a discovery —
-        // `discovery_is_paid_at_create_and_at_cd_and_never_per_turn` pins that
-        // no turn opens a directory, and this opens none.
-        //
-        // One turn, one snapshot, for the reason the config above is one
-        // snapshot: a `/cd` landing between two reads would leave the roster
-        // the model was shown and the registry its call resolves against
-        // describing two different roots. The claim is held, so no move can
-        // land — which makes the single read a *statement* rather than a race
-        // this happens to win.
-        let skills = sessions.skills(&session_id);
-        let mut skill_turn = match &skill {
-            // `invoker` is carried in for REQ-589 ADR-10's acknowledgment: the
-            // question is **addressed** to the connection that typed the `/name`
-            // and answerable by nobody else, exactly as the dynamic-context
-            // question below it is (REQ-585 ADR-7).
-            Some(invocation) => Some(
-                self.accept_invocation(&skills, &probed, invocation, &gate, invoker)
-                    .await?,
-            ),
-            None => None,
-        };
-        // The one reading of "this turn's prompt text". For a skill turn it is
-        // the **body-only** expansion — the dynamic-context output is not folded
-        // in yet, and that is deliberate rather than incidental: the classifier
-        // reads the skill's instructions, and the alternative would make the
-        // route depend on output that the route's own permission level decides
-        // whether to produce.
-        let routed_text: &str = skill_turn
-            .as_ref()
-            .map_or(prompt.as_str(), |skill| skill.text.as_str());
-
-        let router = self.turn_router(&config, &session_id);
-
-        let core_phase = phase.map(to_core_phase);
-        let mut route = self
-            .dispatch_route(&router, &session_id, mode, core_phase, routed_text)
-            .await;
-
-        // REQ-580 BR-1/BR-3: a turn with nowhere to run *only* because the
-        // local tier is still coming up is held here, and then routed afresh.
-        //
-        // Here and not at the `NoTierAvailable` arm below, because everything
-        // between — the tools, the system head, the carried conversation — is
-        // built from the route, and a turn served after the wait must be
-        // built from the route it is served *by* (REQ-567 BR-7 for a single
-        // turn: the head is this turn's, not a stale one's). Nothing above this
-        // line has spent anything a held turn should not spend: the session
-        // claim (which is the point — a second prompt on this session while
-        // this one waits is `SESSION_BUSY`, naming it), and a `dispatch_route`
-        // that the warming tier caused to bypass its classifier.
-        //
-        // The predicate is the attempt's own (`attempt_source`, the reading
-        // `run_one_attempt` refuses on) crossed with the tier's state
-        // (`local_tier_hold`, the reading `unserved_turn_error` codes
-        // `TIER_WARMING` on) — so a turn is held on exactly the two facts that
-        // would otherwise have refused it with "retry in a moment", and no
-        // other. A route the router sent somewhere that can serve (a remote
-        // provider) is not held: the tier's state is not that turn's concern
-        // (REQ-547 D-3 — the gate withholds the tier, never the session).
-        let router = match self.hold_for(&config, &route) {
-            Some((waiting_on, model_id)) => {
-                events.publish(
-                    Some(session_id.clone()),
-                    Event::TurnQueued(TurnQueued {
-                        turn_id: turn_id.clone(),
-                        model_id,
-                        waiting_on,
-                    }),
-                );
-                tokio::select! {
-                    () = self.await_local_tier() => {}
-                    // The client left while the turn was still held. Nothing
-                    // was spent and nobody is listening: end the turn with the
-                    // refusal it would have carried without the hold — the same
-                    // classifier, the same sentence — rather than run a ghost
-                    // turn on the tier when it opens (ADR-3).
-                    () = presence.gone() => {
-                        let category = route.resolution.as_ref().map(|r| r.category);
-                        return Err(unserved_turn_sentence(
-                            &route,
-                            self.unserved_turn_error(&config, category),
-                        ));
-                    }
-                }
-                // Fresh, from the tier's settled state: the router now sees the
-                // tier as it is, and the classifier — bypassed while the tier
-                // was down — runs for real. If the tier failed instead of
-                // opening, this route lands on the `NoTierAvailable` arm below,
-                // where the classifier now says something settled.
-                let router = self.turn_router(&config, &session_id);
-                route = self
-                    .dispatch_route(&router, &session_id, mode, core_phase, routed_text)
-                    .await;
-                router
-            }
-            None => router,
-        };
-
-        // REQ-598 ADR-4 / BR-2.1: **this** is the earliest point a
-        // `TurnContext` may be built, and the line above is why.
-        //
-        // BR-2 asks for construction after the turn is claimed, and the claim is
-        // ~150 lines above. That is necessary and not sufficient. BR-2 names one
-        // instance of a class: *a context must not be constructed before any
-        // point that rebinds a field it captures.* `router` is bound before
-        // `dispatch_route`, and then **shadow-rebound by the hold above** when
-        // the local tier was still warming — rebuilt from the settled tier state
-        // so the classifier that was bypassed while the tier was down runs for
-        // real.
-        //
-        // A context built at the first `router` binding satisfies BR-2, passes
-        // this file's whole suite, and hands every consumer below a router
-        // describing a tier state that no longer exists — silently breaking
-        // REQ-580's guarantee that a turn served after the wait is built from
-        // the route it is served *by*. The guard is mechanical, not this
-        // comment: see the BR-2.1 warming-tier test in this module.
-        let tctx = TurnContext::new(events, &session_id, &config, &router, &gate, invoker);
-
-        // REQ-561 TASK-062: name the session, at most once for its whole life.
-        // Ahead of the turn rather than after it, for two reasons: the name is
-        // derived from the prompt, which is already in hand, so a client can
-        // label the session the moment the user hits enter rather than a whole
-        // answer later; and this is a point on the path that every turn
-        // reaches, where the turn's own maze of early returns is still ahead.
-        //
-        // After the hold rather than before it (REQ-580): the title's route
-        // reads the same tier state the turn's does, and a title requested of a
-        // tier that is still loading spends the session's one naming attempt on
-        // a duty that cannot run — the first prompt of every session that
-        // started during a load stayed untitled for its whole life. One
-        // classification's latency later is the price, and it is paid on the
-        // local model.
-        //
-        // **Started here, not awaited here.** The turn proceeds while the
-        // naming runs on its own task; the handle is dropped because nothing
-        // below reads a title, and a session that is not named yet is a session
-        // with no title — BR-3's degraded state. It cannot fail the turn — see
-        // `spawn_title_session`.
-        //
-        // REQ-585: `routed_text`, not `prompt` — the naming attempt is spent
-        // once per session, and a skill turn's `prompt` is empty.
-        //
-        // **A skill turn names later**, below Stage A. The naming duty is a
-        // model call: on a machine with `reflex` bound remotely it puts a
-        // bounded copy of its input on the wire. Spending it here would make
-        // BR-8's refusal sentence — *"Nothing was sent and no provider saw this
-        // turn"* — true of the turn and false of the machine, and would spend
-        // the session's one naming attempt on an expansion that never ran. A
-        // typed prompt still names exactly here, so REQ-561's "label the
-        // session the moment the user hits enter" is unchanged for every turn
-        // that is not a skill invocation.
-        if skill_turn.is_none() {
-            let _ = self.spawn_title_session(
-                tctx.core,
-                sessions,
-                routed_text,
-                // A typed prompt is the user's own bytes, read from no file, so
-                // there is nothing for a boundary to be compared against. This
-                // is the one call site for which the empty value is a statement
-                // rather than an omission — the skill call site below is the
-                // other one, and it says something different.
-                Provenance::empty(),
-            );
-        }
-
-        // Assemble the harness context, tools, and the permission gate once; a
-        // fallback re-runs the loop against the same accumulated context.
-        //
-        // REQ-544 (known limitation, deliberately deferred): the retry/fallback
-        // path below re-runs the loop against this *same* `ctx`, which by design
-        // preserves completed work (file reads/edits done before a mid-turn
-        // transient failure). The trade-off is that the accumulated context is
-        // re-sent to the retry/fallback provider and thus re-billed as input
-        // tokens — a mid-turn transient failure re-bills the partial progress.
-        // A clean fix (snapshot `ctx` here and restore it before a retry, or drive
-        // retries at single-call granularity so only the failed call is re-issued)
-        // changes the "continue vs. restart" semantics and needs a product call on
-        // whether a fallback should preserve or discard partial work; it is out of
-        // scope for this correctness pass. `ContextManager` is `Clone`, so the
-        // snapshot itself is cheap when that decision is made.
-        // TODO(REQ-544 followup): make retries cost-neutral once continue-vs-restart
-        // semantics are decided.
-        // REQ-563 BR-3: every URL in this prompt joins the session's user-pasted
-        // set **before** the turn runs, so a message that pastes a link and asks
-        // about it in one breath classifies as `UserPasted` — the ordinary
-        // shape of the request. This is the one ingestion point, and the text it
-        // reads is the user's own (see `record_user_prompt_urls`).
-        //
-        // REQ-585: `prompt`, deliberately — **not** `routed_text`. A skill body
-        // is file-authored, and feeding it here would let a file on disk author
-        // its own authorization by writing a URL into the set the web tool then
-        // trusts. A skill turn's `prompt` is empty, so an invocation contributes
-        // nothing, which is the correct answer: nobody pasted anything.
-        self.record_user_prompt_urls(&session_id, &prompt);
-        // The gate is the one fetched above the expansion (REQ-589 ADR-10). It
-        // is still fetched before the tools, which is what the web tool needs:
-        // that tool raises its own per-tier prompt inside its run rather than
-        // being authorized by name at dispatch (REQ-563 BR-3/BR-12).
-        //
-        // This turn's config snapshot is handed on rather than re-read: the
-        // route, the gate, the registry and the capability clause below are then
-        // four readings of ONE config, so a commit that lands mid-turn moves the
-        // next turn instead of leaving this one's prompt disagreeing with its
-        // own tool set (REQ-572 verify).
-        let tools = self
-            // REQ-587 ADR-3: the connection that submitted this turn is the
-            // addressee of any consent the `skill` tool raises — it now travels
-            // on `tctx` with the rest of the turn's facts (REQ-598). `ConnectionId`
-            // is `Copy`, so the seam below still consumes its own.
-            .build_tools(tctx, Arc::clone(&skills))
-            .await;
-        // BUG-147: jail this session's tools to the CLIENT's working directory.
-        // The daemon-global `repo_root` is only a fallback for clients that did
-        // not send one — under launchd it is `/`, which is what had every tool
-        // call running against the filesystem root.
-        //
-        // REQ-583 ADR-1: the root is probed here, per turn, from the registry's
-        // path — never cached, never client-derived — and the ONE probe feeds
-        // both consumers: the jail (`ToolContext::for_root`, whose refusals name
-        // the display) and the prompt (`route.harness.session_root`, the
-        // environment block). Both are built from one `ProbedRoot`, so the jail
-        // path and the probed view cannot come from two readings. Probing per
-        // turn is what keeps the branch honest after a checkout between turns
-        // and moves every consumer the turn after a `/cd` rewrote the path.
-        //
-        // REQ-585 moved the probe itself to the top of the turn — the expansion
-        // needs it, and the expansion runs before the route — so `probed` here
-        // is that same single reading, not a second one.
-        let tool_ctx = ToolContext::for_root(&probed);
-        let stream_events = SessionEvents::new(events.clone(), session_id.clone());
-
-        // REQ-572 BR-3: the prompt's capability clause reads the same classifier
-        // that decides tool exposure — stated here, where both inputs live, so
-        // the SearchUnavailable clause can reach a session (the registry
-        // fallback alone cannot distinguish it from Ready).
-        route.harness.web_capability = Some(web_capability_state(
-            &config.web,
-            self.local_model_present(),
-        ));
-        // REQ-583 BR-1: the same probed root the jail above was built from — so
-        // the environment block and the jail's refusals print one spelling.
-        route.harness.session_root = Some(probed.view.clone());
-        // REQ-584 BR-7: known project names for a NON-project root, ranked by
-        // `last_seen` and bounded here, where the registry is. The composer
-        // places them and decides how many fit; deriving them there would put a
-        // filesystem-backed read inside a pure renderer.
-        //
-        // **Reads the stored snapshot only — it never scans** (BR-3): this runs
-        // on every turn, and a turn that did not ask for projects must not pay
-        // for a directory walk, let alone raise the macOS Documents dialog.
-        route.harness.known_projects =
-            if probed.view.kind == teton_protocol::methods::RootKind::Project {
-                Vec::new()
-            } else {
-                self.projects
-                    .snapshot()
-                    .rank(None)
-                    .iter()
-                    .map(|p| {
-                        teton_core::session_root::bounded_field(
-                            &p.name,
-                            teton_core::session_root::NAME_MAX_CHARS,
-                        )
-                    })
-                    .collect()
-            };
-        let system = build_system_prompt(&tools, &route.harness);
-
-        // ── REQ-585 BR-8 / ADR-11: Stage A — does the BODY fit? ──────────────
-        //
-        // Before the user is asked to approve anything (BR-8d), and before
-        // `CarriedTurn::begin` below, which both pushes the user block and arms
-        // the drop-commit — so a check placed after it would have committed the
-        // very expansion it is refusing (BR-8c). Nothing is derived here: the
-        // budget is the one `Router::budget_for` stamped on this route, and the
-        // measurement is `ContextManager::would_seed_fit`, the estimators the
-        // pressure path itself runs on.
-        //
-        // A refused turn returns from here: no `context_pressure` of any kind,
-        // no health change, no degradation, no retry — none of the machinery
-        // below has run.
-        //
-        // ── REQ-589 BR-2/BR-3: and the refusal is now a *question* ───────────
-        //
-        // Over budget no longer ends the turn on its own. On the user-typed path
-        // — this one, and only this one — the measurement is put to the person
-        // who typed the name, who may send it anyway, take a durable fix, or
-        // decline. Declining is byte-for-byte the refusal above it replaced
-        // (AC-3), and every not-sent arm still returns from here with BR-11
-        // intact: the naming duty is below this line, so a refused turn has
-        // spent no model call.
-        //
-        // `SkillCaller::User` is not passed because it cannot be anything else:
-        // `skill_turn` is `Some` only for a typed `/name`, and
-        // `OverBudgetOffer`'s composer hardcodes it (BR-2). The model's own
-        // expansions are measured by the loop's `skill_append_fit` and are never
-        // offered a choice.
-        //
-        // The one place this turn's pressure policy can be decided, because it
-        // is the one place an over-budget send is consented to (BR-12).
-        //
-        // **One variable, not a flag beside a payload** (REQ-589 BR-14.1). This
-        // was a `bool` and an `Option<String>` set on the same two arms; the
-        // withdrawal below needs the skill's *name* as well, and a third local
-        // that three arms have to remember to keep in step is how one of them
-        // comes to say a turn was accepted while another cannot say what was
-        // accepted. `Some` **is** "this turn's over-budget send was consented
-        // to", and everything downstream reads it from here.
-        let mut accepted: Option<AcceptedExpansion> = None;
-        if let Some(skill) = &skill_turn {
-            match self
-                .offer_or_refuse_over_budget(
-                    tctx,
-                    &route,
-                    SkillStage::Body,
-                    skill,
-                    &system,
-                    // Nothing has been accepted yet: this is the turn's first
-                    // question.
-                    None,
-                )
-                .await
-            {
-                SkillStageVerdict::Fits => {}
-                SkillStageVerdict::Accepted => {
-                    // The exact bytes the answer was about, carried to Stage B
-                    // so an unchanged expansion is not put to the user twice —
-                    // and to the failure path below, which has to find this
-                    // block in the conversation to withdraw it (BR-14.1).
-                    accepted = Some(AcceptedExpansion {
-                        skill: skill.name.clone(),
-                        text: skill.text.clone(),
-                    });
-                }
-                SkillStageVerdict::NotSent(message) => {
-                    return Err(RpcError::new(
-                        error_code::SKILL_EXPANSION_TOO_LARGE,
-                        message,
-                    ));
-                }
-            }
-        }
-
-        // Stage A said the body fits, so this turn is going to happen and the
-        // session may be named after it. Deferred to here rather than run with
-        // the typed prompts above, because the naming duty is a model call and
-        // a refused turn must not have reached one (BR-8).
-        //
-        // **With the expansion's own provenance** (REQ-587 verify). `routed_text`
-        // here is `SkillTurn::text` — the skill file's bytes — and the duty sends
-        // a bounded copy of it to a route `title_route` resolves *remotely*
-        // unless the session is already tainted, which on the session's first
-        // substantive prompt it is not. `Provenance::empty()` short-circuits
-        // `Egress::send` before any boundary check, so passing it here would ship
-        // a `local-only` skill body (or a user skill's fail-closed `unknown`) off
-        // the machine through the one duty the turn does not wait for.
-        //
-        // The values are read off the turn rather than recomputed, and they are
-        // this text's provenance *at this point in the function*: the commands
-        // have not run yet, so `routed_text` still carries
-        // `PENDING_PLACEHOLDER` where their output will go and no command has
-        // contributed anything for `unknown` to account for. The seam below OR's
-        // in `spawned` before the user block is seeded, which is the same rule
-        // applied to a longer string — not a second reading of this one.
-        if let Some(skill) = skill_turn.as_ref() {
-            let _ = self.spawn_title_session(
-                tctx.core,
-                sessions,
-                routed_text,
-                expansion_provenance(&skill.sources, skill.unknown),
-            );
-        }
-
-        // ── REQ-585 BR-6 / BR-12: dynamic-context consent and execution ──────
-        //
-        // The TASK-205 seam. One `authorize_skill` for the whole invocation,
-        // `run_all` in document order with the session root as cwd, the outcomes
-        // folded back into `skill_turn.text`, and BR-12's `skill_invoked`
-        // published — in that order, and all of it **between** the two budget
-        // stages.
-        //
-        // Stage A is above this and must stay there: a body that cannot fit is
-        // refused *before* a user is walked through approving four commands,
-        // watching them run, and then being told the turn was refused (BR-8d).
-        // Stage B is below it and must stay there: until this seam runs, the
-        // slots hold `skills::PENDING_PLACEHOLDER` — exactly what Stage A
-        // measured — and it is the fold that makes the second measurement a
-        // different one.
-        // ─────────────────────────────────────────────────────────────────────
-        if let Some(skill) = &mut skill_turn {
-            self.settle_dynamic_context(events, &session_id, &gate, &probed.path, invoker, skill)
-                .await;
-        }
-
-        // ── REQ-585 BR-8 / ADR-11: Stage B — does it still fit with the
-        // dynamic-context output folded in? ──────────────────────────────────
-        //
-        // Reached only once Stage A has answered `Fits` **or was accepted**,
-        // which is what entitles this stage's sentence to say the body itself
-        // fit. Still before `CarriedTurn::begin`, for Stage A's reason.
-        //
-        // REQ-589: this stage offers too, and the wire carries which stage
-        // spoke precisely so it can. The two are different questions and the
-        // sentence says so — Stage A's is about the body, Stage B's has to say
-        // that the dynamic-context output is what spent the room, which is a
-        // different thing for the user to act on. Leaving this one a hard
-        // refusal would mean a skill with one oversized `` !`command` `` output
-        // could never be sent even by someone who understood exactly what they
-        // were asking for, and would leave `SkillStage::WithDynamicContext`
-        // unreachable on every surface TASK-241 put it on.
-        //
-        // BR-11 reads differently here, and the difference is not new: the
-        // naming duty and the dynamic-context commands are both *above* this
-        // line, so a Stage B refusal has spent them — exactly as it did before
-        // REQ-589. What is unchanged is the invariant that matters for
-        // `-32023`: no provider has seen this turn.
-        if let Some(skill) = &skill_turn {
-            match self
-                .offer_or_refuse_over_budget(
-                    tctx,
-                    &route,
-                    SkillStage::WithDynamicContext,
-                    skill,
-                    &system,
-                    // What Stage A's answer was about, if there was one. An
-                    // expansion the fold left untouched is the same question,
-                    // already answered a few lines up — asking again would let
-                    // a second refusal kill a turn the user had just approved.
-                    accepted.as_ref().map(|a| a.text.as_str()),
-                )
-                .await
-            {
-                SkillStageVerdict::Fits => {}
-                // Recorded with **this** stage's bytes, which is the point of
-                // re-assigning rather than only raising a flag: the fold may
-                // have grown the expansion since Stage A, and it is the folded
-                // text that becomes the block a failure has to withdraw
-                // (BR-14.1). A Stage-B-only acceptance — Stage A said `Fits`,
-                // the dynamic-context output is what spent the room — leaves
-                // this `None` if it does not write here, and the withdrawal
-                // would then have nothing to look for.
-                SkillStageVerdict::Accepted => {
-                    accepted = Some(AcceptedExpansion {
-                        skill: skill.name.clone(),
-                        text: skill.text.clone(),
-                    });
-                }
-                SkillStageVerdict::NotSent(message) => {
-                    return Err(RpcError::new(
-                        error_code::SKILL_EXPANSION_TOO_LARGE,
-                        message,
-                    ));
-                }
-            }
-        }
-
-        // The seed, and its provenance (BR-7, ADR-9): the expansion for a skill
-        // turn, the typed text otherwise. One block either way — `push_user_from`
-        // with an empty set and `unknown: false` is byte-identical to the
-        // `push_user` every typed turn has always taken.
-        // What a **reroute** has to re-ask, carried past the move below.
-        //
-        // Both stages measured against the budget of the route this turn
-        // started on. A mid-turn reroute — the privacy pin, or a provider
-        // fallback — swaps in a smaller one, and `refit_for_reroute` then
-        // *clamps* the conversation: `truncate_to_budget` drops history until
-        // one block is left and middle-elides that block, which by then is the
-        // skill expansion. BR-8 says a skill turn is never middle-elided into
-        // something the user did not invoke, and BR-4 says carried whole or
-        // refused.
-        //
-        // It is not a corner: BR-7 makes the privacy pin the *expected* path
-        // for any invocation that ran a dynamic command on a boundary-configured
-        // machine, which is every ADLC skill. The name and the text are cloned
-        // because the seed below consumes them, and a clone of one expansion is
-        // the price of not shortening it behind the user's back.
-        // The system prompt rides along for the same reason: it is consumed by
-        // `CarriedTurn::begin` below, and the refusal has to measure the same
-        // pair Stage A and Stage B did — system plus expansion.
-        //
-        // **REQ-587 BR-7: there is more than one of them, and REQ-585's guard
-        // could not see any of the others.** This list was a single `Option`
-        // built from `skill_turn`, which is `Some` only for a user-typed
-        // `/name` — so `skill_would_not_survive_refit` answered `None` for
-        // *every* model invocation and `refit_for_reroute` middle-elided the
-        // expansion, at the one seam REQ-585 built the guard for. On a
-        // boundary-configured machine that privacy pin is the expected path for
-        // any invocation that ran a dynamic command, so this was the common
-        // case, not a corner. The typed turn seeds the list; every expansion
-        // the model commits inside the loop joins it below, and the guard
-        // refuses on the first that would not survive.
-        let refit_system = system.clone();
-        let mut skill_refit: Vec<(String, String, String)> = skill_turn
-            .as_ref()
-            .map(|skill| (skill.name.clone(), skill.text.clone(), refit_system.clone()))
-            .into_iter()
-            .collect();
-        // Where the typed seed ends and the loop's own expansions begin, so a
-        // second attempt rebuilds the tail rather than appending a duplicate of
-        // it: the tool's per-turn state accumulates across attempts.
-        let typed_refit = skill_refit.len();
-
-        // The seed, and its provenance (BR-7, ADR-9): the expansion for a skill
-        // turn, the typed text otherwise. One block either way — `push_user_from`
-        // with an empty set and `unknown: false` is byte-identical to the
-        // `push_user` every typed turn has always taken.
-        let (prompt, prompt_sources, prompt_unknown) = match skill_turn {
-            Some(skill) => (skill.text, skill.sources, skill.unknown),
-            None => (prompt, BTreeSet::new(), false),
-        };
-
-        // REQ-567 BR-1: this turn begins from what the session has already said.
-        // The head was rebuilt from *this* turn's tools and route, and the
-        // carried blocks are replayed under it — so a mid-session head change
-        // re-renders the same conversation rather than fossilizing an old head
-        // (BR-7). From here the manager is the conversation-in-progress:
-        // whichever outcome arrives — completed, failed, the task being dropped,
-        // or a panic — decides what the session keeps (see [`CarriedTurn`]),
-        // and there is exactly ONE place below where a turn's outcome becomes
-        // that decision.
-        let mut conversation = CarriedTurn::begin(
-            sessions,
-            &session_id,
-            system,
-            &route.harness,
-            Arc::clone(&self.session_taint),
-            config.effective_boundaries(),
-            prompt,
-            // REQ-585 BR-7: a typed prompt is drawn from no file; a skill turn
-            // carries the skill file's id, or the unpinnable marker for a user
-            // skill outside the root. It is the same block either way.
-            prompt_sources,
-            prompt_unknown,
-        );
-
-        let mut attempts = 0u32;
-        let mut rerouted_local = false;
-        // Whether an accepted expansion was withdrawn from this conversation
-        // because the tier refused it at the window (REQ-589 BR-14.1).
-        //
-        // It travels out of the loop rather than being acted on inside it
-        // because it decides which of the two outcomes below this turn takes,
-        // and the loop's whole shape is that every ending funnels through that
-        // one seam. See the commit/abandon match for what it changes and why.
-        let mut withdrew_accepted_expansion = false;
-        // The loop is labelled and its endings `break` a value rather than
-        // returning one, so every one of them funnels through the single
-        // commit/abandon below instead of each exit remembering to disarm —
-        // BR-6's atomicity is a property of the shape, not of ten call sites
-        // agreeing.
-        // REQ-588 ADR-1: the prompt's spend accumulator, created **here** —
-        // before the attempt loop — because "per prompt" is its lifetime, not a
-        // key looked up somewhere. Every attempt, every fallback reroute and
-        // every duty of this prompt is handed this same `Arc`, so they add into
-        // one total; the next prompt gets a new one and therefore starts at
-        // zero, without anything having to remember to reset it.
-        //
-        // `None` when no ceiling is configured, which is what makes the whole
-        // feature cost nothing when it is off (ADR-6): the check at the choke
-        // point needs both this and a ceiling, so neither the accumulator nor
-        // the pricing lookup exists on an un-opted-in machine.
-        let prompt_spend = config
-            .cost
-            .ceiling_micro_cents()
-            .map(|_| Arc::new(teton_core::cost_ceiling::PromptSpend::default()));
-
-        let outcome: Result<PromptTurnResult, RpcError> = 'turn: loop {
-            router.emit_route_decided(events, Some(session_id.clone()), &route);
-            let provider_id = route.provider_id.clone();
-
-            let result = self
-                .run_one_attempt(
-                    tctx,
-                    // Passed apart from `tctx` on purpose: `route` is reassigned
-                    // by the reroute arms at the foot of this loop, and a
-                    // context owning it would go stale (ADR-3).
-                    &route,
-                    phase,
-                    &tools,
-                    &tool_ctx,
-                    &stream_events,
-                    conversation.ctx_mut(),
-                    prompt_spend.as_ref(),
-                    // REQ-589 BR-12 / ADR-8: the one turn whose top-of-loop
-                    // pressure gate is suspended is the one whose over-budget
-                    // measurement a human was shown and accepted. Built fresh
-                    // per attempt because `PressurePolicy` is consumed by the
-                    // call — which is the type carrying the "exactly one
-                    // iteration" rule rather than a flag someone has to reset —
-                    // and because a fallback attempt re-assembles the *same*
-                    // consented prompt, so it is owed the same suspension.
-                    if accepted.is_some() {
-                        PressurePolicy::SuspendedForAcceptedTurn
-                    } else {
-                        PressurePolicy::Enforced
-                    },
-                )
-                .await;
-
-            // REQ-587 BR-7: what the *loop* committed is only knowable now.
-            // Both reroute arms below sit under this `Err`, so the list is
-            // refreshed here — once, from the tool's own per-turn record of
-            // what it folded — rather than at each guard. The tail is rebuilt
-            // from `typed_refit` because that state accumulates across attempts.
-            if result.is_err() {
-                skill_refit.truncate(typed_refit);
-                skill_refit.extend(model_invoked_expansions(&tools, &refit_system));
-            }
-
-            // REQ-544 M-1: a privacy block is NOT a transient failure. It must
-            // never be retried against the blocked provider (which would emit
-            // duplicate `privacy_block` events and never reroute). Taint the
-            // session and re-run this same turn on the local tier — reusing the
-            // C-2 taint→local mechanism — so there is exactly one block event and
-            // one reroute. The egress choke point already emitted the single
-            // authoritative `privacy_block`.
-            if let Err(err) = &result {
-                // REQ-562 BR-3: the *cause* travels with the signal, so all
-                // three sentences below name which inspection refused the turn.
-                // Read as one value rather than asked twice — a block with no
-                // detail is not a block (see `HarnessError::privacy_block_detail`).
-                if let Some(detail) = err.privacy_block_detail() {
-                    if taints_the_session(detail) && self.session_taint.mark(&session_id) {
-                        eprintln!("{}", taint_pin_line(taint_detail_word(detail)));
-                    }
-                    if !self.engine.present() {
-                        break 'turn Err(RpcError::new(
-                            error_code::PRIVACY_BLOCKED,
-                            unrerouteable_block_sentence(detail),
-                        ));
-                    }
-                    if rerouted_local {
-                        // Already rerouted to local (which has no egress and so
-                        // cannot privacy-block) — never loop.
-                        break 'turn Err(RpcError::new(
-                            error_code::PRIVACY_BLOCKED,
-                            failed_reroute_block_sentence(detail),
-                        ));
-                    }
-                    // REQ-586 BR-1: the budget follows the route. The local
-                    // pin's window is a fraction of the remote one this turn
-                    // was assembled against, so the context is re-fitted here —
-                    // after the route is chosen, before the retry — rather than
-                    // arriving over-window at a tier that has no fallback left.
-                    let previous = route.budget.clone();
-                    route = router.resolve_local_pin(reroute_after_block_reason(detail));
-                    if let Some(refusal) =
-                        skill_would_not_survive_refit(&skill_refit, typed_refit, &route)
-                    {
-                        if !relay_refit_refusal(
-                            &refusal,
-                            &mut conversation,
-                            &tools,
-                            &mut skill_refit,
-                        ) {
-                            break 'turn Err(RpcError::new(
-                                error_code::SKILL_EXPANSION_TOO_LARGE,
-                                refusal.message,
-                            ));
-                        }
-                    }
-                    refit_for_reroute(&mut conversation, &stream_events, &previous, &route.budget);
-                    rerouted_local = true;
-                    continue;
-                }
-            }
-
-            // ── REQ-589 BR-14.1 / D-8: an approval must not leave the session
-            // hitting the same wall ──────────────────────────────────────────
-            //
-            // The tier refused the very bytes a human just approved. The turn
-            // is over either way — nothing about resending them can succeed —
-            // but the *session* must not be left holding the expansion that
-            // earned the refusal, because the budget the next turn is measured
-            // against is the one that already said these bytes fit. A window
-            // that disagrees with the stamped budget disagrees with it again on
-            // the next turn, and the next, which is the circle the reported
-            // `/analyze` failure walked.
-            //
-            // **Read through `context_refusal`, never by matching the two
-            // variants** (ADR-3). The local engine's refusal is its own variant
-            // and it is the tier the reported failure ran on; a predicate that
-            // matched `ContextLengthExceeded` here would handle the remote half
-            // and quietly miss the one that matters, exactly as the arm below
-            // used to.
-            //
-            // Sited here rather than in that arm for the same reason the
-            // privacy block above is: this is where `result` is still a
-            // `HarnessError` and `conversation` is still writable. The arm
-            // below composes the user's sentence from the same projection, so
-            // the words the model reads in the withdrawn block and the words
-            // the user reads in the error are one composer's (BR-5).
-            if let (Some(accepted), Some(refusal)) = (
-                accepted.as_ref(),
-                result
-                    .as_ref()
-                    .err()
-                    .and_then(HarnessError::context_refusal),
-            ) {
-                let sentence = refusal.sentence(&route.budget.window_label);
-                // BR-14.2, and it is marked whether or not the withdrawal below
-                // finds its block: the rejection is a thing this daemon
-                // *watched happen*, and the next offer for this pair is owed it
-                // regardless of what the conversation turned out to look like.
-                // Keyed off the route that actually refused — a fallback may
-                // have moved the turn since the offer was made, and it is the
-                // refusing window the next offer's lead is a claim about.
-                self.window_rejections.mark(
-                    &session_id,
-                    &accepted.skill,
-                    &RouteWindow::of(&route.harness.budget),
-                );
-                withdrew_accepted_expansion =
-                    withdraw_accepted_expansion(&mut conversation, &accepted.text, &sentence);
-            }
-
-            match result {
-                Ok(outcome) => {
-                    // REQ-544 M-5: a provider that just served a turn is healthy
-                    // again — clear any earlier downgrade (including a half-open
-                    // re-probe that just succeeded) so a recovered provider returns
-                    // to full rotation on the next turn.
-                    if let Some(pid) = route.provider_id.as_ref() {
-                        self.record_health(&pid.0, HealthRecord::healthy());
-                    }
-                    // REQ-544 C-2's pin — "this turn's context intersects a
-                    // local-only boundary, so every later turn stays local" —
-                    // is evaluated at the commit seam rather than here. It has
-                    // to be: the cancellation path commits too, and a pin
-                    // written only in this arm left an aborted turn's boundary
-                    // content carried into the next prompt with nothing pinning
-                    // the session (see [`CarriedTurn::commit_now`]).
-                    break 'turn Ok(PromptTurnResult {
-                        turn_id,
-                        stop_reason: outcome.stop_reason,
-                    });
-                }
-                // REQ-586 BR-2 / ADR-8: the tier answered that the request does
-                // not fit its window. A **typed outcome**, and therefore ahead
-                // of every `Remote` arm below: this is not a provider failure
-                // and must not be run through the machinery that treats one.
-                //
-                // No `record_health` — a provider that correctly reported its
-                // own limit is not unhealthy, and downgrading it would move
-                // *later* turns off a provider that is working. No
-                // `on_provider_failure` — a fallback would send the same bytes
-                // to a window that may be smaller, and would emit a
-                // `provider_degraded` blaming the provider for the daemon's
-                // sizing. And no retry, because nothing about resending
-                // unchanged bytes can succeed.
-                //
-                // The sentence carries the three numbers a user can act on and
-                // no response body (BR-11): who refused, what was assembled,
-                // and the budget the route was running under. A wide gap
-                // between the last two says the declared window is wrong; a
-                // narrow one says this content tokenizes denser than the
-                // estimator assumed.
-                //
-                // REQ-589 ADR-3: **both** window refusals arrive here, on one
-                // arm. The local engine has no provider to name, so it is its
-                // own variant; giving it its own arm as well would be a second
-                // place for the same sentence to be edited, and the local tier
-                // is precisely the one whose report was found wrong. Before
-                // this, a local over-window turn fell through to the
-                // `HarnessError::Engine` arm below and reached the user as
-                // `INTERNAL_ERROR "the local engine could not serve the turn"`.
-                Err(
-                    err @ (HarnessError::ContextLengthExceeded { .. }
-                    | HarnessError::LocalContextLengthExceeded { .. }),
-                ) => {
-                    break 'turn Err(RpcError::new(
-                        error_code::CONTEXT_LENGTH_EXCEEDED,
-                        // `Display` is the total fallback rather than an
-                        // `expect`: the pattern above admits only the two
-                        // variants `window_refusal_sentence` answers for, so
-                        // the fallback is unreachable, and a future third
-                        // window refusal degrades to a true sentence instead of
-                        // panicking the daemon.
-                        err.window_refusal_sentence(&route.budget.window_label)
-                            .unwrap_or_else(|| err.to_string()),
-                    ));
-                }
-                // REQ-588 BR-3 / ADR-4: the spend ceiling, answered here and
-                // **before** the generic remote arm below. That arm asks for a
-                // `failure_class`, and this error deliberately has none, so
-                // without this branch a budget stop would fall through to
-                // "provider failed unrecoverably" — a sentence that is wrong
-                // about the cause, silent about the money, and names no remedy.
-                //
-                // The sentence is composed here rather than carried up from the
-                // choke point because `TransportError` is `Copy` and cannot hold
-                // one — and because every fact it needs is already in scope at
-                // this point: the accumulator this prompt has been adding to,
-                // the ceiling the same config supplied to the choke point, and
-                // the route's provider and model. Composed through the one
-                // composer the `/verbose` clause uses, so the two surfaces
-                // cannot come to name different ceilings (BR-2).
-                Err(HarnessError::Remote(perr)) if perr.is_spend_ceiling_reached() => {
-                    use teton_core::cost_ceiling::{ceiling_refusal, unpriced_refusal, SpendBound};
-                    let bound = SpendBound::PromptCeiling;
-                    let ceiling = config.cost.ceiling_micro_cents().unwrap_or(0);
-                    let spent = prompt_spend.as_ref().map_or(0, |s| s.spent());
-                    // Two different problems with two different remedies, told
-                    // apart by what the prompt recorded: an unpriceable call is
-                    // not an overspend, and telling a user to raise a ceiling
-                    // when the real fix is a missing price would send them to
-                    // the wrong file.
-                    let message = if prompt_spend.as_ref().is_some_and(|s| s.saw_unpriced()) {
-                        unpriced_refusal(
-                            provider_id.as_ref().map_or("", |p| p.0.as_str()),
-                            route.model.as_deref().unwrap_or("(unknown model)"),
-                            bound,
-                        )
-                    } else {
-                        ceiling_refusal(spent, ceiling, bound)
-                    };
-                    break 'turn Err(RpcError::new(error_code::SPEND_CEILING_REACHED, message));
-                }
-                Err(HarnessError::Remote(perr)) if attempts < 2 => {
-                    attempts += 1;
-                    let Some(pid) = provider_id.as_ref() else {
-                        break 'turn Err(RpcError::new(
-                            error_code::INTERNAL_ERROR,
-                            "remote turn failed with no provider to fall back from",
-                        ));
-                    };
-                    let Some(class) = perr.failure_class() else {
-                        break 'turn Err(RpcError::new(
-                            error_code::INTERNAL_ERROR,
-                            "provider failed unrecoverably",
-                        ));
-                    };
-                    // REQ-544 M-5: persist the failed provider's health so the
-                    // downgrade survives into the next turn's routing. A transient
-                    // failure (Retry) leaves health untouched; a persistent one is
-                    // stamped with a half-open cooldown so it recovers on its own.
-                    if let Some(record) = health_record_after_failure(class, Instant::now()) {
-                        self.record_health(&pid.0, record);
-                    }
-                    let fo = router.on_provider_failure(&route, &pid.0, class);
-                    if let Some(degraded) = fo.degraded {
-                        router.emit_provider_degraded(events, Some(session_id.clone()), degraded);
-                    }
-                    match fo.route {
-                        Some(next) => {
-                            // REQ-586 BR-1/ADR-2: a fallback provider may
-                            // declare a smaller window than the one that just
-                            // failed, so the same refit runs here. An in-place
-                            // degrade arrives through this arm too and is
-                            // silent by construction — it keeps the failed
-                            // provider's pair (see `refit_for_reroute`).
-                            let previous = route.budget.clone();
-                            route = next;
-                            if let Some(refusal) =
-                                skill_would_not_survive_refit(&skill_refit, typed_refit, &route)
-                            {
-                                if !relay_refit_refusal(
-                                    &refusal,
-                                    &mut conversation,
-                                    &tools,
-                                    &mut skill_refit,
-                                ) {
-                                    break 'turn Err(RpcError::new(
-                                        error_code::SKILL_EXPANSION_TOO_LARGE,
-                                        refusal.message,
-                                    ));
-                                }
-                            }
-                            refit_for_reroute(
-                                &mut conversation,
-                                &stream_events,
-                                &previous,
-                                &route.budget,
-                            );
-                            continue;
-                        }
-                        None => {
-                            break 'turn Err(RpcError::new(
-                                error_code::UNKNOWN_PROVIDER,
-                                "provider failed and no fallback is configured",
-                            ));
-                        }
-                    }
-                }
-                Err(HarnessError::Remote(_)) => {
-                    break 'turn Err(RpcError::new(
-                        error_code::INTERNAL_ERROR,
-                        "remote turn failed after exhausting fallbacks",
-                    ));
-                }
-                // BUG-146: name what actually failed. The reason is the
-                // engine's own sentence, which on this path is always a static
-                // literal or an already-scrubbed backend message — never a
-                // path or prompt text (BR-11).
-                Err(HarnessError::Engine(e)) => {
-                    break 'turn Err(RpcError::new(
-                        error_code::INTERNAL_ERROR,
-                        format!("the local engine could not serve the turn: {e}"),
-                    ));
-                }
-                // BUG-146: nothing could serve the turn. The daemon knows
-                // exactly why — it published the same fact on the lifecycle
-                // stream moments earlier — so it says so, with the action.
-                // BUG-152: and with the code that says whether there is an
-                // action at all, or only a wait.
-                Err(HarnessError::NoTierAvailable) => {
-                    // The category the turn was routed by — read off the
-                    // resolution rather than recomputed, and `None` for the taint
-                    // pin, which resolved no category at all (BR-7).
-                    let category = route.resolution.as_ref().map(|r| r.category);
-                    // REQ-572 ADR-4: the same classification, plus the
-                    // `capability_dead_end` announcement for the one cause that
-                    // names an absent capability rather than a broken one.
-                    break 'turn Err(unserved_turn_sentence(
-                        &route,
-                        self.unserved_turn_error_announcing(&config, category, events, &session_id),
-                    ));
-                }
-                // REQ-544 M-3: a credential that will not resolve is a config
-                // problem, not a transient fault — surface it clearly (the
-                // message names the reference and reason, never the secret) and
-                // do not retry the same broken credential.
-                Err(HarnessError::Credential(msg)) => {
-                    break 'turn Err(RpcError::new(error_code::CONFIG_REJECTED, msg));
-                }
-            }
-        };
-
-        // REQ-567 D-1, the whole commit protocol in one place. A turn that
-        // completed hands the session what its manager holds — the retained
-        // view, post cut and post compaction, moved rather than re-derived. A
-        // turn that failed writes nothing at all, which is what makes BR-6's
-        // "byte-identical to the failed turn never having run" true by
-        // construction: the pre-turn vector was never touched.
-        //
-        // # The one failure that writes, and why (REQ-589 BR-14.1 / D-8)
-        //
-        // BR-14.1 asks for an accepted expansion to be *withdrawn* from the
-        // session when the tier refuses it at the window, so the next turn
-        // assembles without it. Under abandon alone that withdrawal is
-        // unobservable: the manager it edited is dropped, the pre-turn vector
-        // is what the session keeps, and nothing any test can drive would tell
-        // the withdrawal apart from its deletion (LESSON-544's exact shape —
-        // a producer with no consumer, invisible to a green suite). So the
-        // withdrawal is what this turn commits, and BR-6's "no trace" is
-        // narrowed by exactly one path: an over-budget send a human approved,
-        // that the tier then refused at the window, whose block was found.
-        //
-        // What it writes is **smaller than what it was handed** — the same
-        // conversation with the expansion replaced by the refusal that killed
-        // it, and the block's provenance absorbed rather than shed (BUG-188).
-        // A user who approved once is left with a session that can take
-        // another turn, which is D-8's whole ask; the alternative is a
-        // withdrawal that is a comment.
-        //
-        // **This is a deviation from REQ-567 BR-6 and is flagged as one.** The
-        // narrowness is the mitigation: every other failure — every retry
-        // class, every reroute, every panic — still abandons.
-        match outcome {
-            Ok(result) => {
-                // REQ-586 BR-10: the commit re-asserts the budget one last
-                // time, and what it took is news like any other clamp. Written
-                // as one call rather than two lines so that the fixture
-                // standing in for this dispatch runs the same protocol — see
-                // [`commit_and_publish`].
-                commit_and_publish(conversation, &stream_events, &route.budget);
-                Ok(result)
-            }
-            Err(err) if withdrew_accepted_expansion => {
-                // The withdrawal, and the turn's error, both. The commit runs
-                // the same protocol the success arm does — it re-asserts the
-                // budget and evaluates the taint pin — because what is being
-                // handed over is a conversation the session will assemble from
-                // next, not a special case of one.
-                commit_and_publish(conversation, &stream_events, &route.budget);
-                Err(err)
-            }
-            Err(err) => {
-                conversation.abandon();
-                Err(err)
-            }
         }
     }
 

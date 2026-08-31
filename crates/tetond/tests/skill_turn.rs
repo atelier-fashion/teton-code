@@ -3730,20 +3730,48 @@ fn production_source(relative: &str) -> String {
     production_half(&text).to_owned()
 }
 
-/// The body of `run_prompt_turn`, from its signature to the start of the next
-/// item — so a marker that also appears elsewhere in this very large file
-/// cannot satisfy an ordering claim about *this* function.
+/// **The turn's stage sequence**, from `run_prompt_turn`'s signature to the end
+/// of the last stage — so a marker that also appears elsewhere in this very
+/// large file cannot satisfy an ordering claim about the turn.
+///
+/// REQ-600 decomposed `run_prompt_turn` from 1,084 lines into a 178-line
+/// orchestrator plus eight stages, and these ordering claims are about the
+/// *turn*, not about one function. The stages are laid out in `turn.rs` in
+/// **execution order** precisely so source position keeps meaning what it meant
+/// here; a reordering of the definitions would break these tests, which is the
+/// correct outcome rather than an inconvenience.
+///
+/// The span stops before the first `pub(super)` helper. Those helpers are
+/// *definitions* of things the stages call — `accept_invocation`,
+/// `settle_dynamic_context`, `offer_or_refuse_over_budget` — and including them
+/// would count a definition's body as if it were a step in the sequence. That
+/// is not hypothetical: it put the `-32023` raise count at five instead of four.
 fn run_prompt_turn_body() -> String {
     let src = production_source("runtime");
     let start = src
         .find("pub async fn run_prompt_turn(")
         .expect("`run_prompt_turn` is where the turn ordering lives");
     let rest = &src[start..];
-    // The turn's own body ends at the next item declared at method indentation.
     let end = rest[1..]
-        .find("\n    /// Run one attempt")
+        .find("\n    pub(super) ")
         .map_or(rest.len(), |at| at + 1);
-    rest[..end].to_owned()
+    let body = rest[..end].to_owned();
+
+    // Floors: the span must reach the last stage, and must not reach the
+    // helper definitions past it.
+    assert!(
+        body.contains("fn commit_or_abandon("),
+        "vacuity floor: the stage span does not reach `commit_or_abandon`, the \
+         last stage. It was renamed or moved, and every ordering claim below is \
+         now measuring a prefix of the turn."
+    );
+    assert!(
+        !body.contains("async fn accept_invocation("),
+        "vacuity floor: the stage span has swallowed `accept_invocation`'s \
+         *definition*. Positions inside a definition are not steps in the \
+         sequence, and counting them is what put the raise count at five."
+    );
+    body
 }
 
 /// The offset of `needle` in `haystack`, or a failure naming what was not found.
@@ -3916,7 +3944,11 @@ fn the_budget_check_runs_in_the_loop_and_the_tool_measures_nothing() {
 fn the_reroute_guard_is_handed_every_expansion_the_turn_committed_not_only_a_typed_one() {
     let body = run_prompt_turn_body();
     assert!(
-        body.contains("let mut skill_refit: Vec<(String, String, String)>"),
+        body.contains("skill_refit: Vec<(String, String, String)>"),
+        // Matched on the *type*, not on `let mut`: REQ-600 moved this binding
+        // into `prepare_the_attempts`, where it is built and then moved into
+        // the loop's state rather than mutated in place, so the `mut` correctly
+        // went away. The claim was never about the binding.
         "the refit guard's input is a list of `(name, text, system)` triples — \
          a single value cannot carry both a typed turn and the model's own \
          expansions"

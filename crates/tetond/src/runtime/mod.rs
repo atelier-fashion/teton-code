@@ -17571,23 +17571,60 @@ provider_id = \"deepseek\"
         #[test]
         fn the_permission_gate_is_fetched_before_the_invocation_is_accepted() {
             let source = turn_path_production_source();
-            let body_start = source.find("    pub async fn run_prompt_turn(").expect(
-                "vacuity floor: `run_prompt_turn` was not found — renamed or moved, \
-                 and this check is measuring nothing",
+
+            // After REQ-600 the two statements live in different functions:
+            // `run_prompt_turn` fetches the gate and `resolve_the_route` calls
+            // `accept_invocation`. The gate crosses as a **parameter**, so the
+            // ordering is now enforced by the compiler outright — you cannot
+            // call the stage without already holding one.
+            //
+            // What that leaves for a check is the property the type system does
+            // *not* cover: that the stage keeps taking the turn's gate rather
+            // than fetching its own. A re-fetch inside would compile, and would
+            // read a second gate — and since a rebuilt gate forgets every
+            // "allow for this session" answer it earned, the turn would ask
+            // again for something the user already approved.
+            let stage_start = source.find("    async fn resolve_the_route(").expect(
+                "vacuity floor: `resolve_the_route` was not found — renamed or \
+                 moved, and this check is measuring nothing",
             );
-            let body = &source[body_start..];
-            let fetch = body
-                .find("let gate = self.permission_gate_for(")
-                .expect("vacuity floor: the gate fetch was not found inside `run_prompt_turn`");
-            let accept = body.find("self.accept_invocation(").expect(
-                "vacuity floor: the `accept_invocation` call was not found inside \
-                 `run_prompt_turn`",
+            let stage = &source[stage_start..];
+            let stage_end = stage
+                .find("\n    /// ")
+                .or_else(|| stage.find("\n    async fn "))
+                .unwrap_or(stage.len());
+            let stage = &stage[..stage_end];
+
+            // The gate reaches the stage inside `SessionFacts` — the parameter
+            // bundle that replaced a thirteen-argument signature when
+            // `suppression_ratchet.rs` refused the `too_many_arguments` allow.
+            // This floor fired on that change too, and following it is the
+            // point: the property is "the stage is handed the turn's gate", not
+            // "the gate is spelled as its own parameter".
+            assert!(
+                stage.contains("facts: SessionFacts<'_>"),
+                "vacuity floor: `resolve_the_route` no longer takes `SessionFacts`. \
+                 Either the bundle was renamed — in which case this check must \
+                 follow it — or the stage now obtains the gate some other way, \
+                 which is what this asserts against."
             );
             assert!(
-                fetch < accept,
-                "the permission gate must be fetched before the invocation it \
-                 guards is accepted (LESSON-520). Fetch at byte {fetch}, accept at \
-                 {accept}, relative to `run_prompt_turn`."
+                source.contains("gate: &'a Arc<PermissionGate>"),
+                "vacuity floor: `SessionFacts` no longer carries the gate, so \
+                 being handed the bundle no longer implies being handed the gate."
+            );
+            assert!(
+                stage.contains("accept_invocation("),
+                "vacuity floor: `accept_invocation` is not called inside \
+                 `resolve_the_route`; this check is comparing nothing."
+            );
+            assert_eq!(
+                stage.matches("permission_gate_for(").count(),
+                0,
+                "`resolve_the_route` must use the gate it is handed, never fetch \
+                 its own. A rebuilt gate forgets every \"allow for this session\" \
+                 answer the turn already earned, so a second fetch re-asks a \
+                 question the user has answered (REQ-589 ADR-10)."
             );
         }
 
@@ -17620,31 +17657,39 @@ provider_id = \"deepseek\"
         /// fires the span floor rather than passing on the wrong text.
         #[test]
         fn the_turn_path_takes_no_blocking_wait() {
-            let source = turn_path_production_source();
-            let body_start = source.find("    pub async fn run_prompt_turn(").expect(
-                "vacuity floor: `run_prompt_turn` was not found — renamed or moved, \
-                 and this check is measuring nothing",
-            );
-            // The whole body, so a stage extracted *inside* the function is
-            // still covered. Stages moved to sibling functions are covered by
-            // the `TurnContext` no-I/O rule they inherit.
-            let body = &source[body_start..];
-            let end = body
-                .find("\n    /// ")
-                .or_else(|| body.find("\n    pub "))
-                .unwrap_or(body.len());
-            let body = &body[..end];
+            // **The whole of `turn.rs`, not just `run_prompt_turn`.** REQ-600
+            // split the turn path across eight stage methods, and this check
+            // scoped to the orchestrator silently stopped covering most of it:
+            // moving `session_root_for` into `claim_the_turn` put it outside the
+            // span, and the inversion that used to go red went green. Caught by
+            // re-running the mutation after the restructure — which is why AC-4
+            // asks for the inversions to be re-run rather than re-asserted.
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/runtime")
+                .join("turn.rs");
+            let whole = std::fs::read_to_string(&dir)
+                .unwrap_or_else(|err| panic!("unreadable {}: {err}", dir.display()));
+            let source = whole
+                .split_once("\n#[cfg(test)]")
+                .map_or(whole.as_str(), |(production, _)| production);
+
             assert!(
-                body.contains("run_prompt_turn"),
-                "vacuity floor: the extracted body does not contain the function \
-                 it claims to — the span calculation drifted and this assertion \
-                 is reading the wrong text"
+                source.contains("pub async fn run_prompt_turn("),
+                "vacuity floor: `turn.rs` does not contain `run_prompt_turn` — the \
+                 turn path moved and this check is reading the wrong file"
+            );
+            assert!(
+                source.len() > 50_000,
+                "vacuity floor: `turn.rs`'s production half is only {} bytes. The \
+                 turn path is thousands of lines; a corpus this small means the \
+                 cut or the read is wrong.",
+                source.len()
             );
             assert_eq!(
-                body.matches("block_in_place").count(),
+                source.matches("block_in_place").count(),
                 0,
-                "`run_prompt_turn` must take no blocking wait. BUG-184: discovery \
-                 is up to four `read_dir` calls plus metadata+open+read on \
+                "the turn path must take no blocking wait. BUG-184: discovery is \
+                 up to four `read_dir` calls plus metadata+open+read on \
                  user-controlled symlinked paths, and on macOS a root under \
                  `~/Documents` raises a TCC dialog that blocks the syscall for as \
                  long as the user takes to answer. A stage that grew one would \
@@ -17768,20 +17813,24 @@ provider_id = \"deepseek\"
             // Scope to `run_prompt_turn`'s own body. Searching the whole file
             // would find some other function's claim and re-read and compare
             // two things that never run together.
-            let body_start = source.find("    pub async fn run_prompt_turn(").expect(
-                "vacuity floor: `run_prompt_turn` was not found — it was \
+            // Scoped to `claim_the_turn`, the stage that now owns both
+            // statements — REQ-600 moved them out of `run_prompt_turn`, and the
+            // floor below said so in as many words when it fired: "it moved
+            // out, in which case this check must follow it". It followed.
+            let body_start = source.find("    fn claim_the_turn(").expect(
+                "vacuity floor: `claim_the_turn` was not found — it was \
                          renamed or moved, and this check is now measuring nothing",
             );
             let body = &source[body_start..];
 
-            let claim = body.find(".try_begin_turn(&session_id, &turn_id)").expect(
-                "vacuity floor: the turn claim was not found inside `run_prompt_turn`. \
+            let claim = body.find(".try_begin_turn(session_id, &turn_id)").expect(
+                "vacuity floor: the turn claim was not found inside `claim_the_turn`. \
                  Either it moved out — in which case this check must follow it — or \
                  the pattern drifted and the assertion below compares nothing.",
             );
             let re_read = body.find("let session_cwd = sessions").expect(
                 "vacuity floor: the registry re-read was not found inside \
-                 `run_prompt_turn`. LESSON-539 exists because the turn ran on a \
+                 `claim_the_turn`. LESSON-539 exists because the turn ran on a \
                  stale root; if the re-read is gone, that is the regression.",
             );
 
@@ -17789,7 +17838,7 @@ provider_id = \"deepseek\"
                 claim < re_read,
                 "the turn claim must be taken BEFORE the session registry is \
                  re-read (LESSON-539). Found the claim at byte {claim} and the \
-                 re-read at byte {re_read}, relative to `run_prompt_turn`.\n\
+                 re-read at byte {re_read}, relative to `claim_the_turn`.\n\
                  `spawn_prompt_turn` snapshots the summary and then spawns, so a \
                  `/cd` landing between the re-read and the claim moves the root \
                  and clears the conversation under a turn that has already \

@@ -1,7 +1,7 @@
 ---
 id: TASK-310
 title: "Decompose run_prompt_turn into a named stage sequence"
-status: draft
+status: complete
 parent: REQ-600
 created: 2026-08-31
 updated: 2026-08-31
