@@ -59,7 +59,9 @@
     {
       "phase": 8,
       "name": "Merge + Wrapup",
-      "completedAt": "2026-09-01T06:00:00Z"
+      "completedAt": "2026-09-01T06:00:00Z",
+      "mergeCommit": "9ec2a17",
+      "note": "PR #249 squash-merged; #250 recorded the terminal state; #251 corrected AC-1 from 177 to 188"
     }
   ],
   "integrationBranch": "main",

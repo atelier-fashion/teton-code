@@ -256,6 +256,29 @@ its subject looks exactly like a guard that passes.
   scattered across 10,366 lines and was 375 contiguous lines once four unrelated
   slices had left).
 
+## Deferred
+
+Nothing was descoped mid-flight. Four items leave this REQ as their own specs,
+each because it is genuinely separate work rather than a piece left undone:
+
+- **REQ-605** — let every commit's CI finish. `cancel-in-progress` made
+  REQ-599's AC-11 unmeetable and cost this REQ hours of serialised waiting to
+  meet it. Repo-wide change, affects every PR.
+- **REQ-606** — classify the thirteen parameter bundles. Naming the clusters was
+  required (the suppression ratchet refuses the alternative); roughly five carry
+  an invariant and the rest are transport.
+- **REQ-603** — the session-lifecycle slice, still unshipped from REQ-599.
+- **REQ-604** — the pre-split ordering fixtures REQ-599's AC-6 named.
+
+And two things are recorded as **not done rather than deferred**, because no
+future REQ makes them true:
+
+- **AC-2** — the god-impl was split, not shrunk. Marked NOT MET.
+- **AC-4's invariants 2 and 4** — neither has an inversion test; invariant 2's
+  ordering is compiler-enforced and invariant 4 has no presence gate on this
+  path to park in. Both were measured, not assumed, and both have substitute
+  guards that were mutation-verified.
+
 ## Out of Scope
 
 - Further module extraction that does not serve the decomposition of the turn
