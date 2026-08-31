@@ -3,9 +3,29 @@
   "branch": "feat/REQ-602-post-split-cleanup",
   "startedAt": "2026-08-31T18:05:17Z",
   "completed": false,
-  "currentPhase": 0,
-  "completedPhases": [],
-  "phaseHistory": [],
+  "currentPhase": 3,
+  "completedPhases": [
+    0,
+    1,
+    2
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree + Draft PR",
+      "completedAt": "2026-08-31T18:05:27Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-08-31T18:05:59Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect",
+      "completedAt": "2026-08-31T18:15:31Z"
+    }
+  ],
   "integrationBranch": "main",
   "repos": {
     "teton-code": {
@@ -14,8 +34,8 @@
       "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-602",
       "branch": "feat/REQ-602-post-split-cleanup",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/247",
+      "prNumber": 247,
       "merged": false,
       "snapshotBranch": null,
       "snapshotPR": null

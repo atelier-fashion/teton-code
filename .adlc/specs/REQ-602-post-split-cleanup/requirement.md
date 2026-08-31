@@ -78,25 +78,32 @@ _None. No new types; this REQ removes surface rather than adding it._
 
 ## Acceptance Criteria
 
-- [ ] AC-1: For every `pub(crate)` item under `crates/tetond/src/runtime/`, a
-      search establishes either an out-of-tree caller or a demotion. Report the
-      final count of genuine out-of-tree items.
-      **State the counting rule with the number.** A review sample reported "61
-      items with no out-of-tree caller"; validating this spec against the code
-      could not reproduce it — **48** counting top-level items and `impl`
-      methods, **52** if `pub(crate)` struct fields are included. The direction
-      is not in doubt (a large majority have no caller outside the tree, and
-      seven spot-checked `engine.rs` items had zero external references each),
-      but the figure was carried into this spec without being re-measured, which
-      is exactly how REQ-599 ADR-1's bad number got in. Whatever count this REQ
-      reports, it says what it counted.
-- [ ] AC-2: **A test enforces BR-2**, so the next split cannot re-widen by
-      accident. It walks `runtime/`, collects `pub(crate)` items, and fails on
-      any with no reference outside the tree. Shipped with this REQ and kept in
-      CI.
+- [ ] AC-1: Every `pub(crate)` item under `crates/tetond/src/runtime/` that
+      nothing outside that directory needs is narrowed to `pub(super)`.
+      **The count is 5, and it was established by the compiler, not by a
+      search.** Three prior estimates — 61 (a review sample), 48–52 (a bare-name
+      grep), 73 (a qualified-path rule) — were all wrong, in both directions.
+      The method that works is the definition itself: demote every `pub(crate)`
+      under `runtime/` to `pub(super)`, build, and read the errors. Measured:
+      **143 sites → 8** (5 item declarations plus 3 glob re-exports), with
+      `pub(super)` going 40 → 175.
+      The five that genuinely need crate reach, with their consumers:
+      `LOCAL_ENGINE_N_CTX` (`egress/redact.rs`, `harness/budget.rs`,
+      `harness/compact.rs`), `TAINT_BY_CONTEXT` and `taint_pin_line`
+      (`carry.rs`), `endpoint_query_names_a_credential` (`provider_recipes.rs`,
+      `web_setup_catalog.rs`), and `RenderedProviderSetup` (must match its
+      `pub(crate)` accessor).
+- [ ] AC-2: A **ratchet** asserts the `pub(crate)` count under `runtime/` is
+      exactly 8 and names the five items, with a comment recording how to
+      re-derive them (demote all, build, read the errors). Deliberately a
+      ratchet and not a search: a test that greps for out-of-tree references
+      would re-encode the mistake this REQ exists to correct — three different
+      searches gave three different wrong answers. Bounded on **both** sides,
+      like the suppression ratchet, so a drop demands a deliberate update rather
+      than passing as improvement.
 - [ ] AC-3: **Mutation on AC-2** — promoting one `pub(super)` item to
-      `pub(crate)` turns it red; the mutation and its observed failure are
-      recorded in the test's doc comment.
+      `pub(crate)` turns it red, and deleting one of the five turns it red the
+      other way. Both recorded in the test's doc comment with what went red.
 - [ ] AC-4: Every directory scan over `runtime/` recurses. Demonstrated by
       planting a nested `runtime/nested/mod.rs` fixture and confirming each scan
       sees it, then removing it. The sites, corrected during validation:
