@@ -162,7 +162,7 @@ declared before the work began.
 
 | AC | status | evidence |
 |---|---|---|
-| AC-1 | met | `run_prompt_turn` **1,084 → 177 lines** (body span, signature through closing brace). Eight named stages: `claim_the_turn`, `resolve_the_route`, `spawn_the_naming_duty`, `assemble_harness`, `settle_expansion`, `prepare_the_attempts`, `run_attempts`, `commit_or_abandon`. |
+| AC-1 | met | `run_prompt_turn` **1,084 → 188 lines** (body span, signature through closing brace), against a target of 200. **Corrected after merge:** this said 177, which was true when TASK-313 measured it and stopped being true in the review-fix commit, where an 11-line comment run was reattached into the body above the `record_user_prompt_urls` call. Re-derived on `main` two ways — naive and literal-aware brace counting agree at 188. Eight named stages: `claim_the_turn`, `resolve_the_route`, `spawn_the_naming_duty`, `assemble_harness`, `settle_expansion`, `prepare_the_attempts`, `run_attempts`, `commit_or_abandon`. |
 | AC-2 | **NOT MET** | `mod.rs`'s `impl … DaemonRuntime` blocks: **6,543 → 3,656** production lines. Crate-wide, the type's inherent impl went **6,985 → 7,319**: the god-impl was *split*, not shrunk, and 334 lines of module header, `use` and bundle types were added. Moving `run_prompt_turn` alone would have left 5,401. |
 | AC-3 | met | `run_session_turn_with_pressure_policy` **762 → 298 lines, brace depth 9 → 4** — the rule being *maximum brace nesting inside the `fn` body, excluding braces inside string, char and comment tokens*. That exclusion was unstated and is load-bearing: `turn_loop.rs` carries `format!` strings containing `{{"tool":…}}`, and a naive counter grades the result at 7 against a gate of 5. Indentation 11 → 6 alongside; the two new helpers at brace 3 and 4. |
 | AC-4 | **four of five** | Invariants 1, 3 and 5 are pinned by tests that fail on inversion; 3 was written by this REQ. **Invariant 2 is not.** Its ordering is enforced by the compiler — `accept_invocation` takes the gate as a parameter — and what the test asserts is the adjacent property that the gate is *constructed* exactly once, inside the memoizing `permission_gate_for`. That is a real guard, but it is not an inversion test, and AC-4 says "not a comment asserting it holds". **Invariant 4 has no inversion test either and cannot have one on this path** (no presence gate to park in); the substitute pins that no blocking wait is introduced. Both are recorded here rather than behind a tick, per this spec's own Assumptions. |
@@ -230,6 +230,13 @@ that ticked the criterion without checking, and one that met it by waiting.
   than a silent count bump.
 - Three vacuity floors fired with the guidance written into them, and each was
   followed rather than relaxed.
+
+**And one that got past all of it.** AC-1's figure was published as 177 in the
+PR body and the merge commit, having been measured before the review fixes
+changed it. LESSON-597's own rule — *correct a figure everywhere it appears, and
+re-derive before it enters an artifact that will be acted on* — was written into
+this REQ's task list, and the last re-derivation still happened one commit too
+early. The criterion holds either way (188 < 200); the published number did not.
 
 The pattern worth keeping: **every one of these was found by re-running a
 mutation after a change, not by reading the guard.** A guard that stops covering

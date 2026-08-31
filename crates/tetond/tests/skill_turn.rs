@@ -3734,7 +3734,7 @@ fn production_source(relative: &str) -> String {
 /// of the last stage — so a marker that also appears elsewhere in this very
 /// large file cannot satisfy an ordering claim about the turn.
 ///
-/// REQ-600 decomposed `run_prompt_turn` from 1,084 lines into a 177-line
+/// REQ-600 decomposed `run_prompt_turn` from 1,084 lines into a 188-line
 /// orchestrator plus eight stages, and these ordering claims are about the
 /// *turn*, not about one function. The stages are laid out in `turn.rs` in
 /// **execution order** precisely so source position keeps meaning what it meant
