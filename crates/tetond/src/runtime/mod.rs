@@ -17562,28 +17562,86 @@ provider_id = \"deepseek\"
         /// pairs in `crates/tetond/tests/skill_consent_matrix.rs`; this only
         /// pins where it is fetched.
         ///
-        /// **Mutations, run and observed** (reverted): moving the gate fetch
-        /// below `accept_invocation` in production is `error[E0425]: cannot find
-        /// value \`gate\` in this scope` — the inversion does not compile.
-        /// Drifting the `permission_gate_for` pattern gives "the gate fetch was
-        /// not found inside `run_prompt_turn`"; drifting `accept_invocation`
-        /// gives its own floor.
+        /// **Mutations, re-run against the restructured code.** The record here
+        /// previously described moving the fetch below an `accept_invocation`
+        /// match *inside `run_prompt_turn`* — code that no longer exists, since
+        /// the fetch is now at the orchestrator and the call inside
+        /// `resolve_the_route`. Re-run:
+        ///
+        /// | mutation | observed |
+        /// |---|---|
+        /// | duplicate the `PermissionGate::with_level` construction | `constructed 2 time(s)` |
+        /// | drift the `resolve_the_route` pattern | its vacuity floor |
+        /// | drift the `SessionFacts` field pattern | its vacuity floor |
+        ///
+        /// **This is not an inversion test, and AC-4 asks for one.** The
+        /// ordering it names is enforced by the compiler — you cannot call a
+        /// stage that takes the gate before one exists — so there is no
+        /// compiling inversion to observe. What is asserted instead is the
+        /// adjacent hazard that *does* compile. AC-4 records four of five
+        /// invariants pinned by inversion, with this one and invariant 4 named.
         #[test]
         fn the_permission_gate_is_fetched_before_the_invocation_is_accepted() {
             let source = turn_path_production_source();
 
-            // After REQ-600 the two statements live in different functions:
-            // `run_prompt_turn` fetches the gate and `resolve_the_route` calls
-            // `accept_invocation`. The gate crosses as a **parameter**, so the
-            // ordering is now enforced by the compiler outright — you cannot
-            // call the stage without already holding one.
+            // **The claim this used to make was wrong, and review caught it.**
+            // It asserted that `resolve_the_route` must not call
+            // `permission_gate_for`, on the grounds that "a rebuilt gate forgets
+            // every allow-for-this-session answer". `permission_gate_for` is
+            // *memoized* — `Arc::clone(gates.entry(id).or_insert_with(…))` — so a
+            // second fetch returns the identical `Arc` and forgets nothing. The
+            // guard was watching a harmless spelling and calling it the
+            // dangerous one (LESSON-596).
             //
-            // What that leaves for a check is the property the type system does
-            // *not* cover: that the stage keeps taking the turn's gate rather
-            // than fetching its own. A re-fetch inside would compile, and would
-            // read a second gate — and since a rebuilt gate forgets every
-            // "allow for this session" answer it earned, the turn would ask
-            // again for something the user already approved.
+            // The hazard is a gate that is **constructed** rather than fetched:
+            // `accept_invocation` takes `&PermissionGate`, so handing it a fresh
+            // one compiles, does exactly the harm the old message described, and
+            // passed every assertion here. So that is what is asserted now.
+            let constructions = source.matches("PermissionGate::with_level(").count();
+            assert_eq!(
+                constructions, 1,
+                "`PermissionGate::with_level` is constructed {constructions} time(s) in \
+                 `runtime/`'s production half; there must be exactly one, inside \
+                 `permission_gate_for`, which memoizes it per session. A second \
+                 construction is a gate with none of the \"allow for this session\" \
+                 answers the user already gave — and every consumer takes \
+                 `&PermissionGate`, so nothing else would notice."
+            );
+            let ctor = source
+                .find("PermissionGate::with_level(")
+                .expect("the count above found one");
+            // The nearest `fn` declaration above the construction names its
+            // owner. Matched on the bare `fn ` after any visibility, so
+            // `pub(super) fn permission_gate_for(` is found too — the first
+            // draft searched for `    fn permission_gate_for(` and missed it.
+            let owner = source[..ctor]
+                .rmatch_indices("fn ")
+                .find(|(at, _)| {
+                    let line_start = source[..*at].rfind('\n').map_or(0, |n| n + 1);
+                    let before = &source[line_start..*at];
+                    before.trim().is_empty()
+                        || before.trim_start().starts_with("pub")
+                        || before.trim_start().starts_with("async")
+                })
+                .map(|(at, _)| {
+                    source[at + 3..]
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect::<String>()
+                });
+            assert_eq!(
+                owner.as_deref(),
+                Some("permission_gate_for"),
+                "the one construction must be inside `permission_gate_for` — the \
+                 function that memoizes it. The nearest enclosing `fn` is {owner:?}."
+            );
+
+            // The ordering half, now enforced by the compiler rather than here:
+            // `accept_invocation` takes the gate as a parameter, so it cannot run
+            // before one exists. Moving the fetch below the call is
+            // `error[E0425]: cannot find value \`gate\` in this scope`. What is
+            // left to check is that the stage keeps being *handed* the turn's
+            // gate rather than obtaining one itself.
             let stage_start = source.find("    async fn resolve_the_route(").expect(
                 "vacuity floor: `resolve_the_route` was not found — renamed or \
                  moved, and this check is measuring nothing",
@@ -17594,37 +17652,30 @@ provider_id = \"deepseek\"
                 .or_else(|| stage.find("\n    async fn "))
                 .unwrap_or(stage.len());
             let stage = &stage[..stage_end];
-
-            // The gate reaches the stage inside `SessionFacts` — the parameter
-            // bundle that replaced a thirteen-argument signature when
-            // `suppression_ratchet.rs` refused the `too_many_arguments` allow.
-            // This floor fired on that change too, and following it is the
-            // point: the property is "the stage is handed the turn's gate", not
-            // "the gate is spelled as its own parameter".
             assert!(
                 stage.contains("facts: SessionFacts<'_>"),
-                "vacuity floor: `resolve_the_route` no longer takes `SessionFacts`. \
-                 Either the bundle was renamed — in which case this check must \
-                 follow it — or the stage now obtains the gate some other way, \
-                 which is what this asserts against."
-            );
-            assert!(
-                source.contains("gate: &'a Arc<PermissionGate>"),
-                "vacuity floor: `SessionFacts` no longer carries the gate, so \
-                 being handed the bundle no longer implies being handed the gate."
+                "vacuity floor: `resolve_the_route` no longer takes `SessionFacts`, \
+                 the bundle carrying the turn's gate."
             );
             assert!(
                 stage.contains("accept_invocation("),
                 "vacuity floor: `accept_invocation` is not called inside \
                  `resolve_the_route`; this check is comparing nothing."
             );
-            assert_eq!(
-                stage.matches("permission_gate_for(").count(),
-                0,
-                "`resolve_the_route` must use the gate it is handed, never fetch \
-                 its own. A rebuilt gate forgets every \"allow for this session\" \
-                 answer the turn already earned, so a second fetch re-asks a \
-                 question the user has answered (REQ-589 ADR-10)."
+
+            // And that the bundle still carries a gate — scoped to the struct,
+            // not to the whole corpus, so another type declaring the same field
+            // cannot satisfy it.
+            let decl = source
+                .find("struct SessionFacts<'a> {")
+                .expect("vacuity floor: `SessionFacts` was not found");
+            let body_end = source[decl..]
+                .find("\n}")
+                .map_or(source.len(), |at| decl + at);
+            assert!(
+                source[decl..body_end].contains("gate: &'a Arc<PermissionGate>"),
+                "vacuity floor: `SessionFacts` no longer carries the gate, so being \
+                 handed the bundle no longer implies being handed the gate."
             );
         }
 
@@ -17657,43 +17708,98 @@ provider_id = \"deepseek\"
         /// fires the span floor rather than passing on the wrong text.
         #[test]
         fn the_turn_path_takes_no_blocking_wait() {
-            // **The whole of `turn.rs`, not just `run_prompt_turn`.** REQ-600
-            // split the turn path across eight stage methods, and this check
-            // scoped to the orchestrator silently stopped covering most of it:
-            // moving `session_root_for` into `claim_the_turn` put it outside the
-            // span, and the inversion that used to go red went green. Caught by
-            // re-running the mutation after the restructure — which is why AC-4
-            // asks for the inversions to be re-run rather than re-asserted.
-            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src/runtime")
-                .join("turn.rs");
-            let whole = std::fs::read_to_string(&dir)
-                .unwrap_or_else(|err| panic!("unreadable {}: {err}", dir.display()));
-            let source = whole
-                .split_once("\n#[cfg(test)]")
-                .map_or(whole.as_str(), |(production, _)| production);
+            // **Keyed on the hazard, not on the remedy** — LESSON-585, which this
+            // check violated in its first two versions. `block_in_place` is the
+            // *safe* idiom: it tells Tokio a worker is about to block. Asserting
+            // only that it is absent forbids the mitigation and permits the
+            // defect, because a bare `std::fs::read_dir` on a probed root
+            // contains no `block_in_place` at all — and that syscall, on a
+            // user-controlled symlinked path under `~/Documents`, is what raises
+            // the macOS TCC dialog BUG-184 records.
+            //
+            // **And over the whole turn path.** The previous version read
+            // `turn.rs` alone. `harness/turn_loop.rs` is where the model call and
+            // every tool dispatch happen, and REQ-600 restructured it — so a
+            // blocking wait added to `serve_tool_call` or `run_the_allowed_tool`
+            // would have left this green. That is the same failure this check
+            // already fixed once at the *function* boundary, repeated at the
+            // *file* boundary.
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+            let files = [
+                root.join("runtime/turn.rs"),
+                root.join("harness/turn_loop.rs"),
+            ];
+            let corpus: Vec<(String, String)> = files
+                .iter()
+                .map(|path| {
+                    let whole = std::fs::read_to_string(path)
+                        .unwrap_or_else(|err| panic!("unreadable {}: {err}", path.display()));
+                    let production = whole
+                        .split_once("\n#[cfg(test)]")
+                        .map_or(whole.clone(), |(p, _)| p.to_owned());
+                    (path.display().to_string(), production)
+                })
+                .collect();
 
+            // Vacuity floors, one per file: the corpus must actually contain the
+            // turn path. A missing file would read as "no blocking waits found".
+            for (needle, owner) in [
+                ("pub async fn run_prompt_turn(", 0usize),
+                ("async fn run_the_allowed_tool(", 1usize),
+            ] {
+                assert!(
+                    corpus[owner].1.contains(needle),
+                    "vacuity floor: {} does not contain `{needle}` — the turn path \
+                     moved and this check is reading the wrong file.",
+                    corpus[owner].0
+                );
+            }
+            for (name, text) in &corpus {
+                assert!(
+                    text.len() > 40_000,
+                    "vacuity floor: {name}'s production half is only {} bytes; the \
+                     cut or the read is wrong.",
+                    text.len()
+                );
+            }
+
+            // The hazards, with their wider spellings enumerated (LESSON-596):
+            // a guard that watches one spelling watches one door.
+            const BLOCKING: &[&str] = &[
+                "block_in_place",
+                "block_on(",
+                "blocking_lock(",
+                "blocking_recv(",
+                "blocking_send(",
+                "thread::sleep",
+                "fs::read_dir(",
+                "fs::read_to_string(",
+                "fs::write(",
+                "File::open(",
+                "File::create(",
+            ];
+            let mut found = Vec::new();
+            for (name, text) in &corpus {
+                for idiom in BLOCKING {
+                    let n = text.matches(idiom).count();
+                    if n > 0 {
+                        found.push(format!("  {name}: {n}x `{idiom}`"));
+                    }
+                }
+            }
             assert!(
-                source.contains("pub async fn run_prompt_turn("),
-                "vacuity floor: `turn.rs` does not contain `run_prompt_turn` — the \
-                 turn path moved and this check is reading the wrong file"
-            );
-            assert!(
-                source.len() > 50_000,
-                "vacuity floor: `turn.rs`'s production half is only {} bytes. The \
-                 turn path is thousands of lines; a corpus this small means the \
-                 cut or the read is wrong.",
-                source.len()
-            );
-            assert_eq!(
-                source.matches("block_in_place").count(),
-                0,
-                "the turn path must take no blocking wait. BUG-184: discovery is \
-                 up to four `read_dir` calls plus metadata+open+read on \
-                 user-controlled symlinked paths, and on macOS a root under \
-                 `~/Documents` raises a TCC dialog that blocks the syscall for as \
-                 long as the user takes to answer. A stage that grew one would \
-                 stall every RPC on the connection behind a modal."
+                found.is_empty(),
+                "the turn path must take no blocking wait:\n{}\n\
+                 BUG-184: discovery is up to four `read_dir` calls plus \
+                 metadata+open+read on user-controlled, symlinked paths, and on \
+                 macOS a root under `~/Documents` raises a TCC dialog that blocks \
+                 the syscall for as long as the user takes to answer. A stage that \
+                 grew one would stall every RPC on the connection behind a modal.\n\
+                 If a blocking call genuinely belongs here, it goes behind \
+                 `block_in_place_if_multithread` *and* gets named in this list \
+                 with the reason — the point is that it is argued, not that it is \
+                 spelled safely.",
+                found.join("\n")
             );
         }
 
@@ -17821,7 +17927,39 @@ provider_id = \"deepseek\"
                 "vacuity floor: `claim_the_turn` was not found — it was \
                          renamed or moved, and this check is now measuring nothing",
             );
-            let body = &source[body_start..];
+            // **Bounded to `claim_the_turn`.** The first version sliced to the
+            // end of the whole concatenated corpus, which review showed was
+            // exploitable: delete the re-read from this function, put it in a
+            // helper defined *below* it, and call that helper from
+            // `run_prompt_turn` *above* the claim — both patterns are still
+            // found, `claim < re_read` still holds on byte offsets, and the
+            // registry is read before the claim at runtime. Before REQ-600 that
+            // was impossible, because both statements lived in one body and
+            // textual order was execution order. Decomposition removed that
+            // guarantee, and this check had been relying on it.
+            let rest = &source[body_start..];
+            let body_end = rest[1..]
+                .find("\n    async fn ")
+                .or_else(|| rest[1..].find("\n    fn "))
+                .map_or(rest.len(), |at| at + 1);
+            let body = &rest[..body_end];
+            assert!(
+                body.contains("ClaimedTurn {"),
+                "vacuity floor: the `claim_the_turn` slice does not reach its own \
+                 return value — the span calculation drifted."
+            );
+
+            // And the re-read exists exactly once in the whole turn path, so
+            // relocating it into a helper is loud rather than silent.
+            let re_reads = source.matches("let session_cwd = sessions").count();
+            assert_eq!(
+                re_reads, 1,
+                "the registry re-read appears {re_reads} time(s) in the turn path; \
+                 there must be exactly one, inside `claim_the_turn`. A second \
+                 copy — or a copy in a helper called from somewhere else — is how \
+                 the read comes to happen before the claim while this check still \
+                 sees the ordering it expects (LESSON-539)."
+            );
 
             let claim = body.find(".try_begin_turn(session_id, &turn_id)").expect(
                 "vacuity floor: the turn claim was not found inside `claim_the_turn`. \

@@ -30,14 +30,32 @@ wrong answers to one question by pairing a count with the wrong rule
 | `runtime/mod.rs` production | above the first **column-0** `#[cfg(test)]` | 10,306 |
 | `impl DaemonRuntime` | the three `impl … DaemonRuntime` blocks, production only | 6,543 |
 | — its method bodies | 89 spans, `fn` line to closing brace | 4,618 |
-| — the remainder | doc comments and blanks between methods | 1,915 |
+| — the remainder | doc comments and blanks between methods | 1,925 |
 | `run_prompt_turn` | body span | 1,084 |
-| — its max nesting | brace depth inside the fn | 8 |
+| — its max nesting | brace depth inside the fn | 7 |
 | `run_session_turn_with_pressure_policy` | body span | 762 |
 | — its max nesting | **brace depth inside the fn** (the rule AC-3 gates on) | **9** |
 | — the same, other rule | indentation levels below the `fn` | 11 |
-| — where the depth lives | lines at brace depth ≥ 7 | 200 |
-| — the bulk | lines at brace depth 6 | 236 |
+| — where the depth lives | lines at brace depth ≥ 6, inside-fn | 200 |
+| — the bulk | lines at brace depth 5, inside-fn | 236 |
+
+**Corrected after adversarial review.** Five of those rows were wrong. The
+remainder said 1,915 where 6,543 − 4,618 = **1,925**: it had been derived by
+subtracting all three blocks' method lines from the *inherent* block alone,
+mixing two corpora in one subtraction. The other four, and the
+fault was the one this table exists to prevent: it paired two brace conventions.
+`run_prompt_turn` was reported at **8** — counting the `fn`'s own brace — while
+`run_session_turn_with_pressure_policy` was reported at **9**, not counting it;
+the two histogram rows were likewise labelled with raw depths. Under one rule
+(inside-fn, the rule AC-3 gates on) the figures are 7, 9, and ≥6 / ==5. The gate
+verdict is unchanged, because 9 is the same number under the rule that matters.
+
+**The brace rule excludes braces inside string, char and comment tokens.** That
+was unstated and it is not academic: `turn_loop.rs` is full of `format!` strings
+containing `{{"tool":…}}`, and a naive counter reports the post-state at **7**
+against a gate of 5 — i.e. reports AC-3 unmet. Both conventions happen to give
+9 at the *baseline*, so nothing there warned that the rule had a free parameter;
+it only becomes decision-relevant in the state the rule is used to grade.
 
 The depth-9 peak is [`turn_loop.rs:1859`](../../../crates/tetond/src/harness/turn_loop.rs).
 
@@ -127,6 +145,16 @@ No boundary leaks more than 8 values, and the largest stage — the 423-line
 attempt loop — leaks 4. A boundary that needed fifteen values would not be a
 seam; these are.
 
+**That was the pre-implementation estimate, and the delivered shape is wider.**
+Re-derived against what shipped: `resolve_the_route` takes 13 values (six in
+`SessionFacts`, six in `TurnRequest`, plus `presence`) and returns 5;
+`run_attempts` takes `TurnContext` plus `AttemptInputs`'s 8 fields plus
+`AttemptState`'s 7 — the fifteen this paragraph said would disqualify a seam.
+The paragraph is left standing rather than deleted because the prediction is the
+interesting part: the boundaries *are* real, and they still cost more to cross
+than the escape-analysis suggested, because a stage needs everything its
+sub-calls need and the analysis only counted what crossed the line.
+
 ### ADR-4 — Write the three unpinned invariant tests first, on unrestructured code
 
 Of the five BR-3 invariants, exploration found:
@@ -157,8 +185,23 @@ The arithmetic, under the baseline table's rule, counting each method's span
 
 | move | lines removed | `impl DaemonRuntime` becomes | meets ≤ 4,500 |
 |---|---:|---:|---|
-| `run_prompt_turn` alone | 1,085 | 5,458 | **no** |
-| the full turn-path cluster | 2,815 | **3,728** | yes |
+| `run_prompt_turn` alone | 1,142 | 5,401 | **no** |
+| the full turn-path cluster | 2,872 | **3,671** | yes |
+
+**Corrected after adversarial review.** The first version of this table said
+1,085 / 5,458 / 2,815 / 3,728. Fifteen of the sixteen cluster rows below were
+measured under the stated rule — span *including the doc block* — and
+`run_prompt_turn` was not: it counted the body plus its one attribute line and
+dropped the 58-line comment run above it, which is the same run TASK-309 then
+had to go back for. The doc block is 58 lines and the body 1,084, so the span is
+**1,142**.
+
+The conclusion is unaffected — 5,401 still misses 4,500 — and the corrected
+arithmetic in fact predicts the outcome better: 3,671 against an actual 3,656,
+rather than 3,728. An independent re-derivation during review gave 1,141 / 5,402
+/ 2,871; the one-line difference is whether the blank line between the comment
+run and the signature belongs to the span. Nothing turns on it, and it is
+recorded rather than smoothed over.
 
 The cluster: `run_prompt_turn` (1,085), `offer_or_refuse_over_budget` (305),
 `accept_invocation` (256), `run_one_attempt` (209), `settle_dynamic_context`
@@ -188,8 +231,19 @@ and running the guards, not by reading them:
 | `runtime_doc_paths.rs` | passes | same, corpus enumerated from disk |
 | `traceability_sweep.rs` | passes | recursive since REQ-602 |
 
-That REQ-602 made three of these four absorb a new module is the concrete return
-on landing it first.
+**What the probe did and did not measure (corrected after review).** It planted
+an *empty* module. The change this REQ actually made was a *populated split
+inherent impl*, and two of the three guards marked "passes" above were in fact
+edited to keep passing: `runtime_visibility.rs` gained a `PUBLIC` entry and its
+count went 13 → 14, and `runtime_doc_paths.rs` gained a 59-line
+`alias_split_impls` rule so a method reached through its type resolves wherever
+the `impl` block lives.
+
+Both edits are argued in place and neither loosens the check in a way a
+mutation could not catch — but "the corpus is enumerated from disk so a new
+module is absorbed for free" is not why they pass, and the probe could not have
+told me so, because an empty module has no methods to cite and no visibility to
+widen. A probe answers the question you built it to ask.
 
 Four further checks assert on *content* and will need repair as code moves —
 each verified by reading the assertion:

@@ -15,7 +15,7 @@
 //!
 //! Both are failures here. Neither is caught by anything else in the suite.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 fn workspace_root() -> PathBuf {
@@ -31,6 +31,59 @@ fn workspace_root() -> PathBuf {
 /// The table's rows open with a `| \`name.rs\` |` cell. Parsed rather than
 /// duplicated, so the doc stays the single source and this test cannot drift
 /// from it by being edited on its own.
+/// The `production` count each row claims, by module basename.
+///
+/// Parsed from the same rows [`documented_modules`] reads, because the count
+/// column was **unguarded** until REQ-600: the name check passed in both
+/// directions while `testsupport.rs` claimed 42 lines against an actual 87, and
+/// `views.rs` 501 against 532. A map the document calls "live" and "enforced"
+/// was enforced only in its first column.
+fn documented_counts() -> BTreeMap<String, usize> {
+    let doc = workspace_root().join(".adlc/specs/REQ-599-decompose-the-turn-path/architecture.md");
+    let text = std::fs::read_to_string(&doc)
+        .unwrap_or_else(|err| panic!("unreadable architecture doc {}: {err}", doc.display()));
+    let mut out = BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("| `") else {
+            continue;
+        };
+        let Some((name, tail)) = rest.split_once('`') else {
+            continue;
+        };
+        if !name.ends_with(".rs") {
+            continue;
+        }
+        let Some(count) = tail.split('|').nth(1) else {
+            continue;
+        };
+        if let Ok(n) = count.trim().replace(',', "").parse::<usize>() {
+            out.insert(name.to_owned(), n);
+        }
+    }
+    out
+}
+
+/// Each module's production lines: everything above the first column-0
+/// `#[cfg(test)]`, which is the rule the map's own header states.
+fn production_counts() -> BTreeMap<String, usize> {
+    let dir = workspace_root().join("crates/tetond/src/runtime");
+    let mut paths = Vec::new();
+    rust_files_recursive(&dir, &mut paths);
+    paths
+        .iter()
+        .filter_map(|path| {
+            let name = path.file_name()?.to_string_lossy().into_owned();
+            let text = std::fs::read_to_string(path).ok()?;
+            let n = text
+                .lines()
+                .position(|l| l.starts_with("#[cfg(test)]"))
+                .unwrap_or(text.lines().count());
+            Some((name, n))
+        })
+        .collect()
+}
+
 fn documented_modules() -> BTreeSet<String> {
     let doc = workspace_root().join(".adlc/specs/REQ-599-decompose-the-turn-path/architecture.md");
     let text = std::fs::read_to_string(&doc)
@@ -125,5 +178,46 @@ fn the_architecture_docs_module_map_matches_the_modules_on_disk() {
         undocumented.is_empty(),
         "these modules exist but the architecture doc's map does not mention them, so the map \
          is incomplete rather than wrong — add a row: {undocumented:?}"
+    );
+}
+
+/// **The map's counts, not only its names.**
+///
+/// Within 10%, not exact: the map is a map, and a three-line edit should not
+/// fail the suite. What it must not do is drift far enough to mislead — 42
+/// against 87 is not a stale figure, it is a wrong one, and it survived because
+/// nothing read that column.
+#[test]
+fn the_architecture_docs_module_map_counts_are_not_far_wrong() {
+    let documented = documented_counts();
+    let actual = production_counts();
+
+    assert!(
+        documented.len() >= 6,
+        "vacuity floor: the count parser found only {} rows with a numeric \
+         production column. A parser that reads no counts agrees with any tree.\n\
+         found: {documented:?}",
+        documented.len()
+    );
+
+    let mut wrong = Vec::new();
+    for (name, claimed) in &documented {
+        let Some(real) = actual.get(name) else {
+            continue; // the name check owns this failure
+        };
+        let drift = (*claimed as f64 - *real as f64).abs() / (*real).max(1) as f64;
+        if drift > 0.10 {
+            wrong.push(format!(
+                "  {name}: map says {claimed}, tree has {real} ({:.0}% off)",
+                drift * 100.0
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "the module map's production counts have drifted more than 10%:\n{}\n\
+         Refresh them. The map's own header calls it a live map rather than a \
+         historical record; a count nobody checks is how it stops being one.",
+        wrong.join("\n")
     );
 }

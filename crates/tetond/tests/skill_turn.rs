@@ -3774,6 +3774,80 @@ fn run_prompt_turn_body() -> String {
     body
 }
 
+/// **`run_prompt_turn`'s own body** — the orchestrator, without the stages.
+///
+/// [`run_prompt_turn_body`] spans the whole stage sequence, so its positions are
+/// where each stage is *defined*. That is the right corpus for "Stage A refuses
+/// above the seed", because those markers live inside one stage each. It is the
+/// wrong corpus for "the stages run in this order": reordering the **calls**
+/// here changes execution and leaves every definition where it was.
+///
+/// Found by review, and it was a real hole: swapping the `prepare_the_attempts`
+/// call above the `settle_expansion` call would run `CarriedTurn::begin` — which
+/// pushes the user block and arms the drop-commit — before either budget stage,
+/// so both `SKILL_EXPANSION_TOO_LARGE` raises would be refusing an expansion
+/// already committed. That is exactly the BR-8(c) violation these tests exist
+/// for, and every textual assertion still held.
+fn run_prompt_turn_orchestrator() -> String {
+    let src = production_source("runtime");
+    let start = src
+        .find("pub async fn run_prompt_turn(")
+        .expect("`run_prompt_turn` is where the turn's sequence lives");
+    let rest = &src[start..];
+    let end = rest[1..]
+        .find("\n    fn claim_the_turn(")
+        .map_or(rest.len(), |at| at + 1);
+    let body = rest[..end].to_owned();
+    assert!(
+        body.contains("commit_or_abandon("),
+        "vacuity floor: the orchestrator slice does not reach `commit_or_abandon`, \
+         its last statement — the span calculation drifted and the order below is \
+         being read off the wrong text."
+    );
+    assert!(
+        !body.contains("fn settle_expansion("),
+        "vacuity floor: the orchestrator slice has swallowed a stage *definition*. \
+         Positions inside a definition are not call sites, which is the confusion \
+         this function exists to avoid."
+    );
+    body
+}
+
+/// **BR-8's order as the turn actually runs it**, read off the call sequence.
+///
+/// The companion to [`the_two_refusals_bracket_the_consent_seam_and_precede_the_seed`],
+/// which pins where the refusals sit *within* the stages. This pins that the
+/// stages are invoked in the order those positions assume.
+#[test]
+fn the_orchestrator_calls_its_stages_in_the_order_br_8_requires() {
+    let body = run_prompt_turn_orchestrator();
+    let route = at(&body, "resolve_the_route(");
+    let expansion = at(&body, "settle_expansion(");
+    let seed = at(&body, "prepare_the_attempts(");
+    let attempts = at(&body, "run_attempts(");
+    let commit = at(&body, "commit_or_abandon(");
+
+    assert!(
+        route < expansion,
+        "the route is decided before the expansion is measured against its \
+         budget — the budget is the route's"
+    );
+    assert!(
+        expansion < seed,
+        "BR-8(c): both budget stages refuse ABOVE `CarriedTurn::begin`, which \
+         `prepare_the_attempts` calls. Running the seed first would leave every \
+         refusal below it refusing an expansion the session has already committed."
+    );
+    assert!(
+        seed < attempts,
+        "the conversation is armed before the first attempt sends anything"
+    );
+    assert!(
+        attempts < commit,
+        "the commit protocol runs on the loop's outcome, so it follows it"
+    );
+}
+
 /// The offset of `needle` in `haystack`, or a failure naming what was not found.
 fn at(haystack: &str, needle: &str) -> usize {
     haystack

@@ -324,7 +324,18 @@ impl DaemonRuntime {
             .await?;
         let tctx = TurnContext::new(events, &session_id, &config, &router, &gate, invoker);
 
-        self.spawn_the_naming_duty(tctx, sessions, &skill_turn, &prompt, &routed_text);
+        self.spawn_the_naming_duty(tctx, sessions, &skill_turn, &routed_text);
+        // REQ-563 BR-3: every URL in this prompt joins the session's user-pasted
+        // set **before** the turn runs, so a message that pastes a link and asks
+        // about it in one breath classifies as `UserPasted` — the ordinary
+        // shape of the request. This is the one ingestion point, and the text it
+        // reads is the user's own (see `record_user_prompt_urls`).
+        //
+        // REQ-585: `prompt`, deliberately — **not** `routed_text`. A skill body
+        // is file-authored, and feeding it here would let a file on disk author
+        // its own authorization by writing a URL into the set the web tool then
+        // trusts. A skill turn's `prompt` is empty, so an invocation contributes
+        // nothing, which is the correct answer: nobody pasted anything.
         self.record_user_prompt_urls(&session_id, &prompt);
         // The gate is the one fetched above the expansion (REQ-589 ADR-10). It
         // is still fetched before the tools, which is what the web tool needs:
@@ -673,7 +684,6 @@ impl DaemonRuntime {
         tctx: TurnContext<'_>,
         sessions: &SessionRegistry,
         skill_turn: &Option<SkillTurn>,
-        _prompt: &str,
         routed_text: &str,
     ) {
         // REQ-561 TASK-062: name the session, at most once for its whole life.
@@ -722,37 +732,25 @@ impl DaemonRuntime {
                 Provenance::empty(),
             );
         }
-
-        // Assemble the harness context, tools, and the permission gate once; a
-        // fallback re-runs the loop against the same accumulated context.
-        //
-        // REQ-544 (known limitation, deliberately deferred): the retry/fallback
-        // path below re-runs the loop against this *same* `ctx`, which by design
-        // preserves completed work (file reads/edits done before a mid-turn
-        // transient failure). The trade-off is that the accumulated context is
-        // re-sent to the retry/fallback provider and thus re-billed as input
-        // tokens — a mid-turn transient failure re-bills the partial progress.
-        // A clean fix (snapshot `ctx` here and restore it before a retry, or drive
-        // retries at single-call granularity so only the failed call is re-issued)
-        // changes the "continue vs. restart" semantics and needs a product call on
-        // whether a fallback should preserve or discard partial work; it is out of
-        // scope for this correctness pass. `ContextManager` is `Clone`, so the
-        // snapshot itself is cheap when that decision is made.
-        // TODO(REQ-544 followup): make retries cost-neutral once continue-vs-restart
-        // semantics are decided.
-        // REQ-563 BR-3: every URL in this prompt joins the session's user-pasted
-        // set **before** the turn runs, so a message that pastes a link and asks
-        // about it in one breath classifies as `UserPasted` — the ordinary
-        // shape of the request. This is the one ingestion point, and the text it
-        // reads is the user's own (see `record_user_prompt_urls`).
-        //
-        // REQ-585: `prompt`, deliberately — **not** `routed_text`. A skill body
-        // is file-authored, and feeding it here would let a file on disk author
-        // its own authorization by writing a URL into the set the web tool then
-        // trusts. A skill turn's `prompt` is empty, so an invocation contributes
-        // nothing, which is the correct answer: nobody pasted anything.
     }
 
+    // Assemble the harness context, tools, and the permission gate once; a
+    // fallback re-runs the loop against the same accumulated context.
+    //
+    // REQ-544 (known limitation, deliberately deferred): the retry/fallback
+    // path below re-runs the loop against this *same* `ctx`, which by design
+    // preserves completed work (file reads/edits done before a mid-turn
+    // transient failure). The trade-off is that the accumulated context is
+    // re-sent to the retry/fallback provider and thus re-billed as input
+    // tokens — a mid-turn transient failure re-bills the partial progress.
+    // A clean fix (snapshot `ctx` here and restore it before a retry, or drive
+    // retries at single-call granularity so only the failed call is re-issued)
+    // changes the "continue vs. restart" semantics and needs a product call on
+    // whether a fallback should preserve or discard partial work; it is out of
+    // scope for this correctness pass. `ContextManager` is `Clone`, so the
+    // snapshot itself is cheap when that decision is made.
+    // TODO(REQ-544 followup): make retries cost-neutral once continue-vs-restart
+    // semantics are decided.
     /// **Stage — assemble the harness: tools, jail, stream and system prompt.**
     ///
     /// Everything here reads the turn's single `ProbedRoot` and its single
@@ -845,7 +843,7 @@ impl DaemonRuntime {
 
     /// **Stage — settle the skill expansion against the budget.**
     ///
-    /// Stage A asks whether the body fits, the consent tctx.gate asks the user, and
+    /// Stage A asks whether the body fits, the consent gate asks the user, and
     /// stage B folds the dynamic context in. All three read the same `system`
     /// prompt and the same route, and all three may leave `skill_turn` changed —
     /// which is why it is lent mutably rather than returned: a stage that
@@ -1218,7 +1216,7 @@ impl DaemonRuntime {
                     inputs.prompt_spend,
                     // REQ-589 BR-12 / ADR-8: the one turn whose top-of-loop
                     // pressure gate is suspended is the one whose over-budget
-                    // measurement a human was shown and st.accepted. Built fresh
+                    // measurement a human was shown and accepted. Built fresh
                     // per attempt because `PressurePolicy` is consumed by the
                     // call — which is the type carrying the "exactly one
                     // iteration" rule rather than a flag someone has to reset —
@@ -1236,7 +1234,7 @@ impl DaemonRuntime {
             // Both reroute arms below sit under this `Err`, so the list is
             // refreshed here — once, from the tool's own per-turn record of
             // what it folded — rather than at each guard. The tail is rebuilt
-            // from `inputs.typed_refit` because that state accumulates across st.attempts.
+            // from `inputs.typed_refit` because that state accumulates across attempts.
             if result.is_err() {
                 st.skill_refit.truncate(inputs.typed_refit);
                 st.skill_refit
@@ -1273,10 +1271,10 @@ impl DaemonRuntime {
                             failed_reroute_block_sentence(detail),
                         ));
                     }
-                    // REQ-586 BR-1: the budget follows the st.route. The local
+                    // REQ-586 BR-1: the budget follows the route. The local
                     // pin's window is a fraction of the remote one this turn
                     // was assembled against, so the context is re-fitted here —
-                    // after the st.route is chosen, before the retry — rather than
+                    // after the route is chosen, before the retry — rather than
                     // arriving over-window at a tier that has no fallback left.
                     let previous = st.route.budget.clone();
                     st.route = tctx
@@ -1347,8 +1345,8 @@ impl DaemonRuntime {
                 // BR-14.2, and it is marked whether or not the withdrawal below
                 // finds its block: the rejection is a thing this daemon
                 // *watched happen*, and the next offer for this pair is owed it
-                // regardless of what the st.conversation turned out to look like.
-                // Keyed off the st.route that actually refused — a fallback may
+                // regardless of what the conversation turned out to look like.
+                // Keyed off the route that actually refused — a fallback may
                 // have moved the turn since the offer was made, and it is the
                 // refusing window the next offer's lead is a claim about.
                 self.window_rejections.mark(
@@ -1397,7 +1395,7 @@ impl DaemonRuntime {
                 //
                 // The sentence carries the three numbers a user can act on and
                 // no response body (BR-11): who refused, what was assembled,
-                // and the budget the st.route was running under. A wide gap
+                // and the budget the route was running under. A wide gap
                 // between the last two says the declared window is wrong; a
                 // narrow one says this content tokenizes denser than the
                 // estimator assumed.
@@ -1437,8 +1435,8 @@ impl DaemonRuntime {
                 // choke point because `TransportError` is `Copy` and cannot hold
                 // one — and because every fact it needs is already in scope at
                 // this point: the accumulator this prompt has been adding to,
-                // the ceiling the same tctx.core.config supplied to the choke point, and
-                // the st.route's provider and model. Composed through the one
+                // the ceiling the same config supplied to the choke point, and
+                // the route's provider and model. Composed through the one
                 // composer the `/verbose` clause uses, so the two surfaces
                 // cannot come to name different ceilings (BR-2).
                 Err(HarnessError::Remote(perr)) if perr.is_spend_ceiling_reached() => {
@@ -1580,7 +1578,7 @@ impl DaemonRuntime {
                         ),
                     ));
                 }
-                // REQ-544 M-3: a credential that will not resolve is a tctx.core.config
+                // REQ-544 M-3: a credential that will not resolve is a config
                 // problem, not a transient fault — surface it clearly (the
                 // message names the reference and reason, never the secret) and
                 // do not retry the same broken credential.
@@ -1611,7 +1609,7 @@ impl DaemonRuntime {
         //
         // # The one failure that writes, and why (REQ-589 BR-14.1 / D-8)
         //
-        // BR-14.1 asks for an st.accepted expansion to be *withdrawn* from the
+        // BR-14.1 asks for an accepted expansion to be *withdrawn* from the
         // session when the tier refuses it at the window, so the next turn
         // assembles without it. Under abandon alone that withdrawal is
         // unobservable: the manager it edited is dropped, the pre-turn vector
@@ -1646,7 +1644,7 @@ impl DaemonRuntime {
                 // The withdrawal, and the turn's error, both. The commit runs
                 // the same protocol the success arm does — it re-asserts the
                 // budget and evaluates the taint pin — because what is being
-                // handed over is a st.conversation the session will assemble from
+                // handed over is a conversation the session will assemble from
                 // next, not a special case of one.
                 commit_and_publish(st.conversation, stream_events, &st.route.budget);
                 Err(err)

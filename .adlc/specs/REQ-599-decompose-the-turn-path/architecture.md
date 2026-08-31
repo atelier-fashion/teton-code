@@ -248,14 +248,14 @@ table, which do not move.
 | module | production | holds |
 |---|---:|---|
 | `mod.rs` | 7,420 | `DaemonRuntime` and everything not yet sliced. Was 10,306 at REQ-599's close; REQ-600 moved the turn path out |
-| `turn.rs` | 3,409 | **REQ-600.** `run_prompt_turn` and the fifteen methods only it reaches — the god-impl slice REQ-599 deferred as its step 8 |
-| `engine.rs` | 1,091 | probe, installer, engine loaders, `EngineSlot`, `StagedEngines` |
+| `turn.rs` | 3,407 | **REQ-600.** `run_prompt_turn` and the fifteen methods only it reaches — the god-impl slice REQ-599 deferred as its step 8 |
+| `engine.rs` | 1,098 | probe, installer, engine loaders, `EngineSlot`, `StagedEngines` |
 | `config_document.rs` | 888 | rendering and persisting the config document |
 | `duty.rs` | 632 | the five `*_route` resolvers, `resolve_duty`, `spawn_title_session`, `RedactionGateImpl` |
 | `taint.rs` | 535 | `SessionTaint`, the lookup seam, `TaintingPrivacySink` |
-| `views.rs` | 501 | `config/get`'s snapshot and the web-setup views |
+| `views.rs` | 532 | `config/get`'s snapshot and the web-setup views |
 | `provider.rs` | 410 | transport, credentials, connection probe |
-| `testsupport.rs` | 42 | scratch-dir helpers shared by the tree's tests |
+| `testsupport.rs` | 87 | scratch-dir helpers shared by the tree's tests |
 
 `runtime.rs` was **14,183** production lines at `fedcab1`. `mod.rs` is now
 **10,306** — a reduction of 3,877 (27%), with 4,057 lines living in seven

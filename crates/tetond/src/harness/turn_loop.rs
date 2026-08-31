@@ -1129,25 +1129,6 @@ pub async fn run_session_turn_with_source(
     .await
 }
 
-/// [`run_session_turn_with_source`], with the turn's [`PressurePolicy`] named.
-///
-/// The same loop and the same guarantees; the only difference is that the
-/// caller states whether this turn's first iteration may shed history to fit
-/// (REQ-589 BR-12 / D-3, ADR-8). The daemon's routed path calls this with
-/// [`PressurePolicy::SuspendedForAcceptedTurn`] on the turn whose over-budget
-/// expansion the user accepted, and with [`PressurePolicy::Enforced`] — which is
-/// what [`run_session_turn_with_source`] passes — on every other turn.
-///
-/// `pressure` is taken **by value**: it is this turn's answer, spent by this
-/// turn's first iteration, and cannot be carried into the next one. See
-/// [`PressurePolicy`] for why that is a property of the type rather than a rule.
-///
-/// # Errors
-/// As [`run_session_turn_with_source`]. A suspended turn additionally reaches
-/// [`HarnessError::LocalContextLengthExceeded`] /
-/// [`HarnessError::ContextLengthExceeded`] where an enforced one would have
-/// dropped blocks to fit — that visible refusal is BR-12's intended outcome, not
-/// a regression.
 /// The facts every iteration of the turn loop is served with.
 ///
 /// Named rather than passed one by one: `run_session_turn_with_pressure_policy`
@@ -1762,6 +1743,25 @@ async fn run_the_allowed_tool(
     Ok(())
 }
 
+/// [`run_session_turn_with_source`], with the turn's [`PressurePolicy`] named.
+///
+/// The same loop and the same guarantees; the only difference is that the
+/// caller states whether this turn's first iteration may shed history to fit
+/// (REQ-589 BR-12 / D-3, ADR-8). The daemon's routed path calls this with
+/// [`PressurePolicy::SuspendedForAcceptedTurn`] on the turn whose over-budget
+/// expansion the user accepted, and with [`PressurePolicy::Enforced`] — which is
+/// what [`run_session_turn_with_source`] passes — on every other turn.
+///
+/// `pressure` is taken **by value**: it is this turn's answer, spent by this
+/// turn's first iteration, and cannot be carried into the next one. See
+/// [`PressurePolicy`] for why that is a property of the type rather than a rule.
+///
+/// # Errors
+/// As [`run_session_turn_with_source`]. A suspended turn additionally reaches
+/// [`HarnessError::LocalContextLengthExceeded`] /
+/// [`HarnessError::ContextLengthExceeded`] where an enforced one would have
+/// dropped blocks to fit — that visible refusal is BR-12's intended outcome, not
+/// a regression.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_session_turn_with_pressure_policy(
     source: &mut dyn CompletionSource,
@@ -1971,7 +1971,7 @@ pub async fn run_session_turn_with_pressure_policy(
                     ctx.push_tool_result(
                         "system",
                         None,
-                        "You latches.edited a file but have not latches.verified the change. Run a \
+                        "You edited a file but have not verified the change. Run a \
                          verification step (re-read the file, or run a build/test with \
                          the shell tool) and confirm the result before finishing.",
                     );
