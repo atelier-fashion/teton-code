@@ -1,0 +1,44 @@
+{
+  "req": "REQ-600",
+  "branch": "feat/REQ-600-decompose-run-prompt-turn",
+  "startedAt": "2026-08-31T21:45:00Z",
+  "completed": false,
+  "currentPhase": 2,
+  "completedPhases": [
+    0,
+    1
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Worktree + Preflight",
+      "completedAt": "2026-08-31T21:45:00Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-08-31T22:00:00Z"
+    }
+  ],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-600",
+      "branch": "feat/REQ-600-decompose-run-prompt-turn",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "merged": false
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  }
+}
