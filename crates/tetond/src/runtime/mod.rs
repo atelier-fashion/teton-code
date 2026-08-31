@@ -7893,7 +7893,7 @@ impl DaemonRuntime {
     /// daemon has no config file at all. [`error_code::INTERNAL_ERROR`] when the
     /// document could not be derived at all, or when the document this write
     /// derived does not name the row it was told to write.
-    pub(crate) fn derive_provider_setup(
+    fn derive_provider_setup(
         &self,
         candidate: &ProviderSetupCandidate,
         current: &Config,

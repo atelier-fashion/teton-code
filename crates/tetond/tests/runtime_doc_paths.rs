@@ -52,6 +52,26 @@
 //! | silence the citation scanner | the citation vacuity floor, at 0 paths |
 //! | silence the module-tree parser | the declaration vacuity floor, at 0 declarations |
 //!
+//! ## What adversarial review added, after the table above was written
+//!
+//! Every one is a parse that was wrong in the *permissive* direction — the
+//! check stayed green while seeing less — except the first, which was wrong in
+//! both directions at once:
+//!
+//! | defect | consequence |
+//! |---|---|
+//! | `impl<'a> Type<'a> {` skipped: splitting on the first `<` yields an empty subject | `runtime::views::WebSetupAnswers::from_preview` read as broken, while `runtime::views::from_preview` — naming a free function that does not exist — resolved |
+//! | `runtime::a::{b, c}` checked only as far as `a` | renaming `b` or `c` left the guard green; three such citations exist and TASK-305 rewrote all three |
+//! | `r"…"` (zero hashes) parsed as a plain string | `r"C:\"` leaves the scanner inside a string for the rest of the file, dropping every later declaration |
+//! | `at += 1` in the no-literal arm | a non-ASCII char outside a string (`if c == '—'`) panics mid-codepoint |
+//! | `trim_end_matches("mod")` on the path *string* | a future `runtime/submod.rs` becomes `runtime::sub` |
+//! | `static mut G` | registers an item named `mut` |
+//! | corpus hardcoded to three crates; citation floor a bare `>= 15` | losing `crates/tetond/tests` drops 18 citations and still clears the floor |
+//!
+//! The corpus is now enumerated from disk and the citation floor is keyed on
+//! **shape** — each sub-corpus that carries citations today must still carry
+//! them — because a count floor is exactly what a lost directory walks under.
+//!
 //! The middle two matter most: both are *modelling* choices, and getting either
 //! wrong produces a list of false positives rather than a silent pass — which
 //! is the failure that gets a check deleted rather than fixed.
@@ -122,11 +142,14 @@ fn declared_paths() -> BTreeSet<String> {
             .into_owned();
         // `mod.rs` → `runtime`; `duty.rs` → `runtime::duty`;
         // `nested/mod.rs` → `runtime::nested`.
-        let stem = relative
-            .trim_end_matches(".rs")
-            .trim_end_matches("mod")
-            .trim_end_matches('/')
-            .replace('/', "::");
+        // By path component, not by string suffix: `trim_end_matches("mod")`
+        // turns a future `runtime/submod.rs` into `runtime::sub`, and every
+        // citation into it then reads as broken.
+        let mut parts: Vec<&str> = relative.trim_end_matches(".rs").split('/').collect();
+        if parts.last() == Some(&"mod") {
+            parts.pop();
+        }
+        let stem = parts.join("::");
         let prefix = if stem.is_empty() {
             "runtime".to_owned()
         } else {
@@ -306,7 +329,11 @@ fn scan_literals(line: &str, mut state: Literal) -> (bool, Literal) {
                 if bytes[at] == b'"' {
                     state = Literal::Plain;
                 }
-                at += 1;
+                // Advance by a whole character. Stepping one byte and then
+                // slicing `line[at..]` panics mid-codepoint on any non-ASCII
+                // outside a string — `if c == '—'` is enough — and the panic
+                // names a byte offset, not the real problem.
+                at += line[at..].chars().next().map_or(1, |c: char| c.len_utf8());
             }
         }
     }
@@ -329,7 +356,12 @@ fn raw_opener_at(line: &str, at: usize) -> Option<usize> {
         hashes += 1;
         end += 1;
     }
-    (hashes > 0 && bytes.get(end) == Some(&b'"')).then_some(hashes)
+    // `hashes == 0` is `r"…"`, a raw string too. Requiring a hash left `r"C:\\"`
+    // parsed as a plain string whose trailing backslash escapes the closing
+    // quote — after which the scanner stays "inside a string" for the rest of
+    // the file and every later declaration silently leaves the corpus.
+    // Raw strings do not nest, so the first `"` + N `#` closes.
+    (bytes.get(end) == Some(&b'"')).then_some(hashes)
 }
 
 /// `mod x {` — an inline module. `mod x;` is not one: the file it names is
@@ -340,15 +372,48 @@ fn opens_a_module(code: &str) -> Option<String> {
     tail.trim_start().starts_with('{').then(|| name.to_owned())
 }
 
+/// `text` with a leading balanced `<…>` removed, if it opens with one.
+///
+/// Balanced rather than "up to the first `>`", so `<T: Into<String>>` is
+/// consumed whole.
+fn strip_balanced_generics(text: &str) -> &str {
+    let text = text.trim_start();
+    if !text.starts_with('<') {
+        return text;
+    }
+    let mut depth = 0usize;
+    for (at, ch) in text.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return text[at + 1..].trim_start();
+                }
+            }
+            _ => {}
+        }
+    }
+    text
+}
+
 /// The type an `impl` block is about: `impl<T> Trait for Thing<T> {` → `Thing`.
 fn opens_an_impl(code: &str) -> Option<String> {
     let rest = code.strip_prefix("impl")?;
     if !rest.starts_with(['<', ' ']) {
         return None;
     }
+    // Drop `impl`'s own generic parameters before looking for the subject.
+    // Splitting on the first `<` instead — which is what this did — yields an
+    // empty first field for `impl<'a> WebSetupAnswers<'a> {` and the whole impl
+    // is skipped. That is live at `runtime/views.rs`: it made
+    // `runtime::views::WebSetupAnswers::from_preview` read as a broken path
+    // while `runtime::views::from_preview`, naming a free function that does not
+    // exist, resolved. Both directions wrong from one parse.
+    let rest = strip_balanced_generics(rest);
     let head = rest.split_once('{')?.0;
     let subject = head.rsplit(" for ").next().unwrap_or(head).trim();
-    // Drop generics and any leading `<` from `impl<T>`.
+    let subject = strip_balanced_generics(subject);
     let subject = subject.split(['<', ' ']).next().unwrap_or("").trim();
     let name: String = subject
         .chars()
@@ -372,6 +437,8 @@ fn declared_item(code: &str) -> Option<String> {
             if kind == "const " && after.starts_with("fn ") {
                 return declared_item(after);
             }
+            // `static mut G` — `mut` is a modifier, not the name.
+            let after = after.strip_prefix("mut ").unwrap_or(after);
             let name: String = after
                 .chars()
                 .take_while(|c| c.is_alphanumeric() || *c == '_')
@@ -396,10 +463,19 @@ fn strip_visibility(code: &str) -> Option<&str> {
 fn cited_paths() -> BTreeMap<String, Vec<String>> {
     let root = workspace_root();
     let mut sources: Vec<(PathBuf, bool)> = Vec::new();
-    for crate_dir in ["crates/tetond", "crates/teton", "crates/teton-inference"] {
-        for sub in ["src", "tests"] {
+    // Every crate in the workspace, enumerated from disk. A hardcoded list of
+    // crate names is a corpus that silently shrinks: renaming or adding a crate
+    // drops or omits its citations, `rust_files_recursive` returns empty for the
+    // missing path without complaint, and the count floor below still clears.
+    let crates = std::fs::read_dir(root.join("crates"))
+        .unwrap_or_else(|err| panic!("unreadable crates/: {err}"));
+    for entry in crates.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        for sub in ["src", "tests", "benches", "examples"] {
             let mut files = Vec::new();
-            rust_files_recursive(&root.join(crate_dir).join(sub), &mut files);
+            rust_files_recursive(&entry.path().join(sub), &mut files);
             sources.extend(files.into_iter().map(|f| (f, true)));
         }
     }
@@ -471,8 +547,37 @@ fn runtime_paths_in(line: &str) -> Vec<String> {
         let path = path.trim_end_matches(':').to_owned();
         // A bare `runtime` with nothing after it names the module and is not a
         // cross-reference into it.
-        if path.contains("::") {
-            found.push(path);
+        if !path.contains("::") {
+            continue;
+        }
+        // `runtime::duty::dispatch::{a_test, another_test}` — expand the group.
+        // Without this the citation is checked only as far as `dispatch`, so
+        // renaming either test leaves the guard green. Three such citations
+        // exist and TASK-305 rewrote all three, which is the worst place to
+        // stop checking.
+        let after = &line[at + path.len()..];
+        let group = after
+            .trim_start_matches(':')
+            .strip_prefix('{')
+            .and_then(|rest| rest.split_once('}'));
+        match group {
+            Some((members, _)) => {
+                let mut any = false;
+                for member in members.split(',') {
+                    let member = member.trim();
+                    if !member.is_empty() && member.chars().all(|c| c.is_alphanumeric() || c == '_')
+                    {
+                        found.push(format!("{path}::{member}"));
+                        any = true;
+                    }
+                }
+                // A group wrapped across a `//!` continuation has no `}` on
+                // this line; fall back to the prefix rather than dropping it.
+                if !any {
+                    found.push(path);
+                }
+            }
+            None => found.push(path),
         }
     }
     found
@@ -507,10 +612,38 @@ fn every_runtime_path_named_in_a_comment_still_resolves() {
              still clear the count floor above while resolving nothing.",
         );
     }
+    // The citation floor, keyed on shape as well as count. A bare count is
+    // cleared by a corpus that lost a whole directory: `crates/tetond/tests`
+    // alone contributes ~18 distinct paths, and losing it leaves ~30 — still
+    // over any count floor worth setting, with 18 citations silently unchecked.
+    // So each sub-corpus that carries citations today must still carry them.
+    let contributors: BTreeSet<&str> = cited
+        .values()
+        .flatten()
+        .filter_map(|site| {
+            [
+                "crates/tetond/src",
+                "crates/tetond/tests",
+                "crates/teton/tests",
+                "docs",
+            ]
+            .into_iter()
+            .find(|prefix| site.starts_with(prefix))
+        })
+        .collect();
+    for required in ["crates/tetond/src", "crates/tetond/tests", "docs"] {
+        assert!(
+            contributors.contains(required),
+            "vacuity floor: no `runtime::…` citation was found anywhere under `{required}`, \
+             which carries them today. A directory that leaves the corpus takes its \
+             citations with it and the scanner reports success over what remains — \
+             which is the count floor's blind spot, not a hypothetical."
+        );
+    }
     assert!(
-        cited.len() >= 15,
+        cited.len() >= 40,
         "vacuity floor: the citation scanner found only {} distinct `runtime::…` \
-         paths in comments. The corpus contains dozens; the scanner has gone quiet.",
+         paths in comments. The corpus carries more than 45; the scanner has gone quiet.",
         cited.len()
     );
 

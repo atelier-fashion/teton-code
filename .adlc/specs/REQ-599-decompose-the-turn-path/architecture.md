@@ -177,9 +177,12 @@ What the seven commits actually produced:
 `testsupport.rs` shipped as well and appears in no plan row: it was extracted to
 hold helpers two modules had come to share.
 
-The plan's *names* survived — every module it proposed except `types` and
-`session` shipped under its own name — but the **order** did not, and the table
-pairs each name with the wrong step. The seams were chosen from the impl
+Only **two** of the seven proposed names shipped at all: `duty.rs` and
+`provider.rs`. `types`, `consent`, `egress`, `session` and `turn` never existed
+as modules — `consent` ended up inside `engine.rs` and `egress` inside
+`taint.rs`, as *content* rather than as modules. And the two that did survive
+are paired with the wrong steps: `provider` was planned for step 4 and shipped
+at step 7. The seams were chosen from the impl
 structure as ADR-2 said they would be, and that reordered the work; nobody went
 back to say so. Recording the drift is the point: a plan that silently becomes a
 map is the more expensive of the two failures, because the map is what a reader

@@ -47,4 +47,4 @@ after a rename, and used a flat `read_dir` to do it.
       `["nested/mod.rs"]` as it should, and passes again with the fixture
       removed. Recursion alone was not enough — what the scan *found* and what
       the assertion could *see* were two different questions.
-- [ ] `cargo test --workspace --no-fail-fast` green, grepped for `FAILED`.
+- [x] `cargo test --workspace --no-fail-fast` green, grepped for `FAILED`.

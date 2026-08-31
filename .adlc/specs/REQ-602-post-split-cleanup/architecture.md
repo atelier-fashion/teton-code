@@ -38,7 +38,31 @@ to `pub(super)`; build; the errors are exactly the set that needs crate reach.
 No heuristic can beat it, and three attempts at one produced three wrong
 answers — the third by someone who had just corrected the second.
 
-Result: **143 `pub(crate)` sites → 8**; `pub(super)` 40 → 175. The survivors:
+Result, **as planned** — every figure here was superseded by measurement and
+is corrected in the block below rather than silently overwritten, because a plan
+that quietly becomes a map is the failure this REQ was written to fix:
+
+> ~~Result: **143 `pub(crate)` sites → 8**; `pub(super)` 40 → 175.~~
+
+**Corrected at TASK-307 and again after review (2026-08-31).** Each figure now
+carries its rule; the planned ones carried none, which is how "143 → 8" and
+"130 → 5" both survived as long as they did.
+
+| rule | before (`8902439`) | after |
+|---|---:|---:|
+| occurrences of the token `pub(crate)`, seven submodules | 131 | 5 |
+| **item declarations** carrying `pub(crate)`, seven submodules | **88** | **4** |
+| the same, including `mod.rs` (occurrences) | 147 | 20 |
+| `pub(super)` occurrences under `runtime/` | 41 | 168 |
+
+The surface is **four**, not eight and not five. Review asked why
+`RenderedProviderSetup` was crate-wide; the answer given was "it must match its
+`pub(crate)` accessor", and the accessor —
+`DaemonRuntime::derive_provider_setup` in `mod.rs` — had no out-of-tree caller
+either. Every hit outside `runtime/` was prose. Making the accessor private
+drops the type to `pub(super)` and the build is clean. The demote-all method was
+right; it had been applied to the submodules and not to the `mod.rs` item
+holding one of them open. The survivors:
 
 | item | reached from |
 |---|---|
@@ -59,8 +83,12 @@ ADR-1's rule is "compile the whole crate", which a unit test cannot do, and any
 search-shaped approximation re-encodes the mistake — three searches, three wrong
 answers.
 
-So AC-2 ships a **ratchet**: the `pub(crate)` count under `runtime/` is exactly
-8, the five items are named, and a comment records how to re-derive them. Same
+So AC-2 ships a **ratchet**: the crate-wide surface under `runtime/` is exactly
+the **four** items named in it, and a comment records how to re-derive them.
+(This paragraph said "exactly 8, the five items are named" — two figures, both
+superseded, neither ever asserted by the shipped test.) The corpus is
+enumerated from disk rather than listed, so a module REQ-600 or REQ-603 adds is
+scanned rather than silently exempt. Same
 shape as `suppression_ratchet.rs` and bounded on both sides — a *drop* is as
 suspicious as a climb, because it likelier means the selector stopped matching
 than that the code improved.
@@ -75,10 +103,19 @@ written **one commit earlier**, to repair a guard that had gone silently dead
 after a rename — and it used a flat `read_dir`, reproducing the same class in
 the fix for it.
 
-The remedy is a shared helper rather than six hand-written walkers: the crate
-already has `rust_files` in `call_sites.rs` and `suppression_ratchet.rs`. Every
-directory scan over `runtime/` uses one recursive helper, so the next person
-adding a scan inherits recursion instead of re-deciding it.
+The remedy was planned as a single shared helper. **It could not be one, and
+saying so is part of the record**: `call_sites::scan::rust_files` is
+`#[cfg(test)]`-gated inside the lib, so an integration test — which links the
+lib compiled without that cfg — cannot reach it. What shipped is three in-lib
+scans sharing `rust_files`, and four integration tests each carrying a
+documented local copy, matching a pattern four sibling tests already used.
+
+The property that matters is "every directory scan over `runtime/` recurses",
+and that is what AC-4 asserts. One site was missed on the first pass —
+`traceability_sweep.rs`'s vacuity-floor read, which AC-4 named explicitly — and
+was found by adversarial review, not by the plan. It now shares that file's own
+recursive walker, demonstrated by planting `runtime/nested/mod.rs` and watching
+the floor's corpus go from 8 files to 9.
 
 ### ADR-4: Amend, do not re-tick
 
@@ -99,8 +136,9 @@ says what actually happened.
 
 ### ADR-5: Task order is by blast radius, not by AC number
 
-The visibility change touches ~73 declarations across six modules and is the
-one step that can break the build in a way bisect has to untangle. It goes
+The visibility change touches **88 declarations** across seven modules (the
+"~73" here was a fourth estimate, from the qualified-path rule) and is the one
+step that can break the build in a way bisect has to untangle. It goes
 **first**, alone, so everything after it lands on a stable base. The doc-only
 repairs (AC-6, AC-8) go last, where a mistake costs a re-read rather than a
 rebuild.
@@ -109,8 +147,8 @@ rebuild.
 
 | task | subject | depends on |
 |---|---|---|
-| TASK-301 | recursive-scan helper; all six scans use it (AC-4) | — |
-| TASK-302 | narrow 73 items to `pub(super)` (AC-1) | — |
+| TASK-301 | every scan over `runtime/` recurses — seven sites, not six (AC-4) | — |
+| TASK-302 | narrow the submodule surface to `pub(super)` — 88 declarations, leaving 4 (AC-1) | — |
 | TASK-303 | `runtime_visibility.rs` enforcement test + mutation (AC-2, AC-3) | TASK-302 |
 | TASK-304 | move the BR-7 tests, or record why they stay (AC-5) | — |
 | TASK-305 | stale doc paths + a resolution check (AC-7) | TASK-301 |

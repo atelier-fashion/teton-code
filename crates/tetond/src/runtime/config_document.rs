@@ -465,7 +465,7 @@ pub(super) fn render_persisted_document(
 /// commit performs no derivation of its own: a commit that had to extend this
 /// struct to get its bytes would be one derivation away from deriving them
 /// itself, which is the drift ADR-1 and LESSON-451 exist to prevent.
-pub(crate) struct RenderedProviderSetup {
+pub(super) struct RenderedProviderSetup {
     /// The `[[providers]]` row and the `[[tiers]]` rows this candidate writes,
     /// sliced out of `full_text` — what the preview shows, and therefore what
     /// the user confirms.
