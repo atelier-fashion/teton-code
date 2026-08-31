@@ -110,6 +110,15 @@ The cheap version of both: **state the counting rule beside the count.** A figur
 that says what it counted invites the check that a bare figure does not. REQ-602's
 AC-1 now requires exactly that.
 
+**Postscript (2026-08-31): AC-1 then got it wrong twice more.** It shipped
+stating "130 → 5", which pairs a *token-occurrence* count with a *declaration*
+count — two rules, one arrow, inside the criterion written to prevent that. Its
+final verification caught that and corrected it to 88 → 5. Adversarial review
+then found the 5 was wrong too: one item was held crate-wide by an accessor
+nobody had asked the same question of. The answer is 4. That is five wrong
+answers to one question, the last three produced by people actively applying
+this lesson — which is [[lesson-597]]'s subject.
+
 ## Why It Matters
 
 The original conclusion was written into REQ-599's ADR-1, its Assumptions, this
