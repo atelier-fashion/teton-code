@@ -123,3 +123,14 @@ teton-code/
 - PR-gated CI on `main` (plain OSS flow — this repo does NOT use the
   staging-first pipeline of other atelier-fashion repos).
 - Conventional-style commit subjects; PRs reference their REQ.
+- **Every commit pushed as a tip keeps its CI result** (REQ-605). `ci.yml`'s
+  concurrency group is keyed per commit, so pushing the next commit no longer
+  cancels the previous one's run. A multi-commit REQ that needs each step
+  independently green — REQ-599's AC-11, REQ-600's AC-7 — **no longer has to
+  push one commit at a time and wait**; REQ-600 paid two hours of wall-clock for
+  that discipline and the measured cost of dropping it is ~2% of runner minutes.
+  Two caveats: a **batched** push of several commits still fires one run for the
+  tip only, because `ci.yml` triggers on `pull_request` and `push: main` alone
+  (so the intermediate commits never start a run under any concurrency setting);
+  and a force-push no longer kills the abandoned commit's run, which now finishes
+  on a tree nobody will merge.

@@ -2,8 +2,8 @@
   "req": "REQ-605",
   "branch": "feat/REQ-605-ci-concurrency-per-commit",
   "startedAt": "2026-08-31T23:13:51Z",
-  "completed": false,
-  "currentPhase": 7,
+  "completed": true,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
@@ -11,7 +11,9 @@
     3,
     4,
     5,
-    6
+    6,
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -55,6 +57,18 @@
       "name": "Create PR",
       "completedAt": "2026-08-31T23:40:10Z",
       "result": "PR #254 flipped draft->ready, body set, footprint block published."
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-08-31T23:44:50Z",
+      "result": "All 8 branch runs terminal; 7/7 required checks green on head d9bd165."
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup and Merge",
+      "completedAt": "2026-08-31T23:44:50Z",
+      "result": "PR #254 squash-merged as 8188704 (verified MERGED via forge, mergedAt 2026-08-31T23:43:25Z). Worktree /Users/brettluelling/GitHub/teton-code/.worktrees/REQ-605 removed; branch feat/REQ-605-ci-concurrency-per-commit deleted locally and remotely."
     }
   ],
   "repos": {
@@ -66,9 +80,10 @@
       "touched": true,
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/254",
       "prNumber": 254,
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
-      "snapshotPR": null
+      "snapshotPR": null,
+      "mergeCommit": "818870479506e448d2416a98799269c0933c9370"
     }
   },
   "mergeOrder": [
@@ -86,6 +101,7 @@
   "blockers": [],
   "notes": [
     "Step 0: single-repo mode (no .adlc/config.yml). integrationBranch=main, confirmed by conventions.md ('this repo does NOT use the staging-first pipeline'). Draft PR deferred to Phase 6 per LESSON-004 (branch has no commits at Step 0).",
-    "Phase 2: single-repo, all tasks repo=teton-code. Footprint publish skipped (no draft PR at architect time)."
+    "Phase 2: single-repo, all tasks repo=teton-code. Footprint publish skipped (no draft PR at architect time).",
+    "Phase 8: single-repo topology \u2014 pipeline-runner owned the merge. Terminal claim: merged."
   ]
 }
