@@ -1,7 +1,7 @@
 ---
 id: REQ-599
 title: "Decompose the turn path and split runtime.rs, without losing the traceability that makes it readable"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-28
 updated: 2026-08-29
