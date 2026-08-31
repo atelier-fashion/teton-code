@@ -6,9 +6,30 @@ on:
   push:
     branches: [main]
 
-# One in-flight run per ref; newer pushes cancel older ones.
+# One in-flight run per *commit*, not per ref: pushing commit n+1 no longer
+# cancels commit n's run, so every tip that starts a run keeps a complete result.
+# What cancellation always killed was `fmt · clippy · test (macos-latest)`, the
+# slowest of the seven job runs — and macOS is the runner that caught
+# LESSON-591's detached-naming race, which passed 40/40 locally and on
+# ubuntu-latest. REQ-599 lost that leg on two of its seven commits exactly this
+# way; REQ-600 kept it only by waiting out each run before pushing the next.
+#
+# cancel-in-progress stays true and still earns its keep: with the SHA in the
+# group it collapses duplicate runs of the SAME commit on the SAME ref — a
+# re-run, or a close/reopen — which is the only kind of superseding GitHub can
+# actually recognise here.
+#
+# The trade (REQ-605 ADR-2): a force-push that abandons a commit no longer kills
+# its run, so that run finishes on a tree nobody will merge. `concurrency` keys
+# on a string and has no notion of ancestry, so it cannot tell "n+1 builds on n"
+# from "Y replaces X" — one behaviour or the other, not both. The waste is
+# bounded to that one run, and it is small: cancellation only ever landed inside
+# `Tests`, after the toolchain install, the cache restore and a full clippy
+# compile had already been paid for. Killing it there returned about ten seconds
+# of macOS time, destroyed the whole macOS result, and skipped `Post Cache cargo
+# build` so the next run started colder.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: true
 
 # Declared here rather than inherited from the repo-wide default: the default is

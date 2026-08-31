@@ -57,8 +57,12 @@ on:
         required: false
         type: string
 
-# Unlike ci.yml, an in-flight run is NOT cancelled by a newer one: a half-synced
-# bucket or a half-rolled Cloud Run revision is worse than a queued run.
+# A newer run does NOT cancel an in-flight one — it queues behind it: a
+# half-synced bucket or a half-rolled Cloud Run revision is worse than a queued
+# run. ci.yml also declines to cancel on a newer push, but it gets there by
+# keying its group per commit so distinct commits run concurrently (REQ-605);
+# here the serialisation is the whole point, so the group stays repo-wide and
+# cancel-in-progress stays false.
 concurrency:
   group: deploy-site
   cancel-in-progress: false

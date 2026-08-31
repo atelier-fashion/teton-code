@@ -19,10 +19,16 @@ on:
         type: boolean
         default: true
 
-# Unlike ci.yml, an in-flight run is NOT cancelled by a newer one. A release is
-# half-published for a few seconds in the middle of `gh release create`;
+# A newer run does NOT cancel an in-flight one — it queues behind it. A release
+# is half-published for a few seconds in the middle of `gh release create`;
 # cancelling there leaves a release with some of its assets, which is worse than
 # waiting.
+#
+# ci.yml also declines to cancel on a newer push, but by the opposite mechanism
+# and for a different reason: it keys its group per commit so distinct commits
+# run *concurrently*, reserving cancellation for duplicate runs of one commit
+# (REQ-605). Here concurrency is not the goal — the queue is — so this group
+# stays coarse and cancel-in-progress stays false.
 #
 # This group is keyed on the ref, which is right for building and publishing —
 # two tags are two independent releases and neither should wait on the other —
