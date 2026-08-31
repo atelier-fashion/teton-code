@@ -1,0 +1,66 @@
+{
+  "req": "REQ-605",
+  "branch": "feat/REQ-605-ci-concurrency-per-commit",
+  "startedAt": "2026-08-31T23:13:51Z",
+  "completed": false,
+  "currentPhase": 4,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "integrationBranch": "main",
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree + Preflight",
+      "completedAt": "2026-08-31T23:13:51Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-08-31T23:16:46Z",
+      "result": "approved (1 warning fixed: Description said 'six commits', contradicting its own Assumptions and REQ-600 AC-7; re-derived to 10 runs/11 commits on PR #249 with the counting rule stated)"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Tasks",
+      "completedAt": "2026-08-31T23:23:01Z",
+      "result": "OQ-1 settled: per-commit concurrency group (ci-${{github.ref}}-${{github.sha}}), cancel-in-progress kept true. 3 tasks: TASK-314/315/316. Blast radius found beyond ci.yml: two sibling workflows document themselves 'Unlike ci.yml'."
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-08-31T23:25:02Z",
+      "result": "approved; 1 convention issue found and fixed (ADR naming/heading level realigned to repo precedent)"
+    }
+  ],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-605",
+      "branch": "feat/REQ-605-ci-concurrency-per-commit",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  },
+  "blockers": [],
+  "notes": [
+    "Step 0: single-repo mode (no .adlc/config.yml). integrationBranch=main, confirmed by conventions.md ('this repo does NOT use the staging-first pipeline'). Draft PR deferred to Phase 6 per LESSON-004 (branch has no commits at Step 0).",
+    "Phase 2: single-repo, all tasks repo=teton-code. Footprint publish skipped (no draft PR at architect time)."
+  ]
+}

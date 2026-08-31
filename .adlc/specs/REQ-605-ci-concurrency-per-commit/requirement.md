@@ -1,10 +1,10 @@
 ---
 id: REQ-605
 title: "Let every commit's CI finish, so independently-green can be checked rather than assumed"
-status: draft
+status: approved
 deployable: false
 created: 2026-09-01
-updated: 2026-09-01
+updated: 2026-08-31
 component: "ci"
 domain: "developer-experience"
 stack: ["github-actions"]
@@ -29,9 +29,13 @@ the job that is still running when that happens is almost always
 **This has already cost two REQs.** REQ-599's AC-11 required each commit in its
 sequence to be independently green; it was ticked without checking, and REQ-602
 found two of its seven commits had their macOS job cancelled. REQ-600 met the
-same criterion only by pushing each of six commits and waiting for its CI to
-finish before pushing the next — correct, and it cost hours of wall-clock on a
-change that was otherwise ready.
+same criterion only by pushing one commit at a time and waiting for each run to
+finish before pushing the next. The counting rule is *CI runs triggered on the
+branch*, not commits, because one commit on that branch was pushed together with
+another and never built alone: PR #249 shows **10 runs over 11 commits**, every
+one `success` and every one strictly non-overlapping — 34m of run time spread
+across a 2h01m span. Correct, and paid for in wall-clock on a change that was
+otherwise ready.
 
 macOS is not an incidental runner here. It is the one that caught LESSON-591's
 detached-naming race, which passed 40/40 locally and on `ubuntu-latest`.
@@ -59,16 +63,28 @@ detached-naming race, which passed 40/40 locally and on `ubuntu-latest`.
 ## Assumptions
 
 - Sequential pushes are how the multi-commit REQs actually land. REQ-600's AC-7
-  records seven commits pushed and waited on one at a time; AC-1's property is
-  what makes that discipline unnecessary rather than merely tolerable.
+  records seven commits pushed and waited on one at a time — its count as of
+  that criterion's writing, before the branch grew to the ten runs the
+  Description counts. AC-1's property is what makes that discipline unnecessary
+  rather than merely tolerable.
 
 ## Open Questions
 
-- [ ] OQ-1: Which mechanism? Adding `github.sha` to the concurrency group is the
-      obvious one and keys the group per head commit. Dropping
-      `cancel-in-progress` entirely is simpler and trades more queue. Gating on
-      event type is a third. AC-1 is about the property; `/architect` picks the
-      mechanism and states the trade AC-3 asks for.
+- [x] OQ-1 **(settled — ADR-1)**: the group becomes
+      `ci-${{ github.ref }}-${{ github.sha }}` and `cancel-in-progress` stays
+      `true`, still collapsing duplicate runs of the *same* commit.
+  - **Dropping `cancel-in-progress`** was rejected as the worst of the three, not
+    the simplest: `false` does not mean "run both", it means **queue**. Every
+    commit would still serialize behind its predecessor — the exact wall-clock
+    cost REQ-600 paid by hand. It is also the only candidate that creates the
+    queue AC-3 worries about.
+  - **Gating on event type** was rejected on evidence: `main`'s push runs have
+    the same defect (run `33445087015` on `main` was cancelled after 219s), and
+    AC-1's "one branch" includes `main`.
+  - The trade AC-3 asks for is stated in ADR-2, and ADR-3 measures why it
+    is cheap: a cancelled run costs almost exactly what a completed one costs,
+    because the kill lands inside `Tests` after the toolchain install, cache
+    restore and clippy have all been paid for.
 
 ## Out of Scope
 
