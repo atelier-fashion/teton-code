@@ -262,3 +262,14 @@ two of which show the new.
 Only R5's own successor is unrecorded — the run for the commit that writes this
 table, which cannot record its own conclusion. Its id is noted in the PR and its
 result is confirmed green before merge.
+
+**Postscript, added at wrapup once the branch was complete.** The table above is
+conservative. The finished branch ran **8 commits / 8 runs**, with **6**
+overlapping consecutive pairs, of which **4** are after-observations under the
+new config (`5b5af36`→`8cbdb7c` 153s, `8cbdb7c`→`a165c72` 65s,
+`593dbab`→`e6e28ff` 18s, `e6e28ff`→`d9bd165` 108s). Every commit from `5b5af36`
+onward is independently green on all seven job runs. The one `cancelled`
+conclusion on the branch is R1, produced deliberately as the before-observation.
+The extra pairs are recorded here rather than in the table above because they
+accrued after AC-1 was ticked, and they strengthen the verdict without changing
+it.
