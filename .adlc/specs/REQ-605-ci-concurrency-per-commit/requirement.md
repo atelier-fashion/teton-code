@@ -1,7 +1,7 @@
 ---
 id: REQ-605
 title: "Let every commit's CI finish, so independently-green can be checked rather than assumed"
-status: approved
+status: complete
 deployable: false
 created: 2026-09-01
 updated: 2026-08-31
