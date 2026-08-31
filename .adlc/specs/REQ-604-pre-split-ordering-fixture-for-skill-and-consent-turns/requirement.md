@@ -4,7 +4,7 @@ title: "The turn-ordering fixture covers a plain turn only — capture the skill
 status: draft
 deployable: false
 created: 2026-08-31
-updated: 2026-08-31
+updated: 2026-09-01
 component: "daemon/runtime"
 domain: "testing"
 stack: ["rust", "daemon"]
@@ -55,22 +55,38 @@ events fall in a turn.
 
 ## Acceptance Criteria
 
-- [ ] Two sequences are captured **at `17c39ec`**, not at tip: one turn that
+- [ ] AC-1: Two sequences are captured **at `17c39ec`**, not at tip: one turn that
       expands a skill and dispatches, one that raises a consent prompt, is
       answered, and dispatches. The capture commit is recorded in each
       fixture's header, as the existing fixture records its own.
-- [ ] Each new fixture replays identically against the current tree.
-- [ ] Detached events are excluded **by discriminator, not by position** —
+- [ ] AC-2: Each new fixture replays identically against the current tree.
+- [ ] AC-3: **If one does not replay, the disposition is decided on evidence and
+      recorded — never by regenerating.** These scenarios have never been
+      pinned, so a sequence that changed between `17c39ec` and tip is a real
+      possibility and not automatically a bug. Exactly two outcomes are
+      permitted, and each names what it rests on:
+  - **Regression.** The ordering was load-bearing and something moved it. Fix
+    the code; the fixture stands as captured.
+  - **Intended change.** A REQ between `17c39ec` and tip deliberately changed
+    the sequence. Name that REQ and the criterion that authorised it, record the
+    delta in the fixture header beside its provenance, and pin the new sequence
+    as *captured sequence plus stated delta* — never by re-recording at tip,
+    which is the oracle problem LESSON-569 names and the reason this REQ exists
+    at all.
+  - **Default when neither can be shown: regression.** An unexplained delta is
+    not evidence of intent, and "it must have been deliberate" is the reasoning
+    that ticked REQ-599's AC-6 in the first place.
+- [ ] AC-4: Detached events are excluded **by discriminator, not by position** —
       LESSON-591: `session_titled` and the title duty's own `route_decided` are
       both published from inside a `tokio::spawn` and their arrival order is a
       race. Any new detached event these scenarios introduce is identified the
       same way.
-- [ ] Non-vacuity: each fixture asserts a positive count of the events it exists
+- [ ] AC-5: Non-vacuity: each fixture asserts a positive count of the events it exists
       to pin, so a filter that ate everything cannot pass (the existing test's
       "exactly ONE route decision survives" assertion is the model).
-- [ ] A transposition of two adjacent distinct events still fails, per scenario
+- [ ] AC-6: A transposition of two adjacent distinct events still fails, per scenario
       — the normalizer must not have been widened into an excuse.
-- [ ] Suite green, grepped for `FAILED`; clippy and `fmt --check` clean.
+- [ ] AC-7: Suite green, grepped for `FAILED`; clippy and `fmt --check` clean.
 
 ## Assumptions
 

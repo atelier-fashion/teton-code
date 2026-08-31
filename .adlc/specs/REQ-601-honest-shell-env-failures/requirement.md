@@ -4,7 +4,7 @@ title: "A withheld variable should not look like an ssh problem, and the agent s
 status: draft
 deployable: true
 created: 2026-08-31
-updated: 2026-08-31
+updated: 2026-09-01
 component: "daemon/tools"
 domain: "developer-experience"
 stack: ["rust", "daemon"]
@@ -79,13 +79,26 @@ visible and escapable.
       bare count* is not actionable and that BR-5 forbids the payload that would
       make it actionable. A targeted sentence on the one call that failed is a
       different mechanism answering a different question.
-- [ ] BR-4: **REQ-596 BR-5 is not weakened.** The advisory may name only
-      variables from the statically documented rejection table in
-      `child_env.rs` — names that are public in the source and reveal nothing
-      about *this* machine. It must never name a variable discovered from the
-      daemon's environment, nor any name resolved from a configured
-      `auth_ref = "env:<NAME>"`. Those remain unnameable, which is what BR-5
-      protects.
+- [ ] BR-4: **REQ-596 BR-5 is amended, in scope, and the amendment is recorded
+      on REQ-596.** BR-5 as shipped is unconditional — *"no withheld variable
+      **name** appears in tool output"* — and an advisory naming `SSH_AUTH_SOCK`
+      in a tool result is exactly that. Saying this REQ leaves BR-5 untouched
+      would be false, and would tell the next reader the boundary is where it is
+      not. What BR-5 **protects** is disclosure of facts about *this machine*;
+      what it **says** is broader than that. This REQ narrows the letter to the
+      rationale and no further:
+  - **Nameable:** variables in the statically documented rejection table in
+    `child_env.rs`. These are public in the source, identical on every
+    installation, and reveal nothing a reader of the repository does not
+    already know.
+  - **Unnameable, exactly as before:** any variable discovered from the daemon's
+    live environment, and any name resolved from a configured
+    `auth_ref = "env:<NAME>"`. No credential *value* is nameable under any
+    condition — that half of BR-5 is untouched.
+  - The amendment is written into REQ-596's BR-5 with its date and this REQ's
+    id, per the house pattern REQ-602 TASK-306 used on REQ-599's ACs. A rule
+    narrowed in a downstream spec and left unmarked upstream is a rule with two
+    readings.
 - [ ] BR-5: `[shell] allow_ssh_agent = true` admits `SSH_AUTH_SOCK` to the child
       environment and nothing else. It is not a general escape hatch and does not
       accept a list.
@@ -110,29 +123,48 @@ visible and escapable.
       **no** advisory — BR-2's other half, and the one that keeps AC-1's sentence
       worth reading.
 - [ ] AC-3: A `shell` call that **succeeds** carries no advisory.
-- [ ] AC-4: **BR-4 guard.** With `auth_ref = "env:MY_LLM_CRED_SENTINEL"`
+- [ ] AC-4: **BR-3 guard.** The advisory travels on the tool result and nowhere
+      else: for the same failing call as AC-1, the session's event stream is
+      drained and carries **no** event describing the withheld set — no count, no
+      name, no `shell_env_withheld`-shaped payload. Asserted by draining the
+      events the call actually publishes, not by grepping for a type name that a
+      later rename would silently defeat. REQ-596 OQ-1 settled that this event is
+      not emitted; BR-3 adds a targeted sentence without reopening it, and this
+      AC is what keeps the two mechanisms distinct in fact rather than in prose.
+- [ ] AC-5: **BR-4 guard.** With `auth_ref = "env:MY_LLM_CRED_SENTINEL"`
       configured and a failing command, the advisory names neither
       `MY_LLM_CRED_SENTINEL` nor any other variable read from the live
       environment. Asserted against the rendered output.
-- [ ] AC-5: **Mutation.** Deleting the failure-shape condition so the advisory
+- [ ] AC-6: **Mutation.** Deleting the failure-shape condition so the advisory
       is appended unconditionally turns AC-2 and AC-3 red. Recorded in the test's
       doc comment with what actually went red.
-- [ ] AC-6: With `allow_ssh_agent = true`, `SSH_AUTH_SOCK` is present in the
+- [ ] AC-7: With `allow_ssh_agent = true`, `SSH_AUTH_SOCK` is present in the
       child environment; with it `false` or absent, it is not. Asserted by
       inspecting the composed child environment, not by observing a command
       succeed.
-- [ ] AC-7: **BR-7 guard.** With `allow_ssh_agent = true`, a spawned MCP
+- [ ] AC-8: **BR-5's "and nothing else".** The shell child's composed environment
+      with the flag on differs from its value with the flag off by **exactly one
+      entry**, `SSH_AUTH_SOCK`. Asserted as a set difference in **both**
+      directions — nothing gained beyond that one name, and nothing lost — over
+      the whole composed map, not by spot-checking the names the test happens to
+      think of. AC-7 shows the flag admits the variable; this shows it admits
+      only the variable, which is the half that keeps `allow_ssh_agent` from
+      becoming the general escape hatch Out of Scope refuses.
+- [ ] AC-9: **BR-7 guard.** With `allow_ssh_agent = true`, a spawned MCP
       server's composed environment is byte-identical to its value with the flag
       off. The two paths share one composer through a parameter (REQ-596
       BR-7.1); this asserts the parameter is doing its job.
-- [ ] AC-8: With `allow_ssh_agent = true`, a variable named by a configured
+- [ ] AC-10: With `allow_ssh_agent = true`, a variable named by a configured
       `auth_ref = "env:<NAME>"` is **still** absent — REQ-596 BR-3's unconditional
       removal is not reachable through the new flag.
-- [ ] AC-9: Test fixtures use obviously synthetic sentinels containing
+- [ ] AC-11: Test fixtures use obviously synthetic sentinels containing
       `SENTINEL` (LESSON-497).
-- [ ] AC-10: `child_env.rs`'s rejection table is updated: `SSH_AUTH_SOCK`'s row
+- [ ] AC-12: `child_env.rs`'s rejection table is updated: `SSH_AUTH_SOCK`'s row
       records that it is now reachable by opt-in, so the table does not read as
       "rejected, full stop" once the flag exists.
+- [ ] AC-13: **BR-4's upstream half.** REQ-596's BR-5 carries a dated amendment
+      naming this REQ and stating the narrowing, so the rule reads the same from
+      either spec. Checked by reading REQ-596, not by asserting it here.
 
 ## External Dependencies
 
