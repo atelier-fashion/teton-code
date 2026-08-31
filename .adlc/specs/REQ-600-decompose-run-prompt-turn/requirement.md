@@ -111,8 +111,8 @@ in scope; the two provider methods are excluded by Out of Scope below.
       brace, as measured in the baseline table** — the same rule that reports it
       at 1,084 today. Doc comments inside the body count; comments above the
       signature do not.
-- [~] AC-2: `impl DaemonRuntime`'s production line count drops to **4,500 or
-      below** (from 6,543), under the baseline table's rule.
+- [ ] AC-2 **— NOT MET.** `impl DaemonRuntime`'s production line count drops to
+      **4,500 or below** (from 6,543), under the baseline table's rule.
       **The target is fixed here, not in the architecture doc.** An AC whose
       threshold is chosen later, in a document the implementer also writes, after
       seeing the result, is not falsifiable. `/architect` may *tighten* this
@@ -163,7 +163,7 @@ declared before the work began.
 | AC | status | evidence |
 |---|---|---|
 | AC-1 | met | `run_prompt_turn` **1,084 → 177 lines** (body span, signature through closing brace). Eight named stages: `claim_the_turn`, `resolve_the_route`, `spawn_the_naming_duty`, `assemble_harness`, `settle_expansion`, `prepare_the_attempts`, `run_attempts`, `commit_or_abandon`. |
-| AC-2 | **met under a rule the spec did not state — see below** | `mod.rs`'s `impl … DaemonRuntime` blocks: **6,543 → 3,656** production lines. Crate-wide, the type's inherent impl went **6,985 → 7,319**: the god-impl was *split*, not shrunk, and 334 lines of module header, `use` and bundle types were added. Moving `run_prompt_turn` alone would have left 5,401. |
+| AC-2 | **NOT MET** | `mod.rs`'s `impl … DaemonRuntime` blocks: **6,543 → 3,656** production lines. Crate-wide, the type's inherent impl went **6,985 → 7,319**: the god-impl was *split*, not shrunk, and 334 lines of module header, `use` and bundle types were added. Moving `run_prompt_turn` alone would have left 5,401. |
 | AC-3 | met | `run_session_turn_with_pressure_policy` **762 → 298 lines, brace depth 9 → 4** — the rule being *maximum brace nesting inside the `fn` body, excluding braces inside string, char and comment tokens*. That exclusion was unstated and is load-bearing: `turn_loop.rs` carries `format!` strings containing `{{"tool":…}}`, and a naive counter grades the result at 7 against a gate of 5. Indentation 11 → 6 alongside; the two new helpers at brace 3 and 4. |
 | AC-4 | **four of five** | Invariants 1, 3 and 5 are pinned by tests that fail on inversion; 3 was written by this REQ. **Invariant 2 is not.** Its ordering is enforced by the compiler — `accept_invocation` takes the gate as a parameter — and what the test asserts is the adjacent property that the gate is *constructed* exactly once, inside the memoizing `permission_gate_for`. That is a real guard, but it is not an inversion test, and AC-4 says "not a comment asserting it holds". **Invariant 4 has no inversion test either and cannot have one on this path** (no presence gate to park in); the substitute pins that no blocking wait is introduced. Both are recorded here rather than behind a tick, per this spec's own Assumptions. |
 | AC-5 | met | The REQ-598 event fixture replays unregenerated; `one_full_turn_publishes_its_events_in_the_order_the_fixture_records` green throughout. |
@@ -191,9 +191,16 @@ both belong in the record:
   count drops below 4,500" is false of the type's impl; it is true of one file's
   share of it.
 
-**Whether that satisfies AC-2 is the user's call, not the implementer's** —
-which is precisely why the target was fixed in the spec before the work began.
-It is surfaced rather than decided here.
+**The user's decision, taken 2026-09-01: record it NOT MET and keep the work.**
+
+The criterion as written is false of the delivered change, so it says so — the
+same disposition REQ-599's AC-1 and AC-11 got, and for the same reason. The code
+merges on its own merits; the record simply does not claim something the change
+did not do.
+
+That is the whole point of having fixed the number in the spec beforehand. A
+target chosen after seeing the result would have been "the impl in `mod.rs`",
+and this row would have read *met*.
 
 ### AC-7, which REQ-599 could not meet
 
@@ -203,9 +210,9 @@ job. REQ-599's identical criterion was ticked without checking, and REQ-602
 found the gap two REQs later. This REQ pushed each step and waited. The cost is
 wall-clock; the alternative is a criterion that means nothing.
 
-**The systemic fix is still open and is the user's call**: adding the commit SHA
-to the concurrency group would let every commit's CI finish, for every PR. That
-is a repo-wide change and out of this REQ's scope.
+**The systemic fix is filed as REQ-605.** Letting every commit's CI finish is a
+repo-wide change and out of this REQ's scope, but it has now cost two REQs — one
+that ticked the criterion without checking, and one that met it by waiting.
 
 ### What the guards caught, all of it mine
 
