@@ -54,3 +54,7 @@ gha-creds-*.json
 .adlc/.next-bug
 .adlc/.next-req
 .adlc/.next-lesson
+
+# macOS Finder / iCloud duplicate suffix pattern (e.g. "CLAUDE 2.md", "Dockerfile 2")
+* [0-9].*
+* [0-9]

@@ -22,6 +22,18 @@ user having asked for it.
 
 ### Changed
 
+- **Internal: `runtime.rs` is now a module tree (REQ-599).** No user-visible
+  change — every commit was a relocation, not a behavior change, and the turn
+  path's event ordering is pinned by a fixture captured before the work started.
+  Listed only because it touches the file every prompt runs through: 14,183
+  production lines became 10,306 in `runtime/mod.rs` plus seven modules that can
+  be read on their own.
+
+  The decomposition is **not finished**. `impl DaemonRuntime` is still ~6,540
+  lines and `run_prompt_turn` ~1,084; splitting those changes control flow
+  rather than moving code, so it was deliberately deferred to REQ-600 where its
+  diff can be reviewed as a change.
+
 - **Internal: the turn path's parameter cluster is named (REQ-598).** No
   user-visible change — this is a behavior-preserving refactor, and it is listed
   only because it touches the turn path that every prompt runs through. The
