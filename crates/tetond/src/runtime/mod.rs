@@ -23471,8 +23471,12 @@ provider_id = \"deepseek\"
             assert_eq!(
                 runtime.matches(".offer_or_refuse_over_budget(").count(),
                 2,
-                "the offer has exactly two call sites, and both are `run_prompt_turn`’s \
-                 own budget stages"
+                "the offer has exactly two call sites, and both are the turn's own \
+                 budget stages. REQ-600 moved them: they were `run_prompt_turn`'s, \
+                 and are now `settle_expansion`'s (the skill body, before consent) \
+                 and `run_attempts`'s (the reroute arm that re-fits to a smaller \
+                 window). Same two decisions, two stages instead of one function — \
+                 the count is what this pins, and it is unchanged."
             );
         }
 

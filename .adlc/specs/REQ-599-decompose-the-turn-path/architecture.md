@@ -247,8 +247,8 @@ table, which do not move.
 
 | module | production | holds |
 |---|---:|---|
-| `mod.rs` | 7,492 | `DaemonRuntime` and everything not yet sliced. Was 10,306 at REQ-599's close; REQ-600 moved the turn path out |
-| `turn.rs` | 2,868 | **REQ-600.** `run_prompt_turn` and the fifteen methods only it reaches — the god-impl slice REQ-599 deferred as its step 8 |
+| `mod.rs` | 7,420 | `DaemonRuntime` and everything not yet sliced. Was 10,306 at REQ-599's close; REQ-600 moved the turn path out |
+| `turn.rs` | 3,409 | **REQ-600.** `run_prompt_turn` and the fifteen methods only it reaches — the god-impl slice REQ-599 deferred as its step 8 |
 | `engine.rs` | 1,091 | probe, installer, engine loaders, `EngineSlot`, `StagedEngines` |
 | `config_document.rs` | 888 | rendering and persisting the config document |
 | `duty.rs` | 632 | the five `*_route` resolvers, `resolve_duty`, `spawn_title_session`, `RedactionGateImpl` |

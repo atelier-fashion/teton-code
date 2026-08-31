@@ -1,7 +1,7 @@
 ---
 id: TASK-312
 title: "Repair the derived checks the move breaks, and document the new module"
-status: draft
+status: complete
 parent: REQ-600
 created: 2026-08-31
 updated: 2026-08-31
