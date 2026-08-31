@@ -1,7 +1,7 @@
 ---
 id: TASK-313
 title: "Final verification, with every figure carrying its rule"
-status: draft
+status: complete
 parent: REQ-600
 created: 2026-08-31
 updated: 2026-08-31

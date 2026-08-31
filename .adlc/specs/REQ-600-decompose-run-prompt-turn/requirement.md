@@ -1,7 +1,7 @@
 ---
 id: REQ-600
 title: "Decompose run_prompt_turn into a stage sequence, and slice the god-impl"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-31
 updated: 2026-08-31
@@ -38,7 +38,9 @@ change, because that is what it is.
 - **AC-2**: `run_prompt_turn` reduced to a stage sequence, body under 200 lines,
   each stage independently nameable and testable.
 - **AC-3**: `turn_loop.rs::run_session_turn_with_pressure_policy` (762 lines,
-  8–9 levels of nesting) drops to depth 5 or below. It was REQ-599's OQ-3 and
+  8–9 levels of nesting — **that figure is REQ-599's and is imprecise; see the
+  baseline table below, which measures 9 under the brace rule and 11 under the
+  indentation rule**) drops to depth 5 or below. It was REQ-599's OQ-3 and
   sits in a different module with a different parameter cluster (REQ-598 ADR-2).
 - **BR-3's ordering invariants**, which are the actual risk: the three
   typed-outcome arms stay ordered before the generic remote arm; gates stay
@@ -104,30 +106,30 @@ in scope; the two provider methods are excluded by Out of Scope below.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: `run_prompt_turn`'s body is under **200 lines**, a sequence of named
+- [x] AC-1: `run_prompt_turn`'s body is under **200 lines**, a sequence of named
       stages. **Rule: body span, the `fn` signature line through its closing
       brace, as measured in the baseline table** — the same rule that reports it
       at 1,084 today. Doc comments inside the body count; comments above the
       signature do not.
-- [ ] AC-2: `impl DaemonRuntime`'s production line count drops to **4,500 or
+- [x] AC-2: `impl DaemonRuntime`'s production line count drops to **4,500 or
       below** (from 6,543), under the baseline table's rule.
       **The target is fixed here, not in the architecture doc.** An AC whose
       threshold is chosen later, in a document the implementer also writes, after
       seeing the result, is not falsifiable. `/architect` may *tighten* this
       number; loosening it requires recording the reason in the architecture doc
       and saying so in the PR body, so a missed target reads as a missed target.
-- [ ] AC-3: `run_session_turn_with_pressure_policy`'s maximum nesting depth is
+- [x] AC-3: `run_session_turn_with_pressure_policy`'s maximum nesting depth is
       **5 or below under the brace-nesting rule** — currently 9 — and the
       indentation-rule figure is recorded alongside it, currently 11. Both are
       reported; the brace rule is the one that gates.
-- [ ] AC-4: Every BR-3 ordering invariant above has a test that fails when the
+- [x] AC-4: Every BR-3 ordering invariant above has a test that fails when the
       ordering is inverted — not a comment asserting it holds. Each inversion is
       **run and its failure recorded**, per REQ-602's finding that a mutation
       whose outcome was never observed had in fact been impossible.
-- [ ] AC-5: The REQ-598 event-ordering fixture replays identically. The fixture
+- [x] AC-5: The REQ-598 event-ordering fixture replays identically. The fixture
       is **not regenerated**: a golden file computed by its own subject is not an
       oracle (LESSON-569).
-- [ ] AC-6: REQ-599's traceability sweep and module-map guard both still pass,
+- [x] AC-6: REQ-599's traceability sweep and module-map guard both still pass,
       and `runtime_visibility.rs` and `runtime_doc_paths.rs` (REQ-602) pass over
       whatever modules this REQ adds — they enumerate their corpora from disk
       precisely so a new module is scanned rather than silently exempt.
@@ -138,7 +140,7 @@ in scope; the two provider methods are excluded by Out of Scope below.
       base makes the sweep compare the split tree against itself, which proves
       nothing about the split. The wording was inherited from REQ-599's template
       without the correction.
-- [ ] AC-7: Delivered as independently-green commits, each reviewable as a
+- [x] AC-7: Delivered as independently-green commits, each reviewable as a
       change rather than as a relocation. **Green means every required check on
       that commit reports success, not "was not cancelled."** REQ-599's identical
       criterion was marked NOT MET because CI's `cancel-in-progress` cancels the
@@ -147,6 +149,59 @@ in scope; the two provider methods are excluded by Out of Scope below.
       each step's CI is allowed to finish before the next is pushed, or the
       criterion is recorded NOT MET again with the same cause. It is not met by
       pushing seven commits and reading the last one's status.
+
+## Verification (TASK-313)
+
+`cargo test --workspace --no-fail-fast`: **4,072 passed, 0 failed**, output
+captured and **grepped for `FAILED` — 0 occurrences**, `EXIT=0`.
+`cargo clippy --workspace --all-targets` under `clippy::all = deny`: **0**.
+`cargo fmt --all --check`: clean.
+
+Every figure states its rule, and every rule is the one the baseline table
+declared before the work began.
+
+| AC | status | evidence |
+|---|---|---|
+| AC-1 | met | `run_prompt_turn` **1,084 → 177 lines** (body span, signature through closing brace). Eight named stages: `claim_the_turn`, `resolve_the_route`, `spawn_the_naming_duty`, `assemble_harness`, `settle_expansion`, `prepare_the_attempts`, `run_attempts`, `commit_or_abandon`. |
+| AC-2 | met | `impl DaemonRuntime` **6,543 → 3,656** production lines against a 4,500 target. Moving `run_prompt_turn` alone would have left 5,458 — which is why the target was fixed in the spec rather than chosen here afterwards. |
+| AC-3 | met | `run_session_turn_with_pressure_policy` **762 → 298 lines, brace depth 9 → 4** (the rule AC-3 gates on), indentation 11 → 6 reported alongside. Its two new helpers are at brace 3 and 4. |
+| AC-4 | met | All five BR-3 invariants pinned, three of them newly. Every inversion **re-run against the restructured code**, not re-asserted — which is how `the_turn_path_takes_no_blocking_wait` was caught having silently stopped covering the stages. |
+| AC-5 | met | The REQ-598 event fixture replays unregenerated; `one_full_turn_publishes_its_events_in_the_order_the_fixture_records` green throughout. |
+| AC-6 | met | `traceability_sweep`, `runtime_module_map`, `runtime_visibility`, `runtime_doc_paths` and `suppression_ratchet` all green. **`BASE` and `TOUCHED` deliberately not repointed**, per the amendment. |
+| AC-7 | met | Five commits, each pushed only after the previous one's CI reported **success on all seven jobs including `macos-latest`** — not merely "was not cancelled". |
+
+### AC-7, which REQ-599 could not meet
+
+CI sets `concurrency: group: ci-${{ github.ref }}, cancel-in-progress: true`
+(`ci.yml:10-12`), so pushing step *n+1* cancels step *n*'s still-running macOS
+job. REQ-599's identical criterion was ticked without checking, and REQ-602
+found the gap two REQs later. This REQ pushed each step and waited. The cost is
+wall-clock; the alternative is a criterion that means nothing.
+
+**The systemic fix is still open and is the user's call**: adding the commit SHA
+to the concurrency group would let every commit's CI finish, for every PR. That
+is a repo-wide change and out of this REQ's scope.
+
+### What the guards caught, all of it mine
+
+- `the_turn_path_takes_no_blocking_wait` scoped to `run_prompt_turn` and stopped
+  covering the stages the moment `probed` moved into `claim_the_turn`. The
+  inversion that used to go red went green. Widened to the whole turn path.
+- `traceability_sweep` caught the TASK-309 extraction leaving a **58-line
+  plain-`//` rationale run** behind, detaching six ids from `run_prompt_turn`;
+  and then caught the TASK-310 reorder leaving `run_prompt_turn`'s 44-line doc
+  above `dispatch_route`, which wore it.
+- `suppression_ratchet` refused two `too_many_arguments` allows outright — "name
+  it instead" — which is why six parameter bundles exist rather than two
+  suppressions.
+- `runtime_visibility` made `run_prompt_turn`'s `pub` an argued decision rather
+  than a silent count bump.
+- Three vacuity floors fired with the guidance written into them, and each was
+  followed rather than relaxed.
+
+The pattern worth keeping: **every one of these was found by re-running a
+mutation after a change, not by reading the guard.** A guard that stops covering
+its subject looks exactly like a guard that passes.
 
 ## Assumptions
 
