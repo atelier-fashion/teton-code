@@ -75,7 +75,7 @@
 //!
 //! | Mutation | Fails |
 //! |---|---|
-//! | **link 1** — `compact_if_pressured` returns declined before ever asking the duty | `harness::context::tests::a_routed_compaction_replaces_the_blocks_it_forgets`, `…::compaction_runs_ahead_of_the_hard_gate_not_at_it`, `runtime::tests::dispatch::compact::a_performed_compaction_announces_its_route_and_a_declined_one_does_not`, and every other compaction test in `harness::context` |
+//! | **link 1** — `compact_if_pressured` returns declined before ever asking the duty | `harness::context::tests::a_routed_compaction_replaces_the_blocks_it_forgets`, `…::compaction_runs_ahead_of_the_hard_gate_not_at_it`, `runtime::duty::dispatch::compact::a_performed_compaction_announces_its_route_and_a_declined_one_does_not`, and every other compaction test in `harness::context` |
 //! | **link 2** (parse) — `read_compaction` keeps the numbers it managed to read instead of failing the whole answer | `harness::compact::tests::a_partly_readable_answer_is_no_answer_at_all`, `harness::context::tests::a_half_readable_compaction_is_not_half_applied` |
 //! | **link 3** (apply) — the accepted range is taken from the conversation (`blocks.len() − 1`) instead of from the offer (`CompactOffer::droppable`) | `harness::context::tests::an_answer_naming_a_block_that_was_never_offered_is_refused_not_applied` — **and nothing else**, which is how a bounded offer came to accept an answer about blocks it never rendered (verify C1) |
 //! | **link 3** (apply) — the over-budget candidate is committed instead of rejected | `harness::context::tests::an_over_budget_compaction_is_rejected_rather_than_rescued` |
@@ -92,8 +92,8 @@
 //! | the regrowth mark is left at the size the compaction committed at, rather than re-baselined by `truncate_to_budget` — so one tight compaction retires the duty for the turn | `harness::context::tests::a_tight_compaction_does_not_retire_compaction_for_the_rest_of_the_turn` |
 //! | the replacement text skips the control-token cut | `harness::context::tests::a_fabricating_compaction_is_cut_before_context`, `…::a_compaction_whose_summary_is_only_a_forged_frame_is_refused` |
 //! | a summary that is empty after that cut is accepted rather than refused | `harness::context::tests::a_compaction_whose_summary_is_only_a_forged_frame_is_refused` |
-//! | the session-taint override is removed from the resolver (AC-9a) | `runtime::tests::dispatch::compact::a_tainted_session_compacts_on_the_local_tier` |
-//! | `ScriptedFileEngine` loses its `compact` arm (the duty eats a scripted block) | `runtime::tests::dispatch::compact::a_compact_duty_consumes_no_scripted_block` |
+//! | the session-taint override is removed from the resolver (AC-9a) | `runtime::duty::dispatch::compact::a_tainted_session_compacts_on_the_local_tier` |
+//! | `ScriptedFileEngine` loses its `compact` arm (the duty eats a scripted block) | `runtime::duty::dispatch::compact::a_compact_duty_consumes_no_scripted_block` |
 //!
 //! AC-9(b) — "the failure path returns its input unchanged" — is not a separate
 //! row because for this duty it is not a mutation: returning the context

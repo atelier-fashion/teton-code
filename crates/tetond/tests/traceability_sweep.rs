@@ -103,28 +103,36 @@ fn workspace_root() -> PathBuf {
 /// Every `.rs` file under `crates/`, so the disappearance arm can be
 /// workspace-scoped.
 fn workspace_sources() -> Vec<PathBuf> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                // `target/` holds generated sources and vendored copies; it is
-                // not the workspace's own text.
-                if path.file_name().is_some_and(|n| n == "target") {
-                    continue;
-                }
-                walk(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
-        }
-    }
     let mut out = Vec::new();
-    walk(&workspace_root().join("crates"), &mut out);
+    walk_rust_files(&workspace_root().join("crates"), &mut out);
     out.sort();
     out
+}
+
+/// Every `.rs` file under `dir`, **recursively** (REQ-602 BR-4).
+///
+/// Lifted out of `workspace_sources` so the vacuity floor shares it. The floor
+/// read `runtime/` with a flat `read_dir` and was the one site REQ-602's AC-4
+/// named and did not fix — the sweep would have kept passing while a whole
+/// `runtime/turn/` subtree left its corpus, which is precisely the "saw less
+/// and passed" failure the floor exists to turn into a red test.
+fn walk_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // `target/` holds generated sources and vendored copies; it is
+            // not the workspace's own text.
+            if path.file_name().is_some_and(|n| n == "target") {
+                continue;
+            }
+            walk_rust_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
 }
 
 /// Every traceability id in `text`.
@@ -449,12 +457,11 @@ fn the_sweep_sees_enough_of_the_corpus_to_be_meaningful() {
     // REQ-599: the corpus is a directory now. Reading one file would let the
     // floor fall as slices are extracted and read as "the docs shrank".
     let dir = workspace_root().join(RUNTIME_DIR);
-    let mut files: Vec<_> = std::fs::read_dir(&dir)
-        .expect("the runtime module directory is readable")
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-        .collect();
+    // Recursive (REQ-602 BR-4). `runtime/` is a module *tree*; a flat read
+    // would drop the first `runtime/foo/mod.rs` out of the corpus and lower
+    // this floor's own measurement without saying so.
+    let mut files: Vec<PathBuf> = Vec::new();
+    walk_rust_files(&dir, &mut files);
     files.sort();
     assert!(
         !files.is_empty(),

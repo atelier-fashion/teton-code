@@ -1,0 +1,78 @@
+{
+  "req": "REQ-602",
+  "branch": "feat/REQ-602-post-split-cleanup",
+  "startedAt": "2026-08-31T18:05:17Z",
+  "completed": false,
+  "currentPhase": 6,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree + Draft PR",
+      "completedAt": "2026-08-31T18:05:27Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-08-31T18:05:59Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect",
+      "completedAt": "2026-08-31T18:15:31Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture+Tasks",
+      "completedAt": "2026-08-31T18:16:46Z"
+    },
+    {
+      "phase": 4,
+      "name": "Implementation",
+      "completedAt": "2026-08-31T19:40:00Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify + Review",
+      "completedAt": "2026-08-31T20:30:00Z"
+    }
+  ],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-602",
+      "branch": "feat/REQ-602-post-split-cleanup",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/247",
+      "prNumber": 247,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-302",
+      "TASK-301",
+      "TASK-303",
+      "TASK-304",
+      "TASK-305",
+      "TASK-306",
+      "TASK-307"
+    ],
+    "failedTasks": []
+  }
+}

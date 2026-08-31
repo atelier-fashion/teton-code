@@ -383,7 +383,7 @@ impl DynamicOutcome {
 /// "the level does not run them".
 ///
 /// **Here rather than at one caller** (REQ-587). The user-typed `/name` path
-/// (`runtime::settle_dynamic_context`) and the model's `skill` tool
+/// (`runtime::DaemonRuntime::settle_dynamic_context`) and the model's `skill` tool
 /// ([`crate::harness::tools::skill`]) ask the same gate the same question and
 /// must read the same answer out of it; a second copy of this match is how the
 /// two callers come to disagree about what a decline is (LESSON-528). It lives

@@ -5,7 +5,7 @@
 //! ## Why this is here rather than beside the resolver
 //!
 //! Every duty already carries a resolver-level taint test with its own
-//! non-vacuity pair (`runtime::tests::dispatch::{digest,triage,shell,title,
+//! non-vacuity pair (`runtime::duty::dispatch::{digest,triage,shell,title,
 //! compact}::a_tainted_session_*`). Those read `route.provider()`, and AC-5 is
 //! explicit that reading the route is not the assertion it wants: a route may
 //! name `local` while something else still puts bytes on a wire. The only place

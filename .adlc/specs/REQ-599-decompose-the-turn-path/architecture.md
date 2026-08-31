@@ -153,6 +153,52 @@ Each step is its own commit, independently green (BR-9):
 | 7 | session lifecycle -> `runtime/session.rs` | ~900 | medium |
 | ~~8~~ | ~~`run_prompt_turn` -> a stage sequence~~ | ~1,100 | **DEFERRED to its own REQ** |
 
+#### Reconciled with what shipped (REQ-602 TASK-306, 2026-08-31)
+
+The table above is the **plan**. It was never reconciled with the branch, and
+five of the modules it names do not exist: `types`, `consent`, `egress`,
+`session`, and `turn`. Read as a map it is wrong in every row but two — which
+is the failure mode `runtime_module_map.rs` exists to prevent for the *other*
+map in this document, and which this one was not subject to.
+
+What the seven commits actually produced:
+
+| # | planned | shipped | commit |
+|---|---|---|---|
+| 1 | `runtime.rs` -> `runtime/mod.rs` | same | `f1f77b8` |
+| 2 | `types.rs` | `config_document.rs` | `577b568` |
+| 3 | `duty.rs` | `duty.rs` | `9ee1303` |
+| 4 | `provider.rs` | `engine.rs` | `7813b95` |
+| 5 | `consent.rs` | `views.rs` | `fd85489` |
+| 6 | `egress.rs` | `taint.rs` | `f64d99b` |
+| 7 | `session.rs` | `provider.rs` | `56f3777` |
+| ~~8~~ | ~~`turn.rs`~~ | deferred to REQ-600 | — |
+
+`testsupport.rs` shipped as well and appears in no plan row: it was extracted to
+hold helpers two modules had come to share.
+
+Only **two** of the seven proposed names shipped at all: `duty.rs` and
+`provider.rs`. `types`, `consent`, `egress`, `session` and `turn` never existed
+as modules — `consent` ended up inside `engine.rs` and `egress` inside
+`taint.rs`, as *content* rather than as modules. And the two that did survive
+are paired with the wrong steps: `provider` was planned for step 4 and shipped
+at step 7. The seams were chosen from the impl
+structure as ADR-2 said they would be, and that reordered the work; nobody went
+back to say so. Recording the drift is the point: a plan that silently becomes a
+map is the more expensive of the two failures, because the map is what a reader
+trusts.
+
+#### The session-lifecycle slice shipped nothing
+
+Planned step 7 was `session lifecycle -> runtime/session.rs`, ~900 lines. No
+commit in the sequence extracts it, and until now nothing recorded that. It is
+**deferred, not dropped**, and filed as **REQ-603** so the deferral has a
+tracked home rather than living in a paragraph. The reason it did not ship is
+the honest one: the seven steps were chosen cheapest-seam-first from the impl
+structure, session lifecycle was the most entangled of them, and the REQ ran out
+of steps before it ran out of seams. `mod.rs` is still 10,306 production lines
+(AC-1, NOT MET), so the slice has lost none of its value.
+
 **Step 8 is deferred to its own REQ** (decided 2026-08-30). Steps 1–7 relocate
 code; step 8 restructures control flow on the path every prompt runs through.
 Landing them together would bury the one genuine behavior risk inside a diff

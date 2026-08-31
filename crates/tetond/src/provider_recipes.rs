@@ -395,7 +395,7 @@ pub fn recipe_catalog() -> Vec<ProviderRecipe> {
 /// # Matched on [`example_model`], never on [`id_suggestion`]
 ///
 /// This imitates the one production lookup that already exists
-/// (`runtime::derive_provider_setup`, which asks the same question of a
+/// (`runtime::DaemonRuntime::derive_provider_setup`, which asks the same question of a
 /// `provider/setup_commit` candidate) and it imitates it for that caller's
 /// stated reason: **a recipe id is a suggestion and ids are the user's
 /// namespace.** Kimi registered under the id `work-model` is an ordinary

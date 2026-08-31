@@ -6,7 +6,22 @@
 //! `category_route_view` trio that `config/get` renders from.
 //!
 //! A view layer, and it reads as one now that it is not interleaved with the
-//! machinery it reports on. 489 contiguous lines; the census measured its items
+//! machinery it reports on.
+//!
+//! # Its tests (REQ-602 TASK-304)
+//!
+//! This module shipped from REQ-599 with **zero** `#[cfg(test)]` content and no
+//! note saying why, while the four tests describing `snapshot_from_config` —
+//! the projection that lives here — stayed behind in `runtime/mod.rs`. BR-7
+//! asks that a test not be left pointing at a module it no longer describes,
+//! and one of those tests says the quiet part outright: *"the projection is the
+//! step that could drop it."* They are here now.
+//!
+//! The distinction BR-7 turns on is whether a test's **subject** moved or it
+//! merely uses a moved item as a **fixture**. `engine.rs` and `duty.rs` both
+//! record which of theirs stayed on those grounds. This module's silence was
+//! the defect more than the placement — a reader could not tell a decision from
+//! an oversight. 489 contiguous lines; the census measured its items
 //! spanning 467 of them, the tightest grouping left after step 4.
 
 use super::*;
@@ -44,11 +59,11 @@ pub struct BoundaryPosture {
 /// is one state, not two"), so trimming to `None` here means the document the
 /// flow writes says it the same way — rather than persisting `search_endpoint = ""`,
 /// which validates and then reads as nothing.
-pub(crate) struct WebSetupAnswers<'a> {
-    pub(crate) tier: WebTier,
-    pub(crate) search_endpoint: Option<&'a str>,
-    pub(crate) search_key_ref: Option<&'a str>,
-    pub(crate) search_auth: Option<&'a str>,
+pub(super) struct WebSetupAnswers<'a> {
+    pub(super) tier: WebTier,
+    pub(super) search_endpoint: Option<&'a str>,
+    pub(super) search_key_ref: Option<&'a str>,
+    pub(super) search_auth: Option<&'a str>,
 }
 
 impl<'a> WebSetupAnswers<'a> {
@@ -60,7 +75,7 @@ impl<'a> WebSetupAnswers<'a> {
     /// separate (the commit re-asks rather than trusting a preview's blob), but
     /// what they do with those fields was byte-identical prose in two places —
     /// which is one place for a trim rule to be tightened and missed.
-    pub(crate) fn new(
+    pub(super) fn new(
         tier: WireWebTier,
         search_endpoint: Option<&'a str>,
         search_key_ref: Option<&'a str>,
@@ -74,7 +89,7 @@ impl<'a> WebSetupAnswers<'a> {
         }
     }
 
-    pub(crate) fn from_preview(params: &'a WebSetupPreviewParams) -> Self {
+    pub(super) fn from_preview(params: &'a WebSetupPreviewParams) -> Self {
         Self::new(
             params.tier,
             params.search_endpoint.as_deref(),
@@ -83,7 +98,7 @@ impl<'a> WebSetupAnswers<'a> {
         )
     }
 
-    pub(crate) fn from_commit(params: &'a WebSetupCommitParams) -> Self {
+    pub(super) fn from_commit(params: &'a WebSetupCommitParams) -> Self {
         Self::new(
             params.tier,
             params.search_endpoint.as_deref(),
@@ -98,7 +113,7 @@ impl<'a> WebSetupAnswers<'a> {
 /// Names the fact and the remedy and **echoes nothing** — not the digests, not
 /// the field that changed, not the document: a client renders this into a
 /// transcript, and the thing that moved may be another session's answer.
-pub(crate) const SETUP_DIGEST_STALE: &str =
+pub(super) const SETUP_DIGEST_STALE: &str =
     "the configuration changed since the preview, so this would write bytes you did not \
      confirm — run `/web setup` again";
 
@@ -111,13 +126,13 @@ pub(crate) const SETUP_DIGEST_STALE: &str =
 /// the digests, not the field that changed, not the document, and above all not
 /// the candidate: the thing that moved may be another session's answer, and the
 /// candidate carries a credential reference.
-pub(crate) const PROVIDER_SETUP_DIGEST_STALE: &str =
+pub(super) const PROVIDER_SETUP_DIGEST_STALE: &str =
     "the preview you confirmed no longer matches what this daemon would write, so committing \
      would write bytes you did not see — run `/provider setup` again";
 
 /// One setup answer, trimmed, with blank read as absent — see
 /// [`WebSetupAnswers`] for why.
-pub(crate) fn setup_answer(value: Option<&str>) -> Option<&str> {
+pub(super) fn setup_answer(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
@@ -128,7 +143,7 @@ pub(crate) fn setup_answer(value: Option<&str>) -> Option<&str> {
 /// gap's sentence comes from [`SearchGap::as_str`] rather than being written
 /// again, so the status line, the prompt clause and the setup flow cannot each
 /// invent a phrasing of one fact (BR-3, LESSON-456).
-pub(crate) fn to_protocol_capability_state(state: WebCapabilityState) -> WireWebCapabilityState {
+pub(super) fn to_protocol_capability_state(state: WebCapabilityState) -> WireWebCapabilityState {
     match state {
         WebCapabilityState::Ready(tier) => WireWebCapabilityState::Ready {
             tier: to_protocol_web_tier(tier),
@@ -149,7 +164,7 @@ pub(crate) fn to_protocol_capability_state(state: WebCapabilityState) -> WireWeb
 /// **host** only (REQ-563 BR-7, the rule the whole web event family follows),
 /// and the key appears as the reference config holds rather than the value the
 /// keychain holds (BR-6).
-pub(crate) fn web_table_summary(web: &WebConfig) -> WebTableSummary {
+pub(super) fn web_table_summary(web: &WebConfig) -> WebTableSummary {
     WebTableSummary {
         tier: to_protocol_web_tier(web.tier),
         search_host: web
@@ -173,7 +188,7 @@ pub(crate) fn web_table_summary(web: &WebConfig) -> WebTableSummary {
 /// [`endpoint_query_names_a_credential`] — the whole function, not just this
 /// list, so the extraction cannot drift either (REQ-573 verify: a `://`-gated
 /// re-derivation of the split let scheme-less shapes sweep clean).
-pub(crate) const CREDENTIAL_QUERY_KEYS: [&str; 4] = ["api_key", "apikey", "key", "token"];
+pub(super) const CREDENTIAL_QUERY_KEYS: [&str; 4] = ["api_key", "apikey", "key", "token"];
 
 /// Whether `endpoint`'s query string carries a parameter whose **name** says it
 /// holds a credential (REQ-572 verify).
@@ -223,7 +238,7 @@ pub(crate) fn endpoint_query_names_a_credential(endpoint: &str) -> bool {
 /// removal note is about is the document the answer is being applied to: with
 /// the live table instead, a file that had drifted drew a sentence contradicting
 /// the bytes printed directly beside it.
-pub(crate) fn web_setup_warnings(current: &WebConfig, candidate: &WebConfig) -> Vec<String> {
+pub(super) fn web_setup_warnings(current: &WebConfig, candidate: &WebConfig) -> Vec<String> {
     let mut warnings: Vec<String> = Vec::new();
     if candidate.tier < WebTier::Search && candidate.search_endpoint.is_some() {
         warnings.push(format!(
@@ -328,7 +343,7 @@ pub(crate) fn web_setup_warnings(current: &WebConfig, candidate: &WebConfig) -> 
 /// and by the dead-end announcement that keys on the same fact — two readings
 /// of one question is how the message and the event come to disagree about
 /// which state the machine is in (LESSON-456).
-pub(crate) fn has_remote_provider(config: &Config) -> bool {
+pub(super) fn has_remote_provider(config: &Config) -> bool {
     config.providers.iter().any(|p| p.kind.is_remote())
 }
 
@@ -346,7 +361,7 @@ pub(crate) fn has_remote_provider(config: &Config) -> bool {
 /// live (REQ-563 BR-14), and that lives in the daemon's engine slot. Passed in
 /// rather than reached for, so the whole projection stays a function of its
 /// arguments and every cell of it is testable without a daemon.
-pub(crate) fn snapshot_from_config(
+pub(super) fn snapshot_from_config(
     config: &Config,
     router: &Router,
     local_model_present: bool,
@@ -460,7 +475,7 @@ pub(crate) fn snapshot_from_config(
 }
 
 /// One tier row of the snapshot.
-pub(crate) fn tier_route_view(report: &TierReport) -> TierRouteView {
+pub(super) fn tier_route_view(report: &TierReport) -> TierRouteView {
     TierRouteView {
         tier: to_protocol_tier(report.tier),
         provider_id: report.provider_id.as_deref().map(ProviderId::from),
@@ -483,7 +498,7 @@ pub(crate) fn tier_route_view(report: &TierReport) -> TierRouteView {
 /// [`crate::call_sites::has_call_site`] (ADR-A); and
 /// [`CategoryRouteView::content_class`], what the category sends to a model,
 /// from [`ContentClass::for_category`] (REQ-561 BR-11).
-pub(crate) fn category_route_view(resolution: &CategoryResolution) -> CategoryRouteView {
+pub(super) fn category_route_view(resolution: &CategoryResolution) -> CategoryRouteView {
     CategoryRouteView {
         category: to_protocol_category(resolution.category),
         tier: to_protocol_tier(resolution.tier),
@@ -498,5 +513,255 @@ pub(crate) fn category_route_view(resolution: &CategoryResolution) -> CategoryRo
         reached: has_call_site(resolution.category),
         content_class: ContentClass::for_category(to_protocol_category(resolution.category)),
         reason: resolution.reason.clone(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REQ-602 TASK-304 — these moved with their subject.
+//
+// BR-7 of REQ-599 asks that a test not be left "pointing at a module it no
+// longer describes". These four are *about* `snapshot_from_config` — the doc on
+// the redaction one says so in as many words: "the projection is the step that
+// could drop it." The projection lives here, so they do too.
+//
+// `views.rs` shipped from REQ-599 with zero `#[cfg(test)]` content and no note
+// saying why, which is what made the placement unreviewable. `engine.rs` and
+// `duty.rs` both record which of their tests deliberately stayed behind; this
+// module now has tests of its own instead.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::testsupport::{config_with_remote, router_for_config};
+    use teton_protocol::Category as ProtoCategory;
+
+    #[test]
+    fn config_snapshot_round_trips_kinds_and_modes() {
+        let mut config = Config::default();
+        apply_update(
+            &mut config,
+            ConfigUpdate::RegisterProvider(ProviderConfig {
+                id: ProviderId::from("deepseek"),
+                kind: ProtoProviderKind::OpenaiCompatible,
+                endpoint: Some("https://api.deepseek.com/v1/chat/completions".to_owned()),
+                model: Some("deepseek-chat".to_owned()),
+                auth_ref: Some("keychain:deepseek".to_owned()),
+                max_context: None,
+                context_budget_cap: None,
+                allow_cleartext: None,
+                floored_budget: None,
+            }),
+        );
+        apply_update(
+            &mut config,
+            ConfigUpdate::SetTierBinding(TierBindingConfig {
+                tier: ProtoTier::Build,
+                provider_id: ProviderId::from("deepseek"),
+                fallback_id: None,
+            }),
+        );
+        apply_update(
+            &mut config,
+            ConfigUpdate::SetPrivacyBoundary(PrivacyBoundaryConfig {
+                path_glob: "secrets/**".to_owned(),
+                mode: PrivacyMode::LocalOnly,
+                origin: Default::default(),
+            }),
+        );
+        config.validate().expect("valid");
+
+        assert_eq!(config.tiers.len(), 1);
+        assert_eq!(config.tiers[0].tier, Tier::Build);
+        assert_eq!(config.tiers[0].provider_id, "deepseek");
+        // AC-9: no phase-keyed routing row is written by any config op.
+        assert!(config.legacy_routing.is_empty());
+
+        let snap = snapshot_from_config(&config, &router_for_config(&config), false);
+        assert_eq!(snap.providers.len(), 1);
+        assert_eq!(snap.providers[0].kind, ProtoProviderKind::OpenaiCompatible);
+        assert_eq!(snap.privacy[0].mode, PrivacyMode::LocalOnly);
+        // REQ-586 ADR-7: the snapshot ALWAYS populates the window fields — a
+        // provider with no capabilities table reads `Some(0)` ("unknown" /
+        // "no cap"), never `None`, which is reserved for a daemon predating
+        // the fields.
+        assert_eq!(snap.providers[0].max_context, Some(0));
+        assert_eq!(snap.providers[0].context_budget_cap, Some(0));
+
+        // And a declared window round-trips: registered over the wire,
+        // projected back out as the same figures.
+        apply_update(
+            &mut config,
+            ConfigUpdate::RegisterProvider(ProviderConfig {
+                id: ProviderId::from("deepseek"),
+                kind: ProtoProviderKind::OpenaiCompatible,
+                endpoint: Some("https://api.deepseek.com/v1/chat/completions".to_owned()),
+                model: Some("deepseek-chat".to_owned()),
+                auth_ref: Some("keychain:deepseek".to_owned()),
+                max_context: Some(131_072),
+                context_budget_cap: Some(65_536),
+                allow_cleartext: None,
+                floored_budget: None,
+            }),
+        );
+        let snap = snapshot_from_config(&config, &router_for_config(&config), false);
+        assert_eq!(snap.providers[0].max_context, Some(131_072));
+        assert_eq!(snap.providers[0].context_budget_cap, Some(65_536));
+    }
+
+    /// **The snapshot reports whether the redaction scan is enabled** (REQ-562;
+    /// user decision, 2026-08-08) — the daemon half of making the `[privacy]`
+    /// switch visible.
+    ///
+    /// Both states from one projection, so each is the other's discrimination
+    /// (LESSON-485): a field wired to a constant, or one projected from
+    /// something that merely correlates with the switch, fails a leg. The
+    /// absent-table leg is the one that matters most, because it is what almost
+    /// every machine sends: no `[privacy]` table at all must reach a client as
+    /// `false` rather than as a missing answer a renderer has to guess at.
+    ///
+    /// It reads `config.privacy.redact` — the same field `redaction_gate`
+    /// consults before installing the gate — so `policy show` and the gate
+    /// cannot disagree about whether anything is scanning. Asserted here rather
+    /// than at the wire, because the projection is the step that could drop it.
+    #[test]
+    fn the_snapshot_reports_whether_the_redaction_scan_is_enabled() {
+        // The overwhelmingly common config: no `[privacy]` table written at all.
+        let absent = Config::default();
+        assert!(
+            !absent.privacy.redact,
+            "the fixture must model the default, or the `false` leg proves nothing"
+        );
+        assert!(
+            !snapshot_from_config(&absent, &router_for_config(&absent), false).redact_enabled,
+            "an un-opted-in daemon must report the scan as off"
+        );
+
+        // And the opt-in, on the same projection.
+        let opted_in = Config {
+            privacy: teton_core::config::PrivacyConfig {
+                redact: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        assert!(
+            snapshot_from_config(&opted_in, &router_for_config(&opted_in), false).redact_enabled,
+            "`[privacy] redact = true` must reach the client that asked for the config"
+        );
+    }
+
+    /// ADR-A + AC-12, on the projection a client actually reads.
+    ///
+    /// The snapshot carries one row per category — all eleven — with the ones
+    /// that no model call reaches marked, and the BR-9 judgment default beside
+    /// them. Both are things `teton policy show` renders and nothing else
+    /// computes.
+    #[test]
+    fn the_snapshot_marks_the_unreached_categories_and_the_judgment_default() {
+        let mut config = config_with_remote("cheap");
+        config.default_provider = Some("cheap".to_owned());
+        config.judgment_default = teton_core::category::JudgmentCategory::Debug;
+        let snap = snapshot_from_config(&config, &router_for_config(&config), false);
+
+        assert_eq!(snap.routing.len(), 11, "every category gets a row");
+        let unreached: Vec<&str> = snap
+            .routing
+            .iter()
+            .filter(|r| !r.reached)
+            .map(|r| r.category.as_str())
+            .collect();
+        // Empty since REQ-562 TASK-070 wired `redact`, the last of the eleven.
+        // Stated as the census rather than dropped: the loop below is the
+        // invariant (every row agrees with `has_call_site`), and this line is
+        // what makes a *change* to the set show up as a diff a reviewer reads.
+        assert_eq!(
+            unreached,
+            Vec::<&str>::new(),
+            "the marker in the projection must agree with `call_sites::has_call_site`"
+        );
+        for row in &snap.routing {
+            assert_eq!(
+                row.reached,
+                has_call_site(
+                    Category::ALL
+                        .into_iter()
+                        .find(|c| c.as_str() == row.category.as_str())
+                        .expect("category")
+                ),
+                "{} disagrees with the registry",
+                row.category
+            );
+            assert!(!row.reason.is_empty(), "{}", row.category);
+        }
+
+        // AC-12: the declared default is readable as configuration, not only as
+        // a rendered sentence.
+        assert_eq!(snap.judgment_default, Some(ProtoCategory::Debug));
+
+        // The two pinned categories report the pin, whatever the table says.
+        for pinned in [ProtoCategory::Route, ProtoCategory::Redact] {
+            let row = snap
+                .routing
+                .iter()
+                .find(|r| r.category == pinned)
+                .expect("pinned row");
+            assert_eq!(row.source, BindingSource::PinnedLocal, "{pinned}");
+            assert_ne!(
+                row.provider_id.as_ref().map(|p| p.0.as_str()),
+                Some("cheap"),
+                "{pinned} must never resolve to the remote default"
+            );
+        }
+    }
+
+    /// The tier rows report the fill an unbound tier takes, and the two
+    /// **local-by-default** tiers take a different one —
+    /// `Tier::inherits_default_provider`'s fact, reported rather than restated.
+    ///
+    /// `build` inherits `default_provider`; `reflex` and `scan` inherit the
+    /// local tier. This row is where a user sees that asymmetry rather than
+    /// discovering it by watching where their file contents go.
+    #[test]
+    fn an_unbound_tier_reports_what_it_inherits_and_the_local_tiers_differ() {
+        let mut config = config_with_remote("cheap");
+        config.default_provider = Some("cheap".to_owned());
+        apply_update(
+            &mut config,
+            ConfigUpdate::SetTierBinding(TierBindingConfig {
+                tier: ProtoTier::Think,
+                provider_id: ProviderId::from("cheap"),
+                fallback_id: None,
+            }),
+        );
+        let snap = snapshot_from_config(&config, &router_for_config(&config), false);
+        let row = |tier: ProtoTier| {
+            snap.tiers
+                .iter()
+                .find(|t| t.tier == tier)
+                .unwrap_or_else(|| panic!("{tier} row"))
+        };
+        assert_eq!(snap.tiers.len(), 4);
+        assert_eq!(row(ProtoTier::Think).source, TierBindingSource::Configured);
+        assert_eq!(
+            row(ProtoTier::Build).source,
+            TierBindingSource::DefaultProvider,
+            "a turn tier inherits the declared default — the non-vacuity leg, \
+             without which the two below prove nothing"
+        );
+        for local_by_default in [ProtoTier::Reflex, ProtoTier::Scan] {
+            assert_eq!(
+                row(local_by_default).source,
+                TierBindingSource::LocalTier,
+                "`{local_by_default}` never inherits a remote default: its work \
+                 was already local before this REQ, and this row is where the \
+                 user sees that rather than discovering it by watching where \
+                 their file contents go"
+            );
+            assert_ne!(
+                row(local_by_default).provider_id,
+                row(ProtoTier::Build).provider_id
+            );
+        }
     }
 }

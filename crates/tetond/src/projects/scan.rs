@@ -493,18 +493,15 @@ mod tests {
         // read error (BUG-159) is right for a transient I/O fault and wrong for
         // a path that no longer exists, so the two are now distinguished: a
         // missing corpus is a hard failure, a per-file read error still skips.
+        // Recursive: `runtime/` is a module *tree*, and the first
+        // `runtime/foo/mod.rs` would leave a flat scan's corpus silently
+        // (REQ-602 BR-4, LESSON-594). This scan is on that list because the
+        // commit that repaired it — after the REQ-599 rename left it reading a
+        // path that no longer existed — used a flat `read_dir` to do so,
+        // shipping the same class one commit later.
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime");
-        let mut modules: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-            .unwrap_or_else(|err| {
-                panic!(
-                    "the runtime module tree is unreadable at {}: {err}",
-                    dir.display()
-                )
-            })
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-            .collect();
+        let mut modules: Vec<std::path::PathBuf> = Vec::new();
+        crate::call_sites::scan::rust_files(&dir, &mut modules);
         modules.sort();
         assert!(
             !modules.is_empty(),

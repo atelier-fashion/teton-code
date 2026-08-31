@@ -2263,7 +2263,7 @@ impl PermissionGate {
     ///
     /// This door was written for the model's `skill` tool and, until REQ-589,
     /// that tool was its only production caller: the user-typed `/name` path
-    /// (`runtime::accept_invocation`) gated nothing, so a typed project skill
+    /// (`runtime::DaemonRuntime::accept_invocation`) gated nothing, so a typed project skill
     /// ran its body unacknowledged. It now asks here too, **before** it expands
     /// and therefore before the route, the naming duty and both budget stages
     /// (BR-6: nobody authorizes an over-budget send from a repository they have

@@ -18,7 +18,7 @@
 //! * `provider_recipes::tests::every_recipe_maps_onto_a_wire_entry_field_for_field`
 //!   pins the projection — [`recipe_catalog`] onto `recipe_entries()`, by
 //!   destructuring, so a seventh recipe field fails the build.
-//! * `runtime::tests::provider_setup::the_plan_serves_the_shipped_recipe_catalog_unaltered`
+//! * `runtime::tests::provider_setup_flow::the_plan_serves_the_shipped_recipe_catalog_unaltered`
 //!   pins the serve — `provider_setup_plan().catalog` against `recipe_entries()`.
 //!
 //! Neither is the composition, and the composition is the product claim. This

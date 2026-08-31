@@ -10,13 +10,20 @@
 //! `provider` scattered across 10,366 lines and this cluster across 987. ADR-4
 //! said cheapest seam first, and cheapest is measured, not assumed.
 //!
-//! **On BR-7 and which tests came along.** Only two test functions exercise
-//! this code as their subject — `template_fallback_line` and `seam_policy` —
-//! and they moved. Several others construct an `EngineSlot` or a
-//! `StagedEngines` as a *fixture* while testing something else; those stayed
-//! with the code they are about. BR-7 asks that tests not be left "pointing at
-//! a module they no longer describe", which is a claim about what a test
-//! describes, not about which symbols it happens to name.
+//! **On BR-7 and which tests came along.** Three test functions exercise this
+//! code as their subject and live here: `template_fallback_line` and
+//! `seam_policy` came with the original split, and
+//! `only_a_scripted_engine_exempts_the_local_tier_from_the_consent_gate`
+//! followed in REQ-602 TASK-304 — its subject is the scripted-engine exemption
+//! defined in this module, not the gate that consults it.
+//!
+//! Several other tests construct an `EngineSlot` or a `StagedEngines` as a
+//! *fixture* while testing something else; those stayed with the code they are
+//! about. BR-7 asks that tests not be left "pointing at a module they no longer
+//! describe", which is a claim about what a test describes, not about which
+//! symbols it happens to name. The eight `mod.rs` tests naming `scripted` or
+//! `local_tier` are that case: their subject is `Runtime`'s own tier handling,
+//! and a scripted engine is how they arrange it.
 
 use super::*;
 
@@ -35,7 +42,7 @@ use super::*;
 ///   is reported as rate-limiting rather than as a generic transport failure
 ///   (AC-12).
 /// - `events` makes install progress observable as `model_lifecycle` (AC-2).
-pub(crate) fn build_installer(
+pub(super) fn build_installer(
     base_dir: &Path,
     base_url: Option<String>,
     events: &Arc<EventBus>,
@@ -76,7 +83,7 @@ pub(crate) fn build_installer(
 /// that shortened the ladder itself would be exercising a different policy than
 /// the one that ships. Shortening the base delay changes how long the same ladder
 /// takes, not what it does.
-pub(crate) fn download_retry_policy() -> RetryPolicy {
+pub(super) fn download_retry_policy() -> RetryPolicy {
     let default = RetryPolicy::default();
     // DECISION 3: a test seam, honoured only in a debug build with the master
     // switch — never in a shipped daemon.
@@ -92,7 +99,7 @@ pub(crate) fn download_retry_policy() -> RetryPolicy {
 
 /// What the seam master switch means for this build (DECISION 3 / E-6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SeamPolicy {
+pub(super) enum SeamPolicy {
     /// A debug build with the switch on: the seams are honoured.
     Honour,
     /// Nobody asked for them.
@@ -110,7 +117,7 @@ pub(crate) enum SeamPolicy {
 ///
 /// Pure so the release-build refusal is testable from a debug-build test — the
 /// branch that matters is the one this binary cannot otherwise reach.
-pub(crate) fn seam_policy(debug_build: bool, switch: Option<&str>) -> SeamPolicy {
+pub(super) fn seam_policy(debug_build: bool, switch: Option<&str>) -> SeamPolicy {
     match (debug_build, switch) {
         (true, Some("1")) => SeamPolicy::Honour,
         // Only the value a debug build would have honoured is a refusal; an
@@ -165,7 +172,7 @@ pub fn test_seams_enabled() -> bool {
 /// catalog with a warning rather than aborting startup: a mistyped path must not
 /// brick a daemon, and a *silently* substituted catalog would not be a correct
 /// answer, which is why the fallback is announced.
-pub(crate) fn load_catalog() -> (Catalog, bool) {
+pub(super) fn load_catalog() -> (Catalog, bool) {
     let Some(path) = std::env::var_os("TETON_CATALOG") else {
         return (Catalog::bundled(), false);
     };
@@ -204,22 +211,22 @@ pub(crate) fn load_catalog() -> (Catalog, bool) {
 /// [`startup_lifecycle`]'s job, because the honest answer depends on state this
 /// function cannot see — whether a decision has been made, whether weights are
 /// on disk, and whether anything in this build can load them.
-pub(crate) struct ProbeResult {
+pub(super) struct ProbeResult {
     /// The local model id in force after any step-down, or `None` when disabled.
-    pub(crate) model: Option<String>,
+    pub(super) model: Option<String>,
     /// The model the probe itself picked, before a simulated step-down moved off
     /// it. What the `probed` stage names, because that is what was probed.
-    pub(crate) probed_model: Option<String>,
+    pub(super) probed_model: Option<String>,
     /// Whether the local tier is disabled (below floor / resource-starved).
-    pub(crate) disabled: bool,
+    pub(super) disabled: bool,
     /// Why the local tier is disabled, when it is — the probe's own sentence.
-    pub(crate) disabled_reason: Option<String>,
+    pub(super) disabled_reason: Option<String>,
     /// Detected system RAM, as quoted in the `probed` stage.
-    pub(crate) ram_bytes: u64,
+    pub(super) ram_bytes: u64,
     /// Whether the machine cleared the local-tier RAM floor.
-    pub(crate) above_floor: bool,
+    pub(super) above_floor: bool,
     /// The `TETON_PROBE_FORCE_SLOW_BENCH` simulation, when it was asked for.
-    pub(crate) forced_bench: Option<ForcedBench>,
+    pub(super) forced_bench: Option<ForcedBench>,
 }
 
 /// A benchmark ladder the operator explicitly asked to have *simulated*
@@ -229,12 +236,12 @@ pub(crate) struct ProbeResult {
 /// It is the one place a `benchmark` stage is published without a measurement,
 /// and it exists only when that env flag is set: a daemon nobody asked to
 /// simulate anything never emits one.
-pub(crate) struct ForcedBench {
+pub(super) struct ForcedBench {
     /// The model whose simulated benchmark missed the latency duty.
-    pub(crate) from_model: String,
+    pub(super) from_model: String,
     /// The smaller model it stepped down to, or `None` when nothing smaller
     /// clears the duty and the tier is disabled instead.
-    pub(crate) to_model: Option<String>,
+    pub(super) to_model: Option<String>,
 }
 
 /// Run the first-run hardware probe against `profile`.
@@ -242,7 +249,7 @@ pub(crate) struct ForcedBench {
 /// The profile and catalog are passed in rather than resolved here so the probe
 /// and the REQ-547 consent gate describe the *same* machine and the *same*
 /// catalog — re-detecting would let the two disagree.
-pub(crate) fn probe_local_tier(
+pub(super) fn probe_local_tier(
     profile: &HardwareProfile,
     catalog: &Catalog,
     pinned: Option<&str>,
@@ -323,7 +330,7 @@ pub(crate) fn probe_local_tier(
 /// Nothing here claims a download: the only `download` stages that reach a
 /// client come from [`crate::install::LifecycleProgress`], which publishes bytes
 /// as they actually move.
-pub(crate) fn startup_lifecycle(
+pub(super) fn startup_lifecycle(
     probe: &ProbeResult,
     serving_model: Option<String>,
     loader_present: bool,
@@ -477,7 +484,7 @@ pub(crate) fn startup_lifecycle(
 /// rather than the machine. A shipped daemon describes the machine it is on.
 ///
 /// [`validate_choice`]: crate::model_consent::validate_choice
-pub(crate) fn probe_profile() -> HardwareProfile {
+pub(super) fn probe_profile() -> HardwareProfile {
     let seams = test_seams_enabled();
     let ram = env_u64("TETON_PROBE_RAM_BYTES").filter(|_| seams);
     let disk = env_u64("TETON_PROBE_DISK_BYTES").filter(|_| seams);
@@ -512,7 +519,7 @@ pub(crate) fn probe_profile() -> HardwareProfile {
 }
 
 /// The next-smaller catalog model to step down to (by descending download size).
-pub(crate) fn step_down_target(catalog: &Catalog, current: &str) -> Option<String> {
+pub(super) fn step_down_target(catalog: &Catalog, current: &str) -> Option<String> {
     let current_entry = catalog.get(current)?;
     catalog
         .models
@@ -535,7 +542,7 @@ pub(crate) fn step_down_target(catalog: &Catalog, current: &str) -> Option<Strin
 /// gate exists for, and the old spelling would have opened the tier for it
 /// unconditionally — while `first_run_consent_applies()`, keyed the same way,
 /// stopped the consent flow (and its deep verification) from ever running.
-pub(crate) fn local_tier_gated(scripted_engine: bool, consent_required: bool) -> bool {
+pub(super) fn local_tier_gated(scripted_engine: bool, consent_required: bool) -> bool {
     consent_required && !scripted_engine
 }
 
@@ -548,20 +555,20 @@ pub(crate) fn local_tier_gated(scripted_engine: bool, consent_required: bool) ->
 /// lifecycle replay can tell an attaching client what actually happened rather
 /// than guessing between "still loading" and "failed".
 /// A live engine tagged with the model id it serves.
-pub(crate) type TaggedEngine = (String, Arc<Mutex<dyn Engine>>, ChatFormat);
+pub(super) type TaggedEngine = (String, Arc<Mutex<dyn Engine>>, ChatFormat);
 
-pub(crate) struct EngineSlot {
+pub(super) struct EngineSlot {
     /// The live engine, tagged with the model it serves. The tag is what lets a
     /// superseded flow evict **its own** engine without ever being able to evict
     /// a successor's ([`Self::remove_if`]), and what lets the lifecycle replay
     /// name the model actually loaded rather than the probe's boot-time pick.
-    pub(crate) engine: Mutex<Option<TaggedEngine>>,
-    pub(crate) load_failure: Mutex<Option<String>>,
+    pub(super) engine: Mutex<Option<TaggedEngine>>,
+    pub(super) load_failure: Mutex<Option<String>>,
 }
 
 impl EngineSlot {
     /// An empty slot.
-    pub(crate) fn empty() -> Arc<Self> {
+    pub(super) fn empty() -> Arc<Self> {
         Arc::new(Self {
             engine: Mutex::new(None),
             load_failure: Mutex::new(None),
@@ -578,7 +585,7 @@ impl EngineSlot {
     /// instead of the engine — locking the serving mutex for metadata on the
     /// async path would park a tokio worker behind an in-flight completion
     /// (LESSON-448, REQ-554 verify).
-    pub(crate) fn install(&self, model_id: String, engine: Arc<Mutex<dyn Engine>>) {
+    pub(super) fn install(&self, model_id: String, engine: Arc<Mutex<dyn Engine>>) {
         let format = engine
             .lock()
             .expect("engine mutex poisoned at install")
@@ -592,7 +599,7 @@ impl EngineSlot {
 
     /// The live engine and the [`ChatFormat`] it was installed with, if any —
     /// the lock-free-for-metadata surface the async turn path uses.
-    pub(crate) fn get_with_format(&self) -> Option<(Arc<Mutex<dyn Engine>>, ChatFormat)> {
+    pub(super) fn get_with_format(&self) -> Option<(Arc<Mutex<dyn Engine>>, ChatFormat)> {
         self.engine
             .lock()
             .expect("engine slot mutex poisoned")
@@ -601,7 +608,7 @@ impl EngineSlot {
     }
 
     /// The model the live engine serves, if one is live.
-    pub(crate) fn model(&self) -> Option<String> {
+    pub(super) fn model(&self) -> Option<String> {
         self.engine
             .lock()
             .expect("engine slot mutex poisoned")
@@ -610,7 +617,7 @@ impl EngineSlot {
     }
 
     /// Whether an engine is live.
-    pub(crate) fn present(&self) -> bool {
+    pub(super) fn present(&self) -> bool {
         self.engine
             .lock()
             .expect("engine slot mutex poisoned")
@@ -625,7 +632,7 @@ impl EngineSlot {
     /// failed duty, and a loader that panicked (whose own recording code never
     /// ran) — so the replay can never claim "still loading" for a load that
     /// terminally failed.
-    pub(crate) fn record_load_failure(&self, reason: String) {
+    pub(super) fn record_load_failure(&self, reason: String) {
         *self
             .load_failure
             .lock()
@@ -633,7 +640,7 @@ impl EngineSlot {
     }
 
     /// The recorded reason the last load attempt failed, if one did.
-    pub(crate) fn load_failure(&self) -> Option<String> {
+    pub(super) fn load_failure(&self) -> Option<String> {
         self.load_failure
             .lock()
             .expect("load-failure mutex poisoned")
@@ -653,30 +660,30 @@ impl EngineSlot {
 /// ([`EngineSlot::present`]) is established by the same code in production and
 /// in the acceptance suite — a seam with its own private commit path would
 /// leave the production one exercised only in a dogfood run.
-pub(crate) struct StagedEngines {
-    pub(crate) slot: Arc<EngineSlot>,
+pub(super) struct StagedEngines {
+    pub(super) slot: Arc<EngineSlot>,
     /// Loaded-and-measured engines awaiting the gate's commit/abandon verdict,
     /// each with the template-fallback reason its loader captured (`None` for a
     /// recognized template — and for test doubles, which are flat by design,
     /// not degraded).
-    pub(crate) staged: Mutex<HashMap<String, StagedEntry>>,
+    pub(super) staged: Mutex<HashMap<String, StagedEntry>>,
 }
 
 /// A staged engine and the template-fallback reason captured at load time.
-pub(crate) type StagedEntry = (Arc<Mutex<dyn Engine>>, Option<&'static str>);
+pub(super) type StagedEntry = (Arc<Mutex<dyn Engine>>, Option<&'static str>);
 
 /// The user-visible template-downgrade report (REQ-554 BR-2/AC-3), as a pure
 /// function so its shape is pinned by a default-build unit test even though
 /// the emitting path is `llama`-gated. Carries the model and the CAUSE
 /// (LESSON-456 — a downgrade report that names no reason tells the user
 /// something happened but not what to do about it); never prompt content.
-pub(crate) fn template_fallback_line(model_name: &str, reason: &str) -> String {
+pub(super) fn template_fallback_line(model_name: &str, reason: &str) -> String {
     format!("tetond: model {model_name}: {reason}; using flat transcript rendering")
 }
 
 impl StagedEngines {
     /// An empty staging bay in front of `slot`.
-    pub(crate) fn new(slot: Arc<EngineSlot>) -> Self {
+    pub(super) fn new(slot: Arc<EngineSlot>) -> Self {
         Self {
             slot,
             staged: Mutex::new(HashMap::new()),
@@ -685,7 +692,7 @@ impl StagedEngines {
 
     /// Hold `engine` as `model_name`'s staged engine — measured, not serving —
     /// with the loader-captured template-fallback reason, if any.
-    pub(crate) fn stage(
+    pub(super) fn stage(
         &self,
         model_name: &str,
         engine: Arc<Mutex<dyn Engine>>,
@@ -705,7 +712,7 @@ impl StagedEngines {
     /// authority re-check (LESSON-445), and a report for an engine that never
     /// serves would be false. Commit is the moment the downgrade becomes true
     /// of the serving tier — once per engine that actually goes live.
-    pub(crate) fn commit(&self, model_name: &str) {
+    pub(super) fn commit(&self, model_name: &str) {
         let staged = self
             .staged
             .lock()
@@ -720,7 +727,7 @@ impl StagedEngines {
     }
 
     /// Discard `model_name`'s staged engine, if any — never anything live.
-    pub(crate) fn abandon(&self, model_name: &str) {
+    pub(super) fn abandon(&self, model_name: &str) {
         self.staged
             .lock()
             .expect("staged map poisoned")
@@ -734,7 +741,7 @@ impl StagedEngines {
 /// purpose — telling a user who just said yes that they "have not answered"
 /// reads as their accept having been lost. Names the model but no path
 /// (BR-11).
-pub(crate) fn installing_local_model_reason(model_id: &str) -> String {
+pub(super) fn installing_local_model_reason(model_id: &str) -> String {
     format!(
         "{model_id} was accepted and its download/install is running now — \
          the local tier opens when it completes; `teton model status` shows \
@@ -745,7 +752,7 @@ pub(crate) fn installing_local_model_reason(model_id: &str) -> String {
 /// The replay-time explanation for verified weights whose load has not finished:
 /// the startup flow (deep verify → load → benchmark) is still in flight. Names
 /// the model but no path (BR-11).
-pub(crate) fn loading_local_engine_reason(model_id: &str) -> String {
+pub(super) fn loading_local_engine_reason(model_id: &str) -> String {
     format!(
         "{model_id}'s weights are installed and verified; the daemon is loading and \
          benchmarking them now — the local tier opens when that completes."
@@ -757,14 +764,14 @@ pub(crate) fn loading_local_engine_reason(model_id: &str) -> String {
 /// The kind travels with the engine because the consent flow's one exemption is
 /// about the *kind* — a scripted engine downloads nothing — and inferring it from
 /// "an engine exists" silently becomes wrong the day a real GGUF loader lands.
-pub(crate) struct LocalEngine {
+pub(super) struct LocalEngine {
     /// The model id the engine serves (the slot's tag).
-    pub(crate) model_id: String,
+    pub(super) model_id: String,
     /// The engine the router will call.
-    pub(crate) engine: Arc<Mutex<dyn Engine>>,
+    pub(super) engine: Arc<Mutex<dyn Engine>>,
     /// Whether it replays canned replies from `TETON_LOCAL_SCRIPT` rather than
     /// loading weights the daemon would have had to download.
-    pub(crate) scripted: bool,
+    pub(super) scripted: bool,
 }
 
 /// Build the local engine when a scripted engine is configured and the probe did
@@ -774,7 +781,7 @@ pub(crate) struct LocalEngine {
 /// through the consent flow's post-verify loader (`build_engine_loader`), so its
 /// bytes are digest-verified before the GGUF parser ever sees them — and so the
 /// consent flow and its deep verification stay switched on for it (E-5).
-pub(crate) fn build_local_engine(probe: &ProbeResult) -> Option<LocalEngine> {
+pub(super) fn build_local_engine(probe: &ProbeResult) -> Option<LocalEngine> {
     if probe.disabled {
         return None;
     }
@@ -801,7 +808,7 @@ pub(crate) fn build_local_engine(probe: &ProbeResult) -> Option<LocalEngine> {
 /// feeds a gate: the gate stays keyed on `scripted_engine` and the consent
 /// state alone (LESSON-443).
 #[cfg(feature = "llama")]
-pub(crate) fn build_engine_loader(
+pub(super) fn build_engine_loader(
     slot: &Arc<EngineSlot>,
     profile: &HardwareProfile,
     base_dir: &Path,
@@ -819,7 +826,7 @@ pub(crate) fn build_engine_loader(
 
 /// The loaderless build: no `llama` feature, nothing can load a GGUF.
 #[cfg(not(feature = "llama"))]
-pub(crate) fn build_engine_loader(
+pub(super) fn build_engine_loader(
     _slot: &Arc<EngineSlot>,
     _profile: &HardwareProfile,
     _base_dir: &Path,
@@ -832,9 +839,9 @@ pub(crate) fn build_engine_loader(
 /// can assert the published `benchmark` stage carries **this loader's** figures
 /// — not a real measurement, not a default — while sitting safely inside the
 /// BR-8 duty so the flow reaches `ready`.
-pub(crate) const FAKE_LOADER_FIRST_TOKEN_MS: u32 = 42;
+pub(super) const FAKE_LOADER_FIRST_TOKEN_MS: u32 = 42;
 /// See [`FAKE_LOADER_FIRST_TOKEN_MS`].
-pub(crate) const FAKE_LOADER_TOKENS_PER_SEC: f32 = 512.5;
+pub(super) const FAKE_LOADER_TOKENS_PER_SEC: f32 = 512.5;
 
 /// The `TETON_FAKE_ENGINE_LOADER` seam's loader: a [`MockEngine`] behind the
 /// same [`StagedEngines`] stage → re-check → commit path as the real loader,
@@ -847,8 +854,8 @@ pub(crate) const FAKE_LOADER_TOKENS_PER_SEC: f32 = 512.5;
 /// seam: the cross-process suite can otherwise never watch an accepted install
 /// proceed past `verified`, because the default build carries no loader and a
 /// scripted engine skips the consent flow entirely.
-pub(crate) struct FakeEngineLoader {
-    pub(crate) staged: StagedEngines,
+pub(super) struct FakeEngineLoader {
+    pub(super) staged: StagedEngines,
 }
 
 impl crate::model_consent::LocalEngineLoader for FakeEngineLoader {
@@ -900,7 +907,7 @@ impl crate::model_consent::LocalEngineLoader for FakeEngineLoader {
 /// silently. A scripted tier gets no loader here for the same reason it gets
 /// no real one: its engine is already live and the consent flow — the only
 /// caller of a loader — does not apply to it (E-5).
-pub(crate) fn fake_engine_loader(
+pub(super) fn fake_engine_loader(
     slot: &Arc<EngineSlot>,
     scripted_engine: bool,
 ) -> Option<Arc<dyn crate::model_consent::LocalEngineLoader>> {
@@ -1008,7 +1015,7 @@ pub(crate) const LOCAL_ENGINE_N_CTX: u32 = 16_384;
 /// different models can never clobber each other's staged engines, and only a
 /// committed flow ever touches the serving slot.
 #[cfg(feature = "llama")]
-pub(crate) struct LlamaEngineLoader {
+pub(super) struct LlamaEngineLoader {
     staged: StagedEngines,
     base_dir: PathBuf,
     gpu: GpuClass,
@@ -1022,7 +1029,7 @@ pub(crate) struct LlamaEngineLoader {
 /// must never ride either. Both the plain and the `Debug`-quoted renderings are
 /// scrubbed.
 #[cfg(feature = "llama")]
-pub(crate) fn without_path(message: &str, path: &Path) -> String {
+pub(super) fn without_path(message: &str, path: &Path) -> String {
     message
         .replace(&format!("{path:?}"), "<weights file>")
         .replace(&path.display().to_string(), "<weights file>")
@@ -1093,6 +1100,11 @@ impl crate::model_consent::LocalEngineLoader for LlamaEngineLoader {
 mod tests {
     use super::*;
 
+    // REQ-602 TASK-304: moved here with its subject. It calls `local_tier_gated`
+    // four times and nothing else — the module's own header already records
+    // which tests deliberately stayed in `mod.rs` as fixtures; this one was not
+    // one of them, it was simply left behind (BR-7).
+
     #[test]
     fn the_template_fallback_line_names_the_model_and_the_cause() {
         // REQ-554 BR-2/AC-3: the downgrade report's shape is pinned here even
@@ -1125,5 +1137,26 @@ mod tests {
         // Turning the seams off explicitly is not a mistake to refuse over.
         assert_eq!(seam_policy(false, Some("0")), SeamPolicy::Ignore);
         assert_eq!(seam_policy(false, None), SeamPolicy::Ignore);
+    }
+
+    /// E-5: the consent gate must not switch itself off the moment a real engine
+    /// appears — which is exactly when downloading weights starts to mean
+    /// something.
+    #[test]
+    fn only_a_scripted_engine_exempts_the_local_tier_from_the_consent_gate() {
+        // The ordinary first run on a production build: withheld until answered.
+        assert!(local_tier_gated(false, true));
+        // Decided and installed: open.
+        assert!(!local_tier_gated(false, false));
+        // A `TETON_LOCAL_SCRIPT` engine fetches nothing, so it is never gated.
+        assert!(!local_tier_gated(true, true));
+        assert!(!local_tier_gated(true, false));
+        // And the regression this pins: a build that HAS a weights-loading engine
+        // (`scripted_engine == false`) and an outstanding decision is withheld.
+        // The old `engine.is_none() && …` spelling made that case un-gated.
+        assert!(
+            local_tier_gated(false, true),
+            "a real engine must not un-gate the tier before the user has decided"
+        );
     }
 }
