@@ -49,8 +49,20 @@ change, because that is what it is.
 
 ## What REQ-599 learned that this REQ should start from
 
-- **Rationale ids do not locate seams** (LESSON-593, REQ-599 ADR-1). Measured:
-  1 of 19 clustered, 13 scattered file-wide. Do not re-propose that method.
+- **Rationale ids are a weak positive signal — propose with them, decide with
+  structure** (LESSON-593 as corrected 2026-08-31, REQ-599 ADR-1's correction
+  block). The original guidance here read "1 of 19 clustered, 13 scattered file-
+  wide. Do not re-propose that method." **That was wrong and is retracted.**
+  The 1-of-19 figure came from a `max − min` span with no breakdown resistance;
+  one outlying annotation forces the "scattered" verdict. Under the smallest
+  window holding 70% of an id's items, **5 of 19 cluster** — and REQ-581's
+  219-line window is exactly the set that became `runtime/provider.rs`, a seam
+  REQ-599 skipped on the strength of the bad statistic.
+  What genuinely fails is the requirement's *literal rule* ("where they
+  interleave across a proposed boundary, the boundary is wrong"): in a
+  cross-cutting file that condemns every boundary, so it cannot choose one. Use
+  ids to **generate candidates**, structure to **decide**, and if you measure
+  locality, use a densest-window or quantile rather than a range.
 - **Seams are created, not only discovered** (REQ-599 step 7). `provider`
   measured as scattered across 10,366 lines at Phase 2 and was 375 contiguous
   lines after four unrelated slices left. Re-measure cohesion after each step

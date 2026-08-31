@@ -20390,10 +20390,7 @@ provider_id = \"deepseek\"
             ///
             /// `session_update` is emitted per streamed chunk, so recording every
             /// one would pin the scripted engine's chunking — a fact this REQ
-            /// does not touch. Collapsing *only* this one is deliberate: the two
-            /// `route_decided` entries must stay two, because they are the title
-            /// duty's route and the turn's own and losing that distinction is
-            /// exactly what BR-1 forbids.
+            /// does not touch.
             const CHUNKED: &str = "session_update";
 
             /// Put a sequence into the form both sides are compared in.
@@ -20412,10 +20409,29 @@ provider_id = \"deepseek\"
             /// `macos-latest` while `ubuntu-latest` passed on the same commit,
             /// with 40/40 green locally.
             ///
-            /// The fixture file itself is **left exactly as captured**: its whole
-            /// value is that it predates `TurnContext`, and regenerating it now
-            /// would make it an oracle computed by the subject (LESSON-569). So
-            /// the normalization changes, not the golden data.
+            /// **Corrected after review: `session_titled` was not the only
+            /// detached event.** The first `route_decided` is published from the
+            /// same spawned task. `announcing()` only *attaches* a
+            /// `DutyAnnouncement`; the publish happens in `DutyRoute::perform`,
+            /// which the title duty first reaches inside `tokio::spawn` via
+            /// `title::name_session`. The earlier fix claimed both
+            /// `route_decided` entries were published synchronously on the turn
+            /// path — that was wrong, and it left a second scheduler-dependent
+            /// entry in a sequence compared exactly. On a starved runner the
+            /// title duty's decision can arrive after the drain, or mid-stream
+            /// between two chunks, and either way fail as "the turn's event
+            /// ordering changed" while pointing at whatever refactor is in
+            /// flight.
+            ///
+            /// Both detached events are therefore removed, leaving this pinning
+            /// what BR-1 is about: the **turn path's** own ordering. The turn's
+            /// `route_decided` is identified by its category, not its position,
+            /// so this is stricter than counting two indistinguishable entries.
+            ///
+            /// The fixture file is **left exactly as captured** — regenerating
+            /// it would make it an oracle computed by the subject (LESSON-569).
+            /// On the fixture side the detached decision is the entry its own
+            /// header comment identifies as the title duty's: the first of two.
             fn normalize(names: impl IntoIterator<Item = String>) -> Vec<String> {
                 let mut out: Vec<String> = Vec::new();
                 for name in names {
@@ -20430,6 +20446,18 @@ provider_id = \"deepseek\"
                 out
             }
 
+            /// `route_decided` for the `title` category — the detached naming
+            /// duty's own decision, published from inside its `tokio::spawn`.
+            ///
+            /// Discriminated by **category**, which the event carries, rather
+            /// than by position, which is the racy thing.
+            fn is_detached_route(env: &teton_protocol::events::EventEnvelope) -> bool {
+                matches!(
+                    &env.event,
+                    Event::RouteDecided(rd) if rd.category == Some(teton_protocol::Category::Title)
+                )
+            }
+
             /// Event names in publication order, normalized.
             ///
             /// Drained with `try_recv` rather than `recv` under a timeout:
@@ -20440,6 +20468,9 @@ provider_id = \"deepseek\"
             fn drain_names(sub: &mut crate::broadcast::Subscription) -> Vec<String> {
                 let mut raw: Vec<String> = Vec::new();
                 while let Some(env) = sub.try_recv() {
+                    if is_detached_route(&env) {
+                        continue;
+                    }
                     raw.push(env.event_name().to_owned());
                 }
                 normalize(raw)
@@ -20448,13 +20479,25 @@ provider_id = \"deepseek\"
             /// The fixture's expected entries — comment and blank lines stripped,
             /// so the golden file can carry its own provenance header.
             fn expected() -> Vec<String> {
-                normalize(
-                    FIXTURE
-                        .lines()
-                        .map(str::trim)
-                        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                        .map(str::to_owned),
-                )
+                let recorded: Vec<String> = FIXTURE
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                    .map(str::to_owned)
+                    .collect();
+                // Drop the title duty's decision — the fixture's header names it
+                // as the first of the two. The live side drops the same event by
+                // category; one rule, applied through the discriminator each
+                // side actually has.
+                let mut seen_route = false;
+                let kept = recorded.into_iter().filter(|n| {
+                    if n == "route_decided" && !seen_route {
+                        seen_route = true;
+                        return false;
+                    }
+                    true
+                });
+                normalize(kept)
             }
 
             /// **Both observed interleavings normalize to the same sequence.**
@@ -20473,8 +20516,9 @@ provider_id = \"deepseek\"
             fn the_two_observed_interleavings_normalize_alike() {
                 let names = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
 
+                // Both already have the title duty's `route_decided` removed —
+                // that is `drain_names`'s job now, by category.
                 let fast = normalize(names(&[
-                    "route_decided",
                     "session_titled",
                     "route_decided",
                     "session_update",
@@ -20482,7 +20526,6 @@ provider_id = \"deepseek\"
                     "prefix_cache",
                 ]));
                 let slow = normalize(names(&[
-                    "route_decided",
                     "route_decided",
                     "session_titled",
                     "session_update",
@@ -20496,14 +20539,9 @@ provider_id = \"deepseek\"
                 );
                 assert_eq!(
                     fast,
-                    names(&[
-                        "route_decided",
-                        "route_decided",
-                        "session_update",
-                        "prefix_cache"
-                    ]),
-                    "and both must keep BOTH route decisions — the title duty's and the \
-                     turn's own — while collapsing only the chunked event"
+                    names(&["route_decided", "session_update", "prefix_cache"]),
+                    "and both must keep the turn's own route decision while collapsing only \
+                     the chunked event"
                 );
             }
 
@@ -20512,6 +20550,49 @@ provider_id = \"deepseek\"
             /// `normalize` removes one event and merges repeats of another; this
             /// pins that it does nothing else, so it cannot be quietly widened
             /// into an excuse for a real reordering.
+            /// **The starved-runner orderings the review predicted.**
+            ///
+            /// All four arrival orders the detached task can produce reduce to
+            /// the same sequence — including the two that would previously have
+            /// failed: its decision never arriving before the drain, and its
+            /// decision landing mid-stream between two chunks, which no collapse
+            /// rule could have merged away.
+            #[test]
+            fn every_detached_arrival_order_reduces_alike() {
+                let names = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+                let cases = [
+                    names(&[
+                        "session_titled",
+                        "route_decided",
+                        "session_update",
+                        "prefix_cache",
+                    ]),
+                    names(&[
+                        "route_decided",
+                        "session_titled",
+                        "session_update",
+                        "prefix_cache",
+                    ]),
+                    names(&[
+                        "route_decided",
+                        "session_update",
+                        "session_titled",
+                        "session_update",
+                        "prefix_cache",
+                    ]),
+                    names(&["route_decided", "session_update", "prefix_cache"]),
+                ];
+                let want = names(&["route_decided", "session_update", "prefix_cache"]);
+                for (i, case) in cases.iter().enumerate() {
+                    assert_eq!(
+                        normalize(case.clone()),
+                        want,
+                        "arrival order {i} must reduce to the turn path's own sequence — the \
+                         detached naming duty's timing is not something this fixture pins"
+                    );
+                }
+            }
+
             #[test]
             fn normalization_does_not_hide_a_transposition() {
                 let names = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
@@ -20553,11 +20634,11 @@ provider_id = \"deepseek\"
                 );
                 assert_eq!(
                     expected.iter().filter(|n| *n == "route_decided").count(),
-                    2,
-                    "non-vacuity: normalization must leave the title duty's route and the \
-                     turn's own as TWO entries. Collapsing them would hide precisely the \
-                     ordering BR-1 protects, and would make this test pass against a turn \
-                     that stopped announcing one of them"
+                    1,
+                    "non-vacuity: exactly ONE route decision survives — the turn's own. Zero \
+                     would mean the filter ate both and this test could no longer see a turn \
+                     that stopped announcing its route; two would mean the detached title \
+                     duty's decision is still pinned, which is the race this filter removes"
                 );
                 // `session_titled` is deliberately absent from both sides (see
                 // `normalize`). Its arrival is not left unguarded: the BR-2.1
