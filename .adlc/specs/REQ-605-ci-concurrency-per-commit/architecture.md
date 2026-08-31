@@ -102,6 +102,28 @@ tighter cap. GitHub documents specific per-plan limits; that figure is
 measured it. It does not change the decision: account-level queueing delays a
 run, it does not destroy its result, which is the failure this REQ is about.
 
+**Cargo-cache contention — checked, and the check was weak.** Runs on one ref can
+now overlap, so two of them can reach `Post Cache cargo build` at once.
+`Swatinem/rust-cache` keys on `prefix-key` + job id + rust-environment hash +
+lockfile — **not** the commit SHA — so two runs on different commits with an
+unchanged `Cargo.lock` do share a key. The three concurrent runs in this REQ's
+own demonstration (R3/R4/R5) all reported `Cache up-to-date` and every job
+passed. That is *not* evidence that contention is safe: those commits touched no
+Rust code, so no save was attempted, and the observation could not have revealed
+a collision either way (LESSON-569 — an oracle that cannot fail is not a pass).
+What can be said is narrower: no contention was observed, the path was not
+exercised, and `actions/cache` treats a duplicate-key reservation as a non-fatal
+warning, so the expected worst case is a warning rather than a red job. Anyone
+who sees a cache warning on an overlapping pair should read it as this, not as a
+new defect.
+
+**Rate limiting, lost.** The old shared group capped a PR at one in-flight run,
+which incidentally bounded how much runner capacity a rapid pusher could hold.
+That cap is gone: N quick pushes now mean N concurrent runs. On this public repo
+the exposure is small — fork PRs from first-time contributors need approval to
+run at all, and the account-level cap above bounds the rest — but it is a real
+consequence of the change and not merely a cost.
+
 ### ADR-3: Cancellation was already saving almost nothing — the change is close to free
 
 This is the measurement AC-2 asks for, and it is the reason the trade above is
@@ -245,6 +267,25 @@ single-commit push proves nothing either, which is why AC-1 forbids it.
 ref and therefore produces *no* `pull_request` runs at all — silence that reads
 as "not started yet". If an expected run does not appear, `gh pr view --json
 mergeable` is checked before anything is retriggered or blamed on this change.
+
+## The property is not guarded, and that is a deliberate choice
+
+Nothing fails if someone reverts `group:` to the ref-only form. `actionlint` is a
+syntax check and would pass either way; no test reads this file. This repo does
+build derived guards for exactly this shape — `runtime_module_map.rs` asserts a
+doc against disk — so the omission is worth stating rather than leaving implicit.
+
+It is left unguarded on the grounds that a guard here would be weaker than the
+symptom. A regression does not hide: it re-manifests the moment two commits are
+pushed in sequence, as a `cancelled` conclusion on the exact required check
+(`fmt · clippy · test (macos-latest)`) that branch protection already enforces,
+which is how REQ-602 found it in REQ-599. A one-line YAML assertion would also
+need a vacuity floor and a recorded mutation to be worth anything under this
+repo's own testing conventions — more machinery than the invariant carries.
+
+The comment at the block is doing the real work: it names the trade and the two
+rejected alternatives, so a future editor tempted to "simplify" it has the
+reasoning in front of them rather than in a REQ they would have to find.
 
 ## Out of scope, confirmed
 
