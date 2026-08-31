@@ -124,6 +124,17 @@ const CRATE_WIDE: &[&str] = &[
 /// this crate needs it.
 const PUBLIC: &[&str] = &[
     "engine.rs::test_seams_enabled",
+    // REQ-600. **Not a widening** — `run_prompt_turn` was already `pub`, in
+    // `mod.rs`, where it was reachable exactly as far. What changed is the
+    // *corpus*: `mod.rs` is excluded from this scan and `turn.rs` is not, so
+    // relocating the method brought an existing public item into view. The
+    // count below moves 13 -> 14 for that reason and no other.
+    //
+    // It earns `pub` rather than `pub(crate)`: demoting it fails to compile
+    // against the `provenance_egress` integration test, which links the lib
+    // from outside the crate. Established by demoting and building, never by
+    // grepping for the name (LESSON-596).
+    "turn.rs::run_prompt_turn",
     "taint.rs::SessionTaint",
     "taint.rs::SessionTaintView",
     "taint.rs::WebTaintOverride",
@@ -142,7 +153,10 @@ const PUBLIC: &[&str] = &[
 /// One more than `PUBLIC.len()`: `taint.rs` declares `pub fn new` twice, on
 /// `SessionTaint` and on `WebTaintOverride`. Pinned separately so a *third*
 /// `pub fn new` in that file cannot hide inside a name that is already allowed.
-const PUBLIC_DECLARATIONS: usize = 13;
+///
+/// 13 -> 14 at REQ-600, when `run_prompt_turn` moved from `mod.rs` (outside
+/// this scan) into `turn.rs` (inside it). The item's visibility did not change.
+const PUBLIC_DECLARATIONS: usize = 14;
 
 fn runtime_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime")

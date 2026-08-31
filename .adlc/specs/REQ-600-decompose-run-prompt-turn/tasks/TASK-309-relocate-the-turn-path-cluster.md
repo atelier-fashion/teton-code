@@ -1,7 +1,7 @@
 ---
 id: TASK-309
 title: "Relocate the turn-path cluster into runtime/turn.rs — a move, not a restructure"
-status: draft
+status: complete
 parent: REQ-600
 created: 2026-08-31
 updated: 2026-08-31

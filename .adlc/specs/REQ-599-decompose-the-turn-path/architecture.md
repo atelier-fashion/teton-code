@@ -235,12 +235,20 @@ pretending it can be derived.
 
 ## OQ-1 answered — the module map, as built
 
-Measured on the finished branch. Production lines exclude in-file
-`#[cfg(test)]` bodies.
+Production lines exclude in-file `#[cfg(test)]` bodies.
+
+**This table is a live map, not a historical record**, and that distinction is
+enforced: `crates/tetond/tests/runtime_module_map.rs` asserts the set of modules
+named here is exactly the set on disk, in both directions. A module added by a
+later REQ therefore appears here or the suite goes red — so the rows below drift
+forward as the tree does, while the prose around them stays REQ-599's. The
+"as built" figures for REQ-599 itself are the ones in the paragraph beneath the
+table, which do not move.
 
 | module | production | holds |
 |---|---:|---|
-| `mod.rs` | 10,306 | `DaemonRuntime`, the ~6,540-line god-impl, the turn path, and everything not yet sliced |
+| `mod.rs` | 7,492 | `DaemonRuntime` and everything not yet sliced. Was 10,306 at REQ-599's close; REQ-600 moved the turn path out |
+| `turn.rs` | 2,868 | **REQ-600.** `run_prompt_turn` and the fifteen methods only it reaches — the god-impl slice REQ-599 deferred as its step 8 |
 | `engine.rs` | 1,091 | probe, installer, engine loaders, `EngineSlot`, `StagedEngines` |
 | `config_document.rs` | 888 | rendering and persisting the config document |
 | `duty.rs` | 632 | the five `*_route` resolvers, `resolve_duty`, `spawn_title_session`, `RedactionGateImpl` |
