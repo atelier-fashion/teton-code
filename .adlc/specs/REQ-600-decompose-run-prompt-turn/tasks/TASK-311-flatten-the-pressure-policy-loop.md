@@ -1,7 +1,7 @@
 ---
 id: TASK-311
 title: "Flatten run_session_turn_with_pressure_policy from brace depth 9 to 5"
-status: draft
+status: complete
 parent: REQ-600
 created: 2026-08-31
 updated: 2026-08-31
