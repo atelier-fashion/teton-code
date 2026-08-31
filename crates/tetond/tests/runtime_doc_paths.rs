@@ -205,7 +205,66 @@ fn declared_paths() -> BTreeSet<String> {
     for submodule in glob_reexports(&dir) {
         alias_glob(&mut out, &submodule);
     }
+    alias_split_impls(&mut out);
     out
+}
+
+/// A method reached through its type, wherever the `impl` block lives.
+///
+/// REQ-599 ADR-3 establishes that an inherent `impl` may be split across
+/// modules of the same crate, and REQ-600 does exactly that: `DaemonRuntime` is
+/// declared in `mod.rs` while sixteen of its methods live in `turn.rs`. Rust
+/// reaches those methods as `runtime::DaemonRuntime::run_prompt_turn` — through
+/// the *type*, which has one canonical path — and comments cite them that way,
+/// correctly.
+///
+/// Recording them only under the impl block's own module would report every
+/// such citation as broken the moment a method moved, which is the opposite of
+/// what this check is for: the method did not move relative to its type, and a
+/// reader following the citation still arrives.
+///
+/// So for every `runtime::<module>::<Type>::<method>` whose `<Type>` is
+/// declared elsewhere in the tree, the method is also recorded under the type's
+/// declaring path.
+fn alias_split_impls(paths: &mut BTreeSet<String>) {
+    // Where each type is declared: the shortest path ending in its name.
+    let mut declared_at: BTreeMap<String, String> = BTreeMap::new();
+    for path in paths.iter() {
+        let Some(name) = path.rsplit("::").next() else {
+            continue;
+        };
+        if !name.starts_with(|c: char| c.is_uppercase()) {
+            continue;
+        }
+        let entry = declared_at
+            .entry(name.to_owned())
+            .or_insert_with(|| path.clone());
+        if path.matches("::").count() < entry.matches("::").count() {
+            *entry = path.clone();
+        }
+    }
+
+    let mut aliases = Vec::new();
+    for path in paths.iter() {
+        let segments: Vec<&str> = path.split("::").collect();
+        // `runtime::<module>::<Type>::<method>` — at least four segments, with
+        // a capitalised one directly before the leaf.
+        let (Some(method), Some(ty)) = (
+            segments.last(),
+            segments.len().checked_sub(2).and_then(|i| segments.get(i)),
+        ) else {
+            continue;
+        };
+        if segments.len() < 4 || !ty.starts_with(|c: char| c.is_uppercase()) {
+            continue;
+        }
+        if let Some(home) = declared_at.get(*ty) {
+            if home != &segments[..segments.len() - 1].join("::") {
+                aliases.push(format!("{home}::{method}"));
+            }
+        }
+    }
+    paths.extend(aliases);
 }
 
 /// The submodules `runtime/mod.rs` re-exports wholesale.

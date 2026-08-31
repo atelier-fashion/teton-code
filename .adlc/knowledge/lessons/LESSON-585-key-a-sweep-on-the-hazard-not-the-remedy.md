@@ -54,3 +54,19 @@ test run.
 Writing any tree-wide source scan, region check, or lint that enforces "every X
 must do Y"; reviewing a sweep-based acceptance criterion; deciding what a
 guard's own test should assert about its coverage.
+
+## Postscript (2026-09-01, REQ-600)
+
+A fresh instance, in a check written by someone who had this lesson in the
+REQ's own inherited list. `the_turn_path_takes_no_blocking_wait` asserted that
+`block_in_place` appears zero times on the turn path.
+
+`block_in_place` is the **remedy**: it tells Tokio a worker is about to block.
+The hazard BUG-184 records is the blocking syscall — up to four `read_dir` calls
+plus metadata/open/read on user-controlled symlinked paths, which on macOS raises
+a TCC dialog. A stage that grew a bare `std::fs::read_dir` contains no
+`block_in_place` at all, so the assertion passed. **It forbade the mitigation and
+permitted the defect.**
+
+Naming the lesson in the spec did not prevent it. What found it was a reviewer
+asking what the assertion would *fail* on.

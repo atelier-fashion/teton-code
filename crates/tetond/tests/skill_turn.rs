@@ -3730,20 +3730,122 @@ fn production_source(relative: &str) -> String {
     production_half(&text).to_owned()
 }
 
-/// The body of `run_prompt_turn`, from its signature to the start of the next
-/// item — so a marker that also appears elsewhere in this very large file
-/// cannot satisfy an ordering claim about *this* function.
+/// **The turn's stage sequence**, from `run_prompt_turn`'s signature to the end
+/// of the last stage — so a marker that also appears elsewhere in this very
+/// large file cannot satisfy an ordering claim about the turn.
+///
+/// REQ-600 decomposed `run_prompt_turn` from 1,084 lines into a 177-line
+/// orchestrator plus eight stages, and these ordering claims are about the
+/// *turn*, not about one function. The stages are laid out in `turn.rs` in
+/// **execution order** precisely so source position keeps meaning what it meant
+/// here; a reordering of the definitions would break these tests, which is the
+/// correct outcome rather than an inconvenience.
+///
+/// The span stops before the first `pub(super)` helper. Those helpers are
+/// *definitions* of things the stages call — `accept_invocation`,
+/// `settle_dynamic_context`, `offer_or_refuse_over_budget` — and including them
+/// would count a definition's body as if it were a step in the sequence. That
+/// is not hypothetical: it put the `-32023` raise count at five instead of four.
 fn run_prompt_turn_body() -> String {
     let src = production_source("runtime");
     let start = src
         .find("pub async fn run_prompt_turn(")
         .expect("`run_prompt_turn` is where the turn ordering lives");
     let rest = &src[start..];
-    // The turn's own body ends at the next item declared at method indentation.
     let end = rest[1..]
-        .find("\n    /// Run one attempt")
+        .find("\n    pub(super) ")
         .map_or(rest.len(), |at| at + 1);
-    rest[..end].to_owned()
+    let body = rest[..end].to_owned();
+
+    // Floors: the span must reach the last stage, and must not reach the
+    // helper definitions past it.
+    assert!(
+        body.contains("fn commit_or_abandon("),
+        "vacuity floor: the stage span does not reach `commit_or_abandon`, the \
+         last stage. It was renamed or moved, and every ordering claim below is \
+         now measuring a prefix of the turn."
+    );
+    assert!(
+        !body.contains("async fn accept_invocation("),
+        "vacuity floor: the stage span has swallowed `accept_invocation`'s \
+         *definition*. Positions inside a definition are not steps in the \
+         sequence, and counting them is what put the raise count at five."
+    );
+    body
+}
+
+/// **`run_prompt_turn`'s own body** — the orchestrator, without the stages.
+///
+/// [`run_prompt_turn_body`] spans the whole stage sequence, so its positions are
+/// where each stage is *defined*. That is the right corpus for "Stage A refuses
+/// above the seed", because those markers live inside one stage each. It is the
+/// wrong corpus for "the stages run in this order": reordering the **calls**
+/// here changes execution and leaves every definition where it was.
+///
+/// Found by review, and it was a real hole: swapping the `prepare_the_attempts`
+/// call above the `settle_expansion` call would run `CarriedTurn::begin` — which
+/// pushes the user block and arms the drop-commit — before either budget stage,
+/// so both `SKILL_EXPANSION_TOO_LARGE` raises would be refusing an expansion
+/// already committed. That is exactly the BR-8(c) violation these tests exist
+/// for, and every textual assertion still held.
+fn run_prompt_turn_orchestrator() -> String {
+    let src = production_source("runtime");
+    let start = src
+        .find("pub async fn run_prompt_turn(")
+        .expect("`run_prompt_turn` is where the turn's sequence lives");
+    let rest = &src[start..];
+    let end = rest[1..]
+        .find("\n    fn claim_the_turn(")
+        .map_or(rest.len(), |at| at + 1);
+    let body = rest[..end].to_owned();
+    assert!(
+        body.contains("commit_or_abandon("),
+        "vacuity floor: the orchestrator slice does not reach `commit_or_abandon`, \
+         its last statement — the span calculation drifted and the order below is \
+         being read off the wrong text."
+    );
+    assert!(
+        !body.contains("fn settle_expansion("),
+        "vacuity floor: the orchestrator slice has swallowed a stage *definition*. \
+         Positions inside a definition are not call sites, which is the confusion \
+         this function exists to avoid."
+    );
+    body
+}
+
+/// **BR-8's order as the turn actually runs it**, read off the call sequence.
+///
+/// The companion to [`the_two_refusals_bracket_the_consent_seam_and_precede_the_seed`],
+/// which pins where the refusals sit *within* the stages. This pins that the
+/// stages are invoked in the order those positions assume.
+#[test]
+fn the_orchestrator_calls_its_stages_in_the_order_br_8_requires() {
+    let body = run_prompt_turn_orchestrator();
+    let route = at(&body, "resolve_the_route(");
+    let expansion = at(&body, "settle_expansion(");
+    let seed = at(&body, "prepare_the_attempts(");
+    let attempts = at(&body, "run_attempts(");
+    let commit = at(&body, "commit_or_abandon(");
+
+    assert!(
+        route < expansion,
+        "the route is decided before the expansion is measured against its \
+         budget — the budget is the route's"
+    );
+    assert!(
+        expansion < seed,
+        "BR-8(c): both budget stages refuse ABOVE `CarriedTurn::begin`, which \
+         `prepare_the_attempts` calls. Running the seed first would leave every \
+         refusal below it refusing an expansion the session has already committed."
+    );
+    assert!(
+        seed < attempts,
+        "the conversation is armed before the first attempt sends anything"
+    );
+    assert!(
+        attempts < commit,
+        "the commit protocol runs on the loop's outcome, so it follows it"
+    );
 }
 
 /// The offset of `needle` in `haystack`, or a failure naming what was not found.
@@ -3916,7 +4018,11 @@ fn the_budget_check_runs_in_the_loop_and_the_tool_measures_nothing() {
 fn the_reroute_guard_is_handed_every_expansion_the_turn_committed_not_only_a_typed_one() {
     let body = run_prompt_turn_body();
     assert!(
-        body.contains("let mut skill_refit: Vec<(String, String, String)>"),
+        body.contains("skill_refit: Vec<(String, String, String)>"),
+        // Matched on the *type*, not on `let mut`: REQ-600 moved this binding
+        // into `prepare_the_attempts`, where it is built and then moved into
+        // the loop's state rather than mutated in place, so the `mut` correctly
+        // went away. The claim was never about the binding.
         "the refit guard's input is a list of `(name, text, system)` triples — \
          a single value cannot carry both a typed turn and the model's own \
          expansions"
