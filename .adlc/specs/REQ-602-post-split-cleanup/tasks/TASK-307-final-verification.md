@@ -12,6 +12,13 @@ dependencies: [TASK-301, TASK-302, TASK-303, TASK-304, TASK-305, TASK-306]
 
 AC-9 and AC-10. Run every criterion end to end and record the measured figures.
 
+## Files to Create/Modify
+
+- `.adlc/specs/REQ-602-post-split-cleanup/requirement.md` — tick each AC with
+  its evidence, or record it unmet with a reason
+- `.adlc/specs/REQ-602-post-split-cleanup/pipeline-state.json` — terminal record
+- No source files: this task measures and records, it does not change behavior
+
 ## Acceptance Criteria
 
 - [ ] `cargo test --workspace --no-fail-fast` green, output captured and

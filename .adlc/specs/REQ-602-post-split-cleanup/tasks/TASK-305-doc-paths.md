@@ -10,7 +10,7 @@ dependencies: [TASK-301]
 
 ## Description
 
-31 of 42 `runtime::tests::` references no longer resolve. **11 still do** — a
+AC-7. 31 of 42 `runtime::tests::` references no longer resolve. **11 still do** — a
 blanket rewrite breaks those, which is why the count matters more than the
 pattern.
 

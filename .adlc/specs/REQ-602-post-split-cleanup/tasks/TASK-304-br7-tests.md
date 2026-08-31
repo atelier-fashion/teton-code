@@ -10,7 +10,7 @@ dependencies: []
 
 ## Description
 
-BR-7 of REQ-599 was ticked without a check. `views.rs` shipped with **zero**
+AC-5. BR-7 of REQ-599 was ticked without a check. `views.rs` shipped with **zero**
 `#[cfg(test)]` content while its four dedicated `snapshot_from_config` tests
 stayed in `mod.rs`, and `engine.rs::local_tier_gated`'s test stayed too.
 
