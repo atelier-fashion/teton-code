@@ -43,8 +43,8 @@
       "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-605",
       "branch": "feat/REQ-605-ci-concurrency-per-commit",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/254",
+      "prNumber": 254,
       "merged": false,
       "snapshotBranch": null,
       "snapshotPR": null

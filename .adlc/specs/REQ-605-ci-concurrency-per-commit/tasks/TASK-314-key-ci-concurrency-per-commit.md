@@ -1,7 +1,7 @@
 ---
 id: TASK-314
 title: "Key the CI concurrency group on the commit under test"
-status: draft
+status: complete
 parent: REQ-605
 created: 2026-08-31
 updated: 2026-08-31
