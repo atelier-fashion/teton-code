@@ -48,6 +48,18 @@
 
 - **Engine/surface separation** — protocol-first; any new editor client is a
   rendering exercise, not an agent reimplementation.
+- **The turn path is a stage sequence, not a function** (REQ-600).
+  `DaemonRuntime::run_prompt_turn` is an orchestrator that calls eight named
+  stages in order — claim, route, name, assemble, settle, prepare, attempt,
+  commit — each a `&self` method on an `impl DaemonRuntime` split across
+  `runtime/mod.rs` and `runtime/turn.rs`. Two rules make it hold together:
+  parameters travel in **named bundles** rather than long argument lists
+  (`TurnContext` and its siblings; `suppression_ratchet.rs` refuses a new
+  `too_many_arguments` allow on the grounds that it is an unnamed cluster), and
+  `route` stays an **explicit parameter** everywhere because it is rebound on
+  every fallback reroute and that rebinding must stay visible in the signature.
+  The stage definitions are laid out in *execution* order, which several
+  source-scanning checks depend on.
 - **Workflow-aware routing** — phase (spec/architect/implement/review/io)
   determines model tier via a user-visible policy table; never per-prompt
   heuristics in structured mode (BR-5).

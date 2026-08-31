@@ -45,6 +45,28 @@ teton-code/
   early, treat `BrokenPipe` on the stdin write as that outcome and keep every
   other write error fatal (LESSON-540). CI's ubuntu leg is where the macOS-only
   assumption fails.
+- **A source-scanning check must bound its span and key on the hazard**
+  (REQ-600). This codebase derives several guarantees by reading its own source;
+  three rules keep those honest. **Bound the slice to the item you mean** — an
+  unbounded `&source[start..]` is a claim about the rest of the file, and after a
+  decomposition the rest of the file is other functions. **Compare positions only
+  where order means order** — inside one function body, textual order is
+  execution order; across sibling definitions it is file layout, so a call-order
+  claim belongs on the orchestrator's body. **Assert on the hazard, not the
+  remedy** — forbidding `block_in_place` forbids the mitigation and permits the
+  bare blocking syscall (LESSON-585). Cut every corpus at the first column-0
+  `#[cfg(test)]`: a check whose own patterns appear in its own file will
+  otherwise match itself and its vacuity floors can never fire.
+- **Re-run a derived check's mutation after any change to program structure**
+  (LESSON-598). Do not re-read the check — a guard that has stopped covering its
+  subject looks exactly like a guard that passes. REQ-600 moved one line into a
+  helper and an inversion that had gone red went green, with nothing else in
+  4,000 tests noticing.
+- **Bound a mechanical rename to code tokens** (LESSON-599). A word-boundary
+  regex over a region reaches string literals and comments, and those are the
+  one place the compiler, clippy and the whole suite are structurally incapable
+  of noticing. On any refactor claiming "bodies are byte-identical", diff the
+  prose too: `git diff origin/main..HEAD | grep '^[-+].*//'`.
 - **Show the test can fail before trusting that it passed.** Break the thing the
   test guards and confirm it goes red; record the mutation in the test's doc
   comment. REQ-592 shipped seven green assertions that could not have failed —
