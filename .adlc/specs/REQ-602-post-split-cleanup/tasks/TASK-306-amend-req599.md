@@ -1,7 +1,7 @@
 ---
 id: TASK-306
 title: "Amend REQ-599's three unevidenced criteria and reconcile ADR-4"
-status: draft
+status: complete
 parent: REQ-602
 created: 2026-08-31
 updated: 2026-08-31
