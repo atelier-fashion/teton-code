@@ -10,7 +10,7 @@
 //! |---|---:|
 //! | a review sample, rule unstated | ~24 needed |
 //! | bare name appears outside `runtime/` | 24–30 needed |
-//! | qualified `crate::runtime::X` reference | 5 needed |
+//! | qualified `crate::runtime::<item>` reference | 5 needed |
 //! | **demote all, build, read the errors** | **5, exactly** |
 //!
 //! The bare-name search counted **prose** — `startup_lifecycle`, `seam_policy`,

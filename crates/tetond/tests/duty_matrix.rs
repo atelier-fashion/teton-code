@@ -32,7 +32,7 @@
 //! [`Condition::ContentRefused`] is (2): the duty's own content is refused at
 //! the egress choke point before a byte leaves. The resolver-side half — a
 //! tainted session resolving *local* however its tier is bound — is asserted
-//! where the resolver lives (`runtime::tests::dispatch::{digest,triage,shell,
+//! where the resolver lives (`runtime::duty::dispatch::{digest,triage,shell,
 //! title,compact}::a_tainted_session_*`, one per duty) and by captured bytes end
 //! to end in `tests/e2e/duty_taint.rs` (AC-5). Neither is reachable from an
 //! integration test, which can build routes but not a `DaemonRuntime`.

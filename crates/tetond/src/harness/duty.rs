@@ -87,11 +87,11 @@
 //!
 //! | Mutation | Fails |
 //! |---|---|
-//! | `digest_route` loses its taint arm | `runtime::tests::dispatch::digest::a_tainted_session_digests_on_the_local_tier` |
-//! | `triage_route` loses its taint arm | `runtime::tests::dispatch::triage::a_tainted_session_triages_on_the_local_tier`, `tests/e2e/duty_taint.rs::a_tainted_sessions_duties_never_reach_the_provider_they_are_bound_to` |
-//! | `shell_route` loses its taint arm | `runtime::tests::dispatch::shell::a_tainted_session_interprets_on_the_local_tier`, and the same e2e test — the duty is then refused at the choke point instead of served locally, so its interpretation vanishes from the reply |
-//! | `title_route` loses its taint arm | `runtime::tests::dispatch::title::a_tainted_session_titles_on_the_local_tier`, and the same e2e test, **by captured bytes** |
-//! | `compact_route` loses its taint arm | `runtime::tests::dispatch::compact::a_tainted_session_compacts_on_the_local_tier` |
+//! | `digest_route` loses its taint arm | `runtime::duty::dispatch::digest::a_tainted_session_digests_on_the_local_tier` |
+//! | `triage_route` loses its taint arm | `runtime::duty::dispatch::triage::a_tainted_session_triages_on_the_local_tier`, `tests/e2e/duty_taint.rs::a_tainted_sessions_duties_never_reach_the_provider_they_are_bound_to` |
+//! | `shell_route` loses its taint arm | `runtime::duty::dispatch::shell::a_tainted_session_interprets_on_the_local_tier`, and the same e2e test — the duty is then refused at the choke point instead of served locally, so its interpretation vanishes from the reply |
+//! | `title_route` loses its taint arm | `runtime::duty::dispatch::title::a_tainted_session_titles_on_the_local_tier`, and the same e2e test, **by captured bytes** |
+//! | `compact_route` loses its taint arm | `runtime::duty::dispatch::compact::a_tainted_session_compacts_on_the_local_tier` |
 //!
 //! ## AC-9(b) — the failure path stops preserving the call site's invariant
 //!
@@ -104,7 +104,7 @@
 //! | `summarize_if_large`'s mechanical fallback folds the raw text instead of truncating it | `harness::context::tests::engine_failure_falls_back_to_bounded_mechanical_truncation`, `harness::digest::tests::an_unresolved_digest_still_bounds_an_oversized_result`, `…::a_local_only_tool_result_is_never_sent_to_a_remote_digest`, `tests/duty_matrix.rs::every_duty_holds_its_call_sites_invariant_on_every_failure_path` |
 //! | `GrepTool::refine`'s failure arm drops the tool's own result instead of returning it | `harness::tools::grep::tests::every_triage_failure_returns_the_tools_own_unranked_result_verbatim`, `tests/duty_matrix.rs::every_duty_holds_…` |
 //! | `ShellTool::refine`'s failure arm drops the tool's own result | `harness::tools::shell::tests::every_shell_duty_failure_returns_the_tools_own_capped_result_verbatim`, `tests/duty_matrix.rs::every_duty_holds_…`, `tests/duty_egress.rs::a_shell_duty_sends_only_on_a_machine_with_no_boundary_configured` |
-//! | `name_session` answers a failure with a blank title instead of no title | `harness::title::tests::an_empty_answer_is_a_failure_not_a_blank_title`, `…::a_title_over_boundary_content_is_refused_before_a_byte_leaves`, `runtime::tests::dispatch::title::a_failed_title_does_not_retry_on_the_next_turn`, `tests/duty_matrix.rs::every_duty_holds_…` |
+//! | `name_session` answers a failure with a blank title instead of no title | `harness::title::tests::an_empty_answer_is_a_failure_not_a_blank_title`, `…::a_title_over_boundary_content_is_refused_before_a_byte_leaves`, `runtime::duty::dispatch::title::a_failed_title_does_not_retry_on_the_next_turn`, `tests/duty_matrix.rs::every_duty_holds_…` |
 //! | the loop's `truncate_to_budget()` becomes conditional on the compaction having **worked** | `harness::turn_loop::tests::a_turn_whose_compact_duty_cannot_serve_still_ends_under_budget` |
 //!
 //! ## The seam's own guarantees
@@ -120,7 +120,7 @@
 //! | a duty module grows a category from a tool name (`if name == "grep" { … }`) | [`tests::no_duty_category_is_ever_produced_from_text`] |
 //! | a per-category route enum grows back (BR-6) | [`tests::one_route_type_one_trait_and_two_implementations_serve_every_duty`] |
 //! | a duty module takes an `Egress` of its own (BR-6) | [`tests::no_duty_module_carries_any_of_the_seams_concerns`] |
-//! | the choke point stops pinning the session it refused | `runtime::tests::dispatch::a_duty_refused_at_the_choke_point_taints_its_session`, `…::an_unattributable_privacy_block_pins_no_session` |
+//! | the choke point stops pinning the session it refused | `runtime::duty::dispatch::a_duty_refused_at_the_choke_point_taints_its_session`, `…::an_unattributable_privacy_block_pins_no_session` |
 //!
 //! ## REQ-562 — the sixth caller, and the gate it is called from
 //!
@@ -135,16 +135,16 @@
 //! | the gate hook moves **above** the provenance early-return in [`Egress::send`](crate::egress::Egress::send) | `egress::tests::a_payload_refused_by_provenance_is_never_scanned` — AC-11's ordering, by scanner call count |
 //! | `Egress::send` forwards on a `Block` decision (the permissive-guard mutation, AC-8a) | `egress::tests::an_unavailable_scan_blocks_the_send_and_says_it_could_not_run`, `…::a_high_confidence_finding_blocks_with_its_kind_span_and_locus` |
 //! | `block_cause` reports `ScanUnavailable` for a findings verdict, or `Redaction` for an unavailable one | `egress::tests::a_redaction_block_reports_the_first_high_finding_and_never_a_low_one`, and both block tests by `cause` |
-//! | the gate is installed unconditionally, ignoring `[privacy] redact` | `runtime::tests::dispatch::redact::off_means_no_gate_and_on_means_a_gate_that_reaches_the_engine` — the off leg, by engine call count |
-//! | `redact_route` grows a session-taint arm (the "uniformity fix" ADR-3 forbids) | nothing turns red, and that is the point: the arm cannot change the answer, which is what `runtime::tests::dispatch::redact::a_tainted_session_resolves_redact_exactly_as_a_clean_one_does` pins from the other direction |
-//! | `redact_route` falls through to the squatting provider when `local_tier_id` yields nothing | `runtime::tests::dispatch::redact::a_squatted_local_tier_id_leaves_the_scan_unavailable_never_remote` |
-//! | `redact_route` treats an unresolved route as clean instead of unresolved | `runtime::tests::dispatch::redact::a_machine_with_no_engine_loaded_blocks_rather_than_passing_the_scan` |
+//! | the gate is installed unconditionally, ignoring `[privacy] redact` | `runtime::duty::dispatch::redact::off_means_no_gate_and_on_means_a_gate_that_reaches_the_engine` — the off leg, by engine call count |
+//! | `redact_route` grows a session-taint arm (the "uniformity fix" ADR-3 forbids) | nothing turns red, and that is the point: the arm cannot change the answer, which is what `runtime::duty::dispatch::redact::a_tainted_session_resolves_redact_exactly_as_a_clean_one_does` pins from the other direction |
+//! | `redact_route` falls through to the squatting provider when `local_tier_id` yields nothing | `runtime::duty::dispatch::redact::a_squatted_local_tier_id_leaves_the_scan_unavailable_never_remote` |
+//! | `redact_route` treats an unresolved route as clean instead of unresolved | `runtime::duty::dispatch::redact::a_machine_with_no_engine_loaded_blocks_rather_than_passing_the_scan` |
 //! | `build_duty_route` stops installing the gate on a remotely bound duty's choke point | [`tests::a_remote_duty_send_is_scanned_by_the_choke_points_gate`] (at the seam) |
-//! | `mcp_egress` stops installing the gate on the MCP choke point | `runtime::tests::dispatch::redact::an_mcp_tool_call_crosses_the_gate_when_redact_is_on`. **This was GREEN before that fixture existed** — the attachment lived inside `build_tools`, reachable only through `HttpTransport::new()` and a real socket, so deleting it left the whole suite passing. The transport is a parameter of `mcp_egress` now precisely so the construction is drivable from a test |
+//! | `mcp_egress` stops installing the gate on the MCP choke point | `runtime::duty::dispatch::redact::an_mcp_tool_call_crosses_the_gate_when_redact_is_on`. **This was GREEN before that fixture existed** — the attachment lived inside `build_tools`, reachable only through `HttpTransport::new()` and a real socket, so deleting it left the whole suite passing. The transport is a parameter of `mcp_egress` now precisely so the construction is drivable from a test |
 //! | the forward path rebuilds the request from the scanned text instead of passing it through | `egress::tests::a_low_only_or_clean_verdict_forwards_the_exact_bytes`, `…::the_gate_reads_the_exact_bytes_that_would_go_on_the_wire` (AC-9) |
 //! | the gate arm keeps the report **call** and drops its **effect** — `for _line in redact::forwarded_findings_report(&verdict) {}` | `egress::tests::the_gate_arm_reports_a_forwarded_findings_verdict`. Applied to a freshly built workspace, observed (716 passed / 1 failed), reverted. The needle used to be the call alone, which this mutation satisfies; it now covers the whole statement, `eprintln!` included, over whitespace-normalized source |
 //! | the gate hook is placed after `inner.execute`, or metering moves ahead of it | `egress::tests::a_blocked_send_bills_nothing_while_an_allowed_one_still_bills` |
-//! | either taint gate pins the session on `ScanUnavailable` (`=> true`) | `runtime::tests::dispatch::{a_scan_unavailable_block_refuses_the_payload_without_pinning_the_session, the_two_taint_gates_agree_cause_for_cause}` and `…::redact::a_scan_unavailable_turn_does_not_pin_the_session` — applied to a freshly built workspace, 694 passed / 3 failed, reverted. **The gates were added by TASK-072**: before them both sites pinned unconditionally, so a 120-second engine stall permanently routed the rest of the session local on the strength of a fact nobody established |
+//! | either taint gate pins the session on `ScanUnavailable` (`=> true`) | `runtime::duty::dispatch::{a_scan_unavailable_block_refuses_the_payload_without_pinning_the_session, the_two_taint_gates_agree_cause_for_cause}` and `…::redact::a_scan_unavailable_turn_does_not_pin_the_session` — applied to a freshly built workspace, 694 passed / 3 failed, reverted. **The gates were added by TASK-072**: before them both sites pinned unconditionally, so a 120-second engine stall permanently routed the rest of the session local on the strength of a fact nobody established |
 //!
 //! ### REQ-562 AC-8 — the mutations, applied and observed (TASK-071, TASK-072)
 //!
@@ -155,7 +155,7 @@
 //!
 //! | # | Mutation (exact diff) | Turns red |
 //! |---|---|---|
-//! | **(a)** permissive unavailable | `egress/redact.rs`, `decide`: `Outcome::Unavailable => EgressDecision::Block` → `=> EgressDecision::Forward` | **12 lib + 4 integration.** `egress::redact::tests::{confidence_drives_the_egress_decision, an_over_cap_payload_is_unavailable_and_blocks_never_forwards, an_over_cap_payload_carrying_a_credential_still_reports_could_not_scan}`, `egress::tests::an_unavailable_scan_blocks_the_send_and_says_it_could_not_run`, `harness::redact::tests::{an_unresolved_route_is_unavailable_not_clean, an_engine_failure_is_unavailable_not_clean, an_unreadable_answer_blocks_rather_than_passing_as_clean, an_over_cap_payload_is_unavailable_before_any_model_call, a_scan_that_overruns_the_deadline_is_unavailable}`, `runtime::tests::dispatch::redact::{a_machine_with_no_engine_loaded_blocks_rather_than_passing_the_scan, a_squatted_local_tier_id_leaves_the_scan_unavailable_never_remote, a_scan_that_could_not_run_fails_the_turn_saying_so_not_blaming_a_boundary}`, and `tests/redact_egress.rs::{with_no_local_tier_the_payload_is_blocked_unscanned_and_nothing_claims_otherwise, a_payload_past_the_input_cap_blocks_unscanned_and_costs_no_model_call, a_remote_provider_squatting_the_local_id_never_receives_the_scan, an_engine_backed_local_tier_under_another_id_still_serves_the_scan}` |
+//! | **(a)** permissive unavailable | `egress/redact.rs`, `decide`: `Outcome::Unavailable => EgressDecision::Block` → `=> EgressDecision::Forward` | **12 lib + 4 integration.** `egress::redact::tests::{confidence_drives_the_egress_decision, an_over_cap_payload_is_unavailable_and_blocks_never_forwards, an_over_cap_payload_carrying_a_credential_still_reports_could_not_scan}`, `egress::tests::an_unavailable_scan_blocks_the_send_and_says_it_could_not_run`, `harness::redact::tests::{an_unresolved_route_is_unavailable_not_clean, an_engine_failure_is_unavailable_not_clean, an_unreadable_answer_blocks_rather_than_passing_as_clean, an_over_cap_payload_is_unavailable_before_any_model_call, a_scan_that_overruns_the_deadline_is_unavailable}`, `runtime::duty::dispatch::redact::{a_machine_with_no_engine_loaded_blocks_rather_than_passing_the_scan, a_squatted_local_tier_id_leaves_the_scan_unavailable_never_remote, a_scan_that_could_not_run_fails_the_turn_saying_so_not_blaming_a_boundary}`, and `tests/redact_egress.rs::{with_no_local_tier_the_payload_is_blocked_unscanned_and_nothing_claims_otherwise, a_payload_past_the_input_cap_blocks_unscanned_and_costs_no_model_call, a_remote_provider_squatting_the_local_id_never_receives_the_scan, an_engine_backed_local_tier_under_another_id_still_serves_the_scan}` |
 //! | **(b)** unbounded scan input (BR-7) | `egress/redact.rs`, `pattern_verdict`: delete the `if text.len() > REDACT_INPUT_MAX_BYTES { return RedactionVerdict::unavailable(); }` guard | **4 lib + 1 integration.** `egress::redact::tests::{an_over_cap_payload_is_unavailable_and_blocks_never_forwards, an_over_cap_payload_carrying_a_credential_still_reports_could_not_scan}`, `harness::redact::tests::{an_over_cap_payload_is_unavailable_before_any_model_call, an_over_cap_payload_carrying_a_credential_still_says_the_scan_could_not_run}`, `tests/redact_egress.rs::a_payload_past_the_input_cap_blocks_unscanned_and_costs_no_model_call` |
 //! | **(c)** a finding carries its matched text, threaded to the event | `egress/redact.rs`: `Finding` gains `text: String` (both constructors init `String::new()`) plus `fn carrying(self, &str) -> Self` and `fn text(&self) -> &str`; `pattern_pass` maps `Finding::pattern(..).carrying(&text[span])`; `harness/redact.rs`'s `read_findings` maps `Finding::model(..).carrying(&payload[span])`; `egress/mod.rs`'s gate arm builds `path` as `format!("{} ({})", redaction_locus(cause), finding.text())` | **2 lib + 2 integration.** `egress::redact::tests::a_finding_never_carries_the_matched_text` (the derived `Debug` starts rendering the secret), `egress::tests::a_high_confidence_finding_blocks_with_its_kind_span_and_locus`, `tests/redact_egress.rs::{no_emitted_surface_carries_the_sentinel, a_planted_credential_with_clean_provenance_is_blocked_and_the_event_names_redaction}`. **`teton_protocol::events::tests::a_redaction_cause_carries_only_a_kind_and_a_span` stays green** and it is right to: that test guards `BlockCause::Redaction`'s key set, and this variant of the mutation rides the text on `PrivacyBlock.path`, which is a `String` either way. The wire-key-set test covers the *other* variant (a new field on the cause); the sentinel sweep covers this one. Both are needed. |
 //! | **(d)** an id-based locality assertion, restored (BR-2) | two placements, see below | **RED at both layers** (one of them only after a fixture was added — see the note) |
@@ -178,7 +178,7 @@
 //!       ));
 //!   }
 //!   ```
-//!   **RED**: `runtime::tests::dispatch::redact::an_engine_backed_local_tier_under_another_id_still_serves_the_scan`
+//!   **RED**: `runtime::duty::dispatch::redact::an_engine_backed_local_tier_under_another_id_still_serves_the_scan`
 //!   (`left: Unavailable, right: Clean`). **On the first run this was GREEN** —
 //!   see immediately below, because the history is the reason the fixture exists.
 //!
@@ -194,7 +194,7 @@
 //! id comparison inside `RedactionGateImpl::redact_route` fails that machine's
 //! scan closed, and — since the gate sits on the synchronous send path — every
 //! one of its remote turns with it. The suite could not see it: every
-//! `runtime::tests::dispatch::redact` fixture built its router from a config
+//! `runtime::duty::dispatch::redact` fixture built its router from a config
 //! whose local tier carried the canonical id, so the guard could never fire.
 //! `tests/redact_egress.rs::an_engine_backed_local_tier_under_another_id_still_serves_the_scan`
 //! covered the same property one layer down — a real `Router` whose
@@ -203,7 +203,7 @@
 //! reach the daemon's own copy of the resolver.
 //!
 //! The gap was reported first and closed second, in that order, by
-//! `runtime::tests::dispatch::redact::an_engine_backed_local_tier_under_another_id_still_serves_the_scan`:
+//! `runtime::duty::dispatch::redact::an_engine_backed_local_tier_under_another_id_still_serves_the_scan`:
 //! one config (`[[providers]] id = "on-device", kind = "local"`) and the
 //! assertion that the scan resolves, serves, and announces its route under that
 //! id. Re-running the identical mutation against a freshly built workspace after

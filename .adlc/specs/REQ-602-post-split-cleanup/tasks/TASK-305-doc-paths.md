@@ -1,7 +1,7 @@
 ---
 id: TASK-305
 title: "Repoint the 31 stale doc paths, and keep them pointed"
-status: draft
+status: complete
 parent: REQ-602
 created: 2026-08-31
 updated: 2026-08-31

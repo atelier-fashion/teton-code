@@ -2829,7 +2829,7 @@ mod tests {
     /// The cause and the taint that follow from these two verdicts are pinned
     /// where they are decided:
     /// `egress::tests::an_unavailable_verdict_names_a_credential_only_when_the_pattern_pass_found_one`
-    /// and `runtime::tests::the_two_taint_gates_agree_cause_for_cause`.
+    /// and `runtime::duty::dispatch::the_two_taint_gates_agree_cause_for_cause`.
     #[tokio::test]
     async fn a_clean_payload_whose_chunk_failed_still_reports_only_that_it_could_not_run() {
         let payload = filler(OVER_ONE_WINDOW);

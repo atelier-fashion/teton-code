@@ -6,7 +6,7 @@
 //! Three instruments are already pointed at REQ-581, and each is blind to what
 //! is asserted here:
 //!
-//! * `runtime::tests::provider_test` drives [`DaemonRuntime::provider_test`]
+//! * `runtime::provider::provider_test` drives [`DaemonRuntime::provider_test`]
 //!   in-process against a scripted `Transport`. It owns the mapping table and
 //!   the health movement, and it never builds an HTTP request, never resolves
 //!   an `auth_ref` out of a real process environment, and never crosses a wire.

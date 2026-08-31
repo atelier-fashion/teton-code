@@ -32,7 +32,7 @@
 //! the derivation of `local_provider_id` from a config (`runtime::local_tier_id`,
 //! BUG-156/TASK-057), which is pinned by
 //! `runtime::tests::the_local_tier_id_is_never_a_registered_remote_providers_id`
-//! and by `runtime::tests::dispatch::redact::a_squatted_local_tier_id_leaves_the_scan_unavailable_never_remote`.
+//! and by `runtime::duty::dispatch::redact::a_squatted_local_tier_id_leaves_the_scan_unavailable_never_remote`.
 //! Everything downstream of that one value is real here — including, for AC-5,
 //! a gate deliberately given the ability to route the scan over HTTP, so the
 //! capture has something it could catch.
@@ -1455,7 +1455,7 @@ async fn an_engine_backed_local_tier_under_another_id_still_serves_the_scan() {
 ///
 /// The resolver half — that a tainted session resolves local in the first place
 /// — is pinned where the resolver lives
-/// (`runtime::tests::dispatch::redact::a_tainted_session_resolves_redact_exactly_as_a_clean_one_does`)
+/// (`runtime::duty::dispatch::redact::a_tainted_session_resolves_redact_exactly_as_a_clean_one_does`)
 /// and end to end in `tests/e2e/privacy_fixes.rs`.
 #[tokio::test]
 async fn a_turn_pinned_to_the_local_tier_costs_zero_scanner_calls() {

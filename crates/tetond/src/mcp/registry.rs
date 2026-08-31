@@ -176,7 +176,7 @@ impl McpRegistry {
     ///
     /// Opt-in rather than a constructor parameter so the fixtures that build a
     /// registry to test the *lifecycle* keep compiling unchanged; the daemon
-    /// wires its event bus in `runtime::build_tools`. A registry with no sink
+    /// wires its event bus in `runtime::DaemonRuntime::build_tools`. A registry with no sink
     /// still fails closed — the taint is what refuses the call — it simply
     /// cannot say why, which is the gap this exists to close.
     #[must_use]

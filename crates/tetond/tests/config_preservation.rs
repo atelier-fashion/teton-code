@@ -71,7 +71,7 @@
 //! ### Covered elsewhere, deliberately not repeated here
 //!
 //! * **AC-5 through `persist_web_tier`**, and the seam's own missing-file and
-//!   invalid-drift refusals — `runtime::tests::config_document_seam`
+//!   invalid-drift refusals — `runtime::config_document::tests`
 //!   (TASK-136), which can reach `persist_config` directly.
 //! * **AC-3's digest half and AC-4** (a comment-only hand edit between preview
 //!   and commit) — `runtime::tests::web_setup_flow` (TASK-137). The digest is
@@ -585,7 +585,7 @@ fn the_fixture_is_the_readmes_own_block_byte_for_byte() {
 /// 2. the same document with the tier lowered — one value changed, comments and
 ///    all — where the answer *raises* the ceiling, so `tier` moves too.
 ///
-/// `runtime::tests::config_document_seam` already witnesses this writer at the
+/// `runtime::config_document::tests` already witnesses this writer at the
 /// seam on a fixture of its own; what is added here is the README block and the
 /// exact-delta assertion AC-1 asks for.
 #[test]
@@ -1301,7 +1301,7 @@ provider_id = "on-device"
 /// BUG-146).
 ///
 /// `persist_web_tier` is witnessed at the seam in
-/// `runtime::tests::config_document_seam`; the two writers here are the ones
+/// `runtime::config_document::tests`; the two writers here are the ones
 /// that task left for this one, each asserted at its own error code because the
 /// classification is part of the contract a client renders.
 #[test]
@@ -1430,7 +1430,7 @@ fn a_hand_edit_that_fails_validation_refuses_both_writers_and_survives_them() {
 /// `0600` is the load-bearing half: this file can hold secret-adjacent material
 /// (`McpTransport::Stdio { env }` stores arbitrary environment values), so a
 /// created one does not get its permissions from an inherited umask. The seam's
-/// own witness is in `runtime::tests::config_document_seam`; this is the same
+/// own witness is in `runtime::config_document::tests`; this is the same
 /// claim reached through the writer a user's first "enable permanently" answer
 /// actually takes.
 ///
