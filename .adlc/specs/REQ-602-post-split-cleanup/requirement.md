@@ -71,7 +71,7 @@ _None. No new types; this REQ removes surface rather than adding it._
 - [ ] BR-6: A criterion is ticked only with evidence. Three in REQ-599 were not:
       AC-4's module-ownership clause is unimplemented, AC-6 names four scenarios
       and the fixture exercises two, AC-11's "each commit green in CI" is
-      contradicted by three cancelled `macos-latest` runs. Each is either met or
+      contradicted by cancelled `macos-latest` runs (two, measured: `f64d99b` and `56f3777` — steps 6 and 7). Each is either met or
       amended in writing — never left ticked.
 - [ ] BR-7: Documentation that points at a moved item points at where it is now.
       ~30 doc references name test paths that no longer resolve.
@@ -79,10 +79,17 @@ _None. No new types; this REQ removes surface rather than adding it._
 ## Acceptance Criteria
 
 - [ ] AC-1: For every `pub(crate)` item under `crates/tetond/src/runtime/`, a
-      search establishes either an out-of-tree caller or a demotion. The
-      review's sample found **61 items with no out-of-tree caller**, and seven
-      spot-checked `engine.rs` items had zero external references each. Report
-      the final count of genuine out-of-tree items.
+      search establishes either an out-of-tree caller or a demotion. Report the
+      final count of genuine out-of-tree items.
+      **State the counting rule with the number.** A review sample reported "61
+      items with no out-of-tree caller"; validating this spec against the code
+      could not reproduce it — **48** counting top-level items and `impl`
+      methods, **52** if `pub(crate)` struct fields are included. The direction
+      is not in doubt (a large majority have no caller outside the tree, and
+      seven spot-checked `engine.rs` items had zero external references each),
+      but the figure was carried into this spec without being re-measured, which
+      is exactly how REQ-599 ADR-1's bad number got in. Whatever count this REQ
+      reports, it says what it counted.
 - [ ] AC-2: **A test enforces BR-2**, so the next split cannot re-widen by
       accident. It walks `runtime/`, collects `pub(crate)` items, and fails on
       any with no reference outside the tree. Shipped with this REQ and kept in
@@ -90,11 +97,19 @@ _None. No new types; this REQ removes surface rather than adding it._
 - [ ] AC-3: **Mutation on AC-2** — promoting one `pub(super)` item to
       `pub(crate)` turns it red; the mutation and its observed failure are
       recorded in the test's doc comment.
-- [ ] AC-4: The five non-recursive `read_dir` scans recurse
-      (`runtime/mod.rs`, `runtime/taint.rs`, `tests/traceability_sweep.rs`,
-      `tests/skill_turn.rs`, `tests/runtime_module_map.rs`). Demonstrated by
+- [ ] AC-4: Every directory scan over `runtime/` recurses. Demonstrated by
       planting a nested `runtime/nested/mod.rs` fixture and confirming each scan
-      sees it, then removing it.
+      sees it, then removing it. The sites, corrected during validation:
+      `runtime/mod.rs` (3 reads), `runtime/taint.rs`, `tests/skill_turn.rs`,
+      `tests/runtime_module_map.rs`, **`projects/scan.rs`**, and
+      `tests/traceability_sweep.rs`'s *floor* read only — its workspace sweep
+      already walks recursively, so listing it unqualified overstated the work.
+      **`projects/scan.rs` is on this list because this REQ's own predecessor put
+      it there.** The Critical fix in `d7f4e05` repointed that scan at the
+      `runtime/` directory to repair a guard that had gone silently dead — and
+      used a flat `read_dir` to do it. The remedy for "a sweep sees less" shipped
+      with the same latent defect one commit later, which is the fourth instance
+      of this hazard in the REQ-598/599 line and the second committed by hand.
 - [ ] AC-5: `views.rs`'s four `snapshot_from_config` tests and `engine.rs`'s
       `local_tier_gated` test move to their subjects, **or** each module header
       records why they stayed, naming them.
@@ -102,11 +117,15 @@ _None. No new types; this REQ removes surface rather than adding it._
       what actually holds. AC-6's fixture either gains the skill-expansion and
       consent scenarios it names, or the AC is narrowed to what the fixture
       covers.
-- [ ] AC-7: The ~30 stale doc paths resolve. A check asserts every
+- [ ] AC-7: The stale doc paths resolve. Measured during validation: **31**
+      genuinely stale of 42 `runtime::tests::` references — 11 still resolve, so a
+      blanket rewrite would break those. The stale segments are `dispatch` (25),
+      `config_document_seam` (4), `provider_setup` (1), and
+      `the_two_taint_gates_agree_cause_for_cause` (1). A check asserts every
       `runtime::…::` path named in a doc comment exists, so this class cannot
       silently return.
 - [ ] AC-8: ADR-4's step table in REQ-599's architecture doc is reconciled with
-      what shipped — it names four modules that do not exist. **The planned
+      what shipped — it names **five** modules that do not exist (`types.rs`, `consent.rs`, `egress.rs`, `session.rs`, `turn.rs`). **The planned
       session-lifecycle slice delivered nothing and is recorded nowhere as
       deferred**; it is either done here or explicitly deferred with a reason.
 - [ ] AC-9: `cargo test --workspace --no-fail-fast` green with output grepped
@@ -142,7 +161,7 @@ _None. No new types; this REQ removes surface rather than adding it._
       production. Benign today. Fix by wrapping its contents, or by teaching the
       scanners to skip `#[cfg(test)] mod` declarations?
 - [ ] OQ-3: Should the CI `concurrency: cancel-in-progress` setting change? It
-      is what left three `macos-latest` runs cancelled, and macOS is the runner
+      is what left two `macos-latest` runs cancelled, and macOS is the runner
       that caught the last ordering defect (LESSON-591). Cheap to fix; changes
       CI cost for every PR, so it is not this REQ's call to make alone.
 
