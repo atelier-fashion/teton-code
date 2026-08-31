@@ -1,7 +1,7 @@
 ---
 id: TASK-308
 title: "Pin the three BR-3 invariants that only a comment holds"
-status: draft
+status: complete
 parent: REQ-600
 created: 2026-08-31
 updated: 2026-08-31

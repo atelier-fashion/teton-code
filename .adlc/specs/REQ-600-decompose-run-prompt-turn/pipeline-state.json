@@ -3,10 +3,12 @@
   "branch": "feat/REQ-600-decompose-run-prompt-turn",
   "startedAt": "2026-08-31T21:45:00Z",
   "completed": false,
-  "currentPhase": 2,
+  "currentPhase": 4,
   "completedPhases": [
     0,
-    1
+    1,
+    2,
+    3
   ],
   "phaseHistory": [
     {
@@ -18,6 +20,16 @@
       "phase": 1,
       "name": "Validate Spec",
       "completedAt": "2026-08-31T22:00:00Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect",
+      "completedAt": "2026-08-31T22:30:00Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture",
+      "completedAt": "2026-08-31T22:30:00Z"
     }
   ],
   "integrationBranch": "main",
@@ -28,8 +40,8 @@
       "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-600",
       "branch": "feat/REQ-600-decompose-run-prompt-turn",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/249",
+      "prNumber": 249,
       "merged": false
     }
   },
@@ -37,7 +49,7 @@
     "teton-code"
   ],
   "phase4": {
-    "currentTask": null,
+    "currentTask": "TASK-308",
     "completedTasks": [],
     "failedTasks": []
   }

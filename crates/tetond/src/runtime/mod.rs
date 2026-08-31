@@ -20377,6 +20377,353 @@ provider_id = \"deepseek\"
             );
             }
         }
+
+        // -- REQ-600 AC-4: the ordering invariants BR-3 names ----------------
+        //
+        // REQ-599 called these the whole behavioural risk of decomposing the
+        // turn path, and then shipped with three of the five held by a comment.
+        // A comment does not fail when someone reorders two statements. These
+        // are written *before* the decomposition, against the code that
+        // motivated the invariant, so the restructure has a net to fall into —
+        // written afterwards they would pin the new shape instead.
+
+        /// This module's own source, cut at the first column-0 `#[cfg(test)]`.
+        ///
+        /// Shared by the three ordering checks below. The cut is load-bearing:
+        /// every pattern they search for also appears as a string literal *in
+        /// them*, in this same file, so an uncut scan lets a check match its own
+        /// source — which it did, silently, until the vacuity floors were run.
+        fn production_half_of_this_module() -> String {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/runtime")
+                .join("mod.rs");
+            let whole = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("unreadable {}: {err}", path.display()));
+            whole
+                .split_once("\n#[cfg(test)]")
+                .map_or(whole.clone(), |(production, _)| production.to_owned())
+        }
+
+        /// **BR-3, invariant 2 (LESSON-520): the gate is fetched before the
+        /// parse it guards — and that inversion does not compile.**
+        ///
+        /// `accept_invocation(&skills, &probed, invocation, &gate, invoker)`
+        /// takes the gate **as a parameter**, so the binding must exist first.
+        /// Moving `let gate = self.permission_gate_for(…)` below the
+        /// `accept_invocation` match was run, and the result was
+        /// `error[E0425]: cannot find value \`gate\` in this scope`.
+        ///
+        /// That is a stronger guarantee than a test, and it is why this test
+        /// asserts the *weaker* remaining thing — that the fetch stays inside
+        /// `run_prompt_turn` and ahead of the call. After the decomposition the
+        /// gate may be built in one stage and threaded into another, where the
+        /// compiler still enforces it; what it would no longer catch is the
+        /// fetch drifting to a place that re-reads a different session's gate.
+        ///
+        /// LESSON-520 itself is about test *vacuity*, not about the ordering:
+        /// a gate that runs before deserialization makes an invalid-payload test
+        /// prove nothing. The gate's own decisions are pinned by refuse/accept
+        /// pairs in `crates/tetond/tests/skill_consent_matrix.rs`; this only
+        /// pins where it is fetched.
+        ///
+        /// **Mutations, run and observed** (reverted): moving the gate fetch
+        /// below `accept_invocation` in production is `error[E0425]: cannot find
+        /// value \`gate\` in this scope` — the inversion does not compile.
+        /// Drifting the `permission_gate_for` pattern gives "the gate fetch was
+        /// not found inside `run_prompt_turn`"; drifting `accept_invocation`
+        /// gives its own floor.
+        #[test]
+        fn the_permission_gate_is_fetched_before_the_invocation_is_accepted() {
+            let source = production_half_of_this_module();
+            let body_start = source.find("    pub async fn run_prompt_turn(").expect(
+                "vacuity floor: `run_prompt_turn` was not found — renamed or moved, \
+                 and this check is measuring nothing",
+            );
+            let body = &source[body_start..];
+            let fetch = body
+                .find("let gate = self.permission_gate_for(")
+                .expect("vacuity floor: the gate fetch was not found inside `run_prompt_turn`");
+            let accept = body.find("self.accept_invocation(").expect(
+                "vacuity floor: the `accept_invocation` call was not found inside \
+                 `run_prompt_turn`",
+            );
+            assert!(
+                fetch < accept,
+                "the permission gate must be fetched before the invocation it \
+                 guards is accepted (LESSON-520). Fetch at byte {fetch}, accept at \
+                 {accept}, relative to `run_prompt_turn`."
+            );
+        }
+
+        /// **BR-3, invariant 4 (LESSON-518, BUG-184): the turn path takes no
+        /// blocking wait.**
+        ///
+        /// **Recorded finding, per AC-4: there is no presence gate on this path
+        /// to park in, so LESSON-518's `ParkingVerifier` shape does not apply
+        /// here and a test in that shape could not fail.** Measured rather than
+        /// assumed:
+        ///
+        /// - `session/prompt` is **not** in `server.rs`'s `blocks_on_a_human`
+        ///   list, which admits only `session/attach`, `attach/consent`,
+        ///   `model/confirm`, `model/set`, `web/setup_commit`,
+        ///   `provider/setup_commit`, `config/set` and `provider/test`.
+        /// - The one `block_in_place_if_multithread` near this path is inside
+        ///   `store_session_skills`, reached from `session/create` and `/cd` —
+        ///   never from a turn. That is BUG-184's actual site, and
+        ///   `multi_client.rs` already parks there.
+        ///
+        /// What invariant 4 means *for this REQ* is therefore the other
+        /// direction: the decomposition must not **introduce** a blocking wait
+        /// onto the turn path. That is what this pins, and it is why the
+        /// assertion is a `0` rather than a parked verifier.
+        ///
+        /// **Mutations, run and observed** (reverted): wrapping
+        /// `self.session_root_for(...)` in `block_in_place_if_multithread`
+        /// fails here with `left: 1`. Widening the body-start pattern to
+        /// `"    pub async fn "` — so the span starts at some other function —
+        /// fires the span floor rather than passing on the wrong text.
+        #[test]
+        fn the_turn_path_takes_no_blocking_wait() {
+            let source = production_half_of_this_module();
+            let body_start = source.find("    pub async fn run_prompt_turn(").expect(
+                "vacuity floor: `run_prompt_turn` was not found — renamed or moved, \
+                 and this check is measuring nothing",
+            );
+            // The whole body, so a stage extracted *inside* the function is
+            // still covered. Stages moved to sibling functions are covered by
+            // the `TurnContext` no-I/O rule they inherit.
+            let body = &source[body_start..];
+            let end = body
+                .find("\n    /// ")
+                .or_else(|| body.find("\n    pub "))
+                .unwrap_or(body.len());
+            let body = &body[..end];
+            assert!(
+                body.contains("run_prompt_turn"),
+                "vacuity floor: the extracted body does not contain the function \
+                 it claims to — the span calculation drifted and this assertion \
+                 is reading the wrong text"
+            );
+            assert_eq!(
+                body.matches("block_in_place").count(),
+                0,
+                "`run_prompt_turn` must take no blocking wait. BUG-184: discovery \
+                 is up to four `read_dir` calls plus metadata+open+read on \
+                 user-controlled symlinked paths, and on macOS a root under \
+                 `~/Documents` raises a TCC dialog that blocks the syscall for as \
+                 long as the user takes to answer. A stage that grew one would \
+                 stall every RPC on the connection behind a modal."
+            );
+        }
+
+        /// **BR-3, invariant 3 (LESSON-539): the claim is taken before the
+        /// session state is re-read.**
+        ///
+        /// `spawn_prompt_turn` snapshots the session summary and *then* spawns,
+        /// so the `session_cwd` parameter is always a pre-claim reading. A
+        /// `/cd` landing in that window moved the root and cleared the
+        /// conversation, and a turn built on the snapshot would jail to the old
+        /// root, state it in its environment block, and commit into the
+        /// just-cleared conversation.
+        ///
+        /// The fix was to take the claim first and re-read the registry under
+        /// it. This pins the observable consequence: the registry wins over the
+        /// parameter.
+        ///
+        /// **Mutation, run and observed** (reverted): replacing the re-read with
+        /// `let session_cwd = session_cwd;` — keeping the pre-claim snapshot —
+        /// fails here with "the read must resolve against the registry's root".
+        /// Swapping the claim and the re-read leaves this test **green**; that
+        /// inversion is caught by
+        /// [`the_claim_is_taken_before_the_registry_is_re_read`], and the reason
+        /// the split exists is recorded there.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_turns_root_comes_from_the_registry_not_the_pre_claim_snapshot() {
+            // The two roots differ by which file exists in them, not by name:
+            // the environment block elides a long path in the middle, so a
+            // substring match on the directory name is not a reliable
+            // observable. Reading a file *through the jail* is — and it pins
+            // the stronger property, since the jail is what the stale root
+            // would actually have broken.
+            let authoritative = scratch_dir("inv3-registry-root");
+            std::fs::write(authoritative.join("only-in-registry-root.txt"), "42\n")
+                .expect("seed the authoritative root");
+            let stale = scratch_dir("inv3-stale-snapshot");
+
+            let (runtime, seen) = carry_runtime(&[
+                Scripted::Say(
+                    r#"{"tool": "read", "arguments": {"path": "only-in-registry-root.txt"}}"#,
+                ),
+                Scripted::Say("Noted."),
+            ]);
+            let events = Arc::new(EventBus::new());
+            // The registry holds the root a `/cd` moved us to…
+            let (sessions, session_id) = one_session_at(&authoritative);
+
+            prompt(
+                &runtime,
+                &events,
+                &sessions,
+                &session_id,
+                // …while the caller still carries the pre-claim snapshot.
+                Some(stale.clone()),
+                "read the file for me",
+            )
+            .await
+            .expect("the scripted turn completes");
+
+            let contexts = seen.lock().expect("recorded-context mutex").clone();
+            let after_tool = contexts
+                .last()
+                .expect("the engine saw the context carrying the tool result");
+            assert!(
+                after_tool.contains("42"),
+                "the read must resolve against the registry's root — the claim is \
+                 what makes it authoritative. If the turn jailed to the pre-claim \
+                 snapshot the file is not there. Context:\n{after_tool}"
+            );
+        }
+
+        /// **BR-3, invariant 3 — the ordering itself, checked on the source.**
+        ///
+        /// The two behavioural tests around this one pin the invariant's
+        /// *consequences*: the registry wins over the pre-claim snapshot, and a
+        /// held claim refuses the `/cd` that would move the root. Neither pins
+        /// the **ordering**, and that is not an oversight — it was measured.
+        /// Swapping `try_begin_turn` with the registry re-read and running
+        /// `the_turns_root_comes_from_the_registry_not_the_pre_claim_snapshot`
+        /// leaves it **green**, because the hazard is a `/cd` landing in the
+        /// window between them and a single-threaded test cannot force one to.
+        ///
+        /// So the ordering is asserted where it is actually visible: in the
+        /// source. That is the weaker instrument and it is named as such —
+        /// but it is the one that fails on the inversion AC-4 asks about, and
+        /// this crate already derives several guarantees this way
+        /// (`taint.rs`'s single-setter check, the `offer_or_refuse_over_budget`
+        /// call-site count below).
+        ///
+        /// A racing test was considered and rejected: it would need a wall-clock
+        /// window to be reliable, which is the assertion shape that goes flaky
+        /// first under CI scheduler pressure (LESSON-450).
+        ///
+        /// **Mutations, run and observed** (all reverted):
+        ///
+        /// | mutation | observed |
+        /// |---|---|
+        /// | swap the claim and the re-read | "the turn claim must be taken BEFORE the session registry is re-read", naming both byte offsets |
+        /// | drift the `run_prompt_turn` pattern | floor: "`run_prompt_turn` was not found" |
+        /// | drift the `try_begin_turn` pattern | floor: "the turn claim was not found inside `run_prompt_turn`" |
+        /// | drift the `let session_cwd = sessions` pattern | floor: "the registry re-read was not found" |
+        ///
+        /// The floors earned their keep immediately. On the first draft — which
+        /// scanned the whole file — **none of the three fired**, because every
+        /// pattern this test searches for also appears as a string literal in
+        /// this test, in the same file. The check was matching its own source. A
+        /// drifted pattern found itself, and the test passed while measuring
+        /// nothing. Cutting the scan at the production half fixed it; the floors
+        /// staying green under a deliberate drift is the only reason it was
+        /// noticed.
+        #[test]
+        fn the_claim_is_taken_before_the_registry_is_re_read() {
+            // The production half only — see `production_half_of_this_module`
+            // for why the cut is load-bearing rather than tidy.
+            let source = production_half_of_this_module();
+
+            // Scope to `run_prompt_turn`'s own body. Searching the whole file
+            // would find some other function's claim and re-read and compare
+            // two things that never run together.
+            let body_start = source.find("    pub async fn run_prompt_turn(").expect(
+                "vacuity floor: `run_prompt_turn` was not found — it was \
+                         renamed or moved, and this check is now measuring nothing",
+            );
+            let body = &source[body_start..];
+
+            let claim = body.find(".try_begin_turn(&session_id, &turn_id)").expect(
+                "vacuity floor: the turn claim was not found inside `run_prompt_turn`. \
+                 Either it moved out — in which case this check must follow it — or \
+                 the pattern drifted and the assertion below compares nothing.",
+            );
+            let re_read = body.find("let session_cwd = sessions").expect(
+                "vacuity floor: the registry re-read was not found inside \
+                 `run_prompt_turn`. LESSON-539 exists because the turn ran on a \
+                 stale root; if the re-read is gone, that is the regression.",
+            );
+
+            assert!(
+                claim < re_read,
+                "the turn claim must be taken BEFORE the session registry is \
+                 re-read (LESSON-539). Found the claim at byte {claim} and the \
+                 re-read at byte {re_read}, relative to `run_prompt_turn`.\n\
+                 `spawn_prompt_turn` snapshots the summary and then spawns, so a \
+                 `/cd` landing between the re-read and the claim moves the root \
+                 and clears the conversation under a turn that has already \
+                 decided where it is jailed."
+            );
+        }
+
+        /// **BR-3, invariant 3 — the mechanism that makes claiming first
+        /// sufficient.**
+        ///
+        /// Re-reading under the claim is only authoritative because
+        /// `session/set_cwd` takes the *same* claim: with a turn in flight the
+        /// move is refused outright, so no `/cd` can land between the re-read
+        /// and the end of the turn.
+        ///
+        /// A refusal on its own would be vacuous — a `set_cwd` that fails for
+        /// any reason passes it (LESSON-520). So this is a **refuse/accept
+        /// pair** on the identical call: refused while the claim is held,
+        /// accepted the moment it drops. Only the claim differs between them.
+        ///
+        /// **Mutation, run and observed** (reverted): deleting
+        /// `set_session_cwd`'s own `try_begin_turn` fails here at the *refuse*
+        /// half — "a claimed session refuses the move" — with the move having
+        /// succeeded. That is the mechanism, so it is the right thing to break.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_held_claim_refuses_the_cd_that_would_move_the_root_under_the_turn() {
+            let start = repo_with_notes("inv3-claim-start");
+            let destination = repo_with_notes("inv3-claim-destination");
+            let (runtime, _seen) = carry_runtime(&[Scripted::Say("Noted.")]);
+            let events = Arc::new(EventBus::new());
+            let (sessions, session_id) = one_session_at(&start);
+
+            let claim = sessions
+                .try_begin_turn(&session_id, &teton_protocol::TurnId::from("probe-1"))
+                .expect("the session is idle, so the claim is taken");
+
+            let refused = set_cwd(&runtime, &events, &sessions, &session_id, &destination)
+                .expect_err("a claimed session refuses the move");
+            assert!(
+                refused.message.contains("probe-1"),
+                "the refusal must name the turn that holds the session, which is \
+                 what tells a client why: {}",
+                refused.message
+            );
+            assert_eq!(
+                sessions
+                    .get(&session_id)
+                    .expect("the session still exists")
+                    .cwd
+                    .as_deref(),
+                Some(start.as_path()),
+                "a refused move must leave the root exactly as it was"
+            );
+
+            // The accept half: the same call, the same destination, the only
+            // difference being that the claim has dropped.
+            drop(claim);
+            set_cwd(&runtime, &events, &sessions, &session_id, &destination)
+                .expect("with no turn in flight the identical move is accepted");
+            assert_eq!(
+                sessions
+                    .get(&session_id)
+                    .expect("the session still exists")
+                    .cwd
+                    .as_deref(),
+                Some(destination.as_path()),
+                "the accepted move must actually land, or the refusal above \
+                 proved nothing"
+            );
+        }
     }
 
     /// REQ-586: the budget follows the route attempt.
