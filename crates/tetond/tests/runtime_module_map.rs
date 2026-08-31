@@ -58,13 +58,46 @@ fn documented_modules() -> BTreeSet<String> {
 /// The `.rs` files actually under `crates/tetond/src/runtime/`.
 fn modules_on_disk() -> BTreeSet<String> {
     let dir = workspace_root().join("crates/tetond/src/runtime");
-    std::fs::read_dir(&dir)
-        .unwrap_or_else(|err| panic!("unreadable {}: {err}", dir.display()))
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+    let mut paths = Vec::new();
+    rust_files_recursive(&dir, &mut paths);
+    // Relative to `runtime/`, not the basename. A basename collapses
+    // `runtime/nested/mod.rs` onto `runtime/mod.rs`, so a whole undocumented
+    // subtree reads as the documented root module and the map check passes over
+    // it. Found by TASK-301's nested-module fixture, which is what that fixture
+    // is for: the recursion was added and the *comparison* still could not see
+    // what recursion now found.
+    paths
+        .iter()
+        .filter_map(|p| p.strip_prefix(&dir).ok())
+        .map(|p| p.to_string_lossy().into_owned())
         .collect()
+}
+
+/// Every `.rs` file under `dir`, **recursively**.
+///
+/// A local copy, matching the pattern four sibling integration tests already
+/// use (`traceability_sweep.rs`, `recipe_window_one_home.rs`,
+/// `suppression_ratchet.rs`, `boundary_coverage.rs`): the canonical walker is
+/// `call_sites::scan::rust_files`, which is `#[cfg(test)]`-gated inside the lib
+/// and therefore unreachable from an integration test, which links the lib
+/// compiled without that cfg.
+///
+/// Recursion is the point (REQ-602 BR-4): `runtime/` is a module *tree*, and the
+/// first `runtime/foo/mod.rs` would leave a flat scan's corpus silently —
+/// LESSON-594's "a sweep sees less and passes" arriving through a directory
+/// rather than a rename.
+fn rust_files_recursive(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(listing) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in listing.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            rust_files_recursive(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
 }
 
 #[test]

@@ -3686,12 +3686,28 @@ fn production_source(relative: &str) -> String {
         .join(relative);
 
     if path.is_dir() {
-        let mut files: Vec<_> = std::fs::read_dir(&path)
-            .unwrap_or_else(|err| panic!("unreadable source dir {}: {err}", path.display()))
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-            .collect();
+        // Recursive (REQ-602 BR-4): `runtime/` is a module *tree*, so a flat
+        // read would drop the first `runtime/foo/mod.rs` out of the corpus
+        // without failing — LESSON-594's direction that does not announce
+        // itself. Local copy because the canonical walker
+        // (`call_sites::scan::rust_files`) is `#[cfg(test)]`-gated in the lib
+        // and unreachable from an integration test; four sibling tests already
+        // carry the same shape.
+        fn rust_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(listing) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in listing.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    rust_files_recursive(&p, out);
+                } else if p.extension().is_some_and(|e| e == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files: Vec<PathBuf> = Vec::new();
+        rust_files_recursive(&path, &mut files);
         files.sort();
         assert!(
             !files.is_empty(),

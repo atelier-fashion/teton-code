@@ -26183,14 +26183,17 @@ provider_id = \"deepseek\"
             // call sites move and read as "the offer is unreachable" — the
             // failure this assertion exists to catch, produced by the scan
             // rather than by the code (LESSON-585).
+            // Recursive: `runtime/` is a module *tree*, and the first
+            // `runtime/foo/mod.rs` would leave a flat scan's corpus silently
+            // (REQ-602 BR-4, LESSON-594). `call_sites::scan::rust_files` is the
+            // canonical walker — it also tolerates a directory vanishing
+            // mid-walk (BUG-159) while keeping every other error loud.
             let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime");
-            let mut modules: Vec<_> = std::fs::read_dir(&dir)
-                .expect("the runtime module directory is readable")
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-                .collect();
-            modules.sort();
+            let mut paths: Vec<std::path::PathBuf> = Vec::new();
+            crate::call_sites::scan::rust_files(&dir, &mut paths);
+            paths.sort();
+            let modules = paths;
+
             assert!(
                 !modules.is_empty(),
                 "vacuity floor: no sources under {} — the count below could only pass",
