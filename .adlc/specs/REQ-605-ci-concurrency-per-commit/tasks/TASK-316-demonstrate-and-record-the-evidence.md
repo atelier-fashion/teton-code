@@ -1,7 +1,7 @@
 ---
 id: TASK-316
 title: "Demonstrate the property on a real push sequence and record the evidence"
-status: draft
+status: complete
 parent: REQ-605
 created: 2026-08-31
 updated: 2026-08-31

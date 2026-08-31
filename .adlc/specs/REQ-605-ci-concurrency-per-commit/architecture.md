@@ -196,6 +196,11 @@ that must change. Two sibling workflows document themselves **by contrast with
 - `.github/workflows/deploy-site.yml:60` — "Unlike ci.yml, an in-flight run is
   NOT cancelled by a newer one: …"
 
+(Both line numbers are pre-change, locating the sentences this REQ found. The
+rewritten comments sit a few lines lower — `release.yml:27` and
+`deploy-site.yml:62` — because the replacements are longer than what they
+replaced.)
+
 After this change `ci.yml` also does not cancel on a newer push, so "unlike"
 is wrong. The distinction is still real but has moved: `release.yml` and
 `deploy-site.yml` **queue** same-group runs (`cancel-in-progress: false`) because

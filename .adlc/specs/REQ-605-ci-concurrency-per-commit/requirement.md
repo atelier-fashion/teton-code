@@ -14,7 +14,9 @@ tags: ["ci", "concurrency", "cancel-in-progress", "req-599-followup", "macos"]
 
 ## Description
 
-`.github/workflows/ci.yml:10-12` sets:
+`.github/workflows/ci.yml` sets — lines 10-12 on `main` as this was written; the
+block moves down the file once this REQ lands, so the citation is to the state
+being described, not to the fixed one:
 
 ```yaml
 concurrency:
@@ -42,7 +44,7 @@ detached-naming race, which passed 40/40 locally and on `ubuntu-latest`.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: Every commit **pushed as a tip** to one branch keeps a complete CI result:
+- [x] AC-1: Every commit **pushed as a tip** to one branch keeps a complete CI result:
       pushing commit *n+1* does not cancel commit *n*'s in-flight run, and both
       reach a terminal conclusion. Demonstrated on a real sequence of pushes,
       with the run ids and their conclusions recorded.
@@ -156,6 +158,18 @@ macOS `check`: 175s, 162s, 221s; completed: 184s, 226s, 179s) and destroys the
 entire macOS result. It also **skips `Post Cache cargo build`**, so the run does
 not save its cargo cache and the next run starts colder.
 
+**Corroborated on this branch — with a caveat that keeps it out of the figures.**
+R1 below (`33450647558`) is a fourth cancelled run, and it shows the identical
+step pattern: kill inside `Tests`, everything before it green, `Post Cache cargo
+build` skipped — this time on *both* `check` legs, ubuntu as well as macOS. So
+the pattern is now 4 for 4. But R1 cost **less** than the three historical runs
+(10 R / 46 W against 11–13 R / 47–67 W), because the next push came 63 seconds
+after it started — far faster than anyone actually authoring a commit. It is a
+demonstration of the mechanism, not a representative cost, so the before figures
+above stay on the three historical runs, which were cancelled at real authoring
+pace. Counting a deliberately-hurried cancellation as typical would understate
+the cost of the old behaviour and flatter this change.
+
 ### AC-3 — which behaviour is traded for which
 
 **Given up:** automatic cancellation of a *superseded* commit's run. A force-push
@@ -194,8 +208,57 @@ actionlint -color -shellcheck shellcheck .github/workflows/*.yml   # rc=0
 Clean on the baseline tree before any edit, and clean after both workflow
 commits. The `tooling` job re-runs it on every commit in this PR.
 
-### AC-1 — pending, recorded in the next commit
+### AC-1 — the property, observed on a real push sequence
 
-The push sequence is in flight as this commit lands; its run table is written in
-the following commit, once every run has reached a terminal conclusion. AC-1 is
-**not** ticked here.
+Five commits were pushed to `feat/REQ-605-ci-concurrency-per-commit` one at a
+time, each while the previous run was still in flight. In-flight status was
+**verified** with `gh run view <id> --json status` immediately before each push,
+not inferred from timing — a push made after the previous run had already
+finished proves nothing about cancellation, and would be a vacuous observation.
+
+The branch carries **both** configurations, so every run is labelled with the one
+it actually ran under. `pull_request` workflows run from the PR's merge ref, so
+the config in force for a run is the one on the branch at that commit: commits
+before `5b5af36` ran under the old ref-only group, `5b5af36` and later under the
+new per-commit group.
+
+| # | run id | commit | config | start–end (UTC) | conclusion |
+|---|---|---|---|---|---|
+| R1 | 33450647558 | `3c664a8` | old | 23:25:54–23:27:21 | **cancelled** |
+| R2 | 33450729742 | `ebe6841` | old | 23:27:02–23:30:37 | success |
+| R3 | 33450814843 | `5b5af36` | **new** | 23:28:15–23:31:53 | success |
+| R4 | 33450882606 | `8cbdb7c` | **new** | 23:29:20–23:32:32 | success |
+| R5 | 33451033687 | `a165c72` | **new** | 23:31:27–23:34:11 | success |
+
+Every consecutive pair overlapped, so every observation is live:
+
+| pair | configs | overlap | earlier run's conclusion | counts as |
+|---|---|---:|---|---|
+| R1 → R2 | old → old | 19s | **cancelled** | **before** |
+| R2 → R3 | old → **new** | 142s | success | mixed — **excluded** |
+| R3 → R4 | new → new | 153s | success | **after #1** |
+| R4 → R5 | new → new | 65s | success | **after #2** |
+
+**Before.** R1 was in flight — with `fmt · clippy · test (macos-latest)` running,
+checked before the push — when `ebe6841` was pushed, and R1 ended `cancelled`.
+The defect reproduces on demand. It took **both** `check` legs this time, ubuntu
+as well as macOS.
+
+**Mixed, and excluded rather than claimed.** R2 → R3 is *not* evidence for either
+half. R2's group was the old ref-only string and R3's the new per-commit one, so
+those two could not have collided whatever the setting. Recorded because the
+sequence contains it, counted as nothing.
+
+**After.** R3 and R4 each stayed alive through a subsequent push and reached
+`success`. R3 is the stronger case: it was still running when **both** R4
+(23:29:20) and R5 (23:31:27) started, and finished at 23:31:53 regardless. At
+23:31:27–23:31:53 three new-config runs were in flight at once — a state the old
+shared group made unreachable.
+
+**AC-1 is MET.** Not from a single-commit push, and not from the absence of a
+cancellation: from four live pairs, one of which reproduces the old behaviour and
+two of which show the new.
+
+Only R5's own successor is unrecorded — the run for the commit that writes this
+table, which cannot record its own conclusion. Its id is noted in the PR and its
+result is confirmed green before merge.
