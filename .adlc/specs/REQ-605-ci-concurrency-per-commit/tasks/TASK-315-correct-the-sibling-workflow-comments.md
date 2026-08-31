@@ -1,7 +1,7 @@
 ---
 id: TASK-315
 title: "Correct the two sibling-workflow comments that define themselves against ci.yml"
-status: draft
+status: complete
 parent: REQ-605
 created: 2026-08-31
 updated: 2026-08-31
