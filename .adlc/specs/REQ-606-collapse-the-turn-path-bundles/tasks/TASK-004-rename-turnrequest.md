@@ -1,7 +1,7 @@
 ---
 id: TASK-004
 title: "Rename the TurnRequest bundle to PromptRequest to stop it shadowing the provider type"
-status: pending
+status: complete
 parent: REQ-606
 created: 2026-09-01
 updated: 2026-09-01

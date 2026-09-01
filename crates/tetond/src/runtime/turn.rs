@@ -48,6 +48,14 @@ use super::*;
 /// and performs no I/O — the same three rules `turn_context.rs` states for
 /// `TurnContext`, and for the same reason. A type that starts answering
 /// questions becomes a second place for turn logic to live.
+///
+/// **REQ-606 — kept, Rule R (return position, three values).** This is returned
+/// rather than passed, so clippy's argument limit never reaches it and it
+/// justifies itself on width alone: at three or more heterogeneous values a
+/// named struct beats a tuple, because a tuple makes the caller's destructure
+/// positional and a transposition gets no diagnostic. `turn_id` also appears
+/// borrowed in [`PromptRequest`] and [`AttemptInputs`] — see the duplication
+/// note on [`AttemptInputs`], which covers all three occurrences.
 struct ClaimedTurn {
     /// This turn's id, minted before the claim because the claim is keyed on it.
     turn_id: teton_protocol::TurnId,
@@ -59,6 +67,12 @@ struct ClaimedTurn {
 
 /// What the harness stage produces: the turn's tools and the prompt built from
 /// them. A parameter bundle — no behaviour, no I/O, no ids.
+///
+/// **REQ-606 — kept, Rule R (return position, four values).** Returned, so the
+/// argument limit does not apply; four heterogeneous values are past the width
+/// where a tuple stays readable. `system` is lent onward to two stages and is
+/// **not** re-derived by either: REQ-606 deleted a `PreparedAttempts` field
+/// that was a clone of it (see [`DaemonRuntime::prepare_the_attempts`]).
 struct AssembledHarness {
     tools: ToolRegistry,
     tool_ctx: ToolContext,
@@ -73,6 +87,24 @@ struct AssembledHarness {
 /// struct REQ-598 ADR-1 anticipated ("if a subset of the sites turns out to
 /// want a different bundle, the answer is two small structs, not one wide
 /// one"), not a widening of the first.
+///
+/// **REQ-606 — kept, Rule A (eight fields; collapsing puts `run_attempts` at
+/// eleven arguments).** `run_attempts` takes four today. Clippy's
+/// `too_many_arguments` threshold is 7 and fires at 8, and REQ-606 AC-2 forbids
+/// the suppression that would silence it — so this is not a readability
+/// preference, it is the only shape that compiles clean. The cluster is real.
+///
+/// **The duplication of `turn_id`, `route` and `probed` is deliberate**
+/// (REQ-606 AC-1, third category). `turn_id` appears here, in [`ClaimedTurn`]
+/// and in [`PromptRequest`]; `route` in [`ResolvedRoute`], [`TurnProducts`],
+/// [`AttemptState`] and [`ExpansionInputs`]; `probed` in [`ClaimedTurn`],
+/// [`SessionFacts`] and [`ExpansionInputs`]. Each occurrence is the **same
+/// value at a different ownership stage** — minted or produced once, lent to
+/// the stages that read it, owned by whatever outlives them. Rust cannot spell
+/// "the same value, borrowed here and owned there" in one type, so the
+/// repetition is what the borrow checker costs, not a second source of truth.
+/// `route` is the one to watch: it is *reassigned* by the reroute arms, which
+/// is why [`AttemptState`] owns it and every other bundle borrows it.
 #[derive(Clone, Copy)]
 struct AttemptInputs<'a> {
     turn_id: &'a teton_protocol::TurnId,
@@ -96,6 +128,14 @@ struct AttemptInputs<'a> {
 /// `run_prompt_turn` owns the value and lends it, so the fields survive the
 /// loop: the commit protocol below reads `conversation` and `route` after the
 /// last attempt has returned.
+///
+/// **REQ-606 — kept, Rule I (carries an invariant).** Not a signature-width
+/// device. This is the mutable state of one turn's attempt loop, `&mut`-lent
+/// across iterations and then *moved* into `commit_or_abandon`, and the type is
+/// what keeps that state in one place rather than in a row of out-parameters
+/// that each ending would have to remember to update. Collapsing it would also
+/// put `run_attempts` at ten arguments, but the invariant is the reason and the
+/// arithmetic is only the confirmation.
 struct AttemptState {
     attempts: u32,
     rerouted_local: bool,
@@ -112,24 +152,17 @@ struct AttemptState {
 /// and that is the invariant, not an inconvenience: `TurnContext::new` must run
 /// after the warming hold rebinds `router` (REQ-598 BR-2.1), and every field
 /// here is settled before that point.
+///
+/// **REQ-606 — kept, Rule R (return position, five values).** Returned, so the
+/// argument limit does not reach it; five is well past the width at which a
+/// tuple stays readable. The pre-pivot invariant in the paragraph above is the
+/// stronger reason and stands on its own.
 struct ResolvedRoute {
     skills: Arc<SkillRegistry>,
     skill_turn: Option<SkillTurn>,
     routed_text: String,
     router: Router,
     route: crate::router::Route,
-}
-
-/// What [`DaemonRuntime::prepare_the_attempts`] hands the loop.
-///
-/// The loop's carried state, plus the two facts the refit arms read and never
-/// change. They are produced together because they are derived from the same
-/// expansion decision, and separating them would make a caller re-derive one
-/// from the other.
-struct PreparedAttempts {
-    state: AttemptState,
-    refit_system: String,
-    typed_refit: usize,
 }
 
 /// The session facts that are settled before routing begins.
@@ -139,6 +172,19 @@ struct PreparedAttempts {
 /// `too_many_arguments` suppression is a new unnamed parameter cluster; name it
 /// instead." It was right — these six travel together everywhere before the
 /// pivot, which is the definition of a cluster.
+///
+/// **REQ-606 — kept, Rule A, and the arithmetic is the loudest of the set.**
+/// `resolve_the_route` takes four arguments. Collapsing this bundle alone puts
+/// it at nine; collapsing it *together with* [`PromptRequest`], which is the
+/// only way to remove the "which spelling is in force" complaint the REQ-606
+/// spec raises, puts it at **fourteen**. That is why REQ-600 split them into
+/// two rather than widening one, and re-measuring has not changed the answer.
+///
+/// The six are also **not** a re-spelling of `TurnContext` that could be
+/// deleted: no `TurnContext` exists at this point in the turn. `TurnContext::new`
+/// must run after the warming hold rebinds `router` (REQ-598 BR-2.1 / ADR-3),
+/// and every field here is settled before that. The duplication is real, it is
+/// deliberate, and this is its reason.
 #[derive(Clone, Copy)]
 struct SessionFacts<'a> {
     events: &'a Arc<EventBus>,
@@ -154,8 +200,20 @@ struct SessionFacts<'a> {
 /// Separate from [`SessionFacts`] because the split is real: everything here
 /// arrived on the wire with this one request, and everything there belongs to
 /// the session and outlives it.
+///
+/// **REQ-606 — kept, Rule A (six fields; collapsing puts `resolve_the_route` at
+/// nine arguments, or fourteen together with [`SessionFacts`]).**
+///
+/// **Renamed from `TurnRequest`, on a defect found while classifying.** This
+/// module opens `use super::*;`, and `runtime/mod.rs` imports
+/// `teton_providers::TurnRequest` — the provider-facing request type. A locally
+/// declared item shadows a glob import **silently**: no warning, no error. So
+/// inside the turn path `TurnRequest` meant this six-field bundle and the
+/// provider type was unreachable by its own name. `PromptRequest` is also the
+/// more accurate name — a "turn request" is what goes *to a provider*, and this
+/// is what one prompt asked for.
 #[derive(Clone, Copy)]
-struct TurnRequest<'a> {
+struct PromptRequest<'a> {
     turn_id: &'a teton_protocol::TurnId,
     prompt: &'a str,
     skill: Option<&'a SkillInvocation>,
@@ -169,6 +227,12 @@ struct TurnRequest<'a> {
 /// Named rather than suppressed: `suppression_ratchet.rs` treats a new
 /// `too_many_arguments` allow as a new unnamed parameter cluster, and it is
 /// right that these five travel together.
+///
+/// **REQ-606 — kept, Rule A, and it is the narrowest margin in the set.**
+/// `settle_expansion` takes four arguments; collapsing this puts it at
+/// **eight**, one over the threshold that fires at 8. One field short of
+/// collapsible is still not collapsible, and AC-2 forbids buying the difference
+/// with a suppression.
 #[derive(Clone, Copy)]
 struct ExpansionInputs<'a> {
     sessions: &'a SessionRegistry,
@@ -179,6 +243,24 @@ struct ExpansionInputs<'a> {
 }
 
 /// What the routing and expansion stages produced, moved into the loop.
+///
+/// **REQ-606 — kept, Rule A, and this row refutes the prediction that filed the
+/// REQ.** REQ-606's Description calls this one transport: "named as an output
+/// but is an *input* bundle, built from four loose locals at the call site and
+/// destructured on the callee's first line." Both halves are true and the
+/// conclusion does not follow.
+///
+/// `prepare_the_attempts` takes six arguments. Collapsing these four puts it at
+/// **nine**. The best available reduction — passing `TurnContext` and taking
+/// `session_id` and `config` off it, the move `assemble_harness` already makes
+/// — reaches **eight**, still over a threshold that fires at 8. So the cluster
+/// is real and the bundle earns its name, which is the outcome REQ-606's
+/// Assumptions anticipated for exactly this case.
+///
+/// The name is the half of the complaint that was right, and it is left alone
+/// deliberately: these *are* the products of the routing and expansion stages,
+/// named from where they come rather than where they go, and renaming it to
+/// suit the callee would make the two producing stages harder to trace.
 struct TurnProducts {
     route: crate::router::Route,
     skill_turn: Option<SkillTurn>,
@@ -311,7 +393,7 @@ impl DaemonRuntime {
                     gate: &gate,
                     probed: &probed,
                 },
-                TurnRequest {
+                PromptRequest {
                     turn_id: &turn_id,
                     prompt: &prompt,
                     skill: skill.as_ref(),
@@ -369,11 +451,7 @@ impl DaemonRuntime {
                 &mut skill_turn,
             )
             .await?;
-        let PreparedAttempts {
-            state: mut st,
-            refit_system,
-            typed_refit,
-        } = self.prepare_the_attempts(
+        let (mut st, typed_refit) = self.prepare_the_attempts(
             sessions,
             &session_id,
             &config,
@@ -422,7 +500,8 @@ impl DaemonRuntime {
                     tools: &tools,
                     tool_ctx: &tool_ctx,
                     stream_events: &stream_events,
-                    refit_system: &refit_system,
+                    // `system` itself — see `prepare_the_attempts` (REQ-606).
+                    refit_system: &system,
                     typed_refit,
                     prompt_spend: prompt_spend.as_ref(),
                 },
@@ -519,7 +598,7 @@ impl DaemonRuntime {
     async fn resolve_the_route(
         self: &Arc<Self>,
         facts: SessionFacts<'_>,
-        request: TurnRequest<'_>,
+        request: PromptRequest<'_>,
         presence: &mut ClientPresence,
     ) -> Result<ResolvedRoute, RpcError> {
         let SessionFacts {
@@ -530,7 +609,7 @@ impl DaemonRuntime {
             gate,
             probed,
         } = facts;
-        let TurnRequest {
+        let PromptRequest {
             turn_id,
             prompt,
             skill,
@@ -1101,6 +1180,14 @@ impl DaemonRuntime {
     /// The last thing before the loop. `CarriedTurn::begin` pushes the user
     /// block and arms the guard, so nothing here may fail afterwards without
     /// the commit protocol below deciding what to do about it.
+    ///
+    /// **Returns a pair rather than a `PreparedAttempts` (REQ-606).** That
+    /// bundle had three fields and one of them was a round-trip: it took
+    /// `system: &str`, cloned it as `refit_system`, and returned the clone to a
+    /// caller that still held the original unmutated. Deleting the field left
+    /// two values, where a tuple is the idiomatic shape and the binding names at
+    /// the one call site carry the meaning. It also removes a `String`
+    /// allocation from every turn.
     fn prepare_the_attempts(
         self: &Arc<Self>,
         sessions: &SessionRegistry,
@@ -1108,17 +1195,16 @@ impl DaemonRuntime {
         config: &Config,
         system: &str,
         products: TurnProducts,
-    ) -> PreparedAttempts {
+    ) -> (AttemptState, usize) {
         let TurnProducts {
             route,
             skill_turn,
             prompt,
             accepted,
         } = products;
-        let refit_system = system.to_owned();
         let skill_refit: Vec<(String, String, String)> = skill_turn
             .as_ref()
-            .map(|skill| (skill.name.clone(), skill.text.clone(), refit_system.clone()))
+            .map(|skill| (skill.name.clone(), skill.text.clone(), system.to_owned()))
             .into_iter()
             .collect();
         // Where the typed seed ends and the loop's own expansions begin, so a
@@ -1173,11 +1259,7 @@ impl DaemonRuntime {
             route,
         };
 
-        PreparedAttempts {
-            state: st,
-            refit_system,
-            typed_refit,
-        }
+        (st, typed_refit)
     }
 
     /// **Stage — the attempt loop.**

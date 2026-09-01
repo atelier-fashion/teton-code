@@ -1,7 +1,7 @@
 ---
 id: TASK-003
 title: "Narrow ToolCallSite to the three fields not already inside call"
-status: pending
+status: complete
 parent: REQ-606
 created: 2026-09-01
 updated: 2026-09-01

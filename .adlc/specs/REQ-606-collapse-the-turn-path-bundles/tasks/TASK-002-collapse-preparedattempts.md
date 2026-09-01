@@ -1,7 +1,7 @@
 ---
 id: TASK-002
 title: "Collapse PreparedAttempts and delete the refit_system round-trip"
-status: pending
+status: complete
 parent: REQ-606
 created: 2026-09-01
 updated: 2026-09-01

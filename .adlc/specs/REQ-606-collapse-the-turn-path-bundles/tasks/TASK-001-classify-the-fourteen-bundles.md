@@ -1,7 +1,7 @@
 ---
 id: TASK-001
 title: "Classify all fourteen bundles and write each stated reason into its doc"
-status: pending
+status: complete
 parent: REQ-606
 created: 2026-09-01
 updated: 2026-09-01
