@@ -803,10 +803,8 @@ mod tests {
         );
 
         // Gained: exactly the one name.
-        let gained: Vec<(&String, &String)> = on
-            .iter()
-            .filter(|(k, v)| off.get(*k) != Some(*v))
-            .collect();
+        let gained: Vec<(&String, &String)> =
+            on.iter().filter(|(k, v)| off.get(*k) != Some(*v)).collect();
         assert_eq!(
             gained.len(),
             1,
@@ -818,10 +816,8 @@ mod tests {
         // Lost: nothing. An opt-in that *removed* an entry while adding one
         // would keep a naive count at one, and this is the direction that
         // catches it.
-        let lost: Vec<(&String, &String)> = off
-            .iter()
-            .filter(|(k, v)| on.get(*k) != Some(*v))
-            .collect();
+        let lost: Vec<(&String, &String)> =
+            off.iter().filter(|(k, v)| on.get(*k) != Some(*v)).collect();
         assert!(
             lost.is_empty(),
             "the opt-in removed or altered entries it should have left alone: {lost:?}"
@@ -876,12 +872,8 @@ mod tests {
         // Leg 2: the direct conflict.
         let mut collision = BTreeSet::new();
         collision.insert(SSH_AUTH_SOCK.to_owned());
-        let composed = compose_child_env(
-            daemon,
-            &shell_env_allow(true),
-            &collision,
-            &BTreeMap::new(),
-        );
+        let composed =
+            compose_child_env(daemon, &shell_env_allow(true), &collision, &BTreeMap::new());
         assert!(
             value_of(&composed, SSH_AUTH_SOCK).is_none(),
             "allow_ssh_agent reached around REQ-596 BR-3's unconditional removal — a user \
@@ -971,7 +963,9 @@ mod tests {
             + start;
         let table = &source[start..end];
 
-        let rows = table.lines().filter(|l| l.trim_start().starts_with("/// |"));
+        let rows = table
+            .lines()
+            .filter(|l| l.trim_start().starts_with("/// |"));
         assert!(
             rows.count() >= 5,
             "the bounded slice found fewer rejection-table rows than the table is known to \

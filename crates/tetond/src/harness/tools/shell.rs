@@ -1105,7 +1105,10 @@ mod tests {
             ["cd", "ssh"]
         );
         // A leading environment assignment is not the program.
-        assert_eq!(command_position_programs("GIT_SSH_TIMEOUT=5 git push"), ["git"]);
+        assert_eq!(
+            command_position_programs("GIT_SSH_TIMEOUT=5 git push"),
+            ["git"]
+        );
         // But a *quoted* assignment value is a documented false negative: the
         // matcher does not know shell quoting, so it declines to skip a word it
         // has only half seen rather than advancing onto a fragment. The answer
@@ -1119,7 +1122,10 @@ mod tests {
         assert_eq!(command_position_programs("echo \"no ssh here\""), ["echo"]);
         assert_eq!(command_position_programs("grep -r ssh ."), ["grep"]);
         // A command substitution *is* a command position, and is seen.
-        assert_eq!(command_position_programs("echo $(ssh host)"), ["echo", "ssh"]);
+        assert_eq!(
+            command_position_programs("echo $(ssh host)"),
+            ["echo", "ssh"]
+        );
     }
 
     /// The advisory names the program that **matched**, not the first one in the

@@ -114,7 +114,10 @@ impl ScriptedSseTransport {
 
 #[async_trait]
 impl Transport for ScriptedSseTransport {
-    async fn execute(&self, _request: TransportRequest) -> Result<TransportResponse, TransportError> {
+    async fn execute(
+        &self,
+        _request: TransportRequest,
+    ) -> Result<TransportResponse, TransportError> {
         let body = self
             .bodies
             .lock()
@@ -207,7 +210,9 @@ async fn collect_events(
 ///
 /// Returns `(events, transcript)` where `transcript` is the assembled context
 /// after the turn — the tool result the model was actually shown.
-async fn run_failing_shell_turn(session: &str) -> (Vec<teton_protocol::events::EventEnvelope>, String) {
+async fn run_failing_shell_turn(
+    session: &str,
+) -> (Vec<teton_protocol::events::EventEnvelope>, String) {
     let repo = temp_repo();
 
     let bodies = vec![
