@@ -1,5 +1,5 @@
 ---
-id: REQ-601
+id: REQ-607
 title: "A withheld variable should not look like an ssh problem, and the agent should be opt-in-able"
 status: draft
 deployable: true

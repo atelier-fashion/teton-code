@@ -309,7 +309,7 @@ break the claims found the claims that were breakable.
   god-impl, `turn_loop.rs`'s nesting. This REQ makes that work easier and does
   not start it.
 - Further module extraction beyond the stranded session-lifecycle slice (AC-8).
-- The `extra_env` and ssh-agent questions — those are REQ-601.
+- The `extra_env` and ssh-agent questions — those are REQ-607.
 
 ## Retrieved Context
 
