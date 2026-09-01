@@ -1,7 +1,7 @@
 ---
 id: REQ-603
 title: "Extract the session-lifecycle slice REQ-599 planned and never shipped"
-status: approved
+status: complete
 deployable: false
 created: 2026-08-31
 updated: 2026-08-31
