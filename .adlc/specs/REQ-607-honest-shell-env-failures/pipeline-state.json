@@ -3,10 +3,11 @@
   "branch": "feat/REQ-607-honest-shell-env-failures",
   "startedAt": "2026-08-31T00:00:00Z",
   "completed": false,
-  "currentPhase": 2,
+  "currentPhase": 3,
   "completedPhases": [
     0,
-    1
+    1,
+    2
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -20,6 +21,12 @@
       "name": "Validate Spec",
       "completedAt": "2026-08-31T00:00:00Z",
       "result": "APPROVED after 1 fix loop"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Tasks",
+      "completedAt": "2026-08-31T00:00:00Z",
+      "result": "5 ADRs, TASK-350..355"
     }
   ],
   "repos": {

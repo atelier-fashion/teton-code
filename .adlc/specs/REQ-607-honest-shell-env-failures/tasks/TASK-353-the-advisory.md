@@ -60,6 +60,7 @@ Also switch the shell call site from `SHELL_ENV_ALLOW` to
 | rule | kind | artifact | benign_path |
 |---|---|---|---|
 | BR-1 | test-case | `crates/tetond/src/harness/tools/shell.rs` — `a_failing_ssh_command_names_teton_and_the_key_that_admits_the_agent` | no |
+| BR-1 | test-case | `crates/tetond/src/harness/tools/shell.rs` — `an_unrelated_failure_carries_no_advisory` | yes |
 | BR-2 | test-case | `crates/tetond/src/harness/tools/shell.rs` — `an_unrelated_failure_carries_no_advisory` | yes |
 | BR-2 | test-case | `crates/tetond/src/harness/tools/shell.rs` — `a_successful_command_carries_no_advisory` | yes |
 | AC-1 | test-case | `crates/tetond/src/harness/tools/shell.rs` — `a_failing_ssh_command_names_teton_and_the_key_that_admits_the_agent` | no |

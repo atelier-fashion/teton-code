@@ -58,6 +58,7 @@ moment this PR merges. Update it.
 |---|---|---|---|
 | BR-3 | test-case | `crates/tetond/tests/shell_env_advisory.rs` — `the_advisory_rides_the_tool_result_and_no_event_describes_the_withheld_set` | no |
 | BR-4 | test-case | `crates/tetond/tests/shell_env_advisory.rs` — `the_advisory_names_no_variable_read_from_the_live_environment` | no |
+| BR-4 | test-case | `crates/tetond/src/harness/tools/shell.rs` — `a_failing_ssh_command_names_teton_and_the_key_that_admits_the_agent` | yes |
 | AC-4 | test-case | `crates/tetond/tests/shell_env_advisory.rs` — `the_advisory_rides_the_tool_result_and_no_event_describes_the_withheld_set` | no |
 | AC-5 | test-case | `crates/tetond/tests/shell_env_advisory.rs` — `the_advisory_names_no_variable_read_from_the_live_environment` | no |
 | AC-13 | structural-check | `.adlc/specs/REQ-596-credential-safe-shell-environment/requirement.md` — BR-5 amendment + Status bullet | no |
@@ -80,6 +81,12 @@ Note the one structural fact that makes AC-4 satisfiable at all, in the doc
 comment: `SessionUpdatePayload::ToolCall` carries a `title` and
 `ToolCallUpdate` carries only a status — **no event carries tool result
 content**. If that ever changes, this test is the thing that should notice.
+
+**BR-4's benign path is the row above marked `yes`, and it is not ceremony.** BR-4
+is a rule about what may *not* be named; validated only against forbidden names,
+an implementation that names nothing at all would pass every one of its
+assertions and fail BR-1 silently. AC-1's test is the case where the rule
+*permits* naming, and it is what stops that.
 
 `.adlc/` edits do not need to be a separate commit from the test, but the
 architecture.md bullet should be worded exactly as this REQ's `architecture.md`
