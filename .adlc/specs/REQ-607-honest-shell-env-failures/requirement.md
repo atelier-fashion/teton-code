@@ -1,7 +1,7 @@
 ---
 id: REQ-607
 title: "A withheld variable should not look like an ssh problem, and the agent should be opt-in-able"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-31
 updated: 2026-09-01
