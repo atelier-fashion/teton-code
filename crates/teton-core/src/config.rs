@@ -841,6 +841,59 @@ impl SkillsConfig {
     }
 }
 
+/// What the `shell` tool's child is allowed beyond the default (the `[shell]`
+/// table, REQ-607).
+///
+/// # One key, and why it is not a list
+///
+/// REQ-596 gave the `shell` child a twelve-name positive allowlist and recorded
+/// its rejections. One of them — `SSH_AUTH_SOCK` — is the rejection users
+/// actually feel, because a `git push` over ssh needs it. This table is the one
+/// way to get it back, and it is deliberately **not** the general
+/// `[shell] extra_env = [...]` that REQ-596's OQ-2 left open: a list lets a user
+/// admit a name holding a bare-token secret the daemon was never told about,
+/// which is the class REQ-596 closed. A `bool` cannot express that.
+///
+/// The shape is BUG-202's, mirrored rather than reinvented (LESSON-578): a
+/// secure default plus one explicit, greppable key beats both a permissive
+/// default and a heuristic that guesses when the agent is wanted. Nothing in
+/// this daemon reads the environment, the command text, or a prior failure to
+/// decide — the key is the only input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ShellConfig {
+    /// Admit `SSH_AUTH_SOCK` to the `shell` tool's child environment
+    /// (REQ-607 BR-5).
+    ///
+    /// **Defaults to `false`**, and the default is the whole security posture:
+    /// the variable is a handle to an agent that *lends* credentials, so
+    /// admitting it grants every model-issued command the ability to
+    /// authenticate as the user, to any host, for the life of that command.
+    /// REQ-596 weighed that and withheld it; this key does not overturn the
+    /// judgement, it makes the consequence escapable by someone who has read it.
+    ///
+    /// It admits that one name and nothing else, and it reaches the `shell`
+    /// path only. A spawned MCP server's environment is composed from
+    /// `MCP_BASE_ENV_ALLOW` and never consults this (REQ-596 BR-7.1,
+    /// REQ-607 BR-7) — turning the agent on for a command you are watching must
+    /// not turn it on for a third-party `npx` package you are not.
+    ///
+    /// Serialized unconditionally within the table (no `skip_serializing_if`),
+    /// like [`PrivacyConfig::redact`]: a config that names `[shell]` at all
+    /// states its posture rather than leaving it to be inferred.
+    #[serde(default)]
+    pub allow_ssh_agent: bool,
+}
+
+impl ShellConfig {
+    /// Whether every field still holds its default, used to keep the `[shell]`
+    /// table out of a config that never opted in — the same treatment
+    /// [`PrivacyConfig::is_unset`] gives `[privacy]`.
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Top-level configuration document.
 ///
 /// Field order matters for TOML serialization: the scalar `pinned_local_model`
@@ -920,6 +973,12 @@ pub struct Config {
     /// TOML-ordering reason above.
     #[serde(default, skip_serializing_if = "SkillsConfig::is_unset")]
     pub skills: SkillsConfig,
+    /// What the `shell` tool's child may inherit beyond REQ-596's twelve
+    /// (`[shell]`, REQ-607). Absent means `allow_ssh_agent = false` — the
+    /// default REQ-596 shipped, unchanged. Declared here among the tables,
+    /// before the array-of-table fields, for the TOML-ordering reason above.
+    #[serde(default, skip_serializing_if = "ShellConfig::is_unset")]
+    pub shell: ShellConfig,
     /// Registered providers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ModelProvider>,
@@ -3220,6 +3279,10 @@ effort_ladder = []
             // acknowledged), so the round trip proves `[skills]` stays out of a
             // config that never trusted a repository.
             skills: SkillsConfig::default(),
+            // REQ-607: likewise the shipped default (the ssh agent withheld),
+            // so the round trip proves `[shell]` stays out of a config that
+            // never opted in.
+            shell: ShellConfig::default(),
             providers: vec![
                 ModelProvider {
                     id: "local".to_owned(),
@@ -5318,6 +5381,70 @@ cache_ttl_secs = 60
         assert_eq!(
             Config::from_toml(&written).expect("deserialize").web,
             WebConfig::default()
+        );
+    }
+
+    /// REQ-607 BR-8 — the default is `false`, and the default is the security
+    /// posture. `SSH_AUTH_SOCK` is a handle to an agent that lends credentials,
+    /// so a machine that has not opted in must not hand it to a model-issued
+    /// command. REQ-596 decided that; this asserts REQ-607 did not quietly
+    /// undo it while adding the escape hatch.
+    #[test]
+    fn shell_config_defaults_to_withholding_the_agent() {
+        assert!(
+            !Config::default().shell.allow_ssh_agent,
+            "the shipped default admitted the ssh agent"
+        );
+        assert!(ShellConfig::default().is_unset());
+        // A config that says nothing about `[shell]` gets the same answer as
+        // one that does not exist — the absence is not a third state.
+        let quiet = Config::from_toml("").expect("an empty config parses");
+        assert!(!quiet.shell.allow_ssh_agent);
+    }
+
+    /// REQ-607 BR-5 / BR-6 — the opt-in is **one boolean key**, not a list.
+    ///
+    /// This is the shape assertion, and it is the one that keeps
+    /// `allow_ssh_agent` from becoming the general `[shell] extra_env` REQ-596's
+    /// OQ-2 left open and this REQ's Out of Scope refuses. A list lets a user
+    /// admit a name holding a bare-token secret the daemon was never told
+    /// about — the class REQ-596 closed — and a `bool` cannot express it.
+    ///
+    /// Asserted through TOML rather than on the Rust type, because the wire
+    /// form is what a user actually writes: a field widened to `Vec<String>`
+    /// would still compile and still be one field, but this test's
+    /// `allow_ssh_agent = true` would stop parsing.
+    #[test]
+    fn shell_config_carries_one_boolean_key() {
+        let cfg = Config::from_toml("[shell]\nallow_ssh_agent = true\n")
+            .expect("the boolean spelling is the one the key accepts");
+        assert!(cfg.shell.allow_ssh_agent);
+
+        // A list is not a spelling of this key. If this ever starts parsing,
+        // the escape hatch has been widened and BR-5's "and nothing else" is
+        // no longer true.
+        assert!(
+            Config::from_toml("[shell]\nallow_ssh_agent = [\"SSH_AUTH_SOCK\"]\n").is_err(),
+            "a list parsed as the opt-in — the key has become an extra_env"
+        );
+
+        // Round-trip: a written-out `[shell]` states its posture, and a config
+        // that never opted in does not grow the table.
+        let toml_text = cfg.to_toml().expect("serialize");
+        assert!(toml_text.contains("[shell]"), "toml: {toml_text}");
+        assert!(
+            toml_text.contains("allow_ssh_agent = true"),
+            "toml: {toml_text}"
+        );
+        assert_eq!(
+            Config::from_toml(&toml_text).expect("deserialize"),
+            cfg,
+            "round-trip mismatch; toml was:\n{toml_text}"
+        );
+        let written = Config::default().to_toml().expect("serialize");
+        assert!(
+            !written.contains("[shell]"),
+            "an unset opt-in was written into the user's config: {written}"
         );
     }
 
