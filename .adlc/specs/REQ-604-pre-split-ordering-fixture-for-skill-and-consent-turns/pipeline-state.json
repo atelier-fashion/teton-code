@@ -3,10 +3,38 @@
   "branch": "feat/REQ-604-pre-split-ordering-fixture-for-skill-and-consent-turns",
   "startedAt": "2026-08-31T00:00:00Z",
   "completed": false,
-  "currentPhase": 0,
-  "completedPhases": [],
+  "currentPhase": 4,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3
+  ],
   "integrationBranch": "main",
-  "phaseHistory": [],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree + Preflight",
+      "completedAt": "2026-09-01T00:02:36.703659Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-09-01T00:03:41.475307Z",
+      "result": "APPROVED"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Tasks",
+      "completedAt": "2026-09-01T00:09:07.962912Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-09-01T00:09:07.962912Z",
+      "result": "APPROVED"
+    }
+  ],
   "repos": {
     "teton-code": {
       "primary": true,
@@ -14,15 +42,21 @@
       "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-604",
       "branch": "feat/REQ-604-pre-split-ordering-fixture-for-skill-and-consent-turns",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/258",
+      "prNumber": 258,
       "merged": false,
       "snapshotBranch": null,
       "snapshotPR": null
     }
   },
-  "mergeOrder": ["teton-code"],
-  "phase4": { "currentTask": null, "completedTasks": [], "failedTasks": [] },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  },
   "notes": [
     "Sprint override: merge ownership belongs to the /sprint orchestrator (cluster REQ-603 -> REQ-604 -> REQ-606). This runner stops after Phase 7 and reports pr-ready."
   ],
