@@ -1135,6 +1135,12 @@ pub async fn run_session_turn_with_source(
 /// already carries a `#[allow(clippy::too_many_arguments)]`, and
 /// `suppression_ratchet.rs` treats a *new* one as a new unnamed cluster. The
 /// helpers below take this instead, so flattening the loop adds no suppression.
+///
+/// **REQ-606 — kept, Rule A (six fields).** Collapsing puts `serve_tool_call`
+/// at ten arguments and `run_the_allowed_tool` at nine, against a
+/// `too_many_arguments` threshold that fires at 8 — and REQ-606 AC-2 forbids
+/// the suppression. The cluster is also genuine on its own terms: these six are
+/// the facts *every* iteration is served with, unchanged across all of them.
 #[derive(Clone, Copy)]
 struct LoopContext<'a> {
     tools: &'a ToolRegistry,
@@ -1146,11 +1152,31 @@ struct LoopContext<'a> {
 }
 
 /// The one tool call this iteration is serving.
+///
+/// **REQ-606 — narrowed from five fields to three.** It used to carry `name`
+/// and `arguments` beside `call`, whose [`ToolCall`] was built two statements
+/// earlier from `name.clone()` and `arguments.clone()`. Neither was rebound in
+/// between, so both were already reachable *through* `call` — duplication with
+/// no reason, which is the one thing REQ-606 AC-1 does not let a field keep.
+/// `run_the_allowed_tool` re-derives the two locals at the top, at the same
+/// types the destructure produced before, so no use site below changed.
+///
+/// **The full collapse is refused, and recorded as a finding** (REQ-606
+/// `architecture.md`). REQ-606's Description calls this "a borrowed
+/// re-projection of [`ModelReply`]" and proposes deleting it. It *is* a
+/// re-projection, and the re-projection is what the ownership transition costs:
+/// `serve_tool_call` **moves** `text` out of the reply to build the pushed
+/// block, so no whole `&ModelReply` survives to lend, and keeping one would
+/// cost a `String` clone on every tool call. Destructuring through a reference
+/// instead rebinds `name` as `&String` and `dropped_calls` as `&u32`, rippling
+/// deref changes through a 956-line body on a REQ whose AC-4 is "behaviour
+/// unchanged".
 #[derive(Clone, Copy)]
 struct ToolCallSite<'a> {
+    /// The call being served. **Also the source of `name` and `arguments`** —
+    /// `run_the_allowed_tool` reads them off this rather than being handed
+    /// second copies (REQ-606).
     call: &'a ToolCall,
-    name: &'a str,
-    arguments: &'a serde_json::Value,
     request: &'a str,
     /// How many *additional* calls the model's reply carried and this turn
     /// dropped — appended to whatever the tool says back.
@@ -1158,6 +1184,10 @@ struct ToolCallSite<'a> {
 }
 
 /// What one model reply produced, for the iteration that serves it.
+///
+/// **REQ-606 — kept, Rule A (seven fields; collapsing puts `serve_tool_call` at
+/// eleven arguments).** This is the cluster [`ToolCallSite`] was re-projecting,
+/// and it is the one of the two that is real.
 struct ModelReply<'a> {
     name: String,
     arguments: serde_json::Value,
@@ -1173,6 +1203,14 @@ struct ModelReply<'a> {
 }
 
 /// The latches one turn carries across its iterations.
+///
+/// **REQ-606 — kept, Rule I (carries an invariant), and it is the one keep that
+/// Rule R's width test would have collapsed.** At two fields the width rule says
+/// "tuple"; it is overruled here, on a stated reason. These are two `bool`s
+/// passed by `&mut`. As two arguments they are **silently transposable** — a
+/// call site that swaps them compiles, runs, and latches the wrong thing. As a
+/// struct they cannot be. Two same-typed out-parameters are the shape that
+/// earns a name even when the count does not demand one.
 struct TurnLatches {
     edited: bool,
     verified: bool,
@@ -1296,9 +1334,11 @@ async fn serve_tool_call(
                     duties,
                 },
                 ToolCallSite {
+                    // REQ-606: `name` and `arguments` are not passed beside
+                    // `call` — it was built from `name.clone()` and
+                    // `arguments.clone()` above and neither has been rebound
+                    // since, so the callee reads them off it.
                     call: &call,
-                    name: &name,
-                    arguments: &arguments,
                     request,
                     dropped_calls,
                 },
@@ -1337,11 +1377,14 @@ async fn run_the_allowed_tool(
     } = lc;
     let ToolCallSite {
         call,
-        name,
-        arguments,
         request,
         dropped_calls,
     } = site;
+    // REQ-606: re-derived from `call` rather than handed as second copies —
+    // `ToolCall` was built from clones of exactly these two, unrebound. Bound to
+    // the same types the five-field destructure produced (`&str` and
+    // `&serde_json::Value`) so the body below is untouched.
+    let (name, arguments) = (call.name.as_str(), &call.arguments);
     // ── REQ-587 BR-7 / ADR-2: Stage A ────────────────────
     //
     // **Here, and not in the tool.** `build_tools` runs
