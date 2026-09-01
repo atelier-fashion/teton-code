@@ -1,7 +1,7 @@
 ---
 id: TASK-318
 title: "Verify the move and record the before/after measurement with its counting rule"
-status: draft
+status: complete
 parent: REQ-603
 created: 2026-08-31
 updated: 2026-08-31
