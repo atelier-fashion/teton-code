@@ -3,7 +3,7 @@
   "branch": "feat/REQ-606-collapse-the-turn-path-bundles",
   "startedAt": "2026-09-01T00:02:06Z",
   "completed": false,
-  "currentPhase": 7,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
@@ -11,7 +11,8 @@
     3,
     4,
     5,
-    6
+    6,
+    7
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -49,6 +50,11 @@
       "phase": 6,
       "name": "Create PR",
       "completedAt": "2026-09-01T01:40:00Z"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-09-01T01:55:00Z"
     }
   ],
   "repos": {
@@ -81,6 +87,9 @@
   },
   "notes": [
     "Sprint overlap cluster {REQ-603, REQ-604, REQ-606}; REQ-606 is third. Orchestrator owns the merge \u2014 this runner stops at pr-ready per dispatch override.",
-    "AC-4 two of three: invariant 1 (typed-outcome arms before the generic remote arm) is NOT pinned \u2014 deleting the spend-ceiling arm leaves all 4,074 tests green. Pre-existing; arms byte-identical to origin/main. Needs its own REQ."
+    "AC-4 two of three: invariant 1 (typed-outcome arms before the generic remote arm) is NOT pinned \u2014 deleting the spend-ceiling arm leaves all 4,074 tests green. Pre-existing; arms byte-identical to origin/main. Needs its own REQ.",
+    "TERMINAL: pr-ready. Dispatch override \u2014 REQ-606 is THIRD in overlap cluster {603,604,606}; the ORCHESTRATOR owns the merge AND the Step 8b close-out (/wrapup, worktree teardown, completed:true). Exiting completed:false deliberately, not abandoned.",
+    "PR #257 OPEN / MERGEABLE / CLEAN, all 7 CI checks green incl. macos-latest and ubuntu-latest, at d935610 rebased onto origin/main 391091a.",
+    "OWED AFTER FINAL REBASE (architecture.md ADR-2): re-run the five invariant mutations once rebased onto REQ-603 and REQ-604. REQ-603 relocates session-lifecycle code out of runtime/mod.rs, where four of the five guards live and read the turn path by source scan. The current evidence was taken at 391091a (a spec-only commit), so it is valid for this tree but NOT for the post-603 tree."
   ]
 }
