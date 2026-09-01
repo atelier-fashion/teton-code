@@ -3,9 +3,10 @@
   "branch": "feat/REQ-607-honest-shell-env-failures",
   "startedAt": "2026-08-31T00:00:00Z",
   "completed": false,
-  "currentPhase": 1,
+  "currentPhase": 2,
   "completedPhases": [
-    0
+    0,
+    1
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -13,6 +14,12 @@
       "phase": 0,
       "name": "Create Worktree + Preflight",
       "completedAt": "2026-08-31T00:00:00Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-08-31T00:00:00Z",
+      "result": "APPROVED after 1 fix loop"
     }
   ],
   "repos": {
