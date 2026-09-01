@@ -3,7 +3,7 @@
   "branch": "feat/REQ-604-pre-split-ordering-fixture-for-skill-and-consent-turns",
   "startedAt": "2026-08-31T00:00:00Z",
   "completed": false,
-  "currentPhase": 7,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
@@ -11,7 +11,8 @@
     3,
     4,
     5,
-    6
+    6,
+    7
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -51,6 +52,11 @@
       "phase": 6,
       "name": "Create PR",
       "completedAt": "2026-09-01T00:26:25.094520Z"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-09-01T00:27:47.161421Z"
     }
   ],
   "repos": {
@@ -82,7 +88,13 @@
     "failedTasks": []
   },
   "notes": [
-    "Sprint override: merge ownership belongs to the /sprint orchestrator (cluster REQ-603 -> REQ-604 -> REQ-606). This runner stops after Phase 7 and reports pr-ready."
+    "Sprint override: this runner is SECOND in the overlap cluster {REQ-603, REQ-604, REQ-606} and does NOT merge its own PR. Terminal claim is pr-ready.",
+    "The /sprint orchestrator owns BOTH the merge (sequenced 603 -> 604 -> 606 behind a trial-merge gate) AND the Phase 8b close-out (/wrapup, worktree teardown, and the terminal record: completed:true, currentPhase:8, 8 appended to completedPhases, a phase-8 phaseHistory entry, repos.teton-code.merged:true).",
+    "completed:false is deliberate here, not an abandoned run. Phases 0-7 are done; phase 8 is the orchestrator's.",
+    "AC-3 is recorded N/A, not met: both captured sequences replayed unmodified on the first run, so the disposition machinery was never exercised. Neither fixture was regenerated at any point.",
+    "Assumption VERIFIED: 17c39ec builds (cargo build --tests -p tetond clean; 1,932 lib tests run there).",
+    "Rebase expectation: REQ-603 (PR #256) merges ahead of this branch and relocates a session-lifecycle slice out of crates/tetond/src/runtime/mod.rs, which is the file this REQ adds a test module to. Trial-merge against origin/main 391091a is rc=0 as of phase 7, but that is BEFORE 603 lands; re-gate after it merges.",
+    "REQ-606 AC-4 depends on the REQ-598 fixture replaying unregenerated. This REQ does not touch that fixture and its test is still green."
   ],
   "blockers": []
 }
