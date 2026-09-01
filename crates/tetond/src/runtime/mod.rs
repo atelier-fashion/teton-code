@@ -9370,6 +9370,7 @@ provider_id = "on-device"
             lifetime: teton_core::LifetimeConfig::default(),
             permissions: teton_core::PermissionsConfig::default(),
             skills: teton_core::SkillsConfig::default(),
+            shell: teton_core::config::ShellConfig::default(),
             providers: vec![ModelProvider {
                 id: "remote".to_owned(),
                 kind: ProviderKind::OpenaiCompatible,
@@ -9696,6 +9697,7 @@ provider_id = "on-device"
             lifetime: teton_core::LifetimeConfig::default(),
             permissions: teton_core::PermissionsConfig::default(),
             skills: teton_core::SkillsConfig::default(),
+            shell: teton_core::config::ShellConfig::default(),
             providers: vec![
                 ModelProvider {
                     id: "anthropic".to_owned(),

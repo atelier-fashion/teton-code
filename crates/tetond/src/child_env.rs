@@ -57,7 +57,7 @@ use teton_core::config::{is_recognized_auth_ref, Config};
 ///
 /// | Considered | Rejected because |
 /// |---|---|
-/// | `SSH_AUTH_SOCK` | A `git push` over ssh wants it, so it passes the first half. It fails the second, and worse than by holding a credential: it is a handle to an agent that *lends* them. |
+/// | `SSH_AUTH_SOCK` | A `git push` over ssh wants it, so it passes the first half. It fails the second, and worse than by holding a credential: it is a handle to an agent that *lends* them. **Reachable by opt-in since REQ-607:** `[shell] allow_ssh_agent = true` admits it, and only it, to the `shell` path. The rejection above is still the default and still the reasoning — the key does not overturn the judgement, it lets someone who has read it accept the consequence. |
 /// | `CARGO_HOME`, `RUSTUP_HOME` | Needed only when the layout is non-default; `HOME` covers the default, so "needs it to run at all" is not met. |
 /// | `PWD`, `OLDPWD`, `SHLVL` | `sh` sets these itself from the child's working directory. Passing them in is redundant. |
 /// | `LC_NUMERIC`, `LC_TIME`, `LC_COLLATE`, `LC_MESSAGES` | `LANG`/`LC_ALL`/`LC_CTYPE` already cover encoding, the half that breaks a command outright. The rest change formatting, not whether it runs. |
@@ -70,6 +70,86 @@ pub(crate) const SHELL_ENV_ALLOW: &[&str] = &[
     "PATH", "HOME", "TMPDIR", "TZ", "TERM", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE",
     "LC_ALL", "LC_CTYPE",
 ];
+
+/// The one variable `[shell] allow_ssh_agent` admits (REQ-607 BR-5).
+///
+/// A named constant with two readers — [`shell_env_allow`] and
+/// [`WITHHELD_DIAGNOSED`] — so the flag that admits it and the sentence that
+/// explains its absence cannot come to disagree about which variable is at
+/// stake (BR-6).
+pub(crate) const SSH_AUTH_SOCK: &str = "SSH_AUTH_SOCK";
+
+/// A variable the `shell` path withholds whose absence is worth *explaining*
+/// when a command fails (REQ-607 BR-1).
+///
+/// Every `name` here is nameable in tool output, and that is a narrowing of
+/// REQ-596 BR-5 recorded on both specs (amended 2026-09-01). The licence is
+/// exactly this: names in the rejection table above are public in the source and
+/// identical on every installation, so printing one discloses nothing about
+/// *this* machine. A name discovered from the daemon's live environment, or
+/// resolved from a configured `auth_ref = "env:<NAME>"`, is still unnameable,
+/// and no credential *value* is nameable under any condition.
+pub(crate) struct WithheldVar {
+    /// The variable name. Must appear in the rejection table above — the test
+    /// [`every_diagnosable_name_is_in_the_documented_rejection_table`]
+    /// (tests::every_diagnosable_name_is_in_the_documented_rejection_table)
+    /// is what keeps that true.
+    pub name: &'static str,
+    /// Programs whose failure this variable's absence plausibly explains.
+    ///
+    /// Matched in **command position** only — see the shell tool's matcher.
+    pub programs: &'static [&'static str],
+    /// The config key that admits it, spelled as a user would grep for it.
+    ///
+    /// `Option`, because BR-1's config-key clause is conditional: most of the
+    /// rejection table has no opt-in and a row must not invent one. Naming a
+    /// remedy no command can reach is BUG-205's failure mode, which is the very
+    /// thing this table exists to avoid.
+    pub opt_in_key: Option<&'static str>,
+}
+
+/// The rows the advisory may speak about — one today.
+///
+/// This is *not* the rejection table. The rejection table records every name
+/// considered and refused; this records the subset whose absence produces a
+/// failure a user would otherwise misattribute. `CARGO_HOME` is rejected and
+/// absent from here because a command that needs it fails in a way that names
+/// it; `SSH_AUTH_SOCK` is here because `git push` fails saying *"Permission
+/// denied (publickey)"*, which names ssh and never names Teton.
+///
+/// Adding a row is the whole cost of serving another variable: nothing else in
+/// the advisory path is keyed on `SSH_AUTH_SOCK` specifically.
+pub(crate) const WITHHELD_DIAGNOSED: &[WithheldVar] = &[WithheldVar {
+    name: SSH_AUTH_SOCK,
+    // `git` because the failure a user actually hits is `git push`; the rest
+    // because they are the other ways an agent-backed connection is made from a
+    // one-line command.
+    programs: &["ssh", "git", "scp", "sftp", "rsync"],
+    opt_in_key: Some("[shell] allow_ssh_agent"),
+}];
+
+/// The names the `shell` child may inherit, given the one opt-in (REQ-607 BR-5).
+///
+/// [`SHELL_ENV_ALLOW`] plus, when the flag is on, [`SSH_AUTH_SOCK`]. **Nothing
+/// else, ever** — this function is why `allow_ssh_agent` cannot become the
+/// general `extra_env` that REQ-596's OQ-2 left open.
+///
+/// The opt-in adds to a **copy**. `SHELL_ENV_ALLOW` is BR-2.1's recorded set and
+/// REQ-596 AC-3.2 asserts its literal membership; a flag that mutated it would
+/// make that assertion a function of runtime config.
+///
+/// This is also the whole of the flag's reach. `compose_child_env` takes the
+/// allowlist as a **parameter** (REQ-596 BR-7.1), and the MCP spawn path passes
+/// its own constant — so there is no path by which this can widen what a
+/// third-party `npx` package inherits (REQ-607 BR-7). That is a property of the
+/// shape rather than of a test defending it.
+pub(crate) fn shell_env_allow(allow_ssh_agent: bool) -> Vec<&'static str> {
+    let mut allow = SHELL_ENV_ALLOW.to_vec();
+    if allow_ssh_agent {
+        allow.push(SSH_AUTH_SOCK);
+    }
+    allow
+}
 
 /// Compose the environment a spawned child receives.
 ///
@@ -459,6 +539,111 @@ mod tests {
             &declared,
         );
         assert!(value_of(&composed, "SENTINEL_DB").is_some());
+    }
+
+    /// REQ-607 BR-5 / BR-6 — the opt-in adds **one** name to the allowlist.
+    ///
+    /// Asserted as a set difference in both directions, so a widened
+    /// `shell_env_allow` fails here and not only at the composed-map level:
+    /// nothing gained beyond `SSH_AUTH_SOCK`, and nothing lost.
+    ///
+    /// The second half is the one that would rot silently. `SHELL_ENV_ALLOW` is
+    /// REQ-596 BR-2.1's recorded set and REQ-596 AC-3.2 asserts its literal
+    /// membership; if the opt-in ever mutated the constant instead of a copy,
+    /// that assertion would become a function of runtime config.
+    #[test]
+    fn the_opt_in_adds_one_name_to_the_allowlist_and_no_other() {
+        let off: BTreeSet<&str> = shell_env_allow(false).into_iter().collect();
+        let on: BTreeSet<&str> = shell_env_allow(true).into_iter().collect();
+
+        let gained: Vec<&&str> = on.difference(&off).collect();
+        let lost: Vec<&&str> = off.difference(&on).collect();
+        assert_eq!(
+            gained,
+            vec![&SSH_AUTH_SOCK],
+            "the opt-in admitted something other than the ssh agent socket"
+        );
+        assert!(
+            lost.is_empty(),
+            "the opt-in withdrew names it should have left alone: {lost:?}"
+        );
+
+        // The flag adds to a copy — the recorded constant is untouched.
+        assert_eq!(
+            off,
+            SHELL_ENV_ALLOW.iter().copied().collect::<BTreeSet<&str>>(),
+            "shell_env_allow(false) is no longer REQ-596 BR-2.1's recorded set"
+        );
+        assert!(
+            !SHELL_ENV_ALLOW.contains(&SSH_AUTH_SOCK),
+            "the opt-in mutated SHELL_ENV_ALLOW itself, so REQ-596 AC-3.2's membership \
+             assertion is now a function of runtime config"
+        );
+    }
+
+    /// REQ-607 AC-12 / BR-4 — every name the advisory may speak is in the
+    /// **documented** rejection table.
+    ///
+    /// BR-4 narrows REQ-596 BR-5 by exactly this much: a name is nameable in
+    /// tool output *because* it is in that table, public in the source and
+    /// identical on every installation. A code table that drifted from the doc
+    /// table would name something the narrowing does not license — and the
+    /// drift is silent, because nothing else reads the doc comment.
+    ///
+    /// The slice is **bounded to the table** rather than searched over the whole
+    /// file (conventions.md, REQ-600): `SSH_AUTH_SOCK` also appears as a
+    /// constant and inside `WITHHELD_DIAGNOSED`, and an unbounded search would
+    /// find those and pass with the table row deleted. The corpus is
+    /// `production_source`, which cuts at the first column-0 `#[cfg(test)]`, so
+    /// this test's own text cannot satisfy it.
+    ///
+    /// **Mutation run, both halves.** Renaming the rejection table's
+    /// `SSH_AUTH_SOCK` row to `SSH_AGENT_HANDLE_MUTANT` fails this test with
+    /// "WITHHELD_DIAGNOSED names SSH_AUTH_SOCK but the rejection table does
+    /// not" — 1 assertion. Then, with that mutation still in place, widening
+    /// `table` back to the whole `source` makes it **pass** (1 passed, 0
+    /// failed), because the constant and `WITHHELD_DIAGNOSED` both spell the
+    /// name elsewhere in the file. So the bound is not tidiness; it is the only
+    /// reason this check can fail at all.
+    #[test]
+    fn every_diagnosable_name_is_in_the_documented_rejection_table() {
+        let source = crate::call_sites::scan::production_source(
+            &crate::call_sites::scan::daemon_src().join("child_env.rs"),
+        );
+
+        // Bound the slice to the rejection table: from its header row to the
+        // constant the doc comment is attached to.
+        let start = source
+            .find("/// | Considered | Rejected because |")
+            .expect("the rejection table's header row");
+        let end = source[start..]
+            .find("pub(crate) const SHELL_ENV_ALLOW")
+            .expect("the constant the rejection table documents")
+            + start;
+        let table = &source[start..end];
+
+        let rows = table.lines().filter(|l| l.trim_start().starts_with("/// |"));
+        assert!(
+            rows.count() >= 5,
+            "the bounded slice found fewer rejection-table rows than the table is known to \
+             have; the bounds have drifted and this check is passing vacuously"
+        );
+
+        let mut checked = 0_usize;
+        for var in WITHHELD_DIAGNOSED {
+            assert!(
+                table.contains(var.name),
+                "WITHHELD_DIAGNOSED names {} but the rejection table does not. BR-4 makes \
+                 that table the nameable set, so an advisory naming this variable would \
+                 disclose a name REQ-596 BR-5's narrowing does not license.",
+                var.name
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 1,
+            "the diagnosis table is empty, so this check proved nothing"
+        );
     }
 
     /// How far above a `.envs(` the composer call may sit and still count as the
