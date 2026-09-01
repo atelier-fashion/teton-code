@@ -132,14 +132,20 @@ fn main() -> anyhow::Result<ExitCode> {
         // moment of the spawn — a snapshot taken here would not know about a
         // provider added later in the session (LESSON-539).
         //
+        // REQ-607 widened the same closure to carry `[shell] allow_ssh_agent`
+        // alongside it. One provider, not two, so a spawn can never read half a
+        // policy and nobody can wire one reader and forget the other — the
+        // forgotten one would fail in the safe direction, which is the failure
+        // nothing would ever report.
+        //
         // The closure keeps an `Arc<DaemonRuntime>` for the life of the
         // process. That is not a teardown hazard: the ordered shutdown below is
         // an explicit `shutdown(...)` call, not a `Drop` impl, so nothing is
         // skipped by the runtime outliving this scope.
         {
-            let runtime_for_credentials = Arc::clone(&daemon_runtime);
-            tetond::child_env::set_credential_env_names_provider(move || {
-                runtime_for_credentials.credential_env_var_names()
+            let runtime_for_child_env = Arc::clone(&daemon_runtime);
+            tetond::child_env::set_child_env_policy_provider(move || {
+                runtime_for_child_env.child_env_policy()
             });
         }
         eprintln!(

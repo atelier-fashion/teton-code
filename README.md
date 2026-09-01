@@ -226,6 +226,45 @@ Tools a level has never heard of — anything an MCP server supplies — follow 
 level's default rather than a name list: they ask at `guarded` and `edits`, are
 refused at `plan`, and run at `full`.
 
+### The ssh agent, and why your `git push` may stop working
+
+A shell command Teton runs gets a **composed** environment, not the daemon's.
+Twelve names are passed through; everything else is withheld, so a credential
+nobody thought about cannot reach a model-issued command. `SSH_AUTH_SOCK` is one
+of the things withheld, and it is the one you are most likely to notice: a
+`git push` over ssh inside a shell command will fail where it worked before.
+
+Teton says so on the failure itself, rather than leaving you to read an ssh
+error and go looking in the wrong place:
+
+```
+$ git push origin main
+(exit 128)
+
+[teton] This may have failed because Teton withholds SSH_AUTH_SOCK from shell
+commands, rather than because of a problem with `git` — set
+`[shell] allow_ssh_agent = true` in your Teton config to pass it through.
+```
+
+If you want it back:
+
+```toml
+[shell]
+allow_ssh_agent = true
+```
+
+**Understand what that grants before you set it.** `SSH_AUTH_SOCK` is not a
+credential; it is a handle to an agent that *lends* them. Passing it through
+gives every command the model issues the ability to authenticate as you, to any
+host your agent holds a key for, for as long as that command runs. That is why
+it is off by default and why it is a single named key rather than a list —
+there is deliberately no general "pass these extra variables through" setting.
+
+It admits that one variable and nothing else, and only for the `shell` tool: a
+spawned MCP server's environment is unaffected. A credential you have told Teton
+about through `auth_ref = "env:…"` is still removed, unconditionally, even with
+this on.
+
 ### Upgrading
 
 ```sh

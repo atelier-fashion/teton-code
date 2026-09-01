@@ -28,15 +28,30 @@
 //! the other, and the second is the half of the old scrub that survived the
 //! rewrite — deliberately, and with its tests (ADR-E).
 //!
-//! ## The credential set is pulled, not pushed
+//! ## The policy is pulled, not pushed
 //!
 //! `auth_ref = "env:<VAR>"` is a first-class credential form: the daemon knows
 //! at config-load time exactly which variable names hold provider secrets, and
 //! it used to never tell the scrubber. Now it does, through
-//! [`set_credential_env_names_provider`] — a closure the daemon installs once at
+//! [`set_child_env_policy_provider`] — a closure the daemon installs once at
 //! bootstrap that reads the **live** config each time it is called. Not a
 //! snapshot: a provider added mid-session is visible to the very next spawn, and
 //! there is no second copy of the set to go stale (LESSON-539).
+//!
+//! REQ-607 widened what that closure returns from the credential set alone to a
+//! whole [`ChildEnvPolicy`], because the `shell` path now needs a second fact
+//! from the same config at the same instant — `[shell] allow_ssh_agent`. One
+//! provider rather than two: a spawn cannot read half a policy, and nobody can
+//! wire one reader and forget the other.
+//!
+//! ## The one variable an opt-in can add back
+//!
+//! REQ-596's rejections stand, and one of them — `SSH_AUTH_SOCK` — is the one
+//! users feel, because `git push` over ssh needs it and fails saying
+//! *"Permission denied (publickey)"*, which names ssh and never names Teton.
+//! REQ-607 answers that twice over: [`WITHHELD_DIAGNOSED`] lets the `shell` tool
+//! say who withheld it, and [`shell_env_allow`] lets a config author admit it —
+//! that name and no other, on the `shell` path and no other.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
@@ -57,7 +72,7 @@ use teton_core::config::{is_recognized_auth_ref, Config};
 ///
 /// | Considered | Rejected because |
 /// |---|---|
-/// | `SSH_AUTH_SOCK` | A `git push` over ssh wants it, so it passes the first half. It fails the second, and worse than by holding a credential: it is a handle to an agent that *lends* them. |
+/// | `SSH_AUTH_SOCK` | A `git push` over ssh wants it, so it passes the first half. It fails the second, and worse than by holding a credential: it is a handle to an agent that *lends* them. **Reachable by opt-in since REQ-607:** `[shell] allow_ssh_agent = true` admits it, and only it, to the `shell` path. The rejection above is still the default and still the reasoning — the key does not overturn the judgement, it lets someone who has read it accept the consequence. |
 /// | `CARGO_HOME`, `RUSTUP_HOME` | Needed only when the layout is non-default; `HOME` covers the default, so "needs it to run at all" is not met. |
 /// | `PWD`, `OLDPWD`, `SHLVL` | `sh` sets these itself from the child's working directory. Passing them in is redundant. |
 /// | `LC_NUMERIC`, `LC_TIME`, `LC_COLLATE`, `LC_MESSAGES` | `LANG`/`LC_ALL`/`LC_CTYPE` already cover encoding, the half that breaks a command outright. The rest change formatting, not whether it runs. |
@@ -70,6 +85,125 @@ pub(crate) const SHELL_ENV_ALLOW: &[&str] = &[
     "PATH", "HOME", "TMPDIR", "TZ", "TERM", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE",
     "LC_ALL", "LC_CTYPE",
 ];
+
+/// The one variable `[shell] allow_ssh_agent` admits (REQ-607 BR-5).
+///
+/// A named constant with two readers — [`shell_env_allow`] and
+/// [`WITHHELD_DIAGNOSED`] — so the flag that admits it and the sentence that
+/// explains its absence cannot come to disagree about which variable is at
+/// stake (BR-6).
+pub(crate) const SSH_AUTH_SOCK: &str = "SSH_AUTH_SOCK";
+
+/// A variable the `shell` path withholds whose absence is worth *explaining*
+/// when a command fails (REQ-607 BR-1).
+///
+/// Every `name` here is nameable in tool output, and that is a narrowing of
+/// REQ-596 BR-5 recorded on both specs (amended 2026-09-01). The licence is
+/// exactly this: names in the rejection table above are public in the source and
+/// identical on every installation, so printing one discloses nothing about
+/// *this* machine. A name discovered from the daemon's live environment, or
+/// resolved from a configured `auth_ref = "env:<NAME>"`, is still unnameable,
+/// and no credential *value* is nameable under any condition.
+#[derive(Debug)]
+pub(crate) struct WithheldVar {
+    /// The variable name. Must appear in the rejection table above — the test
+    /// [`every_diagnosable_name_is_in_the_documented_rejection_table`]
+    /// (tests::every_diagnosable_name_is_in_the_documented_rejection_table)
+    /// is what keeps that true.
+    pub name: &'static str,
+    /// Programs whose failure this variable's absence plausibly explains.
+    ///
+    /// Matched in **command position** only — see the shell tool's matcher.
+    pub programs: &'static [&'static str],
+    /// The config key that admits it, spelled as a user would grep for it.
+    ///
+    /// `Option`, because BR-1's config-key clause is conditional: most of the
+    /// rejection table has no opt-in and a row must not invent one. Naming a
+    /// remedy no command can reach is BUG-205's failure mode, which is the very
+    /// thing this table exists to avoid.
+    pub opt_in_key: Option<&'static str>,
+}
+
+/// The rows the advisory may speak about — one today.
+///
+/// This is *not* the rejection table. The rejection table records every name
+/// considered and refused; this records the subset whose absence produces a
+/// failure a user would otherwise misattribute. `CARGO_HOME` is rejected and
+/// absent from here because a command that needs it fails in a way that names
+/// it; `SSH_AUTH_SOCK` is here because `git push` fails saying *"Permission
+/// denied (publickey)"*, which names ssh and never names Teton.
+///
+/// Adding a row is the whole cost of serving another variable: nothing else in
+/// the advisory path is keyed on `SSH_AUTH_SOCK` specifically.
+pub(crate) const WITHHELD_DIAGNOSED: &[WithheldVar] = &[WithheldVar {
+    name: SSH_AUTH_SOCK,
+    // `git` because the failure a user actually hits is `git push`; the rest
+    // because they are the other ways an agent-backed connection is made from a
+    // one-line command.
+    programs: &["ssh", "git", "scp", "sftp", "rsync"],
+    opt_in_key: Some("[shell] allow_ssh_agent"),
+}];
+
+/// Which diagnosable variables this child was actually **denied** (REQ-607 BR-1).
+///
+/// A row qualifies only when the daemon **has** the variable and the child does
+/// **not**. Both halves matter, and the first is the one worth arguing for.
+///
+/// The obvious alternative — "on the table and not on the allowlist" — reads
+/// only static facts and is wrong on a machine with no `ssh-agent` running:
+/// `git push` fails there for an entirely different reason, and an advisory
+/// would tell the user Teton withheld something it never had and point them at
+/// a key that would not have helped. Naming a remedy no command can reach is
+/// BUG-205's failure mode, which the advisory exists to avoid.
+///
+/// Asking the composed map instead gets three other cases right without
+/// knowing about them: with the opt-in on the variable is present and nothing
+/// is said; with `auth_ref = "env:SSH_AUTH_SOCK"` the credential removal wins
+/// and the advisory correctly *does* fire; and a future row needs no new logic.
+///
+/// **The residual, named rather than glossed.** Reading the live environment
+/// means the advisory's presence discloses one bit — that this machine has an
+/// agent socket. REQ-596 BR-5 as amended (2026-09-01, REQ-607) forbids a *name*
+/// discovered from the live environment appearing in output; the name here is
+/// drawn from [`WITHHELD_DIAGNOSED`], and the live read only gates whether it is
+/// spoken. That bit is the price of the sentence being true rather than
+/// plausible, and it is disclosed to a model already running commands in that
+/// environment.
+pub(crate) fn withheld_from_child(
+    daemon_vars: &[(String, String)],
+    child_env: &[(String, String)],
+) -> Vec<&'static WithheldVar> {
+    WITHHELD_DIAGNOSED
+        .iter()
+        .filter(|var| {
+            daemon_vars.iter().any(|(k, _)| k == var.name)
+                && !child_env.iter().any(|(k, _)| k == var.name)
+        })
+        .collect()
+}
+
+/// The names the `shell` child may inherit, given the one opt-in (REQ-607 BR-5).
+///
+/// [`SHELL_ENV_ALLOW`] plus, when the flag is on, [`SSH_AUTH_SOCK`]. **Nothing
+/// else, ever** — this function is why `allow_ssh_agent` cannot become the
+/// general `extra_env` that REQ-596's OQ-2 left open.
+///
+/// The opt-in adds to a **copy**. `SHELL_ENV_ALLOW` is BR-2.1's recorded set and
+/// REQ-596 AC-3.2 asserts its literal membership; a flag that mutated it would
+/// make that assertion a function of runtime config.
+///
+/// This is also the whole of the flag's reach. `compose_child_env` takes the
+/// allowlist as a **parameter** (REQ-596 BR-7.1), and the MCP spawn path passes
+/// its own constant — so there is no path by which this can widen what a
+/// third-party `npx` package inherits (REQ-607 BR-7). That is a property of the
+/// shape rather than of a test defending it.
+pub(crate) fn shell_env_allow(allow_ssh_agent: bool) -> Vec<&'static str> {
+    let mut allow = SHELL_ENV_ALLOW.to_vec();
+    if allow_ssh_agent {
+        allow.push(SSH_AUTH_SOCK);
+    }
+    allow
+}
 
 /// Compose the environment a spawned child receives.
 ///
@@ -187,11 +321,36 @@ pub(crate) fn credential_env_names_of(config: &Config) -> BTreeSet<String> {
         .collect()
 }
 
-/// The installed source of [`credential_env_names`].
-type Provider = Box<dyn Fn() -> BTreeSet<String> + Send + Sync>;
-static CREDENTIAL_ENV_NAMES: OnceLock<Provider> = OnceLock::new();
+/// Everything a spawn needs to know from the **live** config (REQ-607 ADR-C).
+///
+/// Two facts, one type, because they are read at the same instant by the same
+/// caller and a spawn that had one without the other would be composing an
+/// environment from half a policy. Bundling them also makes "install one
+/// provider and forget the other" unrepresentable — and a forgotten one would
+/// fail in the *safe* direction, which is the worst kind, because nothing would
+/// ever report it.
+///
+/// This is the same argument [`crate::runtime::DaemonRuntime::boundary_posture`]
+/// makes for reading both boundary facts under one lock: two readings across a
+/// concurrent `config/set` can disagree, and one derivation is what stops that.
+#[derive(Debug, Clone, Default)]
+pub struct ChildEnvPolicy {
+    /// Every variable name a configured `env:<NAME>` credential reference points
+    /// at — removed from the child unconditionally and last (REQ-596 BR-1/BR-3).
+    pub credential_env_names: BTreeSet<String>,
+    /// Whether `[shell] allow_ssh_agent` is set (REQ-607 BR-5).
+    ///
+    /// Read by the `shell` spawn path **only**, through [`shell_env_allow`]. The
+    /// MCP spawn path never consults this type.
+    pub allow_ssh_agent: bool,
+}
 
-/// Install the daemon's live-config reader as the credential-name source.
+/// The installed source of [`child_env_policy`].
+type Provider = Box<dyn Fn() -> ChildEnvPolicy + Send + Sync>;
+static CHILD_ENV_POLICY: OnceLock<Provider> = OnceLock::new();
+
+/// Install the daemon's live-config reader as the child-environment policy
+/// source.
 ///
 /// Called once from the daemon's bootstrap, after the runtime exists, in the
 /// same place and for the same reason as the lifetime work-claim wiring: the
@@ -200,26 +359,33 @@ static CREDENTIAL_ENV_NAMES: OnceLock<Provider> = OnceLock::new();
 /// A second call is ignored rather than fatal — `OnceLock` semantics — because
 /// the only caller is bootstrap and a test double that lost a race should not
 /// abort a daemon over which of two equivalent readers won.
-pub fn set_credential_env_names_provider<F>(provider: F)
+pub fn set_child_env_policy_provider<F>(provider: F)
 where
-    F: Fn() -> BTreeSet<String> + Send + Sync + 'static,
+    F: Fn() -> ChildEnvPolicy + Send + Sync + 'static,
 {
-    let _ = CREDENTIAL_ENV_NAMES.set(Box::new(provider));
+    let _ = CHILD_ENV_POLICY.set(Box::new(provider));
 }
 
-/// The credential env names as of **now**, or an empty set if no provider is
+/// The child-environment policy as of **now**, or the default if no provider is
 /// installed.
 ///
-/// Empty is safe rather than fail-open, and the reason is structural: under
+/// The default is safe in **both** fields, and each for its own reason.
+///
+/// An empty credential set is safe rather than fail-open, structurally: under
 /// [`compose_child_env`]'s step 1 a variable whose name is not on the allowlist
 /// is already absent, whatever this returns. The set only bites for the
 /// pathological intersection — a user who writes `auth_ref = "env:HOME"` — and
 /// the daemon, the one context where such a config exists at all, always
 /// installs the provider.
-pub(crate) fn credential_env_names() -> BTreeSet<String> {
-    CREDENTIAL_ENV_NAMES
+///
+/// `allow_ssh_agent: false` is safe because it is the shipped default: an
+/// uninstalled provider withholds the agent exactly as an unset config key does,
+/// so the failure mode of "nobody wired the bootstrap" is the *secure* posture
+/// rather than a silently widened child.
+pub(crate) fn child_env_policy() -> ChildEnvPolicy {
+    CHILD_ENV_POLICY
         .get()
-        .map_or_else(BTreeSet::new, |f| f())
+        .map_or_else(ChildEnvPolicy::default, |f| f())
 }
 
 #[cfg(test)]
@@ -459,6 +625,368 @@ mod tests {
             &declared,
         );
         assert!(value_of(&composed, "SENTINEL_DB").is_some());
+    }
+
+    /// REQ-607 BR-7 — the benign path for a daemon nobody wired.
+    ///
+    /// `child_env_policy()` falls back to [`ChildEnvPolicy::default`] when no
+    /// provider is installed, so the default *is* the behaviour of an
+    /// unbootstrapped daemon. Both fields must be safe there: no credential
+    /// names is structurally harmless (the allowlist already excludes anything
+    /// a credential is likely to be called), and `allow_ssh_agent: false` is the
+    /// shipped posture — so "nobody wired the bootstrap" withholds the agent
+    /// rather than silently widening the child.
+    ///
+    /// **Asserted on the default rather than by calling `child_env_policy()`
+    /// with nothing installed.** `CHILD_ENV_POLICY` is a process-global
+    /// `OnceLock` and other tests in this binary install a provider, so an
+    /// "uninstalled" assertion would pass or fail on test *order*. The default
+    /// is the value that branch returns, and it is the thing worth pinning.
+    #[test]
+    fn an_uninstalled_policy_provider_withholds_the_agent_and_names_no_credentials() {
+        let fallback = ChildEnvPolicy::default();
+        assert!(
+            !fallback.allow_ssh_agent,
+            "an unbootstrapped daemon admitted the ssh agent — the uninstalled-provider \
+             fallback must be the secure posture, not the permissive one"
+        );
+        assert!(fallback.credential_env_names.is_empty());
+
+        // And the fallback composes a child that really lacks the socket, so
+        // this is a claim about the environment rather than about a struct.
+        let composed = compose_child_env(
+            vars(&[("PATH", "/usr/bin"), (SSH_AUTH_SOCK, "/tmp/SENTINEL.sock")]),
+            &shell_env_allow(fallback.allow_ssh_agent),
+            &fallback.credential_env_names,
+            &BTreeMap::new(),
+        );
+        assert!(value_of(&composed, SSH_AUTH_SOCK).is_none());
+    }
+
+    /// REQ-607's Permissions row — `allow_ssh_agent` is the **config author's**
+    /// decision, never the model's and never a tool call's.
+    ///
+    /// The row is a real constraint and today it holds structurally: `apply_update`
+    /// is the one function that turns a client-issued `ConfigUpdate` into a
+    /// mutation of the loaded config, and none of its arms touches `config.shell`.
+    /// A client cannot reach the key at all.
+    ///
+    /// Nothing in the REQ's BR or AC list pins that, which is exactly why it is
+    /// worth a guard: the row would be silently violated the day someone adds a
+    /// `ConfigUpdate::SetShell` variant, and the violation would look like an
+    /// ordinary feature addition. What would have to change first is
+    /// `apply_update` naming the field.
+    ///
+    /// **Mutation run.** Adding `config.shell.allow_ssh_agent = true;` to any arm
+    /// of `apply_update` fails this test with "the client-driven config-update
+    /// path writes `config.shell`" (1 assertion).
+    #[test]
+    fn no_client_driven_config_update_can_admit_the_agent() {
+        let source = crate::call_sites::scan::production_source(
+            &crate::call_sites::scan::daemon_src().join("runtime/mod.rs"),
+        );
+        let at = source
+            .find("fn apply_update(")
+            .expect("the config-update application path");
+        // Bound the slice to this function: `.shell` appears elsewhere in a file
+        // this size, and an unbounded search would be a claim about the whole
+        // module (conventions.md, REQ-600).
+        let body = &source[at..];
+        let end = body.find("\n}\n").map_or(body.len(), |e| e + 2);
+        let body = &body[..end];
+        assert!(
+            body.contains("ConfigUpdate::"),
+            "the bounded slice does not look like apply_update's body, so this check is \
+             reading the wrong region and passing vacuously"
+        );
+        assert!(
+            !body.contains(".shell"),
+            "the client-driven config-update path writes `config.shell`. REQ-607's \
+             Permissions row makes admitting the ssh agent the config author's decision \
+             and never the model's — a client-issued update that can set it hands a \
+             model the ability to grant itself the user's agent."
+        );
+    }
+
+    /// REQ-607 AC-7 / BR-8 — with the flag **off**, the agent socket is absent;
+    /// with it **on**, present.
+    ///
+    /// Asserted by inspecting the **composed map**, not by observing a command
+    /// succeed: a command can fail or succeed for a dozen reasons, and only the
+    /// map says what the child was actually handed.
+    ///
+    /// The off leg is the benign path and it is the shipped default, so this is
+    /// also the regression guard on REQ-596's decision — the opt-in must not
+    /// have quietly become the posture.
+    #[test]
+    fn with_the_flag_off_the_agent_socket_is_absent() {
+        let daemon = vars(&[
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/SENTINEL-home"),
+            (SSH_AUTH_SOCK, "/tmp/SENTINEL-agent.sock"),
+        ]);
+
+        let off = compose_child_env(
+            daemon.clone(),
+            &shell_env_allow(false),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        );
+        assert!(
+            value_of(&off, SSH_AUTH_SOCK).is_none(),
+            "the shipped default handed the ssh agent to a model-issued command"
+        );
+
+        let on = compose_child_env(
+            daemon,
+            &shell_env_allow(true),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            value_of(&on, SSH_AUTH_SOCK),
+            Some("/tmp/SENTINEL-agent.sock"),
+            "the opt-in did not admit the variable it exists to admit"
+        );
+    }
+
+    /// REQ-607 AC-8 / BR-5's "and nothing else" — the composed map differs by
+    /// **exactly one entry**, in **both** directions.
+    ///
+    /// This is the assertion that keeps `allow_ssh_agent` from becoming the
+    /// general escape hatch Out of Scope refuses. A one-way spot check of the
+    /// names a test happens to think of passes a *widened* allowlist, which is
+    /// precisely the regression worth catching; a two-way set difference over
+    /// the whole map cannot.
+    ///
+    /// **Non-vacuous by construction.** The fixture plants `SSH_AUTH_SOCK` in
+    /// the daemon vars, because with it unset the true difference is *zero*
+    /// entries and every assertion below would be measuring nothing. It also
+    /// plants a name the allowlist rejects, so the map is not merely the
+    /// allowlist echoed back.
+    ///
+    /// **The oracle is not the subject** (conventions.md, LESSON-569): the two
+    /// maps are built by calling the composer twice and diffed against each
+    /// other. Nothing here asks `shell_env_allow` what it expects to see.
+    #[test]
+    fn the_opt_in_admits_exactly_one_more_entry_in_both_directions() {
+        let daemon = vars(&[
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/SENTINEL-home"),
+            ("LANG", "en_US.UTF-8"),
+            (SSH_AUTH_SOCK, "/tmp/SENTINEL-agent.sock"),
+            // Not on any allowlist — present so the composed map is a filter
+            // result rather than the daemon environment echoed back.
+            ("UNRELATED_SENTINEL_VAR", "SENTINEL-unrelated"),
+        ]);
+
+        let off: BTreeMap<String, String> = compose_child_env(
+            daemon.clone(),
+            &shell_env_allow(false),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        )
+        .into_iter()
+        .collect();
+        let on: BTreeMap<String, String> = compose_child_env(
+            daemon,
+            &shell_env_allow(true),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        )
+        .into_iter()
+        .collect();
+
+        assert!(
+            !off.is_empty() && !on.is_empty(),
+            "both composed maps are empty, so this proved nothing"
+        );
+
+        // Gained: exactly the one name.
+        let gained: Vec<(&String, &String)> =
+            on.iter().filter(|(k, v)| off.get(*k) != Some(*v)).collect();
+        assert_eq!(
+            gained.len(),
+            1,
+            "the opt-in changed {} entries, not one: {gained:?}",
+            gained.len()
+        );
+        assert_eq!(gained[0].0.as_str(), SSH_AUTH_SOCK);
+
+        // Lost: nothing. An opt-in that *removed* an entry while adding one
+        // would keep a naive count at one, and this is the direction that
+        // catches it.
+        let lost: Vec<(&String, &String)> =
+            off.iter().filter(|(k, v)| on.get(*k) != Some(*v)).collect();
+        assert!(
+            lost.is_empty(),
+            "the opt-in removed or altered entries it should have left alone: {lost:?}"
+        );
+
+        // And the rejected name is in neither, so the allowlist is still doing
+        // its job on both sides of the comparison.
+        assert!(!off.contains_key("UNRELATED_SENTINEL_VAR"));
+        assert!(!on.contains_key("UNRELATED_SENTINEL_VAR"));
+    }
+
+    /// REQ-607 AC-10 / BR-7 — a configured `auth_ref = "env:<NAME>"` credential
+    /// is still absent with the agent admitted.
+    ///
+    /// Two legs, and the second is the sharp one.
+    ///
+    /// The first is the ordinary case: an unrelated credential name is removed
+    /// by composer step 5 whatever the allowlist says, which is REQ-596 BR-3
+    /// continuing to hold.
+    ///
+    /// The second puts the new flag and the old rule in **direct conflict** —
+    /// `auth_ref = "env:SSH_AUTH_SOCK"` with `allow_ssh_agent = true`, so the
+    /// allowlist admits exactly the name the credential set removes. Step 5 runs
+    /// last and unconditionally, so removal wins. That is REQ-596 BR-3 holding
+    /// against a capability that did not exist when it was written, and it is
+    /// the one arrangement in which the new flag could have reached around it.
+    #[test]
+    fn a_configured_credential_is_absent_even_with_the_agent_admitted() {
+        let daemon = vars(&[
+            ("PATH", "/usr/bin"),
+            ("LANGUAGE", "SENTINEL-language"),
+            (SSH_AUTH_SOCK, "/tmp/SENTINEL-agent.sock"),
+        ]);
+
+        // Leg 1: an allowlisted name the config declares a credential.
+        let mut credentials = BTreeSet::new();
+        credentials.insert("LANGUAGE".to_owned());
+        let composed = compose_child_env(
+            daemon.clone(),
+            &shell_env_allow(true),
+            &credentials,
+            &BTreeMap::new(),
+        );
+        assert!(
+            value_of(&composed, "LANGUAGE").is_none(),
+            "the opt-in re-admitted a configured credential"
+        );
+        // The flag still did its own job, so leg 1 is not passing because the
+        // whole composition broke.
+        assert!(value_of(&composed, SSH_AUTH_SOCK).is_some());
+
+        // Leg 2: the direct conflict.
+        let mut collision = BTreeSet::new();
+        collision.insert(SSH_AUTH_SOCK.to_owned());
+        let composed =
+            compose_child_env(daemon, &shell_env_allow(true), &collision, &BTreeMap::new());
+        assert!(
+            value_of(&composed, SSH_AUTH_SOCK).is_none(),
+            "allow_ssh_agent reached around REQ-596 BR-3's unconditional removal — a user \
+             who wrote auth_ref = \"env:SSH_AUTH_SOCK\" had their credential handed to a \
+             model-issued command by a flag that is not supposed to be able to do that"
+        );
+    }
+
+    /// REQ-607 BR-5 / BR-6 — the opt-in adds **one** name to the allowlist.
+    ///
+    /// Asserted as a set difference in both directions, so a widened
+    /// `shell_env_allow` fails here and not only at the composed-map level:
+    /// nothing gained beyond `SSH_AUTH_SOCK`, and nothing lost.
+    ///
+    /// The second half is the one that would rot silently. `SHELL_ENV_ALLOW` is
+    /// REQ-596 BR-2.1's recorded set and REQ-596 AC-3.2 asserts its literal
+    /// membership; if the opt-in ever mutated the constant instead of a copy,
+    /// that assertion would become a function of runtime config.
+    #[test]
+    fn the_opt_in_adds_one_name_to_the_allowlist_and_no_other() {
+        let off: BTreeSet<&str> = shell_env_allow(false).into_iter().collect();
+        let on: BTreeSet<&str> = shell_env_allow(true).into_iter().collect();
+
+        let gained: Vec<&&str> = on.difference(&off).collect();
+        let lost: Vec<&&str> = off.difference(&on).collect();
+        assert_eq!(
+            gained,
+            vec![&SSH_AUTH_SOCK],
+            "the opt-in admitted something other than the ssh agent socket"
+        );
+        assert!(
+            lost.is_empty(),
+            "the opt-in withdrew names it should have left alone: {lost:?}"
+        );
+
+        // The flag adds to a copy — the recorded constant is untouched.
+        assert_eq!(
+            off,
+            SHELL_ENV_ALLOW.iter().copied().collect::<BTreeSet<&str>>(),
+            "shell_env_allow(false) is no longer REQ-596 BR-2.1's recorded set"
+        );
+        assert!(
+            !SHELL_ENV_ALLOW.contains(&SSH_AUTH_SOCK),
+            "the opt-in mutated SHELL_ENV_ALLOW itself, so REQ-596 AC-3.2's membership \
+             assertion is now a function of runtime config"
+        );
+    }
+
+    /// REQ-607 AC-12 / BR-4 — every name the advisory may speak is in the
+    /// **documented** rejection table.
+    ///
+    /// BR-4 narrows REQ-596 BR-5 by exactly this much: a name is nameable in
+    /// tool output *because* it is in that table, public in the source and
+    /// identical on every installation. A code table that drifted from the doc
+    /// table would name something the narrowing does not license — and the
+    /// drift is silent, because nothing else reads the doc comment.
+    ///
+    /// The slice is **bounded to the table** rather than searched over the whole
+    /// file (conventions.md, REQ-600): `SSH_AUTH_SOCK` also appears as a
+    /// constant and inside `WITHHELD_DIAGNOSED`, and an unbounded search would
+    /// find those and pass with the table row deleted. The corpus is
+    /// `production_source`, which cuts at the first column-0 `#[cfg(test)]`, so
+    /// this test's own text cannot satisfy it.
+    ///
+    /// **Mutation run, both halves.** Renaming the rejection table's
+    /// `SSH_AUTH_SOCK` row to `SSH_AGENT_HANDLE_MUTANT` fails this test with
+    /// "WITHHELD_DIAGNOSED names SSH_AUTH_SOCK but the rejection table does
+    /// not" — 1 assertion. Then, with that mutation still in place, widening
+    /// `table` back to the whole `source` makes it **pass** (1 passed, 0
+    /// failed), because the constant and `WITHHELD_DIAGNOSED` both spell the
+    /// name elsewhere in the file. So the bound is not tidiness; it is the only
+    /// reason this check can fail at all.
+    #[test]
+    fn every_diagnosable_name_is_in_the_documented_rejection_table() {
+        let source = crate::call_sites::scan::production_source(
+            &crate::call_sites::scan::daemon_src().join("child_env.rs"),
+        );
+
+        // Bound the slice to the rejection table: from its header row to the
+        // constant the doc comment is attached to.
+        let start = source
+            .find("/// | Considered | Rejected because |")
+            .expect("the rejection table's header row");
+        let end = source[start..]
+            .find("pub(crate) const SHELL_ENV_ALLOW")
+            .expect("the constant the rejection table documents")
+            + start;
+        let table = &source[start..end];
+
+        let rows = table
+            .lines()
+            .filter(|l| l.trim_start().starts_with("/// |"));
+        assert!(
+            rows.count() >= 5,
+            "the bounded slice found fewer rejection-table rows than the table is known to \
+             have; the bounds have drifted and this check is passing vacuously"
+        );
+
+        let mut checked = 0_usize;
+        for var in WITHHELD_DIAGNOSED {
+            assert!(
+                table.contains(var.name),
+                "WITHHELD_DIAGNOSED names {} but the rejection table does not. BR-4 makes \
+                 that table the nameable set, so an advisory naming this variable would \
+                 disclose a name REQ-596 BR-5's narrowing does not license.",
+                var.name
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 1,
+            "the diagnosis table is empty, so this check proved nothing"
+        );
     }
 
     /// How far above a `.envs(` the composer call may sit and still count as the

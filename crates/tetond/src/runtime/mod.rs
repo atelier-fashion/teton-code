@@ -2928,20 +2928,35 @@ impl DaemonRuntime {
         }
     }
 
-    /// Every environment variable name a configured `env:<NAME>` credential
-    /// reference points at, read from the **live** config (REQ-596 BR-1).
+    /// Everything a spawned child's environment is composed from, read from the
+    /// **live** config under **one** lock (REQ-596 BR-1, REQ-607 ADR-C).
     ///
-    /// The daemon installs this as `child_env`'s credential-name source at
-    /// bootstrap, and it is called once per spawned `shell` child rather than
-    /// snapshotted, so a provider added mid-session is withheld from the very
-    /// next command instead of the next daemon start (LESSON-539).
+    /// The daemon installs this as `child_env`'s policy source at bootstrap, and
+    /// it is called once per spawned `shell` child rather than snapshotted, so a
+    /// provider added mid-session is withheld from the very next command instead
+    /// of the next daemon start (LESSON-539). The same now goes for
+    /// `[shell] allow_ssh_agent`: turning it off takes effect on the next
+    /// command, not the next daemon.
     ///
-    /// The derivation itself lives in [`crate::child_env`] beside the composer
-    /// that consumes it; this method is only the lock.
+    /// **One lock, both facts**, for [`DaemonRuntime::boundary_posture`]'s
+    /// reason: two readings across a concurrent `config/set` can disagree, and a
+    /// child composed from a credential set and an opt-in flag that were true at
+    /// different instants is composed from a policy that never existed.
+    ///
+    /// This **replaced** a narrower `credential_env_var_names` that returned the
+    /// credential set alone. Keeping both would have left a caller able to take
+    /// the credential half without the opt-in half — the very split this method
+    /// exists to make unrepresentable — and after REQ-607 it had no callers
+    /// left. The credential derivation itself is unmoved: it lives in
+    /// [`crate::child_env::credential_env_names_of`] beside the composer that
+    /// consumes it, and this method is only the lock.
     #[must_use]
-    pub fn credential_env_var_names(&self) -> std::collections::BTreeSet<String> {
+    pub fn child_env_policy(&self) -> crate::child_env::ChildEnvPolicy {
         let config = self.config.lock().expect("config mutex poisoned");
-        crate::child_env::credential_env_names_of(&config)
+        crate::child_env::ChildEnvPolicy {
+            credential_env_names: crate::child_env::credential_env_names_of(&config),
+            allow_ssh_agent: config.shell.allow_ssh_agent,
+        }
     }
 
     /// What this daemon's boundary configuration amounts to right now, read
@@ -9370,6 +9385,7 @@ provider_id = "on-device"
             lifetime: teton_core::LifetimeConfig::default(),
             permissions: teton_core::PermissionsConfig::default(),
             skills: teton_core::SkillsConfig::default(),
+            shell: teton_core::config::ShellConfig::default(),
             providers: vec![ModelProvider {
                 id: "remote".to_owned(),
                 kind: ProviderKind::OpenaiCompatible,
@@ -9696,6 +9712,7 @@ provider_id = "on-device"
             lifetime: teton_core::LifetimeConfig::default(),
             permissions: teton_core::PermissionsConfig::default(),
             skills: teton_core::SkillsConfig::default(),
+            shell: teton_core::config::ShellConfig::default(),
             providers: vec![
                 ModelProvider {
                     id: "anthropic".to_owned(),

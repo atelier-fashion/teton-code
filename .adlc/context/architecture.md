@@ -108,6 +108,21 @@
   REQ-596, which closed the cheaper half — the child no longer holds a configured
   credential. A documented guarantee that is false is worse than a narrower one
   that is true.
+- **A withheld capability explains itself at the point it bites** — when a
+  security decision removes something a user's command needs, the resulting
+  failure names the daemon and the key that reverses it, on the failing call and
+  nowhere else. Three properties make that honest rather than noisy. The advisory
+  fires on what the child **actually lacked** — read off the composed
+  environment, never inferred from the rules that built it — so a machine that
+  never had the variable is not told a story about it, and a user who takes the
+  remedy stops being told to take it. It is a sentence on the **tool result**
+  rather than an event, because an event carrying the withheld set is a
+  disclosure surface with no actionable payload (REQ-596 OQ-1, REQ-607 BR-3). And
+  the names it may speak come from a **statically documented** table, so the
+  sentence discloses what any reader of the repository already knows and nothing
+  about this machine. The escape hatch beside it is one named boolean, never a
+  list: a list is the general `extra_env` that reopens the class the allowlist
+  closed (REQ-607, LESSON-578).
 - **Policy is pure, mechanism is gated** — when a subsystem's interesting logic
   sits behind a non-default cargo feature CI never compiles, the *decision* is
   extracted into a feature-free module over plain data and the gated module is

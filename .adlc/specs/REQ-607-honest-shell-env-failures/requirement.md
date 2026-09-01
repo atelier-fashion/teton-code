@@ -1,7 +1,7 @@
 ---
 id: REQ-607
 title: "A withheld variable should not look like an ssh problem, and the agent should be opt-in-able"
-status: draft
+status: complete
 deployable: true
 created: 2026-08-31
 updated: 2026-09-01
@@ -70,6 +70,15 @@ visible and escapable.
       tool result carries one additional sentence naming **Teton** as the cause
       and the config key that changes it. A user must be able to reach the
       explanation from the failure alone, without knowing REQ-596 exists.
+  - **The config-key clause is conditional, because not every withheld variable
+    has a key.** `allow_ssh_agent` admits `SSH_AUTH_SOCK` and nothing else
+    (BR-5), and a general `[shell] extra_env` is refused in Out of Scope — so a
+    row for a variable with no opt-in must not invent one. Where a key exists
+    the sentence names it; where none does, it names the rejection table in
+    `child_env.rs` as the place the decision is recorded. Either way the user
+    lands somewhere that explains the absence, which is the whole of BR-1's
+    promise. Naming a remedy no command can reach is BUG-205's failure mode and
+    the thing this rule exists to avoid.
 - [ ] BR-2: The advisory is attached **only to a failing invocation**. A command
       that succeeded is not annotated, and neither is a command whose failure has
       nothing to do with the environment. A notice on every call is noise, and
@@ -105,6 +114,13 @@ visible and escapable.
 - [ ] BR-6: The opt-in is explicit and **greppable**, the shape BUG-202 settled
       on for `allow_cleartext` (LESSON-578): a secure default plus one named key,
       never a heuristic that guesses when the agent is wanted.
+  - **No AC, deliberately.** BR-6 constrains the *shape* of the design, not an
+    observable a test can read: every behaviour it would assert is already
+    pinned by AC-7 (the key admits the variable) and AC-8 (it admits nothing
+    else), and an AC of the form "there is no heuristic" is unfalsifiable.
+    `/architect` answers it in prose — naming the key, its default, and where a
+    reader greps for it — and that answer is the record. Stated here so the
+    absence reads as a decision rather than an omission.
 - [ ] BR-7: The opt-in does not weaken REQ-596's guarantees. BR-1's unconditional
       credential removal, BR-3's after-the-allowlist ordering, and BR-8's
       `looks_like_credential_url` value check all still run, and

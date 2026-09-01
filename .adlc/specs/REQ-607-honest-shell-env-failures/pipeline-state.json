@@ -1,0 +1,98 @@
+{
+  "req": "REQ-607",
+  "branch": "feat/REQ-607-honest-shell-env-failures",
+  "startedAt": "2026-08-31T00:00:00Z",
+  "completed": false,
+  "currentPhase": 8,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "integrationBranch": "main",
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree + Preflight",
+      "completedAt": "2026-08-31T00:00:00Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-08-31T00:00:00Z",
+      "result": "APPROVED after 1 fix loop"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Tasks",
+      "completedAt": "2026-08-31T00:00:00Z",
+      "result": "5 ADRs, TASK-350..355"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-08-31T00:00:00Z",
+      "result": "APPROVED after 1 fix loop"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-08-31T00:00:00Z",
+      "result": "TASK-350..355 complete"
+    },
+    {
+      "phase": 5,
+      "name": "Verify",
+      "completedAt": "2026-08-31T00:00:00Z",
+      "result": "4 findings fixed (1 major bug, 1 doc/behaviour mismatch, 1 wording, 2 missing guards)"
+    },
+    {
+      "phase": 6,
+      "name": "Create PR",
+      "completedAt": "2026-08-31T00:00:00Z",
+      "result": "PR #260 ready for review"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-08-31T00:00:00Z",
+      "result": "7/7 checks green (macos + ubuntu); fmt drift fixed"
+    }
+  ],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-607",
+      "branch": "feat/REQ-607-honest-shell-env-failures",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/260",
+      "prNumber": 260,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-350",
+      "TASK-351",
+      "TASK-352",
+      "TASK-353",
+      "TASK-354",
+      "TASK-355"
+    ],
+    "failedTasks": []
+  },
+  "blockers": [],
+  "notes": []
+}
