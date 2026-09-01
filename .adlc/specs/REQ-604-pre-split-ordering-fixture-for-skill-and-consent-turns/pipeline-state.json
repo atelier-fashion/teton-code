@@ -2,7 +2,7 @@
   "req": "REQ-604",
   "branch": "feat/REQ-604-pre-split-ordering-fixture-for-skill-and-consent-turns",
   "startedAt": "2026-08-31T00:00:00Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -57,6 +58,11 @@
       "phase": 7,
       "name": "PR Cleanup & CI",
       "completedAt": "2026-09-01T00:27:47.161421Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup and Merge",
+      "completedAt": "2026-09-01T01:06:10.775952Z"
     }
   ],
   "repos": {
@@ -68,9 +74,13 @@
       "touched": true,
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/258",
       "prNumber": 258,
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
-      "snapshotPR": null
+      "snapshotPR": null,
+      "mergeCommit": "4b1d22c",
+      "mergedBy": "sprint-orchestrator (cluster order 603 -> 604 -> 606)",
+      "rebasedHead": "b279cc9",
+      "wrapupPR": "https://github.com/atelier-fashion/teton-code/pull/263"
     }
   },
   "mergeOrder": [
@@ -88,13 +98,14 @@
     "failedTasks": []
   },
   "notes": [
-    "Sprint override: this runner is SECOND in the overlap cluster {REQ-603, REQ-604, REQ-606} and does NOT merge its own PR. Terminal claim is pr-ready.",
-    "The /sprint orchestrator owns BOTH the merge (sequenced 603 -> 604 -> 606 behind a trial-merge gate) AND the Phase 8b close-out (/wrapup, worktree teardown, and the terminal record: completed:true, currentPhase:8, 8 appended to completedPhases, a phase-8 phaseHistory entry, repos.teton-code.merged:true).",
-    "completed:false is deliberate here, not an abandoned run. Phases 0-7 are done; phase 8 is the orchestrator's.",
-    "AC-3 is recorded N/A, not met: both captured sequences replayed unmodified on the first run, so the disposition machinery was never exercised. Neither fixture was regenerated at any point.",
-    "Assumption VERIFIED: 17c39ec builds (cargo build --tests -p tetond clean; 1,932 lib tests run there).",
-    "Rebase expectation: REQ-603 (PR #256) merges ahead of this branch and relocates a session-lifecycle slice out of crates/tetond/src/runtime/mod.rs, which is the file this REQ adds a test module to. Trial-merge against origin/main 391091a is rc=0 as of phase 7, but that is BEFORE 603 lands; re-gate after it merges.",
-    "REQ-606 AC-4 depends on the REQ-598 fixture replaying unregenerated. This REQ does not touch that fixture and its test is still green."
+    "MERGED as 4b1d22c via PR #258. The /sprint orchestrator performed the merge (this runner was second in the overlap cluster {REQ-603, REQ-604, REQ-606} and was instructed not to self-merge); this runner performed the Phase 8b close-out.",
+    "Wrapup PR #263 (chore/REQ-604-wrapup) carries this close-out: knowledge, assumption disposition and terminal record. Merged by the orchestrator.",
+    "AC-3 recorded N/A, NOT met: both captured sequences replayed unmodified on the first run, so its trigger never fired and ADR-7's disposition protocol remains unexercised. A criterion whose condition did not arise is not a criterion met.",
+    "ASSUME-030 validated: 17c39ec builds. Non-recurring \u2014 a future pre-split capture must re-verify its own capture commit.",
+    "Knowledge captured: LESSON-608 (a golden fixture records its discriminator), LESSON-609 (same entry point is not same invocation), LESSON-610 (a session scratchpad is not per-agent). Ids measured against the actual high-water across all six ADLC repos (global max was LESSON-607, ASSUME-029, both taken by REQ-603) -- the id allocator was NOT used, per coordinator instruction after it issued three colliding ids on 2026-08-31.",
+    "EVIDENCE INTEGRITY: this runner clobbered REQ-606's suite results file by writing generic filenames into the shared session scratchpad. REQ-604's own figures were verified as genuinely its own AND re-derived from an isolated path on merged main -- identical (4,078 passed / 0 FAILED / 74 targets). Authoritative evidence was CI, which never touched the scratchpad. See LESSON-610.",
+    "Post-merge verification on merged main (4b1d22c, post-REQ-603): full suite 4,078 passed / 0 FAILED / 74 targets; clippy clean under deny; fmt clean; the four req604_event_order tests green.",
+    "REQ-598 fixture never regenerated -- last touched by e019665 (REQ-598's own commit). REQ-606's AC-4 dependency is intact."
   ],
   "blockers": []
 }
