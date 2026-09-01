@@ -105,15 +105,39 @@ of scope.
       `main` requires" is **asserted from inside the repository**, so a future
       divergence fails a run instead of going unnoticed. Adding one context by
       hand fixes one instance; it does not make the next one visible.
-- [ ] BR-3: The assertion is **derived, not duplicated**. It reads the job names
-      out of `ci.yml` (matrix legs expanded) and compares them against what the
-      forge reports. A hand-maintained second list of check names is the same
-      drift with an extra place to forget.
-- [ ] BR-4: The check is **two-directional**. `missing` (defined but not
-      required) is today's defect. `stale` (required but no longer defined) is
-      the mirror, and it is worse: a required context that can never report
-      blocks every merge until an admin intervenes. Both are reported; the REQ
-      decides in `/architect` whether both fail the run.
+- [ ] BR-3: The assertion is **derived, not duplicated**, and the derivation rule
+      is written down rather than left implicit. A hand-maintained second list of
+      check names is the same drift with an extra place to forget. The rule:
+  - A job's check-run context is its rendered `name:` when it declares one, and
+    its **job key** when it does not.
+  - A matrix job appends ` (<value>)` per dimension, in declaration order.
+  - Every job in `ci.yml` today declares a `name:`, and `check` is the only
+    matrix and is single-dimension. So a parser that mishandles either case
+    works **now** and fails silently later — which is why the rule is stated
+    here, so the next reader can tell a limitation from a bug.
+  - Where the derivation cannot produce a context with confidence, the check
+    **says so and fails** (BR-5). It must never drop an underivable job from the
+    comparison — a job silently excluded is a job silently unrequired, which is
+    this REQ's own defect reappearing inside its fix.
+- [ ] BR-4: The check is **two-directional, and both directions fail the run.**
+      `missing` (defined but not required) is today's defect. `stale` (required
+      but no longer defined) is the mirror. The decision to fail on both is made
+      here, not deferred to `/architect`, and rests on three measured facts:
+  - **`missing` self-scopes.** Every job uses plain `actions/checkout@v4` with no
+    `ref:` override, and a `pull_request` event checks out the merge ref — so the
+    check reads *the PR's* `ci.yml`. A contributor who adds a job sees red on
+    their own PR only; unrelated PRs still carry `main`'s `ci.yml`, still match
+    protection, and stay green. Failing costs no one else anything.
+  - **`stale` costs nothing to fail on.** A required context that can never
+    report already blocks every PR — the forge sits at "Expected — waiting for
+    status to be reported" indefinitely. The check adds the diagnosis, not the
+    blocking.
+  - **Scoping the check to PRs that touch `ci.yml` was considered and rejected.**
+    It would be blind to divergence introduced from the *protection* side — an
+    admin editing required checks — which is precisely how this defect was born:
+    protection was written with six contexts and no `ci.yml` change was involved.
+    A diff-scoped check would not have caught the bug this REQ exists to close.
+  - The one repo-wide failure this decision *can* cause is BR-9's, named there.
 - [ ] BR-5: The check **fails closed**. If it cannot read the protection API —
       no token, insufficient scope, API error — it refuses and says why. It must
       never treat "could not read" as "matches". A suite that declines is
@@ -130,22 +154,48 @@ of scope.
       lands.
 - [ ] BR-8: `ci.yml`'s `gated` comment is corrected to cite **BUG-167**, the bug
       it actually describes, in place of BUG-166.
+- [ ] BR-9: **The one repo-wide failure this check can cause is named, not
+      designed around.** If an admin removes a required context, `main`'s
+      `ci.yml` and protection disagree, and — because every PR carries that
+      `ci.yml` — every PR goes red until the disagreement is resolved. That is
+      the correct response to someone silently weakening the merge gate, and it
+      is reversible in one edit. The check's failure output must therefore name
+      **both** remedies explicitly: revert the protection edit, or update
+      `ci.yml` to match the intended set. A wall of red whose cause takes ten
+      minutes to work out is a worse outcome than the drift it reports.
+- [ ] BR-10: **The protection read does not widen the workflow's blast radius.**
+      `ci.yml` declares `permissions: contents: read` at workflow scope with no
+      job-level override, and its own header records that the grant is narrow
+      *because* this workflow executes repo-authored shell (`tools/release/selftest.sh`)
+      on every PR. Whatever token the read uses, the widened permission is scoped
+      to the job that performs it and no other, and no job that executes
+      repo-authored shell gains it. If the mechanism chosen needs a long-lived
+      PAT rather than a job-scoped `administration: read`, that is a new standing
+      secret and the reason it was preferred is recorded in the architecture doc.
 
 ## Acceptance Criteria
 
 - [ ] AC-1: `main`'s required status checks include `feature-gated targets
       compile (all features)`. Evidenced by the `gh api .../branches/main/protection`
       response before and after, both recorded.
-- [ ] AC-2: **The defect is demonstrated before it is fixed.** A branch whose
-      `gated` job fails — e.g. a deliberate `--all-features` compile error behind
-      `#[cfg(feature = "llama")]` — is shown to be mergeable under the current
-      protection, and not mergeable after. Asserted on the forge's own
-      mergeability verdict, not on a local prediction. If demonstrating this on a
-      real PR is judged too costly or too risky against `main`, say so and record
-      what was checked instead — do not tick this from reasoning alone.
+- [ ] AC-2: **The defect is demonstrated before it is fixed, and the "before"
+      half is not negotiable.** A branch whose `gated` job fails — e.g. a
+      deliberate `--all-features` compile error behind `#[cfg(feature = "llama")]`
+      — is shown to be **mergeable under the current protection**. That half is
+      required unconditionally: it is cheap, needs no admin, involves merging
+      nothing, and *is* the defect claim this REQ rests on. Asserted on the
+      forge's own mergeability verdict, never on a local prediction.
+  - The **"after" half** — the same branch shown not mergeable once the context
+    is required — is the negotiable one. If it is judged too costly or too risky
+    against `main`, say so and record exactly what was checked instead.
+  - An escape hatch on the whole criterion would leave the REQ's central
+    evidential claim to an unbounded judgment call. Splitting it puts the floor
+    where the evidence is cheapest and the claim strongest.
 - [ ] AC-3: A check inside the repository compares `ci.yml`'s defined job names
-      against the forge's required contexts and fails on a mismatch. Its two
-      directions (`missing`, `stale`) are both computed and both rendered.
+      against the forge's required contexts. Both directions (`missing`, `stale`)
+      are computed, both are rendered, and **both fail the run** — per BR-4,
+      which settles this rather than leaving it to the implementer. Each failure
+      names BR-9's two remedies.
 - [ ] AC-4: **BR-3 guard.** The check derives job names by parsing `ci.yml`,
       matrix legs expanded. Adding a job to `ci.yml` without adding it to
       protection turns the check red with no edit to the check itself. Asserted
@@ -164,7 +214,16 @@ of scope.
 - [ ] AC-8: `ci.yml`'s `gated` comment cites BUG-167. The claim it makes about
       `template_smoke.rs` is checked against BUG-167's own description rather
       than carried over.
-- [ ] AC-9: `.github/workflows/*` still passes `actionlint`, and the full suite
+- [ ] AC-9: **BR-10 guard.** The widened permission is scoped to the job that
+      performs the protection read: `ci.yml`'s workflow-level grant is still
+      `contents: read`, and no job that runs repo-authored shell carries the
+      wider grant. Asserted by reading the merged workflow, and stated as a
+      diff of what each job's effective permissions were before and after.
+- [ ] AC-10: **BR-9 guard.** The check's failure output, for both directions,
+      names both remedies — revert the protection edit, or update `ci.yml`.
+      Asserted against the rendered failure text, not the source of the message
+      (LESSON-519).
+- [ ] AC-11: `.github/workflows/*` still passes `actionlint`, and the full suite
       is green, grepped for `FAILED`.
 
 ## External Dependencies
@@ -209,12 +268,14 @@ of scope.
       defines is required" is the rule — making BR-2's check an equality rather
       than a subset test — is a broader policy call that affects any future job
       added as advisory-only.
-- [ ] OQ-3: **What token, and is widening the permission acceptable?** Reading
-      protection needs more than `contents: read`. The workflow's own comment
-      notes that its permissions are declared narrowly on purpose because it
-      executes repo-authored shell on every PR. Widening the workflow-wide grant
-      to read protection would relax that deliberately-tight boundary; a
-      job-scoped widening, or a separate minimal job, may be the better shape.
+- [ ] OQ-3: **Which token mechanism?** Narrowed, not settled. BR-10 now rules
+      the part that is a constraint rather than a choice: the widened permission
+      is job-scoped, and no job running repo-authored shell gains it. What
+      remains open is the mechanism — a job-scoped `administration: read` on the
+      existing job, a separate minimal job that does only the read, or a PAT.
+      `/architect` picks one and records why; if it picks the PAT, BR-10 requires
+      the reason to be written down, because a long-lived standing secret is a
+      different class of thing from a scoped grant.
 - [ ] OQ-4: `main` currently has `required_pull_request_reviews: false` — no
       review approval is required to merge. That is a separate and larger
       decision than this REQ, noted here only because it was measured at the same
