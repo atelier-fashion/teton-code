@@ -663,6 +663,51 @@ mod tests {
         assert!(value_of(&composed, SSH_AUTH_SOCK).is_none());
     }
 
+    /// REQ-607's Permissions row — `allow_ssh_agent` is the **config author's**
+    /// decision, never the model's and never a tool call's.
+    ///
+    /// The row is a real constraint and today it holds structurally: `apply_update`
+    /// is the one function that turns a client-issued `ConfigUpdate` into a
+    /// mutation of the loaded config, and none of its arms touches `config.shell`.
+    /// A client cannot reach the key at all.
+    ///
+    /// Nothing in the REQ's BR or AC list pins that, which is exactly why it is
+    /// worth a guard: the row would be silently violated the day someone adds a
+    /// `ConfigUpdate::SetShell` variant, and the violation would look like an
+    /// ordinary feature addition. What would have to change first is
+    /// `apply_update` naming the field.
+    ///
+    /// **Mutation run.** Adding `config.shell.allow_ssh_agent = true;` to any arm
+    /// of `apply_update` fails this test with "the client-driven config-update
+    /// path writes `config.shell`" (1 assertion).
+    #[test]
+    fn no_client_driven_config_update_can_admit_the_agent() {
+        let source = crate::call_sites::scan::production_source(
+            &crate::call_sites::scan::daemon_src().join("runtime/mod.rs"),
+        );
+        let at = source
+            .find("fn apply_update(")
+            .expect("the config-update application path");
+        // Bound the slice to this function: `.shell` appears elsewhere in a file
+        // this size, and an unbounded search would be a claim about the whole
+        // module (conventions.md, REQ-600).
+        let body = &source[at..];
+        let end = body.find("\n}\n").map_or(body.len(), |e| e + 2);
+        let body = &body[..end];
+        assert!(
+            body.contains("ConfigUpdate::"),
+            "the bounded slice does not look like apply_update's body, so this check is \
+             reading the wrong region and passing vacuously"
+        );
+        assert!(
+            !body.contains(".shell"),
+            "the client-driven config-update path writes `config.shell`. REQ-607's \
+             Permissions row makes admitting the ssh agent the config author's decision \
+             and never the model's — a client-issued update that can set it hands a \
+             model the ability to grant itself the user's agent."
+        );
+    }
+
     /// REQ-607 AC-7 / BR-8 — with the flag **off**, the agent socket is absent;
     /// with it **on**, present.
     ///
@@ -677,7 +722,7 @@ mod tests {
     fn with_the_flag_off_the_agent_socket_is_absent() {
         let daemon = vars(&[
             ("PATH", "/usr/bin"),
-            ("HOME", "/home/sentinel"),
+            ("HOME", "/home/SENTINEL-home"),
             (SSH_AUTH_SOCK, "/tmp/SENTINEL-agent.sock"),
         ]);
 
@@ -727,7 +772,7 @@ mod tests {
     fn the_opt_in_admits_exactly_one_more_entry_in_both_directions() {
         let daemon = vars(&[
             ("PATH", "/usr/bin"),
-            ("HOME", "/home/sentinel"),
+            ("HOME", "/home/SENTINEL-home"),
             ("LANG", "en_US.UTF-8"),
             (SSH_AUTH_SOCK, "/tmp/SENTINEL-agent.sock"),
             // Not on any allowlist — present so the composed map is a filter

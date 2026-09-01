@@ -756,9 +756,13 @@ fn withheld_advisory(
             var.name
         ),
     };
+    // Phrased to avoid an indefinite article before the program name: "an ssh
+    // problem" and "a git problem" take different ones, and a hardcoded article
+    // is wrong for most of the table. A sentence about clarity should not
+    // itself read as a template someone forgot to finish.
     Some(format!(
         "\n[teton] This may have failed because Teton withholds {} from shell commands, \
-         rather than because of an {} problem — {}.\n",
+         rather than because of a problem with `{}` — {}.\n",
         var.name, program, remedy,
     ))
 }
@@ -1152,7 +1156,7 @@ mod tests {
         let sentence = withheld_advisory("cd /repo && ssh host", &withheld)
             .expect("the command names ssh in a later segment");
         assert!(
-            sentence.contains("an ssh problem"),
+            sentence.contains("a problem with `ssh`"),
             "the advisory blamed the wrong program: {sentence}"
         );
         assert!(
