@@ -3,13 +3,14 @@
   "branch": "feat/REQ-604-pre-split-ordering-fixture-for-skill-and-consent-turns",
   "startedAt": "2026-08-31T00:00:00Z",
   "completed": false,
-  "currentPhase": 5,
+  "currentPhase": 6,
   "completedPhases": [
     0,
     1,
     2,
     3,
-    4
+    4,
+    5
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -39,6 +40,11 @@
       "phase": 4,
       "name": "Implement",
       "completedAt": "2026-09-01T00:20:09.942114Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify",
+      "completedAt": "2026-09-01T00:25:45.694150Z"
     }
   ],
   "repos": {
@@ -59,12 +65,13 @@
     "teton-code"
   ],
   "phase4": {
-    "currentTask": "TASK-005",
+    "currentTask": null,
     "completedTasks": [
       "TASK-001",
       "TASK-002",
       "TASK-003",
-      "TASK-004"
+      "TASK-004",
+      "TASK-005"
     ],
     "failedTasks": []
   },
