@@ -3,10 +3,38 @@
   "branch": "feat/REQ-603-extract-the-session-lifecycle-slice",
   "startedAt": "2026-08-31T00:00:00Z",
   "completed": false,
-  "currentPhase": 0,
-  "completedPhases": [],
+  "currentPhase": 4,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3
+  ],
   "integrationBranch": "main",
-  "phaseHistory": [],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree + Preflight",
+      "completedAt": "2026-09-01T00:01:21.779053Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-09-01T00:01:53.237421Z",
+      "result": "APPROVED"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Tasks",
+      "completedAt": "2026-09-01T00:12:04.597557Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-09-01T00:15:10.809942Z",
+      "result": "APPROVED"
+    }
+  ],
   "repos": {
     "teton-code": {
       "primary": true,
@@ -14,15 +42,21 @@
       "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-603",
       "branch": "feat/REQ-603-extract-the-session-lifecycle-slice",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/256",
+      "prNumber": 256,
       "merged": false,
       "snapshotBranch": null,
       "snapshotPR": null
     }
   },
-  "mergeOrder": ["teton-code"],
-  "phase4": { "currentTask": null, "completedTasks": [], "failedTasks": [] },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  },
   "blockers": [],
   "notes": []
 }
