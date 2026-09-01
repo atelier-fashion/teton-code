@@ -2,7 +2,7 @@
   "req": "REQ-606",
   "branch": "feat/REQ-606-collapse-the-turn-path-bundles",
   "startedAt": "2026-09-01T00:02:06Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -55,6 +56,11 @@
       "phase": 7,
       "name": "PR Cleanup & CI",
       "completedAt": "2026-09-01T01:55:00Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup and Merge",
+      "completedAt": "2026-09-01T03:10:00Z"
     }
   ],
   "repos": {
@@ -66,9 +72,11 @@
       "touched": true,
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/257",
       "prNumber": 257,
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
-      "snapshotPR": null
+      "snapshotPR": null,
+      "mergeCommit": "d8871b831c4d91c4c1214cad02163311a3e269b2",
+      "mergedFrom": "dfd6ff4a5e403db1067f08638101ae5a56698a8a"
     }
   },
   "mergeOrder": [
@@ -86,13 +94,13 @@
     "failedTasks": []
   },
   "notes": [
-    "Sprint overlap cluster {REQ-603, REQ-604, REQ-606}; REQ-606 is third. Orchestrator owns the merge \u2014 this runner stops at pr-ready per dispatch override.",
     "AC-4 two of three: invariant 1 (typed-outcome arms before the generic remote arm) is NOT pinned \u2014 deleting the spend-ceiling arm leaves all 4,074 tests green. Pre-existing; arms byte-identical to origin/main. Needs its own REQ.",
-    "TERMINAL: pr-ready. Dispatch override \u2014 REQ-606 is THIRD in overlap cluster {603,604,606}; the ORCHESTRATOR owns the merge AND the Step 8b close-out (/wrapup, worktree teardown, completed:true). Exiting completed:false deliberately, not abandoned.",
     "REQ-603 (7fe035c) merged during Phase 7 and touches 4 crates/ files incl. runtime/mod.rs. Rebased onto it and RE-RAN all five mutations per ADR-2: invariants 3/5 and substitutes 2/4 all red again; invariant 1 still green. Suite 4,074/0; AC-3 unchanged at 185 lines / depth 5.",
     "REQ-604 (4b1d22c) merged; rebased clean (this REQ never edits mod.rs). Re-ran the five-mutation table a THIRD time on the final tree, asserting each patch applied before running its guard: invariants 3/5 and substitutes 2/4 all RED; invariant 1 GREEN on all three trees. Suite 4,078/0. AC-3 unchanged 185 lines / depth 5. REQ-598 fixture still unregenerated.",
-    "FINAL: PR #257 at 253a7e8 \u2014 OPEN / MERGEABLE / CLEAN / up-to-date with origin/main 4b1d22c (strict branch protection satisfied). CI run 33457527874 headSha=253a7e8 conclusion=success, all 7 checks pass.",
-    "Knowledge ids taken by REQ-606: LESSON-611 only. Measured by hand, NOT allocated \u2014 high-water is LESSON-610 + ASSUME-030 on the unmerged chore/REQ-604-wrapup branch, above main's LESSON-607/ASSUME-029. Next free after REQ-606: LESSON-612, ASSUME-031.",
-    "Assumption dispositions (recorded in requirement.md, no ASSUME id taken): (1) 'bundles can be collapsed without exceeding the arg limit' INVALIDATED \u2014 12 of 14 cannot, which is the REQ's headline result; (2) AC-3 body-length budget HELD \u2014 188 to 185 against a limit of 200."
-  ]
+    "TERMINAL: merged. PR #257 squashed to main as d8871b8 from dfd6ff4 (CI run 33458140668, all 7 checks green). Orchestrator owned the merge per dispatch override; this runner never held it. Phase 8b close-out run by this runner afterwards.",
+    "AC-4 invariant 1 remains NOT MET by design. Green on THREE independent trees (391091a 4,074/0; 7fe035c 4,074/0; 4b1d22c 4,078/0) with the arm-deletion PROVEN applied each time (final: 1,475 bytes / 25 lines, is_spend_ceiling_reached 1->0). Needs its own REQ; fixture must drive ProviderError::SpendCeilingReached through run_attempts.",
+    "Knowledge ids taken by REQ-606: LESSON-611 (merged inside d8871b8), ASSUME-031 (invalidated), ASSUME-032 (validated). All measured by hand against origin/main AND unmerged sibling branches, not allocated.",
+    "Process fact recorded in requirement.md: a /sprint pipeline-runner never invokes the delegate \u2014 /proceed Phase 5 skips the adlc-read pre-pass outright in subagent mode, so the delegation gate is never consulted and delegate-gate.sh changes are irrelevant to a sprinted REQ."
+  ],
+  "terminalState": "merged"
 }
