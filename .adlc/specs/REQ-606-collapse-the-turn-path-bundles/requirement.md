@@ -1,7 +1,7 @@
 ---
 id: REQ-606
 title: "Collapse the turn-path parameter bundles that carry no invariant"
-status: approved
+status: complete
 deployable: false
 created: 2026-09-01
 updated: 2026-09-01
@@ -65,18 +65,18 @@ roughly five earn a name and the rest are transport:
 
 ## Acceptance Criteria
 
-- [ ] AC-1: Each of the fourteen named in the Description's table is
+- [x] AC-1: Each of the fourteen named in the Description's table is
       classified: **carries an invariant** (keep), **transport** (collapse), or
       **deliberate duplication with a stated reason** (keep, and say the reason
       in the type's doc). The classification is the deliverable; the count that
       results is not a target.
-- [ ] AC-2: No `#[allow(clippy::too_many_arguments)]` is added.
+- [x] AC-2: No `#[allow(clippy::too_many_arguments)]` is added.
       `suppression_ratchet.rs` stays green at its recorded figure, or the figure
       moves deliberately with what collapsed named.
-- [ ] AC-3: `run_prompt_turn`'s body stays under 200 lines (REQ-600 AC-1) and
+- [x] AC-3: `run_prompt_turn`'s body stays under 200 lines (REQ-600 AC-1) and
       `run_session_turn_with_pressure_policy` stays at brace depth 5 or below
       (REQ-600 AC-3), both under the rules those ACs state.
-- [ ] AC-4: Behaviour unchanged: the REQ-598 event fixture replays unregenerated, and
+- [~] AC-4 **— two of three; invariant 1 NOT pinned, see Verification.** Behaviour unchanged: the REQ-598 event fixture replays unregenerated, and
       **each of REQ-600 BR-3's three testable ordering invariants — 1, 3 and 5 —
       still fails on its inversion, re-run rather than re-asserted.** REQ-600
       shipped a guard that silently stopped covering its subject when code
@@ -95,7 +95,77 @@ roughly five earn a name and the rest are transport:
     assertion for invariant 4. If this REQ's collapse changes a signature such
     that invariant 2's ordering stops being compiler-enforced, that is a finding
     to record, not a substitution to make quietly.
-- [ ] AC-5: Suite green, grepped for `FAILED`; clippy 0 under `deny`; fmt clean.
+- [x] AC-5: Suite green, grepped for `FAILED`; clippy 0 under `deny`; fmt clean.
+
+## Verification (TASK-005)
+
+`cargo test --workspace --no-fail-fast`: **4,074 passed, 0 failed**, output
+grepped for `FAILED` — **0 occurrences**, `EXIT=0`, 74 targets.
+`cargo clippy --workspace --all-targets -- -D warnings`: **0**.
+`cargo fmt --all --check`: clean.
+
+Every figure below states its rule and was re-derived at this REQ's tree, not
+carried over from REQ-600's record.
+
+| AC | status | evidence |
+|---|---|---|
+| AC-1 | met | All fourteen classified, each verdict and its rule written into the type's own doc. **Twelve keep, two collapse** — the opposite weighting to review's "roughly five earn a name", and decided by arithmetic rather than taste (see below). `PreparedAttempts` deleted; `ToolCallSite` 5 fields → 3. `route`/`probed`/`turn_id` duplication carries its stated reason in `AttemptInputs`' doc. |
+| AC-2 | met | **No suppression added or removed** — `git diff origin/main..HEAD` over `crates/**/*.rs` matches zero `allow(clippy` lines in either direction. `suppression_ratchet.rs` green at its recorded figure (3 tests). |
+| AC-3 | met | `run_prompt_turn` body span **188 → 185** lines (signature line through closing brace, REQ-600 AC-1's rule), against 200. `run_session_turn_with_pressure_policy` brace depth **5 → 5**, unchanged. **Instrument note:** this REQ's counter reads the baseline at 5 where REQ-600 recorded 4 — an off-by-one in whether the body's own brace counts as depth 1. Both figures come from one instrument applied to both trees, so the *delta* is sound and it is zero; the absolute figure is reported under this REQ's rule and passes either way. |
+| AC-4 | **two of three** | Invariants **3** and **5** re-run and observed red. Substitutes for **2** and **4** re-run and observed red. **Invariant 1 is NOT pinned — see the finding below.** REQ-598 event fixture replays **unregenerated** (`git diff origin/main..HEAD -- crates/tetond/tests/` is empty). |
+| AC-5 | met | Figures at the head of this section. |
+
+### Mutations, run on the changed tree and observed
+
+Every one applied to **this REQ's** tree and reverted, per AC-4's "re-run rather
+than re-asserted". The first attempt at the invariant-3 mutation is included
+because it is the failure mode AC-4 exists to catch: a bad line index meant the
+edit never applied, and the guard passed — a green that proved nothing. It was
+caught by asserting on the patch, not by reading the result.
+
+| # | instrument | mutation | observed |
+|---|---|---|---|
+| 1 | inversion | generic remote arm moved ahead of the typed spend-ceiling arm | **GREEN — suite unchanged at 4,074** |
+| 1 | deletion (decisive) | the spend-ceiling arm deleted outright | **GREEN — suite unchanged at 4,074** |
+| 2 | substitute | a second `PermissionGate::with_level` construction | RED: "constructed 2 time(s)" |
+| 3 | inversion | claim and registry re-read swapped | RED: "claim at byte 2365 and the re-read at byte 1404" |
+| 3 | (first attempt) | index off by one — patch never applied | GREEN, and meaningless. Recorded. |
+| 4 | substitute | `fs::read_to_string` added inside `run_the_allowed_tool` | RED: "1x `fs::read_to_string(`" — and it caught it in the one function this REQ changed |
+| 5 | inversion | the hold's rebind de-shadowed, so the context carries the pre-hold router | RED: "the context is carrying the pre-hold router" |
+
+### Finding — invariant 1 is not pinned, and REQ-600's table overstated it
+
+REQ-600's architecture recorded invariant 1 ("typed-outcome arms before the
+generic remote arm") as **PINNED — 3 tests**, and REQ-600's AC-4 counted it
+among the three that hold. On this tree it does not hold, and the check is not
+close: **deleting the spend-ceiling arm entirely leaves all 4,074 tests green.**
+
+That deletion is precisely the defect REQ-588 BR-3 names — "without this branch a
+budget stop would fall through to *provider failed unrecoverably* — a sentence
+that is wrong about the cause, silent about the money, and names no remedy."
+
+Two things make the reading precise:
+
+- **The ordering only ever had teeth in one place.** `ContextLengthExceeded` and
+  `LocalContextLengthExceeded` are their own `HarnessError` variants, not
+  refinements of `Remote(_)`, so their position relative to the generic remote
+  arm cannot change behaviour. The only overlapping pair is the spend-ceiling
+  guard against `Remote(perr) if st.attempts < 2` — and nothing drives a ceiling
+  stop through the loop on a first attempt.
+- **The three credited tests pin the choke point, not the arm.** The ceiling
+  refusal is composed in `egress/mod.rs` and is covered there. The turn-path arm
+  is a second, distinct site, and it is uncovered.
+
+**Not a regression from this REQ.** The match arms are byte-identical to
+`origin/main` — verified by diff, not by inspection — and no test changed.
+
+**Recorded NOT MET rather than fixed here, deliberately.** Closing it needs a
+fixture that drives `ProviderError::SpendCeilingReached` through `run_attempts`,
+which exists nowhere today: the variant is only ever produced from
+`TransportError::SpendCeiling` at the egress choke point. That is new
+failure-path coverage, not a refactor, and writing it in a hurry inside a REQ
+whose own AC-4 is about vacuous guards is how LESSON-569 happens again. **It
+needs its own REQ.**
 
 ## Assumptions
 

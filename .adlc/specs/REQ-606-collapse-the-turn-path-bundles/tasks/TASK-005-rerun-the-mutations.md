@@ -1,7 +1,7 @@
 ---
 id: TASK-005
 title: "Re-run every invariant mutation and measure AC-3 against the changed tree"
-status: pending
+status: complete
 parent: REQ-606
 created: 2026-09-01
 updated: 2026-09-01

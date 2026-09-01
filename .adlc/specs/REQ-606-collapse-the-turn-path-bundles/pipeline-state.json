@@ -3,12 +3,13 @@
   "branch": "feat/REQ-606-collapse-the-turn-path-bundles",
   "startedAt": "2026-09-01T00:02:06Z",
   "completed": false,
-  "currentPhase": 4,
+  "currentPhase": 5,
   "completedPhases": [
     0,
     1,
     2,
-    3
+    3,
+    4
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -31,6 +32,11 @@
       "phase": 3,
       "name": "Validate Architecture & Tasks",
       "completedAt": "2026-09-01T00:30:00Z"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-09-01T01:05:00Z"
     }
   ],
   "repos": {
@@ -51,16 +57,18 @@
     "teton-code"
   ],
   "phase4": {
-    "currentTask": "TASK-005",
+    "currentTask": null,
     "completedTasks": [
       "TASK-001",
       "TASK-002",
       "TASK-003",
-      "TASK-004"
+      "TASK-004",
+      "TASK-005"
     ],
     "failedTasks": []
   },
   "notes": [
-    "Sprint overlap cluster {REQ-603, REQ-604, REQ-606}; REQ-606 is third. Orchestrator owns the merge \u2014 this runner stops at pr-ready per dispatch override."
+    "Sprint overlap cluster {REQ-603, REQ-604, REQ-606}; REQ-606 is third. Orchestrator owns the merge \u2014 this runner stops at pr-ready per dispatch override.",
+    "AC-4 two of three: invariant 1 (typed-outcome arms before the generic remote arm) is NOT pinned \u2014 deleting the spend-ceiling arm leaves all 4,074 tests green. Pre-existing; arms byte-identical to origin/main. Needs its own REQ."
   ]
 }
