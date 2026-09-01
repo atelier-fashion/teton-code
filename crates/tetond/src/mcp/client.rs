@@ -1394,6 +1394,80 @@ mod tests {
         );
     }
 
+    /// REQ-607 AC-9 / BR-7 — the `shell` opt-in cannot reach a spawned MCP
+    /// server.
+    ///
+    /// # Asserted as "this path never reads the flag", not "the flag was on"
+    ///
+    /// The obvious test installs a policy with `allow_ssh_agent = true` and
+    /// compares. It was written that way first and **reverted**: the policy
+    /// provider is a process-global `OnceLock`, so installing a permissive one
+    /// here leaks into every other test in this binary — including the
+    /// `shell` advisory tests, which need the default posture and would fail or
+    /// pass on thread scheduling. A test that can poison its siblings is worse
+    /// than the bug it guards.
+    ///
+    /// So the claim is asserted where it actually lives. The flag reaches
+    /// `child_env::compose_child_env` only through its allowlist argument, and
+    /// this module passes `MCP_BASE_ENV_ALLOW`; the guarantee is therefore that
+    /// **the MCP spawn path never reads the shell policy at all**. Two arms:
+    ///
+    /// 1. A planted `SSH_AUTH_SOCK` is excluded from the composed environment —
+    ///    the behaviour, on a variable that was really there to leak.
+    /// 2. A source check that this module names none of the three symbols the
+    ///    opt-in travels on. This is the arm with teeth: it fails the moment
+    ///    somebody wires the policy in here, which is the regression REQ-596
+    ///    BR-7.1 exists to prevent and the one arm 1 could never see.
+    ///
+    /// The corpus is `production_source`, cut at the first column-0
+    /// `#[cfg(test)]`, so this test's own doc comment cannot satisfy or break
+    /// it.
+    ///
+    /// **Mutation run.** Adding
+    /// `let _leak = crate::child_env::child_env_policy().allow_ssh_agent;` to
+    /// this module's `compose_child_env` wrapper — the wiring regression itself,
+    /// in its smallest form — fails arm 2 with "the MCP spawn path names
+    /// `allow_ssh_agent`" (1 assertion). Arm 1 stays **green** through that
+    /// mutation, which is the honest report and the reason arm 2 exists: reading
+    /// the flag is invisible to any behavioural assertion until someone also
+    /// passes it to the allowlist.
+    #[test]
+    fn the_shell_opt_in_does_not_reach_a_spawned_mcp_server() {
+        let daemon_vars = vec![
+            ("PATH".to_owned(), "/usr/bin".to_owned()),
+            ("HOME".to_owned(), "/home/sentinel".to_owned()),
+            (
+                "SSH_AUTH_SOCK".to_owned(),
+                "/tmp/SENTINEL-agent.sock".to_owned(),
+            ),
+        ];
+        let composed = compose_child_env(daemon_vars, &BTreeMap::new());
+        assert!(
+            !composed.iter().any(|(k, _)| k == "SSH_AUTH_SOCK"),
+            "a spawned MCP server was handed the ssh agent socket"
+        );
+        // Not vacuously green on an empty composition.
+        assert!(composed.iter().any(|(k, _)| k == "PATH"));
+
+        let source = crate::call_sites::scan::production_source(
+            &crate::call_sites::scan::daemon_src().join("mcp/client.rs"),
+        );
+        for symbol in ["allow_ssh_agent", "shell_env_allow", "child_env_policy"] {
+            assert!(
+                !source.contains(symbol),
+                "the MCP spawn path names `{symbol}`, so the shell tool's opt-in can now \
+                 reach a third-party npx/uvx server. Turning the agent on for a command \
+                 the user is watching must not turn it on for a package they are not \
+                 (REQ-596 BR-7.1, REQ-607 BR-7)."
+            );
+        }
+        assert!(
+            source.contains("MCP_BASE_ENV_ALLOW"),
+            "the source scan found no allowlist reference at all, so it is reading the \
+             wrong file and both arms above are vacuous"
+        );
+    }
+
     /// AC-4.1b. Sharing the composer must be provably free for the MCP path, not
     /// merely intended to be — so this pins the *whole composed result* for a
     /// fixed daemon environment and a fixed declared map, byte for byte, against

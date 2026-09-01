@@ -663,6 +663,188 @@ mod tests {
         assert!(value_of(&composed, SSH_AUTH_SOCK).is_none());
     }
 
+    /// REQ-607 AC-7 / BR-8 — with the flag **off**, the agent socket is absent;
+    /// with it **on**, present.
+    ///
+    /// Asserted by inspecting the **composed map**, not by observing a command
+    /// succeed: a command can fail or succeed for a dozen reasons, and only the
+    /// map says what the child was actually handed.
+    ///
+    /// The off leg is the benign path and it is the shipped default, so this is
+    /// also the regression guard on REQ-596's decision — the opt-in must not
+    /// have quietly become the posture.
+    #[test]
+    fn with_the_flag_off_the_agent_socket_is_absent() {
+        let daemon = vars(&[
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/sentinel"),
+            (SSH_AUTH_SOCK, "/tmp/SENTINEL-agent.sock"),
+        ]);
+
+        let off = compose_child_env(
+            daemon.clone(),
+            &shell_env_allow(false),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        );
+        assert!(
+            value_of(&off, SSH_AUTH_SOCK).is_none(),
+            "the shipped default handed the ssh agent to a model-issued command"
+        );
+
+        let on = compose_child_env(
+            daemon,
+            &shell_env_allow(true),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            value_of(&on, SSH_AUTH_SOCK),
+            Some("/tmp/SENTINEL-agent.sock"),
+            "the opt-in did not admit the variable it exists to admit"
+        );
+    }
+
+    /// REQ-607 AC-8 / BR-5's "and nothing else" — the composed map differs by
+    /// **exactly one entry**, in **both** directions.
+    ///
+    /// This is the assertion that keeps `allow_ssh_agent` from becoming the
+    /// general escape hatch Out of Scope refuses. A one-way spot check of the
+    /// names a test happens to think of passes a *widened* allowlist, which is
+    /// precisely the regression worth catching; a two-way set difference over
+    /// the whole map cannot.
+    ///
+    /// **Non-vacuous by construction.** The fixture plants `SSH_AUTH_SOCK` in
+    /// the daemon vars, because with it unset the true difference is *zero*
+    /// entries and every assertion below would be measuring nothing. It also
+    /// plants a name the allowlist rejects, so the map is not merely the
+    /// allowlist echoed back.
+    ///
+    /// **The oracle is not the subject** (conventions.md, LESSON-569): the two
+    /// maps are built by calling the composer twice and diffed against each
+    /// other. Nothing here asks `shell_env_allow` what it expects to see.
+    #[test]
+    fn the_opt_in_admits_exactly_one_more_entry_in_both_directions() {
+        let daemon = vars(&[
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/sentinel"),
+            ("LANG", "en_US.UTF-8"),
+            (SSH_AUTH_SOCK, "/tmp/SENTINEL-agent.sock"),
+            // Not on any allowlist — present so the composed map is a filter
+            // result rather than the daemon environment echoed back.
+            ("UNRELATED_SENTINEL_VAR", "SENTINEL-unrelated"),
+        ]);
+
+        let off: BTreeMap<String, String> = compose_child_env(
+            daemon.clone(),
+            &shell_env_allow(false),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        )
+        .into_iter()
+        .collect();
+        let on: BTreeMap<String, String> = compose_child_env(
+            daemon,
+            &shell_env_allow(true),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        )
+        .into_iter()
+        .collect();
+
+        assert!(
+            !off.is_empty() && !on.is_empty(),
+            "both composed maps are empty, so this proved nothing"
+        );
+
+        // Gained: exactly the one name.
+        let gained: Vec<(&String, &String)> = on
+            .iter()
+            .filter(|(k, v)| off.get(*k) != Some(*v))
+            .collect();
+        assert_eq!(
+            gained.len(),
+            1,
+            "the opt-in changed {} entries, not one: {gained:?}",
+            gained.len()
+        );
+        assert_eq!(gained[0].0.as_str(), SSH_AUTH_SOCK);
+
+        // Lost: nothing. An opt-in that *removed* an entry while adding one
+        // would keep a naive count at one, and this is the direction that
+        // catches it.
+        let lost: Vec<(&String, &String)> = off
+            .iter()
+            .filter(|(k, v)| on.get(*k) != Some(*v))
+            .collect();
+        assert!(
+            lost.is_empty(),
+            "the opt-in removed or altered entries it should have left alone: {lost:?}"
+        );
+
+        // And the rejected name is in neither, so the allowlist is still doing
+        // its job on both sides of the comparison.
+        assert!(!off.contains_key("UNRELATED_SENTINEL_VAR"));
+        assert!(!on.contains_key("UNRELATED_SENTINEL_VAR"));
+    }
+
+    /// REQ-607 AC-10 / BR-7 — a configured `auth_ref = "env:<NAME>"` credential
+    /// is still absent with the agent admitted.
+    ///
+    /// Two legs, and the second is the sharp one.
+    ///
+    /// The first is the ordinary case: an unrelated credential name is removed
+    /// by composer step 5 whatever the allowlist says, which is REQ-596 BR-3
+    /// continuing to hold.
+    ///
+    /// The second puts the new flag and the old rule in **direct conflict** —
+    /// `auth_ref = "env:SSH_AUTH_SOCK"` with `allow_ssh_agent = true`, so the
+    /// allowlist admits exactly the name the credential set removes. Step 5 runs
+    /// last and unconditionally, so removal wins. That is REQ-596 BR-3 holding
+    /// against a capability that did not exist when it was written, and it is
+    /// the one arrangement in which the new flag could have reached around it.
+    #[test]
+    fn a_configured_credential_is_absent_even_with_the_agent_admitted() {
+        let daemon = vars(&[
+            ("PATH", "/usr/bin"),
+            ("LANGUAGE", "SENTINEL-language"),
+            (SSH_AUTH_SOCK, "/tmp/SENTINEL-agent.sock"),
+        ]);
+
+        // Leg 1: an allowlisted name the config declares a credential.
+        let mut credentials = BTreeSet::new();
+        credentials.insert("LANGUAGE".to_owned());
+        let composed = compose_child_env(
+            daemon.clone(),
+            &shell_env_allow(true),
+            &credentials,
+            &BTreeMap::new(),
+        );
+        assert!(
+            value_of(&composed, "LANGUAGE").is_none(),
+            "the opt-in re-admitted a configured credential"
+        );
+        // The flag still did its own job, so leg 1 is not passing because the
+        // whole composition broke.
+        assert!(value_of(&composed, SSH_AUTH_SOCK).is_some());
+
+        // Leg 2: the direct conflict.
+        let mut collision = BTreeSet::new();
+        collision.insert(SSH_AUTH_SOCK.to_owned());
+        let composed = compose_child_env(
+            daemon,
+            &shell_env_allow(true),
+            &collision,
+            &BTreeMap::new(),
+        );
+        assert!(
+            value_of(&composed, SSH_AUTH_SOCK).is_none(),
+            "allow_ssh_agent reached around REQ-596 BR-3's unconditional removal — a user \
+             who wrote auth_ref = \"env:SSH_AUTH_SOCK\" had their credential handed to a \
+             model-issued command by a flag that is not supposed to be able to do that"
+        );
+    }
+
     /// REQ-607 BR-5 / BR-6 — the opt-in adds **one** name to the allowlist.
     ///
     /// Asserted as a set difference in both directions, so a widened
