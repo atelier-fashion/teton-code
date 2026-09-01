@@ -2,7 +2,7 @@
   "req": "REQ-603",
   "branch": "feat/REQ-603-extract-the-session-lifecycle-slice",
   "startedAt": "2026-08-31T00:00:00Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -59,6 +60,13 @@
       "name": "PR Cleanup & CI",
       "completedAt": "2026-09-01T00:36:14.238793Z",
       "result": "7/7 checks pass"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup and Merge",
+      "completedAt": "2026-09-01T00:49:49.162442Z",
+      "mergeCommit": "7fe035ce8038ddfa2228e300c5edded8cd16f670",
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/256"
     }
   ],
   "repos": {
@@ -70,7 +78,7 @@
       "touched": true,
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/256",
       "prNumber": 256,
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }
@@ -87,5 +95,9 @@
     "failedTasks": []
   },
   "blockers": [],
-  "notes": []
+  "notes": [
+    "Single-repo topology: this runner owned the merge. PR #256 squash-merged as 7fe035c.",
+    "store_session_skills was identified as part of the slice but did not move \u2014 blocked by a doc-attachment defect frozen into traceability_sweep.rs's baseline (LESSON-607). Filed as a follow-up.",
+    "9 of 10 session-lifecycle tests stayed in conversation_carry under AC-5's second clause; fixture cost is the real reason and is named in the module header."
+  ]
 }
