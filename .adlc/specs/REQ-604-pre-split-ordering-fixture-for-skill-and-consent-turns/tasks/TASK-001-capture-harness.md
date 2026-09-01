@@ -1,7 +1,7 @@
 ---
 id: TASK-001
 title: "Build the capture harness at 17c39ec and record both sequences"
-status: pending
+status: complete
 parent: REQ-604
 repo: teton-code
 created: 2026-08-31
@@ -22,16 +22,16 @@ outside the repo. Nothing from this task is committed to the branch.
 
 ## Acceptance Criteria
 
-- [ ] The skill scenario drives a **user-authored** skill through
+- [x] The skill scenario drives a **user-authored** skill through
       `run_prompt_turn` with a `SkillInvocation`, and the run is proven to have
       expanded (the skill body marker reaches the engine).
-- [ ] The consent scenario drives a scripted `shell` tool call, waits for the
+- [x] The consent scenario drives a scripted `shell` tool call, waits for the
       `permission_request`, resolves it `allow_once`, and joins the turn — no
       wall-clock sleeps (LESSON-450).
-- [ ] Each scenario is run **at least 20 times** and the raw per-run sequences
+- [x] Each scenario is run **at least 20 times** and the raw per-run sequences
       recorded, so entries whose position is unstable are identified
       empirically rather than by reading the code (ADR-4, LESSON-591).
-- [ ] The raw sequences are written out verbatim for TASK-002 to consume.
+- [x] The raw sequences are written out verbatim for TASK-002 to consume.
 
 ## Notes
 

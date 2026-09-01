@@ -1,7 +1,7 @@
 ---
 id: TASK-002
 title: "Write the two fixture files with provenance headers"
-status: pending
+status: complete
 parent: REQ-604
 repo: teton-code
 created: 2026-08-31
@@ -16,11 +16,11 @@ dependencies: [TASK-001]
 
 ## Acceptance Criteria
 
-- [ ] Each header records the capture commit `17c39ec` (AC-1).
-- [ ] Each header says ***runtime*** `TurnContext`, not bare `TurnContext`
+- [x] Each header records the capture commit `17c39ec` (AC-1).
+- [x] Each header says ***runtime*** `TurnContext`, not bare `TurnContext`
       (ADR-8) — `ContentClass::TurnContext` existed at the protocol level at
       that commit, so the unqualified claim would be false.
-- [ ] Each header names which entries are detached and by what discriminator
+- [x] Each header names which entries are detached and by what discriminator
       they are excluded (AC-4) — never by position.
-- [ ] The existing `req598_turn_event_order.txt` is **not** modified
+- [x] The existing `req598_turn_event_order.txt` is **not** modified
       (Out of Scope; REQ-606 AC-4 depends on it replaying unregenerated).

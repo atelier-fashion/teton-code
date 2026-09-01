@@ -1,0 +1,49 @@
+# REQ-604 AC-1 golden event sequence for one turn that expands a skill and
+# dispatches. The first of the two scenarios REQ-599 AC-6 named and never
+# captured (REQ-602 TASK-306 narrowed that criterion and filed this REQ).
+#
+# PROVENANCE (load-bearing): captured at `17c39ec`, where the turn path is
+# still the pre-split single-file `crates/tetond/src/runtime.rs` and no
+# *runtime* `TurnContext` exists. A fixture regenerated at tip would be an
+# oracle computed by the subject (conventions.md; LESSON-569) — which is the
+# whole reason this REQ exists rather than being a two-line fix in REQ-599.
+#
+# base commit: 17c39ec4f26432fae22bfb4d266159ce8afb614f
+#
+# "no *runtime* TurnContext" is deliberate wording. `ContentClass::TurnContext`
+# already existed at this commit in `crates/teton-protocol/src/methods.rs`, so
+# the sibling REQ-598 fixture's unqualified "before any TurnContext existed" is
+# very slightly more than was true. This says only what holds.
+#
+# The scenario: a **user-authored** skill in `~/.claude/skills/<name>`, invoked
+# by name with an empty typed prompt. A *project* skill would raise REQ-589
+# ADR-10's trust acknowledgment and this fixture would then also pin the consent
+# path — so a change to consent handling would move both fixtures at once and
+# neither would say which path broke. The consent path has its own fixture.
+#
+# FORMAT: one event per line, in publication order. Consecutive runs of the same
+# event collapse to one entry (`session_update` is emitted per streamed chunk;
+# pinning the count would pin the scripted engine's chunking, which this REQ
+# does not touch). `route_decided` carries its category, because that is the
+# discriminator both sides filter on.
+#
+# DETACHED ENTRIES — excluded by discriminator, never by position (AC-4,
+# LESSON-591). Two entries below are published from inside a `tokio::spawn` and
+# their arrival order is a race, not an ordering:
+#
+#   route_decided[category=title]  the title duty's own decision
+#   session_titled                 the naming task's result
+#
+# This is not inferred from reading the code — that is what LESSON-591 records
+# getting wrong. Across 288 capture runs at this commit (144 per scenario, six
+# processes), the title duty's `route_decided` was observed *ahead of*
+# `skill_invoked` in 1 run and after it in 143. One observation of the swap is
+# enough: an entry that moves at all is an entry whose position must not be
+# pinned. Both sides drop it by its category, so either arrival order compares
+# alike.
+skill_invoked
+route_decided[category=title]
+session_titled
+route_decided[category=edit]
+session_update
+prefix_cache

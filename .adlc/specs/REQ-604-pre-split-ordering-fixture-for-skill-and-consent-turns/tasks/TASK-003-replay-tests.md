@@ -1,7 +1,7 @@
 ---
 id: TASK-003
 title: "Add the replay test module at tip"
-status: pending
+status: complete
 parent: REQ-604
 repo: teton-code
 created: 2026-08-31
@@ -16,12 +16,12 @@ dependencies: [TASK-002]
 
 ## Acceptance Criteria
 
-- [ ] Both fixtures replay against the current tree (AC-2).
-- [ ] Detached events excluded by discriminator, not position (AC-4).
-- [ ] Non-vacuity per scenario: positive count of `skill_invoked` /
+- [x] Both fixtures replay against the current tree (AC-2).
+- [x] Detached events excluded by discriminator, not position (AC-4).
+- [x] Non-vacuity per scenario: positive count of `skill_invoked` /
       `permission_request` respectively, plus exactly one non-title
       `route_decided`, plus a non-empty expected sequence (AC-5).
-- [ ] A transposition of two adjacent distinct events fails, per scenario
+- [x] A transposition of two adjacent distinct events fails, per scenario
       (AC-6).
-- [ ] Every new assertion is shown able to fail — the mutation is run and
+- [x] Every new assertion is shown able to fail — the mutation is run and
       recorded in the test's doc comment (conventions.md; LESSON-569).

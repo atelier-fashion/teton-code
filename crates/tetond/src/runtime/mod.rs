@@ -17634,6 +17634,575 @@ provider_id = \"deepseek\"
                  proved nothing"
             );
         }
+
+        /// **REQ-604 — the two ordering fixtures REQ-599 AC-6 named and never
+        /// captured.**
+        ///
+        /// REQ-599 AC-6 claimed a pre-split fixture covering "skill expansion, a
+        /// routing decision, a consent prompt, and a successful dispatch". What
+        /// shipped — [`super::req598_event_order`] — is a plain typed turn: no
+        /// skill, no consent. REQ-602 TASK-306 narrowed the criterion to what
+        /// existed and filed this REQ for the remainder.
+        ///
+        /// **Why these could not simply have been added then.** A golden file's
+        /// whole value is its provenance. Recording these at tip would produce
+        /// an oracle computed by the subject it checks (conventions.md;
+        /// LESSON-569) — precisely the trap the sibling fixture's header names.
+        /// So both sequences here were captured at `17c39ec`, against the
+        /// pre-split single-file `runtime.rs`, by a harness built at that commit
+        /// and thrown away. The harness is new; the *subject* is not, and
+        /// provenance is a property of the subject.
+        ///
+        /// **Why the capture is comparable to this replay at all.**
+        /// `run_prompt_turn`'s ten-argument signature is identical at `17c39ec`
+        /// and here — REQ-598's `TurnContext` and REQ-600's stage split were
+        /// both internal. The driver code below is therefore the same code that
+        /// recorded the fixtures, so a mismatch is a fact about the turn path
+        /// and not about how the two sides were driven.
+        ///
+        /// **Why two fixtures and not one.** The skill scenario uses a
+        /// *user*-authored skill. A project skill would raise REQ-589 ADR-10's
+        /// trust acknowledgment, and the skill fixture would then also pin the
+        /// consent path — so a change to consent handling would move both
+        /// fixtures at once, and neither would say which path broke.
+        ///
+        /// **These tests can fail** (conventions.md: show it before trusting
+        /// it). Four mutations were executed and reverted; each test carries its
+        /// own record, including one that failed somewhere other than where it
+        /// was predicted to.
+        mod req604_event_order {
+            use super::*;
+            use crate::grants::GrantRegistry;
+            use crate::harness::permissions::{AddressedPermissionDelivery, PermissionConfig};
+            use crate::skills::{discover, RealFs};
+            use teton_protocol::events::PermissionRequest;
+            use teton_protocol::methods::{PermissionOutcome, SkillInvocation};
+
+            /// The skill turn's golden sequence, captured at `17c39ec`.
+            const SKILL_FIXTURE: &str =
+                include_str!("../../tests/fixtures/req604_skill_turn_event_order.txt");
+
+            /// The consent turn's golden sequence, captured at `17c39ec`.
+            const CONSENT_FIXTURE: &str =
+                include_str!("../../tests/fixtures/req604_consent_turn_event_order.txt");
+
+            /// The detached naming task's result — dropped by name.
+            const DETACHED_TITLED: &str = "session_titled";
+
+            /// The event whose consecutive repeats collapse: one per streamed
+            /// chunk, so pinning the count would pin the scripted engine's
+            /// chunking rather than the turn's ordering.
+            const CHUNKED: &str = "session_update";
+
+            /// The name every routing decision publishes under.
+            const ROUTE: &str = "route_decided";
+
+            /// The category that marks the *detached* routing decision — the
+            /// title duty's own, published from inside its `tokio::spawn`.
+            const TITLE: &str = teton_protocol::Category::Title.as_str();
+
+            /// A body marker no other fixture in this crate uses, so a prompt
+            /// containing it can only have come from this expansion.
+            const MARKER: &str = "SKILLBODYMARKER-604";
+
+            /// One recorded event: its name, plus the discriminator a filter may
+            /// key on.
+            ///
+            /// Carrying the category rather than the index is the whole point
+            /// (AC-4). The sibling REQ-598 fixture identifies the detached route
+            /// decision on the *fixture* side as "the first of the two", which
+            /// works only because that file happens to hold exactly two. These
+            /// fixtures record the category in the file, so neither side ever
+            /// reasons about position — which is the thing the race moves
+            /// (LESSON-591).
+            #[derive(Clone, Debug, PartialEq, Eq)]
+            struct Entry {
+                name: String,
+                category: Option<String>,
+            }
+
+            impl Entry {
+                fn plain(name: &str) -> Self {
+                    Self {
+                        name: name.to_owned(),
+                        category: None,
+                    }
+                }
+
+                fn routed(category: &str) -> Self {
+                    Self {
+                        name: ROUTE.to_owned(),
+                        category: Some(category.to_owned()),
+                    }
+                }
+
+                /// True for an event whose position is decided by the scheduler
+                /// rather than by the turn path.
+                fn is_detached(&self) -> bool {
+                    self.name == DETACHED_TITLED
+                        || (self.name == ROUTE && self.category.as_deref() == Some(TITLE))
+                }
+            }
+
+            /// Parse `name` or `name[category=value]` — the fixture's line form.
+            fn parse_entry(line: &str) -> Entry {
+                match line.split_once('[') {
+                    Some((name, rest)) => Entry {
+                        name: name.to_owned(),
+                        category: rest
+                            .trim_end_matches(']')
+                            .strip_prefix("category=")
+                            .map(str::to_owned),
+                    },
+                    None => Entry::plain(line),
+                }
+            }
+
+            /// The same entry, read off a live envelope.
+            fn from_envelope(env: &teton_protocol::events::EventEnvelope) -> Entry {
+                Entry {
+                    name: env.event_name().to_owned(),
+                    category: match &env.event {
+                        Event::RouteDecided(rd) => rd.category.map(|c| c.as_str().to_owned()),
+                        _ => None,
+                    },
+                }
+            }
+
+            /// Put a sequence into the form both sides are compared in.
+            ///
+            /// Applied identically to the recorded fixture and to the live run,
+            /// so it cannot quietly excuse a real ordering change — anything it
+            /// hides on one side it hides on the other.
+            ///
+            /// Detached entries are dropped **before** the chunk collapse in the
+            /// same pass, so a detached event that lands mid-stream between two
+            /// `session_update`s lets them merge. That is deliberate: it is the
+            /// starved-runner arrival LESSON-591 describes, and no collapse rule
+            /// applied afterwards could reach it.
+            fn normalize(entries: &[Entry]) -> Vec<String> {
+                let mut out: Vec<String> = Vec::new();
+                for entry in entries {
+                    if entry.is_detached() {
+                        continue;
+                    }
+                    if entry.name == CHUNKED && out.last().map(String::as_str) == Some(CHUNKED) {
+                        continue;
+                    }
+                    out.push(entry.name.clone());
+                }
+                out
+            }
+
+            /// The fixture's entries — comment and blank lines stripped, so the
+            /// golden file can carry its own provenance header.
+            fn recorded(fixture: &str) -> Vec<Entry> {
+                fixture
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                    .map(parse_entry)
+                    .collect()
+            }
+
+            /// Live events in publication order.
+            ///
+            /// Drained with `try_recv` rather than `recv` under a timeout:
+            /// `EventBus::publish` is synchronous, so once the turn has returned
+            /// every event it published is already queued. A wall-clock poll is
+            /// the assertion shape that goes flaky first under CI scheduler
+            /// pressure (LESSON-450).
+            fn drain_entries(sub: &mut crate::broadcast::Subscription) -> Vec<Entry> {
+                let mut out: Vec<Entry> = Vec::new();
+                while let Some(env) = sub.try_recv() {
+                    out.push(from_envelope(&env));
+                }
+                out
+            }
+
+            /// Assert the shared non-vacuity floor both fixtures owe (AC-5).
+            ///
+            /// A filter that ate everything, or one that stopped distinguishing
+            /// the detached route decision from the turn's own, fails here
+            /// rather than passing on an empty comparison.
+            fn assert_not_vacuous(expected: &[String], scenario: &str) {
+                assert!(
+                    !expected.is_empty(),
+                    "{scenario}: the fixture is empty — a golden file that records \
+                     nothing cannot fail, which is the vacuity this guards"
+                );
+                assert_eq!(
+                    expected.iter().filter(|n| *n == ROUTE).count(),
+                    1,
+                    "{scenario}: non-vacuity — exactly ONE route decision must \
+                     survive, the turn's own. Zero means the filter ate both and \
+                     this test can no longer see a turn that stopped announcing \
+                     its route; two means the detached title duty's decision is \
+                     still pinned, which is the race the filter removes"
+                );
+            }
+
+            /// Answers whatever it is shown.
+            ///
+            /// The skill scenario invokes a *user*-authored skill, which raises
+            /// no trust question. This exists so that a question raised anyway
+            /// would be answered and show up in the compared sequence, rather
+            /// than deadlocking the test — a hang is a worse failure report than
+            /// a diff.
+            struct AllowsEverything(Arc<PendingPermissions>);
+
+            impl AddressedPermissionDelivery for AllowsEverything {
+                fn deliver(
+                    &self,
+                    connection: ConnectionId,
+                    _session_id: &SessionId,
+                    request: PermissionRequest,
+                ) -> bool {
+                    self.0.resolve_from(
+                        &request.request_id,
+                        PermissionOutcome::Selected {
+                            option_id: "allow_always".to_owned(),
+                        },
+                        connection,
+                    )
+                }
+            }
+
+            /// A home holding one user-authored skill.
+            fn user_home_with_skill(tag: &str, name: &str) -> PathBuf {
+                let home = scratch_root(tag, false);
+                std::fs::create_dir_all(home.join(format!(".claude/skills/{name}"))).unwrap();
+                std::fs::write(
+                    home.join(format!(".claude/skills/{name}/SKILL.md")),
+                    format!("---\ndescription: {name}\n---\n\nPlease handle {MARKER} now.\n"),
+                )
+                .unwrap();
+                home
+            }
+
+            /// **AC-2 for the skill scenario.** A turn that expands a
+            /// user-authored skill and dispatches publishes the sequence
+            /// captured at `17c39ec`.
+            ///
+            /// **Mutation record** (conventions.md: show the test can fail).
+            /// Two were executed and reverted.
+            ///
+            /// *Dropping the category arm from [`Entry::is_detached`]*, so the
+            /// title duty's `route_decided` survives: **all four** tests in this
+            /// module go red. The two replays fail on the AC-5 non-vacuity count
+            /// rather than on the sequence comparison — "two means the detached
+            /// title duty's decision is still pinned" — which is the floor
+            /// firing ahead of the comparison, as intended.
+            ///
+            /// *Transposing this fixture's last two entries* (`session_update`
+            /// and `prefix_cache`): red on the sequence comparison, naming both
+            /// orders. That is the mutation that shows the comparison is live
+            /// and position-sensitive, rather than merely well-commented.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn a_skill_turn_publishes_its_events_in_the_order_the_fixture_records() {
+                let home = user_home_with_skill("req604-skill-home", "marked");
+                let dir = scratch_root("req604-skill-root", false);
+                let (runtime, seen) = carry_runtime(&[Scripted::Say("Noted.")]);
+                let events = Arc::new(EventBus::new());
+                let mut sub = events.subscribe(4_096);
+                let (sessions, session_id) = one_session_with(Some(dir.clone()));
+
+                let probed = runtime.session_root_for(Some(&dir));
+                sessions.set_skills(
+                    &session_id,
+                    discover(Some(&home), &probed.path, probed.view.kind, &RealFs),
+                );
+
+                let pending = Arc::clone(runtime.pending());
+                runtime
+                    .session_gates
+                    .lock()
+                    .expect("session gate mutex poisoned")
+                    .insert(
+                        session_id.clone(),
+                        Arc::new(
+                            PermissionGate::new(
+                                session_id.clone(),
+                                PermissionConfig::default(),
+                                Arc::clone(&events),
+                                Arc::clone(&pending),
+                            )
+                            .with_addressed_delivery(Arc::new(
+                                AllowsEverything(Arc::clone(&pending)),
+                            )),
+                        ),
+                    );
+                let conn = GrantRegistry::new().next_connection_id();
+
+                runtime
+                    .run_prompt_turn(
+                        &events,
+                        &sessions,
+                        session_id,
+                        SessionMode::Freeform,
+                        None,
+                        Some(dir.clone()),
+                        String::new(),
+                        Some(SkillInvocation {
+                            name: "marked".to_owned(),
+                            raw_arguments: String::new(),
+                        }),
+                        Some(conn),
+                        ClientPresence::unwatched(),
+                    )
+                    .await
+                    .expect("the skill turn runs on the local tier");
+
+                let actual = normalize(&drain_entries(&mut sub));
+                let expected = normalize(&recorded(SKILL_FIXTURE));
+
+                assert_not_vacuous(&expected, "skill turn");
+                // The event this fixture exists to pin (AC-5), counted rather
+                // than merely looked for. Without it the whole file could be a
+                // plain turn's sequence and still pass.
+                assert_eq!(
+                    expected.iter().filter(|n| *n == "skill_invoked").count(),
+                    1,
+                    "the skill fixture must record exactly one `skill_invoked`. \
+                     Zero means it is not pinning a skill turn at all; more than \
+                     one means it is pinning something other than the single \
+                     expansion this scenario performs"
+                );
+                assert!(
+                    seen.lock()
+                        .expect("recorded-context mutex")
+                        .iter()
+                        .any(|p| p.contains(MARKER)),
+                    "the skill never expanded, so the comparison below is about a \
+                     turn that did not happen"
+                );
+
+                assert_eq!(
+                    actual, expected,
+                    "the skill turn's event ordering changed.\n  expected: \
+                     {expected:?}\n    actual: {actual:?}"
+                );
+
+                let _ = std::fs::remove_dir_all(&home);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// **AC-2 for the consent scenario.** A turn that raises a consent
+            /// prompt, is answered, and dispatches publishes the sequence
+            /// captured at `17c39ec`.
+            ///
+            /// The gate is answered on the event, never on a timer — the turn is
+            /// genuinely parked at the gate rather than racing a sleep
+            /// (LESSON-450). Two subscriptions, because
+            /// `await_permission_request` consumes what it reads and the
+            /// ordering capture needs its own queue.
+            ///
+            /// **Mutation record.** Two were executed and reverted, and the
+            /// first did *not* fail where it was expected to — recorded as it
+            /// happened rather than as it was predicted.
+            ///
+            /// *Swapping the two scripted replies*, so the tool call never
+            /// happens and the gate is never reached: red, but at
+            /// `await_permission_request`'s ten-second deadline with "no `shell`
+            /// permission prompt arrived" — **not** at the AC-5 assertion below.
+            /// The distinction matters and is easy to get wrong: that assertion
+            /// guards the *fixture*, checking that the recorded file pins a
+            /// consent turn at all. A *live* turn that never reaches the gate is
+            /// caught by the wait, and only the `actual == expected` comparison
+            /// ties the two halves together.
+            ///
+            /// *Transposing the fixture's `session_update` and
+            /// `permission_request`*: red on the sequence comparison. Note the
+            /// expected side came back one entry shorter, because the swap left
+            /// two `session_update`s adjacent and the collapse rule merged them
+            /// — the comparison still failed, which is the point.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn a_consent_turn_publishes_its_events_in_the_order_the_fixture_records() {
+                let root = scratch_root("req604-consent", true);
+                let (runtime, _seen) = carry_runtime(&[
+                    Scripted::Say(r#"{"tool": "shell", "arguments": {"command": "echo hi"}}"#),
+                    Scripted::Say("Done."),
+                ]);
+                let events = Arc::new(EventBus::new());
+                let mut sub = events.subscribe(4_096);
+                let mut gate_sub = events.subscribe(256);
+                let (sessions, session_id) = one_session_with(Some(root.clone()));
+
+                let turn = {
+                    let runtime = Arc::clone(&runtime);
+                    let events = Arc::clone(&events);
+                    let sessions = sessions.clone();
+                    let session_id = session_id.clone();
+                    let root = root.clone();
+                    tokio::spawn(async move {
+                        prompt(
+                            &runtime,
+                            &events,
+                            &sessions,
+                            &session_id,
+                            Some(root),
+                            "run the tests please",
+                        )
+                        .await
+                    })
+                };
+
+                let request = await_permission_request(&mut gate_sub, "shell").await;
+                runtime.pending.resolve(
+                    &request.request_id,
+                    PermissionOutcome::Selected {
+                        option_id: "allow_once".to_owned(),
+                    },
+                );
+                turn.await
+                    .expect("the turn task joins")
+                    .expect("the answered turn completes");
+
+                let actual = normalize(&drain_entries(&mut sub));
+                let expected = normalize(&recorded(CONSENT_FIXTURE));
+
+                assert_not_vacuous(&expected, "consent turn");
+                // The event this fixture exists to pin (AC-5), counted rather
+                // than merely looked for.
+                assert_eq!(
+                    expected
+                        .iter()
+                        .filter(|n| *n == "permission_request")
+                        .count(),
+                    1,
+                    "the consent fixture must record exactly one \
+                     `permission_request`. Zero means it is not pinning a consent \
+                     turn at all; more than one means it is pinning a turn that \
+                     asked twice, which is not this scenario"
+                );
+
+                assert_eq!(
+                    actual, expected,
+                    "the consent turn's event ordering changed.\n  expected: \
+                     {expected:?}\n    actual: {actual:?}"
+                );
+
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            /// **Every arrival order the detached entries can produce reduces
+            /// alike** (AC-4).
+            ///
+            /// The first two cases are not invented: they are the two raw
+            /// orderings the capture at `17c39ec` actually produced across 144
+            /// runs of the skill scenario — the title duty's `route_decided`
+            /// landing after `skill_invoked` (143 runs) and before it (1). One
+            /// observation of the swap is the whole point: an entry that moves
+            /// at all is an entry whose position must not be pinned, and 143
+            /// runs of agreement is exactly the evidence LESSON-591 records as
+            /// insufficient.
+            ///
+            /// The remaining cases are the starved-runner arrivals that review
+            /// predicted for the sibling fixture: the detached decision never
+            /// arriving before the drain, and landing mid-stream between two
+            /// chunks — which no collapse rule applied *after* the drop could
+            /// have reached.
+            #[test]
+            fn every_detached_arrival_order_reduces_alike_for_the_skill_turn() {
+                let want = vec![
+                    "skill_invoked".to_owned(),
+                    ROUTE.to_owned(),
+                    CHUNKED.to_owned(),
+                    "prefix_cache".to_owned(),
+                ];
+                let cases = [
+                    // Observed, 143/144.
+                    vec![
+                        Entry::plain("skill_invoked"),
+                        Entry::routed(TITLE),
+                        Entry::plain(DETACHED_TITLED),
+                        Entry::routed("edit"),
+                        Entry::plain(CHUNKED),
+                        Entry::plain("prefix_cache"),
+                    ],
+                    // Observed, 1/144 — the race.
+                    vec![
+                        Entry::routed(TITLE),
+                        Entry::plain("skill_invoked"),
+                        Entry::plain(DETACHED_TITLED),
+                        Entry::routed("edit"),
+                        Entry::plain(CHUNKED),
+                        Entry::plain("prefix_cache"),
+                    ],
+                    // Never arrived before the drain.
+                    vec![
+                        Entry::plain("skill_invoked"),
+                        Entry::routed("edit"),
+                        Entry::plain(CHUNKED),
+                        Entry::plain("prefix_cache"),
+                    ],
+                    // Landed mid-stream, between two chunks.
+                    vec![
+                        Entry::plain("skill_invoked"),
+                        Entry::routed("edit"),
+                        Entry::plain(CHUNKED),
+                        Entry::routed(TITLE),
+                        Entry::plain(DETACHED_TITLED),
+                        Entry::plain(CHUNKED),
+                        Entry::plain("prefix_cache"),
+                    ],
+                ];
+                for (i, case) in cases.iter().enumerate() {
+                    assert_eq!(
+                        normalize(case),
+                        want,
+                        "arrival order {i} must reduce to the turn path's own \
+                         sequence — the detached naming duty's timing is not \
+                         something these fixtures pin"
+                    );
+                }
+            }
+
+            /// **A transposition of two adjacent distinct events still fails,
+            /// per scenario** (AC-6).
+            ///
+            /// `normalize` drops two kinds of entry and merges repeats of a
+            /// third. This pins that it does nothing else, so it cannot be
+            /// quietly widened into an excuse for a real reordering — every
+            /// exclusion rule added to it has to leave this red.
+            ///
+            /// Every adjacent distinct pair is swapped, not just the first, and
+            /// the transposed sequence is re-normalized before comparison so the
+            /// normalizer gets its chance to launder the swap and is shown not
+            /// to take it.
+            #[test]
+            fn normalization_does_not_hide_a_transposition_in_either_fixture() {
+                for (scenario, fixture) in [
+                    ("skill turn", SKILL_FIXTURE),
+                    ("consent turn", CONSENT_FIXTURE),
+                ] {
+                    let expected = normalize(&recorded(fixture));
+                    assert_not_vacuous(&expected, scenario);
+                    let mut swaps = 0_usize;
+                    for i in 0..expected.len() - 1 {
+                        if expected[i] == expected[i + 1] {
+                            continue;
+                        }
+                        let mut swapped: Vec<Entry> =
+                            expected.iter().map(|n| Entry::plain(n)).collect();
+                        swapped.swap(i, i + 1);
+                        assert_ne!(
+                            normalize(&swapped),
+                            expected,
+                            "{scenario}: transposing positions {i} and {} must stay \
+                             visible after normalization",
+                            i + 1
+                        );
+                        swaps += 1;
+                    }
+                    assert!(
+                        swaps > 0,
+                        "{scenario}: no adjacent distinct pair existed to swap, so \
+                         this guard asserted nothing"
+                    );
+                }
+            }
+        }
     }
 
     /// REQ-586: the budget follows the route attempt.
