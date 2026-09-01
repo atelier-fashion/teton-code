@@ -676,9 +676,12 @@ fn is_env_assignment(word: &str) -> bool {
 ///
 /// - A program reached through indirection (`xargs ssh`, `sudo git`, a script)
 ///   is not seen. Only the outermost word of each segment is.
-/// - A program named inside a substitution (`$(ssh …)`) or a quoted string is
-///   not seen, which is the same rule read from the other side and the reason
-///   `echo "no ssh here"` is correctly silent.
+/// - A program named inside a **quoted string** is not seen, which is the point:
+///   `echo "no ssh here"` is correctly silent. A **command substitution** is a
+///   different case and *is* seen — `(` is one of the split points, so
+///   `echo $(ssh host)` yields `["echo", "ssh"]`. That is right rather than
+///   accidental: `$(ssh host)` really does run ssh, so it really is a command
+///   position.
 /// - A leading environment assignment whose value is **quoted**
 ///   (`GIT_SSH_COMMAND='ssh -v' git push`) is not skipped, because this splits
 ///   on whitespace and cannot tell where the quoted value ends. See
@@ -727,9 +730,20 @@ fn withheld_advisory(
         return None;
     }
     let programs = command_position_programs(command);
-    let var = withheld
-        .iter()
-        .find(|var| programs.iter().any(|p| var.programs.contains(p)))?;
+    // The **matched** program, not `programs.first()`. In `cd /repo && ssh host`
+    // the first program is `cd`, and a sentence blaming a "cd problem" is worse
+    // than no sentence — it is the misattribution this REQ exists to remove,
+    // reintroduced one layer up.
+    //
+    // It also keeps the command's own text out of the sentence entirely: the
+    // name below always comes from the entry's static `programs` list, never
+    // from the model-supplied command string.
+    let (var, program) = withheld.iter().find_map(|var| {
+        programs
+            .iter()
+            .find_map(|p| var.programs.iter().find(|known| known == &p))
+            .map(|program| (var, *program))
+    })?;
 
     // BR-1's config-key clause is conditional. Where a key exists the sentence
     // names it; where none does it names the table where the decision is
@@ -743,11 +757,9 @@ fn withheld_advisory(
         ),
     };
     Some(format!(
-        "\n[teton] This may have failed because Teton withholds {} from shell commands \
+        "\n[teton] This may have failed because Teton withholds {} from shell commands, \
          rather than because of an {} problem — {}.\n",
-        var.name,
-        programs.first().copied().unwrap_or("unknown"),
-        remedy,
+        var.name, program, remedy,
     ))
 }
 
@@ -1102,6 +1114,80 @@ mod tests {
         // The false-positive class the matcher exists to exclude.
         assert_eq!(command_position_programs("echo \"no ssh here\""), ["echo"]);
         assert_eq!(command_position_programs("grep -r ssh ."), ["grep"]);
+        // A command substitution *is* a command position, and is seen.
+        assert_eq!(command_position_programs("echo $(ssh host)"), ["echo", "ssh"]);
+    }
+
+    /// The advisory names the program that **matched**, not the first one in the
+    /// command.
+    ///
+    /// Found in verify. `cd /repo && ssh host` yields `["cd", "ssh"]`, and the
+    /// first draft wrote `programs.first()` into the sentence — so a user whose
+    /// `git push` was preceded by a `cd` was told their failure was not "a cd
+    /// problem". That is the misattribution this whole REQ exists to remove,
+    /// reintroduced one layer up, and it is exactly the kind of thing a test
+    /// asserting only `contains("Teton")` would never see.
+    ///
+    /// The fix has a second effect worth pinning: the named program now always
+    /// comes from the entry's own static `programs` list, so no model-supplied
+    /// command text reaches the sentence at all.
+    #[test]
+    fn the_advisory_names_the_program_that_matched_not_the_first_one() {
+        let daemon_vars = vec![
+            ("PATH".to_owned(), "/usr/bin".to_owned()),
+            (
+                crate::child_env::SSH_AUTH_SOCK.to_owned(),
+                "/tmp/SENTINEL-agent.sock".to_owned(),
+            ),
+        ];
+        let child = crate::child_env::compose_child_env(
+            daemon_vars.iter().cloned(),
+            &crate::child_env::shell_env_allow(false),
+            &std::collections::BTreeSet::new(),
+            &BTreeMap::new(),
+        );
+        let withheld = crate::child_env::withheld_from_child(&daemon_vars, &child);
+        assert!(!withheld.is_empty(), "the fixture withheld nothing");
+
+        let sentence = withheld_advisory("cd /repo && ssh host", &withheld)
+            .expect("the command names ssh in a later segment");
+        assert!(
+            sentence.contains("an ssh problem"),
+            "the advisory blamed the wrong program: {sentence}"
+        );
+        assert!(
+            !sentence.contains("cd problem"),
+            "the advisory blamed the first token rather than the matched one: {sentence}"
+        );
+    }
+
+    /// BR-2's other half — the skill path's dynamic context is never annotated.
+    ///
+    /// `run_bounded` has two callers and only one of them is a tool. The skill
+    /// path (`skills::dynamic`) inlines command output into a prompt the author
+    /// asked for, and a harness advisory landing in there would be text the
+    /// author never wrote.
+    ///
+    /// Asserted structurally rather than behaviourally, because the guarantee
+    /// *is* structural: `render_output` and `withheld_advisory` are private to
+    /// this module, so `dynamic.rs` cannot reach them however it destructures
+    /// `BoundedRun`. The check is that it does not name them — which is what
+    /// would have to change first for the annotation to leak.
+    #[test]
+    fn the_skill_path_never_reaches_the_advisory() {
+        let source = crate::call_sites::scan::production_source(
+            &crate::call_sites::scan::daemon_src().join("skills/dynamic.rs"),
+        );
+        for symbol in ["withheld_advisory", "render_output", "withheld"] {
+            assert!(
+                !source.contains(symbol),
+                "skills/dynamic.rs names `{symbol}`, so a skill's inlined command output                  can now carry the shell tool's advisory — text the skill author never                  wrote, in a prompt they authored (BR-2)."
+            );
+        }
+        assert!(
+            source.contains("run_bounded"),
+            "the scan found no run_bounded reference, so it is reading the wrong file              and the assertions above are vacuous"
+        );
     }
 
     #[test]
