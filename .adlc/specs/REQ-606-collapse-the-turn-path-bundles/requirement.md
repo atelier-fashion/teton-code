@@ -133,6 +133,23 @@ caught by asserting on the patch, not by reading the result.
 | 4 | substitute | `fs::read_to_string` added inside `run_the_allowed_tool` | RED: "1x `fs::read_to_string(`" — and it caught it in the one function this REQ changed |
 | 5 | inversion | the hold's rebind de-shadowed, so the context carries the pre-hold router | RED: "the context is carrying the pre-hold router" |
 
+### Rule A was verified against clippy, not assumed
+
+The classification rests entirely on clippy's `too_many_arguments` threshold
+being 7, so that number was measured rather than recalled. `ExpansionInputs` —
+the **narrowest margin in the set**, and therefore the one that would expose an
+off-by-one — was collapsed for real, its call site updated, and clippy run:
+
+```
+error: this function has too many arguments (8/7)
+    = help: to override `-D clippy::all` add `#[allow(clippy::too_many_arguments)]`
+```
+
+Clippy names the suppression AC-2 forbids as the only escape, which is the whole
+of Rule A in one message. The probe was reverted. Had the threshold been 8, five
+rows of the Rule A table would have changed verdict, so this was the single
+load-bearing assumption in the classification.
+
 ### Finding — invariant 1 is not pinned, and REQ-600's table overstated it
 
 REQ-600's architecture recorded invariant 1 ("typed-outcome arms before the
