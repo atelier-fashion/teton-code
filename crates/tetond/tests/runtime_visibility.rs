@@ -135,6 +135,27 @@ const PUBLIC: &[&str] = &[
     // from outside the crate. Established by demoting and building, never by
     // grepping for the name (LESSON-596).
     "turn.rs::run_prompt_turn",
+    // REQ-603, and **not a widening** for the same reason `run_prompt_turn`
+    // above is not: all three were already `pub`, in `mod.rs`, reachable exactly
+    // as far. Relocating them to `session.rs` moved them from a file this scan
+    // excludes into one it reads. The count below moves 14 -> 17 for that reason
+    // and no other.
+    //
+    // `session_root_for` and `set_session_cwd` earn `pub` rather than
+    // `pub(crate)`: demoting them fails to compile against `provenance_egress`,
+    // `skill_turn`, `skill_tool_loop` and `skill_over_budget_offer`, which link
+    // the lib from outside the crate. Established by demoting and building
+    // (LESSON-596).
+    //
+    // `clear_session` is the exception and is recorded rather than acted on:
+    // demoting it to `pub(crate)` compiles clean — every caller
+    // (`server.rs`, `harness/tools/mod.rs`) is in-crate. It stays `pub` because
+    // narrowing an API inside a relocation is precisely LESSON-595, and REQ-603
+    // is a relocation. Whether the `session/*` surface should be uniformly
+    // `pub(crate)` is a real question and a separate one.
+    "session.rs::clear_session",
+    "session.rs::session_root_for",
+    "session.rs::set_session_cwd",
     "taint.rs::SessionTaint",
     "taint.rs::SessionTaintView",
     "taint.rs::WebTaintOverride",
@@ -156,7 +177,11 @@ const PUBLIC: &[&str] = &[
 ///
 /// 13 -> 14 at REQ-600, when `run_prompt_turn` moved from `mod.rs` (outside
 /// this scan) into `turn.rs` (inside it). The item's visibility did not change.
-const PUBLIC_DECLARATIONS: usize = 14;
+///
+/// 14 -> 17 at REQ-603, when `clear_session`, `session_root_for` and
+/// `set_session_cwd` moved from `mod.rs` into `session.rs` the same way. Their
+/// visibility did not change either.
+const PUBLIC_DECLARATIONS: usize = 17;
 
 fn runtime_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime")

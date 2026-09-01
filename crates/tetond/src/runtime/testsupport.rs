@@ -85,3 +85,41 @@ pub(super) fn config_with_remote(id: &str) -> Config {
     );
     config
 }
+
+// ---------------------------------------------------------------------------
+// REQ-603 — the session-root scratch helper, shared for the same reason the two
+// groups above are.
+//
+// It lived in `runtime/mod.rs`'s `tests::conversation_carry`, reachable only
+// through `super::`, which meant `session.rs` could not take
+// `the_session_root_is_probed_from_the_cwd_or_the_daemon_fallback` with the
+// subject that test describes (BR-7). Nine of `conversation_carry`'s own tests
+// still call it, so a shared home is what it already needed — the third time
+// this module tree has met that shape.
+// ---------------------------------------------------------------------------
+
+// -- REQ-583: the session root through the runtime -------------------
+//
+// The banner came with the helper. It sat above `scratch_root` in
+// `conversation_carry` and is the id `traceability_sweep.rs` records as
+// annotating it — taking the `///` block alone would have left the rationale
+// behind, which is LESSON-594 and the exact mistake `turn.rs`'s header records
+// making once already. The banner also still stands over the REQ-583 tests that
+// remained in `conversation_carry`; both statements are true.
+
+/// A unique scratch directory; the caller removes it. Holds a project
+/// marker when `project` is set, so the probe classifies it as one.
+pub(super) fn scratch_root(tag: &str, project: bool) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "teton-runtime-root-{tag}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    if project {
+        std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+    }
+    dir
+}

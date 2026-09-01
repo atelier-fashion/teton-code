@@ -1,7 +1,7 @@
 ---
 id: TASK-317
 title: "Extract the session-lifecycle slice to runtime/session.rs as one reviewable commit"
-status: draft
+status: complete
 parent: REQ-603
 created: 2026-08-31
 updated: 2026-08-31
