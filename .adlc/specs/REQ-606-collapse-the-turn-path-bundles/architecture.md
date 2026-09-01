@@ -184,6 +184,27 @@ that has stopped covering its subject looks exactly like a guard that passes. So
 every mutation is re-run against the changed tree and its observed output
 recorded, including the ones expected to be unaffected.
 
+## ADR-2 — The mutation evidence is only valid on the tree that merges
+
+This REQ is third in an overlap cluster: REQ-603 and REQ-604 merge ahead of it
+and it rebases onto both. That interacts with AC-4 in a way worth stating,
+because getting it wrong reproduces the exact defect AC-4 exists to catch.
+
+REQ-603 relocates session-lifecycle production code out of `runtime/mod.rs`.
+Four of the five invariant guards live in that file's test module and read the
+turn path *by source scan*. A mutation re-run before the rebase is evidence
+about a tree that will not be merged — and a guard whose subject moved under it
+still passes, silently, which is the whole of LESSON-598.
+
+So TASK-005's mutations are re-run **after the final rebase**, not before, and
+the verification record states the commit they were run against. Running them
+earlier is fine as a working check; it is not the evidence AC-4 asks for.
+
+The file-level conflict risk is separately low: this REQ touches
+`runtime/turn.rs` and `harness/turn_loop.rs`; REQ-603 touches `runtime/mod.rs`
+and adds `runtime/session.rs`; REQ-604 adds fixtures. The one shared file would
+have been REQ-599's module-map table, which this REQ does not edit.
+
 ## Task graph
 
 ```
