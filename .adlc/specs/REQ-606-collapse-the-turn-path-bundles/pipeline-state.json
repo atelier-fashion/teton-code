@@ -1,0 +1,31 @@
+{
+  "req": "REQ-606",
+  "branch": "feat/REQ-606-collapse-the-turn-path-bundles",
+  "startedAt": "2026-09-01T00:02:06Z",
+  "completed": false,
+  "currentPhase": 1,
+  "completedPhases": [0],
+  "integrationBranch": "main",
+  "phaseHistory": [
+    { "phase": 0, "name": "Create Worktree + Preflight", "completedAt": "2026-09-01T00:02:06Z" }
+  ],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-606",
+      "branch": "feat/REQ-606-collapse-the-turn-path-bundles",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": ["teton-code"],
+  "phase4": { "currentTask": null, "completedTasks": [], "failedTasks": [] },
+  "notes": [
+    "Sprint overlap cluster {REQ-603, REQ-604, REQ-606}; REQ-606 is third. Orchestrator owns the merge — this runner stops at pr-ready per dispatch override."
+  ]
+}
