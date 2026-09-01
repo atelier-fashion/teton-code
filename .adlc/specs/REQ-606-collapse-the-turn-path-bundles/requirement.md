@@ -158,6 +158,38 @@ the rebase. **REQ-604 had not merged at this point**, so a final re-run is still
 owed once it does — that is the orchestrator's rebase, and this table is the
 method for it.
 
+### And again after REQ-604 merged — the final rebase
+
+REQ-604 (`4b1d22c`) merged last in the cluster, adding a ~593-line test module
+to `crates/tetond/src/runtime/mod.rs` and two new fixtures. That is the file
+four of the five guards live in, so the table was run a **third** time, on the
+tree that actually merges.
+
+The rebase was clean — this REQ never edits `mod.rs`. The guards kept their
+names and their file but **moved line numbers**, which is exactly the condition
+LESSON-598 says cannot be read off the source. So each mutation asserted that
+its patch had *changed the file* before the guard was run at all — the first
+attempt at the invariant-3 mutation, recorded above, passed a guard precisely
+because a bad index meant nothing was patched.
+
+| # | mutation | patch proof | observed |
+|---|---|---|---|
+| 3 | claim and re-read swapped | +7/-7; re-read line 554 now precedes claim line 569 | RED — "claim at byte 2365, re-read at 1404" |
+| 5 | hold's rebind de-shadowed | +2/-2; `_rebound_router` present | RED — "carrying the pre-hold router" |
+| 2 | second `PermissionGate::with_level` | `with_level` count 1 → 2 | RED — "constructed 2 time(s)" |
+| 4 | `fs::read_to_string` in `run_the_allowed_tool` | `fs::read_to_string` count 0 → 1 | RED — named `turn_loop.rs`, the one file this REQ changes |
+| 1 | spend-ceiling arm deleted outright | 1,475 bytes / 25 lines removed; `is_spend_ceiling_reached` count 1 → 0 | **GREEN — 4,078 / 0** |
+
+Suite **4,078 passed, 0 failed** (REQ-604 added four), `EXIT=0`, `FAILED`
+grepped — 0 occurrences. AC-3 unchanged across both rebases: **185 lines**,
+brace depth **5**. The REQ-598 fixture is still unregenerated — REQ-604 added
+`req604_*` fixtures beside it and did not touch `req598_turn_event_order.txt`.
+
+**Invariant 1 is unchanged by either predecessor.** It was green before REQ-603,
+green after it, and green after REQ-604 — which is the strongest form of the
+finding: three independent trees, same result, and the deletion is provably
+applied each time.
+
 ### Rule A was verified against clippy, not assumed
 
 The classification rests entirely on clippy's `too_many_arguments` threshold
