@@ -88,19 +88,64 @@ events fall in a turn.
       — the normalizer must not have been widened into an excuse.
 - [x] AC-7: Suite green, grepped for `FAILED`; clippy and `fmt --check` clean.
 
-## Outcome
+## Outcome — merged as `4b1d22c` (PR #258)
 
 **Both captured sequences replayed against the current tree on the first run,
-unmodified.** AC-3's disposition machinery was therefore never exercised, and
-AC-3 is marked N/A rather than ticked: no delta appeared, so there was nothing
-to disposition. Neither fixture was regenerated at any point.
+unmodified.** Neither fixture was regenerated at any point.
 
-That both replay is a substantive result rather than a null one. The four
-refactors between `17c39ec` and tip — REQ-598 (`TurnContext`), REQ-599
+### AC-3 is N/A, not met
+
+AC-3 governs what to do *if* a captured sequence does not replay. No sequence
+failed to replay, so its trigger never fired and its machinery was never
+exercised. A criterion whose condition did not arise is not a criterion met, and
+recording it as met would be the same move that ticked REQ-599's AC-6 — claiming
+evidence for something never tested. It is marked N/A deliberately.
+
+What that costs: the disposition protocol in ADR-7 is **unexercised**. It was
+written before the replay was run, precisely so the decision could not be made
+after seeing a red test, but it has never been executed. The next REQ that
+inherits it should treat it as a design, not as a proven procedure.
+
+### What the green result does establish
+
+The four refactors between `17c39ec` and tip — REQ-598 (`TurnContext`), REQ-599
 (decomposing `runtime.rs`), REQ-600 (the eight-stage split) and REQ-602
-(post-split cleanup) — each claimed to preserve behaviour, and each claim was
-previously evidenced on the plain typed turn alone. The skill-expansion and
-consent orderings now carry evidence too, against a pre-split oracle.
+(post-split cleanup) — each claimed to preserve behaviour. Each claim was
+previously evidenced on the **plain typed turn alone**, because that is the only
+scenario the REQ-598 fixture contains. Skill-expansion and consent orderings now
+carry pre-split evidence too. REQ-603's session-lifecycle extraction, which
+landed between this branch's Phase 7 and its merge, is covered as well: the
+fixtures were re-run against merged `main` and are green.
+
+### Verification (re-run from an isolated path after the scratchpad finding below)
+
+Against merged `main` = `4b1d22c`, post-REQ-603:
+
+- `cargo test --workspace --no-fail-fast` — exit 0, **0** occurrences of
+  `FAILED`, 74 targets, **4,078** passed.
+- `cargo clippy --workspace --all-targets` — clean under `deny`; no new
+  `#[allow(...)]`.
+- `cargo fmt --check` — clean.
+- The four `req604_event_order` tests — 4 passed.
+- CI on the rebased head `b279cc9` — 7/7 green, including
+  `fmt · clippy · test (macos-latest)`, the runner LESSON-591's race went red on.
+
+### Evidence-integrity note (disclosed, not buried)
+
+The `/sprint` scratchpad is session-specific but **not agent-specific**, so the
+three concurrent runners shared one directory. This runner wrote workspace test
+output to generic names (`suite.txt`, `suite2.txt`, `suite3.txt`) and clobbered
+REQ-606's results file, which is how REQ-606 came to report "56 passed" from a
+run that was not its own.
+
+REQ-604's own figures were checked rather than assumed after the fact: each file
+contained four `req604_event_order` hits, zero REQ-606 references, and only
+`.worktrees/REQ-604` paths, and the shared `CARGO_TARGET_DIR` had built for this
+worktree only. The numbers were nonetheless **re-derived from an isolated path**
+on merged `main`, and came back identical (4,078 / 0 `FAILED` / 74 targets). The
+authoritative evidence — CI — was never in the scratchpad at all.
+
+Captured as LESSON-610. This runner caused the collision; it did not suffer it.
 
 ## Assumptions
 
