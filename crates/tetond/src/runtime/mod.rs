@@ -17660,6 +17660,13 @@ provider_id = \"deepseek\"
         /// recorded the fixtures, so a mismatch is a fact about the turn path
         /// and not about how the two sides were driven.
         ///
+        /// That was checked rather than assumed: the `run_prompt_turn` call, the
+        /// scripted engine's replies, the skill discovery, the gate install, the
+        /// spawned turn and the gate answer were diffed between the harness and
+        /// this module and are byte-identical, with one exception — rustfmt
+        /// wrapped one `Arc::new(...)` differently here, because this side was
+        /// formatted and the throwaway harness was not.
+        ///
         /// **Why two fixtures and not one.** The skill scenario uses a
         /// *user*-authored skill. A project skill would raise REQ-589 ADR-10's
         /// trust acknowledgment, and the skill fixture would then also pin the
@@ -17745,6 +17752,14 @@ provider_id = \"deepseek\"
             }
 
             /// Parse `name` or `name[category=value]` — the fixture's line form.
+            ///
+            /// A malformed discriminator yields `category: None` rather than an
+            /// error, and that is safe in the only direction that matters: an
+            /// entry that fails to parse as the title duty's route is then *not*
+            /// dropped, so it survives into the comparison and trips either the
+            /// "exactly ONE route decision" floor or the sequence assertion. A
+            /// typo in these files cannot produce a quieter suite — only a
+            /// louder one. Do not "fix" this into a silent default.
             fn parse_entry(line: &str) -> Entry {
                 match line.split_once('[') {
                     Some((name, rest)) => Entry {
@@ -17849,6 +17864,15 @@ provider_id = \"deepseek\"
             /// would be answered and show up in the compared sequence, rather
             /// than deadlocking the test — a hang is a worse failure report than
             /// a diff.
+            ///
+            /// This and [`user_home_with_skill`] restate scaffolding that
+            /// `a_typed_project_skill_is_acknowledged_first` also has. The
+            /// duplication is deliberate, not an oversight: that module is a
+            /// private sibling, so its helpers are unreachable from here without
+            /// widening them, and a golden-ordering fixture that depended on
+            /// another test module's scaffolding would acquire a second reason
+            /// to go red — one that has nothing to do with the turn path it
+            /// exists to pin.
             struct AllowsEverything(Arc<PendingPermissions>);
 
             impl AddressedPermissionDelivery for AllowsEverything {
