@@ -1,0 +1,91 @@
+{
+  "req": "REQ-603",
+  "branch": "feat/REQ-603-extract-the-session-lifecycle-slice",
+  "startedAt": "2026-08-31T00:00:00Z",
+  "completed": false,
+  "currentPhase": 8,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "integrationBranch": "main",
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree + Preflight",
+      "completedAt": "2026-09-01T00:01:21.779053Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-09-01T00:01:53.237421Z",
+      "result": "APPROVED"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Tasks",
+      "completedAt": "2026-09-01T00:12:04.597557Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-09-01T00:15:10.809942Z",
+      "result": "APPROVED"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-09-01T00:28:07.725866Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify",
+      "completedAt": "2026-09-01T00:32:00.950574Z",
+      "result": "no Critical/Major; 2 observations filed as follow-ups"
+    },
+    {
+      "phase": 6,
+      "name": "Create PR",
+      "completedAt": "2026-09-01T00:32:47.319212Z"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-09-01T00:36:14.238793Z",
+      "result": "7/7 checks pass"
+    }
+  ],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-603",
+      "branch": "feat/REQ-603-extract-the-session-lifecycle-slice",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/256",
+      "prNumber": 256,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-317",
+      "TASK-318"
+    ],
+    "failedTasks": []
+  },
+  "blockers": [],
+  "notes": []
+}

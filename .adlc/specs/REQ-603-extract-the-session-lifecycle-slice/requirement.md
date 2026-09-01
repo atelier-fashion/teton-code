@@ -1,10 +1,10 @@
 ---
 id: REQ-603
 title: "Extract the session-lifecycle slice REQ-599 planned and never shipped"
-status: draft
+status: complete
 deployable: false
 created: 2026-08-31
-updated: 2026-09-01
+updated: 2026-08-31
 component: "daemon/runtime"
 domain: "refactoring"
 stack: ["rust", "daemon"]
