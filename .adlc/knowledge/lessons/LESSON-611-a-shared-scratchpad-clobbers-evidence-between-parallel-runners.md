@@ -30,6 +30,15 @@ same filename. The summed result read **56 passed, 0 failed** against an
 expected ~4,000 — and the only reason that was caught is that the file's
 compiler output named `.worktrees/REQ-604` in its paths.
 
+**The writer's side is LESSON-610**, filed by REQ-604's own wrapup, which
+confirmed the mechanism from the other end rather than leaving it inferred: the
+scratchpad is *session*-specific but not *agent*-specific, all three runners of
+the cluster resolved to one directory, and REQ-604 wrote `suite.txt`,
+`suite2.txt`, `suite3.txt` and `pr-body.md` into it. REQ-604 established it was
+the clobberer, not the clobbered — its own files were intact. This lesson is the
+**reader's** side of the same event: what it is like to receive the clobbered
+file and have to notice.
+
 Had the two runs been closer in size, the number would have looked plausible and
 **REQ-606 would have published another REQ's test results as its own.**
 
@@ -79,3 +88,11 @@ collide, and "happened not to" is the whole problem.
 The durable fix belongs in the harness — give each subagent its own scratchpad,
 or key the path on the subagent rather than the parent session. Until then it is
 the runner's job, and the runner cannot see the collision coming.
+
+**See also LESSON-610** for the writing discipline (namespace every scratch path
+by the work item, at Phase 0, before anything is written). The two are
+deliberately not merged: 610 tells a runner how not to cause this, 611 tells a
+runner how to notice it has happened to them. A runner that follows 610
+perfectly can still be the victim of one that does not — which is exactly the
+case here, since REQ-606 was following no convention at all and neither was
+REQ-604.

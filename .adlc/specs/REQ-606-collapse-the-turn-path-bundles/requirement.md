@@ -241,13 +241,91 @@ failure-path coverage, not a refactor, and writing it in a hurry inside a REQ
 whose own AC-4 is about vacuous guards is how LESSON-569 happens again. **It
 needs its own REQ.**
 
+## Wrapup (Phase 8b)
+
+**Merged as `d8871b8`** — "REQ-606: Collapse the turn-path parameter bundles that
+carry no invariant (#257)" — squashed onto `main` from `dfd6ff4`, the exact head
+CI run `33458140668` was green on (all 7 checks, both `macos-latest` and
+`ubuntu-latest`). Third and last of the overlap cluster `{603, 604, 606}`; the
+orchestrator owned the merge and this runner never held it.
+
+### The result, in one line
+
+Fourteen bundles classified. **Twelve earn their name, two did not** — the
+inverse of the "roughly five earn a name" the REQ was filed on, and decided by
+arithmetic rather than taste. `PreparedAttempts` deleted, `ToolCallSite`
+narrowed 5 fields → 3, `TurnRequest` renamed `PromptRequest` to stop it silently
+shadowing `teton_providers::TurnRequest`.
+
+### AC-4 invariant 1 — NOT MET, and the evidence is stronger than a single run
+
+Recorded NOT MET, deliberately, and **not** opportunistically fixed while the
+code was open.
+
+The finding is not one observation. Deleting the spend-ceiling arm from
+`run_attempts` outright leaves the suite **green on three independent trees**:
+
+| tree | suite | invariant 1 |
+|---|---|---|
+| pre-cluster (`391091a`) | 4,074 / 0 | GREEN |
+| post-REQ-603 (`7fe035c`) | 4,074 / 0 | GREEN |
+| post-REQ-604 (`4b1d22c`, the merged tree) | 4,078 / 0 | GREEN |
+
+**And the deletion was proven applied each time**, not assumed: on the final tree
+it removed 1,475 bytes / 25 lines and took `is_spend_ceiling_reached` from 1
+occurrence to 0 before the suite was run. That assertion-on-the-patch exists
+because the first attempt at the invariant-3 mutation silently failed to apply
+and its guard passed — a green that proved nothing, which is precisely the
+failure mode AC-4 exists to catch.
+
+Three trees, three proven-applied deletions, one result. That is the evidence the
+follow-up REQ starts from, and it is what makes "REQ-600's table recorded this as
+PINNED — 3 tests" a correctable record rather than a disagreement. Those three
+tests pin the ceiling refusal composed at the **egress choke point**
+(`egress/mod.rs`); the turn-path arm is a second, distinct site and is uncovered.
+The ordering only ever had teeth there — `ContextLengthExceeded` is its own
+`HarnessError` variant, not a refinement of `Remote(_)`, so its position relative
+to the generic remote arm cannot change behaviour.
+
+**Why it was not fixed here.** Closing it needs a fixture driving
+`ProviderError::SpendCeilingReached` through `run_attempts` on a first attempt.
+That variant is only ever produced from `TransportError::SpendCeiling` at the
+egress choke point, so the fixture is new failure-path coverage — not a refactor
+— and writing it in a hurry inside a REQ whose own AC-4 is about vacuous guards
+is how LESSON-569 repeats. It needs its own REQ.
+
+### Knowledge captured
+
+| id | kind | subject |
+|---|---|---|
+| ASSUME-031 | invalidated | the bundles can be collapsed without exceeding the argument limit |
+| ASSUME-032 | validated | AC-3's body-length budget survives the collapse |
+| LESSON-611 | lesson | a clobbered results file reads as a real run (reader's side of LESSON-610) |
+
+LESSON-611 landed inside the REQ-606 merge itself rather than in this wrapup,
+because the collision was found during Phase 4 and the id was measured by hand
+at that point. Cross-linked to REQ-604's LESSON-610 here.
+
+### A process fact worth writing down
+
+**A `/sprint` pipeline-runner never invokes the delegate.** `/proceed`'s Phase 5
+skips the `adlc-read` pre-pass outright in subagent mode — "subagents cannot
+reliably reach a parent's shell env" — so the delegation *gate* is never
+consulted and the delegate's configured state is irrelevant to a sprinted REQ
+either way. This is stated in `/proceed`'s SKILL.md but is easy to miss when
+reasoning about a runner from the outside: a change to `delegate-gate.sh` (such
+as `e31ee93`, which made an explicit `delegate.enabled: false` outrank a legacy
+key) changes nothing for any REQ running under `/sprint`. It only affects a
+solo `/proceed` in the main conversation.
+
 ## Assumptions
 
-- The bundles can be collapsed without pushing any signature back over the
-  argument limit. If one cannot, that is a finding to record — it would mean the
-  cluster is real and the bundle earns its name after all.
-- **The same applies to AC-3's body-length budget, which is tighter than it
-  looks.** `run_prompt_turn` is at **188** lines against AC-3's 200 — twelve
+- **[ASSUME-031 — INVALIDATED]** The bundles can be collapsed without pushing any
+  signature back over the argument limit. If one cannot, that is a finding to
+  record — it would mean the cluster is real and the bundle earns its name after
+  all. *Twelve of the fourteen could not. The failure branch was the deliverable.*
+- **[ASSUME-032 — VALIDATED]** **The same applies to AC-3's body-length budget,
+  which is tighter than it looks.** *188 → 185 against a limit of 200.* `run_prompt_turn` is at **188** lines against AC-3's 200 — twelve
   lines of headroom, re-derived at this REQ's base rather than taken from
   REQ-600's record. Collapsing an *input* bundle moves its fields back to the
   call site, and for the input bundles that call site is `run_prompt_turn`'s

@@ -66,3 +66,8 @@ being reasoned about.
   runner should be handed a scratch path already namespaced by its work item, so
   no runner has to remember. Recorded here because this is where it was observed
   and where the next sprint will meet it.
+
+**See also LESSON-611** (REQ-606), the reader's side of this same event: how a
+clobbered results file presents to the runner that receives it, and why "56
+passed, 0 failed" is not self-evidently wrong. This lesson is how not to cause
+the collision; 611 is how to notice it has happened to you.
