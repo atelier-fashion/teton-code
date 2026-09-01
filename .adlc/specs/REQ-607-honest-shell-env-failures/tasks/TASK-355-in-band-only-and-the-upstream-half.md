@@ -1,7 +1,7 @@
 ---
 id: TASK-355
 title: "Prove the advisory travels in-band only, and close BR-4's upstream half"
-status: draft
+status: complete
 parent: REQ-607
 created: 2026-08-31
 updated: 2026-08-31

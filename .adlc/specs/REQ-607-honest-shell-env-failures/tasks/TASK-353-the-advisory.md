@@ -1,7 +1,7 @@
 ---
 id: TASK-353
 title: "Carry the withheld fact out of the spawn and word it on the failing tool result"
-status: draft
+status: complete
 parent: REQ-607
 created: 2026-08-31
 updated: 2026-08-31

@@ -1,7 +1,7 @@
 ---
 id: TASK-350
 title: "Add the [shell] config table with its single allow_ssh_agent key"
-status: draft
+status: complete
 parent: REQ-607
 created: 2026-08-31
 updated: 2026-08-31

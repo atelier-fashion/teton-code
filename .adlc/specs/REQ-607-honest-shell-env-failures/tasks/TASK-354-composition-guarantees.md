@@ -1,7 +1,7 @@
 ---
 id: TASK-354
 title: "Pin what the opt-in admits, and what it must not reach"
-status: draft
+status: complete
 parent: REQ-607
 created: 2026-08-31
 updated: 2026-08-31

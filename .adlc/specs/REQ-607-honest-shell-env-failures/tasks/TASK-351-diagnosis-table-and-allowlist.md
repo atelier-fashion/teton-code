@@ -1,7 +1,7 @@
 ---
 id: TASK-351
 title: "The diagnosis table, the SSH_AUTH_SOCK constant, and the opt-in allowlist function"
-status: draft
+status: complete
 parent: REQ-607
 created: 2026-08-31
 updated: 2026-08-31

@@ -1,7 +1,7 @@
 ---
 id: TASK-352
 title: "Widen the child-env provider to one live-config policy read"
-status: draft
+status: complete
 parent: REQ-607
 created: 2026-08-31
 updated: 2026-08-31
