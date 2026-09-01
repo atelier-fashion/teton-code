@@ -1,0 +1,30 @@
+{
+  "req": "REQ-604",
+  "branch": "feat/REQ-604-pre-split-ordering-fixture-for-skill-and-consent-turns",
+  "startedAt": "2026-08-31T00:00:00Z",
+  "completed": false,
+  "currentPhase": 0,
+  "completedPhases": [],
+  "integrationBranch": "main",
+  "phaseHistory": [],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-604",
+      "branch": "feat/REQ-604-pre-split-ordering-fixture-for-skill-and-consent-turns",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": ["teton-code"],
+  "phase4": { "currentTask": null, "completedTasks": [], "failedTasks": [] },
+  "notes": [
+    "Sprint override: merge ownership belongs to the /sprint orchestrator (cluster REQ-603 -> REQ-604 -> REQ-606). This runner stops after Phase 7 and reports pr-ready."
+  ],
+  "blockers": []
+}
