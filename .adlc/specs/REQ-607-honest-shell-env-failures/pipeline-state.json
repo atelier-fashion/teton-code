@@ -3,13 +3,14 @@
   "branch": "feat/REQ-607-honest-shell-env-failures",
   "startedAt": "2026-08-31T00:00:00Z",
   "completed": false,
-  "currentPhase": 5,
+  "currentPhase": 6,
   "completedPhases": [
     0,
     1,
     2,
     3,
-    4
+    4,
+    5
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -41,6 +42,12 @@
       "name": "Implement",
       "completedAt": "2026-08-31T00:00:00Z",
       "result": "TASK-350..355 complete"
+    },
+    {
+      "phase": 5,
+      "name": "Verify",
+      "completedAt": "2026-08-31T00:00:00Z",
+      "result": "4 findings fixed (1 major bug, 1 doc/behaviour mismatch, 1 wording, 2 missing guards)"
     }
   ],
   "repos": {
