@@ -4,10 +4,16 @@
   "startedAt": "2026-08-31T00:00:00Z",
   "completed": false,
   "currentPhase": 1,
-  "completedPhases": [0],
+  "completedPhases": [
+    0
+  ],
   "integrationBranch": "main",
   "phaseHistory": [
-    { "phase": 0, "name": "Create Worktree + Preflight", "completedAt": "2026-08-31T00:00:00Z" }
+    {
+      "phase": 0,
+      "name": "Create Worktree + Preflight",
+      "completedAt": "2026-08-31T00:00:00Z"
+    }
   ],
   "repos": {
     "teton-code": {
@@ -16,14 +22,16 @@
       "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-607",
       "branch": "feat/REQ-607-honest-shell-env-failures",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/260",
+      "prNumber": 260,
       "merged": false,
       "snapshotBranch": null,
       "snapshotPR": null
     }
   },
-  "mergeOrder": ["teton-code"],
+  "mergeOrder": [
+    "teton-code"
+  ],
   "phase4": {
     "currentTask": null,
     "completedTasks": [],
