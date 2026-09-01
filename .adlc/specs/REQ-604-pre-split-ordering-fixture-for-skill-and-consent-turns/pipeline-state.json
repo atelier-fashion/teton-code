@@ -79,7 +79,8 @@
       "snapshotPR": null,
       "mergeCommit": "4b1d22c",
       "mergedBy": "sprint-orchestrator (cluster order 603 -> 604 -> 606)",
-      "rebasedHead": "b279cc9"
+      "rebasedHead": "b279cc9",
+      "wrapupPR": "https://github.com/atelier-fashion/teton-code/pull/263"
     }
   },
   "mergeOrder": [
@@ -98,6 +99,7 @@
   },
   "notes": [
     "MERGED as 4b1d22c via PR #258. The /sprint orchestrator performed the merge (this runner was second in the overlap cluster {REQ-603, REQ-604, REQ-606} and was instructed not to self-merge); this runner performed the Phase 8b close-out.",
+    "Wrapup PR #263 (chore/REQ-604-wrapup) carries this close-out: knowledge, assumption disposition and terminal record. Merged by the orchestrator.",
     "AC-3 recorded N/A, NOT met: both captured sequences replayed unmodified on the first run, so its trigger never fired and ADR-7's disposition protocol remains unexercised. A criterion whose condition did not arise is not a criterion met.",
     "ASSUME-030 validated: 17c39ec builds. Non-recurring \u2014 a future pre-split capture must re-verify its own capture commit.",
     "Knowledge captured: LESSON-608 (a golden fixture records its discriminator), LESSON-609 (same entry point is not same invocation), LESSON-610 (a session scratchpad is not per-agent). Ids measured against the actual high-water across all six ADLC repos (global max was LESSON-607, ASSUME-029, both taken by REQ-603) -- the id allocator was NOT used, per coordinator instruction after it issued three colliding ids on 2026-08-31.",
