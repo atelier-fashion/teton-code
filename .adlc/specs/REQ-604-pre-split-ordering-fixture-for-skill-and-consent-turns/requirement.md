@@ -1,7 +1,7 @@
 ---
 id: REQ-604
 title: "The turn-ordering fixture covers a plain turn only — capture the skill and consent scenarios REQ-599 AC-6 named"
-status: draft
+status: complete
 deployable: false
 created: 2026-08-31
 updated: 2026-09-01
@@ -55,12 +55,12 @@ events fall in a turn.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: Two sequences are captured **at `17c39ec`**, not at tip: one turn that
+- [x] AC-1: Two sequences are captured **at `17c39ec`**, not at tip: one turn that
       expands a skill and dispatches, one that raises a consent prompt, is
       answered, and dispatches. The capture commit is recorded in each
       fixture's header, as the existing fixture records its own.
-- [ ] AC-2: Each new fixture replays identically against the current tree.
-- [ ] AC-3: **If one does not replay, the disposition is decided on evidence and
+- [x] AC-2: Each new fixture replays identically against the current tree.
+- [x] AC-3 **(N/A — the condition did not arise; see note below)**: **If one does not replay, the disposition is decided on evidence and
       recorded — never by regenerating.** These scenarios have never been
       pinned, so a sequence that changed between `17c39ec` and tip is a real
       possibility and not automatically a bug. Exactly two outcomes are
@@ -76,23 +76,38 @@ events fall in a turn.
   - **Default when neither can be shown: regression.** An unexplained delta is
     not evidence of intent, and "it must have been deliberate" is the reasoning
     that ticked REQ-599's AC-6 in the first place.
-- [ ] AC-4: Detached events are excluded **by discriminator, not by position** —
+- [x] AC-4: Detached events are excluded **by discriminator, not by position** —
       LESSON-591: `session_titled` and the title duty's own `route_decided` are
       both published from inside a `tokio::spawn` and their arrival order is a
       race. Any new detached event these scenarios introduce is identified the
       same way.
-- [ ] AC-5: Non-vacuity: each fixture asserts a positive count of the events it exists
+- [x] AC-5: Non-vacuity: each fixture asserts a positive count of the events it exists
       to pin, so a filter that ate everything cannot pass (the existing test's
       "exactly ONE route decision survives" assertion is the model).
-- [ ] AC-6: A transposition of two adjacent distinct events still fails, per scenario
+- [x] AC-6: A transposition of two adjacent distinct events still fails, per scenario
       — the normalizer must not have been widened into an excuse.
-- [ ] AC-7: Suite green, grepped for `FAILED`; clippy and `fmt --check` clean.
+- [x] AC-7: Suite green, grepped for `FAILED`; clippy and `fmt --check` clean.
+
+## Outcome
+
+**Both captured sequences replayed against the current tree on the first run,
+unmodified.** AC-3's disposition machinery was therefore never exercised, and
+AC-3 is marked N/A rather than ticked: no delta appeared, so there was nothing
+to disposition. Neither fixture was regenerated at any point.
+
+That both replay is a substantive result rather than a null one. The four
+refactors between `17c39ec` and tip — REQ-598 (`TurnContext`), REQ-599
+(decomposing `runtime.rs`), REQ-600 (the eight-stage split) and REQ-602
+(post-split cleanup) — each claimed to preserve behaviour, and each claim was
+previously evidenced on the plain typed turn alone. The skill-expansion and
+consent orderings now carry evidence too, against a pre-split oracle.
 
 ## Assumptions
 
-- `17c39ec` still builds. If it does not, this REQ becomes "record that the
-  scenarios cannot be captured and say what covers them instead" — which is a
-  real outcome, not a failure to be papered over.
+- ~~`17c39ec` still builds.~~ **Verified.** `cargo build --tests -p tetond` is
+  clean at that commit and its 1,932 lib tests run, so the fallback outcome
+  ("record that the scenarios cannot be captured and say what covers them
+  instead") was not needed.
 
 ## Out of Scope
 

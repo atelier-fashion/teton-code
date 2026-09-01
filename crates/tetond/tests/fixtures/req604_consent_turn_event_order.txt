@@ -1,0 +1,50 @@
+# REQ-604 AC-1 golden event sequence for one turn that raises a consent prompt,
+# is answered, and dispatches. The second of the two scenarios REQ-599 AC-6
+# named and never captured.
+#
+# PROVENANCE (load-bearing): captured at `17c39ec`, where the turn path is
+# still the pre-split single-file `crates/tetond/src/runtime.rs` and no
+# *runtime* `TurnContext` exists. A fixture regenerated at tip would be an
+# oracle computed by the subject (conventions.md; LESSON-569).
+#
+# base commit: 17c39ec4f26432fae22bfb4d266159ce8afb614f
+#
+# "no *runtime* TurnContext" is deliberate — see the sibling skill fixture's
+# header for why the unqualified claim would be slightly too strong.
+#
+# The scenario: a plain typed prompt whose scripted reply is a `shell` tool
+# call. The gate raises `permission_request`, the harness answers it
+# `allow_once`, and the turn runs on to a final answer. The answer is awaited on
+# the event, never on a timer (LESSON-450).
+#
+# Note the two `prefix_cache` entries: this turn makes two engine calls — the
+# one that produces the tool call, and the one that produces the final answer
+# after the gate is answered — and each reports its own cache outcome. That the
+# consent prompt falls *between* them is the ordering this fixture exists to
+# pin.
+#
+# FORMAT: one event per line, in publication order. Consecutive runs of the same
+# event collapse to one entry (the trailing `session_update session_update` of
+# the dispatch stream is one entry here). `route_decided` carries its category,
+# because that is the discriminator both sides filter on.
+#
+# DETACHED ENTRIES — excluded by discriminator, never by position (AC-4,
+# LESSON-591):
+#
+#   route_decided[category=title]  the title duty's own decision
+#   session_titled                 the naming task's result
+#
+# Across 144 capture runs of this scenario at this commit the raw order was
+# stable, but stability across 144 runs on one machine is not a property — it is
+# the exact evidence LESSON-591 warns is insufficient, since that race passed
+# 40/40 locally and on `ubuntu-latest` and went red only on `macos-latest`. The
+# two entries are dropped by discriminator because of what publishes them, not
+# because they were seen to move here.
+route_decided[category=edit]
+route_decided[category=title]
+session_titled
+prefix_cache
+session_update
+permission_request
+session_update
+prefix_cache
