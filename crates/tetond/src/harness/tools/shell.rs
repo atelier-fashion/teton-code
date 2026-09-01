@@ -403,10 +403,17 @@ pub(crate) fn run_bounded(root: &Path, command: &str, timeout_ms: u64) -> Bounde
     // BR-3). This is the single construction site for a shell child's
     // environment; the region check in `child_env`'s tests fails the build if a
     // second one appears (AC-8).
+    //
+    // REQ-607: the allowlist is now `SHELL_ENV_ALLOW` *plus* whatever the one
+    // opt-in admits, read from the live config at the moment of the spawn. The
+    // policy is read **once** here and used for both arguments, so the child is
+    // never composed from a credential set and an opt-in that were true at
+    // different instants.
+    let policy = crate::child_env::child_env_policy();
     let child_env = crate::child_env::compose_child_env(
         std::env::vars(),
-        crate::child_env::SHELL_ENV_ALLOW,
-        &crate::child_env::credential_env_names(),
+        &crate::child_env::shell_env_allow(policy.allow_ssh_agent),
+        &policy.credential_env_names,
         &BTreeMap::new(),
     );
 
@@ -869,7 +876,10 @@ search_key_ref = "env:{web_var}"
         // the assertion is about the rule, not about this provider.
         let mut names = crate::child_env::credential_env_names_of(&config);
         names.insert("LANGUAGE".to_owned());
-        crate::child_env::set_credential_env_names_provider(move || names.clone());
+        crate::child_env::set_child_env_policy_provider(move || crate::child_env::ChildEnvPolicy {
+            credential_env_names: names.clone(),
+            allow_ssh_agent: false,
+        });
 
         let secrets = [
             (provider_var.clone(), format!("SENTINEL-provider-{unique}")),

@@ -28,15 +28,30 @@
 //! the other, and the second is the half of the old scrub that survived the
 //! rewrite — deliberately, and with its tests (ADR-E).
 //!
-//! ## The credential set is pulled, not pushed
+//! ## The policy is pulled, not pushed
 //!
 //! `auth_ref = "env:<VAR>"` is a first-class credential form: the daemon knows
 //! at config-load time exactly which variable names hold provider secrets, and
 //! it used to never tell the scrubber. Now it does, through
-//! [`set_credential_env_names_provider`] — a closure the daemon installs once at
+//! [`set_child_env_policy_provider`] — a closure the daemon installs once at
 //! bootstrap that reads the **live** config each time it is called. Not a
 //! snapshot: a provider added mid-session is visible to the very next spawn, and
 //! there is no second copy of the set to go stale (LESSON-539).
+//!
+//! REQ-607 widened what that closure returns from the credential set alone to a
+//! whole [`ChildEnvPolicy`], because the `shell` path now needs a second fact
+//! from the same config at the same instant — `[shell] allow_ssh_agent`. One
+//! provider rather than two: a spawn cannot read half a policy, and nobody can
+//! wire one reader and forget the other.
+//!
+//! ## The one variable an opt-in can add back
+//!
+//! REQ-596's rejections stand, and one of them — `SSH_AUTH_SOCK` — is the one
+//! users feel, because `git push` over ssh needs it and fails saying
+//! *"Permission denied (publickey)"*, which names ssh and never names Teton.
+//! REQ-607 answers that twice over: [`WITHHELD_DIAGNOSED`] lets the `shell` tool
+//! say who withheld it, and [`shell_env_allow`] lets a config author admit it —
+//! that name and no other, on the `shell` path and no other.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
@@ -267,11 +282,36 @@ pub(crate) fn credential_env_names_of(config: &Config) -> BTreeSet<String> {
         .collect()
 }
 
-/// The installed source of [`credential_env_names`].
-type Provider = Box<dyn Fn() -> BTreeSet<String> + Send + Sync>;
-static CREDENTIAL_ENV_NAMES: OnceLock<Provider> = OnceLock::new();
+/// Everything a spawn needs to know from the **live** config (REQ-607 ADR-C).
+///
+/// Two facts, one type, because they are read at the same instant by the same
+/// caller and a spawn that had one without the other would be composing an
+/// environment from half a policy. Bundling them also makes "install one
+/// provider and forget the other" unrepresentable — and a forgotten one would
+/// fail in the *safe* direction, which is the worst kind, because nothing would
+/// ever report it.
+///
+/// This is the same argument [`crate::runtime::DaemonRuntime::boundary_posture`]
+/// makes for reading both boundary facts under one lock: two readings across a
+/// concurrent `config/set` can disagree, and one derivation is what stops that.
+#[derive(Debug, Clone, Default)]
+pub struct ChildEnvPolicy {
+    /// Every variable name a configured `env:<NAME>` credential reference points
+    /// at — removed from the child unconditionally and last (REQ-596 BR-1/BR-3).
+    pub credential_env_names: BTreeSet<String>,
+    /// Whether `[shell] allow_ssh_agent` is set (REQ-607 BR-5).
+    ///
+    /// Read by the `shell` spawn path **only**, through [`shell_env_allow`]. The
+    /// MCP spawn path never consults this type.
+    pub allow_ssh_agent: bool,
+}
 
-/// Install the daemon's live-config reader as the credential-name source.
+/// The installed source of [`child_env_policy`].
+type Provider = Box<dyn Fn() -> ChildEnvPolicy + Send + Sync>;
+static CHILD_ENV_POLICY: OnceLock<Provider> = OnceLock::new();
+
+/// Install the daemon's live-config reader as the child-environment policy
+/// source.
 ///
 /// Called once from the daemon's bootstrap, after the runtime exists, in the
 /// same place and for the same reason as the lifetime work-claim wiring: the
@@ -280,26 +320,33 @@ static CREDENTIAL_ENV_NAMES: OnceLock<Provider> = OnceLock::new();
 /// A second call is ignored rather than fatal — `OnceLock` semantics — because
 /// the only caller is bootstrap and a test double that lost a race should not
 /// abort a daemon over which of two equivalent readers won.
-pub fn set_credential_env_names_provider<F>(provider: F)
+pub fn set_child_env_policy_provider<F>(provider: F)
 where
-    F: Fn() -> BTreeSet<String> + Send + Sync + 'static,
+    F: Fn() -> ChildEnvPolicy + Send + Sync + 'static,
 {
-    let _ = CREDENTIAL_ENV_NAMES.set(Box::new(provider));
+    let _ = CHILD_ENV_POLICY.set(Box::new(provider));
 }
 
-/// The credential env names as of **now**, or an empty set if no provider is
+/// The child-environment policy as of **now**, or the default if no provider is
 /// installed.
 ///
-/// Empty is safe rather than fail-open, and the reason is structural: under
+/// The default is safe in **both** fields, and each for its own reason.
+///
+/// An empty credential set is safe rather than fail-open, structurally: under
 /// [`compose_child_env`]'s step 1 a variable whose name is not on the allowlist
 /// is already absent, whatever this returns. The set only bites for the
 /// pathological intersection — a user who writes `auth_ref = "env:HOME"` — and
 /// the daemon, the one context where such a config exists at all, always
 /// installs the provider.
-pub(crate) fn credential_env_names() -> BTreeSet<String> {
-    CREDENTIAL_ENV_NAMES
+///
+/// `allow_ssh_agent: false` is safe because it is the shipped default: an
+/// uninstalled provider withholds the agent exactly as an unset config key does,
+/// so the failure mode of "nobody wired the bootstrap" is the *secure* posture
+/// rather than a silently widened child.
+pub(crate) fn child_env_policy() -> ChildEnvPolicy {
+    CHILD_ENV_POLICY
         .get()
-        .map_or_else(BTreeSet::new, |f| f())
+        .map_or_else(ChildEnvPolicy::default, |f| f())
 }
 
 #[cfg(test)]
@@ -539,6 +586,42 @@ mod tests {
             &declared,
         );
         assert!(value_of(&composed, "SENTINEL_DB").is_some());
+    }
+
+    /// REQ-607 BR-7 — the benign path for a daemon nobody wired.
+    ///
+    /// `child_env_policy()` falls back to [`ChildEnvPolicy::default`] when no
+    /// provider is installed, so the default *is* the behaviour of an
+    /// unbootstrapped daemon. Both fields must be safe there: no credential
+    /// names is structurally harmless (the allowlist already excludes anything
+    /// a credential is likely to be called), and `allow_ssh_agent: false` is the
+    /// shipped posture — so "nobody wired the bootstrap" withholds the agent
+    /// rather than silently widening the child.
+    ///
+    /// **Asserted on the default rather than by calling `child_env_policy()`
+    /// with nothing installed.** `CHILD_ENV_POLICY` is a process-global
+    /// `OnceLock` and other tests in this binary install a provider, so an
+    /// "uninstalled" assertion would pass or fail on test *order*. The default
+    /// is the value that branch returns, and it is the thing worth pinning.
+    #[test]
+    fn an_uninstalled_policy_provider_withholds_the_agent_and_names_no_credentials() {
+        let fallback = ChildEnvPolicy::default();
+        assert!(
+            !fallback.allow_ssh_agent,
+            "an unbootstrapped daemon admitted the ssh agent — the uninstalled-provider \
+             fallback must be the secure posture, not the permissive one"
+        );
+        assert!(fallback.credential_env_names.is_empty());
+
+        // And the fallback composes a child that really lacks the socket, so
+        // this is a claim about the environment rather than about a struct.
+        let composed = compose_child_env(
+            vars(&[("PATH", "/usr/bin"), (SSH_AUTH_SOCK, "/tmp/SENTINEL.sock")]),
+            &shell_env_allow(fallback.allow_ssh_agent),
+            &fallback.credential_env_names,
+            &BTreeMap::new(),
+        );
+        assert!(value_of(&composed, SSH_AUTH_SOCK).is_none());
     }
 
     /// REQ-607 BR-5 / BR-6 — the opt-in adds **one** name to the allowlist.
