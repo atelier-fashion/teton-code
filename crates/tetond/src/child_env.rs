@@ -104,6 +104,7 @@ pub(crate) const SSH_AUTH_SOCK: &str = "SSH_AUTH_SOCK";
 /// *this* machine. A name discovered from the daemon's live environment, or
 /// resolved from a configured `auth_ref = "env:<NAME>"`, is still unnameable,
 /// and no credential *value* is nameable under any condition.
+#[derive(Debug)]
 pub(crate) struct WithheldVar {
     /// The variable name. Must appear in the rejection table above — the test
     /// [`every_diagnosable_name_is_in_the_documented_rejection_table`]
@@ -142,6 +143,44 @@ pub(crate) const WITHHELD_DIAGNOSED: &[WithheldVar] = &[WithheldVar {
     programs: &["ssh", "git", "scp", "sftp", "rsync"],
     opt_in_key: Some("[shell] allow_ssh_agent"),
 }];
+
+/// Which diagnosable variables this child was actually **denied** (REQ-607 BR-1).
+///
+/// A row qualifies only when the daemon **has** the variable and the child does
+/// **not**. Both halves matter, and the first is the one worth arguing for.
+///
+/// The obvious alternative — "on the table and not on the allowlist" — reads
+/// only static facts and is wrong on a machine with no `ssh-agent` running:
+/// `git push` fails there for an entirely different reason, and an advisory
+/// would tell the user Teton withheld something it never had and point them at
+/// a key that would not have helped. Naming a remedy no command can reach is
+/// BUG-205's failure mode, which the advisory exists to avoid.
+///
+/// Asking the composed map instead gets three other cases right without
+/// knowing about them: with the opt-in on the variable is present and nothing
+/// is said; with `auth_ref = "env:SSH_AUTH_SOCK"` the credential removal wins
+/// and the advisory correctly *does* fire; and a future row needs no new logic.
+///
+/// **The residual, named rather than glossed.** Reading the live environment
+/// means the advisory's presence discloses one bit — that this machine has an
+/// agent socket. REQ-596 BR-5 as amended (2026-09-01, REQ-607) forbids a *name*
+/// discovered from the live environment appearing in output; the name here is
+/// drawn from [`WITHHELD_DIAGNOSED`], and the live read only gates whether it is
+/// spoken. That bit is the price of the sentence being true rather than
+/// plausible, and it is disclosed to a model already running commands in that
+/// environment.
+pub(crate) fn withheld_from_child(
+    daemon_vars: &[(String, String)],
+    child_env: &[(String, String)],
+) -> Vec<&'static WithheldVar> {
+    WITHHELD_DIAGNOSED
+        .iter()
+        .filter(|var| {
+            daemon_vars.iter().any(|(k, _)| k == var.name)
+                && !child_env.iter().any(|(k, _)| k == var.name)
+        })
+        .collect()
+}
 
 /// The names the `shell` child may inherit, given the one opt-in (REQ-607 BR-5).
 ///

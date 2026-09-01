@@ -237,7 +237,9 @@ impl Tool for ShellTool {
                 status,
                 stdout,
                 stderr,
-            } => render_output(&command, status, &stdout, &stderr).with_unknown_provenance(),
+                withheld,
+            } => render_output(&command, status, &stdout, &stderr, &withheld)
+                .with_unknown_provenance(),
             // The third arm with no measurement and no provenance: nothing ran,
             // so nothing this machine holds is in the answer. The runner has
             // already phrased the reason.
@@ -357,6 +359,21 @@ pub(crate) enum BoundedRun {
         status: ExitStatus,
         stdout: Vec<u8>,
         stderr: Vec<u8>,
+        /// Which diagnosable variables this child was actually denied
+        /// (REQ-607 BR-1).
+        ///
+        /// A **fact**, not a sentence. `run_bounded` is the only code that sees
+        /// the composed environment, so it is the only code that can compute
+        /// this; wording it is the caller's, because the two callers word it
+        /// differently — the tool appends an advisory and the skill path says
+        /// nothing at all. That split is conventions.md's "compose the sentence
+        /// where the facts are", and it is what keeps BR-2's other half true:
+        /// a skill's inlined command output is never annotated.
+        ///
+        /// No `Default`, deliberately (the architecture.md required-field
+        /// pattern): a spawn path that forgot to compute it is a compile error
+        /// rather than a silent empty set that reads as "nothing was withheld".
+        withheld: Vec<&'static crate::child_env::WithheldVar>,
     },
     /// The deadline passed and the whole process group was `SIGKILL`ed. What to
     /// *say* about that is the caller's — the tool has a sentence and a
@@ -410,12 +427,18 @@ pub(crate) fn run_bounded(root: &Path, command: &str, timeout_ms: u64) -> Bounde
     // never composed from a credential set and an opt-in that were true at
     // different instants.
     let policy = crate::child_env::child_env_policy();
+    let daemon_vars: Vec<(String, String)> = std::env::vars().collect();
     let child_env = crate::child_env::compose_child_env(
-        std::env::vars(),
+        daemon_vars.iter().cloned(),
         &crate::child_env::shell_env_allow(policy.allow_ssh_agent),
         &policy.credential_env_names,
         &BTreeMap::new(),
     );
+    // REQ-607 BR-1: what this child was *actually* denied, computed here
+    // because this is the only place both sides of the comparison exist. The
+    // daemon's own environment is gone from every caller's view by the time
+    // they see a result.
+    let withheld = crate::child_env::withheld_from_child(&daemon_vars, &child_env);
 
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
@@ -484,6 +507,7 @@ pub(crate) fn run_bounded(root: &Path, command: &str, timeout_ms: u64) -> Bounde
                 status,
                 stdout,
                 stderr,
+                withheld,
             }
         }
         Ok(Err(e)) => {
@@ -603,8 +627,138 @@ pub(crate) fn cap_output(merged: String) -> (String, usize, bool) {
     )
 }
 
+/// Whether `word` is a `NAME=value` environment assignment rather than the
+/// program being run — and one this function can be sure it has seen *whole*.
+///
+/// `FOO=bar git push` names `git`, and a matcher that took the literal first
+/// word would miss it.
+///
+/// # Why a quoted value disqualifies the word
+///
+/// This runs over whitespace-split tokens and knows nothing about shell
+/// quoting, so `GIT_SSH_COMMAND='ssh -v' git push` arrives as four tokens and
+/// the first is `GIT_SSH_COMMAND='ssh` — an assignment whose value was cut in
+/// half. Skipping it would advance to `-v'`, and the matcher would then be
+/// reasoning about a fragment: a wrong answer rather than no answer.
+///
+/// So a word containing a quote is never treated as an assignment. The
+/// consequence is that the quoted form is a **false negative** — the advisory
+/// is not offered on it — which is the safe direction, and it is listed with
+/// the matcher's other limits. The alternative is a shell lexer, and a
+/// half-written one is how a matcher starts guessing.
+fn is_env_assignment(word: &str) -> bool {
+    if word.contains(['\'', '"']) {
+        return false;
+    }
+    match word.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => false,
+    }
+}
+
+/// The programs `command` runs **in command position**.
+///
+/// Split at the operators that begin a new command — `|`, `;`, `&`, `(` and
+/// newline, which between them cover `&&` and `||` — then take each segment's
+/// first non-assignment word and strip any directory prefix. So
+/// `cd x && /usr/bin/ssh host` yields `["cd", "ssh"]` and
+/// `echo "no ssh here"` yields `["echo"]`.
+///
+/// # What this deliberately misses
+///
+/// Both known limits are **false negatives**, which is the safe direction for
+/// BR-2 — a false negative costs one user the sentence they would have got, a
+/// false positive costs every future reader their trust in it:
+///
+/// - A program reached through indirection (`xargs ssh`, `sudo git`, a script)
+///   is not seen. Only the outermost word of each segment is.
+/// - A program named inside a substitution (`$(ssh …)`) or a quoted string is
+///   not seen, which is the same rule read from the other side and the reason
+///   `echo "no ssh here"` is correctly silent.
+/// - A leading environment assignment whose value is **quoted**
+///   (`GIT_SSH_COMMAND='ssh -v' git push`) is not skipped, because this splits
+///   on whitespace and cannot tell where the quoted value ends. See
+///   [`is_env_assignment`].
+fn command_position_programs(command: &str) -> Vec<&str> {
+    command
+        .split(['|', ';', '&', '(', '\n'])
+        .filter_map(|segment| {
+            segment
+                .split_whitespace()
+                .find(|word| !is_env_assignment(word))
+                .map(|word| word.rsplit('/').next().unwrap_or(word))
+        })
+        .collect()
+}
+
+/// The sentence REQ-607 BR-1 appends to a failing command that a withheld
+/// variable plausibly explains — or `None`, which is the common case.
+///
+/// Three predicates, and all three must hold. The exit code is the caller's
+/// (BR-2: only a *failing* invocation is annotated); `withheld` is
+/// `run_bounded`'s, and already means "the daemon had it and the child did
+/// not"; the program match is this function's.
+///
+/// # Why a sentence and not an event
+///
+/// REQ-596 OQ-1 settled that no `shell_env_withheld` event is emitted, and BR-3
+/// does not reopen it. A bus event carrying a bare count is not actionable, and
+/// the payload that would make it actionable is the one REQ-596 BR-5 forbids. A
+/// targeted sentence on the one call that failed is a different mechanism
+/// answering a different question, and it reaches the reader who needs it — the
+/// model deciding what to try next, and the user reading the transcript.
+///
+/// # On forgeability
+///
+/// A command can print this prefix itself, as it can print
+/// [`truncation_notice`]. Unlike that notice, nothing keys behaviour on this
+/// one: it is read by a human and a model and parsed by nothing, so a forgery
+/// costs a confusing line and no more. The REQ-561 hazard was that the notice
+/// was a *channel*; this is only ever text.
+fn withheld_advisory(
+    command: &str,
+    withheld: &[&'static crate::child_env::WithheldVar],
+) -> Option<String> {
+    if withheld.is_empty() {
+        return None;
+    }
+    let programs = command_position_programs(command);
+    let var = withheld
+        .iter()
+        .find(|var| programs.iter().any(|p| var.programs.contains(p)))?;
+
+    // BR-1's config-key clause is conditional. Where a key exists the sentence
+    // names it; where none does it names the table where the decision is
+    // recorded, because naming a remedy no command can reach is the failure
+    // BUG-205 is about and the one this whole advisory exists to avoid.
+    let remedy = match var.opt_in_key {
+        Some(key) => format!("set `{key} = true` in your Teton config to pass it through"),
+        None => format!(
+            "see the rejection table in `child_env.rs` for why {} is withheld",
+            var.name
+        ),
+    };
+    Some(format!(
+        "\n[teton] This may have failed because Teton withholds {} from shell commands \
+         rather than because of an {} problem — {}.\n",
+        var.name,
+        programs.first().copied().unwrap_or("unknown"),
+        remedy,
+    ))
+}
+
 /// Render a finished command's output for the model, capped.
-fn render_output(command: &str, status: ExitStatus, stdout: &[u8], stderr: &[u8]) -> ToolOutcome {
+fn render_output(
+    command: &str,
+    status: ExitStatus,
+    stdout: &[u8],
+    stderr: &[u8],
+    withheld: &[&'static crate::child_env::WithheldVar],
+) -> ToolOutcome {
     let mut merged = String::new();
     let stdout = String::from_utf8_lossy(stdout);
     let stderr = String::from_utf8_lossy(stderr);
@@ -629,7 +783,25 @@ fn render_output(command: &str, status: ExitStatus, stdout: &[u8], stderr: &[u8]
         Some(c) => format!("$ {command}\n(exit {c})\n"),
         None => format!("$ {command}\n(terminated by signal)\n"),
     };
-    let content = format!("{status_line}{body}");
+    // The advisory sits between the status line and the output, for
+    // `render_interpreted`'s reason: a weak model should read what happened
+    // before it reads the wall of output. It is **outside** the cap
+    // deliberately — it is harness-authored text, not command output, so a
+    // chatty command must not be able to push it out of the result, and it does
+    // not count toward `raw_output_chars` (which is the length the `shell`
+    // duty's size trigger is decided on, REQ-561 ADR-5).
+    //
+    // BR-2's first half is the `code != Some(0)` guard: a command that
+    // succeeded is never annotated, whatever the child was denied.
+    let advisory = if code == Some(0) {
+        None
+    } else {
+        withheld_advisory(command, withheld)
+    };
+    let content = format!(
+        "{status_line}{}{body}",
+        advisory.as_deref().unwrap_or_default()
+    );
 
     // A non-zero exit is a failure the model must see (so verification can tell
     // a passing test from a failing one).
@@ -706,6 +878,230 @@ mod tests {
         assert!(out.is_error);
         assert!(out.content.contains("exit 3"));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A fixture whose `git push` fails locally, with `SSH_AUTH_SOCK` planted in
+    /// the daemon environment so the advisory's presence predicate is true.
+    ///
+    /// **The plant is load-bearing.** `withheld_from_child` fires only when the
+    /// daemon *has* the variable and the child does not; with `SSH_AUTH_SOCK`
+    /// unset on the machine running the suite, nothing was withheld and AC-1
+    /// would be red for a reason that is not a defect. The value is an obvious
+    /// sentinel (AC-11, LESSON-497) — a socket path nothing will ever connect to.
+    ///
+    /// No network and no ssh server: `git push` in a repository with no remote
+    /// exits non-zero on its own, which is all the advisory's exit-code
+    /// predicate needs.
+    fn ssh_fixture(tag: &str) -> (PathBuf, String) {
+        let root = temp_root(tag);
+        let sentinel = format!("/tmp/SENTINEL-agent-{}.sock", std::process::id());
+        // `git init` so `git push` reaches the "no configured remote" failure
+        // rather than "not a git repository"; both exit non-zero, but the first
+        // is the one a user actually hits.
+        let _ = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .output();
+        (root, sentinel)
+    }
+
+    /// REQ-607 AC-1 / BR-1 / BR-4's benign path — a failing `git push` names
+    /// **Teton** and the config key, on the rendered tool result.
+    ///
+    /// The assertion is on `ToolOutcome::content` — the bytes the model and the
+    /// user actually read — and not on a log line or an internal type
+    /// (LESSON-519). A test that asserted `withheld` was non-empty would prove a
+    /// computation happened and nothing about whether anyone is told.
+    ///
+    /// This is also BR-4's **benign path**, and it is not ceremony: BR-4 is a
+    /// rule about what may not be named, so an implementation that named nothing
+    /// at all would satisfy every one of its adversarial assertions. This is the
+    /// case where naming is licensed, and it is what stops that.
+    #[test]
+    fn a_failing_ssh_command_names_teton_and_the_key_that_admits_the_agent() {
+        let _serialized = ENV_MUTATION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, sentinel) = ssh_fixture("advisory-hit");
+        // SAFETY: set and removed around one spawn, under ENV_MUTATION.
+        unsafe { std::env::set_var("SSH_AUTH_SOCK", &sentinel) };
+
+        let ctx = ToolContext::new(&root);
+        let out = ShellTool::default().run(&ctx, &json!({ "command": "git push origin main" }));
+
+        unsafe { std::env::remove_var("SSH_AUTH_SOCK") };
+
+        assert!(out.is_error, "the fixture must fail: {}", out.content);
+        assert!(
+            out.content.contains("Teton"),
+            "the advisory does not name Teton, so the user is still looking at an ssh \
+             problem: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("allow_ssh_agent"),
+            "the advisory names no config key, so it says what went wrong and nothing \
+             about what to do (BUG-205): {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("SSH_AUTH_SOCK"),
+            "the advisory does not name the variable: {}",
+            out.content
+        );
+        // The value never appears — only the name, and only because it is in the
+        // documented rejection table (BR-4).
+        assert!(
+            !out.content.contains(sentinel.as_str()),
+            "the advisory disclosed the socket path, which is a fact about this machine"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// REQ-607 AC-2 / BR-1 / BR-2's benign path — a failure with nothing to do
+    /// with the environment carries **no** advisory.
+    ///
+    /// This is the half that keeps AC-1's sentence worth reading: a notice on
+    /// every failing call is noise, and noise is how a real notice stops being
+    /// read. `SSH_AUTH_SOCK` is planted here too, so the *only* predicate that
+    /// differs from AC-1 is the program match — the test is about the trigger,
+    /// not about the fixture.
+    ///
+    /// **Mutation run (AC-6), two variants, both applied and reverted.**
+    ///
+    /// 1. *The one AC-6 asks for.* Delete the two failure-shape conditions and
+    ///    nothing else — `render_output`'s `code == Some(0)` guard, and the
+    ///    program match in [`withheld_advisory`] (`withheld.first()?` in place
+    ///    of the `find`) — so the sentence is appended to every result that had
+    ///    anything withheld. **2 tests red**: this one ("an unrelated failure
+    ///    was annotated: $ exit 1") and
+    ///    [`a_successful_command_carries_no_advisory`] ("a successful command
+    ///    was annotated: $ git --version"). AC-1's test stays **green**, which
+    ///    is the right outcome: the sentence it reads is unchanged.
+    /// 2. *A coarser first attempt*, replacing the whole advisory with a
+    ///    hand-rolled string, took **3 tests red** — the two above plus AC-1's,
+    ///    because it also dropped the config key. Recorded because the
+    ///    difference is the point: variant 1 isolates the trigger, variant 2
+    ///    changes the trigger and the content at once and so proves less about
+    ///    either.
+    #[test]
+    fn an_unrelated_failure_carries_no_advisory() {
+        let _serialized = ENV_MUTATION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, sentinel) = ssh_fixture("advisory-miss");
+        // SAFETY: set and removed around one spawn, under ENV_MUTATION.
+        unsafe { std::env::set_var("SSH_AUTH_SOCK", &sentinel) };
+
+        let ctx = ToolContext::new(&root);
+        let out = ShellTool::default().run(&ctx, &json!({ "command": "exit 1" }));
+
+        unsafe { std::env::remove_var("SSH_AUTH_SOCK") };
+
+        assert!(out.is_error, "the fixture must fail: {}", out.content);
+        assert!(
+            !out.content.contains("[teton]"),
+            "an unrelated failure was annotated: {}",
+            out.content
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// REQ-607 AC-3 / BR-2's other benign path — a command that **succeeded**
+    /// carries no advisory, even one whose program is on the table and whose
+    /// variable really was withheld.
+    ///
+    /// `git --version` names `git` and succeeds. Every predicate but the exit
+    /// code holds, so this pins the exit-code guard specifically rather than
+    /// passing because the program did not match.
+    #[test]
+    fn a_successful_command_carries_no_advisory() {
+        let _serialized = ENV_MUTATION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, sentinel) = ssh_fixture("advisory-ok");
+        // SAFETY: set and removed around one spawn, under ENV_MUTATION.
+        unsafe { std::env::set_var("SSH_AUTH_SOCK", &sentinel) };
+
+        let ctx = ToolContext::new(&root);
+        let out = ShellTool::default().run(&ctx, &json!({ "command": "git --version" }));
+
+        unsafe { std::env::remove_var("SSH_AUTH_SOCK") };
+
+        assert!(!out.is_error, "the fixture must succeed: {}", out.content);
+        assert!(
+            !out.content.contains("[teton]"),
+            "a successful command was annotated: {}",
+            out.content
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// REQ-607 BR-5's user-visible half — with the opt-in **on**, the same
+    /// failing command carries no advisory, because nothing was withheld.
+    ///
+    /// This is the advisory and the opt-in agreeing. If the advisory fired on
+    /// "the name is on the table" rather than on "the child actually lacked it",
+    /// a user who took the remedy would keep being told to take it — which is
+    /// the shape of BUG-205's unreachable remedy, one step along.
+    #[test]
+    fn admitting_the_agent_silences_the_advisory_because_nothing_is_withheld() {
+        let daemon_vars = vec![
+            ("PATH".to_owned(), "/usr/bin".to_owned()),
+            (
+                crate::child_env::SSH_AUTH_SOCK.to_owned(),
+                "/tmp/SENTINEL-agent.sock".to_owned(),
+            ),
+        ];
+        for (allow, expect_withheld) in [(false, true), (true, false)] {
+            let child = crate::child_env::compose_child_env(
+                daemon_vars.iter().cloned(),
+                &crate::child_env::shell_env_allow(allow),
+                &std::collections::BTreeSet::new(),
+                &BTreeMap::new(),
+            );
+            let withheld = crate::child_env::withheld_from_child(&daemon_vars, &child);
+            assert_eq!(
+                !withheld.is_empty(),
+                expect_withheld,
+                "allow_ssh_agent = {allow} produced the wrong withheld set"
+            );
+            let advisory = withheld_advisory("git push origin main", &withheld);
+            assert_eq!(
+                advisory.is_some(),
+                expect_withheld,
+                "allow_ssh_agent = {allow} produced the wrong advisory"
+            );
+        }
+    }
+
+    /// The command-position matcher, including the two shapes it must *not*
+    /// match. A matcher over bare whitespace tokens would annotate the `echo`
+    /// case, which is a false positive on a command that has nothing to do with
+    /// ssh — and one false positive is how a real notice stops being read.
+    #[test]
+    fn the_matcher_reads_command_position_and_not_argument_text() {
+        assert_eq!(command_position_programs("git push origin main"), ["git"]);
+        // `&&` splits into three segments, the middle one empty; a segment with
+        // no words yields no program rather than an empty one.
+        assert_eq!(
+            command_position_programs("cd x && /usr/bin/ssh host"),
+            ["cd", "ssh"]
+        );
+        // A leading environment assignment is not the program.
+        assert_eq!(command_position_programs("GIT_SSH_TIMEOUT=5 git push"), ["git"]);
+        // But a *quoted* assignment value is a documented false negative: the
+        // matcher does not know shell quoting, so it declines to skip a word it
+        // has only half seen rather than advancing onto a fragment. The answer
+        // is the fragment `GIT_SSH_COMMAND='ssh`, which matches no program — no
+        // advisory, rather than a wrong one.
+        assert_eq!(
+            command_position_programs("GIT_SSH_COMMAND='ssh -v' git push"),
+            ["GIT_SSH_COMMAND='ssh"]
+        );
+        // The false-positive class the matcher exists to exclude.
+        assert_eq!(command_position_programs("echo \"no ssh here\""), ["echo"]);
+        assert_eq!(command_position_programs("grep -r ssh ."), ["grep"]);
     }
 
     #[test]
