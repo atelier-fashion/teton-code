@@ -34,13 +34,32 @@ and the failure will look like an ssh problem rather than a Teton one.
 
 ## Resolution
 
-Unresolved. Validate by dogfooding: run a normal agent session and watch for
-shell commands that fail in ways they did not before. The signal to watch for is
-a command failing with a *missing-environment* symptom — ssh agent refused, a
-tool not finding its config, a locale warning turning into an error.
+**Still unresolved (updated 2026-09-01, REQ-607).** The assumption is that twelve
+names are *enough*, and only real sessions can settle that. REQ-607 did not test
+it. What REQ-607 changed is the **cost of it being wrong**, on both halves the
+assumption's own wording separates:
 
-If `SSH_AUTH_SOCK` proves necessary, note that admitting it does not violate
-BR-1 or BR-8 (it holds a socket path, not a secret) but does widen what a
-model-driven command can reach, and deserves its own decision rather than being
-folded in as an oversight correction. OQ-2's user-extensible allowlist is the
-other resolution path.
+- *The misattributed error.* The signal below used to require a human to notice a
+  command failing in an unfamiliar way and to guess that the daemon was
+  responsible. The daemon now says so itself, on the failing call, naming Teton
+  and the config key. The dogfooding signal is produced rather than inferred.
+- *The capability loss.* `[shell] allow_ssh_agent` exists, so the one rejection
+  this assumption predicted would bite is now escapable by a config author who has
+  read what it grants.
+
+Two things this deliberately did **not** do. It did not admit `SSH_AUTH_SOCK` by
+default — REQ-596's reasoning stands and the default is unchanged. And it did not
+answer OQ-2's user-extensible allowlist, which remains the other resolution path
+and remains out of scope: a general `extra_env` trades a narrow known risk for a
+broad unknown one.
+
+**The resolution criterion is unchanged and still dogfooding.** Run normal agent
+sessions and watch for commands failing on a missing-environment symptom. The
+advisory only speaks for names in the diagnosis table — one row today — so a
+session that turns up `CARGO_HOME` instead still fails silently and still needs a
+human to notice. That gap is the reason this stays open rather than closing on
+REQ-607's merge: a mechanism for making withheld-variable failures self-describing
+is not evidence that twelve names are enough.
+
+Close this when a period of real use has either produced no such failures, or
+produced a specific name whose absence is worth its own decision.

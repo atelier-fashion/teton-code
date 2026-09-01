@@ -2,7 +2,7 @@
   "req": "REQ-607",
   "branch": "feat/REQ-607-honest-shell-env-failures",
   "startedAt": "2026-08-31T00:00:00Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -62,6 +63,12 @@
       "name": "PR Cleanup & CI",
       "completedAt": "2026-08-31T00:00:00Z",
       "result": "7/7 checks green (macos + ubuntu); fmt drift fixed"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup and Merge",
+      "completedAt": "2026-09-01T02:01:17Z",
+      "result": "PR #260 squash-merged to main as 9f204bc; worktree torn down; ASSUME-024 re-dispositioned (still unresolved); LESSON-612, LESSON-613 captured"
     }
   ],
   "repos": {
@@ -73,7 +80,7 @@
       "touched": true,
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/260",
       "prNumber": 260,
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }
@@ -94,5 +101,10 @@
     "failedTasks": []
   },
   "blockers": [],
-  "notes": []
+  "notes": [
+    "Single-repo topology: this runner owned the merge. PR #260 MERGED 2026-09-01T02:01:17Z as 9f204bc.",
+    "Rebased twice mid-pipeline: REQ-603 landed during Phase 4, REQ-604+REQ-606 landed during Phase 8. Full suite re-run green on each rebase; branch protection is strict (require-up-to-date).",
+    "Artifact ids taken by measuring merged high-water on origin/main, NOT via adlc_alloc_id: LESSON-612, LESSON-613. The reservation refs run BEHIND the merged files (lesson refs top out at 607 vs merged 611), so the allocator would have re-issued a taken id.",
+    "AC-9 discharged by a reformulation, stated rather than silently substituted: 'the MCP path never reads the flag' (source arm + behavioural arm) instead of the AC's literal 'compose with the flag on and compare'. The literal form required installing a process-global OnceLock policy that poisoned sibling tests. Recorded in LESSON-613 and in the test's doc comment."
+  ]
 }
