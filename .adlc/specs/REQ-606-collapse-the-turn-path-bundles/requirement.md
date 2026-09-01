@@ -133,6 +133,31 @@ caught by asserting on the patch, not by reading the result.
 | 4 | substitute | `fs::read_to_string` added inside `run_the_allowed_tool` | RED: "1x `fs::read_to_string(`" — and it caught it in the one function this REQ changed |
 | 5 | inversion | the hold's rebind de-shadowed, so the context carries the pre-hold router | RED: "the context is carrying the pre-hold router" |
 
+### Re-run again after REQ-603 merged, per `architecture.md` ADR-2
+
+ADR-2 said the mutation evidence belongs to the tree that merges, because
+REQ-603 relocates session-lifecycle code out of `runtime/mod.rs` — where four of
+the five guards live and read the turn path by source scan. REQ-603 merged
+(`7fe035c`) while this REQ was in Phase 7, touching four `crates/` files
+including `runtime/mod.rs`. So the whole set was re-run on the rebased tree.
+
+All five guards stayed in `runtime/mod.rs`. **That was not taken as evidence** —
+LESSON-598's whole point is that a guard which has stopped covering its subject
+looks exactly like one that passes — so every mutation was applied again:
+
+| # | mutation | observed post-603 |
+|---|---|---|
+| 3 | claim and re-read swapped | RED — identical message, "claim at byte 2365, re-read at 1404" |
+| 4 | `fs::read_to_string` in `run_the_allowed_tool` | RED — "1x `fs::read_to_string(`" |
+| 2 | second `PermissionGate::with_level` | RED — "constructed 2 time(s)" |
+| 5 | hold's rebind de-shadowed | RED — "carrying the pre-hold router" |
+| 1 | spend-ceiling arm deleted outright | **GREEN — 4,074, unchanged** |
+
+Suite 4,074 / 0 and both AC-3 figures (185 lines, depth 5) are unchanged across
+the rebase. **REQ-604 had not merged at this point**, so a final re-run is still
+owed once it does — that is the orchestrator's rebase, and this table is the
+method for it.
+
 ### Rule A was verified against clippy, not assumed
 
 The classification rests entirely on clippy's `too_many_arguments` threshold

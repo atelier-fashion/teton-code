@@ -90,6 +90,7 @@
     "AC-4 two of three: invariant 1 (typed-outcome arms before the generic remote arm) is NOT pinned \u2014 deleting the spend-ceiling arm leaves all 4,074 tests green. Pre-existing; arms byte-identical to origin/main. Needs its own REQ.",
     "TERMINAL: pr-ready. Dispatch override \u2014 REQ-606 is THIRD in overlap cluster {603,604,606}; the ORCHESTRATOR owns the merge AND the Step 8b close-out (/wrapup, worktree teardown, completed:true). Exiting completed:false deliberately, not abandoned.",
     "PR #257 OPEN / MERGEABLE / CLEAN, all 7 CI checks green incl. macos-latest and ubuntu-latest, at d935610 rebased onto origin/main 391091a.",
-    "OWED AFTER FINAL REBASE (architecture.md ADR-2): re-run the five invariant mutations once rebased onto REQ-603 and REQ-604. REQ-603 relocates session-lifecycle code out of runtime/mod.rs, where four of the five guards live and read the turn path by source scan. The current evidence was taken at 391091a (a spec-only commit), so it is valid for this tree but NOT for the post-603 tree."
+    "REQ-603 (7fe035c) merged during Phase 7 and touches 4 crates/ files incl. runtime/mod.rs. Rebased onto it and RE-RAN all five mutations per ADR-2: invariants 3/5 and substitutes 2/4 all red again; invariant 1 still green. Suite 4,074/0; AC-3 unchanged at 185 lines / depth 5.",
+    "STILL OWED: REQ-604 had not merged at exit. When the orchestrator rebases onto it, re-run the five-mutation table in requirement.md's 'Re-run again after REQ-603 merged' section before merging."
   ]
 }
