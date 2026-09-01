@@ -1,7 +1,7 @@
 ---
 id: REQ-606
 title: "Collapse the turn-path parameter bundles that carry no invariant"
-status: draft
+status: approved
 deployable: false
 created: 2026-09-01
 updated: 2026-09-01
@@ -102,6 +102,16 @@ roughly five earn a name and the rest are transport:
 - The bundles can be collapsed without pushing any signature back over the
   argument limit. If one cannot, that is a finding to record — it would mean the
   cluster is real and the bundle earns its name after all.
+- **The same applies to AC-3's body-length budget, which is tighter than it
+  looks.** `run_prompt_turn` is at **188** lines against AC-3's 200 — twelve
+  lines of headroom, re-derived at this REQ's base rather than taken from
+  REQ-600's record. Collapsing an *input* bundle moves its fields back to the
+  call site, and for the input bundles that call site is `run_prompt_turn`'s
+  body. If a collapse that is right on the classification cannot be had without
+  pushing the body over 200, that is the same kind of finding as the argument
+  limit: record it, and keep the bundle. AC-1's classification is the
+  deliverable; neither the resulting count nor the resulting line count is a
+  target to be hit by weakening the other criterion.
 
 ## Out of Scope
 

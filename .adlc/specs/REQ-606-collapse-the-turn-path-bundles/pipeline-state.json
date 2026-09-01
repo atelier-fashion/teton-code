@@ -3,11 +3,23 @@
   "branch": "feat/REQ-606-collapse-the-turn-path-bundles",
   "startedAt": "2026-09-01T00:02:06Z",
   "completed": false,
-  "currentPhase": 1,
-  "completedPhases": [0],
+  "currentPhase": 2,
+  "completedPhases": [
+    0,
+    1
+  ],
   "integrationBranch": "main",
   "phaseHistory": [
-    { "phase": 0, "name": "Create Worktree + Preflight", "completedAt": "2026-09-01T00:02:06Z" }
+    {
+      "phase": 0,
+      "name": "Create Worktree + Preflight",
+      "completedAt": "2026-09-01T00:02:06Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-09-01T00:10:00Z"
+    }
   ],
   "repos": {
     "teton-code": {
@@ -16,16 +28,22 @@
       "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-606",
       "branch": "feat/REQ-606-collapse-the-turn-path-bundles",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/257",
+      "prNumber": 257,
       "merged": false,
       "snapshotBranch": null,
       "snapshotPR": null
     }
   },
-  "mergeOrder": ["teton-code"],
-  "phase4": { "currentTask": null, "completedTasks": [], "failedTasks": [] },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  },
   "notes": [
-    "Sprint overlap cluster {REQ-603, REQ-604, REQ-606}; REQ-606 is third. Orchestrator owns the merge — this runner stops at pr-ready per dispatch override."
+    "Sprint overlap cluster {REQ-603, REQ-604, REQ-606}; REQ-606 is third. Orchestrator owns the merge \u2014 this runner stops at pr-ready per dispatch override."
   ]
 }
