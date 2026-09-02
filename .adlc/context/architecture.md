@@ -451,6 +451,22 @@
   to failing closed for everyone. The reach of a default is not its list; it is
   every predicate that read the list's emptiness (REQ-597 ADR-1/ADR-2/ADR-3).
 
+- **A merge gate is asserted from inside the tree, in both directions, and the
+  assertion reads the forge rather than a copy** (REQ-608). Branch protection is
+  configuration the repository cannot see, so the set of required checks drifts
+  from the set of jobs silently — in *either* direction, since a required
+  context nobody defines blocks every merge while a defined job nobody requires
+  blocks none. The check derives the job set by parsing the workflow (one rule,
+  stated; anything it cannot derive fails by name — expressions, cross-product
+  matrices, reusable-workflow jobs, duplicate contexts), reads the required set
+  from the forge with the workflow's own token, and fails on `missing` and
+  `stale` alike, naming the two remedies. It is its own job so that its red is
+  self-describing, and so that un-requiring it is itself reported. Every string
+  it prints that came from the forge or the workflow is escaped, because the
+  Actions log parser reads `::command::` at the start of any line. The `gated`
+  job it exists to protect was green on every PR for months while unable to
+  block one (BUG-167, LESSON-464).
+
 ## ADRs
 
 ### ADR-001: Daemon and CLI in Rust (2026-07-17)
