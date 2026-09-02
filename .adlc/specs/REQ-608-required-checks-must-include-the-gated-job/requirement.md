@@ -195,6 +195,18 @@ of scope.
   - An escape hatch on the whole criterion would leave the REQ's central
     evidential claim to an unbounded judgment call. Splitting it puts the floor
     where the evidence is cheapest and the claim strongest.
+  - **Before-half, measured 2026-09-02T21:38:17Z** (TASK-358). PR #272,
+    head `8c51278`, cut from `main` at `467bfa5`, one file changed
+    (`crates/tetond/tests/template_smoke.rs`: a `compile_error!` under
+    `#![cfg(feature = "llama")]`). Run 33685887754: six checks `SUCCESS`, one
+    `FAILURE` — `feature-gated targets compile (all features)`. Forge verdict,
+    verbatim: GraphQL `{"mergeStateStatus":"UNSTABLE","mergeable":"MERGEABLE"}`;
+    REST `{"mergeable":true,"mergeable_state":"unstable"}`. `UNSTABLE` is
+    GitHub's own term for "mergeable with a failing non-required status".
+    Note for the next reader: `mergeStateStatus` read `BLOCKED` on the first
+    three polls while *required* checks were still pending and flipped to
+    `UNSTABLE` only when the last required one landed — the verdict is
+    meaningful only after every rollup entry is terminal.
 - [ ] AC-3: A check inside the repository compares `ci.yml`'s defined job names
       against the forge's required contexts. Both directions (`missing`, `stale`)
       are computed, both are rendered, and **both fail the run** — per BR-4,

@@ -1,7 +1,7 @@
 ---
 id: TASK-358
 title: "Demonstrate the defect on the forge: a red gated job is mergeable under current protection (AC-2 before-half)"
-status: draft
+status: complete
 parent: REQ-608
 created: 2026-09-02
 updated: 2026-09-02
