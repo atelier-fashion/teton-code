@@ -1,7 +1,7 @@
 ---
 id: REQ-608
 title: "The one job that guards feature-gated code is the one job that cannot block a merge"
-status: approved
+status: complete
 deployable: false
 created: 2026-09-01
 updated: 2026-09-02
