@@ -1,0 +1,64 @@
+{
+  "req": "REQ-608",
+  "branch": "feat/REQ-608-required-checks-must-include-the-gated-job",
+  "startedAt": "2026-09-02T21:21:24Z",
+  "completed": false,
+  "currentPhase": 4,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree",
+      "completedAt": "2026-09-02T21:23:07Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-09-02T21:24:09Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect",
+      "completedAt": "2026-09-02T21:31:15Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-09-02T21:31:48Z"
+    }
+  ],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/GitHub/teton-code/.claude/worktrees/open-requirements-470131",
+      "worktree": "/Users/brettluelling/GitHub/teton-code/.claude/worktrees/open-requirements-470131/.worktrees/REQ-608",
+      "branch": "feat/REQ-608-required-checks-must-include-the-gated-job",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/271",
+      "prNumber": 271,
+      "prCreatedAt": "2026-09-02T21:23:58Z",
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": "TASK-356",
+    "completedTasks": [],
+    "failedTasks": []
+  },
+  "notes": [
+    "Step 0: draft PR deferred \u2014 GitHub rejected createPullRequest with no commits between main and the branch (LESSON-004); retry after the first commit lands.",
+    "Draft PR #271 opened after the Phase 1 commit (Step 0 deferral resolved).",
+    "Phase 4 Tier 0: TASK-356 and TASK-358 dispatched in parallel; currentTask records TASK-356, TASK-358 runs beside it."
+  ]
+}
