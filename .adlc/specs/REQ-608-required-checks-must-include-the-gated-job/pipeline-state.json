@@ -2,7 +2,7 @@
   "req": "REQ-608",
   "branch": "feat/REQ-608-required-checks-must-include-the-gated-job",
   "startedAt": "2026-09-02T21:21:24Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "phaseHistory": [
     {
@@ -54,6 +55,13 @@
       "phase": 7,
       "name": "PR Cleanup & CI",
       "completedAt": "2026-09-02T22:10:22Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup",
+      "completedAt": "2026-09-02T22:15:10Z",
+      "mergeCommit": "a11bb2c",
+      "mergedAt": "2026-09-02T22:14:24Z"
     }
   ],
   "integrationBranch": "main",
@@ -67,7 +75,7 @@
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/271",
       "prNumber": 271,
       "prCreatedAt": "2026-09-02T21:23:58Z",
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }
@@ -91,6 +99,7 @@
     "Phase 4 Tier 0: TASK-356 and TASK-358 dispatched in parallel; currentTask records TASK-356, TASK-358 runs beside it.",
     "Tier 0 done: TASK-356 (3d37f73), TASK-358 (PR #272 open, worktree .worktrees/REQ-608-ac2 pending teardown in TASK-359).",
     "TASK-359: protection PATCH applied with admin consent (AskUserQuestion); PR #272 closed; ac2 worktree removed.",
-    "Phase 5: 6 agents, 3 correctness bugs + 1 security fix + 18 tests (1409d73); round-2 confirmation: 1 major + minors (next commit). Delegate pre-pass invoked, empty completion."
+    "Phase 5: 6 agents, 3 correctness bugs + 1 security fix + 18 tests (1409d73); round-2 confirmation: 1 major + minors (next commit). Delegate pre-pass invoked, empty completion.",
+    "Phase 8: PR #271 squash-merged as a11bb2c at 2026-09-02T22:14:24Z (trial-merge rc=0, CLEAN). Terminal: merged. Close-out landed via chore/REQ-608-wrapup."
   ]
 }
