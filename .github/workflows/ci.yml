@@ -428,8 +428,8 @@ jobs:
           if python3 -c 'import yaml' 2>/dev/null; then
             echo "PyYAML present on the runner image"
           else
-            python3 -m pip install --user "$pin" \
-              || python3 -m pip install --user --break-system-packages "$pin"
+            python3 -m pip install --user -- "$pin" \
+              || python3 -m pip install --user --break-system-packages -- "$pin"
           fi
           python3 -c 'import yaml; print("PyYAML", yaml.__version__)'
 

@@ -338,8 +338,12 @@ class TestDerivation(ParityCase):
     def test_reusable_workflow_job_is_underivable(self):
         """BR-3: a `uses:` job is refused — the forge names its check runs
         `<caller> / <callee job>`, one per callee job, and this check does not
-        read the callee. Deriving `name:` for it (verify finding, 2026-09-02)
-        produced a context that could never report.
+        read the callee.
+
+        Mutation executed 2026-09-02 (verify round 1, before the refusal
+        existed): `derive_contexts` on this fixture returned `['alpha check',
+        'beta check']` and the run reached DRIFT for a context that can never
+        report. Under that code this case fails on `AssertionError: 75 != 1`.
         """
         text = MINIMAL_WORKFLOW.replace(
             "  beta:\n    name: beta check\n    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n",
@@ -356,9 +360,13 @@ class TestDerivation(ParityCase):
         """BR-3 / BR-4: two jobs deriving one context are refused together.
 
         `compare` works on sets, so before this refusal `["same", "same"]`
-        against `["same"]` was exit 0 (verify finding, 2026-09-02) — a defined
-        job reported green with no required context of its own, BUG-167's
-        shape surviving the fix. Both job keys are named.
+        against `["same"]` was exit 0 — a defined job reported green with no
+        required context of its own, BUG-167's shape surviving the fix. Both
+        job keys are named.
+
+        Mutation executed 2026-09-02 (verify round 2, test-auditor): the
+        duplicate `Underivable` raise removed. This case fails on
+        `AssertionError: 75 != 0`. Restored, green.
         """
         text = MINIMAL_WORKFLOW.replace("    name: beta check\n", "    name: alpha check\n")
         path = self.write_workflow(text)
@@ -711,14 +719,110 @@ class TestFailsClosed(ParityCase):
         self.assertIn("Error", output)
 
     def test_bad_repo_or_branch_input_fails_closed(self):
-        """BR-5 / LESSON-008: `--repo` and `--branch` are validated before they
-        are interpolated into a URL; a value carrying path or query characters
-        is refused rather than quietly building a different request.
+        """BR-5 / LESSON-008: `--repo` and `--branch` are validated before any
+        read. A repo with an extra path segment, whitespace, or a `.`/`..`
+        segment is refused; a branch that is empty, padded, or carries a
+        control character is refused. `?` and `/` in a branch are legitimate
+        and are percent-quoted, not refused (`release/1.2` is a real branch).
+        The fake records its calls so the case also proves the validator runs
+        before, not after, the read.
         """
-        for repo, branch in (("atelier-fashion/teton-code/extra", "main"), ("a b/c", "main"), (REPO, "main?x=1\n")):
+        calls = []
+
+        def recording_fetch(url, token):
+            calls.append(url)
+            return fake_fetch([])(url, token)
+
+        bad = (
+            ("atelier-fashion/teton-code/extra", "main"),
+            ("a b/c", "main"),
+            ("../..", "main"),
+            ("./repo", "main"),
+            ("owner/..", "main"),
+            (REPO, ""),
+            (REPO, " main"),
+            (REPO, "main\n"),
+        )
+        for repo, branch in bad:
             with self.subTest(repo=repo, branch=branch):
-                code, output = self.run_main(CI_YML, fake_fetch([]), branch=branch, repo=repo)
+                code, output = self.run_main(CI_YML, recording_fetch, branch=branch, repo=repo)
                 self.assertEqual(parity.EXIT_UNCHECKED, code)
+        self.assertEqual([], calls, "the validator must refuse before any read")
+
+        # A legitimate branch name is quoted, read, and compared (the fake
+        # requires nothing, so the verdict is DRIFT — the point is the URL).
+        code, _ = self.run_main(CI_YML, recording_fetch, branch="release/1.2?x=1")
+        self.assertEqual(parity.EXIT_DRIFT, code)
+        self.assertTrue(any("branches/release%2F1.2%3Fx%3D1" in url for url in calls))
+
+    def test_non_string_required_context_fails_closed(self):
+        """BR-5 (verify round 2, Major): a forge body whose `contexts` holds a
+        non-string is 75, never DRIFT. Before this guard `[{"context": "a"},
+        null, 5]` was stringified and compared, and the run exited 1 — an
+        uninterpretable read reported as a disagreement.
+        """
+        body = json.dumps({"name": "main", "protected": True, "protection": {
+            "required_status_checks": {"contexts": [{"context": "a"}, None, 5]}}})
+        code, output = self.run_main(CI_YML, fake_fetch([], branch_body=body))
+        self.assertEqual(parity.EXIT_UNCHECKED, code)
+        self.assertIn("not a string", output)
+        self.assertNotIn("missing (defined, not required):", output)
+
+    def test_remaining_refusal_branches_are_named(self):
+        """BR-3 / BR-5 sweep (verify round 2, test-auditor's uncovered list):
+        every refusal branch the script has, exercised once each, asserting
+        75 and the text that names the cause. Conventions.md: an invariant
+        with more than one enforcement point needs a sweep, not a fix.
+        """
+        minimal = yaml.safe_load(MINIMAL_WORKFLOW)
+
+        def with_beta(**fields):
+            doc = json.loads(json.dumps(minimal))
+            doc["jobs"]["beta"] = {**doc["jobs"]["beta"], **fields}
+            return doc
+
+        derivation_cases = {
+            "workflow not a mapping": (["not", "a", "mapping"], parity.Unverified, "did not parse to a mapping"),
+            "no jobs mapping": ({"name": "x"}, parity.Unverified, "no `jobs:` mapping"),
+            "job is null": ({**minimal, "jobs": {"beta": None}}, parity.Underivable, "not a mapping"),
+            "name is an int": (with_beta(name=7), parity.Underivable, "not a string"),
+            "strategy not a mapping": (with_beta(strategy="x"), parity.Underivable, "`strategy:` is a str"),
+            "matrix is an expression": (with_beta(strategy={"matrix": "${{ fromJSON(needs.x.outputs.m) }}"}), parity.Underivable, "expression"),
+            "matrix not a mapping": (with_beta(strategy={"matrix": [1]}), parity.Underivable, "not a mapping"),
+            "dimension not a list": (with_beta(strategy={"matrix": {"os": "ubuntu-latest"}}), parity.Underivable, "non-empty list"),
+            "dimension empty": (with_beta(strategy={"matrix": {"os": []}}), parity.Underivable, "non-empty list"),
+        }
+        for label, (doc, exc, text) in derivation_cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(exc) as ctx:
+                    parity.derive_contexts(doc)
+                self.assertIn(text, str(ctx.exception))
+
+        with self.subTest(case="integer matrix values render"):
+            doc = with_beta(strategy={"matrix": {"n": [1, 2]}})
+            self.assertEqual(["alpha check", "beta check (1)", "beta check (2)"], parity.derive_contexts(doc))
+
+        read_cases = {
+            "branch payload not an object": (json.dumps([1]), "did not return a branch object"),
+            "protection not an object": (json.dumps({"protected": True, "protection": "yes"}), "no `protection` object"),
+            "contexts key absent": (json.dumps({"protected": True, "protection": {"required_status_checks": {"strict": True}}}), "`protection.required_status_checks.contexts` is absent"),
+        }
+        for label, (body, text) in read_cases.items():
+            with self.subTest(case=label):
+                code, output = self.run_main(CI_YML, fake_fetch([], branch_body=body))
+                self.assertEqual(parity.EXIT_UNCHECKED, code)
+                self.assertIn(text, output)
+
+    def test_escaping_is_injective(self):
+        """Security (verify round 2): a name holding the literal text `a\\x0ab`
+        and a name holding a real line feed render differently, and the
+        Unicode line separators are escaped like the ASCII ones.
+        """
+        self.assertNotEqual(parity._safe("a\\x0ab"), parity._safe("a\nb"))
+        self.assertEqual("a\\\\x0ab", parity._safe("a\\x0ab"))
+        self.assertEqual("a\\u2028b", parity._safe("a\u2028b"))
+        self.assertEqual("a\\x85b", parity._safe("a\x85b"))
+        self.assertFalse(parity._plain_name("a\u2029b"))
 
     def test_pyyaml_pin_flag_has_one_home(self):
         """ADR-608-5: `--pyyaml-pin` prints the requirement the CI job installs,

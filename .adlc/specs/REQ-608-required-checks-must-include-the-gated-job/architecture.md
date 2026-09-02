@@ -86,7 +86,7 @@ protection so a migration is told so rather than "not protected"):
 | that list non-empty | 75 | "rulesets present; this check reads classic protection only — extend it" |
 | `GET /repos/{o}/{r}/branches/{b}`: non-2xx (a 3xx included — redirects are refused), transport error, non-JSON | 75 | status/exception class and the URL |
 | `protected` absent or `false` | 75 | "branch is not protected — nothing to compare against" |
-| `protection` or `protection.required_status_checks` or `.contexts` absent | 75 | the missing key |
+| `protection` or `protection.required_status_checks` or `.contexts` absent, or `.contexts` holding a non-string | 75 | the missing key, or the offending type |
 | `missing` or `stale` non-empty | 1 | both sets and both remedies (BR-9) |
 | parity | 0 | both sets |
 

@@ -49,8 +49,9 @@ Read path (ADR-608-2), in this order: the workflow is parsed and derived first
 (local, no network — a broken workflow is reported without a round trip); then
 `GET /repos/{owner}/{repo}/rules/branches/{branch}` — rulesets are *detected,
 not parsed* (LESSON-460: no fixture written from imagination), so a non-empty
-list stops the check before any classic read is interpreted, and a migration to
-rulesets gets the message written for it rather than "not protected"; then
+list — or a body that is not the documented list at all — stops the check
+before any classic read is interpreted, and a migration to rulesets gets the
+message written for it rather than "not protected"; then
 `GET /repos/{owner}/{repo}/branches/{branch}`, whose
 `protection.required_status_checks.contexts` is public on this repository. The
 token — `$GITHUB_TOKEN`, optional — only lifts the anonymous rate limit shared by
@@ -76,9 +77,12 @@ drift, sending the next reader to debug the forge instead of the script.
 Rendering. Sets are derived in declaration order but *rendered sorted*, so two
 runs against the same state print the same text. Every value that came from the
 forge or from the workflow is printed through `_safe`, which escapes control
-characters: GitHub Actions parses `::error::`-style workflow commands at the
-start of any output line, so a context name carrying a newline could otherwise
-forge an annotation or silence this job's own.
+characters (C0, DEL, C1, and the Unicode line separators) and the backslash, so
+the rendering is injective: GitHub Actions parses `::error::`-style workflow
+commands at the start of any output line, so a context name carrying a newline
+could otherwise forge an annotation or silence this job's own, and a name
+carrying the literal text `\\x0a` must not render the same as one carrying a
+line feed.
 
 Usage
 -----
@@ -127,7 +131,7 @@ PYYAML_PIN = "PyYAML==6.0.2"
 # OWNER/REPO as GitHub spells it: one slash, no path or query characters on
 # either side. The value is interpolated into a URL, so this is the only shape
 # accepted (LESSON-008 — a cited identifier is untrusted input).
-OWNER_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+OWNER_REPO_RE = re.compile(r"^(?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?$)[A-Za-z0-9_.-]+$")
 
 # `fetch(url, token) -> (status, body_text)`: the injection seam (ADR-608-6).
 Fetch = Callable[[str, Optional[str]], Tuple[int, str]]
@@ -154,7 +158,8 @@ REMEDIES = """Two ways to resolve this, pick the one that matches intent:
   2. update .github/workflows/ci.yml — make the defined jobs match the intended required set
 (main's required checks are edited by a repository admin under Settings > Branches; never by a workflow)"""
 
-_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+_ESCAPE_RE = re.compile("[\\\\\x00-\x1f\x7f-\x9f\u2028\u2029]")
 
 
 class Underivable(Exception):
@@ -179,9 +184,23 @@ def _safe(value: object) -> str:
 
     Names come from the forge and from the workflow, and this script prints
     them into a log that GitHub Actions scans for `::command::` lines. A
-    newline inside a name is the whole attack; `\\x0a` is not.
+    newline inside a name is the whole attack; `\\x0a` is not. The backslash
+    is escaped too, so the rendering is injective and a reader resolving drift
+    can tell `a\\x0ab` (literal text) from `a<LF>b`.
     """
-    return _CONTROL_RE.sub(lambda m: f"\\x{ord(m.group(0)):02x}", str(value))
+
+    def _one(match: "re.Match[str]") -> str:
+        char = match.group(0)
+        if char == "\\":
+            return "\\\\"
+        return f"\\x{ord(char):02x}" if ord(char) < 0x100 else f"\\u{ord(char):04x}"
+
+    return _ESCAPE_RE.sub(_one, str(value))
+
+
+def _plain_name(name: str) -> bool:
+    """True when `name` is something the forge renders verbatim."""
+    return bool(name) and name == name.strip() and not _CONTROL_RE.search(name)
 
 
 def _scalar(value: object) -> Optional[str]:
@@ -200,11 +219,6 @@ def _scalar(value: object) -> Optional[str]:
     if isinstance(value, int):
         return str(value)
     return None
-
-
-def _plain_name(name: str) -> bool:
-    """True when `name` is something the forge renders verbatim."""
-    return bool(name) and name == name.strip() and not _CONTROL_RE.search(name)
 
 
 def _matrix_contexts(job_key: object, context: str, matrix: object) -> List[str]:
@@ -541,7 +555,14 @@ def read_required(
             f"{branch_url}, so the required contexts could not be read"
         )
 
-    return [str(context) for context in contexts]
+    for context in contexts:
+        if not isinstance(context, str):
+            raise Unverified(
+                f"`protection.required_status_checks.contexts` from GET {branch_url} "
+                f"holds a {type(context).__name__} ({context!r}), not a string; an "
+                "uninterpretable read is not a disagreement"
+            )
+    return list(contexts)
 
 
 def compare(defined: Sequence[str], required: Sequence[str]) -> Tuple[Set[str], Set[str]]:
@@ -617,6 +638,9 @@ def _unchecked(message: str) -> int:
             f"match ci.yml — nothing was learned either way (exit {EXIT_UNCHECKED} "
             "= EX_TEMPFAIL)."
         )
+        # Flush here, inside the guard: a closed pipe otherwise surfaces at
+        # interpreter shutdown, where CPython exits 120 and the 75 is lost.
+        sys.stdout.flush()
     except OSError:
         pass
     return EXIT_UNCHECKED
@@ -693,6 +717,7 @@ def main(argv: Sequence[str], fetch: Optional[Fetch] = None) -> int:
         print(
             render(defined, required, missing, stale, args.workflow, args.repo, args.branch)
         )
+        sys.stdout.flush()
         return EXIT_DRIFT if (missing or stale) else EXIT_PARITY
 
     except Underivable as err:

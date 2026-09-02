@@ -119,6 +119,13 @@ of scope.
     matrix and is single-dimension. So a parser that mishandles either case
     works **now** and fails silently later — which is why the rule is stated
     here, so the next reader can tell a limitation from a bug.
+  - Added at verify (2026-09-02), so the three copies of this rule — here,
+    ADR-608-4, and the script's header — say the same thing: a job that calls
+    a reusable workflow (`uses:`) is underivable (the forge names its runs
+    `<caller> / <callee job>`, one per callee job); a `name:` that is empty,
+    padded, or carries a control character is underivable; a boolean or float
+    matrix value is underivable; and two jobs deriving one context are
+    underivable together, both named.
   - Where the derivation cannot produce a context with confidence, the check
     **says so and fails** (BR-5). It must never drop an underivable job from the
     comparison — a job silently excluded is a job silently unrequired, which is
