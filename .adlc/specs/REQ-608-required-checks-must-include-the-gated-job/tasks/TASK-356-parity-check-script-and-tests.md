@@ -66,14 +66,17 @@ ADR-608-6, injected fakes only, asserting on rendered output.
 | BR-3 | test-case | `tools/ci/test_required_checks_parity.py::test_matrix_expands_single_dimension` | no |
 | BR-3 | test-case | `tools/ci/test_required_checks_parity.py::test_multi_dimension_matrix_is_underivable` | no |
 | BR-4 | test-case | `tools/ci/test_required_checks_parity.py::test_stale_context_fails` | yes |
-| BR-5 | test-case | `tools/ci/test_required_checks_parity.py::test_read_401_fails_closed` | yes |
+| BR-2 | test-case | `tools/ci/test_required_checks_parity.py::test_parity_passes` | yes |
+| BR-4 | test-case | `tools/ci/test_required_checks_parity.py::test_parity_passes` | yes |
+| BR-5 | test-case | `tools/ci/test_required_checks_parity.py::test_read_401_fails_closed` | no |
+| BR-5 | test-case | `tools/ci/test_required_checks_parity.py::test_parity_passes` | yes |
 | BR-5 | test-case | `tools/ci/test_required_checks_parity.py::test_unprotected_branch_fails_closed` | no |
 | BR-5 | test-case | `tools/ci/test_required_checks_parity.py::test_rulesets_present_fails_closed` | no |
 | BR-6 | test-case | `tools/ci/test_required_checks_parity.py::test_deleting_a_required_context_goes_red` | yes |
 | BR-9 | test-case | `tools/ci/test_required_checks_parity.py::test_both_directions_name_both_remedies` | yes |
 | AC-3 | test-case | `tools/ci/test_required_checks_parity.py::test_both_directions_name_both_remedies` | yes |
 | AC-4 | test-case | `tools/ci/test_required_checks_parity.py::test_added_job_in_fixture_goes_red` | yes |
-| AC-5 | test-case | `tools/ci/test_required_checks_parity.py::test_read_401_fails_closed` | yes |
+| AC-5 | test-case | `tools/ci/test_required_checks_parity.py::test_read_401_fails_closed` | no |
 | AC-6 | test-case | `tools/ci/test_required_checks_parity.py::test_deleting_a_required_context_goes_red` | yes |
 | AC-10 | test-case | `tools/ci/test_required_checks_parity.py::test_both_directions_name_both_remedies` | yes |
 
