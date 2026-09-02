@@ -12,6 +12,18 @@ concerns: ["maintainability", "security", "testing"]
 tags: ["req-599-followon", "visibility", "derived-checks", "br-7", "cleanup"]
 ---
 
+
+> **Cross-repo id collision (BUG-210).** This id is also held by **adlc-toolkit**, whose
+> `REQ-602` is *Doctor: worktree-registration check, and an invocation seam that runs doctor before someone suspects a problem* (created 2026-08-30). Both were issued from one
+> machine-global namespace by an allocator that, run from a git worktree,
+> could see only one repository — the defect fixed in adlc-toolkit `0cacbff`.
+> **Neither artifact is renumbered.** This one is shipped and its id appears in
+> 43 files here, including code comments, test names, lesson and assumption
+> bodies, and merged commit messages that cannot be rewritten — LESSON-599's
+> "a bulk rename does not stop at code", measured. Within this repository
+> `REQ-602` unambiguously means the spec below; cross-repo references must name
+> the repository.
+
 ## Description
 
 REQ-599 split `runtime.rs` into seven modules. A five-agent review over the
