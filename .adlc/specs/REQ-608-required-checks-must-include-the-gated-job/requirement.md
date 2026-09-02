@@ -1,10 +1,10 @@
 ---
 id: REQ-608
 title: "The one job that guards feature-gated code is the one job that cannot block a merge"
-status: draft
+status: approved
 deployable: false
 created: 2026-09-01
-updated: 2026-09-01
+updated: 2026-09-02
 component: "ci"
 domain: "developer-experience"
 stack: ["github-actions", "ci"]
@@ -110,7 +110,11 @@ of scope.
       check names is the same drift with an extra place to forget. The rule:
   - A job's check-run context is its rendered `name:` when it declares one, and
     its **job key** when it does not.
-  - A matrix job appends ` (<value>)` per dimension, in declaration order.
+  - A single-dimension matrix job appends ` (<value>)` to that context, one
+    context per value, in declaration order. A multi-dimension matrix, an
+    `include`/`exclude` entry, or a `name:` containing an expression is
+    **underivable** by this rule — the check must say so and fail (next bullet)
+    rather than guess at the forge's rendering.
   - Every job in `ci.yml` today declares a `name:`, and `check` is the only
     matrix and is single-dimension. So a parser that mishandles either case
     works **now** and fails silently later — which is why the rule is stated
@@ -201,10 +205,11 @@ of scope.
       protection turns the check red with no edit to the check itself. Asserted
       by adding a throwaway job in a fixture or a scratch copy, not by reasoning
       about the parser.
-- [ ] AC-5: **BR-5 guard.** With the protection read made to fail (no token, or
-      a token without the scope), the check exits non-zero and its output names
-      the cause. It does not pass. Asserted by running it that way, not by
-      reading the error branch.
+- [ ] AC-5: **BR-5 guard.** With the protection read made to fail — a rejected
+      credential (401), an endpoint that does not answer, or a response with no
+      protection object — the check exits non-zero and its output names the
+      cause. It does not pass. Asserted by running it that way, not by reading
+      the error branch.
 - [ ] AC-6: **BR-6 known-bad, run.** Deleting one context from the expected set
       turns the check red; the mutation is executed and what actually went red is
       recorded in the check's doc comment or the PR body.
@@ -231,10 +236,16 @@ of scope.
 - **Repository admin access** to edit `main`'s branch protection. This is the
   only step in the REQ that a workflow cannot perform and that the pipeline
   cannot self-serve; it needs a human with the right role.
-- **A token that can read branch protection from CI.** `ci.yml` currently
-  declares `permissions: contents: read`, which is not sufficient — reading
-  protection needs `administration: read` or a PAT. Whether that widening is
-  acceptable is OQ-3.
+- **A read path for `main`'s required contexts from CI.** Measured 2026-09-02
+  (Step 0 of `/proceed`): on this public repository an **unauthenticated**
+  `GET /repos/atelier-fashion/teton-code/branches/main` already returns
+  `protection.required_status_checks.contexts` (and `enforcement_level`), while
+  `/branches/main/protection` answers 401 without admin scope. So the read needs
+  no `administration: read` and no PAT — the workflow's own `GITHUB_TOKEN` at
+  `contents: read` is enough, and is used only to lift the anonymous rate limit
+  shared by every GitHub-hosted runner IP. This narrows OQ-3 to a non-decision;
+  BR-10 holds by construction. `/rules/branches/main` returned an empty list —
+  classic branch protection is the sole source today.
 
 ## Assumptions
 
@@ -251,7 +262,9 @@ of scope.
   comments, test names and merged commit messages, and LESSON-599 records that a
   bulk rename does not stop at code.
 - `gated` is currently green on `main`. If it is not, requiring it blocks every
-  merge the moment the rule lands — check before applying, not after.
+  merge the moment the rule lands — check before applying, not after. Measured
+  2026-09-02: run 33679995402 on `467bfa5`, all seven jobs `success`, `gated`
+  included.
 - The forge is GitHub and the protection API is the source of truth. If the repo
   later moves to rulesets rather than classic branch protection, the read has to
   follow; the property this REQ asserts does not change.
@@ -276,6 +289,9 @@ of scope.
       `/architect` picks one and records why; if it picks the PAT, BR-10 requires
       the reason to be written down, because a long-lived standing secret is a
       different class of thing from a scoped grant.
+      **Narrowed further 2026-09-02:** the branch endpoint exposes the required
+      contexts without any admin scope (External Dependencies). The remaining
+      choice for `/architect` is only *which job* performs the read.
 - [ ] OQ-4: `main` currently has `required_pull_request_reviews: false` — no
       review approval is required to merge. That is a separate and larger
       decision than this REQ, noted here only because it was measured at the same
