@@ -12,6 +12,18 @@ concerns: ["developer-experience", "reliability", "extensibility"]
 tags: ["refactor", "god-impl", "run-prompt-turn", "turn-path", "req-599-followon"]
 ---
 
+
+> **Cross-repo id collision (BUG-210).** This id is also held by **atelier-fashion**, whose
+> `REQ-600` is *Scope the self-hosted runner gcloud teardown to a job-owned config directory* (created 2026-08-28). Both were issued from one
+> machine-global namespace by an allocator that, run from a git worktree,
+> could see only one repository — the defect fixed in adlc-toolkit `0cacbff`.
+> **Neither artifact is renumbered.** This one is shipped and its id appears in
+> 52 files here, including code comments, test names, lesson and assumption
+> bodies, and merged commit messages that cannot be rewritten — LESSON-599's
+> "a bulk rename does not stop at code", measured. Within this repository
+> `REQ-600` unambiguously means the spec below; cross-repo references must name
+> the repository.
+
 ## Description
 
 REQ-599's deferred step 8, filed as its own REQ by decision on 2026-08-30.
