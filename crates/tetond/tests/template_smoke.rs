@@ -28,6 +28,8 @@
 //! ```
 #![cfg(feature = "llama")]
 
+compile_error!("REQ-608 AC-2 evidence: deliberate all-features break — this PR must never merge");
+
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
