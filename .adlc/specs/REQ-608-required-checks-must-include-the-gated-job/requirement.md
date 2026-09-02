@@ -179,10 +179,22 @@ of scope.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: `main`'s required status checks include `feature-gated targets
+- [x] AC-1: `main`'s required status checks include `feature-gated targets
       compile (all features)`. Evidenced by the `gh api .../branches/main/protection`
       response before and after, both recorded.
-- [ ] AC-2: **The defect is demonstrated before it is fixed, and the "before"
+  - **Before, 2026-09-02T21:46:56Z** (`required_status_checks`, `strict: true`):
+    `catalog integrity (BR-8/AC-8)`, `fmt · clippy · test (ubuntu-latest)`,
+    `fmt · clippy · test (macos-latest)`, `acceptance suite (REQ-544 + REQ-547)`,
+    `dependency advisories (cargo audit)`,
+    `release tooling (actionlint · shellcheck · selftest)` — six.
+  - **After, 2026-09-02T21:46:58Z** (one `PATCH .../protection/required_status_checks`,
+    applied through the admin's own `gh` session with recorded consent — TASK-359):
+    the six above plus `feature-gated targets compile (all features)` and
+    `required checks mirror ci.yml (REQ-608)` — eight. `strict` unchanged
+    (`true`); `enforce_admins` unchanged (`false`, OQ-4). The local parity
+    check against live `main` went from exit 1 (both new contexts under
+    `missing`) to exit 0 across the edit.
+- [x] AC-2: **The defect is demonstrated before it is fixed, and the "before"
       half is not negotiable.** A branch whose `gated` job fails — e.g. a
       deliberate `--all-features` compile error behind `#[cfg(feature = "llama")]`
       — is shown to be **mergeable under the current protection**. That half is
@@ -207,6 +219,12 @@ of scope.
     three polls while *required* checks were still pending and flipped to
     `UNSTABLE` only when the last required one landed — the verdict is
     meaningful only after every rollup entry is terminal.
+  - **After-half, measured 2026-09-02T21:47:13Z**, same PR #272, same head
+    `8c51278`, fifteen seconds after the protection edit: GraphQL
+    `{"mergeable":"MERGEABLE","mergeStateStatus":"BLOCKED"}`; REST
+    `{"mergeable":true,"mergeable_state":"blocked"}`. The one red job that
+    could not block a merge now does. PR #272 was then closed unmerged and its
+    branch deleted.
 - [ ] AC-3: A check inside the repository compares `ci.yml`'s defined job names
       against the forge's required contexts. Both directions (`missing`, `stale`)
       are computed, both are rendered, and **both fail the run** — per BR-4,
@@ -225,17 +243,32 @@ of scope.
 - [ ] AC-6: **BR-6 known-bad, run.** Deleting one context from the expected set
       turns the check red; the mutation is executed and what actually went red is
       recorded in the check's doc comment or the PR body.
-- [ ] AC-7: **BR-7 guard.** `gated` is confirmed to run on every `pull_request`
+- [x] AC-7: **BR-7 guard.** `gated` is confirmed to run on every `pull_request`
       event with no path filter or conditional skip, stated with the evidence,
       before AC-1's protection change is applied.
-- [ ] AC-8: `ci.yml`'s `gated` comment cites BUG-167. The claim it makes about
+  - Evidence (quoted from `ci.yml` at `5bc3d36`, before the PATCH): the
+    workflow trigger is `on: pull_request: branches: [main]` / `push: branches:
+    [main]` with no `paths`/`paths-ignore` (`grep -nE '^\s*paths(-ignore)?:'`
+    → nothing); the `gated` job is `gated:` / `name: feature-gated targets
+    compile (all features)` / `runs-on: macos-latest` with no `if:` (`grep -n
+    '^\s*if:' .github/workflows/ci.yml` → nothing, file-wide). Green on `main`
+    at run 33679995402 and on PR #271's run 33687008449.
+- [x] AC-8: `ci.yml`'s `gated` comment cites BUG-167. The claim it makes about
       `template_smoke.rs` is checked against BUG-167's own description rather
       than carried over.
-- [ ] AC-9: **BR-10 guard.** The widened permission is scoped to the job that
+- [x] AC-9: **BR-10 guard.** The widened permission is scoped to the job that
       performs the protection read: `ci.yml`'s workflow-level grant is still
       `contents: read`, and no job that runs repo-authored shell carries the
       wider grant. Asserted by reading the merged workflow, and stated as a
       diff of what each job's effective permissions were before and after.
+  - Diff: **none, for every job.** No permission widened. The read path is the
+    public branch endpoint (External Dependencies), so the `parity` job runs
+    under the unchanged workflow-level `permissions: contents: read` — `grep -n
+    'permissions:' .github/workflows/ci.yml` returns exactly the one
+    workflow-level line (38) before and after. Effective permissions: `check`
+    (both legs), `gated`, `catalog`, `e2e`, `audit`, `tooling`: `contents:
+    read` → `contents: read`; `parity` (new): `contents: read`. `GITHUB_TOKEN`
+    is passed to the check only to lift the anonymous rate limit.
 - [ ] AC-10: **BR-9 guard.** The check's failure output, for both directions,
       names both remedies — revert the protection edit, or update `ci.yml`.
       Asserted against the rendered failure text, not the source of the message

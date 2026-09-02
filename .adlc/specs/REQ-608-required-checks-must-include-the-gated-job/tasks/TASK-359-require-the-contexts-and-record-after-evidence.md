@@ -1,7 +1,7 @@
 ---
 id: TASK-359
 title: "Require gated and parity on main (admin edit), record before/after, capture the AC-2 after-half, close the throwaway PR"
-status: draft
+status: complete
 parent: REQ-608
 created: 2026-09-02
 updated: 2026-09-02
@@ -59,6 +59,15 @@ from TASK-358, close that PR, and delete its branch. Sequence per ADR-608-8.
 | AC-2 | structural-check | `requirement.md` AC-2: after-half `BLOCKED` verbatim on the throwaway PR | no |
 | AC-7 | structural-check | `requirement.md` AC-7: quoted `gated` and `on.pull_request` lines | yes |
 | AC-9 | structural-check | `requirement.md` AC-9: effective-permissions diff per job | no |
+
+## Outcome (2026-09-02)
+
+Consent: the repository admin (Brett, via `/proceed`'s AskUserQuestion) chose
+"Apply it via my gh session". PATCH applied 21:46:58Z; before/after lists,
+the AC-2 after-half (`BLOCKED`), AC-7 quotes and the AC-9 per-job statement
+are recorded in `requirement.md`. PR #272 closed unmerged, branch
+`chore/REQ-608-ac2-evidence` deleted, throwaway worktree removed.
+`docs/release-runbook.md` does not enumerate required checks — no change.
 
 ## Technical Notes
 
