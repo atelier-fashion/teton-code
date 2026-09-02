@@ -1,7 +1,7 @@
 ---
 id: TASK-356
 title: "Write the required-checks parity script and its known-bad unit tests"
-status: draft
+status: complete
 parent: REQ-608
 created: 2026-09-02
 updated: 2026-09-02
