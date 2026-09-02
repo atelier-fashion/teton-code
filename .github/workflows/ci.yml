@@ -77,7 +77,7 @@ jobs:
     # gated behind a non-default feature (`llama`, `presence`, `live`,
     # `test-seam`) is a file CI can see but never compiles — and a file that
     # exists while nothing asserts it still builds is LESSON-510's shape
-    # exactly (existence checked, freshness not). BUG-166 is what that looks
+    # exactly (existence checked, freshness not). BUG-167 is what that looks
     # like in practice: the REQ-554 AC-6 weights smoke
     # (crates/tetond/tests/template_smoke.rs) sat broken on main through a
     # constructor change, CI green the whole time.
@@ -356,6 +356,151 @@ jobs:
               ;;
             *)
               echo "::error title=Release tooling self-test exited $status::selftest.sh returned a code it does not document (its header defines 0, 1 and 75). Treated as a failure, because an unrecognised code is not a pass."
+              ;;
+          esac
+          exit "$status"
+
+  parity:
+    name: required checks mirror ci.yml (REQ-608)
+    runs-on: ubuntu-latest
+    # Branch protection is configuration the forge holds, not a file in this
+    # tree, so the set of *required* contexts drifts from the set of *defined*
+    # jobs silently — and in both directions. A required context nothing
+    # defines blocks every merge; a defined job nothing requires blocks none.
+    # The second is how BUG-167 lived here: `feature-gated targets compile (all
+    # features)` ran on every PR, reported red, and could not stop a single
+    # merge. LESSON-464 names that shape — a control that exists and that
+    # nothing fails when it is removed, weakened, or repositioned. This job is
+    # the thing that fails.
+    #
+    # Its own job rather than a step in `tooling` (ADR-608-1), for two reasons.
+    # A job's `name:` IS its required-check context, and `tooling`'s name
+    # enumerates its contents (`actionlint · shellcheck · selftest`) — bolting
+    # parity onto it would either make that name a lie or force a rename, and a
+    # rename is a coordinated protection edit, exactly the class of change this
+    # job exists to make visible. The other reason is diagnosis: a repo-wide
+    # red on "release tooling" caused by an admin editing branch protection is
+    # a ten-minute mystery, where a red on "required checks mirror ci.yml" says
+    # what happened. It also guards itself — un-require this context and the
+    # check reports its own name under `missing` on every PR. It cannot block
+    # at that point, but it is loud where the original defect was silent.
+    #
+    # Nothing widens to run it, and that is deliberate (AC-9): the before/after
+    # effective-permission diff for this change is *none*, for every job in
+    # this workflow, this one included. No job here declares a job-level
+    # permissions block — grep this file and the sole hit is the workflow-level
+    # one above, which every job inherits as `contents: read`. The
+    # read path is the PUBLIC branch endpoint
+    # (`GET /repos/{owner}/{repo}/branches/main`), which answers anonymously on
+    # this repository — measured, not assumed; `/branches/main/protection` is
+    # the one that 401s, and it is not used. `GITHUB_TOKEN` is passed only to
+    # lift the anonymous 60/hour rate limit shared by every GitHub-hosted
+    # runner behind the same egress IP, so no `administration: read` and no PAT
+    # is required (ADR-608-2).
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # PyYAML because BR-3 wants a real parse: a hand-rolled subset reader for
+      # `jobs:` and `strategy.matrix` is the "works now, fails silently later"
+      # shape that rule exists to avoid. Pinned, so a PyYAML release cannot
+      # change what this gate derives; guarded, so a runner image that already
+      # ships it costs nothing; and deliberately NOT `continue-on-error` — a
+      # gate that waives itself on a transient fetch failure is not a gate
+      # (LESSON-447, the same rule as the pinned actionlint download).
+      - name: Install PyYAML (pinned)
+        run: |
+          set -euo pipefail
+          if python3 -c 'import yaml' 2>/dev/null; then
+            echo "PyYAML present"
+          else
+            python3 -m pip install --user 'PyYAML==6.0.2'
+          fi
+          python3 -c 'import yaml; print("PyYAML", yaml.__version__)'
+
+      # The check's own known-bads (ADR-608-6) run on every PR rather than
+      # being trusted from the commit that added them. Every mutation in that
+      # table is a case here — a job added to a fixture copy of this file, a
+      # context deleted from the required set, one added, a 401, a dropped
+      # connection, an unprotected branch, a ruleset present, a two-dimension
+      # matrix — and each asserts on the RENDERED output rather than on the
+      # source containing a string (LESSON-519). They open no socket: the
+      # script takes its fetcher as an argument, so the fakes never leave the
+      # process.
+      #
+      # The `Ran N tests` grep is not decoration. `unittest` exits 0 on a suite
+      # that collected nothing, so a rename, a moved file, or a discovery
+      # failure under a different runner all produce a green step that verified
+      # nothing — the vacuous-run shape this repo refuses. Output is captured
+      # to a file rather than piped through `tee`: under `pipefail` a
+      # pipeline's status is the last command's, and `tee` always succeeds, so
+      # the failure would be swallowed by the very line meant to record it.
+      - name: Unit tests (known-bads run every PR)
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          status=0
+          python3 -m unittest tools/ci/test_required_checks_parity.py -v > "$log" 2>&1 || status=$?
+          cat "$log"
+
+          if [ "$status" -ne 0 ]; then
+            echo "::error title=Parity known-bads FAILED::The parity check's own test suite exited $status, so the comparison below cannot be trusted whatever it says. Fix the suite first — see the failing case in the log above."
+            exit "$status"
+          fi
+
+          if ! grep -Eq 'Ran [1-9][0-9]* tests?' "$log"; then
+            echo "::error title=Parity known-bads VACUOUS::The unit run exited 0 without reporting 'Ran N tests' for any N >= 1, so no case actually executed. A suite that ran nothing is not a pass — check that tools/ci/test_required_checks_parity.py is still discoverable from the repository root."
+            exit 75
+          fi
+
+      # Derives one context per job by parsing this file (ADR-608-4: the job's
+      # `name:`, one context per leg of a single-dimension matrix, and any
+      # other shape named and failed rather than guessed), reads main's
+      # required set from the forge, and fails on either difference. The two
+      # directions are different defects and both are reported: `missing` is a
+      # job that reports on every PR and can block none (BUG-167's shape);
+      # `stale` is a required context nothing reports, which parks every PR at
+      # "Expected — waiting for status to be reported".
+      #
+      # Same taxonomy as the `catalog` and `tooling` jobs above — "they
+      # disagree" and "I could not look" must never share a code (ADR-608-3,
+      # LESSON-442):
+      #
+      #   0   PARITY     green.
+      #   1   DRIFT      red, ::error::. A real disagreement. The job output
+      #                  above names every missing and stale context and states
+      #                  both remedies; read it rather than guessing which edit
+      #                  is the intended one.
+      #   75  UNCHECKED  red, ::warning::. The workflow could not be parsed, a
+      #                  job was underivable, the forge could not be read, or
+      #                  the tool crashed. Nothing was learned about branch
+      #                  protection either way — this is NOT a pass and NOT
+      #                  drift. Re-run once the read works.
+      #
+      # Any other code fails as well: an undocumented code is not a pass.
+      - name: Required checks mirror ci.yml (both directions)
+        env:
+          # Rate limit only, per the job header — the endpoint is public and
+          # answers without it. No scope is requested and none is required.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          set +e
+          python3 tools/ci/required-checks-parity.py --repo "$GITHUB_REPOSITORY" --branch main
+          status=$?
+          set -e
+          case "$status" in
+            0)
+              echo "::notice title=Required checks::PARITY — main's required status checks are exactly the jobs this workflow defines, in both directions."
+              ;;
+            1)
+              echo "::error title=Required checks DRIFT::main's required status checks and the jobs ci.yml defines disagree. The job output above lists every 'missing' context (defined here, not required — it reports on each PR and can block none) and every 'stale' one (required, not defined — every PR waits forever on a status nothing reports), and it names both remedies: revert the protection edit, or update .github/workflows/ci.yml. Pick the one that matches intent."
+              ;;
+            75)
+              echo "::warning title=Required checks UNCHECKED::The parity check could not reach a verdict, so NOTHING was learned about branch protection. This is NOT a pass and it is NOT evidence of drift — see the log for the cause (unparseable workflow, underivable job, unreadable forge, or a crash) and re-run once the read works."
+              ;;
+            *)
+              echo "::error title=Required checks exited $status::required-checks-parity.py returned a code it does not document (its header defines 0, 1 and 75). Treated as a failure, because an unrecognised code is not a pass."
               ;;
           esac
           exit "$status"

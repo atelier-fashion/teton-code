@@ -49,10 +49,18 @@ _spec.loader.exec_module(parity)
 REPO = "atelier-fashion/teton-code"
 BRANCH_URL = "https://api.github.com/repos/atelier-fashion/teton-code/branches/main"
 
-# The seven contexts ci.yml defines today, in declaration order: `check`'s two
-# matrix legs, then gated, catalog, e2e, audit, tooling. This list is a fixture
-# of the current tree, not a second source of truth — TASK-357 adds an eighth
-# (the parity job itself) and this literal is expected to grow with it.
+# The eight contexts ci.yml defines today, in declaration order: `check`'s two
+# matrix legs, then gated, catalog, e2e, audit, tooling, parity. This list is a
+# fixture of the current tree, not a second source of truth: the derivation
+# under test parses ci.yml, so adding a job to that file reds the suite here
+# until this literal is updated to match — which is the intended friction, and
+# is why the runbook in conventions.md (ADR-608-8) treats a job add or rename
+# as one coordinated change.
+#
+# The last entry is the parity job's own context, added by TASK-357 in the same
+# commit that added the job. The check is required to see itself (ADR-608-1):
+# if an admin ever un-requires it, it reports its own name under `missing` on
+# every PR rather than going quiet.
 CONTEXTS_TODAY = [
     "fmt · clippy · test (ubuntu-latest)",
     "fmt · clippy · test (macos-latest)",
@@ -61,6 +69,7 @@ CONTEXTS_TODAY = [
     "acceptance suite (REQ-544 + REQ-547)",
     "dependency advisories (cargo audit)",
     "release tooling (actionlint · shellcheck · selftest)",
+    "required checks mirror ci.yml (REQ-608)",
 ]
 
 MINIMAL_WORKFLOW = """\
@@ -182,8 +191,9 @@ class TestDerivation(ParityCase):
 
         Asserted against the real `.github/workflows/ci.yml`, not a fixture, so
         the derivation is checked against the document branch protection is
-        actually compared with. The seven-context expectation is the tree as it
-        stands; TASK-357 adds the parity job's own context and this list grows.
+        actually compared with. The expectation is `CONTEXTS_TODAY` — the eight
+        contexts the tree defines as of TASK-357 — and it grows with the next
+        job added there, deliberately: see that literal's comment.
         """
         with open(CI_YML, "r", encoding="utf-8") as handle:
             workflow = yaml.safe_load(handle)

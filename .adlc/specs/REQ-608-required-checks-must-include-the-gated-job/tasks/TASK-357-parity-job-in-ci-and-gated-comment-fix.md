@@ -1,7 +1,7 @@
 ---
 id: TASK-357
 title: "Add the parity job to ci.yml, fix the gated comment to cite BUG-167, and record the job-change runbook"
-status: draft
+status: complete
 parent: REQ-608
 created: 2026-09-02
 updated: 2026-09-02
@@ -37,23 +37,23 @@ the same actionlint version CI pins.
 
 ## Acceptance Criteria
 
-- [ ] `actionlint -color -shellcheck shellcheck .github/workflows/*.yml` passes
+- [x] `actionlint -color -shellcheck shellcheck .github/workflows/*.yml` passes
       locally with actionlint 1.7.12 (the CI pin).
-- [ ] `grep -n BUG-166 .github/workflows/ci.yml` returns nothing; the `gated`
+- [x] `grep -n BUG-166 .github/workflows/ci.yml` returns nothing; the `gated`
       comment cites BUG-167 and its `template_smoke.rs` claim matches BUG-167's
       description (AC-8).
-- [ ] The new job has no `if:`, no `paths`, and no `permissions:` block;
+- [x] The new job has no `if:`, no `paths`, and no `permissions:` block;
       `permissions:` at workflow level is unchanged (`contents: read`) (AC-9: the
       before/after effective-permission diff is "none" for every job — stated in
       the job's header comment).
-- [ ] The job's unit-test step fails if `Ran 0 tests` is reported (vacuous-run
+- [x] The job's unit-test step fails if `Ran 0 tests` is reported (vacuous-run
       guard).
-- [ ] The job's live-check step branches on 0 / 1 / 75 and each branch prints a
+- [x] The job's live-check step branches on 0 / 1 / 75 and each branch prints a
       titled annotation; any other code is treated as failure.
-- [ ] `python3 tools/ci/required-checks-parity.py --workflow .github/workflows/ci.yml --repo atelier-fashion/teton-code`
+- [x] `python3 tools/ci/required-checks-parity.py --workflow .github/workflows/ci.yml --repo atelier-fashion/teton-code`
       run locally (before the admin edit) shows the new job's own name under
       `missing:` — the check sees itself.
-- [ ] `conventions.md` gains the runbook paragraph.
+- [x] `conventions.md` gains the runbook paragraph.
 
 ## Verification
 

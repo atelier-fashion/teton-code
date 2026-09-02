@@ -134,3 +134,26 @@ teton-code/
   (so the intermediate commits never start a run under any concurrency setting);
   and a force-push no longer kills the abandoned commit's run, which now finishes
   on a tree nobody will merge.
+- **Every job `ci.yml` defines is a required check on `main`, and the `parity`
+  job asserts that from inside the tree** (REQ-608). Branch protection is
+  configuration the forge holds, so it drifts from the workflow silently and in
+  *both* directions: a defined job nothing requires reports on every PR and can
+  block none, while a required context nothing defines parks every PR at
+  "Expected — waiting for status to be reported". `required checks mirror
+  ci.yml (REQ-608)` derives the job set by parsing the workflow, reads the
+  required set from the forge, and fails on `missing` and `stale` alike, naming
+  both remedies (revert the protection edit, or update `ci.yml`). BUG-167 is
+  the defect it exists to prevent — `feature-gated targets compile (all
+  features)` was green-or-red on every PR for months while unable to stop one
+  (LESSON-464). **Adding or renaming a job is therefore one coordinated change,
+  in this order** (ADR-608-8): open the PR — its own parity job goes red with
+  the new name under `missing`, and *only* that job, since every other context
+  still matches; ask an admin to add the new context under Settings > Branches
+  (for a *rename*, add the new one and keep the old); merge; then have the
+  admin remove the old context. Two bounded windows of red follow from that
+  sequence and both are expected. Between the admin's edit and the merge, any
+  *other* open PR reds on a parity context its branch does not yet define —
+  minutes, and it clears the moment this PR merges. After a rename's merge,
+  every PR reds on the old context as `stale` until the admin's final edit —
+  and the check's own message says which edit resolves it, so nobody has to
+  work it out. A workflow never edits protection; an admin does.
