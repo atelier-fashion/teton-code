@@ -72,16 +72,21 @@ only to lift the anonymous 60/hour rate limit, which is shared across every
 GitHub-hosted runner behind the same egress IP and would make an anonymous read
 flake. `GITHUB_TOKEN` is already present in every job; nothing widens.
 
-**Fail-closed contract (BR-5)**, in order:
+**Fail-closed contract (BR-5)**, in the order the code evaluates it
+(corrected at verify, 2026-09-02 — the first draft listed the forge reads
+ahead of the local parse; the local parse runs first so a broken workflow is
+reported without a round trip, and rulesets are read ahead of classic
+protection so a migration is told so rather than "not protected"):
 
 | Condition | Exit | Message names |
 |---|---|---|
-| `GITHUB_REPOSITORY` unset and no `--repo` | 75 | the missing input |
-| non-2xx, transport error, timeout, non-JSON body | 75 | status/exception class and the URL |
+| `GITHUB_REPOSITORY` unset and no `--repo`; `--repo` not `OWNER/REPO`; `--branch` not a plain name | 75 | the input |
+| `ci.yml` unreadable / unparseable / job underivable (ADR-608-4) | 75 | the file, or the job key and why |
+| `GET /repos/{o}/{r}/rules/branches/{b}`: non-2xx, transport error, non-JSON, or a body that is not a list | 75 | status/exception class and the URL |
+| that list non-empty | 75 | "rulesets present; this check reads classic protection only — extend it" |
+| `GET /repos/{o}/{r}/branches/{b}`: non-2xx (a 3xx included — redirects are refused), transport error, non-JSON | 75 | status/exception class and the URL |
 | `protected` absent or `false` | 75 | "branch is not protected — nothing to compare against" |
-| `protection.required_status_checks` absent | 75 | the missing key |
-| `GET /repos/{o}/{r}/rules/branches/{b}` non-empty | 75 | "rulesets present; this check reads classic protection only — extend it" |
-| `ci.yml` unparseable / job underivable (ADR-608-4) | 75 | the file, or the job key and why |
+| `protection` or `protection.required_status_checks` or `.contexts` absent | 75 | the missing key |
 | `missing` or `stale` non-empty | 1 | both sets and both remedies (BR-9) |
 | parity | 0 | both sets |
 
@@ -119,7 +124,14 @@ code only changes what the log says happened.
   scalars, and no `include`/`exclude` → one context per value, `f"{ctx} ({v})"`,
   in list order.
 - any other matrix shape (two or more dimensions, `include`/`exclude`, an
-  expression string) → underivable → 75 naming the job and the shape.
+  expression string, a boolean or float value) → underivable → 75 naming the
+  job and the shape.
+- a job carrying `uses:` (a reusable workflow) → underivable: the forge reports
+  `<caller> / <callee job>` per callee job, which this check does not read.
+- a `name:` that is empty, padded, or carries a control character →
+  underivable; and two jobs deriving the same context → underivable naming
+  both (added at verify, 2026-09-02 — `compare` is set-based, so a duplicate
+  was a defined job passing with no required context of its own).
 - a job carrying `if:`, or a workflow whose `on.pull_request` carries
   `paths`/`paths-ignore`, is rendered as a `::warning::` (BR-7's hazard — a
   required context that may not report) but does not by itself change the exit
@@ -133,10 +145,13 @@ underivable job is *named* so the reader can tell a limitation from a bug.
 
 ### ADR-608-5: PyYAML, pinned, imported lazily, missing → 75
 
-**Decision**: the job runs
-`python3 -m pip install --user 'PyYAML==6.0.2'` guarded by
-`python3 -c 'import yaml'`, and the script imports `yaml` inside `main()` so a
-missing module is reported as 75 with the remedy, never as a traceback exit 1.
+**Decision**: the job installs whatever `required-checks-parity.py --pyyaml-pin`
+prints (`PyYAML==6.0.2`, one home for the pin), guarded by
+`python3 -c 'import yaml'`, with a `--break-system-packages` retry for PEP 668
+images; and the script imports `yaml` inside `main()` so a missing module is
+reported as 75 with the remedy, never as a traceback exit 1. A runner image
+that already ships PyYAML is used as-is: the pin governs what is installed,
+not what is accepted, and the version is printed so drift is diagnosable.
 
 **Rationale**: `ci.yml` uses anchors-free plain YAML today, but BR-3 says the
 derivation must be a real parse — a hand-rolled subset reader is the "works now,
@@ -154,7 +169,10 @@ runtime): the dogfood machine runs 3.9, and the tests must run locally.
 **Decision**: `compare(defined, required)`, `derive_contexts(workflow_dict)`,
 and `read_required(fetch, owner_repo, branch)` are pure or take an injected
 `fetch(url, token) -> (status, body)` callable. `main()` wires the real
-`urllib` fetcher. Unit tests (`unittest`, stdlib) inject fakes and assert on
+`urllib` fetcher, which refuses redirects (so `Authorization` never follows a
+3xx off-host) and returns every status as a status. Rendering passes every
+forge- or workflow-sourced string through one escaper, because GitHub Actions
+parses `::command::` at the start of any log line (verify finding). Unit tests (`unittest`, stdlib) inject fakes and assert on
 **rendered output** and exit codes, not on internal structures.
 
 **Known-bads run and recorded (BR-6, AC-4, AC-5, AC-6, AC-10)**:
@@ -170,6 +188,11 @@ and `read_required(fetch, owner_repo, branch)` are pure or take an injected
 | rulesets fetch returns a non-empty list | exit 75, "rulesets" |
 | two-dimension matrix | exit 75, names the job |
 | the real `ci.yml` against a fake required set equal to its derived contexts | exit 0 (**benign path**) |
+| (added at verify) `on.pull_request.paths` under the YAML-1.1 `True` key; a job with no `name:`; a `${{` name; bool/float matrix values; `include:`; a `uses:` job; duplicate contexts; a newline inside a required or defined name; rulesets read 500 / non-list body / read before classic; non-JSON body; `required_status_checks` absent; `protected` key absent; workflow missing / unparseable; bad `--repo`/`--branch`; `--pyyaml-pin` | each 75 (or escaped on render), named |
+
+Every mutation the reflector ran during verify that left the first suite green
+(`_triggers` reduced to one key, the job-key fallback, the `${{` refusal, the
+boolean refusal) now has a case whose docstring records the failure it produces.
 
 The job asserts the unit run executed a non-zero number of cases (grep of
 `Ran N tests`, N ≥ 1) — a green suite that ran nothing is the vacuous-run

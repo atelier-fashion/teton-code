@@ -396,25 +396,40 @@ jobs:
     # the one that 401s, and it is not used. `GITHUB_TOKEN` is passed only to
     # lift the anonymous 60/hour rate limit shared by every GitHub-hosted
     # runner behind the same egress IP, so no `administration: read` and no PAT
-    # is required (ADR-608-2).
+    # is required (ADR-608-2). Handing that token to a step that runs
+    # repo-authored Python on a fork's PR adds no exposure this workflow does
+    # not already carry: `actions/checkout` persists the same token into
+    # `.git/config` in every job here by default, and a fork PR's token is
+    # read-only on a public repository regardless.
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       # PyYAML because BR-3 wants a real parse: a hand-rolled subset reader for
       # `jobs:` and `strategy.matrix` is the "works now, fails silently later"
-      # shape that rule exists to avoid. Pinned, so a PyYAML release cannot
-      # change what this gate derives; guarded, so a runner image that already
-      # ships it costs nothing; and deliberately NOT `continue-on-error` — a
-      # gate that waives itself on a transient fetch failure is not a gate
-      # (LESSON-447, the same rule as the pinned actionlint download).
+      # shape that rule exists to avoid. The pin has ONE home — the script
+      # prints it (`--pyyaml-pin`) and this step installs what it prints — so
+      # the requirement and the remedy the script names cannot drift apart.
+      # Guarded: a runner image that already ships a PyYAML is used as-is (the
+      # pin governs what is INSTALLED, not what is accepted — `safe_load` of
+      # this file is stable across every 5.x/6.x release and the version is
+      # printed so a drift is diagnosable from the log). Deliberately NOT
+      # `continue-on-error`: a gate that waives itself on a transient fetch
+      # failure is not a gate (LESSON-447, the same rule as the pinned
+      # actionlint download). Version-pinned, not hash-pinned, unlike that
+      # download: PyPI forbids re-uploading a released version, so the residual
+      # is registry compromise, accepted for a parse-only dependency. The
+      # `--break-system-packages` retry is for PEP 668 images whose system
+      # Python refuses `--user` installs; this is a throwaway runner.
       - name: Install PyYAML (pinned)
         run: |
           set -euo pipefail
+          pin="$(python3 tools/ci/required-checks-parity.py --pyyaml-pin)"
           if python3 -c 'import yaml' 2>/dev/null; then
-            echo "PyYAML present"
+            echo "PyYAML present on the runner image"
           else
-            python3 -m pip install --user 'PyYAML==6.0.2'
+            python3 -m pip install --user "$pin" \
+              || python3 -m pip install --user --break-system-packages "$pin"
           fi
           python3 -c 'import yaml; print("PyYAML", yaml.__version__)'
 
@@ -431,10 +446,16 @@ jobs:
       # The `Ran N tests` grep is not decoration. `unittest` exits 0 on a suite
       # that collected nothing, so a rename, a moved file, or a discovery
       # failure under a different runner all produce a green step that verified
-      # nothing — the vacuous-run shape this repo refuses. Output is captured
-      # to a file rather than piped through `tee`: under `pipefail` a
-      # pipeline's status is the last command's, and `tee` always succeeds, so
-      # the failure would be swallowed by the very line meant to record it.
+      # nothing — the vacuous-run shape this repo refuses. The bare `OK` line
+      # is required too: `OK (skipped=N)` is also exit 0, and a suite that
+      # skipped everything ran nothing. Output is captured to a file rather
+      # than piped through `tee`: under `pipefail` a pipeline's status is the
+      # last command's, and `tee` always succeeds, so the failure would be
+      # swallowed by the very line meant to record it.
+      #
+      # A vacuous run is `::error::`, not the `::warning::` the script's own 75
+      # gets below: an outage teaches nothing about the tree, but a test suite
+      # that ran nothing is a defect IN the tree, and it is red for that reason.
       - name: Unit tests (known-bads run every PR)
         run: |
           set -euo pipefail
@@ -448,8 +469,8 @@ jobs:
             exit "$status"
           fi
 
-          if ! grep -Eq 'Ran [1-9][0-9]* tests?' "$log"; then
-            echo "::error title=Parity known-bads VACUOUS::The unit run exited 0 without reporting 'Ran N tests' for any N >= 1, so no case actually executed. A suite that ran nothing is not a pass — check that tools/ci/test_required_checks_parity.py is still discoverable from the repository root."
+          if ! grep -Eq '^Ran [1-9][0-9]* tests? in ' "$log" || ! grep -Eqx 'OK' "$log"; then
+            echo "::error title=Parity known-bads VACUOUS::The unit run exited 0 without reporting 'Ran N tests' for any N >= 1 and a bare 'OK' (not 'OK (skipped=N)'), so no case actually executed. A suite that ran nothing is not a pass — check that tools/ci/test_required_checks_parity.py is still discoverable from the repository root."
             exit 75
           fi
 
@@ -460,7 +481,9 @@ jobs:
       # directions are different defects and both are reported: `missing` is a
       # job that reports on every PR and can block none (BUG-167's shape);
       # `stale` is a required context nothing reports, which parks every PR at
-      # "Expected — waiting for status to be reported".
+      # "Expected — waiting for status to be reported". The DRIFT annotation
+      # below paraphrases the script's REMEDIES block; the two are kept in step
+      # by hand.
       #
       # Same taxonomy as the `catalog` and `tooling` jobs above — "they
       # disagree" and "I could not look" must never share a code (ADR-608-3,

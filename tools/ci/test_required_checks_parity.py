@@ -123,6 +123,7 @@ def fake_fetch(
     branch_body=None,
     rules=None,
     rules_status=200,
+    rules_body=None,
     raises=None,
 ):
     """Build a `fetch(url, token)` that answers from memory.
@@ -135,6 +136,8 @@ def fake_fetch(
         if raises is not None:
             raise raises
         if "/rules/branches/" in url:
+            if rules_body is not None:
+                return rules_status, rules_body
             return rules_status, json.dumps(rules if rules is not None else [])
         if branch_body is not None:
             return branch_status, branch_body
@@ -239,6 +242,156 @@ class TestDerivation(ParityCase):
         self.assertEqual(parity.EXIT_PARITY, code)
         self.assertIn("::warning title=Conditional job::", output)
         self.assertIn("'beta'", output)
+
+    def test_path_filter_warns_under_yaml_true_key(self):
+        """BR-7 / ADR-608-4: `on.pull_request.paths` is announced, exit unchanged.
+
+        YAML 1.1 parses the bare key `on` as the boolean `True`, so this case
+        is also the guard on `_triggers`. Mutation executed 2026-09-02 during
+        verify: with the lookup reduced to `workflow.get("on")` alone the whole
+        suite stayed green — the reflector's finding — and this case was
+        written to close it. Re-run under that mutation it fails on:
+
+            AssertionError: '::warning title=Path-filtered workflow::' not
+            found in '...'
+
+        Restored, it passes. The exit code stays PARITY: reding on a path
+        filter is a policy this REQ did not decide.
+        """
+        text = MINIMAL_WORKFLOW.replace(
+            "    branches: [main]\n", "    branches: [main]\n    paths: ['src/**']\n"
+        )
+        path = self.write_workflow(text)
+        with open(path, "r", encoding="utf-8") as handle:
+            parsed = yaml.safe_load(handle)
+        self.assertIn(True, parsed, "PyYAML must resolve bare `on` to True for this case to mean anything")
+
+        code, output = self.run_main(path, fake_fetch(["alpha check", "beta check"]))
+
+        self.assertEqual(parity.EXIT_PARITY, code)
+        self.assertIn("::warning title=Path-filtered workflow::", output)
+        self.assertIn("`paths:`", output)
+
+    def test_job_without_name_uses_its_key(self):
+        """BR-3: a job with no `name:` derives its job key as the context.
+
+        Mutation executed 2026-09-02: `context = str(job_key)` -> `"UNNAMED"`
+        left the suite green (reflector). Under that mutation this case fails
+        on `AssertionError: ['alpha check', 'beta'] != ['alpha check', 'UNNAMED']`.
+        """
+        text = MINIMAL_WORKFLOW.replace("    name: beta check\n", "")
+        derived = parity.derive_contexts(yaml.safe_load(text))
+        self.assertEqual(["alpha check", "beta"], derived)
+
+    def test_expression_name_is_underivable(self):
+        """BR-3: `name:` carrying `${{ }}` is refused by name, exit 75.
+
+        Mutation executed 2026-09-02: `elif "${{" in name:` -> `elif False:`
+        left the suite green (reflector). Under it this case reports DRIFT
+        (exit 1) for a context that can never match — the confusion LESSON-442
+        exists to prevent — and fails on `AssertionError: 75 != 1`.
+        """
+        text = MINIMAL_WORKFLOW.replace(
+            "    name: beta check\n", "    name: beta ${{ github.ref_name }}\n"
+        )
+        path = self.write_workflow(text)
+        code, output = self.run_main(path, fake_fetch(["alpha check"]))
+
+        self.assertEqual(parity.EXIT_UNCHECKED, code)
+        self.assertIn("'beta'", output)
+        self.assertIn("expression", output)
+
+    def test_boolean_and_float_matrix_values_are_underivable(self):
+        """BR-3 / ADR-608-4: `[true, false]` and `[3.10]` are refused, not rendered.
+
+        `str(True)` is `'True'` where GitHub writes `true`; `3.10` parses to
+        `3.1`. Both would produce a permanent bogus DRIFT. Mutation executed
+        2026-09-02: `_scalar` returning `str(value)` for a bool left the suite
+        green (reflector); under it this case fails on `AssertionError: 75 != 1`.
+        """
+        for values in ("[true, false]", "[3.10, 3.9]"):
+            with self.subTest(values=values):
+                text = MINIMAL_WORKFLOW.replace(
+                    "    name: beta check\n",
+                    f"    name: beta check\n    strategy:\n      matrix:\n        flag: {values}\n",
+                )
+                path = self.write_workflow(text)
+                code, output = self.run_main(
+                    path, fake_fetch(["alpha check", "beta check (True)", "beta check (3.1)"])
+                )
+                self.assertEqual(parity.EXIT_UNCHECKED, code)
+                self.assertIn("'beta'", output)
+                self.assertIn("strategy.matrix.flag", output)
+
+    def test_matrix_include_is_underivable(self):
+        """BR-3: a matrix carrying `include:` is refused by name, exit 75."""
+        text = MINIMAL_WORKFLOW.replace(
+            "    name: beta check\n",
+            "    name: beta check\n    strategy:\n      matrix:\n        os: [ubuntu-latest]\n        include:\n          - os: macos-latest\n",
+        )
+        path = self.write_workflow(text)
+        code, output = self.run_main(path, fake_fetch([]))
+
+        self.assertEqual(parity.EXIT_UNCHECKED, code)
+        self.assertIn("`include:`", output)
+
+    def test_reusable_workflow_job_is_underivable(self):
+        """BR-3: a `uses:` job is refused — the forge names its check runs
+        `<caller> / <callee job>`, one per callee job, and this check does not
+        read the callee. Deriving `name:` for it (verify finding, 2026-09-02)
+        produced a context that could never report.
+        """
+        text = MINIMAL_WORKFLOW.replace(
+            "  beta:\n    name: beta check\n    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n",
+            "  beta:\n    name: beta check\n    uses: ./.github/workflows/other.yml\n",
+        )
+        path = self.write_workflow(text)
+        code, output = self.run_main(path, fake_fetch(["alpha check", "beta check"]))
+
+        self.assertEqual(parity.EXIT_UNCHECKED, code)
+        self.assertIn("reusable workflow", output)
+        self.assertIn("'beta'", output)
+
+    def test_duplicate_contexts_are_underivable(self):
+        """BR-3 / BR-4: two jobs deriving one context are refused together.
+
+        `compare` works on sets, so before this refusal `["same", "same"]`
+        against `["same"]` was exit 0 (verify finding, 2026-09-02) — a defined
+        job reported green with no required context of its own, BUG-167's
+        shape surviving the fix. Both job keys are named.
+        """
+        text = MINIMAL_WORKFLOW.replace("    name: beta check\n", "    name: alpha check\n")
+        path = self.write_workflow(text)
+        code, output = self.run_main(path, fake_fetch(["alpha check"]))
+
+        self.assertEqual(parity.EXIT_UNCHECKED, code)
+        self.assertIn("'alpha'", output)
+        self.assertIn("'beta'", output)
+        self.assertIn("already derives", output)
+
+    def test_control_characters_in_names_cannot_forge_a_workflow_command(self):
+        """Security (verify finding, 2026-09-02): a newline inside a name is
+        escaped on render, never printed raw. GitHub Actions parses `::error::`
+        at the start of any output line, so a required context — or a job
+        `name:` — carrying `\\n::notice ...` could forge an annotation. The
+        defined side is refused outright; the required side is rendered with
+        the control character spelled out.
+        """
+        forged = "gamma check\n::notice title=forged::PARITY"
+        path = self.write_workflow(MINIMAL_WORKFLOW)
+        code, output = self.run_main(path, fake_fetch(["alpha check", "beta check", forged]))
+
+        self.assertEqual(parity.EXIT_DRIFT, code)
+        self.assertNotIn("\n::notice", output)
+        self.assertIn("gamma check\\x0a::notice", output)
+
+        text = MINIMAL_WORKFLOW.replace(
+            "    name: beta check\n", '    name: "beta check\\n::notice title=forged::PARITY"\n'
+        )
+        path = self.write_workflow(text)
+        code, output = self.run_main(path, fake_fetch(["alpha check"]))
+        self.assertEqual(parity.EXIT_UNCHECKED, code)
+        self.assertNotIn("\n::notice", output)
 
 
 class TestComparison(ParityCase):
@@ -366,6 +519,12 @@ class TestComparison(ParityCase):
         once — because BR-9's whole point is that a reader hitting a repo-wide
         red must not have to work out which edit resolves it. Asserted on the
         rendered text, never on the source of the message (LESSON-519).
+
+        Mutation executed 2026-09-02 (verify): `REMEDIES` replaced with `""`.
+        All three sub-tests went red on `AssertionError: 'revert the protection
+        edit' not found in ...` while the exit code stayed 1 — the verdict
+        survives the mutation, the remedies do not, which is what this case
+        guards. Restored, green.
         """
         path = self.write_workflow(MINIMAL_WORKFLOW)
 
@@ -389,6 +548,12 @@ class TestFailsClosed(ParityCase):
 
         "Could not read" must never be rendered as "matches" (LESSON-510). The
         URL is in the message so the next reader can reproduce the read.
+
+        Mutation executed 2026-09-02 (verify): `_get_json`'s non-2xx branch
+        replaced with `pass` (the body then fails JSON parsing on the fake's
+        `Bad credentials` object only by accident, so the fake was also given a
+        JSON body). The case went red on `AssertionError: 75 != 1` — a 401
+        rendered as DRIFT, the exact inversion BR-5 forbids. Restored, green.
         """
         code, output = self.run_main(
             CI_YML,
@@ -443,7 +608,10 @@ class TestFailsClosed(ParityCase):
 
         self.assertEqual(parity.EXIT_UNCHECKED, code)
         self.assertIn("OSError", output)
-        self.assertIn(BRANCH_URL, output)
+        # Rulesets are read first (ADR-608-2), so the first read to break is
+        # the one named; both URLs share this prefix.
+        self.assertIn("https://api.github.com/repos/atelier-fashion/teton-code/", output)
+        self.assertIn("transport failure", output)
 
     def test_unforeseen_exception_is_75_not_1(self):
         """AC-5 / LESSON-442: an unforeseen crash is 75, never 1.
@@ -465,6 +633,104 @@ class TestFailsClosed(ParityCase):
         # way to fix the crash the 75 is reporting.
         self.assertIn("Traceback", self.last_stderr)
         self.assertIn("something nobody foresaw", self.last_stderr)
+
+    def test_rulesets_read_failure_fails_closed(self):
+        """BR-5 / ADR-608-2: a failed *rulesets* read is 75, distinct from
+        "rulesets present". "Could not check" must never be downgraded to "no
+        rulesets" (test-auditor finding, 2026-09-02: this row had no case).
+        """
+        code, output = self.run_main(
+            CI_YML, fake_fetch(CONTEXTS_TODAY, rules_status=500, rules_body="{}")
+        )
+        self.assertEqual(parity.EXIT_UNCHECKED, code)
+        self.assertIn("500", output)
+        self.assertIn("/rules/branches/main", output)
+        self.assertNotIn("rulesets present", output)
+
+    def test_rulesets_non_list_body_fails_closed(self):
+        """BR-5: a 200 whose body is not the documented list is 75.
+
+        Verify finding, 2026-09-02: `if isinstance(rules, list) and rules:` let
+        `{"message": "Not Found"}` through as "no rulesets" and the run reached
+        a verdict. Under that code this case fails on `AssertionError: 75 != 0`.
+        """
+        code, output = self.run_main(
+            CI_YML, fake_fetch(CONTEXTS_TODAY, rules_body=json.dumps({"message": "Not Found"}))
+        )
+        self.assertEqual(parity.EXIT_UNCHECKED, code)
+        self.assertIn("did not return the list", output)
+
+    def test_rulesets_are_read_before_classic_protection(self):
+        """ADR-608-2: a repository that moved to rulesets is told so, not told
+        its branch is unprotected (reflector finding, 2026-09-02).
+        """
+        code, output = self.run_main(
+            CI_YML,
+            fake_fetch([], protected=False, rules=[{"id": 1, "type": "required_status_checks"}]),
+        )
+        self.assertEqual(parity.EXIT_UNCHECKED, code)
+        self.assertIn("rulesets present", output)
+        self.assertNotIn("not protected", output)
+
+    def test_non_json_body_fails_closed(self):
+        """BR-5 / ADR-608-2: a 200 with a non-JSON body is 75 naming the URL."""
+        code, output = self.run_main(
+            CI_YML, fake_fetch([], branch_body="<html>rate limited</html>")
+        )
+        self.assertEqual(parity.EXIT_UNCHECKED, code)
+        self.assertIn("not JSON", output)
+        self.assertIn(BRANCH_URL, output)
+
+    def test_required_status_checks_absent_fails_closed(self):
+        """BR-5 / ADR-608-2: `protected: true` with no `required_status_checks` is 75."""
+        body = json.dumps({"name": "main", "protected": True, "protection": {"enabled": True}})
+        code, output = self.run_main(CI_YML, fake_fetch([], branch_body=body))
+        self.assertEqual(parity.EXIT_UNCHECKED, code)
+        self.assertIn("required_status_checks", output)
+
+    def test_protected_key_absent_fails_closed(self):
+        """BR-5: a branch object with no `protected` key at all is 75, not a pass."""
+        body = json.dumps({"name": "main"})
+        code, output = self.run_main(CI_YML, fake_fetch([], branch_body=body))
+        self.assertEqual(parity.EXIT_UNCHECKED, code)
+        self.assertIn("not protected", output)
+
+    def test_workflow_file_missing_fails_closed(self):
+        """BR-5: an absent `--workflow` path is 75 naming the path."""
+        code, output = self.run_main("/nonexistent/REQ-608/ci.yml", fake_fetch([]))
+        self.assertEqual(parity.EXIT_UNCHECKED, code)
+        self.assertIn("/nonexistent/REQ-608/ci.yml", output)
+        self.assertIn("could not read the workflow", output)
+
+    def test_unparseable_yaml_fails_closed(self):
+        """BR-5: a workflow that does not parse is 75 naming the parse error."""
+        path = self.write_workflow("jobs: [\n  unterminated\n")
+        code, output = self.run_main(path, fake_fetch([]))
+        self.assertEqual(parity.EXIT_UNCHECKED, code)
+        self.assertIn("could not read the workflow", output)
+        self.assertIn("Error", output)
+
+    def test_bad_repo_or_branch_input_fails_closed(self):
+        """BR-5 / LESSON-008: `--repo` and `--branch` are validated before they
+        are interpolated into a URL; a value carrying path or query characters
+        is refused rather than quietly building a different request.
+        """
+        for repo, branch in (("atelier-fashion/teton-code/extra", "main"), ("a b/c", "main"), (REPO, "main?x=1\n")):
+            with self.subTest(repo=repo, branch=branch):
+                code, output = self.run_main(CI_YML, fake_fetch([]), branch=branch, repo=repo)
+                self.assertEqual(parity.EXIT_UNCHECKED, code)
+
+    def test_pyyaml_pin_flag_has_one_home(self):
+        """ADR-608-5: `--pyyaml-pin` prints the requirement the CI job installs,
+        so the pin is not restated in ci.yml (quality finding, 2026-09-02).
+        """
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = parity.main(["--pyyaml-pin"], fetch=fake_fetch([]))
+        self.assertEqual(parity.EXIT_PARITY, code)
+        self.assertEqual(parity.PYYAML_PIN + "\n", buffer.getvalue())
+        with open(CI_YML, "r", encoding="utf-8") as handle:
+            self.assertIn("--pyyaml-pin", handle.read())
 
     def test_missing_repo_input_fails_closed(self):
         """BR-5, ADR-608-2 row 1: no `--repo` and no `$GITHUB_REPOSITORY` is 75.

@@ -99,13 +99,13 @@ of scope.
 
 ## Business Rules
 
-- [ ] BR-1: `feature-gated targets compile (all features)` is among `main`'s
+- [x] BR-1: `feature-gated targets compile (all features)` is among `main`'s
       required status checks. A PR whose `gated` job is red cannot merge.
-- [ ] BR-2: The relationship between "jobs `ci.yml` defines" and "contexts
+- [x] BR-2: The relationship between "jobs `ci.yml` defines" and "contexts
       `main` requires" is **asserted from inside the repository**, so a future
       divergence fails a run instead of going unnoticed. Adding one context by
       hand fixes one instance; it does not make the next one visible.
-- [ ] BR-3: The assertion is **derived, not duplicated**, and the derivation rule
+- [x] BR-3: The assertion is **derived, not duplicated**, and the derivation rule
       is written down rather than left implicit. A hand-maintained second list of
       check names is the same drift with an extra place to forget. The rule:
   - A job's check-run context is its rendered `name:` when it declares one, and
@@ -123,7 +123,7 @@ of scope.
     **says so and fails** (BR-5). It must never drop an underivable job from the
     comparison — a job silently excluded is a job silently unrequired, which is
     this REQ's own defect reappearing inside its fix.
-- [ ] BR-4: The check is **two-directional, and both directions fail the run.**
+- [x] BR-4: The check is **two-directional, and both directions fail the run.**
       `missing` (defined but not required) is today's defect. `stale` (required
       but no longer defined) is the mirror. The decision to fail on both is made
       here, not deferred to `/architect`, and rests on three measured facts:
@@ -142,23 +142,23 @@ of scope.
     protection was written with six contexts and no `ci.yml` change was involved.
     A diff-scoped check would not have caught the bug this REQ exists to close.
   - The one repo-wide failure this decision *can* cause is BR-9's, named there.
-- [ ] BR-5: The check **fails closed**. If it cannot read the protection API —
+- [x] BR-5: The check **fails closed**. If it cannot read the protection API —
       no token, insufficient scope, API error — it refuses and says why. It must
       never treat "could not read" as "matches". A suite that declines is
       recoverable; one that passes against nothing has spent its trust
       (informed by LESSON-510).
-- [ ] BR-6: The check lands with its own **known-bad in the same commit**: a
+- [x] BR-6: The check lands with its own **known-bad in the same commit**: a
       mutation proving the run goes red when a context is removed from the
       expected set, run and its outcome recorded. A control added without one is
       an unguarded guard (informed by LESSON-464).
-- [ ] BR-7: Adding `gated` to the required set must not deadlock merges. A
+- [x] BR-7: Adding `gated` to the required set must not deadlock merges. A
       required context that does not report on some PRs blocks them forever, so
       the REQ confirms `gated` runs unconditionally on every `pull_request` —
       no path filter, no `if:` condition, no skip — before the protection change
       lands.
-- [ ] BR-8: `ci.yml`'s `gated` comment is corrected to cite **BUG-167**, the bug
+- [x] BR-8: `ci.yml`'s `gated` comment is corrected to cite **BUG-167**, the bug
       it actually describes, in place of BUG-166.
-- [ ] BR-9: **The one repo-wide failure this check can cause is named, not
+- [x] BR-9: **The one repo-wide failure this check can cause is named, not
       designed around.** If an admin removes a required context, `main`'s
       `ci.yml` and protection disagree, and — because every PR carries that
       `ci.yml` — every PR goes red until the disagreement is resolved. That is
@@ -167,7 +167,7 @@ of scope.
       **both** remedies explicitly: revert the protection edit, or update
       `ci.yml` to match the intended set. A wall of red whose cause takes ten
       minutes to work out is a worse outcome than the drift it reports.
-- [ ] BR-10: **The protection read does not widen the workflow's blast radius.**
+- [x] BR-10: **The protection read does not widen the workflow's blast radius.**
       `ci.yml` declares `permissions: contents: read` at workflow scope with no
       job-level override, and its own header records that the grant is narrow
       *because* this workflow executes repo-authored shell (`tools/release/selftest.sh`)
@@ -225,22 +225,22 @@ of scope.
     `{"mergeable":true,"mergeable_state":"blocked"}`. The one red job that
     could not block a merge now does. PR #272 was then closed unmerged and its
     branch deleted.
-- [ ] AC-3: A check inside the repository compares `ci.yml`'s defined job names
+- [x] AC-3: A check inside the repository compares `ci.yml`'s defined job names
       against the forge's required contexts. Both directions (`missing`, `stale`)
       are computed, both are rendered, and **both fail the run** — per BR-4,
       which settles this rather than leaving it to the implementer. Each failure
       names BR-9's two remedies.
-- [ ] AC-4: **BR-3 guard.** The check derives job names by parsing `ci.yml`,
+- [x] AC-4: **BR-3 guard.** The check derives job names by parsing `ci.yml`,
       matrix legs expanded. Adding a job to `ci.yml` without adding it to
       protection turns the check red with no edit to the check itself. Asserted
       by adding a throwaway job in a fixture or a scratch copy, not by reasoning
       about the parser.
-- [ ] AC-5: **BR-5 guard.** With the protection read made to fail — a rejected
+- [x] AC-5: **BR-5 guard.** With the protection read made to fail — a rejected
       credential (401), an endpoint that does not answer, or a response with no
       protection object — the check exits non-zero and its output names the
       cause. It does not pass. Asserted by running it that way, not by reading
       the error branch.
-- [ ] AC-6: **BR-6 known-bad, run.** Deleting one context from the expected set
+- [x] AC-6: **BR-6 known-bad, run.** Deleting one context from the expected set
       turns the check red; the mutation is executed and what actually went red is
       recorded in the check's doc comment or the PR body.
 - [x] AC-7: **BR-7 guard.** `gated` is confirmed to run on every `pull_request`
@@ -269,11 +269,11 @@ of scope.
     (both legs), `gated`, `catalog`, `e2e`, `audit`, `tooling`: `contents:
     read` → `contents: read`; `parity` (new): `contents: read`. `GITHUB_TOKEN`
     is passed to the check only to lift the anonymous rate limit.
-- [ ] AC-10: **BR-9 guard.** The check's failure output, for both directions,
+- [x] AC-10: **BR-9 guard.** The check's failure output, for both directions,
       names both remedies — revert the protection edit, or update `ci.yml`.
       Asserted against the rendered failure text, not the source of the message
       (LESSON-519).
-- [ ] AC-11: `.github/workflows/*` still passes `actionlint`, and the full suite
+- [x] AC-11: `.github/workflows/*` still passes `actionlint`, and the full suite
       is green, grepped for `FAILED`.
 
 ## External Dependencies
@@ -316,17 +316,23 @@ of scope.
 
 ## Open Questions
 
-- [ ] OQ-1: **Where does the parity check run?** A CI step in the existing
+- [x] OQ-1 (resolved, ADR-608-1: its own job, `required checks mirror ci.yml
+      (REQ-608)` — a step in `tooling` would make that job's red misleading and
+      its enumerating name a lie): **Where does the parity check run?** A CI step in the existing
       `tooling` job is the cheap answer and keeps network access out of the Rust
       test suite. A workspace test is more discoverable but would put a
       network-and-token dependency inside `cargo test`, which no other test has.
       `/architect` decides and records why.
-- [ ] OQ-2: **Should every job be required, or only these seven?** This REQ
+- [x] OQ-2 (resolved by BR-4: the check is an equality, so every job `ci.yml`
+      defines is required — an advisory-only job is not a shape this repo has,
+      and adding one would be a spec change to BR-4, not a protection edit):
+      **Should every job be required, or only these seven?** This REQ
       closes the gap for `gated` specifically. Whether "every job `ci.yml`
       defines is required" is the rule — making BR-2's check an equality rather
       than a subset test — is a broader policy call that affects any future job
       added as advisory-only.
-- [ ] OQ-3: **Which token mechanism?** Narrowed, not settled. BR-10 now rules
+- [x] OQ-3 (resolved, ADR-608-2: the workflow's own `GITHUB_TOKEN` at
+      `contents: read`, rate limit only): **Which token mechanism?** Narrowed, not settled. BR-10 now rules
       the part that is a constraint rather than a choice: the widened permission
       is job-scoped, and no job running repo-authored shell gains it. What
       remains open is the mechanism — a job-scoped `administration: read` on the
