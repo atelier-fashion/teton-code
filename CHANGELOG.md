@@ -18,9 +18,46 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
-## [Unreleased]
+## [0.1.27] - 2026-09-02
+
+### Added
+
+- **A withheld shell variable is diagnosed on the failing result, and the ssh
+  agent is opt-in-able (REQ-607).** With the allowlist below (under Security)
+  the `shell` tool's child sees twelve variables and nothing else, so a `git
+  push` over ssh from inside a shell command failed looking like an ssh
+  problem. Now, when a `shell` invocation exits non-zero and the command names
+  a variable the allowlist withheld — `SSH_AUTH_SOCK` above all — the tool
+  result carries one added sentence naming Teton and the key that reverses it.
+  The sentence is on the failing result only, never on a success and never as
+  an event, and it names only what the child actually lacked.
+
+  The key is `[shell] allow_ssh_agent = true`. It admits `SSH_AUTH_SOCK` — that
+  one variable, nothing else — to the `shell` child, so a model-driven `git
+  push` can use your agent. It is a single named boolean rather than a list on
+  purpose: a list would reopen the class the allowlist closed. The default is
+  `false`, so **upgrading changes nothing** on a machine that has not set it;
+  the only new behavior without the key is the diagnostic sentence.
 
 ### Changed
+
+- **Internal: the turn-path decomposition REQ-599 started is finished (REQ-600,
+  REQ-602, REQ-603, REQ-604, REQ-606).** No user-visible change. `run_prompt_turn`
+  is now an orchestrator over eight named stages; the session-lifecycle slice
+  lives in its own module; the parameter bundles that carried no invariant are
+  collapsed; and the skill and consent turn orderings are pinned by fixtures
+  captured before the split. Listed because it is the path every prompt runs
+  through, and because event order, error codes and routing decisions were held
+  fixed throughout — by fixture, not by assertion.
+
+- **Internal: CI only (REQ-605, REQ-608).** Nothing changes on a user's
+  machine. Every pushed commit now keeps its own CI result instead of being
+  cancelled by the next push, and `main` requires every job `ci.yml` defines —
+  including the one that compiles the feature-gated targets, which had been
+  reporting red on PRs for months while unable to block one (BUG-167). A new
+  job asserts that the required set and the defined set stay equal, in both
+  directions.
+
 
 - **Internal: `runtime.rs` is now a module tree (REQ-599).** No user-visible
   change — every commit was a relocation, not a behavior change, and the turn
@@ -117,6 +154,8 @@ user having asked for it.
   handing credentials to model-driven code execution. If you hit a variable you
   genuinely need, that is worth reporting — the allowlist is meant to grow on
   evidence.
+  (REQ-607, above, is that growth for `SSH_AUTH_SOCK`: the failure now says
+  so, and the agent is admissible by one named key.)
 
 ## [0.1.26] - 2026-08-27
 
