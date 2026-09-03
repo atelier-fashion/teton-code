@@ -1,7 +1,7 @@
 ---
 id: TASK-378
 title: "Docs: the `context` topic section, README rows, doctor topic, the dogfood runbook, and architecture patterns"
-status: draft
+status: complete
 parent: REQ-612
 repo: teton-code
 created: 2026-09-03
@@ -39,11 +39,15 @@ states are the shipped ones.
 
 ## Acceptance Criteria
 
-- [ ] AC-12: `every_topic_serves_its_whole_bundled_body` green with the grown topic; the README
-      row is found by `cli_rows.rs`; the overhead consequence is stated.
-- [ ] The runbook leg exists with the exact prompt and the counting method; the result cell is
+- [x] AC-12: `every_topic_serves_its_whole_bundled_body` green with the grown topic (the
+      `context` topic is 4,074 bytes against the 4,096-byte `MAX_TOPIC_BYTES`, paid for by
+      trimming the same file; `doctor` is 4,068); the `/context [on|off]` row is in the README's
+      session-command table in the `/transcript` row's shape; the overhead consequence is stated
+      in the topic's `[privacy] redact` section, measured (23 KiB, chunk cap 4, bound risen to
+      184,265, up to 5 scan calls).
+- [x] The runbook leg exists with the exact prompt and the counting method; the result cell is
       `OUTSTANDING` until run by hand.
-- [ ] No topic-index change (`TOPIC_INDEX` byte-identical).
+- [x] No topic-index change (`TOPIC_INDEX` byte-identical — `docs.rs` is untouched).
 
 ## Verification
 

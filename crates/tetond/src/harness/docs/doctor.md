@@ -19,8 +19,8 @@ rejected this CLI`, and the handshake error names which half is old:
 - the CLI is older — fix: `brew upgrade teton`.
 
 A reply the CLI cannot parse ("does not match this build's protocol types") is
-the same cause wearing a different message: two builds that agree on the
-protocol version while a message shape moved underneath it. Same remedy.
+the same cause with a different message: two builds agreeing on the protocol
+version while a message shape moved underneath. Same remedy.
 
 `daemon: not running` is not a fault. Running `teton` autostarts one.
 
@@ -43,7 +43,7 @@ at its first call. See topic `providers` for what a 401 usually means.
 
 Each row carries `window:` — the declared context window, or `unknown`. Doctor
 advises on one that declares none, and on an inert `context_budget_cap` (at or
-above its window). Topic `context`.
+above its window).
 
 ## The transcript line
 
@@ -60,13 +60,20 @@ file path and whether recording stopped. No tool may read the directory doctor
 names — `read`, `edit`, `grep` and `glob` refuse it, `shell` excepted — so
 asking to open a transcript gets a refusal, not a file.
 
+## The repository notes
+
+`context:` names the session root's `TETON.md` (or `AGENTS.md`) and its state.
+Doctor advises on two: a file **cut to the cap**, whose tail never reaches the
+model, and one a **privacy boundary covers**, which is never loaded. Topic
+`context`.
+
 ## Where config lives
 
-`config.toml` in Teton's state directory: `$XDG_RUNTIME_DIR/teton` when that is
-set, otherwise `$HOME/Library/Application Support/teton` on macOS, and — when
-neither variable is set, which is unusual and usually means a stripped
-environment — the OS temp directory's `teton`. `TETON_CONFIG` overrides all
-three. Cost history and the downloaded model sit beside it. Keys never do.
+`config.toml` in Teton's state directory: `$XDG_RUNTIME_DIR/teton` when set,
+else `$HOME/Library/Application Support/teton` on macOS, and — when neither is
+set, which usually means a stripped environment — the OS temp directory's
+`teton`. `TETON_CONFIG` overrides all three. Cost history and the downloaded
+model sit beside it. Keys never do.
 
 The third case is worth recognizing rather than debugging: a daemon started
 without `HOME` binds under the temp directory, so it has its own empty config
