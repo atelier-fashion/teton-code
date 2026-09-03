@@ -1711,6 +1711,11 @@ fn planted_notes_block(text: &str) -> RepoContextBlock {
             mtime: None,
             is_symlink: false,
             is_regular: true,
+            // A synthetic key: this file was never `stat`ed, so it has
+            // no identity to carry and no second name to refuse.
+            dev: 0,
+            ino: 0,
+            nlink: 1,
         },
         text: text.to_owned(),
     };

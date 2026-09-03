@@ -2735,12 +2735,25 @@ pub struct SessionContextResult {
     /// is the first question either of those states raises.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
-    /// The file's size on disk, in bytes — `0` when nothing was opened.
+    /// The file's size on disk, in bytes — **absent when the daemon does not
+    /// know one**.
     ///
     /// Reported beside [`Self::resident_bytes`] rather than instead of it,
     /// because the pair is what makes a truncation legible: 40,000 on disk and
     /// 8,192 resident says what one figure alone cannot.
-    pub bytes_on_disk: u64,
+    ///
+    /// An `Option` rather than a `0`, and the difference is the whole of the
+    /// field's honesty. A `0` here is a *measurement*: it says the file is
+    /// empty. But a symlinked entry, a directory wearing the name and a `stat`
+    /// that was refused all reach this surface with nothing to report, and
+    /// flattening them to `0` put `0 bytes on disk` on the `/context` line
+    /// beside a file the user can see the size of in `ls`. Absent means "not
+    /// known"; a client renders no size clause at all for it.
+    ///
+    /// Additive on the wire, so a daemon that never populates it and a client
+    /// built before it read each other unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_on_disk: Option<u64>,
     /// How many bytes of the file are in the system prompt — `0` for every
     /// state but [`RepoContextStateKind::Loaded`] and
     /// [`RepoContextStateKind::Truncated`].
@@ -7121,7 +7134,7 @@ mod tests {
             state: RepoContextStateKind::Truncated,
             source: Some(RepoContextSource::TetonMd),
             file: Some("TETON.md".to_owned()),
-            bytes_on_disk: 40_000,
+            bytes_on_disk: Some(40_000),
             resident_bytes: 8_100,
             cap: 8_192,
             truncated: true,
@@ -7146,7 +7159,7 @@ mod tests {
             state: RepoContextStateKind::Loaded,
             source: Some(RepoContextSource::AgentsMd),
             file: Some("AGENTS.md".to_owned()),
-            bytes_on_disk: 3_000,
+            bytes_on_disk: Some(3_000),
             resident_bytes: 3_000,
             cap: 4_096,
             truncated: false,
@@ -7168,7 +7181,9 @@ mod tests {
                 state,
                 source: None,
                 file: None,
-                bytes_on_disk: 0,
+                // A state that opened nothing has no size to report, and the
+                // `Option` is what says so — see the assertion below.
+                bytes_on_disk: None,
                 resident_bytes: 0,
                 cap: 8_192,
                 truncated: false,
@@ -7183,12 +7198,34 @@ mod tests {
                 wire.get("file").is_none(),
                 "a state that opened no file names no file: {wire}"
             );
+            // **Verify (MAJOR 2).** And no size either. `0` here is a
+            // measurement — "the file is empty" — and these two measured
+            // nothing at all, which is the distinction `/context` prints.
+            assert!(
+                wire.get("bytes_on_disk").is_none(),
+                "a state that measured nothing reported a size: {wire}"
+            );
             assert_eq!(
                 wire["resident_bytes"], 0,
                 "nothing is resident, and `0` says so as a number rather than \
                  by omission: {wire}"
             );
         }
+
+        // Additive in the reading direction too: a frame with no
+        // `bytes_on_disk` reads as `None` (a daemon that has no size to give),
+        // and one carrying the flattened `0` still reads as `Some(0)` — the
+        // measurement it always was.
+        let no_size: SessionContextResult = serde_json::from_str(
+            r#"{"state":"unreadable","resident_bytes":0,"cap":8192,"truncated":false}"#,
+        )
+        .expect("a frame carrying only the required keys must parse");
+        assert_eq!(no_size.bytes_on_disk, None);
+        let empty_file: SessionContextResult = serde_json::from_str(
+            r#"{"state":"absent","bytes_on_disk":0,"resident_bytes":0,"cap":8192,"truncated":false}"#,
+        )
+        .expect("the pre-REQ-612-verify spelling must still parse");
+        assert_eq!(empty_file.bytes_on_disk, Some(0));
 
         // The two states with bytes on disk and none of them in the prompt.
         // Both name the file, because "which file" is the first question either
@@ -7201,7 +7238,7 @@ mod tests {
                 state,
                 source: Some(RepoContextSource::TetonMd),
                 file: Some("TETON.md".to_owned()),
-                bytes_on_disk: 2_048,
+                bytes_on_disk: Some(2_048),
                 resident_bytes: 0,
                 cap: 8_192,
                 truncated: false,

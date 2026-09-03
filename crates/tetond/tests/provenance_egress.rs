@@ -2125,6 +2125,9 @@ impl NotesSession {
             },
             &self.sessions,
             &self.events,
+            // No stamped route: this fixture asserts on egress rather than on
+            // the cap, and a session no turn has routed reports the ceiling.
+            None,
         )
     }
 }

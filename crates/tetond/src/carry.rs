@@ -137,6 +137,26 @@ pub struct RepoContextCarry {
     pub state: Arc<crate::repo_context::RepoContextState>,
 }
 
+/// What one [`CarriedTurn::rebudget`] did.
+///
+/// Two answers because a reroute owes the user two lines and they are published
+/// by different seams: the refit's own pressure (REQ-586 BR-10) and — when the
+/// turn carries repository notes — the notes as *this* route renders them
+/// (REQ-612 BR-3). The second used to be nothing at all: the block was
+/// re-rendered at the new cap and the client was told only about the pressure,
+/// so a reroute onto a floored route cut the file in silence.
+pub struct RebudgetReport {
+    /// What the refit took to make the context fit the new pair.
+    pub pressure: PressureReport,
+    /// The state the notes were rendered from and the block that is now in the
+    /// prompt — `None` for a turn carrying no notes.
+    ///
+    /// The block itself rather than figures derived from it, so the caller
+    /// announces the bytes that were sent rather than a second render of the
+    /// same pair.
+    pub notes: Option<(Arc<crate::repo_context::RepoContextState>, RepoContextBlock)>,
+}
+
 impl CarriedTurn {
     /// Seed a turn from what `session_id` has retained and arm the commit
     /// (REQ-567 BR-1).
@@ -303,12 +323,25 @@ impl CarriedTurn {
     /// It is made anyway, because "the manager kept the field across a
     /// `&mut self` call" is a property of today's [`ContextManager::rebudget`]
     /// and not a promise it makes; LESSON-501 says the seam states the fact.
-    pub fn rebudget(&mut self, budget: &RouteBudget) -> PressureReport {
+    ///
+    /// # It answers with the notes it re-rendered
+    ///
+    /// [`RebudgetReport::notes`] is the block that is now in the prompt, beside
+    /// the state it came from. The caller owes the user a `repo_context_state`
+    /// for it (BR-3): the cap moved, so the same unmoved file may have just been
+    /// cut — and a truncation nobody is told about is the silence BR-3 forbids.
+    /// The block travels rather than being re-derived at the call site, so the
+    /// figures announced are the figures of the bytes that were sent.
+    pub fn rebudget(&mut self, budget: &RouteBudget) -> RebudgetReport {
         self.set_window_label(&budget.window_label);
-        self.rerender_repo_context(budget.repo_context_cap);
+        let notes = self.rerender_repo_context(budget.repo_context_cap);
         self.restate_system_sources();
-        self.ctx_mut()
-            .rebudget(budget.budget_tokens, budget.budget_bytes)
+        RebudgetReport {
+            pressure: self
+                .ctx_mut()
+                .rebudget(budget.budget_tokens, budget.budget_bytes),
+            notes,
+        }
     }
 
     /// Rebuild this turn's system prompt with its repository notes rendered at
@@ -323,20 +356,24 @@ impl CarriedTurn {
     /// it from the block that is actually in the prompt is what keeps that true
     /// without anyone having to remember it.
     ///
+    /// Answers with what it rendered, so the caller can announce it without
+    /// rendering the same `(file, cap)` a second time.
+    ///
     /// # Panics
     ///
     /// As [`Self::ctx`].
-    fn rerender_repo_context(&mut self, cap: usize) {
-        let Some(carry) = &self.repo_context else {
-            return;
-        };
-        let Some(file) = carry.state.file() else {
-            return;
-        };
+    fn rerender_repo_context(
+        &mut self,
+        cap: usize,
+    ) -> Option<(Arc<crate::repo_context::RepoContextState>, RepoContextBlock)> {
+        let carry = self.repo_context.as_ref()?;
+        let file = carry.state.file()?;
+        let state = Arc::clone(&carry.state);
         let block = RepoContextBlock::render(file, cap);
         let system = append_repo_context(&carry.base_system, &block);
-        self.system_sources = std::iter::once(block.provenance).collect();
+        self.system_sources = std::iter::once(block.provenance.clone()).collect();
         self.ctx_mut().set_system(system);
+        Some((state, block))
     }
 
     /// Write this turn's system-prompt identities onto the manager again
@@ -604,6 +641,11 @@ mod tests {
                 mtime: None,
                 is_symlink: false,
                 is_regular: true,
+                // A synthetic key: this file was never `stat`ed, so it has
+                // no identity to carry and no second name to refuse.
+                dev: 0,
+                ino: 0,
+                nlink: 1,
             },
             text: text.to_owned(),
         };

@@ -181,6 +181,14 @@ struct AttemptInputs<'a> {
     refit_system: &'a str,
     typed_refit: usize,
     prompt_spend: Option<&'a Arc<teton_core::cost_ceiling::PromptSpend>>,
+    /// The registry, for the one thing a reroute has to ask it: whether the
+    /// notes it just re-rendered are news (REQ-612 BR-3, `refit_for_reroute`).
+    ///
+    /// It rides this bundle rather than `TurnCore` because `TurnCore` is the
+    /// four *universal* facts and a duty route has no registry to hand it —
+    /// and it is a ninth field here rather than a ninth argument to
+    /// `run_attempts`, which is the whole point of the bundle.
+    sessions: &'a SessionRegistry,
 }
 
 /// The state the attempt loop carries *across* attempts.
@@ -594,6 +602,7 @@ impl DaemonRuntime {
                     refit_system: &system,
                     typed_refit,
                     prompt_spend: prompt_spend.as_ref(),
+                    sessions,
                 },
                 &mut st,
             )
@@ -1062,8 +1071,17 @@ impl DaemonRuntime {
                     let fresh = block_in_place_if_multithread(|| {
                         load_repo_context(probed, &boundaries, enabled, files)
                     });
-                    if always_store || fresh != *current {
-                        (store(fresh), true)
+                    // Two questions, and they have different answers for a bare
+                    // `touch`. **Store it?** — yes whenever `always_store`, or
+                    // the stale key is compared again on every turn after this
+                    // one. **Is it news?** — only when something a client is
+                    // shown moved, which is the state *minus* that key
+                    // (`same_news`). Reading `always_store` as both published a
+                    // `repo_context_state` on every turn following a `touch`
+                    // that changed nothing.
+                    let moved = !fresh.same_news(&current);
+                    if always_store || moved {
+                        (store(fresh), moved)
                     } else {
                         (current, false)
                     }
@@ -1079,7 +1097,7 @@ impl DaemonRuntime {
         // outside the registry lock, before the prompt that carries it is built.
         let figures = repo_context_figures(&state, cap);
         let triple = figures.triple();
-        let event = figures.into_event(&state);
+        let event = Event::RepoContextState(figures.into_news(&state));
         if sessions.claim_repo_context_publish(session_id, triple, state_moved) {
             events.publish(Some(session_id.clone()), event);
         }
@@ -1523,6 +1541,14 @@ impl DaemonRuntime {
             // from `inputs.typed_refit` because that state accumulates across attempts.
             if result.is_err() {
                 st.skill_refit.truncate(inputs.typed_refit);
+                // TODO(REQ-612 verify, Minor 5): `refit_system` is this turn's
+                // prompt as the assemble stage built it, and a reroute has
+                // since re-rendered the notes at the new route's cap — so a
+                // skill measured for a refit after one is measured against a
+                // system prompt that is a few kilobytes wider than the one it
+                // will actually be sent with. Left alone deliberately: the
+                // measurement errs toward refusing, and moving it needs the
+                // refit's own prompt threaded through `AttemptInputs`.
                 st.skill_refit
                     .extend(model_invoked_expansions(inputs.tools, inputs.refit_system));
             }
@@ -1586,6 +1612,7 @@ impl DaemonRuntime {
                     }
                     refit_for_reroute(
                         &mut st.conversation,
+                        inputs.sessions,
                         inputs.stream_events,
                         &previous,
                         &st.route.budget,
@@ -1811,6 +1838,7 @@ impl DaemonRuntime {
                             }
                             refit_for_reroute(
                                 &mut st.conversation,
+                                inputs.sessions,
                                 inputs.stream_events,
                                 &previous,
                                 &st.route.budget,

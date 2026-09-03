@@ -3222,11 +3222,21 @@ fn handle_session_context(daemon: &Daemon, conn: &ConnState, id: Id, params: Val
     if !conn.may_drive(&params.session_id) {
         return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
     }
+    // The cap the answer reports is the **stamped** route's, never a resolved
+    // one (REQ-589 ADR-11's rule, which this shares): resolving a route
+    // consults provider health and can wake the local tier, so a status call
+    // would change the session it was asked to describe. A session no turn has
+    // routed yet has no stamp, and the runtime falls back to the build's
+    // ceiling.
+    let route_cap = daemon
+        .stamped_routes
+        .stamped(&params.session_id)
+        .map(|budget| budget.repo_context_cap);
     ok_string(
         id,
         &daemon
             .runtime
-            .session_context(&params, &daemon.sessions, &daemon.events),
+            .session_context(&params, &daemon.sessions, &daemon.events, route_cap),
     )
 }
 
@@ -5104,7 +5114,16 @@ fn observe_route_decisions(daemon: &Arc<Daemon>) {
 /// Either way every stamp is dropped and the claim released: the next prompt
 /// turn subscribes again, and until it does `/doctor` says there is no route
 /// rather than naming a stale one.
-async fn record_route_decisions(mut subscription: Subscription, routes: Arc<StampedRoutes>) {
+///
+/// # Visibility
+///
+/// `pub` for LESSON-451's reason and no other. REQ-612's acceptance suite
+/// drives `DaemonRuntime::run_prompt_turn` directly rather than through a
+/// socket, and `/context`'s cap is now read off this memo — so the fixture needs
+/// a stamped route. Spawning **this** function is what keeps it from growing its
+/// own two-line drain loop, which is the shape that stays green while the
+/// daemon's own observer stops recording.
+pub async fn record_route_decisions(mut subscription: Subscription, routes: Arc<StampedRoutes>) {
     while let Some(envelope) = subscription.recv().await {
         if let (Some(session), Event::RouteDecided(decided)) =
             (&envelope.session_id, &envelope.event)

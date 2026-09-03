@@ -4166,12 +4166,23 @@ fn format_repo_context(rc: &events::RepoContextState, verbose: bool) -> Option<S
     // guards against is the silent one, a route-capped file rendering
     // "is resident — 4,096 bytes" under `/verbose` and nothing at all without it.
     if rc.truncated || rc.state == K::Truncated {
-        return Some(format!(
-            "context: {file} is {} bytes; the first {} are resident — trim the file or move \
-             detail below the fold",
-            thousands(rc.bytes_on_disk),
-            thousands(rc.resident_bytes)
-        ));
+        // A truncation is a file that was read, so the daemon always has a size
+        // for one — but the field is optional on the wire and the sentence is
+        // written for both, because printing `0 bytes` for a figure nobody
+        // measured is the defect the option exists to prevent.
+        return Some(match rc.bytes_on_disk {
+            Some(on_disk) => format!(
+                "context: {file} is {} bytes; the first {} are resident — trim the file or move \
+                 detail below the fold",
+                thousands(on_disk),
+                thousands(rc.resident_bytes)
+            ),
+            None => format!(
+                "context: {file} was cut to fit; the first {} bytes are resident — trim the file \
+                 or move detail below the fold",
+                thousands(rc.resident_bytes)
+            ),
+        });
     }
     let line = match rc.state {
         K::Absent => return None,
@@ -12022,7 +12033,7 @@ mod repo_context_tests {
             // file name the daemon could never have sent.
             source: (!matches!(state, K::Absent | K::WithheldOff))
                 .then_some(RepoContextSource::TetonMd),
-            bytes_on_disk: 9_412,
+            bytes_on_disk: Some(9_412),
             resident_bytes: match state {
                 K::Loaded | K::Truncated => 8_192,
                 _ => 0,
@@ -12253,7 +12264,7 @@ mod repo_context_tests {
         // The shape a floored route publishes for a 6,000-byte file: the flag is
         // set, the figures are the route's, and the word is the loader's.
         let mut route_capped = state_event(K::Loaded);
-        route_capped.bytes_on_disk = 6_000;
+        route_capped.bytes_on_disk = Some(6_000);
         route_capped.resident_bytes = 4_096;
         route_capped.truncated = true;
 

@@ -2134,14 +2134,22 @@ fn advise_on_repo_context(conn: &mut Connection, ctx: &mut UiContext<'_>) -> any
         Ok(result) => {
             let file = result.file.as_deref().unwrap_or("the repository notes");
             match result.state {
-                RepoContextStateKind::Truncated => ctx.surface.line(
-                    LineKind::Notice,
-                    &status::repo_notes_truncated_advisory(
-                        file,
-                        result.bytes_on_disk,
-                        result.resident_bytes,
-                    ),
-                ),
+                // The advisory quotes both figures, so it is drawn only where
+                // the daemon has both. A truncation always carries a size —
+                // it is a file that was read — and the `if let` says so
+                // structurally rather than by supplying a `0` nobody measured.
+                RepoContextStateKind::Truncated => {
+                    if let Some(on_disk) = result.bytes_on_disk {
+                        ctx.surface.line(
+                            LineKind::Notice,
+                            &status::repo_notes_truncated_advisory(
+                                file,
+                                on_disk,
+                                result.resident_bytes,
+                            ),
+                        );
+                    }
+                }
                 RepoContextStateKind::WithheldBoundary => ctx.surface.line(
                     LineKind::Notice,
                     &status::repo_notes_withheld_advisory(

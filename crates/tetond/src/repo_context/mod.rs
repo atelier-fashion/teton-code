@@ -54,26 +54,54 @@
 //! answered about the target, which is exactly the check the entry rule exists to
 //! make.
 //!
+//! # What closes the `lstat` → `open` window, and what it is closed against
+//!
 //! The `lstat` is a **check**, not a guarantee: between it and the open, a
-//! same-UID process can put a symlink where the regular file was. So the open
-//! carries `O_NOFOLLOW` as well ([`RealFiles::read`]), the `transcript::writer`
-//! discipline — the check names the refusal, the flag makes it unraceable.
+//! same-UID process can put a symlink — or another regular file — where the one
+//! that was `stat`ed used to be. Two things close that window, and the second is
+//! the one that closes it *end to end*:
 //!
-//! # Accepted residual: a hardlink
+//! - the open carries `O_NOFOLLOW` ([`RealFiles::read`]), so a symlink at the
+//!   final component is refused by the kernel rather than followed;
+//! - the entry's **identity** — `(dev, ino)` off the `lstat` — is carried
+//!   forward as a [`FileIdentity`] and compared against an `fstat` of the opened
+//!   handle. Anything else is [`RepoFileError::Changed`].
 //!
-//! A **hardlinked** `TETON.md` passes every rule here. `lstat` says regular file
-//! and not a symlink because that is what a hardlink is — a second name for one
-//! inode — and `O_NOFOLLOW` has nothing to refuse. A user who can create a
-//! hardlink at the session root to a file outside it can therefore make its
-//! bytes resident.
+//! The identity check is what the flag alone cannot do. The path the loader
+//! opens is [`ToolContext::resolve`]'s answer, and `resolve` **canonicalizes** —
+//! so a symlink planted after the `lstat` is already dereferenced by the time
+//! `O_NOFOLLOW` sees the path, and the flag has nothing left to refuse. Passing
+//! the identity rather than trusting the path is therefore not a second belt on
+//! the same braces: it is the only check that spans both syscalls.
 //!
-//! This is accepted, not overlooked, and it is shared with the `read` tool's own
-//! jail (REQ-571): the same hardlink is readable by `read` at the same path, so
-//! closing it here alone would buy nothing and would put a second, stricter
-//! classifier of what may be read beside the one REQ-583 BR-10 makes canonical.
-//! The party who can plant the link is the party who owns the working tree, and
-//! a privacy boundary still judges the identity that is minted for the *link's*
-//! path — so `local_only = ["TETON.md"]` withholds it whatever it points at.
+//! It is an identity comparison and **not** a length one. Length is not
+//! identity: an in-place edit between the two syscalls keeps `(dev, ino)` and is
+//! accepted, which is right — the file at the root is the file the entry rule
+//! judged, and the next turn's staleness check re-reads it. A *replacement* — a
+//! rename over the top, a new file at the same name — moves the inode and is
+//! refused.
+//!
+//! **Who can plant one.** Any process running as this user, which on a
+//! developer's machine includes the daemon's own `shell` tool: a model that runs
+//! `ln -s ~/.ssh/id_ed25519 TETON.md` in the working tree is inside the threat
+//! model, not outside it. And the trigger is **automatic and silent** — BR-6's
+//! staleness check re-reads at the start of any turn whose `stat` key moved, so
+//! nobody has to type `/context` for the read to happen.
+//!
+//! # A hardlink is refused
+//!
+//! A **hardlinked** `TETON.md` passes both checks above: `lstat` says regular
+//! file and not a symlink because that is what a hardlink is — a second name for
+//! one inode — and the identity of the link *is* the identity of the target, so
+//! `O_NOFOLLOW` has nothing to refuse and the `fstat` agrees. A user who can
+//! create a hardlink at the session root to a file outside it would therefore
+//! make its bytes resident.
+//!
+//! So the entry rule refuses `nlink > 1` outright, which is one comparison on a
+//! field the `lstat` already answered. It costs a legitimate `TETON.md` nothing
+//! — a repository file with a second name is not a shape anyone maintains on
+//! purpose — and it closes the last path by which the loader can be pointed at
+//! bytes outside the root without following anything.
 //!
 //! # What is deliberately not here
 //!
@@ -88,7 +116,7 @@ pub mod render;
 
 use std::fs::OpenOptions;
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -179,6 +207,41 @@ pub struct FileStat {
     /// named `TETON.md` is not opened: a FIFO's open for reading blocks until a
     /// writer appears, and this runs on the turn path.
     pub is_regular: bool,
+    /// The device this entry lives on — half of [`Self::identity`].
+    pub dev: u64,
+    /// The inode number — the other half. Unique only *within* a device, which
+    /// is why the pair travels together.
+    pub ino: u64,
+    /// How many names this inode answers to. `1` for an ordinary file; anything
+    /// more is a hardlink, which the entry rule refuses (see the module docs).
+    pub nlink: u64,
+}
+
+impl FileStat {
+    /// The identity the read is checked against ([`RepoFileReader::read`]).
+    #[must_use]
+    pub fn identity(&self) -> FileIdentity {
+        FileIdentity {
+            dev: self.dev,
+            ino: self.ino,
+        }
+    }
+}
+
+/// Which file on which device — the one fact that survives a path being
+/// re-resolved.
+///
+/// Carried from the entry `lstat` into the read so the two syscalls are about
+/// the **same inode** and not merely about the same string. It is deliberately
+/// not a `Path`: the loader opens [`ToolContext::resolve`]'s canonical answer,
+/// and canonicalizing is exactly the step that dereferences a symlink planted
+/// after the check (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    /// The device the entry was on when it was `stat`ed.
+    pub dev: u64,
+    /// The inode it was.
+    pub ino: u64,
 }
 
 /// Why the filesystem could not answer.
@@ -210,6 +273,15 @@ pub enum RepoFileError {
     /// The same verdict [`RepoContext::load`]'s `lstat` reaches, from the other
     /// end: the check runs first and this closes the window behind it.
     Symlink,
+    /// The opened handle is **not the inode that was `stat`ed**: the entry was
+    /// replaced between the check and the open.
+    ///
+    /// Its own variant, and never [`Self::NotRegular`]: the file that is there
+    /// now may be a perfectly ordinary regular file, and telling a user their
+    /// `TETON.md` is "not a regular file" would send them looking at a
+    /// directory that does not exist. A symlink and a hardlink have their own
+    /// sentences too — this is what is left, and what is left is a race.
+    Changed,
     /// It exists, it is not a permission problem, and it could not be read
     /// anyway — an I/O error, a device that went away, a filesystem that
     /// answered `EIO`.
@@ -237,16 +309,28 @@ pub trait RepoFileReader {
     fn stat(&self, path: &Path) -> Result<FileStat, RepoFileError>;
 
     /// The contents of the regular file at `path`, read to at most `ceiling`
-    /// bytes.
+    /// bytes — **provided it is still `expected`**.
     ///
     /// Over-ceiling is **not** a refusal: a huge file is read to the ceiling and
     /// truncated with a marker, because the top of the file is the part a
     /// repository author puts first (ADR-5).
     ///
+    /// `expected` is the identity the caller's [`Self::stat`] answered. An
+    /// implementation must refuse [`RepoFileError::Changed`] when the bytes it
+    /// would return come from any other inode — that is what makes the entry
+    /// rule a guarantee rather than a check with a window behind it, and it is a
+    /// term of the *trait* rather than of one impl so a double cannot pass a
+    /// loader the production reader would refuse.
+    ///
     /// # Errors
     ///
     /// [`RepoFileError`], one variant per user-visible sentence.
-    fn read(&self, path: &Path, ceiling: u64) -> Result<String, RepoFileError>;
+    fn read(
+        &self,
+        path: &Path,
+        ceiling: u64,
+        expected: FileIdentity,
+    ) -> Result<String, RepoFileError>;
 }
 
 /// The production [`RepoFileReader`]: the real filesystem.
@@ -264,41 +348,56 @@ impl RepoFileReader for RealFiles {
             mtime: metadata.modified().ok(),
             is_symlink: metadata.file_type().is_symlink(),
             is_regular: metadata.file_type().is_file(),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            nlink: metadata.nlink(),
         })
     }
 
-    fn read(&self, path: &Path, ceiling: u64) -> Result<String, RepoFileError> {
+    fn read(
+        &self,
+        path: &Path,
+        ceiling: u64,
+        expected: FileIdentity,
+    ) -> Result<String, RepoFileError> {
         // Type checked off `metadata` **before** the open — `fs_util`'s order,
         // for `fs_util`'s reason: a FIFO whose open blocks for a writer must
-        // never be opened at all. The caller has already refused a symlinked
-        // entry, so following here resolves nothing it has not judged.
-        let metadata = std::fs::metadata(path).map_err(map_io)?;
-        if !metadata.is_file() {
+        // never be opened at all, and no flag on the open can undo that. It
+        // follows, which is fine here: it decides nothing, and the two checks
+        // below decide everything.
+        if !std::fs::metadata(path).map_err(map_io)?.is_file() {
             return Err(RepoFileError::NotRegular);
         }
-        // `O_NOFOLLOW`, the `transcript::writer` discipline (REQ-611 BR-9): the
-        // caller's `lstat` refused a symlinked entry, and this closes the window
-        // between that check and this open — a same-UID process that swaps a
-        // symlink in between would otherwise redirect the read at any file the
-        // user owns. `ELOOP` is the answer `O_NOFOLLOW` gives for a symlink, and
-        // it is mapped to the *same* verdict the `lstat` reaches so one refusal
-        // has one sentence.
+        // `O_NOFOLLOW`, the `transcript::writer` discipline (REQ-611 BR-9): a
+        // symlink at the final component is refused by the kernel rather than
+        // followed. `ELOOP` is the answer it gives, `EMLINK` on the rare
+        // platform that spells it that way (`install::is_symlink_refusal`), and
+        // both are mapped to the *same* verdict the `lstat` reaches so one
+        // refusal has one sentence.
         let handle = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
             .map_err(map_open)?;
-        // The other half of the same window, narrowed rather than closed: the
-        // type check above ran against a path and this runs against the *open
-        // descriptor*, so a file that was replaced between the two is refused
-        // instead of read. Cheap — one `fstat`, no path resolution — and it
-        // cannot be made exact without a syscall this seam does not have: a
-        // regular file whose size changes under an editor answers the same way,
-        // which is the right direction to be wrong in, because the alternative
-        // is reading half of each of two files.
+        // And the half `O_NOFOLLOW` cannot do: the caller's `lstat` was of
+        // `<root>/TETON.md` as spelled, this open was of the **canonical** path
+        // `ToolContext::resolve` answered, and canonicalizing dereferences a
+        // final-component symlink — so by the time the flag sees the path there
+        // is no link left at it to refuse. The identity spans both syscalls
+        // instead: `(dev, ino)` off the entry `stat`, compared against an
+        // `fstat` of this very descriptor.
+        //
+        // Identity, **not** length. Length is not identity, and comparing it
+        // refused the wrong things in both directions: an in-place edit between
+        // the two syscalls keeps the inode and is a file the entry rule already
+        // judged, while a same-size replacement is a different file wearing the
+        // same number.
         let opened = handle.metadata().map_err(map_io)?;
-        if !opened.is_file() || opened.len() != metadata.len() {
+        if !opened.is_file() {
             return Err(RepoFileError::NotRegular);
+        }
+        if opened.dev() != expected.dev || opened.ino() != expected.ino {
+            return Err(RepoFileError::Changed);
         }
         let mut bytes = Vec::new();
         // `take` as well as the ceiling argument, so a file that grows under the
@@ -324,9 +423,13 @@ impl RepoFileReader for RealFiles {
 ///
 /// - **the buffer is exactly at the ceiling**, so this is a file the read cut
 ///   rather than a file that ended;
-/// - **the invalid bytes are the last three or fewer**, which is the whole of
-///   what an incomplete UTF-8 sequence can be (the longest encoding is four
-///   bytes, so at most three of them can be a valid prefix).
+/// - **the tail is a genuinely incomplete sequence** — `error_len().is_none()`,
+///   which is `str`'s own way of saying "these bytes are a valid *prefix* and
+///   more of them would have finished it". Position is not enough: three `0xFF`
+///   bytes are also the last three bytes of the buffer, and `0xFF` is not the
+///   start of any UTF-8 sequence, so a file that ends in them is not a cut
+///   codepoint — it is not text. Verified as well as positioned, because the
+///   positional half alone would have recovered exactly that file.
 ///
 /// Anything else is `NotUtf8`, unchanged: a file with a stray `0x80` in the
 /// middle is not text, and saying so is the honest answer.
@@ -340,12 +443,19 @@ fn decode_at_ceiling(bytes: Vec<u8>, ceiling: u64) -> Result<String, RepoFileErr
         Err(error) => error,
     };
     let valid_up_to = error.utf8_error().valid_up_to();
+    // `None` means "the input ended in the middle of a sequence that was still
+    // valid so far" — precisely the state a byte-aligned cut leaves behind.
+    // `Some(n)` means those `n` bytes are wrong wherever they sit.
+    let incomplete = error.utf8_error().error_len().is_none();
     let mut bytes = error.into_bytes();
     let at_ceiling = bytes.len() as u64 == ceiling;
-    let straddles = bytes.len() - valid_up_to <= 3;
-    if !(at_ceiling && straddles) {
+    if !(at_ceiling && incomplete) {
         return Err(RepoFileError::NotUtf8);
     }
+    debug_assert!(
+        bytes.len() - valid_up_to <= 3,
+        "an incomplete UTF-8 tail cannot be longer than three bytes"
+    );
     bytes.truncate(valid_up_to);
     String::from_utf8(bytes).map_err(|_| RepoFileError::NotUtf8)
 }
@@ -368,8 +478,13 @@ fn map_io(error: std::io::Error) -> RepoFileError {
 /// `libc::ELOOP` rather than either literal: the number differs by platform (62
 /// on macOS, 40 on Linux) and `io::ErrorKind` has no stable value for it, so the
 /// platform's own constant is the only spelling that is right on both.
+///
+/// `EMLINK` beside it because a rare platform reports the same condition that
+/// way — the pair `install::is_symlink_refusal` already matches, matched here
+/// the same way so one kernel answer does not reach a user as two different
+/// sentences depending on which of this daemon's two `O_NOFOLLOW` opens hit it.
 fn map_open(error: std::io::Error) -> RepoFileError {
-    if error.raw_os_error() == Some(libc::ELOOP) {
+    if matches!(error.raw_os_error(), Some(libc::ELOOP) | Some(libc::EMLINK)) {
         return RepoFileError::Symlink;
     }
     map_io(error)
@@ -466,6 +581,19 @@ pub enum RepoContextState {
 
 /// The reason for a symlinked entry ([`RepoContextState::Unreadable`]).
 const REASON_SYMLINK: &str = "it is a symlink, and a symlinked entry is not followed";
+/// The reason for an entry whose inode answers to a second name.
+///
+/// The symlink sentence's sibling: both name an entry that is a *reference* to
+/// bytes somewhere else, and both are refused for that reason (see the module
+/// docs). Worded as a fact about the file, because the remedy is the file's —
+/// copy it, do not link it.
+const REASON_HARDLINK: &str = "it is a hard link";
+/// The reason for a file that stopped being the file that was `stat`ed.
+///
+/// Not [`REASON_NOT_REGULAR`]: what is at the path now may be an ordinary file,
+/// and the honest sentence is that it moved under the read rather than that it
+/// is the wrong kind of thing.
+const REASON_CHANGED: &str = "it changed while it was being read";
 /// The reason for an `EPERM`/TCC refusal.
 const REASON_DENIED: &str = "it could not be opened (permission denied)";
 /// The reason for a directory, FIFO, socket or device wearing the name.
@@ -552,6 +680,49 @@ impl RepoContextState {
             Self::Absent | Self::WithheldOff => None,
         }
     }
+
+    /// Whether `other` says the same thing to a user as `self` — everything but
+    /// the staleness key.
+    ///
+    /// **A `touch` is not news.** [`RefreshVerdict::Reload`]'s `always_store` is
+    /// a fact about the *key*: an `mtime` that moved must be stored whatever the
+    /// bytes turn out to be, or the re-read repeats on every turn thereafter.
+    /// Whether the answer is worth **announcing** is a different question, and
+    /// full equality cannot ask it — [`FileStat`] is a field of the state, so a
+    /// bare `touch` compares unequal while nothing a client is shown has moved.
+    /// This is the comparison the publish gate wants; `==` is the one the store
+    /// wants, and they are deliberately not the same.
+    ///
+    /// A same-length edit *is* news and is caught here, because the file's
+    /// `text` is compared: only the key is excluded, not the content.
+    ///
+    /// # Adding a field to [`RepoContextFile`]
+    ///
+    /// It belongs in the comparison below unless it is another fact about
+    /// *when* the copy was read. The exhaustive destructuring is what makes the
+    /// compiler ask.
+    #[must_use]
+    pub fn same_news(&self, other: &Self) -> bool {
+        let (a, b) = match (self, other) {
+            (Self::Loaded(a), Self::Loaded(b)) | (Self::Truncated(a), Self::Truncated(b)) => (a, b),
+            // Every other pairing — including `Loaded` against `Truncated` —
+            // carries no key to exclude, so full equality is the answer.
+            _ => return self == other,
+        };
+        let RepoContextFile {
+            source,
+            path,
+            provenance,
+            text,
+            bytes_on_disk,
+            key: _,
+        } = a;
+        source == &b.source
+            && path == &b.path
+            && provenance == &b.provenance
+            && text == &b.text
+            && bytes_on_disk == &b.bytes_on_disk
+    }
 }
 
 /// The loader (ADR-3): one file, one place, two entry points.
@@ -577,15 +748,17 @@ impl RepoContext {
     ///    or `plain` root costs no `stat` either;
     /// 3. **one `stat` per candidate**, in [`CANDIDATE_NAMES`] order, on the path
     ///    as spelled — a missing file stops here, which is BR-1's normal case;
-    /// 4. **the entry rule** — a symlink or a non-regular file is named
-    ///    `Unreadable` and never opened;
+    /// 4. **the entry rule** — a symlink, a hardlink or a non-regular file is
+    ///    named `Unreadable` and never opened;
     /// 5. **the jail and the mint** — [`ToolContext::resolve`], one call for both
     ///    halves of the identity (REQ-571 ADR-B);
     /// 6. **the boundary** — a covered identity is withheld **before** the read,
     ///    so a `local-only` file's bytes never enter the daemon's memory at all
     ///    (ADR-2 asks for the block to be withheld; not reading it is the
     ///    stronger property and costs nothing);
-    /// 7. **the read**, bounded by [`REPO_CONTEXT_READ_CEILING_BYTES`].
+    /// 7. **the read**, bounded by [`REPO_CONTEXT_READ_CEILING_BYTES`] and
+    ///    checked against the [`FileIdentity`] step 3 answered, so the bytes
+    ///    that come back are the inode step 4 judged.
     ///
     /// A present-but-empty (or whitespace-only) file is [`RepoContextState::Absent`]
     /// and does **not** fall through to the next candidate. The contest is decided
@@ -624,6 +797,14 @@ impl RepoContext {
                 return unreadable(source, REASON_NOT_REGULAR, None);
             }
             let on_disk = Some(key.len);
+            // A hardlink is a regular file and not a symlink, so neither check
+            // above sees it and `O_NOFOLLOW` has nothing to refuse — see the
+            // module docs. `lstat` already counted the names; this is the whole
+            // of the refusal. The size is reported because it is a real regular
+            // file's real size, unlike a symlink's `lstat` length.
+            if key.nlink > 1 {
+                return unreadable(source, REASON_HARDLINK, on_disk);
+            }
             // The jail's own resolution, and the identity it mints — never a
             // second parse of the same path (LESSON-494, LESSON-623).
             let Ok(resolved) = jail.resolve(name) else {
@@ -642,7 +823,16 @@ impl RepoContext {
                     bytes_on_disk: on_disk,
                 };
             }
-            let text = match files.read(&resolved.path, REPO_CONTEXT_READ_CEILING_BYTES) {
+            // The **identity** the `stat` above answered travels into the read,
+            // not the path it answered about: `resolved.path` is canonical, and
+            // canonicalizing is what dereferences a symlink planted since the
+            // `stat`. This is the seam that makes the entry rule hold end to
+            // end (see the module docs).
+            let text = match files.read(
+                &resolved.path,
+                REPO_CONTEXT_READ_CEILING_BYTES,
+                key.identity(),
+            ) {
                 Ok(text) => text,
                 Err(other) => return unreadable(source, reason_for(other), on_disk),
             };
@@ -733,8 +923,9 @@ impl RepoContext {
     /// - **the root kind** — a session whose root stopped being a `project`
     ///   re-derives, because BR-1 reads only a project root and the stored file
     ///   was read under one that was;
-    /// - **the root itself** — a stored file that is no longer *under* the
-    ///   probed root is a file from the repository the session has left. The
+    /// - **the root itself** — a stored file that is no longer *at* the
+    ///   probed root is a file from the repository the session has left, and
+    ///   `/repo/sub`'s notes are not `/repo`'s. The
     ///   `stat` below would happily find a same-named file at the new root and
     ///   compare it against the old one's key, which is how a `/cd` that raced
     ///   the rebuild would keep the old repository's bytes resident.
@@ -819,21 +1010,33 @@ pub enum RefreshVerdict {
     },
 }
 
-/// Whether `path` — a canonical path the jail resolved — lies under `root` as
-/// the session spells it.
+/// Whether `path` — a canonical path the jail resolved — is a file **directly
+/// at** `root` as the session spells it.
+///
+/// The parent must *equal* the root, not merely start with it. BR-1 reads one
+/// file at one place, and the place is the root itself: a session at
+/// `/repo/sub` holding `/repo/sub/TETON.md` that `/cd`s to `/repo` is standing
+/// somewhere else, and `starts_with` — the shape this replaced — called that
+/// "still under the root". The `stat` below then found `/repo/TETON.md`,
+/// compared it against the key of a *different* file, and answered `Unchanged`
+/// whenever the two happened to share an `mtime` and a length: the parent
+/// repository's notes never became resident.
 ///
 /// [`ToolContext::resolve`] canonicalizes the root before it resolves, so the
-/// stored path is under `root.canonicalize()` and **not** necessarily under
-/// `root` as written: `/tmp` is `/private/tmp` on macOS, and a root reached
-/// through any symlink has the same shape. The textual comparison is tried
-/// first and answers for every root that is already canonical, which is the
-/// ordinary one; the `realpath` behind it runs only for a root spelled through a
-/// link, and only to save that turn a full re-read.
+/// stored path's parent is `root.canonicalize()` and **not** necessarily `root`
+/// as written: `/tmp` is `/private/tmp` on macOS, and a root reached through any
+/// symlink has the same shape. The textual comparison is tried first and answers
+/// for every root that is already canonical, which is the ordinary one; the
+/// `realpath` behind it runs only for a root spelled through a link, and only to
+/// save that turn a full re-read.
 fn under_root(path: &Path, root: &Path) -> bool {
-    path.starts_with(root)
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    parent == root
         || root
             .canonicalize()
-            .is_ok_and(|canonical| path.starts_with(canonical))
+            .is_ok_and(|canonical| parent == canonical)
 }
 
 /// One spelling of the `Unreadable` construction, so every refusal above is one
@@ -864,6 +1067,7 @@ fn reason_for(error: RepoFileError) -> &'static str {
         RepoFileError::NotRegular => REASON_NOT_REGULAR,
         RepoFileError::NotUtf8 => REASON_NOT_UTF8,
         RepoFileError::Symlink => REASON_SYMLINK,
+        RepoFileError::Changed => REASON_CHANGED,
         RepoFileError::Unavailable => REASON_UNAVAILABLE,
     }
 }
@@ -882,6 +1086,15 @@ mod tests {
         read: Result<String, RepoFileError>,
     }
 
+    /// The identity every [`Planted::regular`] file wears.
+    ///
+    /// Fixed rather than minted per fixture, and that is load-bearing: the
+    /// staleness check compares whole [`FileStat`]s, so a counter here would
+    /// make two identical plantings of one file compare unequal and turn every
+    /// `Unchanged` leg below into a re-load. A test that wants a *mismatch*
+    /// says so ([`Planted::with_identity`]).
+    const PLANTED_IDENTITY: FileIdentity = FileIdentity { dev: 1, ino: 2 };
+
     impl Planted {
         /// A regular file of `text`, with `mtime` as the staleness key's stamp.
         fn regular(text: &str, mtime_secs: u64) -> Self {
@@ -893,9 +1106,20 @@ mod tests {
                     ),
                     is_symlink: false,
                     is_regular: true,
+                    dev: PLANTED_IDENTITY.dev,
+                    ino: PLANTED_IDENTITY.ino,
+                    nlink: 1,
                 }),
                 read: Ok(text.to_owned()),
             }
+        }
+
+        /// The same file, `stat`ing as `nlink` names — a hardlink at 2.
+        fn with_links(mut self, nlink: u64) -> Self {
+            if let Ok(stat) = &mut self.stat {
+                stat.nlink = nlink;
+            }
+            self
         }
 
         /// A symlinked entry: `lstat` says link, and the read would succeed —
@@ -908,6 +1132,9 @@ mod tests {
                     mtime: Some(SystemTime::UNIX_EPOCH),
                     is_symlink: true,
                     is_regular: false,
+                    dev: PLANTED_IDENTITY.dev,
+                    ino: PLANTED_IDENTITY.ino,
+                    nlink: 1,
                 }),
                 read: Ok("followed it\n".to_owned()),
             }
@@ -974,7 +1201,12 @@ mod tests {
             }
         }
 
-        fn read(&self, path: &Path, ceiling: u64) -> Result<String, RepoFileError> {
+        fn read(
+            &self,
+            path: &Path,
+            ceiling: u64,
+            expected: FileIdentity,
+        ) -> Result<String, RepoFileError> {
             self.calls
                 .lock()
                 .unwrap()
@@ -983,6 +1215,13 @@ mod tests {
                 Some(planted) => planted,
                 None => return Err(RepoFileError::NotFound),
             };
+            // The seam's *other* contract, honoured by the double for the same
+            // reason the ceiling is: a loader that stopped carrying the entry's
+            // identity forward would be handed bytes here rather than a refusal,
+            // and the fixture would agree with a production reader that does not.
+            if planted.stat.is_ok_and(|stat| stat.identity() != expected) {
+                return Err(RepoFileError::Changed);
+            }
             let text = planted.read.clone()?;
             // The seam's contract, honoured by the double: at most `ceiling`
             // bytes leave it, and the count is what the ceiling test asserts on.
@@ -1137,6 +1376,27 @@ mod tests {
             "a symlinked entry was followed"
         );
 
+        // **Verify (HIGH).** A hardlinked entry is refused by the entry rule and
+        // never opened — the property `RealFiles`' own leg cannot assert,
+        // because only a recording seam can say a read did not happen.
+        let files = Recorded::new(vec![(
+            root.path.join("TETON.md"),
+            Planted::regular("linked bytes\n", 10).with_links(2),
+        )]);
+        assert_eq!(
+            RepoContext::load(&root, &matcher, true, &files),
+            RepoContextState::Unreadable {
+                source: RepoContextSource::TetonMd,
+                reason: REASON_HARDLINK,
+                bytes_on_disk: Some("linked bytes\n".len() as u64),
+            }
+        );
+        assert_eq!(
+            files.calls(&root.path),
+            vec!["stat TETON.md".to_owned()],
+            "a hardlinked entry was opened"
+        );
+
         let files = Recorded::new(vec![(root.path.join("TETON.md"), Planted::denied())]);
         assert_eq!(
             RepoContext::load(&root, &matcher, true, &files),
@@ -1287,9 +1547,17 @@ mod tests {
     /// Mutation: dropping `key == file.key` from the guard answers `Unchanged`
     /// forever and fails the edited leg; dropping the boundary re-check answers
     /// `Unchanged` on the covered leg and leaves a `local-only` file resident,
-    /// which is OQ-4's hole; deleting the root-kind or under-the-root gate makes
+    /// which is OQ-4's hole; deleting the root-kind or at-the-root gate makes
     /// the two `/cd` legs answer `Unchanged` and keep the departed repository's
     /// bytes.
+    ///
+    /// **Verify (MINOR 4):** restoring `path.starts_with(root)` in
+    /// [`under_root`] makes the `/repo/sub` → `/repo` leg answer `Unchanged`
+    /// and leave the subdirectory's file resident at the parent root.
+    /// **Verify (MINOR 3):** making [`RepoContextState::same_news`] full
+    /// equality makes the `touch` leg fail — a re-read that changed nothing a
+    /// client is shown reads as news, and the publish gate above it announces
+    /// it on every touched turn.
     #[test]
     fn refresh_reads_only_when_mtime_len_or_verdict_changed() {
         let (dir, root) = project_root("refresh", RootKind::Project);
@@ -1422,6 +1690,76 @@ mod tests {
             },
             "a file under the root the session left was compared against the new root's"
         );
+        // **Verify (MINOR 4).** A `/cd` *up* one level, to a root that is a
+        // prefix of the one the session left. `starts_with` — the shape this
+        // replaced — called `/repo/sub/TETON.md` "still under `/repo`", and the
+        // `stat` below then compared `/repo/TETON.md` against the key of a
+        // file in the subdirectory. The two are byte-identical here, which is
+        // the case the old spelling could not tell apart: the parent
+        // repository's own notes never became resident.
+        let nested = dir.join("sub");
+        std::fs::create_dir_all(&nested).unwrap();
+        let nested = std::fs::canonicalize(&nested).unwrap();
+        let inner = ProbedRoot {
+            path: nested.clone(),
+            view: root.view.clone(),
+        };
+        let files = Recorded::new(vec![(
+            nested.join("TETON.md"),
+            Planted::regular("first\n", 10),
+        )]);
+        let inner_loaded = RepoContext::load(&inner, &matcher, true, &files);
+        assert_eq!(
+            inner_loaded.file().unwrap().path,
+            nested.join("TETON.md"),
+            "the subdirectory fixture did not load"
+        );
+        let files = Recorded::new(vec![(
+            // Same name, same key, same bytes — a different file, one directory up.
+            root.path.join("TETON.md"),
+            Planted::regular("first\n", 10),
+        )]);
+        assert_eq!(
+            RepoContext::verdict(&inner_loaded, &root, &matcher, true, &files),
+            RefreshVerdict::Reload {
+                always_store: false
+            },
+            "a `/cd` from `/repo/sub` to `/repo` kept the subdirectory's notes"
+        );
+        assert_eq!(
+            settle(&inner_loaded, &root, &matcher, true, &files)
+                .expect("the parent root's own file is a new state")
+                .file()
+                .unwrap()
+                .path,
+            root.path.join("TETON.md"),
+        );
+        std::fs::remove_dir_all(&nested).ok();
+
+        // **Verify (MINOR 3).** A bare `touch` moves the key and nothing else.
+        // The verdict says *store it* — otherwise the stale key is re-read on
+        // every turn after it — and `same_news` says there is nothing to
+        // announce, which is the distinction the publish gate turns on.
+        let touched = Recorded::new(vec![(path.clone(), Planted::regular("first\n", 99))]);
+        assert_eq!(
+            RepoContext::verdict(&loaded, &root, &matcher, true, &touched),
+            RefreshVerdict::Reload { always_store: true }
+        );
+        let fresh = RepoContext::load(&root, &matcher, true, &touched);
+        assert_ne!(fresh, loaded, "the key must move, or the leg is vacuous");
+        assert!(
+            fresh.same_news(&loaded),
+            "a `touch` with no edit reads as news: {fresh:?}"
+        );
+        // And an edit that keeps the length is news, so the exclusion is of the
+        // key alone and not of the content.
+        let edited = Recorded::new(vec![(path.clone(), Planted::regular("FIRST\n", 10))]);
+        let edited = RepoContext::load(&root, &matcher, true, &edited);
+        assert!(
+            !edited.same_news(&loaded),
+            "a same-length edit was suppressed as a `touch`"
+        );
+
         let (home_dir, home) = project_root("refresh-home", RootKind::Home);
         assert_eq!(
             RepoContext::verdict(&loaded, &home, &matcher, true, &files),
@@ -1492,6 +1830,15 @@ mod tests {
         std::fs::canonicalize(&dir).unwrap()
     }
 
+    /// The identity the entry `stat` answers for `path` — what
+    /// [`RepoContext::load`] carries into the read.
+    fn identity_of(path: &Path) -> FileIdentity {
+        RealFiles
+            .stat(path)
+            .expect("the fixture's own file stats")
+            .identity()
+    }
+
     /// **Verify (MAJOR 2).** A codepoint the read ceiling cuts in half is a cut,
     /// not a corrupt file: the valid prefix is kept. Anything else that is not
     /// UTF-8 is still [`RepoFileError::NotUtf8`].
@@ -1506,9 +1853,13 @@ mod tests {
     /// Mutation, run and observed: deleting the recovery from
     /// [`decode_at_ceiling`] — `String::from_utf8(bytes).map_err(|_| NotUtf8)` —
     /// fails the first leg with `Err(NotUtf8)` on a file that is valid UTF-8
-    /// throughout. Widening the guard to drop `at_ceiling`, or to allow more
-    /// than three trailing bytes, fails the third and fourth legs by returning
-    /// a silently shortened file where the honest answer is a refusal.
+    /// throughout. Widening the guard to drop `at_ceiling` fails the third and
+    /// fourth legs by returning a silently shortened file where the honest
+    /// answer is a refusal. **Verify (MINOR 1):** restoring the positional test
+    /// `bytes.len() - valid_up_to <= 3` in place of `error_len().is_none()`
+    /// fails the last leg, which is a file ending in three `0xFF` at the
+    /// ceiling — three trailing bytes, and not one of them the start of a UTF-8
+    /// sequence.
     #[test]
     fn a_codepoint_straddling_the_read_ceiling_keeps_the_valid_prefix() {
         let dir = scratch("utf8-ceiling");
@@ -1519,7 +1870,7 @@ mod tests {
         let straddling = dir.join("straddle.md");
         std::fs::write(&straddling, format!("{}\u{2014}tail\n", "a".repeat(63))).unwrap();
         assert_eq!(
-            RealFiles.read(&straddling, CEILING),
+            RealFiles.read(&straddling, CEILING, identity_of(&straddling)),
             Ok("a".repeat(63)),
             "the read stopped mid-codepoint and called the file corrupt"
         );
@@ -1527,7 +1878,7 @@ mod tests {
         // The same file read past its end is whole, so the fixture is not a
         // file that was broken to begin with.
         assert_eq!(
-            RealFiles.read(&straddling, 4_096),
+            RealFiles.read(&straddling, 4_096, identity_of(&straddling)),
             Ok(format!("{}\u{2014}tail\n", "a".repeat(63)))
         );
 
@@ -1535,7 +1886,7 @@ mod tests {
         let corrupt = dir.join("corrupt.md");
         std::fs::write(&corrupt, [b'o', b'k', 0xFF, b'\n']).unwrap();
         assert_eq!(
-            RealFiles.read(&corrupt, CEILING),
+            RealFiles.read(&corrupt, CEILING, identity_of(&corrupt)),
             Err(RepoFileError::NotUtf8),
             "a file that is not text was quietly truncated instead of refused"
         );
@@ -1548,47 +1899,217 @@ mod tests {
         let deep_path = dir.join("deep.md");
         std::fs::write(&deep_path, &deep).unwrap();
         assert_eq!(
-            RealFiles.read(&deep_path, CEILING),
+            RealFiles.read(&deep_path, CEILING, identity_of(&deep_path)),
             Err(RepoFileError::NotUtf8)
+        );
+
+        // **MINOR 1.** Three `0xFF` at the production ceiling: positionally
+        // indistinguishable from a cut four-byte codepoint — the last three
+        // bytes of a buffer that is exactly `REPO_CONTEXT_READ_CEILING_BYTES`
+        // long — and not text at all. `0xFF` is not a lead byte in any UTF-8
+        // encoding, so `error_len()` names it a real error rather than an
+        // incomplete tail, and the file is refused.
+        let mut ff = vec![b'z'; usize::try_from(REPO_CONTEXT_READ_CEILING_BYTES).unwrap() - 3];
+        ff.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
+        ff.extend_from_slice(b"more after the ceiling\n");
+        let ff_path = dir.join("trailing-ff.md");
+        std::fs::write(&ff_path, &ff).unwrap();
+        assert_eq!(
+            RealFiles.read(
+                &ff_path,
+                REPO_CONTEXT_READ_CEILING_BYTES,
+                identity_of(&ff_path)
+            ),
+            Err(RepoFileError::NotUtf8),
+            "three bytes that can never start a codepoint were recovered as a \
+             codepoint the ceiling cut in half"
         );
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// **Verify (MAJOR 3).** The open itself refuses a symlink, so the entry
-    /// rule is not the only thing standing between the daemon and a link.
+    /// A real [`ProbedRoot`] naming an existing directory, for the tests below
+    /// that drive the whole of [`RepoContext::load`] against the real
+    /// filesystem.
+    fn probed_at(path: &Path) -> ProbedRoot {
+        ProbedRoot {
+            path: path.to_path_buf(),
+            view: SessionRoot {
+                display: "~/repo".to_owned(),
+                kind: RootKind::Project,
+                project_name: Some("repo".to_owned()),
+                vcs_branch: None,
+            },
+        }
+    }
+
+    /// **Verify (HIGH).** A symlinked `TETON.md` is refused through the **whole
+    /// of `load`** against the real filesystem, and a read handed an identity
+    /// that is not the file's own is `Changed`.
     ///
-    /// [`RepoContext::load`]'s `lstat` short-circuits long before the read, so
-    /// this calls [`RepoFileReader::read`] **directly** with the link's path —
-    /// which is exactly the state a same-UID process creates by swapping a
-    /// symlink in between the two syscalls. The pre-open `metadata` follows the
-    /// link and says "regular file"; only `O_NOFOLLOW` catches it.
+    /// # The window this closes, and why the earlier version did not close it
     ///
-    /// Mutation, run and observed: dropping `.custom_flags(libc::O_NOFOLLOW)`
-    /// returns `Ok("the target's own bytes\n")` — the daemon reading a file the
-    /// entry rule exists to refuse.
+    /// The first fix put `O_NOFOLLOW` on the open and compared the opened
+    /// handle's *length* against a pre-open `metadata`. Neither reaches the
+    /// hazard. `load` opens `ToolContext::resolve`'s answer, and `resolve`
+    /// canonicalizes — so a symlink planted after the entry `lstat` is already
+    /// dereferenced before `O_NOFOLLOW` sees the path, and the flag refuses
+    /// nothing. Length is not identity either: a replacement of the same size
+    /// passes, and an in-place edit — which is not an attack — fails.
+    ///
+    /// So the identity travels. Both halves are asserted here because they fail
+    /// separately:
+    ///
+    /// 1. the **loader**, end to end on a real tree, with the link planted
+    ///    *before* `load` runs so the entry `lstat` is the syscall that sees it;
+    /// 2. the **seam**, called directly with an identity that is not the file's,
+    ///    which is the state a same-UID process leaves behind by replacing the
+    ///    entry between the `stat` and the open. No fixture can hold that race
+    ///    open, and handing `read` the wrong identity is exactly what the race
+    ///    produces.
+    ///
+    /// # Mutation, run and observed
+    ///
+    /// | change | result |
+    /// |---|---|
+    /// | drop the `(dev, ino)` check | leg 2 is `Ok("the target's own bytes\n")` — the daemon reading bytes it never `stat`ed. This is also what the length comparison it replaced did, because both lengths were read *inside* `read` and so spanned microseconds rather than the caller's window |
+    /// | drop `.custom_flags(libc::O_NOFOLLOW)` | leg 3 is `Err(Changed)` where `Err(Symlink)` is owed — the identity catches the swap, and the user is told the wrong thing about it |
     #[test]
-    fn a_symlinked_path_is_refused_by_the_open_and_not_only_by_the_entry_rule() {
+    fn a_symlinked_entry_is_refused_through_load_and_a_swapped_inode_is_changed() {
         let dir = scratch("nofollow");
+        let boundaries = no_boundaries();
+        let matcher = BoundaryMatcher::new(&boundaries).unwrap();
+        let root = probed_at(&dir);
+
         let target = dir.join("target.md");
         std::fs::write(&target, "the target's own bytes\n").unwrap();
         let link = dir.join("TETON.md");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
+        // Leg 1 — the loader, whole, on a real tree. The link is planted before
+        // `load` runs, so the entry `lstat` is what sees it.
         assert_eq!(
-            RealFiles.read(&link, REPO_CONTEXT_READ_CEILING_BYTES),
+            RepoContext::load(&root, &matcher, true, &RealFiles),
+            RepoContextState::Unreadable {
+                source: RepoContextSource::TetonMd,
+                reason: REASON_SYMLINK,
+                bytes_on_disk: None,
+            },
+            "a symlinked `TETON.md` was followed by the loader"
+        );
+
+        // Leg 2 — the seam, handed an identity that is not this file's. The
+        // *path* resolves to an ordinary regular file and the open succeeds;
+        // only the `fstat` comparison can refuse it.
+        let elsewhere = dir.join("elsewhere.md");
+        std::fs::write(&elsewhere, "somebody else's bytes\n").unwrap();
+        assert_eq!(
+            RealFiles.read(
+                &target,
+                REPO_CONTEXT_READ_CEILING_BYTES,
+                identity_of(&elsewhere),
+            ),
+            Err(RepoFileError::Changed),
+            "the read answered about an inode it was not asked about"
+        );
+
+        // Leg 3 — `O_NOFOLLOW` still refuses a link handed to the seam directly,
+        // which is the case where the path was *not* canonicalized first.
+        assert_eq!(
+            RealFiles.read(&link, REPO_CONTEXT_READ_CEILING_BYTES, identity_of(&link)),
             Err(RepoFileError::Symlink),
             "the open followed a symlink"
         );
-        // Non-vacuity: the same reader reads the target at its own name, so the
-        // refusal above is about the link and not about the fixture.
+        // Non-vacuity: the same reader reads the target at its own name with its
+        // own identity, so the three refusals above are about the fixtures'
+        // shapes and not about the reader.
         assert_eq!(
-            RealFiles.read(&target, REPO_CONTEXT_READ_CEILING_BYTES),
+            RealFiles.read(
+                &target,
+                REPO_CONTEXT_READ_CEILING_BYTES,
+                identity_of(&target),
+            ),
             Ok("the target's own bytes\n".to_owned())
         );
         // And the loader's own answer for a symlinked candidate is the same
         // sentence, from the other end of the pair.
         assert_eq!(reason_for(RepoFileError::Symlink), REASON_SYMLINK);
+        assert_eq!(reason_for(RepoFileError::Changed), REASON_CHANGED);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **Verify (HIGH).** A hardlinked `TETON.md` is refused by the entry rule,
+    /// and an **in-place edit** between the entry `stat` and the read is not.
+    ///
+    /// The two belong in one test because they are the two directions the
+    /// identity check can be got wrong in, and a fix for either one alone
+    /// produces a plausible-looking build:
+    ///
+    /// - a hardlink is a regular file, is not a symlink, and *is* the inode it
+    ///   points at — so every other check here passes it, and only `nlink`
+    ///   refuses it. A user who can plant one at the session root can make any
+    ///   file they own resident;
+    /// - an in-place edit keeps `(dev, ino)` and changes the bytes and the
+    ///   length. It is the ordinary case — somebody saved their `TETON.md`
+    ///   while a turn was starting — and the length comparison this replaced
+    ///   refused it, which is a legitimate file the daemon would have called
+    ///   unreadable.
+    ///
+    /// # Mutation, run and observed
+    ///
+    /// | change | result |
+    /// |---|---|
+    /// | delete the `key.nlink > 1` refusal | leg 1 loads `the linked bytes\n`, and the recorded-double leg in `a_symlinked_entry_and_an_eperm_…` fails beside it |
+    /// | add `len` to [`FileIdentity`] and compare it | leg 2 fails: the rewritten file's identity no longer matches the one taken before the edit, so an ordinary save is refused as a race |
+    #[test]
+    fn a_hardlink_is_refused_and_an_in_place_edit_is_read() {
+        let dir = scratch("hardlink");
+        let boundaries = no_boundaries();
+        let matcher = BoundaryMatcher::new(&boundaries).unwrap();
+        let root = probed_at(&dir);
+
+        // Leg 1 — a second name for one inode, planted at the candidate.
+        let outside = dir.join("outside.md");
+        std::fs::write(&outside, "the linked bytes\n").unwrap();
+        let linked = dir.join("TETON.md");
+        std::fs::hard_link(&outside, &linked).unwrap();
+        assert_eq!(
+            RealFiles.stat(&linked).expect("the hardlink stats").nlink,
+            2,
+            "the fixture is not a hardlink, so the refusal below is vacuous"
+        );
+        assert_eq!(
+            RepoContext::load(&root, &matcher, true, &RealFiles),
+            RepoContextState::Unreadable {
+                source: RepoContextSource::TetonMd,
+                reason: REASON_HARDLINK,
+                // A hardlink is a regular file, so its `lstat` length is a real
+                // size and is reported — unlike a symlink's.
+                bytes_on_disk: Some("the linked bytes\n".len() as u64),
+            },
+            "a hardlinked `TETON.md` made a file outside the root resident"
+        );
+
+        // Leg 2 — the same inode, rewritten between the `stat` and the read.
+        // The identity is taken first, exactly as `load` takes it, and the file
+        // is then rewritten in place before the read runs.
+        std::fs::remove_file(&linked).unwrap();
+        let edited = dir.join("TETON.md");
+        std::fs::write(&edited, "before the edit\n").unwrap();
+        let identity = identity_of(&edited);
+        std::fs::write(&edited, "after the edit, and rather longer than before\n").unwrap();
+        assert_eq!(
+            identity_of(&edited),
+            identity,
+            "the fixture replaced the inode instead of rewriting it, which is \
+             the other case entirely"
+        );
+        assert_eq!(
+            RealFiles.read(&edited, REPO_CONTEXT_READ_CEILING_BYTES, identity),
+            Ok("after the edit, and rather longer than before\n".to_owned()),
+            "an ordinary in-place edit was refused as a race"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1638,6 +2159,7 @@ mod tests {
             RepoFileError::NotRegular,
             RepoFileError::NotUtf8,
             RepoFileError::Symlink,
+            RepoFileError::Changed,
             RepoFileError::Unavailable,
         ]
         .map(reason_for);
@@ -1646,6 +2168,12 @@ mod tests {
             unique.len(),
             reasons.len(),
             "two seam errors share one sentence: {reasons:?}"
+        );
+        // The entry rule's own refusal is not a seam error and still must not
+        // reach a user as one of the seam's sentences.
+        assert!(
+            !reasons.contains(&REASON_HARDLINK),
+            "the hardlink refusal shares a sentence with a seam error: {reasons:?}"
         );
     }
 }

@@ -63,6 +63,9 @@
 //! | the published-triple record dropped (an event on every prompt) | [`a_floored_routes_smaller_cap_is_announced_once_and_widening_it_is_announced_again`] |
 //! | `repo_context_cap` dropped from `route_decided` | [`a_floored_routes_smaller_cap_is_announced_once_and_widening_it_is_announced_again`] |
 //! | `bytes_on_disk` dropped from `WithheldBoundary` | [`a_withheld_file_reports_the_size_the_stat_saw_on_both_surfaces`] |
+//! | `bytes_on_disk` flattened to `Some(0)` for a state that measured nothing | [`a_withheld_file_reports_the_size_the_stat_saw_on_both_surfaces`] |
+//! | `/context` reporting `REPO_CONTEXT_MAX_BYTES` instead of the stamped route's cap | [`a_floored_routes_smaller_cap_is_announced_once_and_widening_it_is_announced_again`] |
+//! | `always_store` read as "the state moved" (a `touch` announced) | [`an_edit_between_prompts_is_resident_on_the_next_and_a_mid_turn_edit_is_not`] |
 //!
 //! ## What is not here
 //!
@@ -147,6 +150,38 @@ impl Tree {
 
     fn write_notes(&self, notes: &str) {
         std::fs::write(self.root.join("TETON.md"), notes).unwrap();
+    }
+
+    /// Move `TETON.md`'s modification time forward without touching a byte of
+    /// it — a bare `touch`.
+    ///
+    /// `utimes` rather than a rewrite of the same bytes: the staleness key is
+    /// `(mtime, len)`, and whether a rewrite moves it at all depends on the
+    /// filesystem's timestamp granularity. A whole five seconds is past every
+    /// granularity anyone ships, so the leg this feeds cannot pass by the key
+    /// having failed to move (which would make its "no event" assertion
+    /// vacuous — the failure LESSON-569 is about).
+    fn touch_notes(&self) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let path = self.root.join("TETON.md");
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let secs = before
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a file's mtime is after the epoch")
+            .as_secs()
+            + 5;
+        let when = libc::timeval {
+            tv_sec: secs as libc::time_t,
+            tv_usec: 0,
+        };
+        let raw = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let rc = unsafe { libc::utimes(raw.as_ptr(), [when, when].as_ptr()) };
+        assert_eq!(rc, 0, "utimes: {}", std::io::Error::last_os_error());
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "the touch did not move the key, so the leg below is vacuous"
+        );
     }
 
     fn path(&self) -> &Path {
@@ -239,9 +274,14 @@ impl RepoFileReader for CountingFiles {
         self.inner.stat(path)
     }
 
-    fn read(&self, path: &Path, ceiling: u64) -> Result<String, RepoFileError> {
+    fn read(
+        &self,
+        path: &Path,
+        ceiling: u64,
+        expected: tetond::repo_context::FileIdentity,
+    ) -> Result<String, RepoFileError> {
         self.record("read", path);
-        self.inner.read(path, ceiling)
+        self.inner.read(path, ceiling, expected)
     }
 }
 
@@ -442,6 +482,15 @@ struct Harness {
     vendor: Vendor,
     files: Arc<CountingFiles>,
     connection: ConnectionId,
+    /// The stamped-route memo `/context` reads its cap off (REQ-612 verify,
+    /// MAJOR 3), fed by the daemon's **own** observer.
+    ///
+    /// `server::record_route_decisions` rather than a two-line drain of this
+    /// fixture's own: the memo is what `handle_session_context` asks, and a
+    /// fixture with its own writer would keep answering after the daemon's
+    /// stopped recording (LESSON-451). The subscription is taken here, before
+    /// any session exists, so the first turn's own `route_decided` lands in it.
+    routes: Arc<server::StampedRoutes>,
 }
 
 impl Harness {
@@ -485,13 +534,20 @@ impl Harness {
                 }))
                 .expect("binding a tier");
         }
+        let events = Arc::new(EventBus::new());
+        let routes = Arc::new(server::StampedRoutes::new());
+        tokio::spawn(server::record_route_decisions(
+            events.subscribe(64),
+            Arc::clone(&routes),
+        ));
         Self {
             runtime,
-            events: Arc::new(EventBus::new()),
+            events,
             sessions: SessionRegistry::new(),
             vendor,
             files,
             connection: GrantRegistry::new().next_connection_id(),
+            routes,
         }
     }
 
@@ -515,12 +571,17 @@ impl Harness {
         id
     }
 
-    /// One `/context` call, through the daemon's own method.
+    /// One `/context` call, through the daemon's own method — with the cap
+    /// read off the stamped route exactly as `handle_session_context` reads it.
     fn context(
         &self,
         id: &SessionId,
         action: ContextAction,
     ) -> teton_protocol::methods::SessionContextResult {
+        let route_cap = self
+            .routes
+            .stamped(id)
+            .map(|budget| budget.repo_context_cap);
         self.runtime.session_context(
             &SessionContextParams {
                 session_id: id.clone(),
@@ -528,6 +589,7 @@ impl Harness {
             },
             &self.sessions,
             &self.events,
+            route_cap,
         )
     }
 
@@ -559,6 +621,29 @@ impl Harness {
     /// This session's stored notes, as the next turn would read them.
     fn stored(&self, id: &SessionId) -> Arc<RepoContextState> {
         self.sessions.repo_context(id)
+    }
+
+    /// Wait until the daemon's route observer has stamped `expected` for this
+    /// session, so a `/context` taken afterwards reads the route the turn just
+    /// ran on.
+    ///
+    /// Synchronization, not an oracle: the figure asserted on is
+    /// `SessionContextResult::cap`, which the daemon's own method derives. This
+    /// only waits for the observer task to have run — the memo is fed off the
+    /// bus, so "the turn returned" does not by itself mean "the stamp landed"
+    /// (LESSON-450's rule read the other way: wait on the condition, not on a
+    /// wall-clock guess).
+    async fn await_route_stamp(&self, id: &SessionId, expected: usize) {
+        for _ in 0..200 {
+            if self.routes.stamped(id).map(|b| b.repo_context_cap) == Some(expected) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "no route with a {expected}-byte notes cap was ever stamped: {:?}",
+            self.routes.stamped(id).map(|b| b.repo_context_cap)
+        );
     }
 
     /// This session's permission level, read back through the daemon's own
@@ -1009,6 +1094,40 @@ async fn an_edit_between_prompts_is_resident_on_the_next_and_a_mid_turn_edit_is_
     assert!(
         repo_context_events(&mut bus).await.is_empty(),
         "a turn that changed nothing announced a change"
+    );
+
+    // --- a bare `touch`: re-read, stored, and **not** announced -----------
+    //
+    // **Verify (MINOR 3).** `RefreshVerdict::Reload { always_store: true }`
+    // means the *key* moved, which is a reason to store the fresh copy — or the
+    // stale key is compared again on every turn after this one. It is not a
+    // reason to publish: nothing a client is shown has changed, and reading
+    // `always_store` as both put a `repo_context_state` on the bus after every
+    // `touch`. The three assertions are the three halves of that: re-read,
+    // silent, and quiet again afterwards.
+    repo.touch_notes();
+    h.files.drain();
+    h.turn(&session, "touched").await;
+    let reread = h.files.drain();
+    assert_eq!(
+        reread
+            .iter()
+            .filter(|call| call.starts_with("read "))
+            .count(),
+        1,
+        "a moved key must be re-read: {reread:?}"
+    );
+    assert!(
+        repo_context_events(&mut bus).await.is_empty(),
+        "a `touch` that changed no byte of the file was announced as a change"
+    );
+    h.files.drain();
+    h.turn(&session, "after the touch").await;
+    let quiet = h.files.drain();
+    assert_eq!(
+        quiet.len(),
+        1,
+        "the touched key was not stored, so every later turn re-reads: {quiet:?}"
     );
 
     // --- an edit between prompts ------------------------------------------
@@ -1973,7 +2092,7 @@ async fn a_floored_routes_smaller_cap_is_announced_once_and_widening_it_is_annou
             .iter()
             .map(|e| (e.state, e.truncated, e.resident_bytes, e.bytes_on_disk))
             .collect::<Vec<_>>(),
-        vec![(RepoContextStateKind::Truncated, true, 4_096, 6_000)],
+        vec![(RepoContextStateKind::Truncated, true, 4_096, Some(6_000))],
         "a route-cap truncation was announced as something else, or not at all: \
          {announced:?}"
     );
@@ -1984,6 +2103,22 @@ async fn a_floored_routes_smaller_cap_is_announced_once_and_widening_it_is_annou
         RepoContextStateKind::Loaded,
         "the loader classifies against the ceiling, not against the route"
     );
+    // **Verify (MAJOR 3).** And `/context` says what the prompt says. The
+    // answer used to report `REPO_CONTEXT_MAX_BYTES` unconditionally, so a
+    // session pinned to this route was told `cap 8192, truncated false` while
+    // `/verbose` said `cap 4,096` on every prompt and the block in the prompt
+    // carried the marker — two surfaces, two answers, one file. The cap is now
+    // the session's **stamped** route's, and `truncated` is re-derived at it.
+    h.await_route_stamp(&session, 4_096).await;
+    let status = h.context(&session, ContextAction::Status);
+    assert_eq!(
+        (status.cap, status.truncated, status.resident_bytes),
+        (4_096, true, 4_096),
+        "`/context` reported a cap the block was never rendered at: {status:?}"
+    );
+    assert_eq!(status.state, RepoContextStateKind::Truncated);
+    assert_eq!(status.bytes_on_disk, Some(6_000));
+
     let first = wire_systems(&h.vendor)
         .last()
         .cloned()
@@ -2026,6 +2161,15 @@ async fn a_floored_routes_smaller_cap_is_announced_once_and_widening_it_is_annou
     assert!(
         !third.contains("truncated:"),
         "the block is still cut at the wider cap"
+    );
+    // And the routed answer follows the route back up, which is the half a
+    // constant could never have got right in either direction.
+    h.await_route_stamp(&session, 8_192).await;
+    let status = h.context(&session, ContextAction::Status);
+    assert_eq!(
+        (status.cap, status.truncated, status.resident_bytes),
+        (8_192, false, 6_000),
+        "`/context` kept the floored route's cap after the route widened: {status:?}"
     );
 }
 
@@ -2074,7 +2218,7 @@ async fn a_withheld_file_reports_the_size_the_stat_saw_on_both_surfaces() {
             .iter()
             .map(|e| (e.state, e.bytes_on_disk, e.resident_bytes))
             .collect::<Vec<_>>(),
-        vec![(RepoContextStateKind::WithheldBoundary, 2_048, 0)],
+        vec![(RepoContextStateKind::WithheldBoundary, Some(2_048), 0)],
         "the event reports a covered file's size as something other than its \
          size on disk: {announced:?}"
     );
@@ -2091,8 +2235,46 @@ async fn a_withheld_file_reports_the_size_the_stat_saw_on_both_surfaces() {
     assert_eq!(status.state, RepoContextStateKind::WithheldBoundary);
     assert_eq!(
         (status.bytes_on_disk, status.resident_bytes),
-        (2_048, 0),
+        (Some(2_048), 0),
         "`/context` reports a visible file as zero bytes on disk: {status:?}"
     );
     assert_eq!(status.file.as_deref(), Some("TETON.md"));
+
+    // The other half of the same rule (verify, MAJOR 2): a state whose `stat`
+    // answered about something that is **not** a regular file has no size to
+    // report, and says so by absence rather than by `0`. A symlinked entry's
+    // `lstat` length is its target path, which is a number that means nothing
+    // dressed as one that means something.
+    //
+    // Driven through the daemon rather than through the renderer, because the
+    // `Option` has to survive the whole way: the loader answers `None`, the
+    // figures carry it, and both wire surfaces omit the key.
+    let linked = Tree::new("symlinked-size");
+    std::fs::write(
+        linked.path().join("elsewhere.md"),
+        "not the notes
+",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        linked.path().join("elsewhere.md"),
+        linked.path().join("TETON.md"),
+    )
+    .unwrap();
+    let linked_session = h.session_at(linked.path());
+    let announced = repo_context_events(&mut bus).await;
+    assert_eq!(
+        announced
+            .iter()
+            .map(|e| (e.state, e.bytes_on_disk))
+            .collect::<Vec<_>>(),
+        vec![(RepoContextStateKind::Unreadable, None)],
+        "a symlinked entry was given a size: {announced:?}"
+    );
+    let status = h.context(&linked_session, ContextAction::Status);
+    assert_eq!(
+        (status.state, status.bytes_on_disk, status.file.as_deref()),
+        (RepoContextStateKind::Unreadable, None, Some("TETON.md")),
+        "`/context` gave a symlinked entry a size: {status:?}"
+    );
 }

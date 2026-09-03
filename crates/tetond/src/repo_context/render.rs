@@ -198,6 +198,11 @@ impl RepoContextBlock {
                 mtime: None,
                 is_symlink: false,
                 is_regular: true,
+                // A synthetic key: this file was never `stat`ed, so it has
+                // no identity to carry and no second name to refuse.
+                dev: 0,
+                ino: 0,
+                nlink: 1,
             },
             text,
         };
@@ -289,6 +294,11 @@ mod tests {
                 mtime: None,
                 is_symlink: false,
                 is_regular: true,
+                // A synthetic key: this file was never `stat`ed, so it has
+                // no identity to carry and no second name to refuse.
+                dev: 0,
+                ino: 0,
+                nlink: 1,
             },
         }
     }

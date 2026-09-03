@@ -2820,7 +2820,8 @@ fn handle_context(
 }
 
 /// The lines `/context` draws: the state first, then — when there are byte
-/// figures worth reading — the file, its size, what is resident and the cap.
+/// figures worth reading — the file, its size **if the daemon has one**, what is
+/// resident and the cap.
 ///
 /// **One or two lines, never more** (BR-2's list: file, source, bytes on disk,
 /// resident bytes, cap, state). The split is by *whether the daemon has figures
@@ -2859,9 +2860,20 @@ fn render_context(result: &SessionContextResult) -> Vec<String> {
                 line.push_str(&format!(" ({name})"));
             }
         }
+        // The size clause is printed only where there is a size. `file` is
+        // `Some` for a symlinked entry, a directory wearing the name and a
+        // `stat` that was refused — all of which the daemon `stat`ed and none
+        // of which it got a file size out of — so keying the clause on `file`
+        // and flattening the figure printed `0 bytes on disk` beside a file the
+        // user can see the size of. The daemon says `None`; this says nothing.
+        if let Some(on_disk) = result.bytes_on_disk {
+            line.push_str(&format!(" — {on_disk} bytes on disk,"));
+        } else {
+            line.push_str(" —");
+        }
         line.push_str(&format!(
-            " — {} bytes on disk, {} resident, cap {}",
-            result.bytes_on_disk, result.resident_bytes, result.cap
+            " {} resident, cap {}",
+            result.resident_bytes, result.cap
         ));
         if result.truncated {
             line.push_str(" (truncated)");
@@ -7253,6 +7265,92 @@ mod transcript_render_tests {
         assert_eq!(
             render_transcript(true, &never),
             "transcript: off — degraded: directory refused: mode 0755"
+        );
+    }
+}
+
+#[cfg(test)]
+mod context_render_tests {
+    use super::*;
+    use teton_protocol::methods::{RepoContextSource, RepoContextStateKind};
+
+    /// **Verify (MAJOR 2).** `/context` prints a size only where the daemon
+    /// has one.
+    ///
+    /// # The defect this pins
+    ///
+    /// The size clause was keyed on `file`, and `file` is `Some` for every
+    /// state that knows *which* name is on disk — including the three that
+    /// `stat`ed something and got no file size out of it: a symlinked entry, a
+    /// directory wearing the name, and a refusal. With the wire field a bare
+    /// `u64` those all arrived as `0`, and the line read
+    /// `TETON.md — 0 bytes on disk`, beside a file the user can see the size of
+    /// in `ls`. Not merely uninformative — wrong, and the first figure they
+    /// would check.
+    ///
+    /// Both directions are asserted together, because a fix that dropped the
+    /// clause everywhere would be just as wrong: a withheld file's size is the
+    /// one figure a state that read nothing can honestly give, and it still
+    /// prints.
+    ///
+    /// # Mutation, run and observed
+    ///
+    /// | change | result |
+    /// |---|---|
+    /// | print the clause whenever `file` is `Some`, with `unwrap_or(0)` | leg 1 gains `0 bytes on disk` |
+    /// | drop the clause unconditionally | leg 2 loses `2048 bytes on disk` |
+    #[test]
+    fn the_context_line_prints_a_size_only_where_the_daemon_has_one() {
+        // Leg 1 — a symlinked `TETON.md`. The daemon `lstat`ed it, so it knows
+        // the name; an `lstat`'s length for a link is its target path, not a
+        // file size, so it reports none.
+        let symlinked = SessionContextResult {
+            state: RepoContextStateKind::Unreadable,
+            source: Some(RepoContextSource::TetonMd),
+            file: Some("TETON.md".to_owned()),
+            bytes_on_disk: None,
+            resident_bytes: 0,
+            cap: 8_192,
+            truncated: false,
+        };
+        let lines = render_context(&symlinked);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(
+            lines[1], "context: TETON.md — 0 resident, cap 8192",
+            "a file the daemon never measured was given a size"
+        );
+        assert!(!lines[1].contains("bytes on disk"), "{}", lines[1]);
+
+        // Leg 2 — a boundary-covered file. Its `stat` succeeded about a regular
+        // file, so the size is real and is printed: it is what makes the
+        // withholding legible rather than mysterious.
+        let covered = SessionContextResult {
+            state: RepoContextStateKind::WithheldBoundary,
+            source: Some(RepoContextSource::TetonMd),
+            file: Some("TETON.md".to_owned()),
+            bytes_on_disk: Some(2_048),
+            resident_bytes: 0,
+            cap: 8_192,
+            truncated: false,
+        };
+        assert_eq!(
+            render_context(&covered)[1],
+            "context: TETON.md — 2048 bytes on disk, 0 resident, cap 8192"
+        );
+
+        // And the ordinary truncated case still reads as one sentence.
+        let truncated = SessionContextResult {
+            state: RepoContextStateKind::Truncated,
+            source: Some(RepoContextSource::TetonMd),
+            file: Some("TETON.md".to_owned()),
+            bytes_on_disk: Some(6_000),
+            resident_bytes: 4_096,
+            cap: 4_096,
+            truncated: true,
+        };
+        assert_eq!(
+            render_context(&truncated)[1],
+            "context: TETON.md — 6000 bytes on disk, 4096 resident, cap 4096 (truncated)"
         );
     }
 }

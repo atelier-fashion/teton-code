@@ -1498,7 +1498,7 @@ mod tests {
                 state: teton_protocol::methods::RepoContextStateKind::Truncated,
                 source: Some(teton_protocol::methods::RepoContextSource::TetonMd),
                 file: Some("TETON.md".to_owned()),
-                bytes_on_disk: 9_412,
+                bytes_on_disk: Some(9_412),
                 resident_bytes: 8_192,
                 cap: 8_192,
                 truncated: true,

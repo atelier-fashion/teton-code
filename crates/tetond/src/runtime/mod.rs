@@ -3599,18 +3599,20 @@ impl DaemonRuntime {
         }
         let figures = repo_context_figures(&loaded, REPO_CONTEXT_MAX_BYTES);
         let triple = figures.triple();
-        let event = figures.into_event(&loaded);
+        let event = Event::RepoContextState(figures.into_news(&loaded));
         // A session that vanished between the caller's claim and this write
         // stores nothing and announces nothing — `set_skills`'s reading of the
         // same `false`, and the reason the publish is guarded by it rather than
         // unconditional.
-        if sessions.set_repo_context(session_id, loaded)
-            // `always`: the *state* moved, which is news whatever the rendered
-            // triple happens to be — two repositories' notes can be the same
-            // size. The claim also records the triple, so the turn path's own
-            // gate measures against what a client was actually last told.
-            && sessions.claim_repo_context_publish(session_id, triple, true)
-        {
+        //
+        // **One lock, not two.** The state and the record of what was announced
+        // about it move together or a concurrent `/cd` can interleave them —
+        // see `store_and_claim_repo_context`. The claim is unconditional
+        // because the *state* moved (checked above), which is news whatever the
+        // rendered triple happens to be: two repositories' notes can be the
+        // same size. Recording the triple is what lets the turn path's own gate
+        // measure against what a client was actually last told.
+        if sessions.store_and_claim_repo_context(session_id, loaded, triple) {
             // After the store and after the lock — see above.
             events.publish(Some(session_id.clone()), event);
         }
@@ -4184,18 +4186,32 @@ impl DaemonRuntime {
     /// as the other two are (`may_drive`, in the handler): the answer names the
     /// file, which the broadcast event deliberately does not.
     ///
-    /// # The cap this answer reports
+    /// # The cap this answer reports — the session's own route's, when it has one
     ///
-    /// [`REPO_CONTEXT_MAX_BYTES`], because between turns there is no route to
-    /// ask — and it is the figure the stored state was classified against, so
-    /// the `truncated` flag here and the state word agree. A floored route
-    /// renders the same file at its own smaller cap and says so through
-    /// `repo_context_state` at the next prompt.
+    /// `route_cap` is the `repo_context_cap` of the budget this session's last
+    /// turn was **decided** on (`StampedRoutes`), and the caller reads it there
+    /// rather than resolving a route: a diagnostic that decided one would
+    /// consult provider health and could wake the local tier, which is REQ-589
+    /// ADR-11's rule and applies verbatim here.
+    ///
+    /// It matters because the cap is route-aware (ADR-5). Reporting
+    /// [`REPO_CONTEXT_MAX_BYTES`] unconditionally — the shape this replaced —
+    /// meant a session pinned to a floored route was told `cap 8,192, truncated
+    /// false` by `/context` while `/verbose` said `cap 4,096` on every prompt
+    /// and the prompt itself carried the marker. Two surfaces, two answers, one
+    /// file: the figure a user acts on has to be the one the block was rendered
+    /// at, and `truncated` is re-derived at that same cap so the flag and the
+    /// figure cannot come apart.
+    ///
+    /// `None` — and only then — falls back to [`REPO_CONTEXT_MAX_BYTES`]: before
+    /// any turn there is no route, and the ceiling is both the widest a route
+    /// can ask for and the figure the stored state was classified against.
     pub fn session_context(
         &self,
         params: &SessionContextParams,
         sessions: &SessionRegistry,
         events: &EventBus,
+        route_cap: Option<usize>,
     ) -> SessionContextResult {
         if let Some(enabled) = match params.action {
             ContextAction::On => Some(true),
@@ -4212,7 +4228,7 @@ impl DaemonRuntime {
         }
         repo_context_result(
             &sessions.repo_context(&params.session_id),
-            REPO_CONTEXT_MAX_BYTES,
+            route_cap.unwrap_or(REPO_CONTEXT_MAX_BYTES),
         )
     }
 
@@ -6906,8 +6922,34 @@ fn model_invoked_expansions(
 }
 
 /// [`pressure_kind`](crate::harness::turn_loop::pressure_kind).
-fn refit_for_reroute(
+///
+/// # It announces the notes as well as the pressure (REQ-612 BR-3)
+///
+/// The repository-notes cap is a quarter of the route's byte budget, so a
+/// reroute re-renders the block — and a reroute onto a floored route cuts a file
+/// that was whole a moment ago. That is exactly the silence BR-3 forbids, and
+/// until this published it, the only trace was the marker inside a system prompt
+/// no client ever sees.
+///
+/// The publish is gated through the same
+/// [`SessionRegistry::claim_repo_context_publish`] the assemble stage and the
+/// two lifecycle sites take, with `always = false`: nothing about the *file*
+/// moved here, only the cap it is rendered at, so the triple is the whole of the
+/// question and a reroute back to the route the turn started on says nothing.
+/// It runs **before** the pressure line, so a client reading its stream in order
+/// learns what the prompt now contains before it learns what fitting it cost.
+///
+/// # Visibility
+///
+/// `pub` for [`commit_and_publish`]'s reason and no other (LESSON-451): the
+/// acceptance fixture that drives a reroute end to end links this crate from
+/// outside, and a fixture that called `CarriedTurn::rebudget` and then published
+/// its own event would be testing its own copy of the protocol — which is
+/// exactly how `conversation_carry.rs` came to run a *different* commit protocol
+/// from the dispatch, twice.
+pub fn refit_for_reroute(
     conversation: &mut CarriedTurn,
+    sessions: &SessionRegistry,
     events: &SessionEvents,
     previous: &RouteBudget,
     next: &RouteBudget,
@@ -6916,13 +6958,19 @@ fn refit_for_reroute(
     if next.budget_tokens == previous.budget_tokens && next.budget_bytes == previous.budget_bytes {
         return;
     }
-    let report = conversation.rebudget(next);
-    let kind = if report.over_budget {
+    let crate::carry::RebudgetReport { pressure, notes } = conversation.rebudget(next);
+    if let Some((state, block)) = notes {
+        let figures = RepoContextFigures::from_render(&state, Some(&block));
+        if sessions.claim_repo_context_publish(events.session_id(), figures.triple(), false) {
+            events.repo_context_state(figures.into_news(&state));
+        }
+    }
+    let kind = if pressure.over_budget {
         ContextPressureKind::DidNotFit
     } else {
         ContextPressureKind::RefitOnReroute
     };
-    events.context_pressure(&report, kind, next);
+    events.context_pressure(&pressure, kind, next);
 }
 
 /// The whole success-arm commit protocol: hand the session what the turn's
@@ -7368,7 +7416,14 @@ struct RepoContextFigures {
     state: RepoContextStateKind,
     /// The size on disk, for every state that got an answer about it — see
     /// [`RepoContextState::bytes_on_disk`].
-    bytes_on_disk: u64,
+    ///
+    /// Carried as the `Option` it is, all the way to both wire surfaces. The
+    /// shape this replaced flattened it with `unwrap_or(0)` here, which is one
+    /// line and put `0 bytes on disk` on the `/context` line for every state
+    /// whose `stat` had nothing to say — a symlinked entry, a directory, a
+    /// refusal. A figure nobody measured must not be reported as one somebody
+    /// did (BR-2's honesty clause).
+    bytes_on_disk: Option<u64>,
     /// The bytes of the **file** in the prompt; not the block's own length,
     /// because the harness frame around the notes is this build's text and is
     /// not what a user is weighing against their budget.
@@ -7385,22 +7440,48 @@ impl RepoContextFigures {
         (self.state, self.truncated, self.resident_bytes)
     }
 
-    /// The broadcast event these figures shape, with `state`'s own two
+    /// The broadcast payload these figures shape, with `state`'s own two
     /// file-derived fields beside them.
     ///
     /// Takes the state back rather than carrying `source`/`reason` through,
     /// because those two are not measurements: they do not depend on the cap and
     /// have no business in a struct whose whole reason to exist is that the cap
     /// changes the answer.
-    fn into_event(self, state: &RepoContextState) -> Event {
-        Event::RepoContextState(teton_protocol::events::RepoContextState {
+    ///
+    /// The payload rather than the `Event` around it, because one of the three
+    /// publishers reaches the bus through [`SessionEvents`] and the other two
+    /// through [`EventBus::publish`] directly — the wrapping is the caller's,
+    /// the derivation is here.
+    fn into_news(self, state: &RepoContextState) -> teton_protocol::events::RepoContextState {
+        teton_protocol::events::RepoContextState {
             state: self.state,
             source: state.source(),
             bytes_on_disk: self.bytes_on_disk,
             resident_bytes: self.resident_bytes,
             truncated: self.truncated,
             reason: repo_context_reason(state),
-        })
+        }
+    }
+
+    /// The figures a **rendered block** implies for `state`.
+    ///
+    /// The one derivation, and it takes the block rather than a cap so a caller
+    /// that has already rendered one — the reroute — announces the bytes it
+    /// sent rather than a second render of the same pair.
+    fn from_render(state: &RepoContextState, block: Option<&RepoContextBlock>) -> Self {
+        Self {
+            state: match block {
+                // The route-aware word. `Loaded`/`Truncated` are the only two
+                // kinds a state carrying a file can have, so this decides between
+                // exactly those two and defers to the state for every other one.
+                Some(block) if block.truncated => RepoContextStateKind::Truncated,
+                Some(_) => RepoContextStateKind::Loaded,
+                None => state.kind(),
+            },
+            bytes_on_disk: state.bytes_on_disk(),
+            resident_bytes: block.map_or(0, |block| block.resident_bytes as u64),
+            truncated: block.is_some_and(|block| block.truncated),
+        }
     }
 }
 
@@ -7412,24 +7493,10 @@ impl RepoContextFigures {
 /// turn's `assemble` stage measures at the route's own effective cap.
 fn repo_context_figures(state: &RepoContextState, cap: usize) -> RepoContextFigures {
     let block = state.file().map(|file| RepoContextBlock::render(file, cap));
-    RepoContextFigures {
-        state: match &block {
-            // The route-aware word. `Loaded`/`Truncated` are the only two kinds a
-            // state carrying a file can have, so this decides between exactly
-            // those two and defers to the state for every other one.
-            Some(block) if block.truncated => RepoContextStateKind::Truncated,
-            Some(_) => RepoContextStateKind::Loaded,
-            None => state.kind(),
-        },
-        bytes_on_disk: state.bytes_on_disk().unwrap_or(0),
-        resident_bytes: block
-            .as_ref()
-            .map_or(0, |block| block.resident_bytes as u64),
-        truncated: block.is_some_and(|block| block.truncated),
-    }
+    RepoContextFigures::from_render(state, block.as_ref())
 }
 
-/// [`RepoContextFigures::into_event`]'s routed twin — the answer `session/context` returns
+/// [`RepoContextFigures::into_news`]'s routed twin — the answer `session/context` returns
 /// on the asking connection, which is the one surface that names the file
 /// (REQ-612 BR-2).
 ///
@@ -18302,8 +18369,17 @@ provider_id = \"deepseek\"
                 "fs::read_dir(",
                 "fs::read_to_string(",
                 "fs::write(",
+                "fs::read(",
                 "File::open(",
                 "File::create(",
+                // REQ-612: the repository-notes read opens with `O_NOFOLLOW`,
+                // which is an `OpenOptions` builder rather than a `File::open`
+                // — the same syscall behind a spelling the list did not watch
+                // (LESSON-596: a guard that watches one spelling watches one
+                // door). `fs::read(` beside it for the same reason: it is
+                // neither `read_to_string` nor `read_dir`, and the two entries
+                // above do not match it.
+                "OpenOptions",
             ];
             let mut found = Vec::new();
             for (name, text) in &corpus {
@@ -18328,6 +18404,82 @@ provider_id = \"deepseek\"
                  spelled safely.",
                 found.join("\n")
             );
+        }
+
+        /// **Verify (MINOR 2).** The lifecycle store and the record of what was
+        /// announced about it are **one** registry call at the one site that
+        /// makes both.
+        ///
+        /// # Why this is a source check
+        ///
+        /// The hazard is two lock acquisitions with a seam between them, and
+        /// nothing observable distinguishes that from one without a scheduler
+        /// this suite controls. A 5,000-iteration two-thread race over the
+        /// two-call form was written, run, and **stayed green** — which is
+        /// exactly the assertion LESSON-569 says not to ship. The registry's own
+        /// `a_stored_repo_context_and_the_line_announced_about_it_move_together`
+        /// pins the new method's contract; this pins that the site uses it.
+        ///
+        /// # The three rules a source check owes (REQ-600, LESSON-585)
+        ///
+        /// **Bounded** to `store_session_repo_context`'s own body, not to the
+        /// rest of the file. **Cut** at the first column-0 `#[cfg(test)]`, so
+        /// this check's own patterns cannot match itself. **Keyed on the
+        /// hazard** — the two calls it replaced — rather than only on the
+        /// remedy, so deleting the claim entirely fails too.
+        ///
+        /// It is textual, so the two forbidden names may appear in the doc
+        /// comment above the function (they do) and must not appear inside it.
+        ///
+        /// Mutation, run and observed: restoring
+        /// `sessions.set_repo_context(session_id, loaded) &&
+        /// sessions.claim_repo_context_publish(session_id, triple, true)` fails
+        /// on the hazard assertion, naming both halves.
+        #[test]
+        fn the_lifecycle_store_and_its_claim_are_one_registry_call() {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("runtime/mod.rs");
+            let whole = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("unreadable {}: {err}", path.display()));
+            let production = whole
+                .split_once("\n#[cfg(test)]")
+                .map_or(whole.clone(), |(p, _)| p.to_owned());
+            const SIGNATURE: &str = "pub fn store_session_repo_context(";
+            let start = production.find(SIGNATURE).expect(
+                "vacuity floor: `store_session_repo_context` is not in this file's \
+                 production half, so this check is reading nothing",
+            );
+            let rest = &production[start..];
+            let end = rest
+                .find("\n    }\n")
+                .expect("the function's closing brace at method indent");
+            let body = &rest[..end];
+
+            // Vacuity floors: the slice really is the function, and it really
+            // does talk to the registry.
+            assert!(
+                body.len() > 400 && body.contains("sessions."),
+                "the bounded slice is {} bytes and does not reach the registry, \
+                 so the assertions below are about nothing",
+                body.len()
+            );
+            assert!(
+                body.contains("store_and_claim_repo_context("),
+                "the lifecycle store no longer goes through the registry's \
+                 single-lock method"
+            );
+            for half in ["set_repo_context(", "claim_repo_context_publish("] {
+                assert!(
+                    !body.contains(half),
+                    "`store_session_repo_context` calls `{half}` — the store and \
+                     the claim are two lock acquisitions again, and two \
+                     concurrent `/cd`s can interleave them: A stores its state, \
+                     B stores and claims, A claims over B. The registry then \
+                     holds one repository's file beside the other's published \
+                     line."
+                );
+            }
         }
 
         /// **BR-3, invariant 3 (LESSON-539): the claim is taken before the
@@ -19292,7 +19444,7 @@ provider_id = \"deepseek\"
                  ({before} words)"
             );
 
-            refit_for_reroute(&mut turn, &events, &wide, &local);
+            refit_for_reroute(&mut turn, &sessions, &events, &wide, &local);
 
             assert!(
                 turn.ctx().estimated_tokens() <= local.budget_tokens
@@ -19328,7 +19480,7 @@ provider_id = \"deepseek\"
             let narrower = remote_budget(32_000);
             let mut turn = turn_of(&sessions, &session_id, &wide, 2, 50);
 
-            refit_for_reroute(&mut turn, &events, &wide, &narrower);
+            refit_for_reroute(&mut turn, &sessions, &events, &wide, &narrower);
 
             let published = pressure(&mut sub).await;
             assert_eq!(published.len(), 1, "{published:#?}");
@@ -19362,7 +19514,7 @@ provider_id = \"deepseek\"
             let mut turn = turn_of(&sessions, &session_id, &wide, 12, 2_000);
             let before = turn.ctx().estimated_tokens();
 
-            refit_for_reroute(&mut turn, &events, &wide, &wide.clone());
+            refit_for_reroute(&mut turn, &sessions, &events, &wide, &wide.clone());
 
             assert!(
                 pressure(&mut sub).await.is_empty(),

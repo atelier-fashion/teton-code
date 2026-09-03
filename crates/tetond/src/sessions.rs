@@ -897,6 +897,51 @@ impl SessionRegistry {
         true
     }
 
+    /// Replace this session's repository notes **and** claim the right to
+    /// announce `triple` for them, under one lock (REQ-612 BR-1/BR-3).
+    ///
+    /// [`Self::set_repo_context`] followed by
+    /// [`Self::claim_repo_context_publish`] is the same two writes and is
+    /// **not** the same operation. Between the two calls the mutex is free, so
+    /// two concurrent `/cd`s can interleave: A stores its state, B stores its
+    /// state and claims its triple, then A claims *its* triple over B's. The
+    /// registry is then holding B's file beside A's published record, and the
+    /// next turn measures its news against a line no client was ever sent —
+    /// which is the exact failure the published record exists to prevent.
+    ///
+    /// So the lifecycle sites take this instead, and it is the only shape that
+    /// makes "the state and the line about it move together" a property of the
+    /// registry rather than of two calls staying adjacent.
+    ///
+    /// The claim is unconditional here — this is only reached once the caller
+    /// has established that the **state itself** moved, which is `always` by
+    /// construction; the turn path's gate is the conditional one, because a
+    /// route can move the render without moving the file.
+    ///
+    /// `false` for a session the registry does not have: nothing is stored and
+    /// there is no client to tell. The publish is still the caller's and still
+    /// happens after this returns, outside the mutex (LESSON-448).
+    pub fn store_and_claim_repo_context(
+        &self,
+        id: &SessionId,
+        state: RepoContextState,
+        triple: (RepoContextStateKind, bool, u64),
+    ) -> bool {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .expect("session registry mutex poisoned");
+        let Some(record) = sessions
+            .iter_mut()
+            .find(|record| &record.summary.session_id == id)
+        else {
+            return false;
+        };
+        record.repo_context = Arc::new(state);
+        record.repo_context_published = triple;
+        true
+    }
+
     /// Set this session's `/context` switch (REQ-612 BR-2).
     ///
     /// Session-scoped and never persisted: the durable half is
@@ -1918,5 +1963,62 @@ mod tests {
                 session_id: ghost.clone(),
             }
         );
+    }
+
+    /// **Verify (MINOR 2).** The lifecycle sites' store and their claim are one
+    /// operation, and the registry is what makes them one.
+    ///
+    /// # The hazard
+    ///
+    /// `set_repo_context` then `claim_repo_context_publish` is the same two
+    /// writes with the mutex free in between, so two concurrent `/cd`s can
+    /// interleave: A stores its state, B stores its state and claims its
+    /// triple, A claims *its* triple over B's. The registry then holds B's file
+    /// beside A's published record, and the next turn measures its news against
+    /// a line no client was sent — the exact thing the record exists to prevent.
+    ///
+    /// # What is asserted here, and what is asserted next door
+    ///
+    /// This leg is the **contract**: one call writes both fields, shown by
+    /// reading the state back and by a following claim of the same triple being
+    /// refused as a duplicate. It is deterministic and it is not the whole
+    /// claim — replacing the body with the two calls it replaced keeps it
+    /// green, because the two writes still land.
+    ///
+    /// The atomicity is asserted where it can be: at the **call site**, by
+    /// `runtime`'s `the_lifecycle_store_and_its_claim_are_one_registry_call`.
+    /// A two-thread, 5,000-iteration race over the two-call form was written,
+    /// run, and stayed green — the window is a lock release and re-acquire with
+    /// no work in it — so shipping it would have been an assertion that cannot
+    /// fail (LESSON-569). The source check next door can, and its mutation was
+    /// observed.
+    #[test]
+    fn a_stored_repo_context_and_the_line_announced_about_it_move_together() {
+        use crate::repo_context::RepoContextState;
+        use teton_protocol::methods::RepoContextStateKind;
+
+        let reg = SessionRegistry::new();
+        let id = reg
+            .create(SessionMode::Freeform, None, None)
+            .expect("a freeform session needs no phase")
+            .session_id;
+
+        // One call, both writes.
+        let triple = (RepoContextStateKind::Absent, false, 0);
+        assert!(reg.store_and_claim_repo_context(&id, RepoContextState::Absent, triple));
+        assert_eq!(*reg.repo_context(&id), RepoContextState::Absent);
+        assert!(
+            !reg.claim_repo_context_publish(&id, triple, false),
+            "the triple was not recorded, so a later identical render would be \
+             announced against a line no client saw"
+        );
+
+        // A session the registry does not have: nothing stored, nothing to tell.
+        let ghost = SessionId::from("no-such-session");
+        assert!(!reg.store_and_claim_repo_context(&ghost, RepoContextState::Absent, triple));
+
+        // The pairing under contention is not asserted here — see the doc
+        // above for why a race over this window cannot be made to fail on
+        // demand, and where the atomicity is pinned instead.
     }
 }

@@ -3970,8 +3970,19 @@ pub struct RepoContextState {
     /// unopened").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<RepoContextSource>,
-    /// The file's size on disk in bytes — `0` when nothing was opened.
-    pub bytes_on_disk: u64,
+    /// The file's size on disk in bytes — **absent when the daemon does not
+    /// know one**.
+    ///
+    /// An `Option` for [`crate::methods::SessionContextResult::bytes_on_disk`]'s
+    /// reason, and it is the same defect on this half of the split: `0` is a
+    /// measurement meaning "the file is empty", while a symlinked entry, a
+    /// directory wearing the name and a refused `stat` have no measurement to
+    /// give. Absent means not known; a client renders no size for it.
+    ///
+    /// Additive, so a monitor built before this reads it as `None` and a daemon
+    /// that never populates it emits no key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_on_disk: Option<u64>,
     /// How many of those bytes are in the system prompt — `0` for every state
     /// but `loaded` and `truncated`.
     ///
@@ -4356,7 +4367,7 @@ mod tests {
                 Event::RepoContextState(RepoContextState {
                     state: RepoContextStateKind::Loaded,
                     source: Some(RepoContextSource::TetonMd),
-                    bytes_on_disk: 3_120,
+                    bytes_on_disk: Some(3_120),
                     resident_bytes: 3_120,
                     truncated: false,
                     reason: None,
@@ -4652,12 +4663,19 @@ mod tests {
     /// `event_names_match_the_spec_events_table`, which is the pairing that
     /// makes ADR-6's "one event, one name, one row" checkable. Restored after
     /// observing.
+    ///
+    /// **Verify (MAJOR 2), shown to fail.** Flattening `bytes_on_disk` back to
+    /// a bare `u64` — the shape this replaced — is red on the `None` legs of
+    /// the state table: `absent`, `withheld_off` and a `stat`-refused
+    /// `unreadable` emit `"bytes_on_disk":0`, and a client renders `0 bytes on
+    /// disk` for a file it never measured. Dropping only the
+    /// `skip_serializing_if` emits `null` and is red on the same assertion.
     #[test]
     fn repo_context_state_is_additive_in_both_directions() {
         let loaded = RepoContextState {
             state: RepoContextStateKind::Loaded,
             source: Some(RepoContextSource::TetonMd),
-            bytes_on_disk: 3_120,
+            bytes_on_disk: Some(3_120),
             resident_bytes: 3_120,
             truncated: false,
             reason: None,
@@ -4706,36 +4724,39 @@ mod tests {
         // file's size with **none** of it resident — the pair is the point: a
         // user is told a file is there, how big it is, and that none of it is in
         // the prompt. `absent` and `withheld_off` opened nothing, so they name
-        // no source and carry no size: `off` never `stat`ed, and `absent` has
-        // nothing to `stat`.
+        // no source and **no size at all**: `off` never `stat`ed, and `absent`
+        // has nothing to `stat`. A size is a measurement, and those two have
+        // none to give — which is why the field is an `Option` and not a `0`
+        // (verify MAJOR 2). The `unreadable` leg below is the one whose `stat`
+        // itself failed, so it is `None` beside a source that is `Some`.
         for (state, spelling, source, on_disk, resident) in [
             (
                 RepoContextStateKind::Truncated,
                 "truncated",
                 Some(RepoContextSource::AgentsMd),
-                40_000_u64,
+                Some(40_000_u64),
                 8_100_u64,
             ),
-            (RepoContextStateKind::Absent, "absent", None, 0, 0),
+            (RepoContextStateKind::Absent, "absent", None, None, 0),
             (
                 RepoContextStateKind::WithheldOff,
                 "withheld_off",
                 None,
-                0,
+                None,
                 0,
             ),
             (
                 RepoContextStateKind::WithheldBoundary,
                 "withheld_boundary",
                 Some(RepoContextSource::TetonMd),
-                2_048,
+                Some(2_048),
                 0,
             ),
             (
                 RepoContextStateKind::Unreadable,
                 "unreadable",
                 Some(RepoContextSource::TetonMd),
-                2_048,
+                None,
                 0,
             ),
         ] {
@@ -4757,6 +4778,16 @@ mod tests {
                     "a state that opened no file names no source: {wire}"
                 );
             }
+            match on_disk {
+                Some(bytes) => assert_eq!(wire["bytes_on_disk"], bytes, "{wire}"),
+                // The whole of MAJOR 2 on this half of the split: a state the
+                // daemon has no size for emits no key, so no client can render
+                // `0 bytes on disk` for a file it never measured.
+                None => assert!(
+                    wire.get("bytes_on_disk").is_none(),
+                    "a state the daemon never measured reported a size: {wire}"
+                ),
+            }
         }
 
         // The bounded reason, which only two states have words for. It is the
@@ -4765,7 +4796,7 @@ mod tests {
         let unreadable = RepoContextState {
             state: RepoContextStateKind::Unreadable,
             source: Some(RepoContextSource::TetonMd),
-            bytes_on_disk: 0,
+            bytes_on_disk: None,
             resident_bytes: 0,
             truncated: false,
             reason: Some("Operation not permitted (os error 1)".to_owned()),
@@ -4775,18 +4806,27 @@ mod tests {
         assert_eq!(wire["reason"], "Operation not permitted (os error 1)");
 
         // Direction one — a frame carrying only the required keys reads with
-        // both optionals `None`, and a payload that never populated them emits
-        // no key at all rather than `null`, which is the same wire a daemon
-        // predating either field writes.
-        let minimal: RepoContextState = serde_json::from_str(
-            r#"{"state":"absent","bytes_on_disk":0,"resident_bytes":0,"truncated":false}"#,
-        )
-        .expect("a frame carrying only the required keys must parse");
+        // all three optionals `None`, and a payload that never populated them
+        // emits no key at all rather than `null`, which is the same wire a
+        // daemon predating any of the three writes.
+        let minimal: RepoContextState =
+            serde_json::from_str(r#"{"state":"absent","resident_bytes":0,"truncated":false}"#)
+                .expect("a frame carrying only the required keys must parse");
         assert_eq!(minimal.source, None);
         assert_eq!(minimal.reason, None);
+        assert_eq!(minimal.bytes_on_disk, None);
         let wire = serde_json::to_value(&minimal).unwrap();
         assert!(wire.get("source").is_none(), "{wire}");
         assert!(wire.get("reason").is_none(), "{wire}");
+        assert!(wire.get("bytes_on_disk").is_none(), "{wire}");
+        // And a frame from a daemon that *did* send the flattened `0` still
+        // reads as the measurement it was — `Some(0)`, an empty file — rather
+        // than being confused with the absence above.
+        let flattened: RepoContextState = serde_json::from_str(
+            r#"{"state":"absent","bytes_on_disk":0,"resident_bytes":0,"truncated":false}"#,
+        )
+        .expect("the pre-REQ-612-verify spelling must still parse");
+        assert_eq!(flattened.bytes_on_disk, Some(0));
 
         // Direction two — a reader built before REQ-612. This models the shipped
         // `Event` faithfully in the one respect that decides the outcome: it is

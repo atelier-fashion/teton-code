@@ -902,6 +902,18 @@ impl SessionEvents {
         );
     }
 
+    /// Publish what this session's repository notes are doing (REQ-612 BR-3).
+    ///
+    /// Here rather than at the call site because the mid-turn publisher — the
+    /// reroute's refit — holds a `SessionEvents` and no bus, which is the same
+    /// shape [`Self::context_pressure`] beside it exists for. The payload is
+    /// derived by `RepoContextFigures`, the one derivation all three publishers
+    /// share; this only puts it on the bus for the right session.
+    pub fn repo_context_state(&self, news: teton_protocol::events::RepoContextState) {
+        self.bus
+            .publish(Some(self.session_id.clone()), Event::RepoContextState(news));
+    }
+
     fn agent_message(&self, text: &str) {
         self.emit(SessionUpdatePayload::AgentMessageChunk {
             text: text.to_owned(),
@@ -6667,6 +6679,11 @@ mod tests {
                 mtime: None,
                 is_symlink: false,
                 is_regular: true,
+                // A synthetic key: this file was never `stat`ed, so it has
+                // no identity to carry and no second name to refuse.
+                dev: 0,
+                ino: 0,
+                nlink: 1,
             },
             text: text.to_owned(),
         };
