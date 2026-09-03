@@ -1,7 +1,7 @@
 ---
 id: TASK-360
 title: "The [transcript] table and the data-dir resolver"
-status: draft
+status: complete
 parent: REQ-611
 repo: teton-code
 created: 2026-09-03
@@ -35,22 +35,22 @@ transcript directory is denied in the tool jail by TASK-368 instead.
 
 ## Acceptance Criteria
 
-- [ ] BR-1: a `Config` parsed from a TOML with no `[transcript]` table has `transcript.enabled ==
+- [x] BR-1: a `Config` parsed from a TOML with no `[transcript]` table has `transcript.enabled ==
       false`; one with `[transcript]` and no `enabled` key also parses to `false`.
-- [ ] BR-13: `retain_days` defaults to `30` and `max_record_bytes` to `65536`; `retain_days = 0`
+- [x] BR-13: `retain_days` defaults to `30` and `max_record_bytes` to `65536`; `retain_days = 0`
       parses and validates.
-- [ ] `effective_dir`: `dir` set → that path; unset → `<data_dir>/transcripts`. Pure, no I/O.
-- [ ] AC-19 (unit half): rendering a `Config` through `config_doc` whose source TOML never named
+- [x] `effective_dir`: `dir` set → that path; unset → `<data_dir>/transcripts`. Pure, no I/O.
+- [x] AC-19 (unit half): rendering a `Config` through `config_doc` whose source TOML never named
       `[transcript]` emits no `[transcript]` table; one whose source did name it re-emits it with
       the user's keys only — the effective directory never appears unless `dir` was written
       (assert on the rendered text).
-- [ ] `effective_boundaries()` is byte-identical to `main` — REQ-597's region test and its index
+- [x] `effective_boundaries()` is byte-identical to `main` — REQ-597's region test and its index
       assertions pass unchanged.
-- [ ] Validation: `max_record_bytes = 10` and a relative `dir` are structural errors; a valid
+- [x] Validation: `max_record_bytes = 10` and a relative `dir` are structural errors; a valid
       table passes. Config validity vs usability per `conventions.md` — no other refusals at load.
-- [ ] `resolve_data_dir`: `xdg_data_home` wins when set; macOS home form otherwise; temp dir when
+- [x] `resolve_data_dir`: `xdg_data_home` wins when set; macOS home form otherwise; temp dir when
       neither. A table test mirrors the existing `resolve_base_dir` tests.
-- [ ] `cargo test -p teton-core -p teton-protocol --no-fail-fast` is green.
+- [x] `cargo test -p teton-core -p teton-protocol --no-fail-fast` is green.
 
 ## Verification
 

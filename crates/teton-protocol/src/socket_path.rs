@@ -11,6 +11,19 @@
 //! `~/Library/Application Support/teton`, else the OS temp dir. Both the socket
 //! and the lock file sit side by side under that directory so a single lock
 //! guards a single socket.
+//!
+//! # The base directory and the *data* directory are not the same question
+//!
+//! [`resolve_base_dir`] answers "where does this daemon's **runtime** state
+//! live" — a socket, a lock, a log, a rebuildable cache. On Linux that is
+//! `$XDG_RUNTIME_DIR`, a tmpfs cleared at logout, which is the correct place
+//! for exactly those things and the wrong place for anything the user expects
+//! to still be there tomorrow. [`resolve_data_dir`] answers the other question
+//! (REQ-611 ADR-4), and it is deliberately a **second** resolver rather than a
+//! redefinition of the first: relocating the socket would break every running
+//! client, and relocating `cost.db` in the same change would silently migrate a
+//! store whose tests assume the current place. On macOS the two agree, so the
+//! default install is unchanged either way.
 
 use std::path::PathBuf;
 
@@ -74,6 +87,66 @@ pub fn daemon_paths() -> DaemonPaths {
     }
 }
 
+/// Where user data that must outlive a logout is kept (REQ-611 ADR-4).
+///
+/// The composition sibling of [`daemon_paths`], reading `$XDG_DATA_HOME` and
+/// `$HOME` and handing them to [`resolve_data_dir`]. Returns the directory
+/// itself rather than a path *inside* it, because its only consumer today
+/// derives its own subdirectory from it
+/// (`TranscriptConfig::effective_dir`) and a second store added later must be
+/// able to do the same.
+#[must_use]
+pub fn data_dir() -> PathBuf {
+    resolve_data_dir(
+        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+/// The `$HOME`-relative data directory for this platform.
+///
+/// `cfg` rather than a runtime branch because the answer is a property of the
+/// build target, and one constant rather than two literals because the whole
+/// point of a resolver is that the location has a single spelling.
+#[cfg(target_os = "macos")]
+const HOME_DATA_SUFFIX: &str = "Library/Application Support/teton";
+/// The `$HOME`-relative data directory for this platform — the XDG default,
+/// which is what `$XDG_DATA_HOME` means when it is unset.
+#[cfg(not(target_os = "macos"))]
+const HOME_DATA_SUFFIX: &str = ".local/share/teton";
+
+/// Chooses the **data** directory from the two environment inputs (REQ-611
+/// ADR-4).
+///
+/// Pure, for [`resolve_base_dir`]'s reason: the precedence rule is unit-testable
+/// without mutating process-global state.
+///
+/// # Why this is not `resolve_base_dir`
+///
+/// The precedence *shape* is the same — an explicit XDG variable, then a
+/// home-relative default, then the OS temp dir — and the middle step is where
+/// they diverge. `resolve_base_dir` falls back to the macOS location on every
+/// platform, which is right for a socket (on Linux the variable it prefers is
+/// effectively always set) and wrong here: a Linux box with `$XDG_DATA_HOME`
+/// unset is the *ordinary* case, since XDG says an unset variable means
+/// `~/.local/share`. Falling back to `Library/Application Support` there would
+/// put a 30-day retention policy in a directory no Linux tool knows about.
+///
+/// The temp-dir last resort is shared with [`resolve_base_dir`] and is worth
+/// naming as the compromise it is: with neither variable set there is no
+/// durable place this function can name, and a daemon that still runs — writing
+/// records that may not survive a reboot — beats one that panics at startup.
+#[must_use]
+pub fn resolve_data_dir(xdg_data_home: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    if let Some(xdg) = xdg_data_home {
+        return xdg.join("teton");
+    }
+    if let Some(home) = home {
+        return home.join(HOME_DATA_SUFFIX);
+    }
+    std::env::temp_dir().join("teton")
+}
+
 /// Chooses the base directory from the two environment inputs.
 ///
 /// Kept pure (no direct env reads) so the precedence rule is unit-testable
@@ -130,6 +203,84 @@ mod tests {
             base,
             PathBuf::from("/Users/x/Library/Application Support/teton")
         );
+    }
+
+    /// **REQ-611 ADR-4 / TASK-360.** The data directory's precedence, in the
+    /// table shape `resolve_base_dir`'s own cases have one row of each.
+    ///
+    /// The home-fallback row is platform-selected because the resolver is, and
+    /// it is written as a **literal per platform** rather than by joining
+    /// `HOME_DATA_SUFFIX`: an expectation computed from the subject's own
+    /// constant would agree with any value that constant ever held
+    /// (LESSON-569).
+    ///
+    /// **Mutation** (LESSON-441): swap the two `HOME_DATA_SUFFIX` definitions
+    /// so the `cfg(target_os = "macos")` arm carries `.local/share/teton` —
+    /// the third row goes red on macOS and on Linux alike. Restored.
+    #[test]
+    fn resolve_data_dir_prefers_xdg_data_home_then_the_home_form_then_temp() {
+        let home_form = if cfg!(target_os = "macos") {
+            PathBuf::from("/Users/x/Library/Application Support/teton")
+        } else {
+            PathBuf::from("/Users/x/.local/share/teton")
+        };
+        let cases: [(Option<PathBuf>, Option<PathBuf>, PathBuf); 4] = [
+            // The variable wins even where a home is available to fall back to.
+            (
+                Some(PathBuf::from("/home/x/.local/share")),
+                Some(PathBuf::from("/Users/x")),
+                PathBuf::from("/home/x/.local/share/teton"),
+            ),
+            (
+                Some(PathBuf::from("/home/x/.local/share")),
+                None,
+                PathBuf::from("/home/x/.local/share/teton"),
+            ),
+            (None, Some(PathBuf::from("/Users/x")), home_form),
+            // Neither set: somewhere to write beats refusing to start.
+            (None, None, std::env::temp_dir().join("teton")),
+        ];
+        for (xdg, home, expected) in cases {
+            assert_eq!(
+                resolve_data_dir(xdg.clone(), home.clone()),
+                expected,
+                "xdg_data_home={xdg:?}, home={home:?}"
+            );
+        }
+    }
+
+    /// **REQ-611 ADR-4.** The whole reason for a second resolver: on a
+    /// Linux-style environment the data directory is *not* the runtime base,
+    /// which is a tmpfs cleared at logout and would contradict a 30-day
+    /// retention policy.
+    ///
+    /// Asserted as a relationship between the two resolvers rather than against
+    /// a literal, so it keeps holding if either location is ever moved.
+    #[test]
+    fn the_data_dir_is_not_the_logout_cleared_runtime_base() {
+        let home = PathBuf::from("/home/x");
+        let runtime = resolve_base_dir(Some(PathBuf::from("/run/user/1000")), Some(home.clone()));
+        let data = resolve_data_dir(Some(PathBuf::from("/home/x/.local/share")), Some(home));
+        assert_ne!(
+            runtime, data,
+            "transcripts would be cleared at logout with the socket"
+        );
+        assert!(
+            !data.starts_with("/run/user"),
+            "the data directory resolved under the runtime directory: {data:?}"
+        );
+    }
+
+    /// The composition reads the environment and still names the one directory
+    /// every teton store hangs off — the property `daemon_paths`'s own tests
+    /// assert about the socket's parent.
+    #[test]
+    fn data_dir_composes_from_the_environment_and_names_teton() {
+        assert_eq!(
+            data_dir().file_name().and_then(|n| n.to_str()),
+            Some("teton")
+        );
+        assert!(data_dir().is_absolute() || data_dir().starts_with(std::env::temp_dir()));
     }
 
     #[test]
