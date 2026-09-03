@@ -6770,7 +6770,8 @@ fn reject_unusable_binding(config: &Config, update: &ConfigUpdate) -> Result<(),
         // construction — the per-provider clamp is what makes it so.
         ConfigUpdate::RegisterProvider(_)
         | ConfigUpdate::SetPrivacyBoundary(_)
-        | ConfigUpdate::SetEffort(_) => {
+        | ConfigUpdate::SetEffort(_)
+        | ConfigUpdate::SetTranscriptEnabled { .. } => {
             return Ok(());
         }
     };
@@ -6801,6 +6802,10 @@ fn apply_update(config: &mut Config, update: ConfigUpdate) {
         // starts here. The session override (ADR-I) is applied by the caller
         // that owns a session; this is the durable floor.
         ConfigUpdate::SetEffort(level) => config.effort = level,
+        // REQ-611 BR-2 / ADR-5: the durable transcript default. Written to the
+        // persisted config so sessions created afterwards start from it; a
+        // running session's effective state is the sink's and is untouched.
+        ConfigUpdate::SetTranscriptEnabled { enabled } => config.transcript.enabled = enabled,
         ConfigUpdate::RegisterProvider(pc) => {
             let id = pc.id.0;
             // BUG-155: re-registering an existing id keeps the capability
@@ -9374,6 +9379,7 @@ provider_id = "on-device"
     #[test]
     fn an_unconfigured_default_provider_is_none_not_a_synthesized_id() {
         let config = Config {
+            transcript: Default::default(),
             pinned_local_model: None,
             effort: teton_core::EffortLevel::default(),
             // The whole point: unset.
@@ -9702,6 +9708,7 @@ provider_id = "on-device"
 
     fn two_provider_spec_config() -> Config {
         Config {
+            transcript: Default::default(),
             pinned_local_model: None,
             effort: teton_core::EffortLevel::default(),
             default_provider: Some("anthropic".to_owned()),

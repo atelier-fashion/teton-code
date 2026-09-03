@@ -740,6 +740,25 @@ pub fn render_event(
             );
             EventOutcome::Rendered
         }
+        Event::TranscriptState(ts) => {
+            // REQ-611 BR-15: news for every attached client — the state, never
+            // the path (that is `/transcript`'s routed answer). Never
+            // verbose-gated, for the same reason `context_cleared` is not: a
+            // second attached client would otherwise watch its record stop in
+            // silence.
+            let line = match (ts.enabled, ts.reason) {
+                (true, _) => "transcript: on".to_owned(),
+                (false, events::TranscriptStateReason::WriteFailure) => {
+                    "transcript: off (write failure — see /transcript)".to_owned()
+                }
+                (false, events::TranscriptStateReason::DirRefused) => {
+                    "transcript: off (directory refused — see /transcript)".to_owned()
+                }
+                (false, _) => "transcript: off".to_owned(),
+            };
+            surface.line(LineKind::Notice, &line);
+            EventOutcome::Rendered
+        }
         Event::PrefixCache(cache) => {
             // Diagnostic chrome, not news: prefix reuse is a pure latency
             // optimization and BR-1 makes it unobservable in output, so a user
