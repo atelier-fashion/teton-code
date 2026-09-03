@@ -79,6 +79,13 @@ teton-code/
   to assert. When a test guards a gate or a structural rule, invert the gate,
   count what fails, and write the number down — "the old tests still pass" is
   not evidence the gate works.
+- **An egress-leak marker lives only in the guarded file's bytes** (REQ-611,
+  LESSON-624). Tool-call arguments, grep patterns, prompts and file names are
+  echoed into the conversation and reach the provider legitimately, so a
+  marker placed in any of them turns a correct daemon into a failing
+  egress-capture assertion. When such an assertion fires, print which request
+  indices carry the marker beside the ordered event names before touching the
+  choke point.
 - **An invariant with more than one enforcement point needs a sweep, not a
   fix.** Enumerate every site that can violate it before fixing the one in
   front of you. A sweep that *counts* call sites is weaker than one that
