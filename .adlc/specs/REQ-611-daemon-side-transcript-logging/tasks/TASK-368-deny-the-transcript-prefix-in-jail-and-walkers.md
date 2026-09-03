@@ -1,7 +1,7 @@
 ---
 id: TASK-368
 title: "Deny the transcript directory in the tool jail and the walkers"
-status: draft
+status: complete
 parent: REQ-611
 repo: teton-code
 created: 2026-09-03
@@ -35,23 +35,23 @@ file does. Covers BR-8 and the unit legs of AC-12 and AC-21.
 
 ## Acceptance Criteria
 
-- [ ] BR-8 (jail seam): `resolve("<dir>/x.jsonl")` with the dir **inside** a temp root is
+- [x] BR-8 (jail seam): `resolve("<dir>/x.jsonl")` with the dir **inside** a temp root is
       refused with the transcript reason; the same call with the dir **outside** the root is
       refused (the existing out-of-root reason is acceptable — assert refusal, and assert the
       transcript reason when the path is in-root). A sibling path beside the dir resolves
       normally (benign path).
-- [ ] BR-8 (walker seam): `walk::visit` over a root containing the transcript dir never yields a
+- [x] BR-8 (walker seam): `walk::visit` over a root containing the transcript dir never yields a
       path under it and reports it as skipped; a sibling directory is walked (benign path).
-- [ ] AC-12 (unit legs): `read`, `edit`, `grep` and `glob` each refuse an in-root transcript path
+- [x] AC-12 (unit legs): `read`, `edit`, `grep` and `glob` each refuse an in-root transcript path
       through their own entry point — four cases, not one, because the seams differ (LESSON-502).
-- [ ] AC-21 (unit leg): the four refusals are identical with `disable_default_boundaries = true`;
+- [x] AC-21 (unit leg): the four refusals are identical with `disable_default_boundaries = true`;
       the denial reads no boundary state.
-- [ ] Mutation recorded: removing the check from `resolve` reddens the `read`/`edit` cases and
+- [x] Mutation recorded: removing the check from `resolve` reddens the `read`/`edit` cases and
       **not** the walker case; removing it from `WalkPolicy` reddens `grep`/`glob` and not
       `read`/`edit`. Both results written into the tests' doc comments.
-- [ ] `boundary_coverage.rs`'s every-tool-has-a-test posture is satisfied: each file tool has a
+- [x] `boundary_coverage.rs`'s every-tool-has-a-test posture is satisfied: each file tool has a
       transcript-refusal case.
-- [ ] `cargo test -p tetond harness::tools --no-fail-fast` is green.
+- [x] `cargo test -p tetond harness::tools --no-fail-fast` is green.
 
 ## Verification
 
@@ -75,3 +75,26 @@ Scope names the sandbox as the real fix.
 
 Canonicalize prefixes the way `resolve` canonicalizes candidates (`canonical_through_existing_
 ancestor`), or a symlinked data dir on macOS (`/var` → `/private/var`) defeats `starts_with`.
+
+## Outcome
+
+Landed as specified. Three notes for the tasks downstream of this one:
+
+- **The effective transcript directory has one composer**:
+  `crates/tetond/src/runtime/turn.rs::effective_transcript_dir(&TranscriptConfig)
+  -> PathBuf`, `pub(super)`, composing `TranscriptConfig::effective_dir` with
+  `teton_protocol::socket_path::data_dir()`. TASK-363 constructs the sink in
+  `runtime/mod.rs`, which `pub(super)` reaches. A consumer outside `runtime/`
+  promotes it to `pub(crate)` **and** registers it in
+  `tests/runtime_visibility.rs`'s `CRATE_WIDE` — that suite fails the widening
+  otherwise, which is how the visibility was chosen rather than guessed.
+- **`boundary_coverage.rs` needed no new entry.** Its `COVERAGE` table pairs each
+  tool with an *egress boundary* test, and ADR-7's denial is deliberately not a
+  boundary. The posture the AC asks for is satisfied by the four per-tool legs
+  inside `each_file_tool_refuses_an_in_root_transcript` — one case per tool, not
+  one case standing for four (LESSON-502). The suite is green unchanged,
+  including `no_walker_declares_a_private_skip_list_and_both_walk_through_the_shared_driver`.
+- **`WalkReport` gained `denied: usize` and deliberately no trailer line.** Every
+  other thing the report carries is rendered for the model; naming a pruned
+  transcript directory in tool output would hand back the fact the denial hides
+  (BR-15). The count exists so a test can tell a pruned tree from an absent one.

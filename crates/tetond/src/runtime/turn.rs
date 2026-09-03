@@ -42,6 +42,37 @@
 
 use super::*;
 
+/// Where this daemon writes session transcripts, for the config it is handed —
+/// REQ-611 ADR-4, the one place that pairing is spelled.
+///
+/// Two halves, and neither belongs to the other's crate. `TranscriptConfig::
+/// effective_dir` is pure and answers *"the user's `dir`, or `transcripts`
+/// under whatever data directory you give me"*; `socket_path::data_dir` reads
+/// the environment and answers *"which data directory this machine has"*.
+/// Composing them anywhere but one function invites a second caller to compose
+/// them differently — and the pair that matters here is that the directory the
+/// tools are told to refuse (`assemble_harness`, below) is byte-for-byte the
+/// one the sink will write to. A denial aimed at a directory nothing writes to
+/// is a denial of nothing at all.
+///
+/// **Not `DaemonRuntime::data_dir`.** That field is the *base* directory — the
+/// socket's, which on Linux is `$XDG_RUNTIME_DIR`, a tmpfs cleared at logout.
+/// A thirty-day retention policy under a directory that does not survive a
+/// logout is a promise the daemon cannot keep, which is the whole reason ADR-4
+/// added a second resolver instead of reusing the first. Relocating `cost.db`
+/// to match is a filed follow-up (TASK-367), not a side effect of this.
+///
+/// `pub(super)`, which is what `runtime_visibility.rs` requires of everything
+/// under `runtime/` that no other module needs — and it reaches `runtime/mod.rs`,
+/// where the sink is constructed. A consumer outside `runtime/` promotes it to
+/// `pub(crate)` **and** registers it in that suite's `CRATE_WIDE` with its
+/// consumer named; the ratchet is the argument, not a grep (LESSON-596).
+pub(super) fn effective_transcript_dir(
+    transcript: &teton_core::config::TranscriptConfig,
+) -> PathBuf {
+    transcript.effective_dir(&teton_protocol::socket_path::data_dir())
+}
+
 /// What [`DaemonRuntime::claim_the_turn`] establishes before anything else runs.
 ///
 /// A parameter bundle, not a stage object: it holds no behaviour, mints no ids,
@@ -873,7 +904,16 @@ impl DaemonRuntime {
         // REQ-585 moved the probe itself to the top of the turn — the expansion
         // needs it, and the expansion runs before the route — so `probed` here
         // is that same single reading, not a second one.
-        let tool_ctx = ToolContext::for_root(probed);
+        //
+        // REQ-611 BR-8 / ADR-7: and the session's transcript directory is
+        // denied to every file tool the turn runs, at both seams the jail and
+        // the walkers give a path. Composed on **every** turn, not only while a
+        // transcript is being recorded: `enabled` is a fact about what the sink
+        // writes next, and last week's file is still on disk after
+        // `/transcript off`. Nothing here reads `transcript.enabled`, and that
+        // is the point.
+        let tool_ctx = ToolContext::for_root(probed)
+            .with_denied_prefix(effective_transcript_dir(&config.transcript));
         let stream_events = SessionEvents::new(events.clone(), session_id.clone());
 
         // REQ-572 BR-3: the prompt's capability clause reads the same classifier
