@@ -43,8 +43,9 @@ use teton_core::entities::{BoundaryMode, PrivacyBoundary};
 use teton_protocol::events::{Event, PermissionRequest, WebLookupOutcome};
 use teton_protocol::jsonrpc::RpcError;
 use teton_protocol::methods::{
-    ConfigUpdate, PermissionOutcome, PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig,
-    SkillInvocation, TierBindingConfig,
+    BoundaryOriginConfig, ConfigUpdate, ContextAction, PermissionOutcome, PrivacyBoundaryConfig,
+    PromptTurnResult, ProviderConfig, RepoContextSource, RepoContextStateKind,
+    SessionContextParams, SkillInvocation, TierBindingConfig,
 };
 use teton_protocol::{
     Phase as ProtoPhase, PrivacyMode, ProviderId, ProviderKind as ProtoProviderKind, SessionId,
@@ -64,6 +65,7 @@ use tetond::harness::{
     PermissionConfig, PermissionGate, RemoteProviderSource, SessionEvents, ToolContext, ToolDuties,
     ToolRegistry,
 };
+use tetond::repo_context::{RepoContextBlock, RepoContextState};
 use tetond::runtime::{ClientPresence, DaemonRuntime, SessionTaint, WebTaintOverride};
 use tetond::sessions::SessionRegistry;
 use tetond::skills::RealFs;
@@ -753,6 +755,8 @@ async fn probe_spelling(repo: &std::path::Path, path_arg: &str) -> (SessionProbe
         PROMPT,
         std::collections::BTreeSet::new(),
         false,
+        // No notes in this fixture, so a reroute has nothing to re-render.
+        None,
     );
 
     let args = serde_json::json!({ "path": path_arg }).to_string();
@@ -2029,4 +2033,445 @@ async fn a_skill_turns_expansion_never_reaches_the_naming_dutys_provider() {
         "the naming duty put the skill body on the wire: {:?}",
         guarded.bodies()
     );
+}
+
+// ===========================================================================
+// REQ-612 BR-5 / AC-7 — a resident repository-notes block is a file on the
+// wire, and the boundary matcher judges it as one
+// ===========================================================================
+//
+// The bypass this section guards is stated in BR-5 in as many words: before
+// this REQ the system prompt carried no file provenance at all, so a `TETON.md`
+// under a `local-only` glob placed in the system string would have egressed to
+// every remote provider on every turn of the session with no boundary verdict
+// ever taken — a session-long leak rather than a single tool result's, and the
+// one path around the charter's BR-1.
+//
+// Two legs, and the second is what makes the first mean anything.
+
+/// A string that exists **only** inside the fixture's `TETON.md`.
+///
+/// LESSON-624: the marker is never a prompt, never a tool argument, never a
+/// grep pattern and never a path — a marker any of those carried would reach a
+/// request body through a daemon that leaked nothing, and the assertion below
+/// would fire against a correct build.
+const NOTES_ONLY_MARKER: &str = "quartzite-heliotrope-4417";
+
+/// The notes the fixture repository describes itself with.
+///
+/// Ordinary prose: this file's subject is the boundary verdict, not the
+/// sanitizer, so nothing here is hostile and nothing here is framed.
+const NOTES_BODY: &str = "# fixture\n\nThe crates live under crates/. Build with cargo.\n\
+                          The line below is this repository's own name for itself:\n\n\
+                          quartzite-heliotrope-4417\n";
+
+/// The prompt the notes turns run under.
+///
+/// Deliberately says nothing about the notes and names no file: the block is
+/// resident because the *session* carries it, and a prompt that asked about it
+/// would put the fixture's own words in the request body.
+const NOTES_PROMPT: &str = "Summarize what you already know.";
+
+/// A `local-only` set covering the notes file and nothing else.
+fn notes_boundaries() -> Vec<PrivacyBoundary> {
+    vec![PrivacyBoundary {
+        path_glob: "**/TETON.md".to_owned(),
+        mode: BoundaryMode::LocalOnly,
+        origin: Default::default(),
+    }]
+}
+
+/// A `project`-kind root whose `TETON.md` carries [`NOTES_ONLY_MARKER`].
+///
+/// The `Cargo.toml` is load-bearing: BR-1 reads a `project` root and nothing
+/// else, so without a marker file both legs would be asserting the `absent`
+/// path by accident.
+fn notes_repo() -> PathBuf {
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "teton-notes-egress-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"notes\"\n").unwrap();
+    std::fs::write(root.join("TETON.md"), NOTES_BODY).unwrap();
+    root
+}
+
+/// One session whose repository notes were loaded through the daemon's own
+/// `session/create` derivation, and the `repo_context_state` line that load
+/// published.
+struct NotesSession {
+    runtime: Arc<DaemonRuntime>,
+    sessions: SessionRegistry,
+    events: Arc<EventBus>,
+    session_id: SessionId,
+    announced: Vec<teton_protocol::events::RepoContextState>,
+}
+
+impl NotesSession {
+    fn state(&self) -> Arc<RepoContextState> {
+        self.sessions.repo_context(&self.session_id)
+    }
+
+    /// This session's `/context` answer, through the daemon's own method.
+    fn status(&self) -> teton_protocol::methods::SessionContextResult {
+        self.runtime.session_context(
+            &SessionContextParams {
+                session_id: self.session_id.clone(),
+                action: ContextAction::Status,
+            },
+            &self.sessions,
+            &self.events,
+            // No stamped route: this fixture asserts on egress rather than on
+            // the cap, and a session no turn has routed reports the ceiling.
+            None,
+        )
+    }
+}
+
+/// Create a session at `repo` with `boundary` configured, loading its notes
+/// through [`DaemonRuntime::store_session_repo_context`] — the same function
+/// `session/create` calls, so this fixture cannot drift into an agreeing
+/// re-implementation of the load path (LESSON-451).
+async fn notes_session(repo: &std::path::Path, boundary: Option<&str>) -> NotesSession {
+    let events = Arc::new(EventBus::new());
+    // The shipped set is off so the only glob in play is this fixture's own: a
+    // second row that happened to match would make the `withheld` leg pass for
+    // a reason the test did not choose.
+    let runtime = Arc::new(DaemonRuntime::minimal().with_default_boundaries_disabled());
+    if let Some(path_glob) = boundary {
+        runtime
+            .apply_config_update(ConfigUpdate::SetPrivacyBoundary(PrivacyBoundaryConfig {
+                path_glob: path_glob.to_owned(),
+                mode: PrivacyMode::LocalOnly,
+                origin: BoundaryOriginConfig::User,
+            }))
+            .expect("a boundary is a config update");
+    }
+    let sessions = SessionRegistry::new();
+    let session_id = sessions
+        .create(SessionMode::Freeform, None, Some(repo.to_path_buf()))
+        .expect("a freeform session needs no phase")
+        .session_id;
+
+    let mut sub = events.subscribe(64);
+    let probed = runtime.session_root_for(Some(repo));
+    runtime.store_session_repo_context(&sessions, &session_id, &probed, &events);
+
+    let mut announced = Vec::new();
+    while let Ok(Some(envelope)) =
+        tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv()).await
+    {
+        if let Event::RepoContextState(state) = envelope.event {
+            announced.push(state);
+        }
+    }
+
+    NotesSession {
+        runtime,
+        sessions,
+        events,
+        session_id,
+        announced,
+    }
+}
+
+/// `scripted_config()` with `block` as this route's resident notes, at the cap
+/// the route derived.
+///
+/// The one line production spells at `runtime::turn` — `state.file().map(|file|
+/// RepoContextBlock::render(file, cap))` — asked of the *real* renderer over the
+/// *real* loaded file, never a `RepoContextBlock { text: … }` literal
+/// (LESSON-544): what AC-7 is about is the bytes the producer makes.
+fn notes_config(state: &RepoContextState) -> HarnessConfig {
+    let base = scripted_config();
+    let cap = base.budget.repo_context_cap;
+    HarnessConfig {
+        repo_context: state.file().map(|file| RepoContextBlock::render(file, cap)),
+        ..base
+    }
+}
+
+/// Drive one remote turn over `ctx` and return the loop result, every request
+/// body the transport was asked to send, and the ordered event names the turn
+/// published.
+///
+/// No tool call is scripted: the claim is about what the *system prompt* puts
+/// on the wire, and a turn that read the file would put its bytes there
+/// legitimately.
+async fn drive_notes_turn(
+    repo: &std::path::Path,
+    session_id: &SessionId,
+    config: &HarnessConfig,
+    ctx: &mut ContextManager,
+    boundaries: Vec<PrivacyBoundary>,
+) -> (
+    Result<tetond::harness::TurnOutcome, HarnessError>,
+    Vec<Vec<u8>>,
+    Vec<String>,
+) {
+    let transport = CaptureSse::with_bodies(vec![sse_turn("Understood.", None)]);
+    let capture = transport.clone();
+
+    let bus = Arc::new(EventBus::new());
+    let egress = Egress::new(transport, boundaries, bus.clone());
+    let provider = OpenAiCompatAdapter::new(OpenAiCompatConfig::new(
+        "deepseek",
+        "https://api.deepseek.com/v1/chat/completions",
+    ));
+    let mut source = RemoteProviderSource::new(
+        &provider,
+        &egress,
+        "deepseek",
+        "deepseek-chat",
+        session_id.clone(),
+        ResolvedEffort::effort(EffortLevel::High),
+    );
+
+    let tools = ToolRegistry::with_builtins();
+    let tool_ctx = ToolContext::new(repo);
+    let gate = PermissionGate::new(
+        session_id.clone(),
+        PermissionConfig::permissive(),
+        Arc::clone(&bus),
+        Arc::new(PendingPermissions::new()),
+    );
+    let events = SessionEvents::new(Arc::clone(&bus), session_id.clone());
+    let mut hook = NoopProvenanceHook;
+    let mut sub = bus.subscribe(256);
+
+    let result = run_session_turn_with_source(
+        &mut source,
+        &tools,
+        &tool_ctx,
+        &gate,
+        &events,
+        ctx,
+        config,
+        &mut hook,
+        &DutyRoute::unresolved("no digest route in this test"),
+        &DutyRoute::unresolved("no compact route in this test"),
+        &ToolDuties {
+            triage: &DutyRoute::unresolved("no triage route in this test"),
+            shell: &DutyRoute::unresolved("no shell route in this test"),
+        },
+    )
+    .await;
+
+    let mut names = Vec::new();
+    while let Ok(Some(envelope)) =
+        tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv()).await
+    {
+        names.push(envelope.event.name().to_owned());
+    }
+    (result, capture.captured(), names)
+}
+
+/// **REQ-612 BR-5 / AC-7, both legs.** A `TETON.md` covered by a `local-only`
+/// glob is never made resident and **no byte of it reaches any remote request
+/// body**; the same file with no glob over it is resident, its bytes do reach
+/// the wire, and its identity is in the turn's egress provenance union — so the
+/// boundary matcher has something to judge on every later turn.
+///
+/// ## Why the two legs are one test
+///
+/// The claim is a comparison, not an absence. "No request carried the marker"
+/// is satisfied by a fixture that cannot put a system prompt on a wire at all,
+/// by a loader that read no file, and by a repository with no notes in it — so
+/// leg 2 asserts the marker **does** reach a captured body under the identical
+/// fixture with the glob removed. Only the pair says the boundary did the work
+/// (LESSON-479).
+///
+/// ## The marker
+///
+/// [`NOTES_ONLY_MARKER`] lives in the file's bytes and nowhere else — not in
+/// [`NOTES_PROMPT`], not in a tool argument, not in the fixture's paths. A
+/// marker any of those carried would ride to the vendor through a daemon that
+/// leaked nothing, and this test would fail against a correct build (LESSON-624).
+///
+/// ## The instruments, and why each is the daemon's own
+///
+/// - the state is read back through `session/context` **and** off the published
+///   `repo_context_state` line, so BR-5's "one line says so" is asserted rather
+///   than assumed;
+/// - the block is produced by the real loader and the real renderer over a real
+///   file, never by a `RepoContextBlock { text: … }` literal (LESSON-544);
+/// - the union is read by the production `context_provenance` off the manager a
+///   real turn ran against, seeded through `CarriedTurn::begin` — the one
+///   seeding path the daemon has.
+///
+/// ## Mutation (run 2026-09-03)
+///
+/// | change | result |
+/// |---|---|
+/// | `context_provenance` skips the `system_sources` union | leg 2's provenance assertion fails |
+/// | `RepoContext::load`'s boundary gate deleted | leg 1's state, its line, and the marker assertion all fail |
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_boundary_covered_notes_file_never_leaves_and_an_uncovered_one_is_in_the_union() {
+    let repo = notes_repo();
+
+    // --- Leg 1: the glob covers the file --------------------------------
+    let covered = notes_session(&repo, Some("**/TETON.md")).await;
+    assert_eq!(
+        covered.state().kind(),
+        RepoContextStateKind::WithheldBoundary,
+        "a covered file must not be made resident: {:?}",
+        covered.state()
+    );
+
+    // BR-5's "one line says so", on both surfaces that carry it.
+    assert_eq!(
+        covered
+            .announced
+            .iter()
+            .map(|line| line.state)
+            .collect::<Vec<_>>(),
+        vec![RepoContextStateKind::WithheldBoundary],
+        "the withholding was silent: {:?}",
+        covered.announced
+    );
+    assert_eq!(
+        covered.announced[0].source,
+        Some(RepoContextSource::TetonMd)
+    );
+    assert_eq!(
+        covered.announced[0].resident_bytes, 0,
+        "a withheld file is resident in no bytes at all"
+    );
+    let status = covered.status();
+    assert_eq!(status.state, RepoContextStateKind::WithheldBoundary);
+    assert_eq!(status.file.as_deref(), Some("TETON.md"));
+    assert_eq!(status.resident_bytes, 0);
+
+    let config = notes_config(&covered.state());
+    assert!(
+        config.repo_context.is_none(),
+        "a withheld state renders no block"
+    );
+    let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
+    assert!(
+        !system.contains(NOTES_ONLY_MARKER),
+        "the covered file reached the system prompt:\n{system}"
+    );
+
+    let mut turn = CarriedTurn::begin(
+        &covered.sessions,
+        &covered.session_id,
+        system,
+        &config,
+        Arc::new(SessionTaint::new()),
+        notes_boundaries(),
+        NOTES_PROMPT,
+        std::collections::BTreeSet::new(),
+        false,
+        // No notes in this fixture, so a reroute has nothing to re-render.
+        None,
+    );
+    let (result, captured, names) = drive_notes_turn(
+        &repo,
+        &covered.session_id,
+        &config,
+        turn.ctx_mut(),
+        notes_boundaries(),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "the covered leg's turn must run — a refused turn sends nothing and \
+         proves nothing: {result:?}"
+    );
+    assert!(
+        !captured.is_empty(),
+        "no request reached the transport at all, so the assertion below is \
+         about a fixture rather than about a boundary"
+    );
+    // The conventions' rule for an egress assertion: name the requests, beside
+    // the ordered event names, before anybody goes looking at the choke point.
+    let carrying: Vec<usize> = captured
+        .iter()
+        .enumerate()
+        .filter(|(_, body)| contains_bytes(body, NOTES_ONLY_MARKER))
+        .map(|(index, _)| index)
+        .collect();
+    assert!(
+        carrying.is_empty(),
+        "the covered file's bytes left the machine: requests {carrying:?} of \
+         {} carried the marker; the turn published {names:?}",
+        captured.len()
+    );
+    assert!(
+        !context_provenance(turn.ctx()).contains("TETON.md"),
+        "a file that was never read must contribute no identity: {:?}",
+        context_provenance(turn.ctx()).sources().collect::<Vec<_>>()
+    );
+
+    // --- Leg 2: the same file, no glob over it ---------------------------
+    let open = notes_session(&repo, None).await;
+    let state = open.state();
+    assert_eq!(
+        state.kind(),
+        RepoContextStateKind::Loaded,
+        "with no boundary the same file loads: {state:?}"
+    );
+    let identity = state
+        .file()
+        .expect("a loaded state carries its file")
+        .provenance
+        .clone();
+
+    let config = notes_config(&state);
+    let block = config
+        .repo_context
+        .as_ref()
+        .expect("a loaded state renders a block");
+    assert!(
+        block.text.contains(NOTES_ONLY_MARKER),
+        "the block the route stamped does not carry the file's own bytes:\n{}",
+        block.text
+    );
+    let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
+
+    let mut turn = CarriedTurn::begin(
+        &open.sessions,
+        &open.session_id,
+        system,
+        &config,
+        Arc::new(SessionTaint::new()),
+        Vec::new(),
+        NOTES_PROMPT,
+        std::collections::BTreeSet::new(),
+        false,
+        // No notes in this fixture, so a reroute has nothing to re-render.
+        None,
+    );
+    let (result, captured, names) =
+        drive_notes_turn(&repo, &open.session_id, &config, turn.ctx_mut(), Vec::new()).await;
+    assert!(result.is_ok(), "the uncovered turn failed: {result:?}");
+    assert!(
+        captured
+            .iter()
+            .any(|body| contains_bytes(body, NOTES_ONLY_MARKER)),
+        "non-vacuity: with no boundary the resident notes must genuinely reach \
+         the vendor, or leg 1's silence is about a fixture that cannot send \
+         them; the turn published {names:?}"
+    );
+
+    // The union: the identity the *head* carries, read by the production
+    // function off the manager the turn actually ran against.
+    let provenance = context_provenance(turn.ctx());
+    assert!(
+        provenance.contains(identity.as_str()),
+        "the resident block egressed with no identity for the boundary matcher \
+         to judge — BR-5's bypass, re-opened: {:?}",
+        provenance.sources().collect::<Vec<_>>()
+    );
+    assert!(
+        !provenance.is_unknown(),
+        "the notes are attributable bytes, not a `shell` result"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
 }

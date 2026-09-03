@@ -1,7 +1,7 @@
 ---
 id: REQ-612
 title: "TETON.md — a per-repository context file the session reads at its root and carries as resident data, so a project's shape is known without a walk"
-status: approved
+status: complete
 deployable: true
 created: 2026-09-03
 updated: 2026-09-03
@@ -151,14 +151,35 @@ _Leg B — bounded, and the bound is stated_
   with a reviewed ceiling move, and exceeding it is never silent.** The block
   is bounded by a pinned constant chosen so that the widest system prompt
   this build produces **plus a block at the cap** still leaves a floored
-  route (2,048 words / 16,384 bytes — REQ-586's smallest pair, "the smallest
-  that still holds the system prompt") room for a prompt and a reply. **The cap
-  is 8 KiB** (product decision 2026-09-03: solid context over cheap context),
-  and it is **route-aware**: the effective cap on a route is the smaller of
-  8 KiB and a quarter of the route's byte budget (REQ-586's per-route pair),
-  so the local tier carries the full 8 KiB, a floored 16,384-byte route
-  carries 4 KiB, and no route ever spends more than a quarter of its context
-  on the notes. The effective cap is derived where the route is decided, like
+  route room for a prompt and a reply. **The cap is 8 KiB** (product decision
+  2026-09-03: solid context over cheap context), and it is **route-aware**:
+  the effective cap on a route is the smaller of 8 KiB and a quarter of the
+  route's byte budget (REQ-586's per-route pair), so the local tier carries
+  the full 8 KiB (its budget is 63,488 bytes since REQ-590, so the notes are
+  about an eighth of it) and no route ever spends more than a quarter of its
+  context on the notes.
+
+  **Amended by the product owner, 2026-09-03 (second decision of the day).**
+  This clause originally added "and a floored 16,384-byte route carries
+  4 KiB", against REQ-586's floor of `MIN_BUDGET_BYTES = LOCAL_BUDGET_BYTES /
+  2`. The owner rejected that trade: a floored route is exactly the route
+  whose model needs the repository's own description most, and halving the
+  block there makes the notes a thing that moves under a user when their
+  provider falls back. So **the floor moves instead** —
+  `MIN_BUDGET_BYTES` is now a pinned **50,000 bytes** (6,250 words),
+  chosen against the measurement the 2× invariant is made of: the widest
+  default system prompt carrying a worst-case 8,192-byte block is 15,370
+  bytes, and 50,000 ≥ 2 × 15,370 with 19,260 to spare. 50,000 / 4 = 12,500 >
+  8 KiB, so **a floored route carries the whole block**.
+
+  The consequence, stated because it is the honest reading of the amendment:
+  the smallest budget any arm of `budget::derive` returns is now the default
+  pair's 32,768 bytes, whose quarter is 8,192 exactly — so **every route this
+  build can derive carries the notes at the pinned cap**, and the quarter half
+  of the `min` is a live rule on a latent path. It stays in the code, stays
+  derived where the route is decided, and is pinned at a synthetic sub-floor
+  budget rather than at a route, so that lowering the floor again inherits the
+  rule rather than the bug. The effective cap is derived where the route is decided, like
   the budget itself, and `/verbose` prints it beside the resident bytes. A file over the cap is
   **truncated at the last line boundary under the cap**, the block ends with
   a harness-authored marker naming the cap and the bytes dropped, the state
@@ -173,8 +194,10 @@ _Leg B — bounded, and the bound is stated_
   so this REQ **moves `REDACT_BODY_OVERHEAD_BYTES` once**, with the chunk
   arithmetic re-stated where it lives (REQ-586 BR-11) and the consequence
   named in the docs: the overhead is a production input to every
-  redact-scanning route's budget (REQ-586 verify (b)), so the cap's bytes
-  come off that budget too. Truncation, not refusal, because the top of the
+  redact-scanning route's budget (REQ-586 verify (b)). *Measured at
+  implementation (TASK-375): the move is 14 → 23 KiB, the chunk cap rises
+  3 → 4, and the scannable bound rises rather than shrinks — the cost lands
+  on scan calls, and the docs state that, not the predicted shrink.* Truncation, not refusal, because the top of the
   file is the part a repository author puts first; the marker is what makes
   the choice honest (informed by REQ-586 BR-7/BR-11, REQ-585 BR-8, BUG-181,
   LESSON-543, REQ-587 BR-2).
@@ -263,7 +286,8 @@ _Leg F — cost, and what the model is told_
   every iteration, so a prompt that runs to its `max_turns` (12 on the local
   profile, 40 on the strong-model profile — `teton_docs context`'s "25" is a
   stale figure this REQ corrects in passing) carries an 8 KiB block 12 to 40
-  times, and on the local tier it is up to a quarter of the byte budget —
+  times, and on the local tier it is about an eighth of the byte budget
+  (a sixth on a floored route, whose pair is 6,250 words / 50,000 bytes) —
   which is why the cap is small and why the file should hold the facts a
   session needs every time (layout, build and test commands, conventions)
   and not the ones it needs once (informed by REQ-586 BR-9, LESSON-543).
@@ -426,7 +450,10 @@ _Leg F — cost, and what the model is told_
   Resolved 2026-09-03: pinned at 8 KiB, route-aware by the quarter rule (BR-3).
   A user knob that can exceed the floored pair would reopen the silent
   overflow REQ-586 closed; the quarter rule gives the big-window user nothing
-  extra because the file, not the window, is the limit.
+  extra because the file, not the window, is the limit. Amended the same day:
+  the floored pair itself was raised to 6,250 words / 50,000 bytes so that a
+  floored route carries the whole 8 KiB — see BR-3. The answer to OQ-6 is
+  unchanged; what changed is that the quarter no longer bites on any route.
 
 ## Out of Scope
 

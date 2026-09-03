@@ -415,6 +415,19 @@ impl DaemonRuntime {
             skills_fs,
             &self.projects,
         );
+        // REQ-612 BR-1 / ADR-3, in this block and for this block's reason: the
+        // repository's notes are read at the root the session stands on, so the
+        // root moving re-reads them — under the new root's boundary matcher and
+        // with the new root's `TETON.md`, or with none. It lands **before** the
+        // two publishes below, which is the ordering REQ-585 established for the
+        // skill registry one line above: a second attached client reacting to
+        // `session_root_changed` must not be able to read the pre-move notes.
+        //
+        // The store publishes `repo_context_state` itself when the state moved,
+        // outside the registry lock — so a `/cd` out of a repository with notes
+        // announces that the block was dropped, and a `/cd` between two plain
+        // directories announces nothing.
+        self.store_session_repo_context(sessions, &params.session_id, &moved_to, events);
         self.drop_grants_expiring_on_root_change(&params.session_id);
 
         let root = moved_to.view;

@@ -108,6 +108,9 @@ use teton_protocol::methods::{
     SessionRoot, SessionSetCwdParams, SkillSkipped, SkillSource, SkillView, SkillsListResult,
     WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams, WebRefreshResult,
 };
+use teton_protocol::methods::{
+    ContextAction, RepoContextStateKind, SessionContextParams, SessionContextResult,
+};
 use teton_protocol::methods::{SessionTranscriptParams, SessionTranscriptResult, TranscriptAction};
 use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::SessionId;
@@ -662,6 +665,23 @@ const COMMANDS: &[CommandSpec] = &[
         args: Args::Optional,
         mirror: None,
         handler: handle_transcript,
+    },
+    // REQ-612's session-lifetime repository-notes switch, beside `/transcript`
+    // for the reason `/transcript` sits beside `/verbose`: it is about *this
+    // session* and is never written to disk. The durable default is
+    // `teton context enable` (ADR-6's two lifetimes).
+    //
+    // `context` is a unique first word, so [`help_family`] gives it the empty
+    // family `/transcript` already has and `/help`'s built-in section gains one
+    // row and no new blank line.
+    CommandSpec {
+        name: "context",
+        aliases: &[],
+        summary: "Carry this repository's notes in the prompt, or stop: /context [on|off]; \
+                  bare, show the state.",
+        args: Args::Optional,
+        mirror: None,
+        handler: handle_context,
     },
     // REQ-560's permission level. Placed beside `/clear` and `/verbose` because
     // all three are about *this session* rather than about the machine's
@@ -1483,6 +1503,15 @@ pub fn run_cli_line(
             crate::TranscriptCli::Disable => "disable".to_owned(),
             crate::TranscriptCli::Status => "status".to_owned(),
         },
+        // REQ-612: the transcript family's shape one feature over. Shell-only,
+        // so this is unreachable from the classifier for the same reason — the
+        // arm exists so the leaf is *named* rather than swept into the
+        // catch-all below.
+        Some(crate::Command::Context { action }) => match action {
+            crate::ContextCli::Enable => "enable".to_owned(),
+            crate::ContextCli::Disable => "disable".to_owned(),
+            crate::ContextCli::Status => "status".to_owned(),
+        },
         Some(crate::Command::Model {
             action: crate::ModelAction::Set { name },
         }) => name,
@@ -2123,6 +2152,38 @@ pub(crate) fn mirrored_rows() -> impl Iterator<Item = (&'static str, &'static st
         .filter_map(|spec| spec.mirror.map(|mirror| (spec.name, mirror.shell)))
 }
 
+/// Every spelling the table dispatches: each row's canonical name and each of
+/// its aliases (REQ-612 AC-11).
+///
+/// [`mirrored_rows`]'s counterpart for the README cross-check, and derived from
+/// [`COMMANDS`] for the reason `reserved_names` is: the table is the list that
+/// decides what runs, so a documentation check reading a copy would go green the
+/// day a row was renamed.
+#[cfg(test)]
+pub(crate) fn builtin_spellings() -> Vec<&'static str> {
+    COMMANDS
+        .iter()
+        .flat_map(|spec| std::iter::once(spec.name).chain(spec.aliases.iter().copied()))
+        .collect()
+}
+
+/// Every row with **no** shell twin — the commands that exist only inside a
+/// session (REQ-612 AC-11).
+///
+/// The complement of [`mirrored_rows`] over the same table, so the two cannot
+/// come to disagree about which half a row is in. What it is for: the resident
+/// guide may name a mirrored row's `teton …` form as a footnote (REQ-582 BR-9's
+/// mapping), and must never name a `teton …` form for one of these, because
+/// there is no such command to run — BUG-181's shape, delivered by Teton's own
+/// instructions.
+#[cfg(test)]
+pub(crate) fn session_only_rows() -> impl Iterator<Item = &'static str> {
+    COMMANDS
+        .iter()
+        .filter(|spec| spec.mirror.is_none())
+        .map(|spec| spec.name)
+}
+
 /// `/verbose`: flip the session's notice visibility and echo the new state
 /// (BR-5). Session-scoped — it persists nothing, and the next session starts
 /// from the `--verbose` flag's default again.
@@ -2696,6 +2757,170 @@ const TRANSCRIPT_NEEDS_A_SESSION: &str =
 
 const TRANSCRIPT_UNAVAILABLE: &str =
     "this daemon does not serve transcripts — restart it after upgrading to use /transcript.";
+
+/// `/context [on|off]` (REQ-612 BR-2, architecture ADR-6). The session-lifetime
+/// half of the repository-notes switch, shaped as [`handle_transcript`] line for
+/// line.
+///
+/// **It never calls `config/set`, and that is the whole of BR-2's two-switch
+/// rule at this surface.** `/context off` moves *this session* and writes
+/// nothing to `config.toml`; the durable default is `teton context disable`,
+/// which is a different command with a different blast radius. A `config/set`
+/// here would make one session's choice a machine-wide one, silently, from a
+/// line the user typed inside a session — the failure REQ-611 BR-2 named and
+/// this REQ inherits.
+///
+/// Bare `/context` is `Status` and is the **non-visual read path** REQ-560 BR-10
+/// requires: it works on a pipe, because the status row is TTY-gated and a fact
+/// the row might one day show has to be reachable without a terminal. It is also
+/// the only surface that names the file (`SessionContextResult::file`) — the
+/// broadcast `repo_context_state` event deliberately does not.
+///
+/// Piped input may drive all three actions: the switch changes what this
+/// session's prompt carries and writes nothing, so it is not an escalation.
+fn handle_context(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    args: &str,
+) -> anyhow::Result<CommandOutcome> {
+    let Some(session_id) = ctx.session_id.clone() else {
+        ctx.surface.line(LineKind::Error, CONTEXT_NEEDS_A_SESSION);
+        return Ok(CommandOutcome::Continue);
+    };
+    let action = match args.trim() {
+        "" => ContextAction::Status,
+        "on" => ContextAction::On,
+        "off" => ContextAction::Off,
+        other => {
+            ctx.surface.line(
+                LineKind::Error,
+                &format!(
+                    "unknown context argument `{other}` — use `/context`, \
+                     `/context on` or `/context off`."
+                ),
+            );
+            return Ok(CommandOutcome::Continue);
+        }
+    };
+    match conn.call(SessionContextParams { session_id, action }, ctx)? {
+        Ok(result) => {
+            for line in render_context(&result) {
+                ctx.surface.line(LineKind::Notice, &line);
+            }
+        }
+        Err(err) if err.code == error_code::METHOD_NOT_FOUND => {
+            ctx.surface.line(LineKind::Notice, CONTEXT_UNAVAILABLE);
+        }
+        Err(err) => ctx.surface.line(
+            LineKind::Error,
+            &format!("the repository notes are unavailable: {}", err.message),
+        ),
+    }
+    Ok(CommandOutcome::Continue)
+}
+
+/// The lines `/context` draws: the state first, then — when there are byte
+/// figures worth reading — the file, its size **if the daemon has one**, what is
+/// resident and the cap.
+///
+/// **One or two lines, never more** (BR-2's list: file, source, bytes on disk,
+/// resident bytes, cap, state). The split is by *whether the daemon has figures
+/// to give*: `absent` and `withheld_off` opened no file, so there is nothing to
+/// measure and a second line would be four zeroes pretending to be facts.
+///
+/// Every figure is the daemon's. `cap` in particular is the route's **effective**
+/// cap, which no client can derive — it is `min(REPO_CONTEXT_MAX_BYTES,
+/// budget_bytes / 4)` and needs the router's budget — so it travels and is
+/// printed, never recomputed (ADR-5's one-derivation rule).
+///
+/// **All three actions render identically**, which is where this parts company
+/// with [`render_transcript`] and is a decision rather than an omission. That
+/// renderer varies by action because a transcript's *path* means something
+/// different in a read than in a switch. Here it would not: the answer to
+/// `/context off` is the state after the switch, which is exactly what a bare
+/// `/context` asks for, so one rendering means an `on` refused by a boundary
+/// says `withheld` and why instead of echoing what was requested — and the two
+/// surfaces cannot word one state two ways.
+fn render_context(result: &SessionContextResult) -> Vec<String> {
+    let mut lines = vec![format!("context: {}", context_state_words(result.state))];
+    // The figures line, only where there are figures. `file` is `None` exactly
+    // when nothing was opened, so it is the one predicate rather than a second
+    // opinion about which states carry bytes.
+    if let Some(file) = &result.file {
+        let mut line = format!("context: {file}");
+        // The source is BR-2's sixth field and is normally the same word as the
+        // file — the daemon spells the path root-relative, and the path of a
+        // file at the root *is* its name. Printed only when the two differ, so
+        // the common line reads `TETON.md` rather than `TETON.md (TETON.md)`;
+        // a daemon that ever spells the path differently still says which of
+        // the two names it read.
+        if let Some(source) = result.source {
+            let name = context_source_words(source);
+            if name != file {
+                line.push_str(&format!(" ({name})"));
+            }
+        }
+        // The size clause is printed only where there is a size. `file` is
+        // `Some` for a symlinked entry, a directory wearing the name and a
+        // `stat` that was refused — all of which the daemon `stat`ed and none
+        // of which it got a file size out of — so keying the clause on `file`
+        // and flattening the figure printed `0 bytes on disk` beside a file the
+        // user can see the size of. The daemon says `None`; this says nothing.
+        if let Some(on_disk) = result.bytes_on_disk {
+            line.push_str(&format!(" — {on_disk} bytes on disk,"));
+        } else {
+            line.push_str(" —");
+        }
+        line.push_str(&format!(
+            " {} resident, cap {}",
+            result.resident_bytes, result.cap
+        ));
+        if result.truncated {
+            line.push_str(" (truncated)");
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+/// One word for each state, in the vocabulary BR-2 lists.
+///
+/// The three withheld shapes keep their reasons apart on purpose: they name
+/// three different remedies — a boundary to relax, a switch to flip, a file to
+/// fix — and folding them would send a user to the wrong one
+/// ([`RepoContextStateKind`]'s own argument).
+fn context_state_words(state: RepoContextStateKind) -> &'static str {
+    match state {
+        RepoContextStateKind::Loaded => "on — the repository notes are resident",
+        RepoContextStateKind::Truncated => "on — the repository notes are resident, truncated",
+        // Not "there is no file". `absent` is also what a non-`project` root
+        // answers, what a present-but-empty file answers, and what an
+        // uncompilable boundary set fails closed to — so a sentence claiming the
+        // filesystem is empty would be wrong in three ways a user standing next
+        // to their own `TETON.md` would notice immediately. What the daemon
+        // actually knows, and all it knows, is that nothing is resident.
+        RepoContextStateKind::Absent => "off — no repository notes are resident",
+        RepoContextStateKind::WithheldBoundary => {
+            "off — withheld: a local-only boundary covers the file"
+        }
+        RepoContextStateKind::WithheldOff => "off — the switch is off, so the file is not opened",
+        RepoContextStateKind::Unreadable => "off — withheld: the file could not be read",
+    }
+}
+
+/// Which of the two names was read, spelled for a person.
+fn context_source_words(source: teton_protocol::methods::RepoContextSource) -> &'static str {
+    match source {
+        teton_protocol::methods::RepoContextSource::TetonMd => "TETON.md",
+        teton_protocol::methods::RepoContextSource::AgentsMd => "AGENTS.md",
+    }
+}
+
+const CONTEXT_NEEDS_A_SESSION: &str =
+    "no session is attached, so there are no repository notes to switch or show.";
+
+const CONTEXT_UNAVAILABLE: &str = "this daemon does not serve repository notes — restart it \
+     after upgrading to use /context.";
 
 fn handle_web_refresh(
     conn: &mut Connection,
@@ -3501,6 +3726,10 @@ mod tests {
             "model set",
             "verbose",
             "transcript",
+            // REQ-612 BR-2: the session-lifetime repository-notes switch,
+            // declared here for the reason every row above it was — a new row
+            // is a spec decision rather than a drive-by.
+            "context",
             "quit",
             // REQ-563 BR-13 / BR-12: the two user-only web actions. Added here
             // first, deliberately — this list is where a new row is declared to
@@ -6274,6 +6503,9 @@ mod tests {
                 "transcript enable",
                 "transcript disable",
                 "transcript status",
+                "context enable",
+                "context disable",
+                "context status",
             ],
             "a new shell-only command needs its own reason in `refusal_for_path`"
         );
@@ -6287,6 +6519,19 @@ mod tests {
                 "{line}"
             );
             assert!(!line.contains("removes its data"), "{line}");
+        }
+        // REQ-612: the third family, and its sentence names its own two
+        // lifetimes rather than borrowing the transcript's.
+        for leaf in ["enable", "disable", "status"] {
+            let line = cli_rows::refusal_for_path(&["context", leaf]);
+            assert!(
+                line.contains("durable repository-notes default") && line.contains("/context on"),
+                "{line}"
+            );
+            assert!(
+                !line.contains("removes its data") && !line.contains("transcript"),
+                "{line}"
+            );
         }
     }
 
@@ -7020,6 +7265,92 @@ mod transcript_render_tests {
         assert_eq!(
             render_transcript(true, &never),
             "transcript: off — degraded: directory refused: mode 0755"
+        );
+    }
+}
+
+#[cfg(test)]
+mod context_render_tests {
+    use super::*;
+    use teton_protocol::methods::{RepoContextSource, RepoContextStateKind};
+
+    /// **Verify (MAJOR 2).** `/context` prints a size only where the daemon
+    /// has one.
+    ///
+    /// # The defect this pins
+    ///
+    /// The size clause was keyed on `file`, and `file` is `Some` for every
+    /// state that knows *which* name is on disk — including the three that
+    /// `stat`ed something and got no file size out of it: a symlinked entry, a
+    /// directory wearing the name, and a refusal. With the wire field a bare
+    /// `u64` those all arrived as `0`, and the line read
+    /// `TETON.md — 0 bytes on disk`, beside a file the user can see the size of
+    /// in `ls`. Not merely uninformative — wrong, and the first figure they
+    /// would check.
+    ///
+    /// Both directions are asserted together, because a fix that dropped the
+    /// clause everywhere would be just as wrong: a withheld file's size is the
+    /// one figure a state that read nothing can honestly give, and it still
+    /// prints.
+    ///
+    /// # Mutation, run and observed
+    ///
+    /// | change | result |
+    /// |---|---|
+    /// | print the clause whenever `file` is `Some`, with `unwrap_or(0)` | leg 1 gains `0 bytes on disk` |
+    /// | drop the clause unconditionally | leg 2 loses `2048 bytes on disk` |
+    #[test]
+    fn the_context_line_prints_a_size_only_where_the_daemon_has_one() {
+        // Leg 1 — a symlinked `TETON.md`. The daemon `lstat`ed it, so it knows
+        // the name; an `lstat`'s length for a link is its target path, not a
+        // file size, so it reports none.
+        let symlinked = SessionContextResult {
+            state: RepoContextStateKind::Unreadable,
+            source: Some(RepoContextSource::TetonMd),
+            file: Some("TETON.md".to_owned()),
+            bytes_on_disk: None,
+            resident_bytes: 0,
+            cap: 8_192,
+            truncated: false,
+        };
+        let lines = render_context(&symlinked);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(
+            lines[1], "context: TETON.md — 0 resident, cap 8192",
+            "a file the daemon never measured was given a size"
+        );
+        assert!(!lines[1].contains("bytes on disk"), "{}", lines[1]);
+
+        // Leg 2 — a boundary-covered file. Its `stat` succeeded about a regular
+        // file, so the size is real and is printed: it is what makes the
+        // withholding legible rather than mysterious.
+        let covered = SessionContextResult {
+            state: RepoContextStateKind::WithheldBoundary,
+            source: Some(RepoContextSource::TetonMd),
+            file: Some("TETON.md".to_owned()),
+            bytes_on_disk: Some(2_048),
+            resident_bytes: 0,
+            cap: 8_192,
+            truncated: false,
+        };
+        assert_eq!(
+            render_context(&covered)[1],
+            "context: TETON.md — 2048 bytes on disk, 0 resident, cap 8192"
+        );
+
+        // And the ordinary truncated case still reads as one sentence.
+        let truncated = SessionContextResult {
+            state: RepoContextStateKind::Truncated,
+            source: Some(RepoContextSource::TetonMd),
+            file: Some("TETON.md".to_owned()),
+            bytes_on_disk: Some(6_000),
+            resident_bytes: 4_096,
+            cap: 4_096,
+            truncated: true,
+        };
+        assert_eq!(
+            render_context(&truncated)[1],
+            "context: TETON.md — 6000 bytes on disk, 4096 resident, cap 4096 (truncated)"
         );
     }
 }

@@ -497,6 +497,22 @@ pub(super) fn snapshot_from_config(
             dir: transcript_dir.display().to_string(),
             retain_days: config.transcript.retain_days,
         }),
+        // REQ-612 BR-2/BR-7: the durable `[context] repo_file` default, read
+        // from the config's own key for `redact_enabled`'s reason — this is the
+        // same question `store_session_repo_context` asks when a session starts,
+        // and a second reading here could answer it differently.
+        //
+        // The cap is the daemon's pinned constant rather than a figure a client
+        // could hold, so `doctor`'s worst-case sentence and the truncation
+        // marker are two readings of one number (ADR-5's one-derivation rule).
+        // It is `REPO_CONTEXT_MAX_BYTES` and not a route's effective cap on
+        // purpose: `config/get` reports configuration, and no route is in scope
+        // here — the per-route quarter is `SessionContextResult::cap`'s to say,
+        // on the connection that asked about a session.
+        repo_context: Some(teton_protocol::methods::RepoContextPosture {
+            enabled: config.context.repo_file,
+            max_bytes: crate::repo_context::REPO_CONTEXT_MAX_BYTES as u64,
+        }),
     }
 }
 
@@ -696,6 +712,77 @@ mod tests {
             )
             .redact_enabled,
             "`[privacy] redact = true` must reach the client that asked for the config"
+        );
+    }
+
+    /// **REQ-612 BR-2/BR-7 (verify).** `config/get` reports the durable
+    /// `[context] repo_file` default, read from the config's own key.
+    ///
+    /// [`the_snapshot_reports_whether_the_redaction_scan_is_enabled`]'s twin,
+    /// for its reason: this is the same question `store_session_repo_context`
+    /// asks when a session starts, and a projection that answered it from
+    /// anywhere else — a constant, a router field, a session's own switch —
+    /// would put `/doctor` and `teton context` at odds with what the daemon
+    /// actually does when it loads a file.
+    ///
+    /// The cap is asserted as the pinned constant on both legs, because it is
+    /// configuration this projection reports and **not** a route's effective
+    /// quarter: no route is in scope at `config/get`, and the per-route figure
+    /// is `SessionContextResult::cap`'s to say.
+    ///
+    /// Mutation: pinning `enabled` to a literal, or reading it off anything but
+    /// `config.context.repo_file`, fails whichever leg disagrees with it — the
+    /// default leg for `true`, the opted-in leg for `false`.
+    #[test]
+    fn the_snapshot_reports_whether_the_repository_notes_are_on_by_default() {
+        // The default a machine with no `[context]` table has.
+        let absent = Config::default();
+        let posture = snapshot_from_config(
+            &absent,
+            &router_for_config(&absent),
+            false,
+            a_transcript_dir(),
+        )
+        .repo_context
+        .expect("the snapshot always states the notes posture");
+        assert_eq!(
+            posture.enabled, absent.context.repo_file,
+            "the snapshot must report the config's own key, not a second opinion"
+        );
+        assert_eq!(
+            posture.max_bytes,
+            crate::repo_context::REPO_CONTEXT_MAX_BYTES as u64
+        );
+
+        // And the other value of the same key, on the same projection — so the
+        // assertion above cannot pass by reporting a constant that happens to
+        // equal the default.
+        let flipped = Config {
+            context: teton_core::config::ContextConfig {
+                repo_file: !absent.context.repo_file,
+            },
+            ..Config::default()
+        };
+        let posture = snapshot_from_config(
+            &flipped,
+            &router_for_config(&flipped),
+            false,
+            a_transcript_dir(),
+        )
+        .repo_context
+        .expect("the snapshot always states the notes posture");
+        assert_eq!(
+            posture.enabled, flipped.context.repo_file,
+            "`[context] repo_file` did not reach the client that asked for the config"
+        );
+        assert_ne!(
+            posture.enabled, absent.context.repo_file,
+            "the two legs must disagree, or neither of them is reading the key"
+        );
+        assert_eq!(
+            posture.max_bytes,
+            crate::repo_context::REPO_CONTEXT_MAX_BYTES as u64,
+            "the cap this projection reports is configuration, not a route's quarter"
         );
     }
 

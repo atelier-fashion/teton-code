@@ -716,6 +716,198 @@ fn a_local_turn_records_one_unpriced_ledger_row_with_its_cached_count() {
 }
 
 // ---------------------------------------------------------------------------
+// REQ-612 AC-9 — the repository-notes block and the prefix cache
+// ---------------------------------------------------------------------------
+
+/// A repository-notes block rendered by the real renderer from a real file.
+///
+/// LESSON-544: a `RepoContextBlock` assembled here by hand would prove only
+/// that `build_system_prompt` appends a string. AC-9 is a claim about the
+/// **bytes** two turns' prompts share, so the bytes come from the producer —
+/// frame, naming sentence, closing sentence and all.
+fn repo_block(text: &str) -> tetond::repo_context::RepoContextBlock {
+    let file = tetond::repo_context::RepoContextFile {
+        source: teton_protocol::methods::RepoContextSource::TetonMd,
+        path: std::path::PathBuf::from("/repo/TETON.md"),
+        provenance: teton_core::ProvenanceId::from_resolved(
+            std::path::Path::new("/repo"),
+            std::path::Path::new("/repo/TETON.md"),
+        )
+        .expect("`/repo/TETON.md` is a file under `/repo`"),
+        bytes_on_disk: text.len() as u64,
+        key: tetond::repo_context::FileStat {
+            len: text.len() as u64,
+            mtime: None,
+            is_symlink: false,
+            is_regular: true,
+            // A synthetic key: this file was never `stat`ed, so it has
+            // no identity to carry and no second name to refuse.
+            dev: 0,
+            ino: 0,
+            nlink: 1,
+        },
+        text: text.to_owned(),
+    };
+    tetond::repo_context::RepoContextBlock::render(
+        &file,
+        tetond::repo_context::REPO_CONTEXT_MAX_BYTES,
+    )
+}
+
+/// The system prompt a turn carrying `notes` would run under.
+fn prompt_with_notes(notes: &str) -> String {
+    let config = HarnessConfig {
+        repo_context: Some(repo_block(notes)),
+        ..HarnessConfig::default()
+    };
+    build_system_prompt(&ToolRegistry::with_builtins(), &config)
+}
+
+/// **REQ-612 AC-9 / BR-6: an unchanged `TETON.md` costs the prefix cache
+/// nothing, and a changed one costs it exactly one turn.**
+///
+/// The claim is the inverse of BUG-181's shape: the notes are in the prompt so
+/// the model does not have to call a tool for them, and the price of putting
+/// them there is that the prompt's tail changes when the file does. This test
+/// says what that price is — one re-prefill, at the next turn, and nothing
+/// after it.
+///
+/// Four turns on one session, driven through the same
+/// [`PrefixCacheState`] the real engine runs (see this file's header for what
+/// that does and does not prove):
+///
+/// | turn | notes | expected |
+/// |---|---|---|
+/// | 1 | A | cold, necessarily |
+/// | 2 | A | hit, non-divergent, only the conversation delta prefilled |
+/// | 3 | B | the reuse stops at the block — the invalidation |
+/// | 4 | B | hit again, reusing at least what turn 2 did |
+///
+/// Turn 2 is the AC's first half, and it is asserted against turn 1's prompt
+/// rather than against a figure: the two system prompts must be **byte
+/// identical**, which is BR-6's "byte-identical across turns while the file is
+/// unchanged" and is what makes the hit possible at all.
+///
+/// **Mutation, run red.** Making `build_system_prompt` drop the block fails
+/// `an edited file must change the prompt, or the model never sees the edit` —
+/// the assertion that keeps this test from being a green statement about a
+/// prompt with no notes in it. A render that stopped being deterministic (a
+/// timestamp in the frame, an unordered set in the naming line) fails the
+/// byte-identity assertion above it, and then turn 2's `processed_tokens`
+/// bound; that one is reasoned, not run, because there is nothing in the
+/// renderer today to make non-deterministic.
+#[test]
+fn an_unchanged_repo_context_block_keeps_the_prefix_cache_and_a_changed_one_misses_once() {
+    let system_a = prompt_with_notes("Build with `cargo test`.\n");
+    let system_a_again = prompt_with_notes("Build with `cargo test`.\n");
+    let system_b = prompt_with_notes("Build with `cargo nextest run`.\n");
+
+    assert_eq!(
+        system_a, system_a_again,
+        "an unchanged file must render the same prompt bytes twice, or no turn \
+         after the first can ever hit"
+    );
+    assert_ne!(
+        system_a, system_b,
+        "an edited file must change the prompt, or the model never sees the edit"
+    );
+    assert!(
+        tokenize(&system_a).len() < WIDE_N_CTX as usize / 2,
+        "the fixture's prompt has to leave the window room for four turns"
+    );
+
+    let (mut engine, log) = CachingScriptedEngine::new(&["one.", "two.", "three.", "four."], true);
+
+    // Turns 1 and 2 under the same notes: an ordinary extending session.
+    let mut tail = String::new();
+    tail.push_str(" user turn one");
+    let reply = turn(&mut engine, "s1", &format!("{system_a}{tail}"));
+    tail.push(' ');
+    tail.push_str(reply.trim());
+    tail.push_str(" user turn two");
+    let reply = turn(&mut engine, "s1", &format!("{system_a}{tail}"));
+    tail.push(' ');
+    tail.push_str(reply.trim());
+
+    // Turn 3 rebuilds the head from the edited file — exactly what the
+    // `assemble` stage does at the start of the next prompt (BR-6) — and
+    // replays the same conversation under it.
+    tail.push_str(" user turn three");
+    let reply = turn(&mut engine, "s1", &format!("{system_b}{tail}"));
+    tail.push(' ');
+    tail.push_str(reply.trim());
+    // Turn 4: the file is unchanged again, so the session is back to extending.
+    tail.push_str(" user turn four");
+    turn(&mut engine, "s1", &format!("{system_b}{tail}"));
+
+    let calls = log.lock().expect("log").clone();
+    assert_eq!(calls.len(), 4);
+
+    assert_eq!(
+        calls[0].miss,
+        Some(MissReason::Cold),
+        "a first turn is cold"
+    );
+
+    // The AC's first half: an unchanged file is invisible to the cache.
+    assert_eq!(calls[1].miss, None, "an unchanged block must still hit");
+    assert!(
+        !calls[1].divergent,
+        "nothing was rewritten — the same notes rendered the same bytes"
+    );
+    assert!(
+        calls[1].processed_tokens <= 5,
+        "turn 2 prefilled {} tokens for a three-word delta: the whole system \
+         prompt was re-processed, so the block is not stable across turns",
+        calls[1].processed_tokens
+    );
+
+    // The AC's second half: a changed file invalidates, and the reuse stops at
+    // the block rather than somewhere earlier or later. `cached_tokens` is
+    // bounded above by the agreeing head of the two prompts, so a turn that
+    // reused past the edit would have to have reused text it never saw.
+    let agreeing_head = tokenize(&system_a)
+        .iter()
+        .zip(tokenize(&system_b).iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    assert!(
+        calls[2].cached_tokens as usize <= agreeing_head,
+        "turn 3 reused {} tokens past the {agreeing_head} its prompt shares \
+         with the resident one — the edit did not reach the model",
+        calls[2].cached_tokens
+    );
+    assert!(
+        calls[2].processed_tokens > calls[1].processed_tokens,
+        "turn 3 cost no more than turn 2, so the changed block was never \
+         re-prefilled"
+    );
+    assert_eq!(
+        calls[2].cached_tokens + calls[2].processed_tokens,
+        calls[2].prompt_tokens,
+        "cached and processed must partition the prompt exactly"
+    );
+
+    // …and it costs exactly one turn: the next one is an ordinary hit again.
+    assert_eq!(calls[3].miss, None, "turn 4 must be a hit");
+    assert!(
+        !calls[3].divergent,
+        "turn 4 extends turn 3's prompt — nothing was rewritten"
+    );
+    assert!(
+        calls[3].processed_tokens <= 5,
+        "turn 4 prefilled {} tokens: the invalidation cost more than the one \
+         turn AC-9 allows",
+        calls[3].processed_tokens
+    );
+    assert!(
+        calls[3].cached_tokens >= calls[1].cached_tokens,
+        "turn 4 reused less than turn 2 did, so the session never recovered \
+         the prefix the edit cost it"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The policy seam itself
 // ---------------------------------------------------------------------------
 

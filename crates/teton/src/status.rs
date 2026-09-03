@@ -122,6 +122,75 @@ pub fn transcript_line(enabled_default: bool, effective_dir: &str, retain_days: 
     format!("{TRANSCRIPT_LABEL}: {default} by default{FIELD_SEPARATOR}{effective_dir}{FIELD_SEPARATOR}{kept}")
 }
 
+/// The `repo notes:` label, shared by `teton doctor`, `/doctor` and
+/// `teton context status` so the three cannot drift (REQ-612 AC-11, the
+/// [`TRANSCRIPT_LABEL`] rule).
+pub const REPO_NOTES_LABEL: &str = "repo notes";
+
+/// One line stating the machine's repository-notes posture (REQ-612 BR-2,
+/// BR-7): the durable `[context] repo_file` default and the cap a resident
+/// block is bounded by.
+///
+/// Pure, like [`transcript_line`]: the caller reads the posture off `config/get`
+/// and hands the two facts in. `max_bytes` is the daemon's own
+/// `REPO_CONTEXT_MAX_BYTES` rather than a constant on this side, so the figure
+/// this line prints is the figure the daemon actually bounds a block with.
+///
+/// The off arm says **the file is never opened** rather than merely "off",
+/// because BR-2's off is not "loaded and ignored": it is zero reads, and a user
+/// deciding whether the switch protects a file from being read needs the line
+/// to answer that. The cap is dropped from the off arm for the same reason — a
+/// ceiling on bytes that are never read would be describing nothing.
+#[must_use]
+pub fn repo_notes_line(enabled_default: bool, max_bytes: u64) -> String {
+    if enabled_default {
+        format!(
+            "{REPO_NOTES_LABEL}: on (default){FIELD_SEPARATOR}TETON.md or AGENTS.md at the \
+             session root{FIELD_SEPARATOR}up to {max_bytes} bytes resident"
+        )
+    } else {
+        format!("{REPO_NOTES_LABEL}: off (default){FIELD_SEPARATOR}the file is never opened")
+    }
+}
+
+/// The advisory a **truncated** notes file earns on `doctor` (REQ-612 BR-7,
+/// AC-11).
+///
+/// Advisories are `doctor`'s established shape for "this is not broken, and you
+/// probably did not mean it" (REQ-578): one line, a remedy in it, and no change
+/// to the exit status. The remedy is the file's, not Teton's — the cap is
+/// pinned (ADR-5 / OQ-6) — so the sentence says trim rather than offering a knob
+/// that does not exist.
+///
+/// Both figures, for [`teton_protocol::methods::SessionContextResult`]'s reason:
+/// "9,412 on disk, 8,192 resident" is what makes a truncation legible, and
+/// either number alone reads as a complete file.
+#[must_use]
+pub fn repo_notes_truncated_advisory(
+    file: &str,
+    bytes_on_disk: u64,
+    resident_bytes: u64,
+) -> String {
+    format!(
+        "advisory: {REPO_NOTES_LABEL}: {file} is {bytes_on_disk} bytes; the first \
+         {resident_bytes} are resident — trim the file or move detail below the fold. \
+         The cap is pinned, so the remedy is the file's."
+    )
+}
+
+/// The advisory a **withheld** notes file earns on `doctor` (REQ-612 BR-5,
+/// BR-7, AC-11).
+///
+/// `why` is the daemon's own word for the state — a boundary, the switch, or an
+/// unreadable file — because those are three different remedies (a boundary to
+/// relax, a switch to flip, a file to fix) and a line that folded them would
+/// send a user to the wrong one. It arrives already bounded and is defused again
+/// by `Surface::line`, the two-layer rule an `io::Error`'s text takes.
+#[must_use]
+pub fn repo_notes_withheld_advisory(file: &str, why: &str) -> String {
+    format!("advisory: {REPO_NOTES_LABEL}: {file} is not resident — {why}")
+}
+
 /// Reading the **client's** own sources, for the seam assertion below.
 ///
 /// The client twin of `tetond`'s `call_sites::scan`, and a separate copy rather
@@ -569,6 +638,83 @@ mod transcript_line_tests {
         assert!(
             transcript_line(true, "/x", 0).ends_with("kept forever"),
             "retain_days = 0 is BR-13's never-prune and is said in words"
+        );
+    }
+}
+
+#[cfg(test)]
+mod repo_notes_line_tests {
+    use super::*;
+
+    /// **REQ-612 BR-2/BR-7.** The posture names the durable default, the two
+    /// file names the daemon looks for, and the cap it bounds a block with —
+    /// and the off arm says the file is never *opened*, which is the whole
+    /// content of BR-2's "off means unopened".
+    ///
+    /// **Mutation (run 2026-09-03):** making the off arm print the cap too
+    /// reddened the `!contains("up to")` assertion — a ceiling on bytes nobody
+    /// reads describes nothing; restored.
+    #[test]
+    fn the_repo_notes_line_states_the_default_the_files_and_the_cap() {
+        let on = repo_notes_line(true, 8_192);
+        assert!(
+            on.starts_with("repo notes: on (default)"),
+            "the default comes first; got: {on}"
+        );
+        assert!(
+            on.contains("TETON.md") && on.contains("AGENTS.md"),
+            "the line names both files the daemon looks for; got: {on}"
+        );
+        assert!(
+            on.contains("up to 8192 bytes resident"),
+            "BR-7 asks the cost be stated; got: {on}"
+        );
+
+        let off = repo_notes_line(false, 8_192);
+        assert!(off.starts_with("repo notes: off (default)"), "got: {off}");
+        assert!(
+            off.contains("never opened"),
+            "BR-2's off is zero reads, not a loaded-and-ignored file; got: {off}"
+        );
+        assert!(
+            !off.contains("up to"),
+            "a cap on bytes that are never read describes nothing; got: {off}"
+        );
+    }
+
+    /// **REQ-612 BR-7 / AC-11.** Both advisories name the file and carry a
+    /// remedy; the truncated one carries both byte figures, because either
+    /// alone reads as a complete file.
+    ///
+    /// **Mutation (run 2026-09-03):** dropping `resident_bytes` from the
+    /// truncated sentence reddened the `contains("8192")` assertion; restored.
+    #[test]
+    fn each_advisory_names_the_file_and_a_remedy() {
+        let truncated = repo_notes_truncated_advisory("TETON.md", 9_412, 8_192);
+        assert!(
+            truncated.starts_with("advisory: repo notes: "),
+            "{truncated}"
+        );
+        assert!(
+            truncated.contains("TETON.md")
+                && truncated.contains("9412")
+                && truncated.contains("8192"),
+            "the pair is what makes a truncation legible; got: {truncated}"
+        );
+        assert!(
+            truncated.contains("trim the file"),
+            "an advisory with no remedy is a dead end; got: {truncated}"
+        );
+
+        let withheld = repo_notes_withheld_advisory(
+            "TETON.md",
+            "a local-only boundary covers it, and a session-long pin is not what a \
+             boundary means",
+        );
+        assert!(withheld.starts_with("advisory: repo notes: "), "{withheld}");
+        assert!(
+            withheld.contains("TETON.md") && withheld.contains("boundary"),
+            "the daemon's own reason travels rather than being re-worded; got: {withheld}"
         );
     }
 }

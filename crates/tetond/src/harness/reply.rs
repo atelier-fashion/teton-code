@@ -61,6 +61,15 @@ use teton_inference::ChatFormat;
 /// opposite payoff: a model that emits one is not claiming to hold a skill body
 /// but re-drawing the line inside one the harness already wrote, which is how a
 /// forged region ends up outside the "this is data" sentence.
+/// `<repo-notes` ([`super::render::REPO_NOTES_OPEN_TAG`]) is the REQ-612 BR-4
+/// frame around the repository's own notes in the system prompt. A model that
+/// emits one flush-left is claiming the repository said something it never
+/// said — and because that frame's closing line is harness prose ("the notes
+/// end there"), a fabricated opening is a way to put model-authored text where
+/// the reader has been told the *repository* is speaking.
+///
+/// Only the **opening** spellings are listed; the closers stay input-only
+/// (BUG-151, and see `every_opening_envelope_tag_is_also_an_output_marker`).
 pub(super) const FLAT_ANCHORED_MARKERS: &[&str] = &[
     "User:",
     "Assistant:",
@@ -69,6 +78,7 @@ pub(super) const FLAT_ANCHORED_MARKERS: &[&str] = &[
     "<mcp-tool-result",
     "<skill-body",
     "<skill-arguments",
+    super::render::REPO_NOTES_OPEN_TAG,
 ];
 
 /// Line-anchored fabrication markers for the ChatML rendering (REQ-554 BR-4,
@@ -87,6 +97,7 @@ pub(super) const CHATML_ANCHORED_MARKERS: &[&str] = &[
     "<mcp-tool-result",
     "<skill-body",
     "<skill-arguments",
+    super::render::REPO_NOTES_OPEN_TAG,
     super::context::TOOL_RESULT_LABEL_PREFIX,
 ];
 

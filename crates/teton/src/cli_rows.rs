@@ -158,6 +158,12 @@ pub(crate) const SHELL_ONLY: &[&str] = &[
     "transcript enable",
     "transcript disable",
     "transcript status",
+    // REQ-612: the same shape one lifetime over — the durable
+    // `[context] repo_file` default is a shell command by design, and the
+    // session's `/context on|off` is a different lifetime, not a twin.
+    "context enable",
+    "context disable",
+    "context status",
 ];
 
 /// What [`write_gate`] decides.
@@ -711,6 +717,17 @@ pub(crate) fn refusal_for_path(path: &[&str]) -> String {
             "`teton {spelling}` is shell-only: it sets the machine's durable transcript default, \
              so nothing was run — run `teton {spelling}` from a shell; this session's own \
              switch is `/transcript on` and `/transcript off`."
+        );
+    }
+    // REQ-612: the same split one feature over. The durable half decides what
+    // *every future session* starts from; the session's own switch is
+    // `/context on|off` and writes nothing, so the refusal names both rather
+    // than sending a user to a shell for something they can type here.
+    if spelling.starts_with("context ") && SHELL_ONLY.contains(&spelling.as_str()) {
+        return format!(
+            "`teton {spelling}` is shell-only: it sets the machine's durable repository-notes \
+             default, so nothing was run — run `teton {spelling}` from a shell; this session's \
+             own switch is `/context on` and `/context off`."
         );
     }
     if SHELL_ONLY.contains(&spelling.as_str()) {
@@ -1455,9 +1472,18 @@ mod tests {
     /// re-worded any of it would be the second estimator ADR-11 exists to
     /// prevent (LESSON-456; REQ-586 verify M1).
     ///
+    /// **REQ-612 AC-11 rides here too**: the same in-session report asks
+    /// `session/context` and turns a `truncated` answer into the advisory. It
+    /// shares this test rather than taking one of its own because it is the same
+    /// claim about the same call sequence — a session `/doctor` asks the daemon
+    /// about *this session* — and a second scripted connection would only
+    /// re-stage the fixture.
+    ///
     /// **Mutation**: reformat, re-order or summarize the report here and the
     /// byte assertion fails; drop the `verbose` flag from the params and the
-    /// params assertion does.
+    /// params assertion does. **Mutation (run 2026-09-03):** dropping the
+    /// `advise_on_repo_context` call from `doctor_report_on` reddened the
+    /// advisory assertion; restored.
     #[test]
     fn a_session_doctor_asks_for_the_skill_preflight_and_prints_it_verbatim() {
         let report = "skills: 1 of 3 dispatchable skill(s) will not fit on this route \
@@ -1466,6 +1492,16 @@ mod tests {
             empty_config(),
             serde_json::to_value(teton_protocol::methods::SkillsPreflightResult {
                 rendered: report.to_owned(),
+            })
+            .expect("the result serializes"),
+            serde_json::to_value(teton_protocol::methods::SessionContextResult {
+                state: teton_protocol::methods::RepoContextStateKind::Truncated,
+                source: Some(teton_protocol::methods::RepoContextSource::TetonMd),
+                file: Some("TETON.md".to_owned()),
+                bytes_on_disk: Some(9_412),
+                resident_bytes: 8_192,
+                cap: 8_192,
+                truncated: true,
             })
             .expect("the result serializes"),
         ]);
@@ -1502,6 +1538,15 @@ mod tests {
                  `{line}` from {lines:?}"
             );
         }
+
+        // REQ-612 AC-11: the truncated file earns its advisory, in the shared
+        // composer's words and with both byte figures.
+        let notices = surface.lines_of(LineKind::Notice);
+        assert!(
+            notices.iter().any(|line| line
+                == &crate::status::repo_notes_truncated_advisory("TETON.md", 9_412, 8_192)),
+            "a session `/doctor` must advise on a truncated notes file: {notices:?}"
+        );
     }
 
     /// The shell twin owns no session, so it says so rather than answering
@@ -1978,7 +2023,10 @@ mod guide_tests {
     /// The same bytes `build_system_prompt` embeds as `SELF_CONFIG_GUIDE`, not
     /// a copy of them — a copy is a file that agrees with the prompt until
     /// somebody edits one of the two.
-    const GUIDE: &str = include_str!("../../tetond/src/harness/self_config.md");
+    ///
+    /// `pub(super)` so [`super::readme_tests`] reads the one embedding rather
+    /// than opening the guide a second time (REQ-612 AC-11).
+    pub(super) const GUIDE: &str = include_str!("../../tetond/src/harness/self_config.md");
 
     /// The mirrored rows whose session answer is **not** `/<row name>`.
     ///
@@ -2090,6 +2138,127 @@ mod guide_tests {
                      step 1 does), or drop the equivalence and add the row's own spelling."
                 );
             }
+        }
+    }
+}
+
+/// **The README's session-command tables and this build name the same
+/// commands** (REQ-612 AC-11, the [`guide_tests`] rule one document over).
+///
+/// [`guide_tests`] pins the *resident guide* against the mirrored rows. This
+/// pins the *README* against the whole table, and the two are different
+/// failures: a guide that names a shell form sends a session user to a
+/// terminal, while a README that names a command the build does not carry sends
+/// a new user to a line that answers `unknown command`. REQ-612 is where the
+/// second one became live — `/context` is documented and dispatched by two
+/// different tasks, and nothing until now made the pair fail together.
+#[cfg(test)]
+mod readme_tests {
+    use super::guide_tests::GUIDE;
+    use crate::slash::{builtin_spellings, session_only_rows};
+
+    /// The README's own bytes, embedded the way [`GUIDE`] is — compile time, no
+    /// runtime scan of a file path (BUG-159). The cost is that this crate
+    /// rebuilds when the README changes, which is exactly the coupling being
+    /// asserted.
+    const README: &str = include_str!("../../../README.md");
+
+    /// Every command the README's session tables document, as the table spells
+    /// it minus its placeholders: `provider add`, `model set`, `context`.
+    ///
+    /// A row is a markdown line whose first cell is a backticked `/command`, so
+    /// this reads the two "Command | Effect" tables and nothing else — prose
+    /// that mentions a command in passing is not a documented row and is not
+    /// this test's subject.
+    ///
+    /// Placeholders are dropped by **keeping** the leading run of bare words:
+    /// a command's own words are lowercase and hyphenated (`set-tier`), and
+    /// everything a user substitutes is bracketed, angled, dashed or elided
+    /// (`<name>`, `[on|off]`, `--kind`, `…`). Written as a positive rule rather
+    /// than a list of things to strip, so a placeholder spelled a new way stops
+    /// the scan instead of being mistaken for a command word.
+    fn readme_session_commands() -> Vec<String> {
+        README
+            .lines()
+            .filter_map(|line| {
+                let cell = line.strip_prefix("| `/")?;
+                let spelling = cell.split('`').next()?;
+                let words: Vec<&str> = spelling
+                    .split_whitespace()
+                    .take_while(|word| {
+                        !word.is_empty() && word.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                    })
+                    .collect();
+                (!words.is_empty()).then(|| words.join(" "))
+            })
+            .collect()
+    }
+
+    /// AC-11: every README session row names a command this build dispatches,
+    /// the `/context` row is one of them, and the resident guide names no
+    /// `teton …` form for a session-only command.
+    ///
+    /// **Why the two halves share a test.** They are one claim about one
+    /// command's two documents: the README is where a user finds `/context`, and
+    /// the guide is what the *model* answers from when asked how to reach it.
+    /// A `/context` documented in the README and reachable in the guide only as
+    /// `teton context on` — which is not a command at all — would be the
+    /// BUG-181 shape with Teton's own instructions as the author, and a test
+    /// that checked only the first half would pass through it.
+    ///
+    /// **Mutation (run 2026-09-03):** adding `teton context` to a copy of the
+    /// guide reddened the second half; deleting the `/context` README row
+    /// reddened the first. Restored both.
+    #[test]
+    fn every_readme_session_row_has_a_command_and_the_guide_names_no_shell_form() {
+        let documented = readme_session_commands();
+        assert!(
+            documented.len() >= 20,
+            "the README's session-command tables shrank to {} rows, so this check now \
+             holds over almost nothing — re-anchor it rather than leaving the tables \
+             ungated. Found: {documented:?}",
+            documented.len()
+        );
+
+        let spellings = builtin_spellings();
+        for row in &documented {
+            assert!(
+                spellings.contains(&row.as_str()),
+                "the README documents `/{row}` and no row in `slash::COMMANDS` is spelled \
+                 `{row}`, so a user who follows the README is answered `unknown command`. \
+                 Either the row was renamed — fix the README and the table together — or \
+                 the README is advertising a command this build does not have. \
+                 Table: {spellings:?}"
+            );
+        }
+
+        // REQ-612 AC-12's client half: the row TASK-378 adds to the README is
+        // the row this task's table carries. Named outright rather than left to
+        // the sweep, which is a conditional over whatever the README happens to
+        // list and would pass a README that simply never mentioned `/context`.
+        assert!(
+            documented.iter().any(|row| row == "context"),
+            "the README's session-command table names no `/context` row (REQ-612 AC-12). \
+             It is TASK-378's to add — do not add it from the CLI task; if that commit \
+             has not landed yet, this failure is the coordination working. Found: \
+             {documented:?}"
+        );
+
+        // The guide half. A session-only row has no `teton …` form at all, so
+        // the resident prompt naming one would be advertising a command that
+        // does not exist — the inverse of REQ-582 BR-9's defect and the same
+        // harm. `teton context …` *does* exist, and that is exactly why the
+        // check matters here: it is a different lifetime, and a guide that
+        // offered it as the answer to "how do I stop carrying the notes in this
+        // session" would be teaching a machine-wide config write.
+        for row in session_only_rows() {
+            let shell = format!("teton {row}");
+            assert!(
+                !GUIDE.contains(&shell),
+                "the bundled guide names `{shell}`, and `/{row}` is a session-only row: \
+                 either there is no such shell command, or it is a different lifetime \
+                 from the one a session user is asking about. Name `/{row}` instead."
+            );
         }
     }
 }

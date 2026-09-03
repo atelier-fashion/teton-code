@@ -1,0 +1,113 @@
+{
+  "req": "REQ-612",
+  "branch": "feat/REQ-612-teton-md-repo-context-file",
+  "startedAt": "2026-09-03T18:01:58Z",
+  "completed": false,
+  "currentPhase": 7,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "integrationBranch": "main",
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Resolve Repos + Worktree + Preflight + Draft PR",
+      "completedAt": "2026-09-03T18:02:04Z",
+      "notes": "single-repo; worktree /Users/brettluelling/GitHub/teton-code/.worktrees/REQ-612; draft PR #281"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Requirement Spec",
+      "completedAt": "2026-09-03T18:02:26Z",
+      "verdict": "APPROVED (validated 2026-09-03 earlier this session; re-checked mechanically at gate; status already approved)"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Break Into Tasks",
+      "completedAt": "2026-09-03T18:03:31Z",
+      "notes": "architecture.md (8 ADRs) and TASK-369..378 produced by /architect on 2026-09-03 earlier this session and landed on main in #280; single repo teton-code, 10 tasks, mergeOrder [teton-code]"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-09-03T18:03:31Z",
+      "verdict": "VALIDATED \u2014 10 tasks, DAG acyclic, max 3 deps, 20/21 obligations mapped (AC-13 dogfood unmapped by design, advisory), benign paths present"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-09-03T20:44:12Z",
+      "notes": "tiers: [369,370,372] -> [371] -> [373] -> [374,375] -> [376,378] -> [377]; all 10 complete; orchestrator hotfix 393a765 for exhaustive matches after TASK-370; workspace 4,214 passed"
+    },
+    {
+      "phase": 5,
+      "name": "Verify (6-agent review + 2 fix passes + confirmation loops)",
+      "completedAt": "2026-09-03T22:38:34Z",
+      "verdict": "PASS after fixes \u2014 first pass: 0 critical, 5 correctness majors + 3 reflector majors (2 overlapping) + 1 security medium, all fixed in 1a30958; confirmation loop found the symlink fix closed the wrong seam (High) + 4 majors, fixed in 1d54520 (identity-checked read by dev/ino, honest sizes/caps, reroute announces); second confirmation: High closed, 2 Lows fixed in 661eed2. Workspace 4,228 passed / 0 failed. Halt #2: reflector user-facing questions surfaced (floored-route headroom invariant; docs-topic trims; AC-13 dogfood owner)."
+    },
+    {
+      "phase": 6,
+      "name": "Create Pull Request",
+      "completedAt": "2026-09-03T23:20:28Z",
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/281",
+      "notes": "draft #281 flipped to ready; body set; requirement status complete"
+    }
+  ],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-612",
+      "branch": "feat/REQ-612-teton-md-repo-context-file",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/281",
+      "prNumber": 281,
+      "prCreatedAt": "2026-09-03T18:02:01Z",
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-370",
+      "TASK-369",
+      "TASK-372",
+      "TASK-371",
+      "TASK-373",
+      "TASK-375",
+      "TASK-374",
+      "TASK-378",
+      "TASK-376",
+      "TASK-377"
+    ],
+    "failedTasks": [],
+    "tier": 5,
+    "notes": [
+      "TASK-370 5951ca0: Event::RepoContextState makes crates/teton fail to compile until TASK-376 adds the session_ui arm \u2014 test per crate until then",
+      "TASK-369 3ceeb28 (serde field default via fn, not bare #[serde(default)]; config_document untouched by design); orchestrator hotfix commit adds the SetRepoContextEnabled + RepoContextState arms so the workspace compiles between tiers",
+      "TASK-371 9290fb6: refresh(current,..) not &self; strip->neutralize->truncate so the cap is a hard bound; worst_case() is the widest block (AgentsMd, truncated); refresh costs two stats on a changed turn",
+      "TASK-373 03dd226: CarriedTurn lives at crates/tetond/src/carry.rs (task path corrected); RouteBudget golden rows gained repo_context_cap 8192; rebudget re-states the set with no new parameter",
+      "TASK-375 9ccc983: ceiling measured at 23 KiB not 22 (block costs 8,603 resident bytes); REDACT_TOTAL_CAP_CHUNKS 3->4; scannable bound rises 141,224->184,265; margins 742/789; architecture+spec amended to the measured figures",
+      "TASK-374 ae7235a: store_session_repo_context/session_context live in runtime/mod.rs; config/get posture deferred to TASK-376 (no ConfigSnapshot field on the wire yet); cap reports REPO_CONTEXT_MAX_BYTES between turns",
+      "TASK-378 1a37a7b: no README cross-check exists in cli_rows.rs (AC-12's clause not mechanically satisfiable as written); context.md at 4,074/4,096 after trimming; local budget is 63,488 since REQ-590 so the cap is ~1/8 local \u2014 spec/ADR-5 wording corrected",
+      "TASK-376 94cb5a6: ConfigSnapshot.repo_context posture added additively; doctor advisories via /doctor in-session (shell doctor prints posture only); /verbose notes bytes from the last repo_context_state seen",
+      "TASK-377 4deba04: workspace 4,214 passed / 0 failed; AC-5's 'any one neutralizer' claim false for neutralize_frame_labels (twice-applied at assemble/prepare) \u2014 recorded green; AC-6 has no structural mutation"
+    ]
+  },
+  "conflictsResolved": [],
+  "blockers": [],
+  "notes": [
+    "2026-09-03T22:41:57Z halt #2 resolved by product owner: (1) MIN_BUDGET_BYTES raised to 50,000 so a floored route carries the full 8 KiB block under the 2x invariant; (2) MAX_TOPIC_BYTES raised to 50,000 and the four trimmed context-topic facts restored; (3) not decided \u2014 assumed: AC-13 stays OUTSTANDING and this repo's own TETON.md waits for REQ-613 to generate it"
+  ]
+}

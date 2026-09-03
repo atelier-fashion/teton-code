@@ -29,10 +29,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use teton_core::session_root::CwdRefusal;
-use teton_protocol::methods::SessionSummary;
+use teton_protocol::methods::{RepoContextStateKind, SessionSummary};
 use teton_protocol::{Phase, SessionId, SessionMode, TurnId};
 
 use crate::harness::context::{ContextBlock, RetainedContext};
+use crate::repo_context::RepoContextState;
 use crate::skills::SkillRegistry;
 
 /// One session as the registry holds it: what clients see, plus what only the
@@ -80,6 +81,57 @@ struct SessionRecord {
     /// registry lock (LESSON-448's rule at a smaller scale: a lock held across a
     /// deep copy is a lock every other session waits on).
     skills: Arc<SkillRegistry>,
+    /// The repository's own notes, as this session last read them (REQ-612
+    /// BR-1, ADR-3).
+    ///
+    /// Beside [`Self::skills`] because it is the same kind of fact and moves at
+    /// the same three moments: a **snapshot** derived from the root the session
+    /// stands on, taken at `session/create`, retaken when the root moves, and —
+    /// unlike the skill registry — re-checked at the start of each prompt turn
+    /// against one `stat` (BR-6). Storing it anywhere else would be a second
+    /// thing to move on `/cd`.
+    ///
+    /// [`RepoContextState::Absent`] until the first load, which is the honest
+    /// reading of a record nobody has derived yet: no file is resident, and the
+    /// prompt is byte-identical to a build without this feature.
+    ///
+    /// Behind an [`Arc`] for [`Self::skills`]'s reason at a smaller scale — the
+    /// state carries up to 64 KiB of file text, and a turn reading it under the
+    /// registry lock would hold that lock for the copy.
+    repo_context: Arc<RepoContextState>,
+    /// The last `repo_context_state` this session **published**, as the triple
+    /// a client actually renders (REQ-612 BR-3, AC-3).
+    ///
+    /// Separate from [`Self::repo_context`] because the two answer different
+    /// questions, and conflating them let a truncation go out in silence. The
+    /// stored state is the *file*, classified once at the widest cap any route
+    /// can ask for; what a client is told is the file **as this route rendered
+    /// it**, and a narrower route cap renders the same unchanged file as a truncated
+    /// block. So a session that moves from an 8,192-cap route to a 4,096-cap one
+    /// has a stored state that did not move and news that did.
+    ///
+    /// The triple is `(state, truncated, resident_bytes)` — the three fields a
+    /// route can move without the file moving; `source`, `bytes_on_disk` and
+    /// `reason` are facts about the file, and a change to one of *those* is
+    /// announced through [`SessionRegistry::claim_repo_context_publish`]'s
+    /// `always`.
+    ///
+    /// Seeded rather than `Option`: see the constructor.
+    repo_context_published: (RepoContextStateKind, bool, u64),
+    /// This session's `/context on|off`, or `None` while it follows the durable
+    /// `[context] repo_file` default (REQ-612 BR-2).
+    ///
+    /// Three values rather than two, and the third is what makes the two
+    /// switches composable: `None` is "nobody has said anything about *this*
+    /// session", so a `config/set` that flips the durable default reaches every
+    /// session that has not overridden it. A `bool` seeded from the config at
+    /// create would freeze each session at the value the config held that
+    /// moment, which is the second store REQ-611 ASSUME-017 keeps this feature
+    /// free of.
+    ///
+    /// Never persisted: `/context off` is a fact about one session and writes
+    /// nothing to `config.toml` (BR-2).
+    context_switch: Option<bool>,
 }
 
 /// One session's conversation: the ordered blocks the harness retained, turn
@@ -512,6 +564,25 @@ impl SessionRegistry {
                 // id being returned here is the first anyone learns of the
                 // session, and reaching it needs that id.
                 skills: Arc::new(SkillRegistry::default()),
+                // Absent until the caller loads one ([`Self::set_repo_context`]),
+                // for the reason above it: the load needs the session's probed
+                // root, its boundary set and the durable switch, and this
+                // registry holds none of the three. Nothing can observe the gap
+                // — the id being returned here is the first anyone learns of the
+                // session.
+                repo_context: Arc::new(RepoContextState::Absent),
+                // Seeded with `absent` rather than left unstated, because
+                // `absent` is what silence *means* on this event: a client that
+                // has heard nothing correctly renders no notes line, which is
+                // the same thing an `absent` event would tell it. Leaving this
+                // unset would make the first turn of every session in every
+                // directory without a `TETON.md` publish an `absent` nobody
+                // asked for — the line LESSON-513 is about.
+                repo_context_published: (RepoContextStateKind::Absent, false, 0),
+                // No session has said anything about itself yet, so every one of
+                // them follows `[context] repo_file` until someone types
+                // `/context`.
+                context_switch: None,
             });
         Ok(summary)
     }
@@ -708,6 +779,208 @@ impl SessionRegistry {
             .find(|record| &record.summary.session_id == id)
             .map(|record| Arc::clone(&record.skills))
             .unwrap_or_default()
+    }
+
+    /// Replace this session's repository notes (REQ-612 BR-1, ADR-3).
+    ///
+    /// Called from the **three** sites ADR-3 names and nowhere else: at
+    /// `session/create`, inside `session/set_cwd` before the move is announced,
+    /// and from the turn's `assemble` stage when BR-6's staleness check says the
+    /// file moved. `/context on|off` reaches it through the first of those
+    /// spellings, since a switch that changed is a state that changed.
+    ///
+    /// Unconditional, like [`Self::set_skills`] beside it: the file is re-read
+    /// as often as its key moves. `false` only for a session the registry does
+    /// not have.
+    ///
+    /// **The publish is the caller's, and it happens after this returns.** The
+    /// event bus is not to be touched while this mutex is held — the
+    /// `set_session_cwd` discipline, and the reason `store_session_repo_context`
+    /// separates the store from the announcement.
+    pub fn set_repo_context(&self, id: &SessionId, state: RepoContextState) -> bool {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .expect("session registry mutex poisoned");
+        let Some(record) = sessions
+            .iter_mut()
+            .find(|record| &record.summary.session_id == id)
+        else {
+            return false;
+        };
+        record.repo_context = Arc::new(state);
+        true
+    }
+
+    /// This session's repository notes, as the next turn's staleness check
+    /// compares them and as `/context` reports them.
+    ///
+    /// A cloned [`Arc`], so the lock is held for a pointer bump rather than for
+    /// a copy of the file's text (LESSON-448) — the same trade
+    /// [`Self::skills`] makes.
+    ///
+    /// A session the registry does not have answers [`RepoContextState::Absent`],
+    /// for [`Self::skills`]'s reason: a session that does not exist carries no
+    /// notes, and `Absent` is a state every consumer already handles — it is
+    /// what a session at a `home` root has.
+    #[must_use]
+    pub fn repo_context(&self, id: &SessionId) -> Arc<RepoContextState> {
+        self.sessions
+            .lock()
+            .expect("session registry mutex poisoned")
+            .iter()
+            .find(|record| &record.summary.session_id == id)
+            .map_or_else(
+                || Arc::new(RepoContextState::Absent),
+                |record| Arc::clone(&record.repo_context),
+            )
+    }
+
+    /// Claim the right to publish `triple` as this session's
+    /// `repo_context_state`, and record it (REQ-612 BR-3, AC-3).
+    ///
+    /// `true` when the caller should announce — which is when the triple differs
+    /// from the last one published for this session, **or** when `always` says
+    /// the stored state itself moved. `false` when a client has already been
+    /// told exactly this, and the news would be a duplicate line on every prompt
+    /// of a session whose notes have not moved.
+    ///
+    /// # Two reasons to publish, and both are needed
+    ///
+    /// `always` is the *file* moving: a `/cd` between two repositories whose
+    /// notes happen to be the same size renders an identical triple and is
+    /// still a different file, so the client is owed the line.
+    ///
+    /// The triple is the *render* moving. The turn path renders at the route's
+    /// own cap, so a session that reroutes from an 8,192-cap route to a
+    /// narrower-cap one has a stored state that did not change and a truncation the
+    /// user has not been told about — which is exactly the silence BR-3 forbids.
+    /// Gating the publish on [`Self::set_repo_context`]'s `false` (the shape
+    /// this replaced) could not see that, because nothing about the *file*
+    /// moved.
+    ///
+    /// The triple is `(state, truncated, resident_bytes)` — the three fields a
+    /// route can move on its own. `source`, `bytes_on_disk` and `reason` are
+    /// facts about the file and are covered by `always`.
+    ///
+    /// # The record moves only when the announcement does
+    ///
+    /// A triple stored without being published would let a later, identical
+    /// render be suppressed against a line no client ever saw. So this writes
+    /// exactly when it returns `true`, read and write under one lock, so two
+    /// turns of one session cannot both decide they are the change. The publish
+    /// itself is the caller's and happens after this returns, outside the mutex
+    /// — the [`Self::set_repo_context`] discipline.
+    ///
+    /// `false` for a session the registry does not have: a session that is gone
+    /// has no client to tell.
+    pub fn claim_repo_context_publish(
+        &self,
+        id: &SessionId,
+        triple: (RepoContextStateKind, bool, u64),
+        always: bool,
+    ) -> bool {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .expect("session registry mutex poisoned");
+        let Some(record) = sessions
+            .iter_mut()
+            .find(|record| &record.summary.session_id == id)
+        else {
+            return false;
+        };
+        if !always && record.repo_context_published == triple {
+            return false;
+        }
+        record.repo_context_published = triple;
+        true
+    }
+
+    /// Replace this session's repository notes **and** claim the right to
+    /// announce `triple` for them, under one lock (REQ-612 BR-1/BR-3).
+    ///
+    /// [`Self::set_repo_context`] followed by
+    /// [`Self::claim_repo_context_publish`] is the same two writes and is
+    /// **not** the same operation. Between the two calls the mutex is free, so
+    /// two concurrent `/cd`s can interleave: A stores its state, B stores its
+    /// state and claims its triple, then A claims *its* triple over B's. The
+    /// registry is then holding B's file beside A's published record, and the
+    /// next turn measures its news against a line no client was ever sent —
+    /// which is the exact failure the published record exists to prevent.
+    ///
+    /// So the lifecycle sites take this instead, and it is the only shape that
+    /// makes "the state and the line about it move together" a property of the
+    /// registry rather than of two calls staying adjacent.
+    ///
+    /// The claim is unconditional here — this is only reached once the caller
+    /// has established that the **state itself** moved, which is `always` by
+    /// construction; the turn path's gate is the conditional one, because a
+    /// route can move the render without moving the file.
+    ///
+    /// `false` for a session the registry does not have: nothing is stored and
+    /// there is no client to tell. The publish is still the caller's and still
+    /// happens after this returns, outside the mutex (LESSON-448).
+    pub fn store_and_claim_repo_context(
+        &self,
+        id: &SessionId,
+        state: RepoContextState,
+        triple: (RepoContextStateKind, bool, u64),
+    ) -> bool {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .expect("session registry mutex poisoned");
+        let Some(record) = sessions
+            .iter_mut()
+            .find(|record| &record.summary.session_id == id)
+        else {
+            return false;
+        };
+        record.repo_context = Arc::new(state);
+        record.repo_context_published = triple;
+        true
+    }
+
+    /// Set this session's `/context` switch (REQ-612 BR-2).
+    ///
+    /// Session-scoped and never persisted: the durable half is
+    /// `[context] repo_file` through `config/set`, and the two are composed —
+    /// not merged — by the reader, so this write cannot be mistaken for a
+    /// machine-wide one. `false` only for a session the registry does not have.
+    ///
+    /// There is no verb that clears it back to `None`. A session that has been
+    /// switched has an opinion for the rest of its life, which is what makes
+    /// `/context off` survive a `config/set` that turns the default on.
+    pub fn set_context_switch(&self, id: &SessionId, enabled: bool) -> bool {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .expect("session registry mutex poisoned");
+        let Some(record) = sessions
+            .iter_mut()
+            .find(|record| &record.summary.session_id == id)
+        else {
+            return false;
+        };
+        record.context_switch = Some(enabled);
+        true
+    }
+
+    /// This session's `/context` switch, or `None` while it follows the durable
+    /// default.
+    ///
+    /// A session the registry does not have answers `None`, which is the same
+    /// answer as "has not been switched" and is the honest one: nobody has
+    /// switched a session that does not exist.
+    #[must_use]
+    pub fn context_switch(&self, id: &SessionId) -> Option<bool> {
+        self.sessions
+            .lock()
+            .expect("session registry mutex poisoned")
+            .iter()
+            .find(|record| &record.summary.session_id == id)
+            .and_then(|record| record.context_switch)
     }
 
     /// This session's retained conversation, as the next turn replays it
@@ -1690,5 +1963,62 @@ mod tests {
                 session_id: ghost.clone(),
             }
         );
+    }
+
+    /// **Verify (MINOR 2).** The lifecycle sites' store and their claim are one
+    /// operation, and the registry is what makes them one.
+    ///
+    /// # The hazard
+    ///
+    /// `set_repo_context` then `claim_repo_context_publish` is the same two
+    /// writes with the mutex free in between, so two concurrent `/cd`s can
+    /// interleave: A stores its state, B stores its state and claims its
+    /// triple, A claims *its* triple over B's. The registry then holds B's file
+    /// beside A's published record, and the next turn measures its news against
+    /// a line no client was sent — the exact thing the record exists to prevent.
+    ///
+    /// # What is asserted here, and what is asserted next door
+    ///
+    /// This leg is the **contract**: one call writes both fields, shown by
+    /// reading the state back and by a following claim of the same triple being
+    /// refused as a duplicate. It is deterministic and it is not the whole
+    /// claim — replacing the body with the two calls it replaced keeps it
+    /// green, because the two writes still land.
+    ///
+    /// The atomicity is asserted where it can be: at the **call site**, by
+    /// `runtime`'s `the_lifecycle_store_and_its_claim_are_one_registry_call`.
+    /// A two-thread, 5,000-iteration race over the two-call form was written,
+    /// run, and stayed green — the window is a lock release and re-acquire with
+    /// no work in it — so shipping it would have been an assertion that cannot
+    /// fail (LESSON-569). The source check next door can, and its mutation was
+    /// observed.
+    #[test]
+    fn a_stored_repo_context_and_the_line_announced_about_it_move_together() {
+        use crate::repo_context::RepoContextState;
+        use teton_protocol::methods::RepoContextStateKind;
+
+        let reg = SessionRegistry::new();
+        let id = reg
+            .create(SessionMode::Freeform, None, None)
+            .expect("a freeform session needs no phase")
+            .session_id;
+
+        // One call, both writes.
+        let triple = (RepoContextStateKind::Absent, false, 0);
+        assert!(reg.store_and_claim_repo_context(&id, RepoContextState::Absent, triple));
+        assert_eq!(*reg.repo_context(&id), RepoContextState::Absent);
+        assert!(
+            !reg.claim_repo_context_publish(&id, triple, false),
+            "the triple was not recorded, so a later identical render would be \
+             announced against a line no client saw"
+        );
+
+        // A session the registry does not have: nothing stored, nothing to tell.
+        let ghost = SessionId::from("no-such-session");
+        assert!(!reg.store_and_claim_repo_context(&ghost, RepoContextState::Absent, triple));
+
+        // The pairing under contention is not asserted here — see the doc
+        // above for why a race over this window cannot be made to fail on
+        // demand, and where the atomicity is pinned instead.
     }
 }

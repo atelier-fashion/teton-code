@@ -1255,10 +1255,15 @@ async fn a_refused_skill_turn_seeds_nothing_says_nothing_and_changes_no_health()
     let repo = Tree::new("toobig");
     repo.write(
         ".claude/skills/huge/SKILL.md",
-        &skill_file("a body no small route can carry", &filler(40_000)),
+        &skill_file("a body no small route can carry", &filler(60_000)),
     );
     // The shipped Ollama recipe's window: derived below the floor, so the budget
     // in force is *larger* than the declaration and the refusal has to say so.
+    //
+    // 60,000 bytes rather than 40,000 since REQ-612 raised that floor to 50,000:
+    // the pair in force is (6,250 words / 50,000 bytes), and the typed twin
+    // below needs the *same* bytes to bust **both** halves, not only the word
+    // one — see the note there.
     let h = Harness::with_window(4_096);
     let session = h.session_at(repo.path());
     let mut sub = h.events.subscribe(256);
@@ -1367,7 +1372,14 @@ async fn a_typed_oversized_prompt_still_elides_loudly_on_the_route_that_refuses_
     let session = h.session_at(repo.path());
     let mut sub = h.events.subscribe(256);
 
-    h.turn(&session, &filler(40_000), None)
+    // The same 60,000 bytes the skill twin above carries. It has to bust the
+    // **byte** half as well as the word one: `truncate_to_budget`'s in-place
+    // clamp of the newest block is what sets `newest_user_elided`, and it is
+    // measured in bytes — at 40,000 (the pre-REQ-612 size, over the old
+    // 16,384-byte floor by 2.4×) the floored pair's 50,000 bytes now hold the
+    // whole thing and nothing is clamped, so this leg went quiet without
+    // anything being wrong with the elision.
+    h.turn(&session, &filler(60_000), None)
         .await
         .expect("a typed oversized prompt is served, not refused");
 
@@ -2663,10 +2675,26 @@ async fn a_relative_path_past_the_display_ceiling_is_still_elided_on_the_wire() 
 // ---------------------------------------------------------------------------
 
 /// A body sized to fit its route with a placeholder in the slot and to overflow
-/// it once ~8 KB of command output is folded in.
+/// it once the command's ~8 KB of output is folded in.
 ///
 /// One skill file, two sessions, two levels — which is what makes the pair a
 /// statement about the **dynamic output** rather than about the body.
+///
+/// **The body moved with REQ-612's floor, and the currency it busts moved with
+/// it.** The route below declares `max_context = 16_000`, which used to derive
+/// (9,984 words / 29,952 bytes): a 20,000-byte body fit it and 9 KB of output
+/// took it past the **byte** half. Raising `MIN_BUDGET_BYTES` to 50,000 floors
+/// that route's byte half alone — the pair is now (9,984 / 50,000) — so the old
+/// fixture fit at *both* stages and no refusal ever came.
+///
+/// The output cannot simply be made bigger: `shell::MAX_OUTPUT_CHARS` caps a
+/// command at 8,000 characters however much it writes, which is what the
+/// original "~8 KB" meant. So the body grows instead, to 34,000 bytes of
+/// `filler` (4 B/word): with the ~753-word system head it is 9,253 words —
+/// inside the 9,984-word half by 731 — and the 8 KB of output takes it to
+/// ~11,278, past that half by ~1,294. The byte half is no longer what refuses
+/// it, and on a floored route it cannot be: at 4 bytes a word, a body large
+/// enough to threaten 50,000 bytes is already thousands of words over.
 fn stage_b_repo(tag: &str) -> Tree {
     let repo = Tree::new(tag);
     repo.write(
@@ -2675,7 +2703,7 @@ fn stage_b_repo(tag: &str) -> Tree {
             "a large body plus a chatty command",
             &format!(
                 "{}\n\nOut: !`head -c 9000 /dev/zero | tr '\\\\0' 'x'`\n",
-                filler(20_000)
+                filler(34_000)
             ),
         ),
     );
@@ -3348,11 +3376,18 @@ async fn a_model_invocation_whose_command_output_overflows_is_refused_at_stage_b
     // room. Both sessions run at `full`, where BR-4's acknowledgment is granted
     // by the level and BR-5's consent asks nothing — a `plan` control would
     // have been refused at the acknowledgment and proved nothing about size.
+    //
+    // **38,000 bytes, not 25,000 (REQ-612).** The 20,000-token route derives
+    // 37,952 bytes and REQ-612's floor raises that to 50,000, so the old body
+    // fit at both stages and the refusal below never came. The body is what
+    // moves, for the reason the comment on `heavy` gives: the output is capped
+    // at 8,000 characters whatever the command writes, so the room left over
+    // has to be made smaller than that.
     let repo = Tree::new("mdlstgb");
     model_invocable_skill(
         &repo,
         "light",
-        &format!("{}\n\nOut: !`echo tiny`\n", filler(25_000)),
+        &format!("{}\n\nOut: !`echo tiny`\n", filler(38_000)),
     );
     model_invocable_skill(
         &repo,
@@ -3362,7 +3397,7 @@ async fn a_model_invocation_whose_command_output_overflows_is_refused_at_stage_b
             // the *body* is what has to be sized to leave less than that much
             // room: a bigger `head -c` would change nothing.
             "{}\n\nOut: !`head -c 20000 /dev/zero | tr '\\0' 'x'`\n",
-            filler(25_000)
+            filler(38_000)
         ),
     );
     let h = Harness::with_window(20_000);
@@ -4606,13 +4641,16 @@ fn measured_words(message: &str) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn what_the_budget_measured_is_the_block_the_turn_carried_on_both_paths() {
     let repo = Tree::new("meas");
-    // Twenty kilobytes: comfortably inside a 128k window's budget and
-    // comfortably past the floor a one-token window derives (2,048 words /
-    // 16 KiB), so one fixture reaches both verdicts.
+    // Sixty kilobytes: comfortably inside a 128k window's budget (253,952 B)
+    // and comfortably past the floor a one-token window derives, so one fixture
+    // reaches both verdicts. It was twenty while that floor was 2,048 words /
+    // 16,384 bytes; REQ-612 raised it to 6,250 / 50,000 and a 20 KiB expansion
+    // (5,000 words) started fitting the cramped route too, which took the
+    // refusal — and with it the measured side of this comparison — away.
     model_invocable_skill(
         &repo,
         "measured",
-        &format!("Head.\n{}\nTail.\n", filler(20_000)),
+        &format!("Head.\n{}\nTail.\n", filler(60_000)),
     );
 
     // ── the user path ────────────────────────────────────────────────────────
@@ -4622,7 +4660,7 @@ async fn what_the_budget_measured_is_the_block_the_turn_carried_on_both_paths() 
     roomy
         .turn(&session, "", Harness::invoke("measured", ""))
         .await
-        .expect("a 20 KiB expansion fits a 128k window");
+        .expect("a 60 KiB expansion fits a 128k window");
     let system = wire_system(&roomy);
     let seeded = message_containing(&roomy, "a command defined in");
 
@@ -4632,7 +4670,7 @@ async fn what_the_budget_measured_is_the_block_the_turn_carried_on_both_paths() 
     let refusal = cramped
         .turn(&cramped_session, "", Harness::invoke("measured", ""))
         .await
-        .expect_err("a 20 KiB expansion cannot fit the floor");
+        .expect_err("a 60 KiB expansion cannot fit the floor");
     assert_eq!(refusal.code, error_code::SKILL_EXPANSION_TOO_LARGE);
     assert_eq!(
         measured_words(&refusal.message),
@@ -4893,7 +4931,10 @@ async fn both_callers_project_their_dynamic_outcomes_through_the_one_view() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reroute_after_a_committed_model_expansion_relays_the_refusal_and_continues() {
     let repo = Tree::new("reroute");
-    model_invocable_skill(&repo, "big", &format!("Head.\n{}\nTail.\n", filler(20_000)));
+    // 60 KB, not 20: the floor a one-token window derives is 6,250 words /
+    // 50,000 bytes since REQ-612, and a 20 KB expansion (5,000 words) *fits*
+    // it — so the guard had nothing to refuse and the reroute simply succeeded.
+    model_invocable_skill(&repo, "big", &format!("Head.\n{}\nTail.\n", filler(60_000)));
     // A roomy primary and a fallback at the floor: the reroute is a *smaller*
     // budget, which is the only shape this guard exists for.
     let h = Harness::with_fallback(128_000, 1);
@@ -4983,7 +5024,8 @@ async fn a_reroute_after_a_committed_model_expansion_relays_the_refusal_and_cont
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reroute_after_a_typed_expansion_still_names_it_as_the_slash_command_the_user_typed() {
     let repo = Tree::new("rerouteu");
-    model_invocable_skill(&repo, "big", &format!("Head.\n{}\nTail.\n", filler(20_000)));
+    // 60 KB for the sibling's reason: the floor is 50,000 bytes since REQ-612.
+    model_invocable_skill(&repo, "big", &format!("Head.\n{}\nTail.\n", filler(60_000)));
     let h = Harness::with_fallback(128_000, 1);
     let session = h.session_at(repo.path());
     h.at_level(&session, PermissionLevel::Full);

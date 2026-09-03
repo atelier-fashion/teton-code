@@ -524,6 +524,37 @@ pub struct ContextManager {
     /// and defaults to [`DEFAULT_WINDOW_LABEL`] so an unstamped manager renders
     /// exactly what it rendered before.
     window_label: String,
+    /// File identities carried by the **system prompt** rather than by a block
+    /// (REQ-612 BR-5, ADR-2).
+    ///
+    /// # Why the manager and not a block variant
+    ///
+    /// The system prompt has never carried file provenance:
+    /// [`context_provenance`](super::completion::context_provenance) matches
+    /// `System | Model => {}`, so a repository's `TETON.md` placed in the
+    /// system string would reach every remote provider on every turn with no
+    /// boundary verdict at all — the one path around the charter's BR-1.
+    ///
+    /// The fix is manager-level because the system prompt is **one string,
+    /// charged as one unit** by [`Self::truncate_to_budget`]: a
+    /// `CtxProvenance::RepoContext` block variant would put a repository's notes
+    /// into the oldest-first drop order the gate applies to *conversation*,
+    /// where a long turn would silently spend them. This set is a property of
+    /// the prompt the turn is running under, and it lasts exactly as long as
+    /// the manager does.
+    ///
+    /// # It is re-stated, never carried
+    ///
+    /// Nothing puts it into [`RetainedContext`], which holds conversation and
+    /// not the prompt. Every seam that seeds or re-budgets a manager states it
+    /// again from the block *that* turn rendered — LESSON-501's rule, and the
+    /// only spelling under which `/cd` to a different repository, a `/context
+    /// off`, or a boundary added mid-session cannot leave a stale identity
+    /// pinning turns that no longer carry the file.
+    ///
+    /// Empty on every manager nobody has told, which contributes nothing to the
+    /// union and is byte-identical to the pre-REQ-612 behaviour.
+    system_sources: BTreeSet<ProvenanceId>,
 }
 
 /// What one [`ContextManager::truncate_to_budget`] actually did — the news the
@@ -764,6 +795,9 @@ impl ContextManager {
             request: String::new(),
             pending_tool_call: false,
             window_label: DEFAULT_WINDOW_LABEL.to_owned(),
+            // Unstated: a manager nobody has told about a repository-notes
+            // block contributes nothing to the provenance union (REQ-612).
+            system_sources: BTreeSet::new(),
         }
     }
 
@@ -805,6 +839,36 @@ impl ContextManager {
     pub fn with_window_label(mut self, window_label: impl Into<String>) -> Self {
         self.window_label = window_label.into();
         self
+    }
+
+    /// State the file identities this turn's **system prompt** carries
+    /// (REQ-612 BR-5, ADR-2) — see [`system_sources`](Self::system_sources).
+    ///
+    /// Takes an iterator rather than the set so a caller holding one
+    /// [`RepoContextBlock`](crate::repo_context::RepoContextBlock)'s single
+    /// identity does not have to build a collection to say so, and so a future
+    /// second system-prompt source folds in at the same call rather than at a
+    /// second one.
+    ///
+    /// **Replaces, never merges.** The set describes the prompt this manager is
+    /// running under, and a merge would make `/cd`-ing out of a repository
+    /// leave the old file's identity pinning the new root's turns — the exact
+    /// staleness the "re-stated, never carried" rule exists to prevent. Every
+    /// seam that calls this has just derived the whole truth.
+    #[must_use]
+    pub fn with_system_sources(mut self, sources: impl IntoIterator<Item = ProvenanceId>) -> Self {
+        self.system_sources = sources.into_iter().collect();
+        self
+    }
+
+    /// The file identities this turn's system prompt carries (REQ-612 BR-5).
+    ///
+    /// Read by [`context_provenance`](super::completion::context_provenance),
+    /// which unions it through the same mapping a `read` result takes, so one
+    /// spelling decides what a repository file means to egress.
+    #[must_use]
+    pub fn system_sources(&self) -> &BTreeSet<ProvenanceId> {
+        &self.system_sources
     }
 
     /// Append a user turn the user typed.
@@ -1142,6 +1206,30 @@ impl ContextManager {
     #[must_use]
     pub fn system(&self) -> &str {
         &self.system
+    }
+
+    /// Replace the system prompt mid-turn (REQ-612 BR-3).
+    ///
+    /// **One caller, and it is the reroute**:
+    /// [`CarriedTurn::rebudget`](crate::carry::CarriedTurn::rebudget) rebuilds
+    /// the prompt with the repository-notes block rendered at the new route's
+    /// cap, because that cap is a quarter of the route's byte budget and moves
+    /// with it. Everything else about a head is rebuilt *between* turns and
+    /// seeded through [`Self::new`]; a second in-turn writer would be a second
+    /// spelling of "what is this turn running under".
+    ///
+    /// `&mut self` rather than a consuming builder because the reroute already
+    /// holds the manager mutably and the pair of currencies is set the same way
+    /// ([`Self::rebudget`]) — and because this must happen *before* that gate
+    /// runs, so it cannot be a step the caller could reorder past it by
+    /// accident.
+    ///
+    /// It changes what the budget gate measures and nothing else: the blocks,
+    /// the request, the dropped-provenance record and `system_sources` are all
+    /// untouched. Restating the identities is the caller's, for
+    /// [`Self::with_system_sources`]'s "replaces, never merges" reason.
+    pub fn set_system(&mut self, system: impl Into<String>) {
+        self.system = system.into();
     }
 
     /// [`Self::estimated_tokens`] over an arbitrary block sequence.

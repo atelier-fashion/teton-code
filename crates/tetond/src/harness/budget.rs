@@ -54,9 +54,11 @@
 //! derived from a **declaration** — a provider's promise, which the provider
 //! may then refuse against, saying so. The engine's `n_ctx` is an allocation,
 //! and a budget above it buys nothing a turn can spend, so the floor is held to
-//! the engine's own window there (BR-8). At 32,768 the floor never bites either
-//! way; the rule is latent, stated, and tested at a synthetic window so that
-//! whoever lowers that constant inherits the rule rather than the bug.
+//! the engine's own window there (BR-8). At 32,768 the floor still never bites
+//! either way — the local pair's 63,488 bytes clear the 50,000-byte floor
+//! REQ-612 raised it to, though by less than it used to; the rule is latent,
+//! stated, and tested at a synthetic window so that whoever lowers that
+//! constant inherits the rule rather than the bug.
 //!
 //! Precedence, stated once and tested pairwise: `LocalEngine` >
 //! `DefaultUnknown` > (`RedactScan` when it bites) > `UserCap` > `Window`.
@@ -81,7 +83,9 @@
 //! cap actually set. The pair is monotone in `usable` up to the floor and never
 //! rises above what the window says; below the floor it deliberately stops
 //! falling, because a budget under the harness's own system prompt is not a
-//! budget at all (see [`MIN_BUDGET_BYTES`]).
+//! budget at all (see [`MIN_BUDGET_BYTES`], raised to 50,000 by REQ-612 so that
+//! the prompt it must hold — now carrying up to 8 KiB of the repository's own
+//! notes — is still a minority of it).
 //!
 //! ## Two currencies, deliberately
 //!
@@ -136,6 +140,7 @@ use super::context::{ContextManager, Fit, APPROX_BYTES_PER_TOKEN};
 use super::duty::DUTY_REQUEST_BYTES_PER_TOKEN;
 use super::permissions::{OverBudgetOptionLabels, OverBudgetRemedyLabels};
 use crate::egress::redact::REDACT_SCANNABLE_CONTEXT_BYTES;
+use crate::repo_context::REPO_CONTEXT_MAX_BYTES;
 use crate::runtime::LOCAL_ENGINE_N_CTX;
 use crate::skills::SkillSource;
 
@@ -175,13 +180,52 @@ pub const LOCAL_BUDGET_TOKENS: usize = 4_096;
 pub const LOCAL_BUDGET_BYTES: usize = LOCAL_BUDGET_TOKENS * APPROX_BYTES_PER_TOKEN;
 
 /// The smallest byte budget a route with a **declared** window may derive —
-/// the floor (REQ-586 verify, M1): half the local pair, 16,384 bytes.
+/// the floor (REQ-586 verify, M1): **50,000 bytes**, a pinned product constant.
 ///
-/// Why a floor exists at all: the budget is charged against
-/// `ContextManager::estimated_bytes()`, which includes the harness's own system
-/// prompt (5,979 bytes for the built-in registry — measured, not assumed, by
-/// `min_budget_bytes_holds_the_harnesss_own_system_prompt`). A window-derived
-/// pair below that is not a small budget, it is an unmeetable one:
+/// # Why a literal, and why this one (REQ-612 decision, 2026-09-03)
+///
+/// It was `LOCAL_BUDGET_BYTES / 2` (16,384) — "half the local pair", the
+/// nearest step that still left the system prompt a minority of the window.
+/// REQ-612 made the repository's own notes a **resident region of the system
+/// prompt**, up to [`REPO_CONTEXT_MAX_BYTES`] of them, and that moved the thing
+/// the floor is measured against. The product owner's decision is that a
+/// floored route carries the *whole* block rather than a cut-down one, at the
+/// unchanged 2× invariant, so the floor is now a number chosen against a
+/// measurement instead of a fraction of another constant:
+///
+/// | worst system prompt | measured | 2× |
+/// |---|---|---|
+/// | no block (the pre-REQ-612 shape) | 6,838 B | 13,676 |
+/// | with a 4,096-byte block | 11,275 B | 22,550 |
+/// | with an 8,192-byte block | **15,370 B** | **30,740** |
+///
+/// 50,000 ≥ 30,740 with 19,260 bytes to spare — and it is the smallest round
+/// figure that also carries the quarter rule: `50,000 / 4 = 12,500 >
+/// REPO_CONTEXT_MAX_BYTES`, so [`repo_context_cap`] hands a floored route the
+/// full 8 KiB rather than a quarter of a smaller budget. That is the decision
+/// stated as arithmetic: the two halves of it (hold the prompt twice over, and
+/// hold the whole block) are one constant.
+///
+/// The three figures are measured by
+/// `min_budget_bytes_holds_the_harnesss_own_system_prompt`, which builds
+/// `HarnessConfig::default()` — the *larger* of the two shipped harness shapes
+/// here, 6,838 against `for_strong_model`'s 6,726 — with
+/// `repo_context: Some(RepoContextBlock::worst_case())`, so the invariant is
+/// measured for the prompt that ships rather than for a prompt without the
+/// feature in it.
+///
+/// **It no longer derives from [`LOCAL_BUDGET_BYTES`], and must not go back
+/// to.** The two constants now answer different questions — one is the default
+/// pair's byte half, the other is the smallest assembled prompt plus room for a
+/// conversation — and re-deriving one from the other is how the floor came to be
+/// smaller than the prompt it exists to hold.
+///
+/// # Why a floor exists at all
+///
+/// The budget is charged against `ContextManager::estimated_bytes()`, which
+/// includes the harness's own system prompt (the table above — measured, not
+/// assumed). A window-derived pair below that is not a small budget, it is an
+/// unmeetable one:
 /// `truncate_to_budget`'s `room.max(1_024)` floor would hand the engine a
 /// prompt over its own budget on every turn, and every block after the system
 /// prompt would be elided to a marker. Ollama's shipped recipe is the live
@@ -189,12 +233,22 @@ pub const LOCAL_BUDGET_BYTES: usize = LOCAL_BUDGET_TOKENS * APPROX_BYTES_PER_TOK
 /// bytes for the whole conversation and is *below* the smallest prompt the
 /// clamp can produce (the system prompt plus that 1 KiB floor).
 ///
-/// Why **half the local pair** and not a number picked beside it: the local
-/// pair (32,768 B) is the budget the weak tier runs under, and half of it is
-/// the nearest step that still leaves the system prompt a minority of the
-/// window (the test above pins `MIN_BUDGET_BYTES >= 2 × system prompt`) — so a
-/// tiny-window route runs the same shape as the local tier, with less room,
-/// rather than a shape no turn can be assembled in.
+/// What the floor buys, said as a shape rather than as a fraction: a
+/// tiny-window route runs the same shape as the local tier — the whole system
+/// prompt, the whole repository-notes block, and at least as many bytes again
+/// for the conversation — with less room, rather than a shape no turn can be
+/// assembled in.
+///
+/// **The floor is now the only thing between a route and a sub-8 KiB notes
+/// cap.** At 50,000 the smallest budget any arm of [`derive`] can return is the
+/// default pair's 32,768 (`DefaultUnknown`), whose quarter is 8,192 — so every
+/// route this build can derive carries the notes at
+/// [`REPO_CONTEXT_MAX_BYTES`], and the quarter half of [`repo_context_cap`]'s
+/// `min` bites only on a budget constructed below the floor by hand. That is
+/// the intended consequence of the decision, not an accident of it: the rule is
+/// pinned at a synthetic sub-floor row in
+/// `the_repo_context_cap_is_a_quarter_of_the_byte_budget_up_to_the_pinned_max`
+/// so that whoever lowers this constant inherits the rule rather than the bug.
 ///
 /// The honest cost, stated: on a window *below* the floor the budget admits
 /// more than the window declares, so those turns are sent knowing the provider
@@ -222,10 +276,10 @@ pub const LOCAL_BUDGET_BYTES: usize = LOCAL_BUDGET_TOKENS * APPROX_BYTES_PER_TOK
 /// user-visible guard for the rest is the one this module provides directly:
 /// the derivation records the declaration, runs the floor, and says `floored` on
 /// `route_decided`, `context_pressure` and `/doctor` (TASK-194 2b).
-pub const MIN_BUDGET_BYTES: usize = LOCAL_BUDGET_BYTES / 2;
+pub const MIN_BUDGET_BYTES: usize = 50_000;
 
 /// The floor's word half: [`MIN_BUDGET_BYTES`] bridged at
-/// [`APPROX_BYTES_PER_TOKEN`] = 2,048 whitespace words.
+/// [`APPROX_BYTES_PER_TOKEN`] = 6,250 whitespace words.
 ///
 /// Bridged from the bytes for the same reason [`LOCAL_BUDGET_BYTES`] is bridged
 /// from the words: the floor is one shape in two currencies, and deriving each
@@ -598,6 +652,51 @@ pub struct RouteBudget {
     ///   by whoever is improving that prose, who has no reason to know an id
     ///   was being read out of it. That break is silent in both directions.
     pub provider_id: Option<String>,
+    /// How many bytes of the repository's own notes this route may carry
+    /// (REQ-612 BR-3, ADR-5): `min(REPO_CONTEXT_MAX_BYTES, budget_bytes / 4)`.
+    ///
+    /// Derived **here**, beside the pair it is a quarter of, for REQ-586's own
+    /// reason: the loader, the block renderer, the truncation marker's figure
+    /// and `/verbose` all quote this number, and four call sites each dividing
+    /// a budget by four is four places the quarter rule can drift. The local
+    /// tier reaches the pinned 8 KiB (`63,488 / 4 = 15,872`, capped).
+    ///
+    /// **Since REQ-612 raised [`MIN_BUDGET_BYTES`] to 50,000, so does every
+    /// other route this build can derive**: the smallest budget any arm of
+    /// [`derive`] returns is the default pair's 32,768, whose quarter is 8,192
+    /// exactly, and a floored route runs at 50,000 (quarter 12,500, capped).
+    /// The quarter half of the `min` is therefore latent — reachable only on a
+    /// [`RouteBudget`] built below the floor by hand, which is where the table
+    /// test pins it. That is the decision: a floored route carries the whole
+    /// block, and the notes cap stops being a thing that moves under a user
+    /// when their route falls back.
+    ///
+    /// It is a quarter of the budget the turn **actually runs under**, so the
+    /// redact clamp — which lands before [`budget_of`] — takes its bytes off
+    /// this too. That is the intended reading of BR-3's "no route ever spends
+    /// more than a quarter of its context on the notes": the context in
+    /// question is the clamped one, because that is the one the turn has.
+    pub repo_context_cap: usize,
+}
+
+/// The route-aware repository-notes cap (REQ-612 BR-3, ADR-5) — **the one
+/// home** of the quarter rule.
+///
+/// A free function rather than a method on [`RouteBudget`] so the two
+/// constructors below cannot build a budget whose field disagrees with it: a
+/// getter would have left the field settable to anything, and every literal
+/// `RouteBudget` in the tree is a place that could then have set it wrong.
+///
+/// `pub(crate)` for exactly one caller outside this module: `StampedRoutes`
+/// rebuilds a [`RouteBudget`] from a `route_decided` event, and `budget_bytes`
+/// *is* on that wire — so the cap is derivable there and deriving it is
+/// strictly better than the empty value its wire-less neighbours take.
+pub(crate) const fn repo_context_cap(budget_bytes: usize) -> usize {
+    if budget_bytes / 4 < REPO_CONTEXT_MAX_BYTES {
+        budget_bytes / 4
+    } else {
+        REPO_CONTEXT_MAX_BYTES
+    }
 }
 
 /// Turn a route's window facts into its budget — the one classifier (BR-8,
@@ -735,8 +834,8 @@ enum Floor {
     /// allocation.
     ///
     /// **Latent at today's constants** — at [`LOCAL_ENGINE_N_CTX`] *this
-    /// helper* derives 21,162 words / 63,488 bytes, both well clear of the
-    /// 2,048-word / 16,384-byte floor, so this arm and
+    /// helper* derives 21,162 words / 63,488 bytes, both clear of the
+    /// 6,250-word / 50,000-byte floor, so this arm and
     /// [`Self::RaisesADeclaration`] agree there and AC-1's "one formula" claim
     /// is exact in both currencies. It
     /// becomes live only if that constant falls, which is precisely when
@@ -837,6 +936,9 @@ fn budget_of(
         digest_threshold_bytes,
         floored: pair.floored,
         provider_id,
+        // After the redact clamp, like the thresholds above and for the same
+        // reason: a quarter of the budget the turn runs under (REQ-612 ADR-5).
+        repo_context_cap: repo_context_cap(pair.bytes),
     }
 }
 
@@ -859,6 +961,7 @@ fn default_pair(bound: BudgetBound, labelled: (String, Option<String>)) -> Route
         digest_threshold_bytes,
         // The default pair is the answer, not a clamp of a smaller one.
         floored: false,
+        repo_context_cap: repo_context_cap(LOCAL_BUDGET_BYTES),
     }
 }
 
@@ -2001,7 +2104,8 @@ pub struct ProposedWindow {
 /// Ollama is the live case for the first term and the reason ADR-6 exists. Its
 /// recipe window is 4k — the served default, honestly recorded, and *smaller*
 /// than Teton's own local pair. Deriving from it gives (2,048 words, 16 KiB),
-/// which is below the floor, so the pair is raised and reported `floored`:
+/// which is below the floor, so the pair is raised to (6,250, 50,000) and
+/// reported `floored`:
 /// a declared ceiling that is not in force. Writing that window into a config to
 /// fix an over-budget skill would record a smaller declaration than the route
 /// already had, and change nothing about the refusal.
@@ -2995,7 +3099,7 @@ mod tests {
             ),
             (
                 // Words stay window-derived (84,650); bytes 253,952 clamp to
-                // the scannable bound (≈89 KB).
+                // the scannable bound (≈184 KB since REQ-612).
                 "redact on 128k clamps bytes only",
                 remote(128_000, 0, true),
                 84_650,
@@ -3003,13 +3107,20 @@ mod tests {
                 BudgetBound::RedactScan,
             ),
             (
-                // usable = 78,976; ×2/3 = 52,650; ×2 = 157,952 > scannable
-                // (141,224) → the clamp applies after the cap and names the
-                // bound. (A 60k cap did this against the 88,196 bound of the
-                // 16,384-token engine window; 117,952 sits under 141,224.)
-                "cap 80k + redact on 200k: the clamp is last",
-                remote(200_000, 80_000, true),
-                52_650,
+                // usable = 158,976; ×2/3 = 105,984; ×2 = 317,952 > scannable
+                // (184,265) → the clamp applies after the cap and names the
+                // bound. **The cap in this row tracks the bound**, which is the
+                // maintenance this row asks for and has had twice: a 60k cap
+                // did it against the 88,196 bound of the 16,384-token engine
+                // window, an 80k cap against 141,224, and REQ-612's raise of
+                // `REDACT_BODY_OVERHEAD_BYTES` took the chunk count 3 → 4 and
+                // the bound to 184,265, which 157,952 sits *under*. A row whose
+                // clamp stops biting does not fail loudly — it silently becomes
+                // a second `UserCap` row — so the cap moves with the bound and
+                // the row keeps proving what it says.
+                "cap 160k + redact on 200k: the clamp is last",
+                remote(200_000, 160_000, true),
+                105_984,
                 REDACT_SCANNABLE_CONTEXT_BYTES,
                 BudgetBound::RedactScan,
             ),
@@ -3085,6 +3196,127 @@ mod tests {
             assert_eq!(got.budget_tokens, *tokens, "{name}: budget_tokens");
             assert_eq!(got.budget_bytes, *bytes, "{name}: budget_bytes");
             assert_eq!(got.bound, *bound, "{name}: bound");
+        }
+    }
+
+    /// **REQ-612 BR-3 / ADR-5: the repository-notes cap is a quarter of the
+    /// route's byte budget, held under the pinned maximum.**
+    ///
+    /// Five rows, chosen so that each half of the `min` binds on at least one
+    /// of them and neither half can be dropped without a row going red:
+    ///
+    /// | route | byte budget | quarter | cap |
+    /// |---|---|---|---|
+    /// | local | 63,488 | 15,872 | 8,192 (the pin binds) |
+    /// | floored | 50,000 | 12,500 | 8,192 (the pin binds) |
+    /// | 128k | 253,952 | 63,488 | 8,192 (the pin binds) |
+    /// | 1M | 1,997,952 | 499,488 | 8,192 (the pin binds) |
+    /// | **synthetic sub-floor** | 16,384 | 4,096 | 4,096 (the quarter binds) |
+    ///
+    /// # The last row is synthetic on purpose (REQ-612 decision, 2026-09-03)
+    ///
+    /// The floored row used to be the one that made the quarter bind: Ollama's
+    /// shipped 4,096-token window derived 16,384 bytes and carried 4 KiB of
+    /// notes. Raising [`MIN_BUDGET_BYTES`] to 50,000 so a floored route holds
+    /// the *whole* block took that with it — 50,000 / 4 = 12,500, capped at
+    /// 8,192 — and the smallest budget any arm of [`derive`] can now return is
+    /// the default pair's 32,768, whose quarter is 8,192 exactly. So **no route
+    /// this build can derive makes the quarter bind**, and a table with only
+    /// derived rows would let `repo_context_cap` be replaced by
+    /// `REPO_CONTEXT_MAX_BYTES` and stay green.
+    ///
+    /// The last row is therefore a [`RouteBudget`] built below the floor by
+    /// hand — `budget_bytes: 16_384`, the pair the floor used to produce — and
+    /// it exercises [`repo_context_cap`] directly. It is not a route; it is the
+    /// rule, kept pinned for whoever lowers the floor again.
+    ///
+    /// **Mutations, both run red.** Returning `REPO_CONTEXT_MAX_BYTES`
+    /// unconditionally (the quarter dropped) fails the sub-floor row with
+    /// `8192 != 4096`, which is a 16 KiB budget spending half its context on the
+    /// notes. Returning `budget_bytes / 4` (the pin dropped) fails local, the
+    /// floored row, 128k and 1M — 15,872, 12,500, 63,488 and 499,488 against
+    /// 8,192 — which is a block past the ceiling both resident-prompt sweeps
+    /// measure.
+    #[test]
+    fn the_repo_context_cap_is_a_quarter_of_the_byte_budget_up_to_the_pinned_max() {
+        let rows: &[(&str, BudgetInputs<'_>, usize, usize)] = &[
+            (
+                "local",
+                BudgetInputs::local(),
+                63_488,
+                REPO_CONTEXT_MAX_BYTES,
+            ),
+            // The floor's pair, through the floor: usable = 3,072 → 2,048
+            // words / 6,144 bytes, both raised to (MIN_BUDGET_TOKENS,
+            // MIN_BUDGET_BYTES) = (6,250, 50,000). Its quarter is 12,500, so
+            // the pin is what binds — a floored route carries the whole block.
+            (
+                "floored (ollama's 4,096-token window)",
+                remote(4_096, 0, false),
+                MIN_BUDGET_BYTES,
+                REPO_CONTEXT_MAX_BYTES,
+            ),
+            (
+                "128k",
+                remote(128_000, 0, false),
+                253_952,
+                REPO_CONTEXT_MAX_BYTES,
+            ),
+            // usable = 998,976; ×2 = 1,997,952.
+            (
+                "1M",
+                remote(1_000_000, 0, false),
+                1_997_952,
+                REPO_CONTEXT_MAX_BYTES,
+            ),
+        ];
+        for (name, inputs, bytes, cap) in rows {
+            let got = derive(*inputs);
+            assert_eq!(
+                got.budget_bytes, *bytes,
+                "{name}: the row's byte budget moved, so its quarter is no longer \
+                 the number below"
+            );
+            assert_eq!(got.repo_context_cap, *cap, "{name}: repo_context_cap");
+            assert!(
+                got.repo_context_cap <= got.budget_bytes / 4,
+                "{name}: the notes may never take more than a quarter of the route"
+            );
+            assert!(
+                got.repo_context_cap <= REPO_CONTEXT_MAX_BYTES,
+                "{name}: the pinned maximum is what both resident-prompt sweeps \
+                 measure the widest prompt at"
+            );
+        }
+
+        // The floored route now carries the whole block: the decision, as one
+        // derivation. 6,250 words / 50,000 bytes, 8,192 of notes.
+        let floored = derive(remote(4_096, 0, false));
+        assert_eq!(
+            (
+                floored.budget_tokens,
+                floored.budget_bytes,
+                floored.repo_context_cap
+            ),
+            (6_250, 50_000, REPO_CONTEXT_MAX_BYTES),
+            "a floored route must carry the whole block (REQ-612 decision)"
+        );
+        assert!(floored.floored, "the floor is what produced that pair");
+
+        // The synthetic sub-floor row, and the non-vacuity that says why it has
+        // to be synthetic: nothing `derive` can return reaches it.
+        assert_eq!(repo_context_cap(16_384), 4_096, "the quarter rule, pinned");
+        assert!(
+            repo_context_cap(16_384) < REPO_CONTEXT_MAX_BYTES,
+            "the sub-floor row must make the quarter bind, or it pins nothing"
+        );
+        const {
+            assert!(
+                MIN_BUDGET_BYTES / 4 >= REPO_CONTEXT_MAX_BYTES
+                    && LOCAL_BUDGET_BYTES / 4 >= REPO_CONTEXT_MAX_BYTES,
+                "if a derived route can reach the quarter again, give this table a \
+                 derived row for it rather than leaving the rule on a synthetic one"
+            );
         }
     }
 
@@ -3612,7 +3844,7 @@ mod tests {
     /// engine can hold.**
     ///
     /// Latent at today's constants — the helper's 21,162 words / 63,488 bytes
-    /// are nowhere near the 2,048-word / 16,384-byte floor — so it is exercised
+    /// clear the 6,250-word / 50,000-byte floor — so it is exercised
     /// at a **synthetic** window, on the same helper the local arm runs, paired
     /// with a window large enough that the floor does not bite. A criterion
     /// that can only run on a configuration nobody ships is a criterion that
@@ -3965,19 +4197,68 @@ mod tests {
         }
     }
 
-    /// **Verify M1.** The floor is big enough to hold the thing every budget
-    /// must hold: this harness's own system prompt.
+    /// **Verify M1, and REQ-612's decision of 2026-09-03.** The floor is big
+    /// enough to hold the thing every budget must hold: this harness's own
+    /// system prompt — **including the repository-notes block that ships in
+    /// it**.
     ///
     /// Measured, not asserted about: the floor is pinned at ≥ 2× the real
     /// prompt `build_system_prompt` produces for the built-in registry, which
     /// is what makes "the system prompt is a minority of the window" true
     /// rather than aspirational. Ollama's window is the live case the margin
     /// is for — its window-derived bytes (6,144) are *under* the prompt.
+    ///
+    /// # The config is the shape that ships (REQ-612)
+    ///
+    /// `repo_context: Some(RepoContextBlock::worst_case())`, rendered at
+    /// [`repo_context_cap`] of the floor itself — which is
+    /// [`REPO_CONTEXT_MAX_BYTES`], asserted below rather than assumed, because
+    /// that equality *is* the decision: a floored route carries the whole
+    /// block. Measuring the invariant against a prompt with no block in it
+    /// would have been LESSON-481's shape — a ceiling test measuring a prompt
+    /// the daemon does not build — and it is exactly how a 16,384-byte floor
+    /// came to be smaller than the prompt it had to hold twice over.
+    ///
+    /// **Measured 2026-09-03**, `HarnessConfig::default()` and the built-in
+    /// registry: 6,838 bytes with no block, **15,370 with the worst-case 8,192
+    /// one**. Twice that is 30,740, against a 50,000-byte floor — 19,260 bytes
+    /// of margin. (`for_strong_model` is the *smaller* of the two shipped
+    /// shapes here, 6,726 bare, so `default()` is the right one to pin.)
+    ///
+    /// **Mutation, run and observed:** `MIN_BUDGET_BYTES = 30_000` fails the
+    /// first assertion with `30000 against a 15370-byte prompt`. (A floor of
+    /// 32,000 would *not* — 2 × 15,370 = 30,740 is under it — so 30,000 is the
+    /// figure recorded here, not a rounder one that the test cannot actually
+    /// catch.) Dropping `repo_context` from the config below takes the measured
+    /// prompt back to 6,838 and the mutation survives, which is what the
+    /// non-vacuity check on the block's own bytes is for.
     #[test]
     fn min_budget_bytes_holds_the_harnesss_own_system_prompt() {
+        // The decision, as an equality: the floor's own quarter is at or above
+        // the pinned maximum, so the block the prompt below carries is the
+        // whole one and `worst_case()` — which renders at
+        // `REPO_CONTEXT_MAX_BYTES` — is the right fixture for it.
+        assert_eq!(
+            repo_context_cap(MIN_BUDGET_BYTES),
+            REPO_CONTEXT_MAX_BYTES,
+            "a floored route must carry the whole repository-notes block, or the \
+             prompt measured below is not the one a floored route builds"
+        );
+        let block = crate::repo_context::RepoContextBlock::worst_case();
         let system = crate::harness::turn_loop::build_system_prompt(
             &crate::harness::tools::ToolRegistry::with_builtins(),
-            &HarnessConfig::default(),
+            &HarnessConfig {
+                repo_context: Some(block.clone()),
+                ..HarnessConfig::default()
+            },
+        );
+        // Non-vacuity: the prompt measured is the one carrying the block. Drop
+        // the field and this fires before the arithmetic below quietly passes
+        // on the smaller shape.
+        assert!(
+            system.contains(&block.text),
+            "the prompt measured carries no repository-notes block, so this \
+             invariant is not the one a shipping route runs under"
         );
         assert!(
             MIN_BUDGET_BYTES >= system.len() * 2,
@@ -4112,9 +4393,11 @@ mod tests {
             BudgetBound::DefaultUnknown
         );
         // RedactScan > UserCap: both bite, the clamp is last and names it
-        // (an 80k cap derives 157,952 B, over the 141,224 scannable bound).
+        // (a 160k cap derives 317,952 B, over the 184,265 scannable bound —
+        // the same fixture `derivation_table` carries, and it moves with the
+        // bound for the reason recorded there).
         assert_eq!(
-            derive(remote(200_000, 80_000, true)).bound,
+            derive(remote(200_000, 160_000, true)).bound,
             BudgetBound::RedactScan
         );
         // RedactScan > Window.
@@ -4350,13 +4633,23 @@ mod tests {
             "the very fact that needs saying: {} words against a 500-token cap",
             capped.budget_tokens
         );
-        // Only one half raised, and it still counts: 9,000 − 1,024 = 7,976 →
-        // 5,317 words (over the 2,048 floor) but 15,952 bytes (under 16,384).
-        let one_half = derive(remote(9_000, 0, false));
+        // Only one half raised, and it still counts: 16,000 − 1,024 = 14,976 →
+        // 9,984 words (over the 6,250 floor) but 29,952 bytes (under 50,000).
+        // The window that plays this part moved with the floor — REQ-612 took
+        // it 16,384 → 50,000, and at a 9,000-token window *both* halves are now
+        // raised, which would have made this row say nothing about "either one
+        // can be the half that was raised".
+        let one_half = derive(remote(16_000, 0, false));
         assert!(one_half.floored);
         assert_eq!(
             (one_half.budget_tokens, one_half.budget_bytes),
-            (5_317, MIN_BUDGET_BYTES)
+            (9_984, MIN_BUDGET_BYTES)
+        );
+        assert!(
+            one_half.budget_tokens > MIN_BUDGET_TOKENS,
+            "the row is only about one half if the word half stands on its own: \
+             {} against a {MIN_BUDGET_TOKENS}-word floor",
+            one_half.budget_tokens
         );
         // Ollama's shipped recipe is the live window case.
         assert!(derive(remote(4_096, 0, false)).floored);
@@ -4893,16 +5186,37 @@ mod tests {
     /// commands already ran, and saying otherwise sends the user to change the
     /// wrong thing.
     ///
-    /// Both fixtures are the Ollama-shaped route, because that is where the
-    /// distinction is real on the live corpus: `/status`'s body fits its
-    /// 16,384-byte budget with 3,812 bytes to spare, and its dynamic context
-    /// produces 7,462.
+    /// # The fixture's body is synthetic since REQ-612, and the route is real
+    ///
+    /// Both fixtures ran on the Ollama-shaped route with the **live corpus**,
+    /// because that is where the distinction used to be real: `/status`'s body
+    /// fit its 16,384-byte budget with 3,812 bytes to spare, and its dynamic
+    /// context produced 7,462 more, which pushed it over.
+    ///
+    /// REQ-612 raised [`MIN_BUDGET_BYTES`] to 50,000, so that route's pair is
+    /// now 6,250 words / 50,000 bytes and `/status` fits it at **both** stages
+    /// — body 12,572 B, body-plus-output 20,035 B. No route this build can
+    /// derive is small enough to split the two stages on any skill the ADLC
+    /// toolkit ships (the smallest is the default pair's 32,768 bytes). Rather
+    /// than shrink the *route* below anything the derivation produces — which
+    /// would test the message against a budget no user can have — the **body**
+    /// is synthesized at the size that splits the stages on the real floored
+    /// pair: 35,000 bytes fits (42,249 B / 5,753 w assembled), and 9,000 bytes
+    /// of dynamic output does not (51,250 B).
+    ///
+    /// The route stays the derived one on purpose: it is the thing REQ-612
+    /// moved, and a synthetic budget here would have kept passing across that
+    /// move without noticing it.
     #[test]
     fn the_message_says_which_stage_refused() {
         let system = real_system_prompt();
         let budget = derive(remote(4_096, 0, false));
-        let status = corpus_body(STATUS_BODY_BYTES);
-        let with_output = format!("{status}\n{}", corpus_body(STATUS_DYNAMIC_OUTPUT_BYTES));
+        // Synthetic, and sized against this route rather than against the
+        // toolkit — see the note above. The measured `/status` figures
+        // ([`STATUS_BODY_BYTES`], [`STATUS_DYNAMIC_OUTPUT_BYTES`]) are still
+        // what `the_ac16_route_shapes_admit_and_refuse_the_real_corpus` runs.
+        let status = corpus_body(35_000);
+        let with_output = format!("{status}\n{}", corpus_body(9_000));
 
         // Non-vacuity, and BR-8(d)'s whole point: Stage A admits this body, so
         // the user is asked for consent and the commands run.
@@ -4919,6 +5233,30 @@ mod tests {
             SkillFit::Fits,
             "`/status`'s body fits this route; if it stops fitting, this test \
              is no longer about the second stage"
+        );
+        // …and the reason the body above is synthetic rather than the live
+        // corpus: on the floored pair the real `/status` fits at **both**
+        // stages. Asserted rather than asserted-about, so a floor that came
+        // back down — or a `/status` that grew — is a red test telling whoever
+        // reads it to put the measured fixture back.
+        assert_eq!(
+            skill_fit(
+                SkillCaller::User,
+                SkillStage::WithDynamicContext,
+                "status",
+                &system,
+                &format!(
+                    "{}\n{}",
+                    corpus_body(STATUS_BODY_BYTES),
+                    corpus_body(STATUS_DYNAMIC_OUTPUT_BYTES)
+                ),
+                &budget,
+                Some("ollama")
+            ),
+            SkillFit::Fits,
+            "the live corpus splits the two stages on this route again — put \
+             `STATUS_BODY_BYTES` / `STATUS_DYNAMIC_OUTPUT_BYTES` back as this \
+             test's fixture and delete the synthetic one"
         );
 
         let body_alone = refusal(
@@ -5011,6 +5349,9 @@ mod tests {
             digest_threshold_bytes: 1,
             floored: false,
             provider_id: None,
+            // Unread by every surface under test here, and a figure `derive`
+            // never mints — the same posture as the one-word pair above.
+            repo_context_cap: 0,
         };
         let message = refusal(
             SkillStage::Body,
@@ -5202,6 +5543,9 @@ mod tests {
             digest_threshold_bytes: 1,
             floored: false,
             provider_id: None,
+            // Unread by every surface under test here, and a figure `derive`
+            // never mints — the same posture as the one-word pair above.
+            repo_context_cap: 0,
         };
 
         assert_eq!(
@@ -6998,6 +7342,9 @@ mod tests {
             digest_threshold_bytes: 1,
             floored: false,
             provider_id: None,
+            // Unread by every surface under test here, and a figure `derive`
+            // never mints — the same posture as the one-word pair above.
+            repo_context_cap: 0,
         };
         let offer = OverBudgetOffer::new(
             "analyze",

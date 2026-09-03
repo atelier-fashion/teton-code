@@ -731,15 +731,23 @@ async fn a_two_hundred_block_conversation_on_a_big_route_compacts_through_the_lo
 ///
 /// ## The shape
 ///
-/// A deliberately narrow remote window (8,000 provider tokens → 4,650 words /
-/// 13,952 bytes), so one pasted block busts it and is clamped in place with the
-/// marker. The whole conversation is the new prompt — nothing carried — because
-/// what is under test is the seeding, not the replay.
+/// A deliberately narrow remote window (30,000 provider tokens → 19,317 words /
+/// 57,952 bytes), so one pasted block busts the byte half and is clamped in
+/// place with the marker. The whole conversation is the new prompt — nothing
+/// carried — because what is under test is the seeding, not the replay.
+///
+/// **The window moved with REQ-612's floor.** It was 8,000 tokens (4,650 words
+/// / 13,952 bytes) with a 6,000-word paste. Raising `MIN_BUDGET_BYTES` to
+/// 50,000 floors any window under 26,024 tokens, so that route's pair became
+/// (6,250, 50,000) and the paste no longer busted it — the non-vacuity check
+/// below is what said so. 30,000 is the narrowest round window that is still
+/// **not** floored, which keeps this test about a declared window's label
+/// rather than about the floor's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_marker_names_the_routes_window_when_the_turn_is_seeded_by_carried_turn() {
     let fixture = Fixture::new("carryseed", "I answered the shortened version.");
     let budget = derive(BudgetInputs {
-        window: 8_000,
+        window: 30_000,
         cap: 0,
         reservation: 1_024,
         is_local: false,
@@ -747,6 +755,11 @@ async fn the_marker_names_the_routes_window_when_the_turn_is_seeded_by_carried_t
         provider_id: Some("kimi"),
     });
     assert_eq!(budget.window_label, "kimi's context window");
+    assert!(
+        !budget.floored,
+        "this route must be the declaration's own pair, not the floor's, or the \
+         marker under test names a window nobody declared"
+    );
     let config = HarnessConfig::default().with_route_budget(budget.clone());
 
     // Seeded exactly as `DaemonRuntime::run_prompt_turn` seeds a turn: the head
@@ -760,9 +773,11 @@ async fn the_marker_names_the_routes_window_when_the_turn_is_seeded_by_carried_t
         &config,
         Arc::new(SessionTaint::new()),
         Vec::new(),
-        format!("review this paste:\n{}", filler(6_000)),
+        format!("review this paste:\n{}", filler(16_000)),
         std::collections::BTreeSet::new(),
         false,
+        // No notes in this fixture, so a reroute has nothing to re-render.
+        None,
     );
     // Non-vacuity: the pasted block really is over the route's byte budget, so
     // the clamp has to fire and a marker has to be written.

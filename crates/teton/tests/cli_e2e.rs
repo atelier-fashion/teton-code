@@ -7767,3 +7767,346 @@ fn a_piped_session_streams_the_reply_unrendered() {
         "an escape reached a pipe; stdout:\n{stdout:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REQ-612 — the repository-notes switch, at the client (TASK-376)
+// ---------------------------------------------------------------------------
+//
+// AC → test map for this section:
+//
+//   BR-2 + AC-10 (the switch, the state line, and the untouched config)
+//       → `context_off_and_on_toggle_the_notes_without_writing_config`
+//   BR-7 + AC-11 (the truncation notice with /verbose off, the withheld line,
+//   and doctor's two advisories)
+//       → `a_truncated_or_withheld_notes_file_is_announced_and_doctor_advises`
+//
+// What this section deliberately does **not** hold: whether the block actually
+// left the system prompt. That is a claim about the bytes a vendor received and
+// belongs where the vendor can be inspected — `tetond`'s `repo_context.rs` and
+// the egress-capture suite. What is checked here is the client's half of BR-2
+// and BR-7: the surfaces a user meets, and the file on disk they must not have
+// changed by typing a session command.
+
+/// A project fixture under `root` holding a `TETON.md` of `notes`.
+///
+/// A `Cargo.toml` beside it because only a `project`-kind root is read (BR-1),
+/// which is `root_fixtures`' rule and the reason a bare directory with notes in
+/// it would make these tests pass vacuously.
+fn notes_fixture(root: &Path, name: &str, notes: &str) -> PathBuf {
+    let project = root.join(name);
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("Cargo.toml"), "[package]\nname = \"notes\"\n").unwrap();
+    std::fs::write(project.join("TETON.md"), notes).unwrap();
+    project
+}
+
+/// The label `doctor`'s two repository-notes advisories share, cut at rather
+/// than matched whole because a piped surface decorates its notice lines.
+const ADVISORY: &str = "advisory: repo notes:";
+
+/// A `TETON.md` comfortably over the 8 KiB cap, in whole lines so the
+/// truncation has a line boundary to cut at (BR-3).
+fn oversized_notes() -> String {
+    let line = "This repository is described here, at some length, for the cap to bite.\n";
+    line.repeat(200)
+}
+
+/// Every `context: …` line a piped session drew, with the surface's own
+/// decorations (`\u{203a} `, `>> `) trimmed off the front.
+///
+/// Trimmed rather than matched whole because a piped session's lines carry the
+/// notice marker and, on the line the user typed on, the entry prompt as well —
+/// so `starts_with` on the raw line finds nothing while `contains` would match a
+/// sentence that merely mentions the word. This cuts at the label.
+fn context_lines<'a>(output: &'a str, what: &str) -> Vec<&'a str> {
+    let lines: Vec<&str> = output
+        .lines()
+        .filter_map(|line| line.find("context: ").map(|at| &line[at..]))
+        .collect();
+    assert!(
+        !lines.is_empty(),
+        "{what}: the session drew no `context:` line at all; output:\n{output}"
+    );
+    lines
+}
+
+/// **REQ-612 BR-2 / AC-10, the client half.** `/context` reports the state on a
+/// pipe; `/context off` stops the notes being carried and `/context on`
+/// restores them; `config.toml` is byte-identical throughout.
+///
+/// The load-bearing observation is the **`/verbose` route line**, not the
+/// command's own echo: BR-2 says `off` changes what the next prompt carries, and
+/// a test that only read `/context`'s answer back would pass on a daemon that
+/// changed nothing but its reply. So the session runs a real turn on each side
+/// of the switch and asserts the `· notes N B` clause appears on one and not the
+/// other — the resident bytes BR-7 puts on that line, which are the same bytes
+/// the block is made of.
+///
+/// The two switches are typed **before** each turn rather than relying on the
+/// state published at session create, because `repo_context_state` is published
+/// only when there is news (ADR-3): a client that attached after create would
+/// see nothing, and a test written against that ordering would be flaky rather
+/// than wrong. Every event this asserts on follows a change the test made.
+///
+/// **Mutation (run 2026-09-03):** making `slash::handle_context` send
+/// `ConfigUpdate::SetRepoContextEnabled` through `config/set` instead of
+/// `session/context` reddened the byte-identical-config assertion — which is
+/// AC-10's whole point, and the one failure a reader of the command's output
+/// alone would never see. Restored.
+#[test]
+fn context_off_and_on_toggle_the_notes_without_writing_config() {
+    let daemon_bin = daemon_bin();
+    let daemon = TestDaemon::spawn_scripted(&daemon_bin, TURN_REPLIES);
+    let teton = teton_bin();
+    let project = notes_fixture(
+        &daemon.root,
+        "proj",
+        "# proj\n\nThe crates live in crates/.\n",
+    );
+    let config_path = daemon.root.join("config.toml");
+    let before = std::fs::read_to_string(&config_path).expect("the fixture config is readable");
+
+    let (stdout, stderr, status) = daemon.run_cli_from(
+        &teton,
+        &["--cwd", project.to_str().unwrap()],
+        "/verbose\n/context\n/context off\n/context\nfirst\n/context on\n/context\nsecond\n",
+        Some(&daemon.root),
+        &[],
+    );
+    assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    // The bare read, on a pipe (BR-2's REQ-560 BR-10 clause): the file, the
+    // bytes on disk, what is resident, and the cap — all of them the daemon's
+    // figures, none of them derivable here.
+    let lines = context_lines(&stdout, "the toggle session");
+    let read_back = lines
+        .iter()
+        .find(|line| line.contains("TETON.md") && line.contains("cap "))
+        .unwrap_or_else(|| panic!("no `/context` figures line; stdout:\n{stdout}"));
+    for needle in ["TETON.md", "bytes on disk", "resident", "cap "] {
+        assert!(
+            read_back.contains(needle),
+            "AC-10: the state line must name {needle:?}; got: {read_back}"
+        );
+    }
+
+    // Off is off, and it says why — the switch, not a missing file.
+    assert!(
+        lines.iter().any(|line| line.contains("the switch is off")),
+        "`/context off` must report the switch, not a missing file; lines:\n{lines:#?}"
+    );
+
+    // The load-bearing half: the turn after `off` spends no notes bytes, and
+    // the turn after `on` does. Route lines only render under `/verbose`, which
+    // the session turned on first.
+    let routes: Vec<&str> = stdout
+        .lines()
+        .filter_map(|line| line.find("route [").map(|at| &line[at..]))
+        .collect();
+    assert_eq!(
+        routes.len(),
+        2,
+        "the session must have run one turn on each side of the switch; \
+         stdout:\n{stdout}\ndaemon log:\n{}",
+        daemon.log()
+    );
+    assert!(
+        !routes[0].contains("· notes "),
+        "the turn after `/context off` still spent notes bytes: {}",
+        routes[0]
+    );
+    assert!(
+        routes[1].contains("· notes "),
+        "the turn after `/context on` carried no notes: {}\ndaemon log:\n{}",
+        routes[1],
+        daemon.log()
+    );
+
+    // AC-10's other half, read off the disk rather than inferred: a session
+    // switch writes nothing.
+    let after = std::fs::read_to_string(&config_path).expect("the fixture config is readable");
+    assert_eq!(
+        before, after,
+        "`/context on|off` is session-scoped and must not touch config.toml"
+    );
+
+    // BR-2's **other** switch, here because it is the contrast that gives the
+    // assertion above its meaning: a durable default exists, it is a shell
+    // command, and it does write. Without this leg "the config did not change"
+    // would also be satisfied by a build in which nothing can change it.
+    let posture = daemon.run_cli(&teton, &["context", "status"]);
+    assert!(
+        posture.contains("repo notes: on (default)"),
+        "`teton context status` reports the durable default; output:\n{posture}"
+    );
+    let disabled = daemon.run_cli(&teton, &["context", "disable"]);
+    assert!(
+        disabled.contains("repo notes: off (default)"),
+        "`teton context disable` reads the posture back off `config/get` rather than \
+         echoing the request; output:\n{disabled}"
+    );
+    assert_ne!(
+        before,
+        std::fs::read_to_string(&config_path).expect("the fixture config is readable"),
+        "the durable switch is the half that writes"
+    );
+
+    // And the one line, shared: `teton doctor` prints exactly what
+    // `teton context status` printed (AC-11's no-drift clause, the REQ-611
+    // AC-20 rule one feature over).
+    let doctor = daemon.run_cli(&teton, &["doctor"]);
+    // The *posture* line, not every line the label opens: doctor also says
+    // "repo notes: no session here", which is the shell form declining to
+    // answer about a session it does not own (`report_skill_preflight`'s rule).
+    let posture_lines: Vec<&str> = doctor
+        .lines()
+        .filter_map(|line| line.find("repo notes: ").map(|at| &line[at..]))
+        .filter(|line| line.contains("(default)"))
+        .collect();
+    assert_eq!(
+        posture_lines.len(),
+        1,
+        "doctor prints exactly one repo-notes posture line; output:\n{doctor}"
+    );
+    assert!(
+        disabled
+            .lines()
+            .any(|line| line.trim().ends_with(posture_lines[0])),
+        "`teton context …` and `teton doctor` must print one line, not two; \
+         doctor: {:?}\nteton context disable:\n{disabled}",
+        posture_lines[0]
+    );
+}
+
+/// **REQ-612 BR-7 / AC-11.** A file that is cut to fit says so with `/verbose`
+/// **off**, a file a boundary covers says so too, and `/doctor` advises on each
+/// while staying green.
+///
+/// Two daemons, because the two states are two different fixtures: one whose
+/// `TETON.md` is over the cap, and one whose config carries a `**/TETON.md`
+/// boundary. Both sessions are quiet — no `/verbose` anywhere — which is the
+/// claim: BR-3's "nothing is clamped in silence" and BR-5's "a session-long
+/// silent pin is what the load-time rule exists to prevent" are not diagnostics
+/// a user has to opt into.
+///
+/// `/doctor` rather than the shell's `teton doctor` for the advisories, and the
+/// split is `report_skill_preflight`'s: the posture line is configuration and
+/// `teton doctor` prints it (`doctor_prints_one_transcript_posture_line`'s
+/// neighbour asserts that), while "is *this session's* file truncated" is a
+/// question only a session's root can answer. The shell form says so instead of
+/// answering about a session it picked, and that arm is pinned in
+/// `cli_rows::a_sessionless_doctor_names_no_session_and_asks_for_no_preflight`.
+///
+/// **Mutation (run 2026-09-03):** putting the `truncated` arm of
+/// `session_ui::format_repo_context` behind the verbose gate reddened the first
+/// leg's notice assertion; dropping `advise_on_repo_context` from
+/// `doctor_report_on` reddened both advisory assertions. Restored.
+#[test]
+fn a_truncated_or_withheld_notes_file_is_announced_and_doctor_advises() {
+    let daemon_bin = daemon_bin();
+
+    // Leg one: over the cap. The notes are resident, and the user is told that
+    // what the model has is the first 8 KiB of them.
+    {
+        let daemon = TestDaemon::spawn_scripted(&daemon_bin, TURN_REPLIES);
+        let teton = teton_bin();
+        let project = notes_fixture(&daemon.root, "big", &oversized_notes());
+
+        // `off` then `on` so the announcement follows a change this test made,
+        // rather than depending on whether the client was subscribed in time for
+        // the state published at session create (ADR-3 publishes only news).
+        let (stdout, stderr, status) = daemon.run_cli_from(
+            &teton,
+            &["--cwd", project.to_str().unwrap()],
+            "/context off\n/context on\n/doctor\n",
+            Some(&daemon.root),
+            &[],
+        );
+        assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(
+            !stdout.contains("route ["),
+            "this leg must be quiet — a verbose session would prove nothing about \
+             BR-3's ungated notice; stdout:\n{stdout}"
+        );
+
+        let announced = context_lines(&stdout, "the truncated session");
+        assert!(
+            announced
+                .iter()
+                .any(|line| line.contains("are resident") && line.contains("trim the file")),
+            "BR-3: a truncated file is announced with /verbose off, with its remedy; \
+             lines:\n{announced:#?}\ndaemon log:\n{}",
+            daemon.log()
+        );
+
+        let advisories: Vec<&str> = stdout
+            .lines()
+            .filter_map(|line| line.find(ADVISORY).map(|at| &line[at..]))
+            .collect();
+        assert_eq!(
+            advisories.len(),
+            1,
+            "AC-11: `/doctor` advises exactly once on a truncated file; \
+             stdout:\n{stdout}"
+        );
+        assert!(
+            advisories[0].contains("TETON.md") && advisories[0].contains("trim the file"),
+            "the advisory names the file and the remedy; got: {}",
+            advisories[0]
+        );
+
+        // And it is an advisory: REQ-578's posture, unchanged.
+        let (_out, _err, doctor_status) =
+            daemon.run_cli_from(&teton, &["doctor"], "", Some(&daemon.root), &[]);
+        assert!(
+            doctor_status.success(),
+            "an advisory must not change doctor's exit status"
+        );
+    }
+
+    // Leg two: a boundary covers the file, so it is never made resident.
+    {
+        let daemon = TestDaemon::spawn_scripted_with_config(
+            &daemon_bin,
+            TURN_REPLIES,
+            "[[boundaries]]\npath_glob = \"**/TETON.md\"\nmode = \"local-only\"\n\n",
+        );
+        let teton = teton_bin();
+        let project = notes_fixture(&daemon.root, "walled", "# walled\n\nSecrets, apparently.\n");
+
+        let (stdout, stderr, status) = daemon.run_cli_from(
+            &teton,
+            &["--cwd", project.to_str().unwrap()],
+            "/context off\n/context on\n/doctor\n",
+            Some(&daemon.root),
+            &[],
+        );
+        assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+        let announced = context_lines(&stdout, "the withheld session");
+        assert!(
+            announced
+                .iter()
+                .any(|line| line.contains("local-only boundary")),
+            "BR-5: a covered file says so rather than going quiet; \
+             lines:\n{announced:#?}\ndaemon log:\n{}",
+            daemon.log()
+        );
+
+        let advisories: Vec<&str> = stdout
+            .lines()
+            .filter_map(|line| line.find(ADVISORY).map(|at| &line[at..]))
+            .collect();
+        assert_eq!(
+            advisories.len(),
+            1,
+            "AC-11: `/doctor` advises exactly once on a withheld file; \
+             stdout:\n{stdout}"
+        );
+        assert!(
+            advisories[0].contains("not resident") && advisories[0].contains("boundary"),
+            "the advisory names the reason and the remedy; got: {}",
+            advisories[0]
+        );
+    }
+}

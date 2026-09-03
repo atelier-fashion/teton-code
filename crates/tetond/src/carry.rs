@@ -25,7 +25,8 @@ use crate::harness::context::{
     BlockRole, ContextManager, PressureReport, Provenance, RetainedContext,
 };
 use crate::harness::reply::prose_before_tool_call;
-use crate::harness::turn_loop::HarnessConfig;
+use crate::harness::turn_loop::{append_repo_context, HarnessConfig};
+use crate::repo_context::RepoContextBlock;
 use crate::runtime::{context_is_sensitive, taint_pin_line, SessionTaint, TAINT_BY_CONTEXT};
 use crate::sessions::SessionRegistry;
 
@@ -76,6 +77,92 @@ pub struct CarriedTurn {
     /// Whether a drop from here would be a cancellation. Set once the new user
     /// message is in the manager and cleared by whichever outcome arrives first.
     armed: bool,
+    /// The identities this turn's **system prompt** carries — the repository's
+    /// own notes, when the route rendered a block (REQ-612 BR-5, ADR-2).
+    ///
+    /// Held on the guard rather than only written onto the manager once,
+    /// because the manager is not written once: [`Self::rebudget`] rebuilds
+    /// the budget mid-turn on a reroute, and every seam that touches the
+    /// manager owes the same re-statement (LESSON-501). The guard is the one
+    /// value that lives for exactly the turn, which is exactly how long this
+    /// fact is true for.
+    ///
+    /// It is derived in [`Self::begin`] from `HarnessConfig::repo_context` and
+    /// **never** from the session's [`RetainedContext`], which holds
+    /// conversation and not the prompt. A block dropped between turns — a `/cd`
+    /// out of the repository, a `/context off`, a boundary that came to cover
+    /// the file — therefore leaves nothing behind to pin the next turn with.
+    ///
+    /// Empty for every turn with no notes, which contributes nothing to
+    /// `context_provenance` and is the pre-REQ-612 behaviour byte for byte.
+    system_sources: BTreeSet<ProvenanceId>,
+    /// What a reroute needs to re-render the repository-notes block at the cap
+    /// of the route the turn is actually taking (REQ-612 BR-3).
+    ///
+    /// `None` for every turn with no notes, which is the pre-REQ-612 path byte
+    /// for byte. See [`RepoContextCarry`] for why the block cannot simply be
+    /// kept.
+    repo_context: Option<RepoContextCarry>,
+}
+
+/// The two halves of a system prompt that carries repository notes, kept apart
+/// so a mid-turn reroute can rebuild it at the new route's cap (REQ-612 BR-3).
+///
+/// # Why the block cannot just be kept
+///
+/// The notes cap is a **quarter of the route's byte budget**, so it moves when
+/// the route does: a turn assembled on the local tier renders 8,192 bytes of
+/// notes, and a turn rerouted to a 16,384-byte budget may spend only 4,096.
+/// Keeping the block already rendered pushes a ~16.4 KB system prompt into a
+/// 16,384-byte budget, and `truncate_to_budget` then makes room by dropping
+/// conversation oldest-first — which on a fresh turn is the user's own message.
+/// The user asks a question, the notes stay whole, and the model is shown the
+/// notes without the question.
+///
+/// **No route derives a narrower cap today** (REQ-612's decision of
+/// 2026-09-03: `MIN_BUDGET_BYTES` is 50,000, so every derived route reaches the
+/// pinned 8,192). This seam is therefore latent rather than dead: it is the one
+/// place a narrower route would arrive, its behaviour is pinned at a synthetic
+/// sub-floor budget in `conversation_carry.rs`, and it still re-renders on
+/// every reroute — a cheap no-op when the cap has not moved, and the guard that
+/// stops the failure above the day it does.
+///
+/// So the block is re-rendered at the new cap instead, which is the only party
+/// to the prompt that a reroute *should* shrink: the notes are the repository's
+/// description of itself and the turn is the user's.
+///
+/// # Why a state and not a file
+///
+/// [`Arc<RepoContextState>`](crate::repo_context::RepoContextState) is what the
+/// session registry already holds, so carrying it costs a pointer bump rather
+/// than a copy of up to 64 KiB of file text on every turn that has notes.
+pub struct RepoContextCarry {
+    /// The system prompt **without** the notes — `build_system_prompt` run with
+    /// `repo_context: None`. A function of the tools and the route's harness,
+    /// neither of which a reroute moves, so it is rendered once per turn.
+    pub base_system: String,
+    /// The state the block is rendered from, exactly as the registry holds it.
+    pub state: Arc<crate::repo_context::RepoContextState>,
+}
+
+/// What one [`CarriedTurn::rebudget`] did.
+///
+/// Two answers because a reroute owes the user two lines and they are published
+/// by different seams: the refit's own pressure (REQ-586 BR-10) and — when the
+/// turn carries repository notes — the notes as *this* route renders them
+/// (REQ-612 BR-3). The second used to be nothing at all: the block was
+/// re-rendered at the new cap and the client was told only about the pressure,
+/// so a reroute onto a floored route cut the file in silence.
+pub struct RebudgetReport {
+    /// What the refit took to make the context fit the new pair.
+    pub pressure: PressureReport,
+    /// The state the notes were rendered from and the block that is now in the
+    /// prompt — `None` for a turn carrying no notes.
+    ///
+    /// The block itself rather than figures derived from it, so the caller
+    /// announces the bytes that were sent rather than a second render of the
+    /// same pair.
+    pub notes: Option<(Arc<crate::repo_context::RepoContextState>, RepoContextBlock)>,
 }
 
 impl CarriedTurn {
@@ -112,6 +199,15 @@ impl CarriedTurn {
     /// second seeding entry point is how a path nobody remembered to update
     /// comes to push an unpinned block — and this is the one function every turn
     /// in the daemon goes through.
+    ///
+    /// # `repo_context` is the same argument again (REQ-612 BR-3)
+    ///
+    /// It is a parameter, not a builder call, for exactly the reason above: a
+    /// `with_repo_context` a caller could forget would seed a turn whose reroute
+    /// silently keeps a block sized for a route it is no longer taking, and the
+    /// only symptom is the user's own message being elided out of the prompt.
+    /// `None` says "this turn carries no notes", which is every fixture and
+    /// every session outside a repository.
     // The prompt's two provenance facts are passed individually because that is
     // the shape `ContextManager::push_user_from` takes them in, and one spelling
     // of the pair across the whole seeding path is worth more here than a
@@ -128,15 +224,32 @@ impl CarriedTurn {
         prompt: impl Into<String>,
         prompt_sources: BTreeSet<ProvenanceId>,
         prompt_unknown: bool,
+        repo_context: Option<RepoContextCarry>,
     ) -> Self {
         // REQ-586 BR-1/BR-7: the pair AND the window it is a budget *for*, from
         // the one `RouteBudget` the router derived — so the in-prompt elision
         // marker names this route's window rather than the local engine's, and
         // the three facts cannot be seeded from two different routes.
+        // REQ-612 BR-5: the identities the *head* above carries. Read off the
+        // block the `assemble` stage rendered for this turn, which is the same
+        // value `system` was built from — so the prompt's bytes and the
+        // provenance of those bytes are seeded from one fact, not two.
+        let system_sources: BTreeSet<ProvenanceId> = harness
+            .repo_context
+            .as_ref()
+            .map(|block| block.provenance.clone())
+            .into_iter()
+            .collect();
         let mut ctx = ContextManager::new(system, harness.context_budget_tokens)
             .with_budget_bytes(harness.context_budget_bytes)
             .with_window_label(harness.budget.window_label.clone());
         ctx.replay(sessions.conversation_snapshot(session_id).into_retained());
+        // Stated **after** the replay, deliberately: the set is the prompt's and
+        // the replay is the conversation's, and a seeding order that let a
+        // future `replay` clear it would be a silent hole in BR-5 rather than a
+        // failing test. Restated rather than merged, for the reason
+        // `with_system_sources` records.
+        let mut ctx = ctx.with_system_sources(system_sources.clone());
         ctx.push_user_from(prompt, prompt_sources, prompt_unknown);
         Self {
             ctx: Some(ctx),
@@ -145,6 +258,8 @@ impl CarriedTurn {
             taint,
             boundaries,
             armed: true,
+            system_sources,
+            repo_context,
         }
     }
 
@@ -198,10 +313,90 @@ impl CarriedTurn {
     /// because a `RouteBudget` is one fact and setting it in two calls is how
     /// the marker comes to name a window the budget is no longer against: the
     /// label and both currencies move together or not at all.
-    pub fn rebudget(&mut self, budget: &RouteBudget) -> PressureReport {
+    /// The third seam REQ-612 BR-5 owes its re-statement to — the reroute one.
+    ///
+    /// # The notes are re-rendered at the new cap, before the refit
+    ///
+    /// The repository-notes cap is a quarter of the route's byte budget
+    /// ([`RouteBudget::repo_context_cap`]), so it moves with the route. A
+    /// reroute that kept the block already rendered would carry a system prompt
+    /// derived from a *wider* budget into a narrower one, and
+    /// [`ContextManager::truncate_to_budget`] would then make room by dropping
+    /// conversation oldest-first — which on a first attempt is the user's own
+    /// message. The order here is therefore: re-render, restate, then refit, so
+    /// the gate below measures the prompt this route will actually send.
+    ///
+    /// The identity does not depend on the cap, so
+    /// [`Self::restate_system_sources`] is a re-assertion in the ordinary case.
+    /// It is made anyway, because "the manager kept the field across a
+    /// `&mut self` call" is a property of today's [`ContextManager::rebudget`]
+    /// and not a promise it makes; LESSON-501 says the seam states the fact.
+    ///
+    /// # It answers with the notes it re-rendered
+    ///
+    /// [`RebudgetReport::notes`] is the block that is now in the prompt, beside
+    /// the state it came from. The caller owes the user a `repo_context_state`
+    /// for it (BR-3): the cap moved, so the same unmoved file may have just been
+    /// cut — and a truncation nobody is told about is the silence BR-3 forbids.
+    /// The block travels rather than being re-derived at the call site, so the
+    /// figures announced are the figures of the bytes that were sent.
+    pub fn rebudget(&mut self, budget: &RouteBudget) -> RebudgetReport {
         self.set_window_label(&budget.window_label);
-        self.ctx_mut()
-            .rebudget(budget.budget_tokens, budget.budget_bytes)
+        let notes = self.rerender_repo_context(budget.repo_context_cap);
+        self.restate_system_sources();
+        RebudgetReport {
+            pressure: self
+                .ctx_mut()
+                .rebudget(budget.budget_tokens, budget.budget_bytes),
+            notes,
+        }
+    }
+
+    /// Rebuild this turn's system prompt with its repository notes rendered at
+    /// `cap` (REQ-612 BR-3) — a no-op for a turn carrying none.
+    ///
+    /// The join is [`append_repo_context`], the **same** function
+    /// `build_system_prompt` finishes with, so the reroute's prompt and the
+    /// assemble stage's prompt cannot differ by a newline.
+    ///
+    /// `system_sources` is restated from the freshly rendered block rather than
+    /// left alone: the identity does not depend on the cap today, and deriving
+    /// it from the block that is actually in the prompt is what keeps that true
+    /// without anyone having to remember it.
+    ///
+    /// Answers with what it rendered, so the caller can announce it without
+    /// rendering the same `(file, cap)` a second time.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::ctx`].
+    fn rerender_repo_context(
+        &mut self,
+        cap: usize,
+    ) -> Option<(Arc<crate::repo_context::RepoContextState>, RepoContextBlock)> {
+        let carry = self.repo_context.as_ref()?;
+        let file = carry.state.file()?;
+        let state = Arc::clone(&carry.state);
+        let block = RepoContextBlock::render(file, cap);
+        let system = append_repo_context(&carry.base_system, &block);
+        self.system_sources = std::iter::once(block.provenance.clone()).collect();
+        self.ctx_mut().set_system(system);
+        Some((state, block))
+    }
+
+    /// Write this turn's system-prompt identities onto the manager again
+    /// (REQ-612 BR-5, LESSON-501).
+    ///
+    /// Goes through the owned `Option` for the reason
+    /// [`Self::set_window_label`] does: the manager's setter is a consuming
+    /// builder, because the ordinary case states it once at seeding.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::ctx`].
+    fn restate_system_sources(&mut self) {
+        let ctx = self.ctx.take().expect("the turn context was taken");
+        self.ctx = Some(ctx.with_system_sources(self.system_sources.clone()));
     }
 
     /// Name the window this turn's context is budgeted against (REQ-586 BR-7).
@@ -439,6 +634,163 @@ mod tests {
         blocks.iter().map(|b| b.text.as_str()).collect()
     }
 
+    /// A repository-notes block rendered by the real renderer from a real file
+    /// (LESSON-544: a hand-built `RepoContextBlock` would prove only that this
+    /// module can read a field it was handed).
+    fn repo_block(name: &str) -> crate::repo_context::RepoContextBlock {
+        let text = "Build with `cargo test`.\n";
+        let file = crate::repo_context::RepoContextFile {
+            source: teton_protocol::methods::RepoContextSource::TetonMd,
+            path: std::path::PathBuf::from("/repo").join(name),
+            provenance: crate::fixture_id(name),
+            bytes_on_disk: text.len() as u64,
+            key: crate::repo_context::FileStat {
+                len: text.len() as u64,
+                mtime: None,
+                is_symlink: false,
+                is_regular: true,
+                // A synthetic key: this file was never `stat`ed, so it has
+                // no identity to carry and no second name to refuse.
+                dev: 0,
+                ino: 0,
+                nlink: 1,
+            },
+            text: text.to_owned(),
+        };
+        crate::repo_context::RepoContextBlock::render(
+            &file,
+            crate::repo_context::REPO_CONTEXT_MAX_BYTES,
+        )
+    }
+
+    /// **REQ-612 BR-5 / LESSON-501: the system prompt's identities are stated
+    /// at every seam that writes a manager — three seams, three assertions.**
+    ///
+    /// The seams, and what each would break if it stopped stating them:
+    ///
+    /// 1. **`begin`** — the ordinary turn. Without it the notes reach every
+    ///    remote provider with no boundary verdict, on every turn.
+    /// 2. **`rebudget`** — the mid-turn reroute. The system prompt is fixed for
+    ///    the turn (ADR-5), so this is a re-assertion; it is asserted because
+    ///    "the `&mut self` call happened to keep the field" is a property of
+    ///    today's `ContextManager::rebudget`, not a promise, and the reroute is
+    ///    exactly the moment a turn stops being local.
+    /// 3. **a replay from `RetainedContext`** — the *second* turn of a session.
+    ///    The set is deliberately not carried in the retained conversation, so
+    ///    this leg is what proves it is re-derived from the config: the second
+    ///    `begin` replays a committed conversation and must still hold the
+    ///    identity, and the fourth assertion below — a third turn whose config
+    ///    has no block — proves the derivation is the config's and not a
+    ///    residue of the replay.
+    ///
+    /// **Mutations, and one of them is honest about being green.** Deleting the
+    /// `with_system_sources` line in `begin` fails legs 1–3 together (run red).
+    /// Deleting the `restate_system_sources()` call in `rebudget` leaves leg 2
+    /// **green today** (run, and it passed): `ContextManager::rebudget` takes
+    /// `&mut self` and keeps the field, so the re-statement is currently
+    /// redundant — what catches its removal today is `-D warnings` on the
+    /// orphaned method, and what leg 2 really guards is the day `rebudget`
+    /// rebuilds its manager the way `set_window_label` already has to. Saying
+    /// that here rather than claiming a red is the point of LESSON-569.
+    ///
+    /// The fourth assertion is the structural one: nothing in this module may
+    /// read the set out of `RetainedContext`, and a turn whose config carries no
+    /// block must pin nothing even when the conversation it replays was
+    /// assembled under one. That is the `/cd`-out, `/context off` and
+    /// boundary-added-mid-session case, and it fails the moment a future edit
+    /// makes the retained conversation a source for this fact.
+    #[test]
+    fn system_sources_are_restated_at_begin_rebudget_and_replay() {
+        let sessions = SessionRegistry::new();
+        let session = sessions
+            .create(SessionMode::Freeform, None, None)
+            .expect("a freeform session needs no phase")
+            .session_id;
+        let taint = Arc::new(SessionTaint::new());
+        let block = repo_block("TETON.md");
+        let notes = crate::fixture_id("TETON.md");
+        let config = HarnessConfig {
+            repo_context: Some(block),
+            ..HarnessConfig::default()
+        };
+        let seed = |config: &HarnessConfig| {
+            CarriedTurn::begin(
+                &sessions,
+                &session,
+                "HEAD",
+                config,
+                Arc::clone(&taint),
+                Vec::new(),
+                "what does this repo build with?",
+                BTreeSet::new(),
+                false,
+                // No notes in this fixture, so a reroute has nothing to re-render.
+                None,
+            )
+        };
+
+        // 1. `begin`.
+        let mut turn = seed(&config);
+        assert!(
+            turn.ctx().system_sources().contains(&notes),
+            "the seeding seam must state the prompt's identities: {:?}",
+            turn.ctx().system_sources()
+        );
+
+        // 2. `rebudget` — the reroute. A different route's pair, so the
+        // manager really is re-budgeted rather than short-circuited.
+        let rerouted = crate::harness::budget::derive(crate::harness::BudgetInputs {
+            window: 128_000,
+            cap: 0,
+            reservation: 1_024,
+            is_local: false,
+            redact_scan: false,
+            provider_id: Some("kimi"),
+        });
+        assert_ne!(
+            rerouted.budget_bytes, config.budget.budget_bytes,
+            "the fixture reroutes to a different pair, or `rebudget` is a no-op"
+        );
+        let _ = turn.rebudget(&rerouted);
+        assert!(
+            turn.ctx().system_sources().contains(&notes),
+            "a reroute must not drop the prompt's identities: {:?}",
+            turn.ctx().system_sources()
+        );
+        turn.ctx_mut().push_model("cargo.");
+        turn.commit();
+
+        // 3. The replay: a second turn over a committed conversation.
+        let replayed = seed(&config);
+        assert!(
+            replayed
+                .ctx()
+                .blocks()
+                .iter()
+                .any(|b| b.text.contains("cargo.")),
+            "the fixture must actually replay something, or leg 3 is leg 1 again"
+        );
+        assert!(
+            replayed.ctx().system_sources().contains(&notes),
+            "a replayed conversation must still carry the prompt's identities: {:?}",
+            replayed.ctx().system_sources()
+        );
+        replayed.abandon();
+
+        // 4. …and they come from the config, never from what was retained: a
+        // turn whose route rendered no block carries nothing, even though the
+        // conversation it replays was assembled under one.
+        let dropped = seed(&HarnessConfig::default());
+        assert!(
+            dropped.ctx().system_sources().is_empty(),
+            "a turn with no block must pin nothing — a `/cd` out of the \
+             repository, a `/context off`, or a boundary that came to cover the \
+             file: {:?}",
+            dropped.ctx().system_sources()
+        );
+        dropped.abandon();
+    }
+
     /// Run the trim over `blocks` and hand back what it left.
     fn trimmed(blocks: Vec<ContextBlock>) -> Vec<ContextBlock> {
         let mut retained = RetainedContext::from_blocks(blocks);
@@ -505,6 +857,8 @@ mod tests {
             "do the thing",
             BTreeSet::new(),
             false,
+            // No notes in this fixture, so a reroute has nothing to re-render.
+            None,
         )
     }
 
@@ -671,6 +1025,8 @@ mod tests {
                 "do the thing",
                 BTreeSet::new(),
                 false,
+                // No notes in this fixture, so a reroute has nothing to re-render.
+                None,
             );
             for i in 0..6 {
                 turn.ctx_mut()

@@ -72,6 +72,7 @@ use teton_protocol::events::{
     BlockCause, BudgetBound, Event, FindingKind as WireFindingKind, PrivacyAction, PrivacyBlock,
     ProvenanceRejected,
 };
+use teton_protocol::methods::RepoContextSource;
 use teton_protocol::{ProviderId, SessionId};
 use teton_providers::transport::{
     HttpMethod, Transport, TransportError, TransportRequest, TransportResponse,
@@ -89,7 +90,10 @@ use tetond::egress::redact::{
 use tetond::egress::{Egress, EgressContext, EgressError, NoopSink, PrivacyEventSink, Provenance};
 use tetond::harness::budget::derive;
 use tetond::harness::redact::{scan, REDACTION_OUTPUT_CONTRACT};
-use tetond::harness::{BudgetInputs, DutyRoute, REDACT_DUTY};
+use tetond::harness::{
+    build_system_prompt, BudgetInputs, DutyRoute, HarnessConfig, ToolRegistry, REDACT_DUTY,
+};
+use tetond::repo_context::{FileStat, RepoContextBlock, RepoContextFile, REPO_CONTEXT_MAX_BYTES};
 use tetond::router::Router;
 
 /// Mint the identity of a fixture file (REQ-571 ADR-A).
@@ -284,6 +288,22 @@ impl EnginePair {
             .iter()
             .filter(|p| p.contains(REDACTION_OUTPUT_CONTRACT))
             .count()
+    }
+
+    /// The scan prompts themselves — what the redactor was actually shown.
+    ///
+    /// The instrument for "these bytes were *scanned*", which the forwarded body
+    /// cannot settle: a payload reaches the wire whether the scan read all of it
+    /// or a prefix of it, and a gate that chunked wrongly would forward the same
+    /// bytes it never looked at (REQ-612 BR-5's last clause).
+    fn scanned_prompts(&self) -> Vec<String> {
+        self.prompts
+            .lock()
+            .expect("prompt log poisoned")
+            .iter()
+            .filter(|p| p.contains(REDACTION_OUTPUT_CONTRACT))
+            .cloned()
+            .collect()
     }
 }
 
@@ -1653,5 +1673,247 @@ async fn no_emitted_surface_carries_the_sentinel() {
         forward_engine.redact_calls(),
         1,
         "the model really was asked here too, so its reply carried the sentinel"
+    );
+}
+
+// ===========================================================================
+// REQ-612 BR-5, last clause — the resident repository-notes block is inside
+// what the scan reads, at the bound this REQ raised
+// ===========================================================================
+
+/// A benign `TETON.md`: this leg's subject is the **scan**, not the sanitizer.
+///
+/// The corpus a hostile file gets is `repo_context`'s and `turn_loop`'s; what
+/// matters here is only that these bytes are a repository's and that they are in
+/// the body the redactor was shown.
+const NOTES_TEXT: &str = "# fixture\n\nThe crates live under crates/. Build with cargo.\n\
+                          Run the suite with `cargo test --workspace`.\n";
+
+/// The block's harness-authored opening tag, spelled here because
+/// `harness::render::REPO_NOTES_OPEN_TAG` is crate-private.
+///
+/// A literal in a test beside a `const` in the crate is the drift this file
+/// would otherwise be blind to, which is why the assertion below also demands
+/// the file's own prose: a renamed tag with the notes still resident fails on
+/// the tag, and a dropped block fails on both.
+const NOTES_OPEN_TAG: &str = "<repo-notes";
+
+/// The repository-notes block a route stamps for a planted file, rendered by the
+/// production renderer at the widest cap any route asks for.
+fn planted_notes_block(text: &str) -> RepoContextBlock {
+    let file = RepoContextFile {
+        source: RepoContextSource::TetonMd,
+        path: std::path::PathBuf::from("/repo/TETON.md"),
+        provenance: source_id("TETON.md"),
+        bytes_on_disk: text.len() as u64,
+        key: FileStat {
+            len: text.len() as u64,
+            mtime: None,
+            is_symlink: false,
+            is_regular: true,
+            // A synthetic key: this file was never `stat`ed, so it has
+            // no identity to carry and no second name to refuse.
+            dev: 0,
+            ino: 0,
+            nlink: 1,
+        },
+        text: text.to_owned(),
+    };
+    RepoContextBlock::render(&file, REPO_CONTEXT_MAX_BYTES)
+}
+
+/// The system prompt a `[privacy] redact = true` route composes with `notes`
+/// resident — the real composer, so the block sits where ADR-1 puts it rather
+/// than where a fixture chose to.
+fn system_prompt_with_notes(notes: RepoContextBlock) -> String {
+    let config = HarnessConfig {
+        repo_context: Some(notes),
+        ..HarnessConfig::for_strong_model()
+    };
+    build_system_prompt(&ToolRegistry::with_builtins(), &config)
+}
+
+/// **REQ-612 BR-5, last clause.** On a `[privacy] redact = true` route the
+/// resident repository-notes block is **inside the body the scan reads**, at the
+/// scannable bound this REQ's `REDACT_BODY_OVERHEAD_BYTES` raise moved.
+///
+/// ## Why this is not covered by the sweeps that measure the block
+///
+/// AC-4's two resident-ceiling sweeps prove the block *fits* under
+/// [`tetond::egress::redact::REDACT_BODY_OVERHEAD_BYTES`]. Fitting is an
+/// arithmetic claim about a constant. BR-5's sentence — "the `[privacy] redact`
+/// scan sees the block as it sees the rest of the body" — is a claim about what
+/// a redactor was shown, and the only thing that can settle it is a redactor's
+/// own prompt log. A block that rode outside the assembled payload, or that the
+/// chunker dropped off the front, would leave every ceiling sweep green.
+///
+/// ## The three assertions, and why each needs the other two
+///
+/// 1. **the forwarded body carries the frame** — the block reached the wire at
+///    all, so the rest is not about an empty payload;
+/// 2. **a scan prompt carries the frame** — the redactor was shown it, which is
+///    the sentence itself. Forwarding is not scanning: a gate that read a prefix
+///    would forward the same bytes;
+/// 3. **a credential planted inside the notes blocks** — the notes region is
+///    scanned *for findings*, not merely present in a prompt the scan ignored.
+///
+/// ## The bound
+///
+/// The body is assembled at [`REDACT_SCANNABLE_CONTEXT_BYTES`] as `derive`
+/// answers it today — 184,265 bytes since this REQ raised the overhead 14 → 23
+/// KiB and the chunk cap went 3 → 4. Nothing here restates that figure: the
+/// bound is derived by the production function and then spent, so the day the
+/// next overhead raise moves it this test moves with it.
+///
+/// ## Mutation (run 2026-09-03)
+///
+/// Deleting the `if let Some(block) = &config.repo_context` append in
+/// `build_system_prompt` reddens assertions 1 and 2 together; leaving the append
+/// and dropping the notes from the *assembled* payload would redden 2 and 3
+/// while 1 stayed green, which is why all three are here.
+#[tokio::test]
+async fn the_resident_notes_block_is_inside_the_scanned_body_at_the_raised_bound() {
+    /// The provider window, and the reservation every route subtracts.
+    const WINDOW: u32 = 128_000;
+    const RESERVATION: u32 = 1_024;
+
+    let scanned = derive(BudgetInputs {
+        window: WINDOW,
+        cap: 0,
+        reservation: RESERVATION,
+        is_local: false,
+        redact_scan: true,
+        provider_id: Some("frontier"),
+    });
+    assert_eq!(
+        scanned.budget_bytes, REDACT_SCANNABLE_CONTEXT_BYTES,
+        "this leg is about the scanned route's bound, not a window-derived one"
+    );
+
+    // --- Leg 1: a benign file, resident, scanned, forwarded ---------------
+    let capture = CaptureTransport::default();
+    let sink = Arc::new(CapturingSink::default());
+    let engine = engine_pair("NONE");
+    let gate = Arc::new(
+        TestGate::new(router_with_local_tier(Some(CANONICAL_LOCAL_ID)))
+            .serving(Arc::clone(&engine.engine)),
+    );
+    let egress = choke_point(&capture, &sink, Arc::clone(&gate));
+
+    let system = system_prompt_with_notes(planted_notes_block(NOTES_TEXT));
+    assert!(
+        system.contains(NOTES_OPEN_TAG) && system.contains("The crates live under crates/."),
+        "the composer put no block in the prompt, so nothing below is about the \
+         notes:\n{system}"
+    );
+
+    // The rest of the route's budget, spent the way `a_redact_scanned_128k_route…`
+    // spends it: prose at ≈ 5.8 B/word, so the body genuinely spans several
+    // engine windows and the scan genuinely chunks.
+    const SENTENCE: &str = "the retry helper reads the manifest and writes one report line. ";
+    let filler = SENTENCE.repeat((scanned.budget_bytes - system.len()) / SENTENCE.len());
+    let blocks = [
+        ContextBlock::synthetic(&system),
+        ContextBlock::from_file(source_id("src/main.rs"), &filler),
+    ];
+    let (request, provenance) = assemble(&blocks);
+    let body = request.body.clone();
+    assert!(
+        body.len() <= REDACT_INPUT_MAX_BYTES,
+        "a body assembled at the bound must fit the cap the bound derives from: \
+         {} against {REDACT_INPUT_MAX_BYTES}",
+        body.len()
+    );
+    assert!(
+        body.len() > REDACT_CHUNK_MAX_BYTES,
+        "a body at this bound spans several engine windows, or the chunking \
+         claim below proves nothing: {}",
+        body.len()
+    );
+
+    egress
+        .send(request, &provenance, &ctx())
+        .await
+        .expect("a benign body at the bound forwards");
+
+    // (1) The block reached the wire.
+    let forwarded = capture.captured();
+    assert_eq!(forwarded.len(), 1);
+    let on_the_wire =
+        String::from_utf8(forwarded[0].body.clone()).expect("the fixture body is text");
+    assert!(
+        on_the_wire.contains(NOTES_OPEN_TAG)
+            && on_the_wire.contains("The crates live under crates/."),
+        "the forwarded body carries no repository-notes frame"
+    );
+
+    // (2) The redactor was shown it. This is BR-5's sentence.
+    let verdict = gate.only_verdict();
+    assert_eq!(verdict.outcome(), Outcome::Clean);
+    assert!(
+        verdict.scanned(),
+        "a forward here must be a scan that ran, not one that could not"
+    );
+    let prompts = engine.scanned_prompts();
+    assert!(
+        prompts.len() > 1,
+        "a body at the bound is several windows wide and is scanned in several \
+         calls; {} would be a gate that stopped looking",
+        prompts.len()
+    );
+    let showing: Vec<usize> = prompts
+        .iter()
+        .enumerate()
+        .filter(|(_, prompt)| prompt.contains(NOTES_OPEN_TAG))
+        .map(|(index, _)| index)
+        .collect();
+    assert!(
+        !showing.is_empty(),
+        "the resident block was forwarded but never scanned — none of the {} \
+         scan prompts carried the frame",
+        prompts.len()
+    );
+    assert!(
+        prompts[showing[0]].contains("The crates live under crates/."),
+        "the frame reached the scan without the file's own bytes inside it"
+    );
+
+    // --- Leg 2: a credential inside the notes region blocks ---------------
+    //
+    // Presence in a prompt is not the same as being read for findings, and this
+    // is the leg that tells them apart.
+    let capture = CaptureTransport::default();
+    let sink = Arc::new(CapturingSink::default());
+    let engine = engine_pair("NONE");
+    let gate = Arc::new(
+        TestGate::new(router_with_local_tier(Some(CANONICAL_LOCAL_ID)))
+            .serving(Arc::clone(&engine.engine)),
+    );
+    let egress = choke_point(&capture, &sink, Arc::clone(&gate));
+
+    let planted = format!("{NOTES_TEXT}\nThe deploy key is {PATTERN_SENTINEL}.\n");
+    let system = system_prompt_with_notes(planted_notes_block(&planted));
+    let filler = SENTENCE.repeat((scanned.budget_bytes - system.len()) / SENTENCE.len());
+    let (request, provenance) = assemble(&[
+        ContextBlock::synthetic(&system),
+        ContextBlock::from_file(source_id("src/main.rs"), &filler),
+    ]);
+    let err = egress
+        .send(request, &provenance, &ctx())
+        .await
+        .expect_err("a credential inside the resident notes must block");
+    assert!(
+        matches!(
+            err,
+            EgressError::PrivacyBlocked {
+                cause: BlockCause::Redaction { .. },
+                ..
+            }
+        ),
+        "the notes region is scanned for findings like any other: {err:?}"
+    );
+    assert!(
+        capture.captured().is_empty(),
+        "and nothing left the machine"
     );
 }

@@ -1,7 +1,7 @@
 ---
 id: TASK-370
 title: "Protocol: `session/context`, `repo_context_state`, and `SetRepoContextEnabled`"
-status: draft
+status: complete
 parent: REQ-612
 repo: teton-code
 created: 2026-09-03

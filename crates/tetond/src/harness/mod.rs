@@ -121,6 +121,6 @@ pub use tools::{
 };
 pub use triage::TRIAGE_DUTY;
 pub use turn_loop::{
-    build_system_prompt, run_session_turn, run_session_turn_with_source, HarnessConfig,
-    HarnessError, SessionEvents, TurnOutcome,
+    append_repo_context, build_system_prompt, run_session_turn, run_session_turn_with_source,
+    HarnessConfig, HarnessError, SessionEvents, TurnOutcome,
 };

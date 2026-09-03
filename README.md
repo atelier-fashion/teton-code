@@ -67,6 +67,7 @@ prompts:
 | `/effort [level]` | Show, or change, the global reasoning effort |
 | `/permissions [level]` | Show, or change, what this session may run without asking |
 | `/transcript [on\|off]` | Record this session to a file, or stop; bare, print the state and the file's path |
+| `/context [on\|off]` | Use this repository's `TETON.md` notes in the prompt, or stop; bare, print the state, the file and its resident bytes |
 | `/web setup` | Set up web lookup: pick a tier, name a backend, confirm before anything is written |
 | `/web allow` | Lift this session's web taint restriction (grants no new tier) |
 | `/web refresh <url>` | Drop a URL's cached copy so the next lookup re-fetches |
@@ -98,6 +99,20 @@ and the session's own file tools refuse to read it: a `read`, `edit`, `grep` or
 The shell surface of the durable switch is `teton transcript enable|disable|status`;
 it is not a twin of `/transcript`, because the two switches have different
 lifetimes.
+
+**The repository can introduce itself.** A `TETON.md` at the session root — or
+`AGENTS.md` when there is no `TETON.md`, and never `CLAUDE.md` — is read at a
+project root and carried in the system prompt as the repository's own
+description of itself, not as instructions: layout, build and test commands,
+conventions, the things a new contributor asks first. Up to 8 KiB of it, or a
+quarter of the route's byte budget where that is smaller, cut at a line boundary
+under a marker naming the bytes dropped. It is re-read at the start of a prompt
+turn whenever the file has changed, `/cd` re-reads it under the new root, and a
+file one of your privacy boundaries covers is never loaded at all. Two switches
+again, with two lifetimes: `[context] repo_file = false` in `config.toml` turns
+it off durably — the file is never opened — and `/context on` / `/context off`
+switch the session you are in without writing anything. `teton context
+enable|disable|status` is the durable switch's shell surface.
 
 Everything you would otherwise open a second terminal for is here too. The ten
 commands below that have a `teton …` twin *are* that twin — the same arguments,

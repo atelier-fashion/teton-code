@@ -3712,3 +3712,135 @@ fn transcript_unknown_argument_prints_the_usage_line() {
         "nothing was switched or reported; transcript:\n{text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REQ-612 AC-3 — the truncation notice, at a terminal
+// ---------------------------------------------------------------------------
+//
+// The piped suite owns the *content* of this line (`cli_e2e`'s
+// `a_truncated_or_withheld_notes_file_is_announced_and_doctor_advises`), and it
+// owns it against a surface that draws no frame. What a pipe cannot show is
+// that the line survives the terminal surface: the notice arrives on the event
+// channel while the session sits at its entry prompt, and REQ-556's rule is
+// that such a line is drawn *above* the frame with nothing typed. A notice that
+// reached a pipe and not a pty would be a line every interactive user misses,
+// which is the whole audience BR-3's "nothing is clamped in silence" is for.
+
+/// **REQ-612 AC-3 / BR-3, the terminal half.** A session in a repository whose
+/// `TETON.md` is over the 8 KiB cap prints the truncation notice at a real
+/// terminal, with `/verbose` off, naming both figures and the remedy.
+///
+/// ## The arithmetic is the fixture's, and it is exact
+///
+/// 129 lines of 64 bytes is 8,256 on disk; the cut takes the last line boundary
+/// at or under 8,192, which is line 128 exactly — so the notice must read
+/// **8,256** and **8,192**, and a renderer that reported the block's length
+/// (frame included) or the cap instead of what was kept fails on the digits
+/// rather than on a substring. Both figures are asserted, because either alone
+/// is satisfiable by a build that reported the same number twice.
+///
+/// ## Why the switch is toggled rather than the launch awaited
+///
+/// `repo_context_state` is published only when the state is *news* (ADR-3), and
+/// a client that attached after `session/create` may never have seen the load.
+/// `/context off` then `/context on` makes the announcement follow a change this
+/// test made, which is what `cli_e2e`'s piped twin does and for the same reason
+/// — a test written against the launch ordering would be flaky rather than
+/// wrong.
+///
+/// **Mutation (run 2026-09-03):** putting `session_ui::format_repo_context`'s
+/// `Truncated` arm behind the `verbose` gate leaves the session quiet and this
+/// test red on its notice wait, which is BR-3's claim exactly.
+#[test]
+fn the_truncated_notes_notice_reaches_the_terminal() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn(&daemon_path);
+
+    // A project root — only a `project`-kind root is read (BR-1), so without
+    // the marker file this session would be asserting the `absent` path.
+    let project = daemon.root.join("big");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("Cargo.toml"), "[package]\nname = \"big\"\n").unwrap();
+
+    let line = format!(
+        "{:<63}\n",
+        "The crates live under crates/; the cap will bite below this."
+    );
+    assert_eq!(
+        line.len(),
+        64,
+        "this fixture's two figures are derived from 64-byte lines"
+    );
+    let notes = line.repeat(129);
+    assert_eq!(notes.len(), 8_256, "129 whole lines of 64 bytes");
+    std::fs::write(project.join("TETON.md"), &notes).unwrap();
+
+    // Wide enough that the notice is one row: the claim is about the bytes the
+    // surface drew, and a wrapped line would make `contains` a test of the
+    // terminal's width.
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 40,
+            cols: 200,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+    let mut cmd = CommandBuilder::new(teton_bin());
+    cmd.args(["--cwd", project.to_str().unwrap()]);
+    cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
+    cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
+    cmd.env("TETON_REPO_ROOT", &daemon.root);
+    let mut session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
+    drop(pty.slave);
+    let transcript = spawn_reader(pty.master.try_clone_reader().expect("pty reader"));
+    let mut writer = pty.master.take_writer().expect("pty writer");
+
+    assert!(
+        wait_for(&transcript, "ready (freeform)"),
+        "the session never reached the entry prompt; transcript:\n{}",
+        snapshot(&transcript)
+    );
+
+    writer
+        .write_all(b"/context off\r")
+        .expect("type /context off");
+    writer.flush().ok();
+    let switched_off = wait_for(&transcript, "nothing was opened");
+    writer
+        .write_all(b"/context on\r")
+        .expect("type /context on");
+    writer.flush().ok();
+    let announced = wait_for(&transcript, "trim the file or move detail below the fold");
+    let seen = snapshot(&transcript);
+    let _ = session.kill();
+    let _ = session.wait();
+
+    assert!(
+        switched_off,
+        "`/context off` never reported the switch, so the `on` below announced \
+         nothing; transcript:\n{seen}\ndaemon log:\n{}",
+        std::fs::read_to_string(daemon.root.join("tetond.log")).unwrap_or_default()
+    );
+    assert!(
+        announced,
+        "the truncation notice never reached the terminal; transcript:\n{seen}\n\
+         daemon log:\n{}",
+        std::fs::read_to_string(daemon.root.join("tetond.log")).unwrap_or_default()
+    );
+    assert!(
+        seen.contains("context: TETON.md is 8,256 bytes"),
+        "the notice must name the file and its size on disk; transcript:\n{seen}"
+    );
+    assert!(
+        seen.contains("the first 8,192 are resident"),
+        "the notice must name what the model actually has — the bytes kept, not \
+         the cap and not the block's own length; transcript:\n{seen}"
+    );
+    assert!(
+        !seen.contains("route ["),
+        "this session is quiet: a `/verbose` route line would mean the notice \
+         above proves nothing about BR-3's ungated announcement; transcript:\n{seen}"
+    );
+}

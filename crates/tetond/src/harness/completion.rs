@@ -884,9 +884,39 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
 /// alone would call that content ordinary conversation and let it egress. So a
 /// `local-only` read that has since been truncated away still scopes this
 /// context, and an unknown-provenance `shell` result still fail-closes it.
+///
+/// ## The system prompt can carry file provenance too (REQ-612 BR-5)
+///
+/// `System` blocks still contribute nothing — the prompt's harness prose is
+/// this build's own text — but since REQ-612 the prompt's **tail** can be a
+/// repository's `TETON.md`, and that file's identity is on the manager
+/// ([`ContextManager::system_sources`](super::context::ContextManager::system_sources)),
+/// not on a block. It folds in through the same mapping, so a `local-only`
+/// boundary covering the notes scopes the turn exactly as a `read` of them
+/// would. Without this union the notes would reach every remote provider on
+/// every turn with no boundary verdict at all — the one path around the
+/// charter's BR-1, and the reason ADR-2 puts the set on the manager rather than
+/// leaving the load-time check to stand alone.
 #[must_use]
 pub fn context_provenance(ctx: &ContextManager) -> Provenance {
     let mut prov = Provenance::empty();
+    // Through that same mapping again (REQ-612 BR-5, ADR-2): a repository file
+    // in the **system prompt** means to egress exactly what a `read` of it
+    // means. `System => {}` below is still right for the prompt's harness prose;
+    // what changed is that the prompt can now carry file bytes, and the
+    // identity of those bytes rides on the manager rather than on a block —
+    // see `ContextManager::system_sources` for why it cannot be a block.
+    //
+    // First, because the system prompt is the first thing the provider reads,
+    // and because a union is a union: nothing here depends on the order, and a
+    // reader looking for "where do the prompt's own files fold in" finds it
+    // before the loop rather than after it.
+    let system_sources = ctx.system_sources();
+    if !system_sources.is_empty() {
+        prov.merge(&tool_result_provenance(&ToolProvenance::Sources(
+            system_sources.clone(),
+        )));
+    }
     for block in ctx.blocks() {
         match &block.provenance {
             CtxProvenance::Tool { provenance, .. } => {
@@ -1740,6 +1770,61 @@ mod tests {
         assert!(!prov.is_empty(), "unknown provenance is never empty");
         // Known sources are still carried alongside the unknown bit.
         assert!(prov.contains("src/lib.rs"));
+    }
+
+    /// **Seam 4 of four (REQ-612 BR-5, ADR-2, AC-7's unit half).** The union is
+    /// also over the identities the *system prompt* carries, which before this
+    /// REQ was a set that could not exist: `CtxProvenance::System` contributes
+    /// nothing and a repository file placed in the prompt would therefore have
+    /// egressed with no boundary verdict on any turn.
+    ///
+    /// Three claims, and the empty-set one is what says the addition is inert
+    /// for every session with no notes — which is every session in the tree's
+    /// other 2,000 tests.
+    ///
+    /// **Mutation, run red.** Deleting the `system_sources` union in
+    /// `context_provenance` fails the first two assertions with `len` 1 against
+    /// 2 and a missing `TETON.md`. It is the mutation AC-7 names ("a test that
+    /// makes `context_provenance` ignore the block fails"), and it is checked
+    /// here rather than asserted about.
+    #[test]
+    fn context_provenance_unions_the_system_sources() {
+        // A manager whose *conversation* is nothing but typed prose: with no
+        // union the answer would be empty, so nothing here can pass by
+        // borrowing another block's identity.
+        let mut ctx =
+            ContextManager::new("system", 10_000).with_system_sources([fixture_id("TETON.md")]);
+        ctx.push_user("what does this repo build with?");
+        ctx.push_model("cargo.");
+        ctx.push_tool_result("read", Some(fixture_id("src/lib.rs")), "code");
+
+        let prov = context_provenance(&ctx);
+        assert!(
+            prov.contains("TETON.md"),
+            "the notes in the prompt must pin the turn as a read of them \
+             would: {prov:?}"
+        );
+        assert_eq!(
+            prov.len(),
+            2,
+            "the system source unions with the blocks' rather than replacing \
+             them: {prov:?}"
+        );
+        assert!(prov.contains("src/lib.rs"));
+        assert!(
+            !prov.is_unknown(),
+            "a minted identity is known provenance, never a fail-closed one"
+        );
+
+        // The empty set contributes nothing: `is_unknown` stays false and the
+        // length is the blocks' alone. This is what makes the addition inert
+        // for a session with no `TETON.md` — the overwhelming majority.
+        let mut bare = ContextManager::new("system", 10_000);
+        bare.push_tool_result("read", Some(fixture_id("src/lib.rs")), "code");
+        let bare_prov = context_provenance(&bare);
+        assert_eq!(bare_prov.len(), 1, "{bare_prov:?}");
+        assert!(!bare_prov.is_unknown());
+        assert!(bare_prov.contains("src/lib.rs"));
     }
 
     /// The half of ADR-9 that a one-field `Provenance::User` would have broken:

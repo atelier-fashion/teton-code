@@ -99,12 +99,6 @@ const KNOWN_UNRELATED_HOMES: &[(u32, &str, usize, &str)] = &[
     ),
     (
         4_096,
-        "harness/tools/docs.rs",
-        1,
-        "`MAX_TOPIC_BYTES` — a byte cap on a docs topic name",
-    ),
-    (
-        4_096,
         "harness/tools/grep.rs",
         1,
         "`MAX_MATCH_LINE_BYTES` — a byte cap on one reported match line",

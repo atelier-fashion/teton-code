@@ -512,6 +512,46 @@
   provenance like every other file on the machine (REQ-611 ADR-7, REQ-596 BR-6,
   REQ-597).
 
+- **A system-prompt block that came from a file carries that file's identity at
+  the manager** (REQ-612). `context_provenance` matches `System | Model => {}`:
+  the system prompt is one string, charged as one unit by `truncate_to_budget`
+  and carrying no per-block provenance — so a repository file rendered into it
+  would egress on every remote turn with no boundary verdict, the one path
+  around the charter's local-only rule. The fix is a **manager-level**
+  `system_sources: BTreeSet<ProvenanceId>` that `context_provenance` unions
+  through the same `ToolProvenance::Sources` mapping the skill-expansion arm
+  uses, not a new `CtxProvenance` variant: a variant would file the notes into
+  the oldest-first drop order the gate applies to *conversation*, and the prompt
+  is not conversation. The set is re-stated at every seam that seeds or
+  re-budgets the manager (`CarriedTurn::begin`, the reroute `rebudget`) from the
+  block that turn actually rendered, and is never carried in `RetainedContext` —
+  a fact recorded where it is known and re-asserted at each writing seam. The
+  identity itself is minted by the seam that *resolved* the path, so a
+  `local-only` glob names the same spelling the daemon read, and the load-time
+  boundary refusal is re-run at every turn-start refresh rather than trusted
+  once (REQ-612 ADR-2, AC-7, LESSON-501, LESSON-623).
+
+- **Repository text in the system prompt is the last region, and it is framed as
+  description rather than instruction** (REQ-612). The session root's `TETON.md`
+  is appended **after** the tool docs — the final bytes of the prompt — so every
+  harness-authored instruction precedes it, and the only harness sentence
+  following the file's text is the one saying the notes are the repository's
+  description of itself, not the user's instructions for this turn. Placing it
+  between the opener and the guide would put repository prose inside the region
+  a top-down reader treats as Teton's own instructions: BUG-181's shape with the
+  repository as author. The tool docs already carry third-party text in exactly
+  this position, so containment stays one story; the frame is an envelope pair
+  whose tags join `UNTRUSTED_ENVELOPE_TAGS` and both output marker sets, and the
+  file's text is neutralized **where the frame is written** rather than where
+  the bytes came from. Residency is paid for by a reviewed ceiling move, and the
+  ledger on `REDACT_BODY_OVERHEAD_BYTES` is where that move is recorded: 14 → 23
+  KiB, **measured** at implementation rather than derived by adding the 8 KiB
+  cap to the old figure, and its consequence ran opposite to the prediction —
+  three chunks stopped holding twice a body, so `REDACT_TOTAL_CAP_CHUNKS` went
+  3 → 4 and the scannable bound *rose* 141,224 → 184,265, moving the cost onto
+  scan calls (up to five) instead of onto context (REQ-612 ADR-1/ADR-4/ADR-5,
+  LESSON-477, LESSON-543, LESSON-593, LESSON-597).
+
 ## ADRs
 
 ### ADR-001: Daemon and CLI in Rust (2026-07-17)

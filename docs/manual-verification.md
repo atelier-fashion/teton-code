@@ -2218,6 +2218,15 @@ cannot bound — and the registry, the `/help` section, the invocation preamble
 and the refusal messages are surfaces and turn-scoped text, which the resident
 prompt does not pay for. Neither the overhead nor the floor moved.
 
+**That quotation is REQ-585's wording, not the shipped one.** REQ-612 amended
+the same sentence again — it now reads "loads skills and commands from
+`.claude/` and `~/.claude`, and the repository notes from `TETON.md` (or
+`AGENTS.md`) at the session root, but nothing else there (no CLAUDE.md, agents
+or hooks)" — and paid for it by moving `REDACT_BODY_OVERHEAD_BYTES` 14 → 23 KiB
+rather than out of this margin; the measured figures for that move live in the
+ledger on that constant in `crates/tetond/src/egress/redact.rs`, which is the
+one home of them.
+
 **A 26-byte correction to REQ-586's recorded figures.** That REQ recorded
 6,096 / 9,372 / **868** and 6,049 / 9,325 / **915**; re-measured here, its own
 tip is 6,070 and 6,023. `self_config.md`, `turn_loop.rs` and `harness/tools/`
@@ -3563,4 +3572,139 @@ Anything that hung, aborted, panicked, or crashed    :
 Findings worth filing (renderer half)                :
 Findings worth filing (clause half, incl. "no effect"):
 Notes                                                :
+```
+
+---
+
+# Manual verification runbook — REQ-612 AC-13 (the repository's own notes, dogfooded)
+
+**Status: OUTSTANDING — nothing below has been executed.** REQ-612 spends up to
+8,192 resident bytes of every local turn on the repository's own `TETON.md`, and
+it does so on the strength of ASSUME-1: that a small local model *uses* resident
+repository notes the way it uses the environment line, rather than searching the
+tree anyway. AC-13 is the only check that assumption gets, and no test can make
+it — a scripted engine answers what the fixture told it to answer, which is
+precisely the thing in question. Leave AC-13 unticked in
+`.adlc/specs/REQ-612-teton-md-repo-context-file/requirement.md` until the
+sign-off block below is filled in.
+
+> If the answer is "the local model searched anyway", that is a **finding, not a
+> failure of the run**: the cap is then spent for nothing on that tier, and
+> BR-2's switch (`/context off`, `[context] repo_file = false`) is the remedy the
+> architecture already names. Record it and file it; do not re-run until it
+> comes out the way the spec hoped.
+
+## What this proves that CI does not
+
+| Claim | Proven by CI? | Why not |
+|---|---|---|
+| The file is found, capped, framed, sanitized | **yes** | `crates/tetond/tests/repo_context.rs` and the renderer's own tests |
+| A covered file is withheld and the manager knows | **yes** | the provenance/egress acceptance legs |
+| The resident ceiling still clears its floor | **yes** | the two sweeps, at the block's worst case |
+| A **real** local model answers from the notes | **no** | no engine in CI, and a scripted one answers as scripted |
+| Zero searches is worth up to 8 KiB of every call | **no** | that is a judgement about answers, not about bytes |
+
+## Prerequisites
+
+- A build **with the engine**: `cargo build --release --workspace --features
+  tetond/llama`. A default build has no local tier, and a remote answer says
+  nothing about ASSUME-1, which is a claim about the weak tier.
+- `teton doctor` confirming a loaded local engine **before** you start.
+- This repository as the session root, `[context] repo_file` at its default
+  (on), and `/verbose` on.
+- A `TETON.md` at the repository root describing the **crate layout** — `teton`
+  (CLI), `tetond` (daemon: `harness`, `runtime`, `egress`, `repo_context`),
+  `teton-core`, `teton-protocol`, `teton-providers`, `teton-inference` — and
+  naming in one line that the system prompt is assembled by
+  `build_system_prompt` in `crates/tetond/src/harness/turn_loop.rs`. Keep it
+  under 8,192 bytes: a truncated file measures a different file than the one you
+  wrote, and `/context` will say so.
+
+## The prompt
+
+Exactly this, as the **first** prompt of a fresh session, on every leg:
+
+    where does the system prompt get built?
+
+Nothing before it — no `/help`, no `/cd`, no warm-up. A first prompt is the one
+whose answer can only have come from the notes or from a search of the tree.
+
+## Counting the searches
+
+`/transcript on` before the prompt, then count the tool calls the daemon
+recorded rather than the lines that scrolled past:
+
+    jq -r 'select(.kind=="tool_call_input") | .tool' <session>.jsonl | sort | uniq -c
+
+`glob` and `grep` are the two AC-13 counts. A `read` of a path the notes
+themselves named is **not** a search — record it separately, because "read the
+one file the notes pointed at" is the behaviour the feature is buying.
+
+## Procedure
+
+### Leg (a) — with the file (AC-13's positive half)
+
+1. `TETON.md` in place. Fresh session in this repository. `/transcript on`.
+2. `/context` — expect state `loaded`, the file `TETON.md`, its resident bytes,
+   and **not** truncated. If it says `truncated`, trim the file and start over.
+3. Send the prompt, once. Do not re-ask, and do not rephrase: a second attempt
+   measures a different thing and the count is no longer AC-13's.
+4. Count `glob` + `grep` calls. AC-13 wants **zero**.
+5. Record the answer verbatim, and whether it names
+   `crates/tetond/src/harness/turn_loop.rs` (or `build_system_prompt`). A
+   zero-search answer that is *wrong* is a worse outcome than one search, and
+   the sign-off has a row for exactly that.
+
+### Leg (b) — without the file (the control)
+
+1. `mv TETON.md TETON.md.off`, and check no `AGENTS.md` is left at the root —
+   the fallback would quietly make this the same leg as (a).
+2. Fresh session, `/transcript on`, `/context` — expect state `absent`.
+3. The same prompt, once. Count again: AC-13 wants **at least one** `glob` or
+   `grep`. If this leg also searches zero times, the local model knew the answer
+   without either source and **neither leg is evidence** — say so in the notes
+   and pick a fact the weights cannot hold (a path this branch introduced).
+
+### Leg (c) — the switch, on the way past
+
+1. Put `TETON.md` back. Fresh session, `/context off`.
+2. `/context` — expect `withheld_off`; `config.toml` must be untouched
+   (`grep -c repo_file` on it is the cheap check).
+3. The same prompt. It should behave like leg (b), which is what says the switch
+   reaches the prompt and not just the report.
+
+## Sign-off
+
+```
+REQ-612 AC-13 sign-off
+----------------------
+RESULT                                              : OUTSTANDING
+Verified by                                         :
+Date / build / commit                               :
+Machine (chip, RAM, OS)                             :
+Model loaded (name, quant, n_ctx)                   :
+`teton doctor` confirmed a loaded local engine      : yes / no  <-- must be "yes"
+TETON.md size, in bytes                             :
+`/context` reported state / resident bytes          :
+
+(a) glob calls                                      :
+(a) grep calls                                      :          <-- AC-13 wants 0 for both
+(a) any read of a path the notes named              : yes / no  (which:)
+(a) the answer named turn_loop.rs/build_system_prompt: yes / no
+(a) the answer, verbatim                            :
+(a) prompt sent exactly once                        : yes / no  <-- must be "yes"
+
+(b) TETON.md moved away, no AGENTS.md present       : yes / no  <-- must be "yes"
+(b) `/context` reported `absent`                    : yes / no
+(b) glob calls                                      :
+(b) grep calls                                      :          <-- AC-13 wants >= 1 total
+(b) the answer, verbatim                            :
+
+(c) `/context off` reported `withheld_off`          : yes / no
+(c) config.toml untouched                           : yes / no  <-- must be "yes"
+(c) searched like leg (b)                           : yes / no
+
+ASSUME-1 verdict: notes used / notes ignored / inconclusive
+Anything that hung, aborted, or crashed             :
+Notes / findings                                    :
 ```

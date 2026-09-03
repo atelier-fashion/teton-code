@@ -43,7 +43,8 @@ at its first call. See topic `providers` for what a 401 usually means.
 
 Each row carries `window:` — the declared context window, or `unknown`. Doctor
 advises on one that declares none, and on an inert `context_budget_cap` (at or
-above its window). Topic `context`.
+above its window). A route whose window derives under the floor is named with
+the pair actually in force. Topic `context`.
 
 ## The transcript line
 
@@ -59,6 +60,13 @@ bare `/transcript` answers for the session it is typed in, with that session's
 file path and whether recording stopped. No tool may read the directory doctor
 names — `read`, `edit`, `grep` and `glob` refuse it, `shell` excepted — so
 asking to open a transcript gets a refusal, not a file.
+
+## The repository notes
+
+`context:` names the session root's `TETON.md` (or `AGENTS.md`) and its state.
+Doctor advises on two: a file **cut to the cap**, whose tail never reaches the
+model, and one a **privacy boundary covers**, which is never loaded. Topic
+`context`.
 
 ## Where config lives
 

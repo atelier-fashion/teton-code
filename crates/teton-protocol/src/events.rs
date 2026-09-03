@@ -49,6 +49,15 @@
 //! is a `tetond` record type and deliberately **not** an [`Event`]
 //! (REQ-611 architecture ADR-2, BR-4): widening the bus would change who learns
 //! a session's content, which is the one thing that REQ must not do.
+//! REQ-612 adds `repo_context_state` (BR-1/BR-2), the **one** event the
+//! repository-notes block puts on the bus: whether the file at the session root
+//! is riding this session's system prompt, how many bytes of it are, and — when
+//! it is not — which of the three reasons applies. The spec's Events table first
+//! named two (`repo_context_loaded`, `repo_context_withheld`); architecture
+//! ADR-6 folded them into this one event's `state`. It carries **no file name**,
+//! for the reason `transcript_state` carries no path: which file the notes came
+//! out of is [`crate::methods::SessionContextResult`]'s routed answer to the
+//! connection that asked.
 //!
 //! This list is an index, not decoration: a new variant of [`Event`] that is not
 //! named here makes the paragraph above wrong.
@@ -57,7 +66,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::effort::ResolvedEffort;
 use crate::methods::{
-    ProviderHealth, ProviderTestOutcome, RootKind, SessionRoot, SkillSource, TierBinding,
+    ProviderHealth, ProviderTestOutcome, RepoContextSource, RepoContextStateKind, RootKind,
+    SessionRoot, SkillSource, TierBinding,
 };
 use crate::{
     Category, ClientKind, Phase, ProtocolVersion, ProviderId, ProviderKind, RequestId, SessionId,
@@ -227,6 +237,9 @@ pub enum Event {
     BoundaryDefaultsApplied(BoundaryDefaultsApplied),
     /// A session's transcript started or stopped recording (REQ-611 BR-15).
     TranscriptState(TranscriptState),
+    /// A session's repository notes were loaded, or exist and were not made
+    /// resident (REQ-612 BR-1/BR-2).
+    RepoContextState(RepoContextState),
 }
 
 impl Event {
@@ -274,6 +287,7 @@ impl Event {
             Event::UnboundedRootWarning(_) => "unbounded_root_warning",
             Event::BoundaryDefaultsApplied(_) => "boundary_defaults_applied",
             Event::TranscriptState(_) => "transcript_state",
+            Event::RepoContextState(_) => "repo_context_state",
         }
     }
 }
@@ -512,6 +526,25 @@ pub struct RouteDecided {
     /// always populates it, and `None` means a daemon that predates it.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub bound_floored: Option<bool>,
+    /// How many bytes of the repository's own notes this route may carry
+    /// (REQ-612 BR-3, BR-7): `min(8192, budget_bytes / 4)`.
+    ///
+    /// The **ceiling** the route stamps, not what is resident — the resident
+    /// figure is a property of the file and rides
+    /// [`RepoContextState::resident_bytes`]. Both are on the wire because
+    /// `/verbose` renders them as a pair (`notes 2,310 B / cap 4,096 B`) and a
+    /// user weighing a file against a budget needs to know whether the number
+    /// they are looking at is against the cap or well under it.
+    ///
+    /// Derived where the budget is, so a floored route's quarter and the cap the
+    /// truncation marker names are one number asked twice rather than two that
+    /// can drift.
+    ///
+    /// Same additivity as [`Self::budget_tokens`]: a daemon that has this field
+    /// always populates it, and `None` means a daemon that predates it — which
+    /// renders the pre-REQ-612 clause byte for byte.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub repo_context_cap: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3890,6 +3923,103 @@ pub struct TranscriptState {
     pub reason: TranscriptStateReason,
 }
 
+// ---------------------------------------------------------------------------
+// repo_context_state (REQ-612)
+// ---------------------------------------------------------------------------
+
+/// A session's repository notes were loaded, or exist and were not made
+/// resident (REQ-612 System Model, BR-1/BR-2).
+///
+/// Published session-scoped whenever the state is established or changes: at
+/// `session/create`, in `/cd`'s rebuild before `session_root_changed` reaches a
+/// second client, on BR-6's staleness re-read, and on `/context on|off`. Every
+/// attached client and declared monitor learns that a repository file is riding
+/// this session's system prompt — including the three ways it can fail to
+/// (`withheld_boundary`, `withheld_off`, `unreadable`), which are the half a
+/// user could not otherwise find out about.
+///
+/// **One event, not the two the spec's Events table first named.** Architecture
+/// ADR-6 folded `repo_context_loaded` and `repo_context_withheld` into
+/// [`Self::state`]: a client renders one line either way, and one event is one
+/// `name()` arm, one spec-table row and one thing for a monitor to subscribe
+/// to. The two spellings survive as two of the six values of
+/// [`RepoContextStateKind`].
+///
+/// **There is no file name here, and that is BR-2's split rather than an
+/// omission**, exactly as for [`TranscriptState`]. The event is *news*; which
+/// file the notes came out of is answered on the asking connection as
+/// [`crate::methods::SessionContextResult`]'s routed reply. [`Self::source`]
+/// says which of the two *names* was read, which is a closed two-value enum
+/// this build wrote and not a path — a monitor learns a repository has notes
+/// and does not learn where the user's working tree is.
+///
+/// The session is named by [`EventEnvelope::session_id`], not by a field here:
+/// [`Event`] is internally tagged and flattened, so a `session_id` on this
+/// struct would emit the key twice and fail to deserialize — the same shape
+/// [`ContextCleared`], [`SessionTitled`], [`PrefixCache`] and [`TranscriptState`]
+/// document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoContextState {
+    /// What the notes are doing **after** this change.
+    pub state: RepoContextStateKind,
+    /// Which name was read, when one was.
+    ///
+    /// Additive and absent-means-nothing-was-opened: `absent` and
+    /// `withheld_off` carry no source, because `off` never opened a file and so
+    /// does not know which of the two names is on disk (BR-2's "off means
+    /// unopened").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<RepoContextSource>,
+    /// The file's size on disk in bytes — **absent when the daemon does not
+    /// know one**.
+    ///
+    /// An `Option` for [`crate::methods::SessionContextResult::bytes_on_disk`]'s
+    /// reason, and it is the same defect on this half of the split: `0` is a
+    /// measurement meaning "the file is empty", while a symlinked entry, a
+    /// directory wearing the name and a refused `stat` have no measurement to
+    /// give. Absent means not known; a client renders no size for it.
+    ///
+    /// Additive, so a monitor built before this reads it as `None` and a daemon
+    /// that never populates it emits no key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_on_disk: Option<u64>,
+    /// How many of those bytes are in the system prompt — `0` for every state
+    /// but `loaded` and `truncated`.
+    ///
+    /// Published beside [`Self::bytes_on_disk`] rather than instead of it
+    /// because the pair is what BR-7 makes visible: resident bytes are spent on
+    /// every model call of every iteration, and a user weighing that trade needs
+    /// both the file's size and the part of it they are paying for.
+    pub resident_bytes: u64,
+    /// Whether the file was cut to fit the route's effective cap (BR-3).
+    ///
+    /// Redundant with `state == `[`RepoContextStateKind::Truncated`] on purpose,
+    /// for [`crate::methods::SessionContextResult::truncated`]'s reason: a
+    /// client renders the byte figures above beside a flag rather than by
+    /// matching on an enum whose future values it may not know.
+    pub truncated: bool,
+    /// Why, in the daemon's own words, when the state has words to give.
+    ///
+    /// **Only `unreadable` has any.** The reason names the filesystem verdict —
+    /// a symlinked entry, a permission, bytes that are not text — from a closed
+    /// set of harness-authored sentences. A `withheld_boundary` carries none and
+    /// never will: the glob that covered the file is configuration, not a fact
+    /// about the file, and the state word already names the remedy.
+    ///
+    /// **Bounded and neutralised by the daemon before it reaches the wire**
+    /// (`session_root::bounded_field`, the [`crate::methods::SkillView`] rule).
+    /// An `io::Error`'s text is repository-adjacent content — it can carry a
+    /// path the repository chose — so it is treated as file bytes at both ends:
+    /// bounded where the frame is written, and defused again at render through
+    /// `Surface::line` (REQ-591 BR-11, ADR-009's two layers).
+    ///
+    /// Absent for every state that has nothing to explain, so `unreadable` with
+    /// no reason is "we could not say why" and `unreadable` with one is a
+    /// remedy the user can act on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3971,6 +4101,7 @@ mod tests {
             bound: Some(BudgetBound::Window),
             bound_floored: None,
             spend_ceiling_micro_cents: None,
+            repo_context_cap: None,
         }));
         // Flattened: envelope metadata and the payload share one object.
         assert_eq!(wire["event"], "route_decided");
@@ -4008,6 +4139,7 @@ mod tests {
                     bound: None,
                     bound_floored: None,
                     spend_ceiling_micro_cents: None,
+                    repo_context_cap: None,
                 }),
                 "route_decided",
             ),
@@ -4228,6 +4360,19 @@ mod tests {
                     reason: TranscriptStateReason::ConfigDefault,
                 }),
                 "transcript_state",
+            ),
+            (
+                // REQ-612 ADR-6: the one event, whose `state` carries the
+                // distinction the spec's two names drew.
+                Event::RepoContextState(RepoContextState {
+                    state: RepoContextStateKind::Loaded,
+                    source: Some(RepoContextSource::TetonMd),
+                    bytes_on_disk: Some(3_120),
+                    resident_bytes: 3_120,
+                    truncated: false,
+                    reason: None,
+                }),
+                "repo_context_state",
             ),
         ];
 
@@ -4478,6 +4623,261 @@ mod tests {
         );
     }
 
+    /// **REQ-612 AC-2's wire half, both directions of the additive rule
+    /// (REQ-573).** `repo_context_state` reaches a client as a flat object
+    /// naming its session, what the notes are doing, and what they cost — and
+    /// **no file name**. The two directions are asserted rather than assumed,
+    /// and like [`a_context_that_did_not_fit_has_its_own_kind_and_an_unknown_one_degrades`]
+    /// they are **not symmetric**, which is worth saying out loud:
+    ///
+    /// * **a daemon that populates only the required keys → this build**:
+    ///   additive and lossless. `source` and `reason` are absent, not `null`,
+    ///   and read as `None`.
+    /// * **this daemon → a client predating REQ-612**: the frame is *dropped*,
+    ///   in silence, which is exactly what "older clients ignore unknown
+    ///   events" means in this codebase. [`Event`] is closed with no
+    ///   `#[serde(other)]`, so an unknown `event` tag is a deserialization
+    ///   error, and the CLI's reader spells that
+    ///   `serde_json::from_value(params).ok()?` — a `None` that skips the
+    ///   notification. The cost is one status line about a file the *turn* is
+    ///   carrying regardless, which is why this ships as an ordinary additive
+    ///   event rather than a protocol-version bump.
+    ///
+    /// The absent file name is asserted the way [`TranscriptState`]'s absent
+    /// path is: the payload's key set is checked **whole** rather than by
+    /// probing for `file`, so any other field added later fails here too. This
+    /// event goes to every declared monitor, and a monitor is told a session has
+    /// repository notes without being told where the user's working tree is.
+    ///
+    /// **Shown to fail** (conventions: show the test can fail before trusting
+    /// that it passed). Three mutations. `pub file: Option<String>` added to
+    /// [`RepoContextState`] and populated — red on the key-set assertion
+    /// (`left ["bytes_on_disk", "file", "resident_bytes", "source", "state",
+    /// "truncated"]`), with `session_context_params_and_result_round_trip_and_do_not_end_a_turn`
+    /// still green, which is the right split: the file name belongs on the
+    /// routed result and nowhere else. Dropping `#[serde(default,
+    /// skip_serializing_if = "Option::is_none")]` from `source` — red where the
+    /// first direction starts, on `a frame carrying only the required keys must
+    /// parse`, which is where the test stops. Renaming the `name()` arm to
+    /// `repo_context_loaded` — red on the tag assertion here **and** in
+    /// `event_names_match_the_spec_events_table`, which is the pairing that
+    /// makes ADR-6's "one event, one name, one row" checkable. Restored after
+    /// observing.
+    ///
+    /// **Verify (MAJOR 2), shown to fail.** Flattening `bytes_on_disk` back to
+    /// a bare `u64` — the shape this replaced — is red on the `None` legs of
+    /// the state table: `absent`, `withheld_off` and a `stat`-refused
+    /// `unreadable` emit `"bytes_on_disk":0`, and a client renders `0 bytes on
+    /// disk` for a file it never measured. Dropping only the
+    /// `skip_serializing_if` emits `null` and is red on the same assertion.
+    #[test]
+    fn repo_context_state_is_additive_in_both_directions() {
+        let loaded = RepoContextState {
+            state: RepoContextStateKind::Loaded,
+            source: Some(RepoContextSource::TetonMd),
+            bytes_on_disk: Some(3_120),
+            resident_bytes: 3_120,
+            truncated: false,
+            reason: None,
+        };
+        round_trip(&loaded);
+
+        let wire = envelope_wire(Event::RepoContextState(loaded.clone()));
+        assert_eq!(wire["event"], "repo_context_state");
+        assert_eq!(wire["session_id"], "s1");
+        assert_eq!(wire["state"], "loaded");
+        assert_eq!(wire["source"], "teton_md");
+        assert_eq!(wire["bytes_on_disk"], 3_120);
+        assert_eq!(wire["resident_bytes"], 3_120);
+        assert_eq!(wire["truncated"], false);
+        assert_eq!(
+            Event::RepoContextState(loaded.clone()).name(),
+            "repo_context_state"
+        );
+
+        // BR-2's split: the news says *that* the notes are resident and what
+        // they cost, never *which file on disk* they came out of.
+        let payload = serde_json::to_value(&loaded).unwrap();
+        let keys: Vec<&str> = payload
+            .as_object()
+            .expect("the payload is a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            // `serde_json`'s map is ordered, so this is the set spelled
+            // alphabetically rather than in declaration order.
+            vec![
+                "bytes_on_disk",
+                "resident_bytes",
+                "source",
+                "state",
+                "truncated"
+            ],
+            "the event must carry no file name (BR-2): {payload}"
+        );
+
+        // Every state, spelled as the System Model spells it, with the payload
+        // each one actually carries. A truncated file is resident *and* cut.
+        // `withheld_boundary` and an `unreadable` the daemon `stat`ed carry the
+        // file's size with **none** of it resident — the pair is the point: a
+        // user is told a file is there, how big it is, and that none of it is in
+        // the prompt. `absent` and `withheld_off` opened nothing, so they name
+        // no source and **no size at all**: `off` never `stat`ed, and `absent`
+        // has nothing to `stat`. A size is a measurement, and those two have
+        // none to give — which is why the field is an `Option` and not a `0`
+        // (verify MAJOR 2). The `unreadable` leg below is the one whose `stat`
+        // itself failed, so it is `None` beside a source that is `Some`.
+        for (state, spelling, source, on_disk, resident) in [
+            (
+                RepoContextStateKind::Truncated,
+                "truncated",
+                Some(RepoContextSource::AgentsMd),
+                Some(40_000_u64),
+                8_100_u64,
+            ),
+            (RepoContextStateKind::Absent, "absent", None, None, 0),
+            (
+                RepoContextStateKind::WithheldOff,
+                "withheld_off",
+                None,
+                None,
+                0,
+            ),
+            (
+                RepoContextStateKind::WithheldBoundary,
+                "withheld_boundary",
+                Some(RepoContextSource::TetonMd),
+                Some(2_048),
+                0,
+            ),
+            (
+                RepoContextStateKind::Unreadable,
+                "unreadable",
+                Some(RepoContextSource::TetonMd),
+                None,
+                0,
+            ),
+        ] {
+            let event = RepoContextState {
+                state,
+                source,
+                bytes_on_disk: on_disk,
+                resident_bytes: resident,
+                truncated: state == RepoContextStateKind::Truncated,
+                reason: None,
+            };
+            round_trip(&event);
+            let wire = envelope_wire(Event::RepoContextState(event));
+            assert_eq!(wire["state"], spelling, "{wire}");
+            assert_eq!(wire["resident_bytes"], resident, "{wire}");
+            if source.is_none() {
+                assert!(
+                    wire.get("source").is_none(),
+                    "a state that opened no file names no source: {wire}"
+                );
+            }
+            match on_disk {
+                Some(bytes) => assert_eq!(wire["bytes_on_disk"], bytes, "{wire}"),
+                // The whole of MAJOR 2 on this half of the split: a state the
+                // daemon has no size for emits no key, so no client can render
+                // `0 bytes on disk` for a file it never measured.
+                None => assert!(
+                    wire.get("bytes_on_disk").is_none(),
+                    "a state the daemon never measured reported a size: {wire}"
+                ),
+            }
+        }
+
+        // The bounded reason, which only two states have words for. It is the
+        // daemon's own sentence, bounded before it reaches here — a filesystem
+        // error's text is repository-adjacent content (REQ-591 BR-11).
+        let unreadable = RepoContextState {
+            state: RepoContextStateKind::Unreadable,
+            source: Some(RepoContextSource::TetonMd),
+            bytes_on_disk: None,
+            resident_bytes: 0,
+            truncated: false,
+            reason: Some("Operation not permitted (os error 1)".to_owned()),
+        };
+        round_trip(&unreadable);
+        let wire = envelope_wire(Event::RepoContextState(unreadable));
+        assert_eq!(wire["reason"], "Operation not permitted (os error 1)");
+
+        // Direction one — a frame carrying only the required keys reads with
+        // all three optionals `None`, and a payload that never populated them
+        // emits no key at all rather than `null`, which is the same wire a
+        // daemon predating any of the three writes.
+        let minimal: RepoContextState =
+            serde_json::from_str(r#"{"state":"absent","resident_bytes":0,"truncated":false}"#)
+                .expect("a frame carrying only the required keys must parse");
+        assert_eq!(minimal.source, None);
+        assert_eq!(minimal.reason, None);
+        assert_eq!(minimal.bytes_on_disk, None);
+        let wire = serde_json::to_value(&minimal).unwrap();
+        assert!(wire.get("source").is_none(), "{wire}");
+        assert!(wire.get("reason").is_none(), "{wire}");
+        assert!(wire.get("bytes_on_disk").is_none(), "{wire}");
+        // And a frame from a daemon that *did* send the flattened `0` still
+        // reads as the measurement it was — `Some(0)`, an empty file — rather
+        // than being confused with the absence above.
+        let flattened: RepoContextState = serde_json::from_str(
+            r#"{"state":"absent","bytes_on_disk":0,"resident_bytes":0,"truncated":false}"#,
+        )
+        .expect("the pre-REQ-612-verify spelling must still parse");
+        assert_eq!(flattened.bytes_on_disk, Some(0));
+
+        // Direction two — a reader built before REQ-612. This models the shipped
+        // `Event` faithfully in the one respect that decides the outcome: it is
+        // internally tagged on `event` and closed, so a tag it has never heard
+        // of is an error, and the CLI turns that error into a skipped
+        // notification.
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "event", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum EventAsShippedBeforeReq612 {
+            TranscriptState(TranscriptState),
+            ContextCleared(ContextCleared),
+        }
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        struct EnvelopeAsShippedBeforeReq612 {
+            #[serde(default)]
+            session_id: Option<SessionId>,
+            seq: u64,
+            #[serde(flatten)]
+            event: EventAsShippedBeforeReq612,
+        }
+
+        let frame = serde_json::to_string(&EventEnvelope::new(
+            7,
+            Some(SessionId::from("s1")),
+            Event::RepoContextState(loaded),
+        ))
+        .unwrap();
+        assert!(
+            serde_json::from_str::<EnvelopeAsShippedBeforeReq612>(&frame)
+                .ok()
+                .is_none(),
+            "the older reader must drop the frame — which is how the CLI's \
+             `from_value(params).ok()?` ignores an unknown event: {frame}"
+        );
+
+        // Non-vacuity: that same reader still reads the events it shipped with,
+        // so the drop above is about the new tag and not about the envelope.
+        let known = serde_json::to_string(&EventEnvelope::new(
+            8,
+            Some(SessionId::from("s1")),
+            Event::TranscriptState(TranscriptState {
+                enabled: true,
+                reason: TranscriptStateReason::ConfigDefault,
+            }),
+        ))
+        .unwrap();
+        assert!(serde_json::from_str::<EnvelopeAsShippedBeforeReq612>(&known).is_ok());
+    }
+
     /// **REQ-586 BR-7's wire half.** A clamp reaches a client as a flat
     /// `context_pressure` object naming its session, what the gate did, how
     /// much, and the budget it fitted to with its bound — and survives the
@@ -4615,8 +5015,8 @@ mod tests {
             dropped_blocks: 0,
             elided_bytes: 0,
             newest_user_elided: false,
-            budget_tokens: 2_048,
-            budget_bytes: 16_384,
+            budget_tokens: 6_250,
+            budget_bytes: 50_000,
             bound: BudgetBound::UserCap,
             bound_floored: true,
         };
@@ -4677,11 +5077,12 @@ mod tests {
             model: None,
             reason: "r".to_owned(),
             effort: None,
-            budget_tokens: Some(2_048),
-            budget_bytes: Some(16_384),
+            budget_tokens: Some(6_250),
+            budget_bytes: Some(50_000),
             bound: Some(BudgetBound::UserCap),
             bound_floored: Some(true),
             spend_ceiling_micro_cents: None,
+            repo_context_cap: None,
         };
         round_trip(&decided);
         let wire = serde_json::to_value(&decided).unwrap();
@@ -4826,6 +5227,7 @@ mod tests {
             bound: None,
             bound_floored: None,
             spend_ceiling_micro_cents: None,
+            repo_context_cap: None,
         });
 
         // REQ-586: the budget pair and its bound ride the same frame, and every
@@ -4851,6 +5253,7 @@ mod tests {
                 bound: Some(bound),
                 bound_floored: None,
                 spend_ceiling_micro_cents: None,
+                repo_context_cap: None,
             };
             round_trip(&decided);
             let wire: serde_json::Value =
@@ -4908,6 +5311,7 @@ mod tests {
             bound: Some(BudgetBound::UserCap),
             bound_floored: None,
             spend_ceiling_micro_cents: None,
+            repo_context_cap: None,
         })
         .unwrap();
         assert!(
@@ -6070,6 +6474,7 @@ mod tests {
             bound: None,
             bound_floored: None,
             spend_ceiling_micro_cents: None,
+            repo_context_cap: None,
         };
         round_trip(&decided);
         let wire: serde_json::Value =
