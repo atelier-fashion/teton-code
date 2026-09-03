@@ -17,9 +17,9 @@
   },
   {
     "file": "numeric_grid.txt",
-    "words": 10240,
-    "bytes": 20480,
-    "tokens": 20480,
+    "words": 21162,
+    "bytes": 42324,
+    "tokens": 42324,
     "tokenizer": "o200k_base",
     "tokenizer_version": "tiktoken 0.14.0"
   },

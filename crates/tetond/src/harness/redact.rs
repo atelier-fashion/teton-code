@@ -369,7 +369,7 @@ pub(crate) fn rendered_prompt_bytes(prompt: &str) -> usize {
 ///   information: a full postal address is comfortably under 128 bytes.
 ///
 /// The slack is cheap but not free, and the honest arithmetic is worth writing
-/// down. 256 bytes shrinks the stride by under 1% — 26,814 instead of 27,070 —
+/// down. 256 bytes shrinks the stride by under 1% — 56,305 instead of 56,561 —
 /// so a payload needs under 1% more window to cover. At the small counts this
 /// cap allows, that rounds to **at most one extra model call**: a payload at
 /// [`REDACT_INPUT_MAX_BYTES`] is five chunks with the overlap and would be four
@@ -413,15 +413,16 @@ const _: () = assert!(REDACT_CHUNK_STRIDE_BYTES > 0);
 /// The most chunks a payload can be cut into — equivalently, the most model
 /// calls one send can buy (BR-7, ADR-8).
 ///
-/// Five, at today's constants: a payload at [`REDACT_INPUT_MAX_BYTES`]
-/// (108,280 bytes) covered by 27,070-byte windows striding 26,814 bytes needs
-/// `ceil((108,280 − 27,070) / 26,814) + 1 = 5` of them.
+/// Four, at today's constants: a payload at [`REDACT_INPUT_MAX_BYTES`]
+/// (169,683 bytes) covered by 56,561-byte windows striding 56,305 bytes needs
+/// `ceil((169,683 − 56,561) / 56,305) + 1 = 4` of them. (Five, on the
+/// 16,384-token window: `ceil((108,280 − 27,070) / 26,814) + 1`.)
 ///
 /// It is the number ADR-8's budget is multiplied by — p50 ≤ 2 s per chunk means
-/// p50 ≤ 10 s for a maximal payload. It is **not** what the worst-case wait is
+/// p50 ≤ 8 s for a maximal payload. It is **not** what the worst-case wait is
 /// multiplied by: [`scan`] bounds the whole loop at one
 /// [`DUTY_DEADLINE`](super::duty::DUTY_DEADLINE), so a degenerate engine costs
-/// one deadline rather than five.
+/// one deadline rather than four.
 ///
 /// Derived here rather than declared so that raising the total cap moves it;
 /// [`tests::the_chunker_never_cuts_more_chunks_than_the_derived_ceiling`] checks
@@ -1894,9 +1895,11 @@ mod tests {
 
         let block = "<|".repeat(31) + "|>";
         let mut payload = "z".repeat(REDACT_CHUNK_MAX_BYTES);
-        // Enough dense content to render the second chunk past the window, and
-        // little enough that the payload is two chunks rather than three.
-        payload.push_str(&block.repeat(24_000 / 64));
+        // Enough dense content to render the second chunk past the window
+        // (each 64-byte block grows by 31 bytes under neutralization, so ~52 KB
+        // of it renders past a 63,488-byte prompt budget), and little enough
+        // that the payload is two chunks rather than three.
+        payload.push_str(&block.repeat(52_000 / 64));
         assert_eq!(
             chunk_ranges(&payload).len(),
             2,
@@ -2196,8 +2199,10 @@ mod tests {
 
     /// A payload comfortably over one engine window and comfortably under the
     /// total cap — the size the harness's own context budget makes ordinary,
-    /// and the size that used to block.
-    const OVER_ONE_WINDOW: usize = 40 * 1024;
+    /// and the size that used to block. 70 KiB against a 56,561-byte window and
+    /// a 169,683-byte cap (it was 40 KiB against 27,070 and 108,280 on the
+    /// 16,384-token engine window).
+    const OVER_ONE_WINDOW: usize = 70 * 1024;
 
     /// An engine with one scripted answer per call, so a fixture can say what
     /// the *second* chunk comes back with.
@@ -2253,7 +2258,7 @@ mod tests {
     /// degrading.
     ///
     /// The last row is three-byte characters, chosen so the arithmetic boundary
-    /// lands *inside* one: `REDACT_CHUNK_MAX_BYTES` is 27,070 and 27,069 is the
+    /// lands *inside* one: `REDACT_CHUNK_MAX_BYTES` is 56,561 and 56,559 is the
     /// nearest multiple of three below it, so a chunker that did not walk back
     /// to a char boundary panics on this row rather than merely mis-sizing.
     #[test]
@@ -2354,12 +2359,15 @@ mod tests {
         // rounding could push the count past the ceiling this is where it would
         // show, and the guard `scan` now carries would start refusing maximal
         // payloads of ordinary emoji or CJK text rather than scanning them.
-        let four_byte = "😀".repeat(REDACT_INPUT_MAX_BYTES / 4);
+        // The cap need not divide by four (169,683 does not), so the row is
+        // padded to it with ASCII: every window boundary but the last still
+        // lands on 4-byte chars, which is where the walk-back pays.
+        let mut four_byte = "😀".repeat(REDACT_INPUT_MAX_BYTES / 4);
+        four_byte.push_str(&"z".repeat(REDACT_INPUT_MAX_BYTES % 4));
         assert_eq!(
             four_byte.len(),
             REDACT_INPUT_MAX_BYTES,
-            "the cap must be a whole number of 4-byte chars, or this row is not \
-             at the cap"
+            "the padded row must sit exactly at the cap, or it is not at the cap"
         );
         let cut = chunk_ranges(&four_byte).len();
         assert!(
@@ -2372,8 +2380,8 @@ mod tests {
     /// **The headline: a payload past one engine window is scanned, not
     /// refused.**
     ///
-    /// 40 KiB is over `REDACT_CHUNK_MAX_BYTES` (27,070) and well over the
-    /// harness's own `context_budget_bytes` (32,768) once a system prompt and
+    /// 70 KiB is over `REDACT_CHUNK_MAX_BYTES` (56,561) and over the
+    /// harness's own `context_budget_bytes` (63,488) once a system prompt and
     /// JSON escaping ride along — which is to say it is the shape of an
     /// ordinary context-heavy remote turn. Before chunking this was
     /// `Unavailable` → **Block**: the scan refused it, and the turn failed

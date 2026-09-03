@@ -18,11 +18,12 @@
 //!
 //! * **AC-10(a)** wall-clock prefill — time to first token, with generation
 //!   capped at a handful of tokens so decode is noise — for a prompt at the
-//!   derived budget (15,360 tokens: `LOCAL_ENGINE_N_CTX` less the 1,024-token
-//!   generation reservation) against one at today's budget (6,144 tokens: 4,096
-//!   whitespace words × the 3/2 safety ratio). Prefill is ~linear in prompt
-//!   tokens, so ~2.5× is the expected ratio; a materially worse one means
-//!   something other than linear cost, and *that* is the finding.
+//!   derived budget (31,744 tokens: `LOCAL_ENGINE_N_CTX` less the 1,024-token
+//!   generation reservation) against one at the previous window's budget
+//!   (15,360 tokens: the 16,384-token window less the same reservation).
+//!   REQ-590 measured prefill as **super-linear** on this engine (6,164 →
+//!   15,410 tokens cost 3,111 → 13,548 ms, 4.35× for 2.5×), so the ratio to
+//!   expect for this 2.07× step is well over 2×; the number is the finding.
 //!
 //! * **AC-10(b)** the REQ-544 BR-8 duty ([`DutySpec::default`] —
 //!   `min_tokens_per_sec: 5.0`, `max_first_token_ms: 1000`) run twice: verbatim
@@ -80,17 +81,19 @@ mod llama {
     /// a crate this one does not depend on; a measurement taken against a
     /// *different* window would be measuring nothing, so it is printed in the
     /// report for the reader to check against the source.
-    const N_CTX: u32 = 16_384;
+    const N_CTX: u32 = 32_768;
 
     /// `LOCAL_GENERATION_RESERVATION` (`tetond/src/harness/budget.rs`, TASK-269).
     const RESERVATION: u32 = 1_024;
 
-    /// The budget REQ-590 derives: `N_CTX - RESERVATION`, in real tokens.
+    /// The budget the derivation gives this window: `N_CTX - RESERVATION`, in
+    /// real tokens.
     const AFTER_TOKENS: u32 = N_CTX - RESERVATION;
 
-    /// What today's budget claims at the codebase's own 3/2 words-per-token
-    /// safety ratio: 4,096 whitespace words × 3 ÷ 2.
-    const BEFORE_TOKENS: u32 = 6_144;
+    /// The same derivation on the 16,384-token window the daemon loaded with
+    /// before: `16,384 - 1,024`. (REQ-590's original run compared 15,360
+    /// against the pre-derivation 6,144 — 4,096 whitespace words × 3 ÷ 2.)
+    const BEFORE_TOKENS: u32 = 16_384 - RESERVATION;
 
     /// Prefill probes per size. The first is discarded as a warmup (Metal
     /// pipeline construction lands on it), and the median of the rest reported.
@@ -312,7 +315,7 @@ fn resolve_route(&self, session: &SessionId, hint: Option<&RouteHint>) -> RouteD
         println!("## AC-10(a) — the shape, swept");
         println!("  | target tokens | prompt tokens | median first token | ms/token |");
         println!("  |---|---|---|---|");
-        for target in [3_072u32, 6_144, 9_216, 12_288, 15_360] {
+        for target in [6_144u32, 12_288, 18_432, 24_576, 31_744] {
             let (tokens, ms, _) = prefill_at_quiet(&engine, target, tokens_per_unit)?;
             println!(
                 "  | {target} | {tokens} | {ms} ms | {:.3} |",

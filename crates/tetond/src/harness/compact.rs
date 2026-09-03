@@ -125,10 +125,10 @@ use crate::runtime::LOCAL_ENGINE_N_CTX;
 /// # One chain, written down once (REQ-590 ADR-5, LESSON-491)
 ///
 /// ```text
-///   engine window          16,384 tokens   (LOCAL_ENGINE_N_CTX)
+///   engine window          32,768 tokens   (LOCAL_ENGINE_N_CTX)
 ///   − the generation        1,024 tokens   (LOCAL_GENERATION_RESERVATION)
-///   = 15,360 usable        × 2 B/token     (DUTY_REQUEST_BYTES_PER_TOKEN)
-///   = 30,720 bytes  — everything a prompt of this window can hold once the
+///   = 31,744 usable        × 2 B/token     (DUTY_REQUEST_BYTES_PER_TOKEN)
+///   = 63,488 bytes  — everything a prompt of this window can hold once the
 ///                     reply's room is set aside, which is the most a repair
 ///                     could ever usefully return
 /// ```
@@ -142,27 +142,22 @@ use crate::runtime::LOCAL_ENGINE_N_CTX;
 /// engine only by coincidence, and the coincidence was invisible at both
 /// definition sites.
 ///
-/// # Ceiling ≤ budget is an **ordering**, not an equality (REQ-590 ADR-9)
+/// # Ceiling = budget, by construction (REQ-590 ADR-6a, restored at 32,768)
 ///
-/// D-4 originally took the window-derived byte half for the local route too, at
-/// which point the ceiling and the budget were the same 30,720 by construction.
-/// **D-4 was reversed on measurement** — the local byte budget is
-/// [`LOCAL_BUDGET_BYTES`](super::budget::LOCAL_BUDGET_BYTES) again, 32,768 —
-/// so the two numbers now answer different questions and the relation between
-/// them is `ceiling ≤ budget`, with 2,048 bytes of room. That is the right
-/// shape: pinning the equality was defensible only while both sides derived
-/// from one number, and would now be a coincidence to assert.
-///
-/// The 2,048-byte gap is not slack in the engine's favour. It is exactly what
-/// the byte budget out-claims the engine by at the 2 B/token floor — 32,768 / 2
-/// = 16,384 tokens against 15,360 usable — so the ceiling is what a repair can
-/// really return and the budget is what the guard will really admit. The
-/// residual is stated where the numbers meet, in `tests/token_corpus.rs`'s
-/// `a_full_word_budget_turn_of_token_dense_byte_light_content_overruns_the_engine`.
-///
-/// So the relation is held **by construction** here and **asserted as a
-/// relation** in `the_compact_ceiling_is_the_loosest_of_the_five` — never as two
+/// The local route's byte budget derives from the same chain —
+/// [`derive`](super::budget::derive)'s local arm bridges the same usable window
+/// at the same 2 B/token — so the ceiling and the budget are the same 63,488 by
+/// construction, and `the_compact_ceiling_is_the_loosest_of_the_five` asserts
+/// them equal as a **relation** between two derived values, never as two
 /// literals that happen to agree, which is the shape that broke.
+///
+/// That equality was gone between REQ-590 ADR-9 and the window's raise to
+/// 32,768: on the 16,384-token window the derived byte half (30,720) was
+/// *smaller* than the 32,768 constant the local route had always run under,
+/// so ADR-9 kept the constant and the relation was `ceiling ≤ budget` with a
+/// 2,048-byte residual — the amount by which that constant out-claimed the
+/// engine. At 32,768 the derived half is 63,488, nearly twice the constant, the
+/// premise is gone and both numbers come off one chain again.
 ///
 /// The one link this does *not* follow is the redact clamp or a remote route's
 /// larger pair: the ceiling is the **local** budget on purpose, for the same
@@ -198,9 +193,9 @@ pub const COMPACT_DUTY: DutyKind = DutyKind::new(Category::Compact, COMPACT_OUTP
 /// [`REDACT_PROMPT_BUDGET_BYTES`](crate::egress::redact::REDACT_PROMPT_BUDGET_BYTES):
 ///
 /// ```text
-///   engine window            16,384 tokens   (LOCAL_ENGINE_N_CTX)
+///   engine window            32,768 tokens   (LOCAL_ENGINE_N_CTX)
 ///   − the duty's generation   4,096 tokens   (COMPACT_DUTY.max_tokens())
-///   = 12,288 tokens × 2 B/token             (DUTY_REQUEST_BYTES_PER_TOKEN)
+///   = 28,672 tokens × 2 B/token             (DUTY_REQUEST_BYTES_PER_TOKEN)
 ///   − the ChatML envelope        55 bytes   (CHATML_DUTY_ENVELOPE_BYTES)
 /// ```
 ///
@@ -850,10 +845,10 @@ mod tests {
     /// shape.
     #[test]
     fn the_prompt_budget_is_derived_from_the_local_engine_window() {
-        // The arithmetic, written out once: 16,384 − 4,096 = 12,288 tokens, at
-        // 2 B/token = 24,576, less the 55-byte ChatML envelope.
+        // The arithmetic, written out once: 32,768 − 4,096 = 28,672 tokens, at
+        // 2 B/token = 57,344, less the 55-byte ChatML envelope.
         assert_eq!(
-            COMPACT_PROMPT_BUDGET_BYTES, 24_521,
+            COMPACT_PROMPT_BUDGET_BYTES, 57_289,
             "the duty's prompt budget moved; if that was deliberate, say why here"
         );
         const {
@@ -1121,40 +1116,31 @@ mod tests {
              repairing to",
             local.budget_bytes
         );
-        // **The equality that used to stand here is gone, deliberately (ADR-9).**
+        // **The equality TASK-271 first asserted stands again (ADR-6a).** A
+        // ceiling *below* the budget leaves the duty unable to write the
+        // paragraph its own budget could hold; a ceiling *above* it is bytes
+        // spent to be thrown away. Both sides derive from one chain — the
+        // engine's usable window at the 2 B/token floor — so they are the same
+        // number by construction, and the relation is pinned as an equality
+        // between two derived values rather than as two literals.
         //
-        // TASK-271 asserted `ceiling == budget` on the reasoning that a ceiling
-        // *below* the budget leaves the duty unable to write the paragraph its
-        // own budget could hold. That was right while both were window-derived.
-        //
-        // ADR-9 reversed D-4: the byte budget is `LOCAL_BUDGET_BYTES` (32,768,
-        // word-derived) while the ceiling stays window-derived (30,720). They
-        // are answers to two different questions now — "how many bytes may a
-        // local prompt claim" and "how many bytes can this engine actually take
-        // back" — so equality would be a coincidence to pin, not an invariant.
-        //
-        // The 2,048 B between them is not slack the duty is being denied. It is
-        // exactly the amount by which the byte budget out-claims the engine at
-        // the 2 B/token floor — the known residual ADR-9 accepted, stated here
-        // in the one place the two numbers meet.
+        // Between REQ-590 ADR-9 and the window's raise to 32,768 this read
+        // `ceiling ≤ budget` with a stated 2,048-byte residual, because the
+        // local byte budget was then the 32,768 constant rather than the
+        // window's 30,720; at 32,768 tokens the derived half is 63,488 and the
+        // constant is no longer read here.
         assert_eq!(
-            local.budget_bytes - COMPACT_OUTPUT_MAX_BYTES,
-            crate::harness::budget::LOCAL_BUDGET_BYTES
-                - (LOCAL_ENGINE_N_CTX.saturating_sub(LOCAL_GENERATION_RESERVATION) as usize
-                    * DUTY_REQUEST_BYTES_PER_TOKEN),
-            "the distance between the byte budget and the ceiling is no longer the distance \
-             between what the byte half claims and what the engine can take — one of the two \
-             has moved without the other, which is LESSON-491's shape returning"
+            COMPACT_OUTPUT_MAX_BYTES, local.budget_bytes,
+            "the ceiling and the local byte budget have parted company — one of the two has \
+             moved without the other, which is LESSON-491's shape returning"
         );
         // The same relation through the config the turn loop actually runs on,
         // so the chain is pinned at the surface as well as at the derivation.
-        // `<=`, not `==`, for the reason above: since ADR-9 the two are answers
-        // to different questions and only their ordering is an invariant.
-        assert!(
-            COMPACT_OUTPUT_MAX_BYTES <= super::super::HarnessConfig::default().context_budget_bytes,
-            "the ceiling ({COMPACT_OUTPUT_MAX_BYTES} B) is above the local route's context \
-             byte budget ({} B), so a compaction can be bigger than the window it makes room \
-             in — bytes spent to be thrown away",
+        assert_eq!(
+            COMPACT_OUTPUT_MAX_BYTES,
+            super::super::HarnessConfig::default().context_budget_bytes,
+            "the ceiling ({COMPACT_OUTPUT_MAX_BYTES} B) and the local route's context byte \
+             budget ({} B) are one chain, and the config no longer carries it",
             super::super::HarnessConfig::default().context_budget_bytes
         );
         assert_eq!(COMPACT_DUTY.ceiling_bytes(), COMPACT_OUTPUT_MAX_BYTES);
@@ -1165,9 +1151,9 @@ mod tests {
         // to assert is that it never asks for more output than the ceiling
         // would keep. At this ceiling the *cap* is what binds (pinned as
         // `COMPACT_DUTY.max_tokens() == DUTY_MAX_TOKENS_REQUEST` in `duty.rs`,
-        // where that constant lives), which is why moving the ceiling from
-        // 32,768 to 30,720 left the generation budget — and therefore
-        // `COMPACT_PROMPT_BUDGET_BYTES` — untouched.
+        // where that constant lives), which is why the ceiling's moves —
+        // 32,768 → 30,720 in REQ-590, 30,720 → 63,488 with the window — left
+        // the generation budget untouched.
         assert!(
             COMPACT_DUTY.max_tokens() as usize
                 <= COMPACT_OUTPUT_MAX_BYTES / DUTY_REQUEST_BYTES_PER_TOKEN,

@@ -538,7 +538,7 @@ fn only_a_declaration_counts_never_a_mention() {
             "taint_pin_line",
         ),
         (
-            "pub(crate) const LOCAL_ENGINE_N_CTX: u32 = 16_384;",
+            "pub(crate) const LOCAL_ENGINE_N_CTX: u32 = 32_768;",
             "LOCAL_ENGINE_N_CTX",
         ),
         (

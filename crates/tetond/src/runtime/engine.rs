@@ -939,24 +939,47 @@ pub(super) fn fake_engine_loader(
 /// this number, so a reader who arrives here looking for the ~4× of margin the
 /// old wording promised will not find it.
 ///
+/// # 32,768, raised from 16,384
+///
+/// At 16,384 the local byte budget was a fixed 32,768 B (REQ-590 ADR-9), and a
+/// `/analyze` turn whose dynamic context came to **55 KB** was refused against
+/// it while the window would have held it comfortably at real BPE density. A
+/// repository audit is a baseline task for the local tier, so the window is
+/// doubled and **both** halves of the local pair now derive from it — the byte
+/// half's fixed constant existed only because the window-derived figure was
+/// *smaller* at 16,384, and at 32,768 it is 1.94× the constant instead (see
+/// [`derive`](crate::harness::budget::derive)'s local arm).
+///
+/// Every catalogued model holds this natively: Qwen2.5-Coder's 1.5B/3B/7B
+/// weights carry a 32,768 position table and Qwen3-Coder-30B-A3B a 262,144 one,
+/// so no RoPE scaling is asked for. What it costs is KV: roughly double the
+/// per-context cache (≈3 GiB per context on the 30B-A3B Q4_K at fp16 KV, ≈1.75
+/// GiB on the 7B, ≈1.1 GiB on the 3B, ≈0.9 GiB on the 1.5B), and — because
+/// prefill is super-linear (REQ-590 TASK-275 measured 4.35× the time for 2.5×
+/// the tokens) — a turn that genuinely *fills* the window waits longer for its
+/// first token. The budget is a ceiling: a turn pays only for what it sends.
+///
 /// # What derives from it
 ///
 /// * The local route's **word** budget, in
-///   [`derive`](crate::harness::budget::derive)'s local arm: `16,384 − 1,024
-///   reserved for the reply = 15,360 usable`, then the same 3/2 rule every
-///   window-derived route runs, giving **10,240 whitespace words**. That is
-///   *exactly* saturating and carries **zero** slack (ADR-6): 10,240 × 3/2 =
-///   15,360, so any content denser than 1.5 real BPE tokens per whitespace word
-///   overruns the engine at full budget, with the engine's own typed
-///   `context_length_exceeded` as the only catch. The local **byte** budget is
-///   not derived from here at all — ADR-9 kept it at
-///   [`LOCAL_BUDGET_BYTES`](crate::harness::budget::LOCAL_BUDGET_BYTES),
-///   32,768, and `derive`'s local arm says why.
+///   [`derive`](crate::harness::budget::derive)'s local arm: `32,768 − 1,024
+///   reserved for the reply = 31,744 usable`, then the same 3/2 rule every
+///   window-derived route runs, giving **21,162 whitespace words** (the 2/3 is
+///   integer division; the one token it leaves is truncation, not headroom).
+///   That is saturating and carries no deliberate slack (ADR-6): any content
+///   denser than 1.5 real BPE tokens per whitespace word overruns the engine at
+///   full budget, with the engine's own typed `context_length_exceeded` as the
+///   only catch.
+/// * The local route's **byte** budget, on the same arm: `31,744 × 2 B/token =
+///   63,488 B`. Both halves now bridge to exactly the usable window, so a
+///   prompt saturated in either currency claims what the engine has, not more.
 /// * [`COMPACT_OUTPUT_MAX_BYTES`](crate::harness::compact::COMPACT_OUTPUT_MAX_BYTES)
 ///   and [`COMPACT_PROMPT_BUDGET_BYTES`](crate::harness::compact::COMPACT_PROMPT_BUDGET_BYTES)
 ///   — the `compact` duty's output ceiling and its own prompt bound.
 /// * [`REDACT_CHUNK_MAX_BYTES`](crate::egress::redact::REDACT_CHUNK_MAX_BYTES)
-///   and `REDACT_PROMPT_BUDGET_BYTES`, on the same chain.
+///   and `REDACT_PROMPT_BUDGET_BYTES`, on the same chain — and through the
+///   chunk cap, the scan's total cap and every `[privacy] redact = true`
+///   route's byte budget.
 ///
 /// # So lowering it is not a local edit (BR-8, OQ-2)
 ///
@@ -967,20 +990,15 @@ pub(super) fn fake_engine_loader(
 ///   window holds. The floor's "only ever raises" property is safe against a
 ///   provider's *declaration*, which the provider can refuse in words a user
 ///   reads, and is not safe against this **allocation**, where a budget above
-///   the window buys nothing a turn can spend. Latent at 16,384; live the
+///   the window buys nothing a turn can spend. Latent at 32,768; live the
 ///   moment this constant falls. `budget::Floor::HeldToTheEngine` is where it
 ///   is enforced and tested at a synthetic window.
-/// * **OQ-2, open — and its premise moved under it.** OQ-2 was written against
-///   a byte half that fell with this window: at 4,096 tokens `window_pair`
-///   gives 6,144 bytes, below the harness's own ~6 KB system prompt plus the
-///   1 KiB truncation floor, i.e. a tier that cannot serve anything. Since
-///   ADR-9 the local arm **discards** that byte half and takes the constant, so
-///   the hazard at a small window now runs the *other* way: the local byte
-///   budget would still be 32,768 — 16,384 claimed tokens against 3,072 usable,
-///   a 5.3× overclaim, with no floor and no derivation to stop it, because
-///   BR-8's floor only ever guards against raising a *derived* pair. Neither
-///   number is safe at 4,096; they fail in opposite directions. Read `derive`'s
-///   local arm and OQ-2 together before changing this line.
+/// * **OQ-2, open.** At 4,096 tokens `window_pair` gives 6,144 bytes, below
+///   the harness's own ~6 KB system prompt plus the 1 KiB truncation floor,
+///   i.e. a tier that cannot serve anything — and since both halves derive
+///   again there is no constant to fall back on. `HeldToTheEngine` refuses to
+///   raise it, by design. Read `derive`'s local arm and OQ-2 together before
+///   changing this line downward.
 ///
 /// The harness bounds its side in this window's currency as well as in words:
 /// the assembled context and the summarizer's input are capped in **bytes**
@@ -999,11 +1017,11 @@ pub(super) fn fake_engine_loader(
 /// is **derived** from this number in every build (REQ-562, LESSON-446): the
 /// scan's per-chunk cap and this window are two descriptions of one budget,
 /// and they were once picked independently — 64 KiB against a window that
-/// refuses anything over 30,720 bytes — so payloads in the ~30–64 KiB band
+/// refused anything over 30,720 bytes — so payloads in the ~30–64 KiB band
 /// passed the cap and then failed as an opaque engine error, blocking with
 /// the wrong reason. One number, one place; the scan's total cap
 /// (`REDACT_INPUT_MAX_BYTES`) is in turn a stated multiple of the chunk cap.
-pub(crate) const LOCAL_ENGINE_N_CTX: u32 = 16_384;
+pub(crate) const LOCAL_ENGINE_N_CTX: u32 = 32_768;
 
 /// The real weights loader: llama.cpp behind the [`Engine`] trait (AC-2).
 ///

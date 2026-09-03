@@ -15342,17 +15342,21 @@ provider_id = \"deepseek\"
 
         /// A scratch repo with one boundary file and three bulky ordinary ones.
         ///
-        /// Each file is ~1260 words: **under** the 1500-token `digest`
-        /// threshold, so it folds into context whole rather than arriving as a
-        /// duty's condensed answer (which would carry the provenance but none of
-        /// the bytes, and leave nothing big enough to press on the budget), and
-        /// big enough that two of them bust the default budget and force the
-        /// oldest — the boundary read — out.
+        /// Each file is ~2,800 words / ~17.6 KB: **under** the local `digest`
+        /// threshold (7,749 words / 23,250 bytes on the 32,768-token window), so
+        /// it folds into context whole rather than arriving as a duty's
+        /// condensed answer (which would carry the provenance but none of the
+        /// bytes, and leave nothing big enough to press on the budget), and big
+        /// enough that all four of them (~70 KB, plus the system prompt) bust
+        /// the 63,488-byte local budget while three do not — which forces the
+        /// oldest, the boundary read, out and nothing else. (It was 180 lines
+        /// a file, two of which busted the 32,768-byte budget of the
+        /// 16,384-token window.)
         fn repo_with_a_secret(tag: &str) -> PathBuf {
             let dir = scratch_dir(tag);
             std::fs::create_dir_all(dir.join("secrets")).expect("secrets dir");
             let bulk = |seed: &str| {
-                (0..180)
+                (0..400)
                     .map(|n| format!("{seed} line {n} of otherwise unremarkable text\n"))
                     .collect::<String>()
             };
@@ -22142,7 +22146,7 @@ provider_id = \"deepseek\"
         /// which is what it read until REQ-590 and is no longer the local
         /// tier's word budget. That constant is now the *no-better-fact* pair's
         /// half, and when the local arm stopped returning it this body — 8,192
-        /// words — fell under the new 10,240-word budget while staying over the
+        /// words — fell under the new word budget while staying over the
         /// byte half. The doc here already claimed to be sized "so the fixture
         /// cannot quietly stop being over budget if the pair moves"; reading the
         /// derivation is what actually makes that true.

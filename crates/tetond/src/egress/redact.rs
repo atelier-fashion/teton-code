@@ -141,10 +141,10 @@ pub(crate) const REDACT_PROMPT_BUDGET_BYTES: usize =
 /// to be two independently chosen numbers:
 ///
 /// ```text
-///   engine window            16,384 tokens   (LOCAL_ENGINE_N_CTX)
+///   engine window            32,768 tokens   (LOCAL_ENGINE_N_CTX)
 ///   − the duty's generation   1,024 tokens   (REDACT_DUTY.max_tokens())
-///   = prompt budget          15,360 tokens
-///   × 2 bytes/token          30,720 bytes    (the seam's convention — an
+///   = prompt budget          31,744 tokens
+///   × 2 bytes/token          63,488 bytes    (the seam's convention — an
 ///                                             ESTIMATE, see below)
 ///   − the ChatML envelope         55 bytes   (CHATML_DUTY_ENVELOPE_BYTES:
 ///                                             33 message delimiters + 22 cue,
@@ -155,11 +155,11 @@ pub(crate) const REDACT_PROMPT_BUDGET_BYTES: usize =
 ///                                             + 11 header)
 ///   − 1 byte                                 (the frame-defusing bound's
 ///                                             constant term)
-///   = 30,078 bytes for payload + its worst-case defusing
-///   × 9/10                   30,078 → 27,070 (ADR-009 frame defusing inserts at
+///   = 62,846 bytes for payload + its worst-case defusing
+///   × 9/10                   62,846 → 56,561 (ADR-009 frame defusing inserts at
 ///                                             most one byte per 9 bytes of
 ///                                             payload — REDACT_DEFUSE_GROWTH_DIVISOR)
-///   = REDACT_CHUNK_MAX_BYTES  27,070 bytes
+///   = REDACT_CHUNK_MAX_BYTES  56,561 bytes
 /// ```
 ///
 /// Every term is *measured*, not stated: the numbers above are what the
@@ -200,18 +200,19 @@ pub(crate) const REDACT_PROMPT_BUDGET_BYTES: usize =
 /// the render guard is what makes "the prompt fits the window" true rather
 /// than estimated.
 ///
-/// The old value was a flat 64 KiB, which is **more than twice** the prompt
-/// budget. Every payload between roughly 30 KiB and 64 KiB therefore passed the
-/// cap, was rendered into a prompt, and was refused by the engine as
-/// over-window — reported as "the redaction scan could not run" when the true
+/// The old value was a flat 64 KiB, which was **more than twice** the prompt
+/// budget of the 16,384-token window this chain was first derived on. Every
+/// payload between roughly 30 KiB and 64 KiB therefore passed the cap, was
+/// rendered into a prompt, and was refused by the engine as over-window — reported as "the redaction scan could not run" when the true
 /// reason was "this payload is too large to scan", which is BR-3's distinction
 /// collapsed by arithmetic rather than by wording.
 ///
 /// ## It is a *per-call* cap now, not the bound on what can be scanned
 ///
 /// It used to be both, and being both is what collided with the harness's own
-/// context budget: `HarnessConfig::context_budget_bytes` is **32,768** —
-/// *larger* than this number — so a turn that filled its context budget
+/// context budget: `HarnessConfig::context_budget_bytes` was **32,768** —
+/// *larger* than the 27,070 this derived to on the 16,384-token window — so a
+/// turn that filled its context budget
 /// assembled a body the scan refused outright, and with `[privacy] redact =
 /// true` every such remote turn blocked as `ScanUnavailable`. Fail-closed and
 /// honest about its reason, and unusable on any repository where long turns are
@@ -312,13 +313,30 @@ pub(crate) const REDACT_ESCAPING_DIVISOR: usize = 10;
 ///
 /// **What is new is the other direction.** Since REQ-586 this constant has a
 /// production reader, so raising it *narrows* every `[privacy] redact = true`
-/// route's byte budget: [`REDACT_SCANNABLE_CONTEXT_BYTES`] drops 89,127 →
-/// 88,196, a **931-byte** cut to the budget BR-7's `bound: redact scan`
-/// refusal measures against. Every assertion about that bound is an inequality
-/// that holds either way, so the cut is silent unless it is stated —
+/// route's byte budget: [`REDACT_SCANNABLE_CONTEXT_BYTES`] dropped 89,127 →
+/// 88,196 at that raise, a **931-byte** cut to the budget BR-7's `bound: redact
+/// scan` refusal measures against. Every assertion about that bound is an
+/// inequality that holds either way, so the cut is silent unless it is stated —
 /// `the_overhead_raise_restates_the_chunk_count_and_the_scannable_bound` is
 /// what states it, and it is the test the *next* raise has to come back and
 /// re-state too.
+///
+/// Raised 11→14 KiB when the local engine window went 16,384 → 32,768 and the
+/// local byte budget with it, 32,768 → 63,488. This one is **not** the shape of
+/// the three above: nothing was added to the prompt. The overhead has two
+/// terms, the resident prompt and the JSON escaping of the context, and the
+/// escaping is charged at one part in [`REDACT_ESCAPING_DIVISOR`] of the byte
+/// budget — `63,488 / 10 = 6,348` against `32,768 / 10 = 3,276`, a **3,072-byte**
+/// (exactly 3 KiB) rise that the prompt's own bytes had nothing to do with. So
+/// the assumption moves by exactly that 3 KiB and the two recorded margins
+/// ([`RECORDED_PROMPT_MARGIN_BYTES`] 129, [`RECORDED_WEB_PROMPT_MARGIN_BYTES`]
+/// 176) are unchanged to the byte, which is the check that this raise spent
+/// nothing on the prompt. Downstream, everything re-derives: the chunk window
+/// is 56,561 (27,070 before), twice a full default body is 155,648 = 2.75
+/// chunks so [`REDACT_TOTAL_CAP_CHUNKS`] is **three** (four before) and the cap
+/// 169,683 (108,280 before), and the scannable bound *rises* 88,196 → 141,224 —
+/// the first raise of this constant that widened a scanned route's budget
+/// rather than cutting it, because the window it rides on doubled.
 ///
 /// `pub(crate)` because the *other* prompt shape has to clear it too and cannot
 /// be built from here: with `[web] tier` above `off` the system prompt carries
@@ -328,7 +346,7 @@ pub(crate) const REDACT_ESCAPING_DIVISOR: usize = 10;
 /// (`harness::tools::web::tests::the_web_tool_docs_clear_the_outbound_body_overhead`);
 /// this is the number both of them measure against, so the two shapes cannot
 /// come to disagree about the budget.
-pub(crate) const REDACT_BODY_OVERHEAD_BYTES: usize = 11 * 1024;
+pub(crate) const REDACT_BODY_OVERHEAD_BYTES: usize = 14 * 1024;
 
 /// The smallest headroom [`REDACT_BODY_OVERHEAD_BYTES`] may be left with after
 /// the largest system prompt this build produces (REQ-572 verify).
@@ -397,31 +415,33 @@ pub(crate) const RECORDED_WEB_PROMPT_MARGIN_BYTES: usize = 176;
 /// How many per-chunk windows the total cap is worth — the multiple that turns
 /// [`REDACT_CHUNK_MAX_BYTES`] into [`REDACT_INPUT_MAX_BYTES`].
 ///
-/// **Four, and the arithmetic is the reason** (the ADR-6 derivation's shape:
+/// **Three, and the arithmetic is the reason** (the ADR-6 derivation's shape:
 /// state the terms, do not pick the answer):
 ///
 /// ```text
-///   HarnessConfig::context_budget_bytes   32,768 bytes  (turn_loop.rs)
-///   + `REDACT_BODY_OVERHEAD_BYTES`        11,264 bytes  (system prompt, tool
+///   HarnessConfig::context_budget_bytes   63,488 bytes  (turn_loop.rs)
+///   + `REDACT_BODY_OVERHEAD_BYTES`        14,336 bytes  (system prompt, tool
 ///                                                        descriptions, JSON
 ///                                                        envelope + escaping —
 ///                                                        the assumption, and
 ///                                                        the test below checks
 ///                                                        it against the real
 ///                                                        system prompt)
-///   = the largest ordinary outbound body  44,032 bytes
+///   = the largest ordinary outbound body  77,824 bytes
 ///   × 2 (the margin — a cap that only just clears the body it has to hold is
 ///        one context-budget bump away from being the old collision again)
-///   = 88,064 bytes to clear
-///   ÷ REDACT_CHUNK_MAX_BYTES              88,064 / 27,070 = 3.25
-///   → the next whole chunk up                        4
+///   = 155,648 bytes to clear
+///   ÷ REDACT_CHUNK_MAX_BYTES              155,648 / 56,561 = 2.75
+///   → the next whole chunk up                        3
 /// ```
 ///
 /// The overhead term moved 8→9 KiB in REQ-577 (quotient 3.03→3.10), 9→10 KiB in
-/// BUG-181 (3.10→3.18) and 10→11 KiB in REQ-587 (3.18→3.25), which is the point
-/// of writing the arithmetic out rather than the answer: the chunk count is
-/// unchanged all three times, so [`REDACT_INPUT_MAX_BYTES`] is unchanged, and a
-/// reader can see that rather than take it on trust.
+/// BUG-181 (3.10→3.18) and 10→11 KiB in REQ-587 (3.18→3.25), and the chunk count
+/// stayed at four all three times, which is the point of writing the arithmetic
+/// out rather than the answer. When the engine window doubled to 32,768 every
+/// term above moved at once — the budget, the overhead, and the chunk window —
+/// and the quotient fell to 2.75, so the count is **three**: a larger window
+/// holds a full body in fewer calls, and the cap follows.
 ///
 /// **REQ-586: the remote budget is bounded by this when the scan applies.**
 /// The arithmetic above runs from the *default* context budget up to the cap;
@@ -437,17 +457,17 @@ pub(crate) const RECORDED_WEB_PROMPT_MARGIN_BYTES: usize = 176;
 /// The other half of the choice is the chunk **count**, because every chunk is
 /// a model call and ADR-8's budget is per call. With the
 /// [`REDACT_CHUNK_OVERLAP_BYTES`](crate::harness::redact::REDACT_CHUNK_OVERLAP_BYTES)
-/// overlap the stride is 26,814 bytes, so a payload at the total cap is at most
-/// **five** chunks
+/// overlap the stride is 56,305 bytes, so a payload at the total cap is at most
+/// **four** chunks
 /// ([`REDACT_MAX_CHUNKS`](crate::harness::redact::REDACT_MAX_CHUNKS), asserted
 /// against the real chunker rather than restated, and enforced by
 /// [`scan`](crate::harness::redact::scan) before the first call) — p50 ≤ 10 s
 /// and p95 ≤ 25 s at ADR-8's per-chunk budget, against a context-budget-full
-/// turn's expected **two**. Five is the number that has to stay small because
+/// turn's expected **two**. Four is the number that has to stay small because
 /// it multiplies that budget, and a cap twice this size would double the
 /// ordinary latency. It no longer multiplies the *worst case*: the scan as a
 /// whole is bounded at one `DUTY_DEADLINE`, not one per chunk.
-const REDACT_TOTAL_CAP_CHUNKS: usize = 4;
+const REDACT_TOTAL_CAP_CHUNKS: usize = 3;
 
 /// The largest payload the redactor will scan **at all**, in bytes (BR-7,
 /// ADR-6).
@@ -463,10 +483,12 @@ const REDACT_TOTAL_CAP_CHUNKS: usize = 4;
 /// and [`REDACT_TOTAL_CAP_CHUNKS`] carries the arithmetic that picked it.
 ///
 /// **This is the number that used to sit under the harness's context budget**
-/// (32,768) and block every context-budget-full remote turn. It is now
-/// **108,280** — 3.3× that budget, 2.46× a full body with the system prompt and
-/// JSON overhead on top of it (2.6× before REQ-577 widened the overhead term,
-/// 2.58× before BUG-181 widened it again, 2.52× before REQ-587 did).
+/// (32,768, then) and block every context-budget-full remote turn. It is now
+/// **169,683** — 2.67× the 63,488-byte local budget, 2.18× a full body with the
+/// system prompt and JSON overhead on top of it (it was 108,280 on the
+/// 16,384-token window: 2.46× a full body, 2.6× before REQ-577 widened the
+/// overhead term, 2.58× before BUG-181 widened it again, 2.52× before REQ-587
+/// did).
 /// The collision is closed rather than measured; what
 /// `docs/manual-verification.md` now records is the *chunk-count distribution*,
 /// which is where the cost went.
@@ -488,23 +510,24 @@ pub const REDACT_INPUT_MAX_BYTES: usize = REDACT_TOTAL_CAP_CHUNKS * REDACT_CHUNK
 /// [`REDACT_TOTAL_CAP_CHUNKS`], run from the cap downward (BR-11, LESSON-491):
 ///
 /// ```text
-///   REDACT_INPUT_MAX_BYTES              108,280 bytes  (the cap: 4 × 27,070)
-///   − REDACT_BODY_OVERHEAD_BYTES         11,264 bytes  (system prompt, JSON
+///   REDACT_INPUT_MAX_BYTES              169,683 bytes  (the cap: 3 × 56,561)
+///   − REDACT_BODY_OVERHEAD_BYTES         14,336 bytes  (system prompt, JSON
 ///                                                       envelope — what the
 ///                                                       body carries beyond
 ///                                                       the context)
-///   = room for the escaped context       97,016 bytes
+///   = room for the escaped context      155,347 bytes
 ///   ÷ (1 + 1/REDACT_ESCAPING_DIVISOR)    × 10 / 11     (the context plus its
 ///                                                       own escaping has to fit
 ///                                                       in that room)
-///   = the scannable context               88,196 bytes
+///   = the scannable context              141,224 bytes
 /// ```
 ///
-/// So a body at the bound is `88,196 + 8,819 (escaping) + 11,264 (overhead) =
-/// 108,279 ≤ 108,280`: four chunk-widths, up to five chunks with the overlap
+/// So a body at the bound is `141,224 + 14,122 (escaping) + 14,336 (overhead) =
+/// 169,682 ≤ 169,683`: three chunk-widths, up to four chunks with the overlap
 /// ([`REDACT_MAX_CHUNKS`](crate::harness::redact::REDACT_MAX_CHUNKS)) — inside
-/// the envelope REQ-562 measured, and ≈ 2.7× the default context budget
-/// (32,768), which admits every ADLC skill.
+/// the envelope REQ-562 measured, and ≈ 2.2× the local context budget
+/// (63,488), which admits every ADLC skill. (On the 16,384-token engine window
+/// this read `88,196 + 8,819 + 11,264 = 108,279 ≤ 108,280`.)
 ///
 /// Two things about the shape of the expression, both decisions rather than
 /// arithmetic:
@@ -527,8 +550,9 @@ pub const REDACT_INPUT_MAX_BYTES: usize = REDACT_TOTAL_CAP_CHUNKS * REDACT_CHUNK
 /// reads it, and the egress-capture integration tests (the redact bound's own,
 /// AC-6) read the caps the same way from outside the crate. It is the *only*
 /// place the redact chain's arithmetic leaves this module — a second copy of
-/// the number anywhere (TASK-192's one-home grep: `89_127`/`89127` must hit
-/// comments only) would be the drift LESSON-446 is about.
+/// the number anywhere (TASK-192's one-home grep: `141_224`/`141224` must hit
+/// comments and the one re-stating assertion only) would be the drift
+/// LESSON-446 is about.
 pub const REDACT_SCANNABLE_CONTEXT_BYTES: usize =
     (REDACT_INPUT_MAX_BYTES - REDACT_BODY_OVERHEAD_BYTES) * REDACT_ESCAPING_DIVISOR
         / (REDACT_ESCAPING_DIVISOR + 1);
@@ -2632,18 +2656,21 @@ mod tests {
     ///
     /// The two claims a raise has to re-state:
     ///
-    /// 1. **The chunk count is still four.** Re-derived here from the same
-    ///    terms [`REDACT_TOTAL_CAP_CHUNKS`]'s doc block runs — twice a full
+    /// 1. **The chunk count follows from the terms.** Re-derived here from the
+    ///    same terms [`REDACT_TOTAL_CAP_CHUNKS`]'s doc block runs — twice a full
     ///    default body, rounded up to whole chunks — rather than compared
     ///    against `REDACT_INPUT_MAX_BYTES / REDACT_CHUNK_MAX_BYTES`, which is
-    ///    that constant's own definition and would be a tautology. At 11 KiB
-    ///    the quotient is 3.25; the count is unchanged, so the cap is unchanged
-    ///    and no `Unavailable` threshold moved.
-    /// 2. **Every `[privacy] redact = true` route's byte budget got smaller.**
+    ///    that constant's own definition and would be a tautology. At 11 KiB on
+    ///    the 16,384-token window the quotient was 3.25 and the count four; on
+    ///    the 32,768-token window with the overhead at 14 KiB it is 2.75 and
+    ///    the count is **three**.
+    /// 2. **Every `[privacy] redact = true` route's byte budget moved.**
     ///    [`REDACT_SCANNABLE_CONTEXT_BYTES`] is `(cap − overhead) × 10 / 11`, so
-    ///    the raise cut it 89,127 → **88,196**: 931 bytes off the budget BR-7's
-    ///    `bound: redact scan` refusal measures against, on every scanned route,
-    ///    with no test above able to see it.
+    ///    REQ-587's raise cut it 89,127 → 88,196 (931 bytes off the budget
+    ///    BR-7's `bound: redact scan` refusal measures against, on every scanned
+    ///    route, with no test above able to see it), and the window's doubling
+    ///    then raised it 88,196 → **141,224**, because the cap it derives from
+    ///    is three windows of a window twice the size.
     ///
     /// The literal here is the **assertion**, not a second home for the number
     /// (TASK-192's one-home grep is about the constant's definition, which is
@@ -2670,14 +2697,14 @@ mod tests {
 
         assert_eq!(
             REDACT_SCANNABLE_CONTEXT_BYTES,
-            88_196,
+            141_224,
             "the scannable bound moved to {REDACT_SCANNABLE_CONTEXT_BYTES}. It is derived, \
              so this is not a bug — it is the *cost*: every `[privacy] redact = true` \
              route's byte budget just changed by {} bytes, and that budget is what BR-7's \
              `bound: redact scan` refusal measures against. Update this figure in the same \
              diff that moved `REDACT_BODY_OVERHEAD_BYTES`, and say in that diff which way \
              the budget went.",
-            88_196i64 - REDACT_SCANNABLE_CONTEXT_BYTES as i64
+            141_224i64 - REDACT_SCANNABLE_CONTEXT_BYTES as i64
         );
     }
 

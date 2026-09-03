@@ -45,17 +45,20 @@ base64.txt     4 KiB of base64 over /dev/urandom bytes, wrapped at 76 columns.
 numeric_grid.txt
                REQ-590 AC-9: the token-dense **byte-light** quadrant — a
                small-integer matrix as `numpy.savetxt(fmt="%d")` writes one
-               (a quantized intensity raster), 160 rows x 64 columns of
-               space-separated single digits. Exactly 10,240 words / 20,480
+               (a quantized intensity raster), 3,527 rows x 6 columns of
+               space-separated single digits. Exactly 21,162 words / 42,324
                bytes, i.e. one turn at the full local word budget that the
-               byte budget (32,768) admits with room to spare. Reproducible
-               by construction, in integer arithmetic so no libm rounding can
-               move a cell:
+               byte budget (63,488) admits with room to spare. The shape is
+               the word budget's factorisation (21,162 = 3,527 x 6; the pair
+               derives from a 32,768-token window and is not otherwise round)
+               — it was 160 x 64 = 10,240 words while the window was 16,384.
+               Reproducible by construction, in integer arithmetic so no libm
+               rounding can move a cell:
 
-                   ROWS, COLS = 160, 64
+                   ROWS, COLS = 3527, 6
                    "".join(
                        " ".join(
-                           str((((x - 32) ** 2 + (y - 80) ** 2) // 53) % 10)
+                           str((((x - 3) ** 2 + (y - 1763) ** 2) // 53) % 10)
                            for x in range(COLS)
                        ) + "\\n"
                        for y in range(ROWS)

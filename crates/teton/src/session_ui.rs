@@ -1426,7 +1426,7 @@ fn turn_invocations_line(turn: events::TurnInvocations) -> String {
 /// than a number that would have to summarize four different endings.
 ///
 /// The size is [`teton_protocol::format_bytes`] — the product's single byte
-/// formatter, the one the daemon's own skip reasons (`over 64 KiB (67,184 B)`)
+/// formatter, the one the daemon's own skip reasons (`over 128 KiB (135,184 B)`)
 /// and the first-run sentences already speak. The spec writes the example as
 /// `5.3 KB`; two spellings of a file size in one feature would be worse than
 /// one that differs from an illustration by a unit suffix.

@@ -687,10 +687,12 @@ fn oversized_for_a_declared_window() -> String {
 /// A quarter past the word half at 4 bytes a word absorbs Stage A's own
 /// overhead, which this fixture does not own — the body is measured *with* the
 /// system prompt — while staying clear of discovery's per-file
-/// `SKILL_MAX_BYTES`. Those two ceilings are closer than they look: doubling
-/// both halves of the pair lands on the 64 KiB file ceiling, at which point the
-/// skill is **skipped** and these tests fail with "no skill `/heavy` you can
-/// dispatch" rather than with anything about a budget.
+/// `SKILL_MAX_BYTES`. Those two ceilings are closer than they look: at 4 B/word
+/// a quarter past the 21,162-word half is ~106 KB against a 128 KiB file
+/// ceiling (the ceiling was 64 KiB while the pair was 10,240 w / 32,768 B, and
+/// doubling that pair landed on it exactly), past which the skill is
+/// **skipped** and these tests fail with "no skill `/heavy` you can dispatch"
+/// rather than with anything about a budget.
 fn oversized_for_the_local_pair() -> String {
     let local = tetond::harness::budget::derive(tetond::harness::BudgetInputs::local());
     let words = local.budget_tokens + local.budget_tokens / 4;

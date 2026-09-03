@@ -800,7 +800,7 @@ pub struct SkillSkipped {
     /// user-visible surface.
     pub path: String,
     /// Why it was skipped, in the daemon's own words — `unreadable (permission
-    /// denied)`, `over 64 KiB (67,184 B)`, `not UTF-8`, `malformed
+    /// denied)`, `over 128 KiB (135,184 B)`, `not UTF-8`, `malformed
     /// frontmatter`, `invalid name`, `symlink not followed`, `shadowed by
     /// <what>` (ADR-4).
     pub reason: String,

@@ -385,26 +385,21 @@ pub struct HarnessConfig {
     /// conservative proxy for BPE tokens (code averages ≳2 bytes per token).
     ///
     /// The default is the local route's pair, whose two halves have **different
-    /// provenance since REQ-590 ADR-9** — read `derive`'s local arm rather than
+    /// provenance since REQ-590** — read `derive`'s local arm rather than
     /// trusting this summary.
     ///
-    /// The **word** half is window-derived (`LOCAL_ENGINE_N_CTX` less
-    /// `LOCAL_GENERATION_RESERVATION`, then the 3/2 rule). The **byte** half is
-    /// `LOCAL_BUDGET_TOKENS × APPROX_BYTES_PER_TOKEN` — the `words × 8` bridge,
-    /// unchanged, and *not* window-derived.
+    /// Both halves are window-derived: `LOCAL_ENGINE_N_CTX` less
+    /// `LOCAL_GENERATION_RESERVATION`, then the 3/2 rule for words and the
+    /// 2 B/token floor for bytes — 21,162 words / 63,488 bytes on the
+    /// 32,768-token window.
     ///
-    /// D-4 briefly did derive it from the window, at the 2 B/token floor, which
-    /// gave 30,720. That was reversed: it made the pair *worse* than the old one
-    /// above 7.5 B/word — where code lives — and over the byte interval the
-    /// `/analyze` field report admits (`31 KB` rounded, so [30,500, 31,499]) it
-    /// was worth between +0.7% and −2.4%, mostly moving the refusal from the
-    /// word guard to the byte guard rather than removing it.
-    ///
-    /// The honest consequence, stated because it is the thing the window
-    /// derivation would have fixed: at the 2 B/token floor this byte half claims
-    /// 16,384 provider tokens against 15,360 usable, so a byte-saturated local
-    /// prompt out-claims the engine by exactly `LOCAL_GENERATION_RESERVATION`.
-    /// That was true before REQ-590 and stays true after it; the catch is the
+    /// The byte half was the `words × 8` constant (32,768) while the window was
+    /// 16,384: the window bridge gave 30,720 there, *smaller* than the constant
+    /// and worse above 7.5 B/word, where code lives, so REQ-590 ADR-9 kept the
+    /// constant and accepted that a byte-saturated prompt out-claimed the
+    /// engine by one generation's worth. At 32,768 the bridge gives 63,488,
+    /// nearly twice the constant, and both halves claim exactly the usable
+    /// window. The catch for content denser than the bridge assumes is the
     /// engine's own typed `context_length_exceeded`. Like the word half, this is
     /// stamped by [`with_route_budget`](Self::with_route_budget) on the next
     /// route decision, so hand-sizing it for a different engine holds only

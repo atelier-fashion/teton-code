@@ -928,8 +928,10 @@ struct Overhead {
 /// reversal put that back to 32,768 and every fixture resting on that accident
 /// stopped raising an offer at all — which is a fixture testing the daemon's
 /// silence and calling it the daemon's question. See [`over_the_local_pair`].
-const CALIBRATION_WORDS: usize = 12_000;
-const CALIBRATION_BYTES: usize = 48_000;
+/// (12,000 / 48,000 against that pair; 26,000 / 104,000 against the
+/// 32,768-token window's 21,162 / 63,488, under the 128 KiB file ceiling.)
+const CALIBRATION_WORDS: usize = 26_000;
+const CALIBRATION_BYTES: usize = 104_000;
 
 /// A body comfortably over the local route's derived pair in **both**
 /// currencies, whatever that pair currently is.
@@ -951,12 +953,13 @@ const CALIBRATION_BYTES: usize = 48_000;
 ///
 /// The body must clear the budget and stay under discovery's per-file
 /// [`SKILL_MAX_BYTES`](tetond::skills::SKILL_MAX_BYTES). Those two are closer
-/// together than they look now that the word half is 10,240: at more than
-/// ~6.4 bytes a word a full-budget body does not fit in a `SKILL.md` at all,
-/// and the failure does not present as anything about a budget — the skill is
-/// *skipped*, and every test here fails with "no skill `/heavy` you can
-/// dispatch". Naively doubling both halves of the pair lands exactly on the
-/// ceiling and does precisely that.
+/// together than they look: at more than ~6.2 bytes a word a full-budget body
+/// (21,162 words) does not fit in a 128 KiB `SKILL.md` at all, and the failure
+/// does not present as anything about a budget — the skill is *skipped*, and
+/// every test here fails with "no skill `/heavy` you can dispatch". (With the
+/// 16,384-token window's 10,240-word half and 64 KiB ceiling the crossover was
+/// ~6.4 B/word, and naively doubling both halves of the pair landed exactly on
+/// the ceiling.)
 fn over_the_local_pair() -> String {
     let local = local_pair();
     let words = local.budget_tokens + local.budget_tokens / 4;
@@ -1015,9 +1018,11 @@ async fn calibrate(fx: &Fixture) -> Overhead {
 /// The reported failure was *one word* over: **4,097 words against 4,096**, with
 /// room still free in the byte half, `bound: local engine`, on a route that
 /// declares no window at all. REQ-590 gave that route a word budget derived from
-/// the engine's own window — 10,240 — and left the byte half at
-/// `LOCAL_BUDGET_BYTES`, 32,768. **Both** halves of the reported measurement are
-/// therefore inside the budget, and the turn is served silently.
+/// the engine's own window — 10,240, and 21,162 since the window went to
+/// 32,768 — and the byte half, held at `LOCAL_BUDGET_BYTES` (32,768) on the
+/// 16,384-token window, derives too now (63,488). **Both** halves of the
+/// reported measurement are therefore inside the budget, and the turn is served
+/// silently.
 ///
 /// # What the record actually says about the byte half
 ///
@@ -1193,21 +1198,21 @@ async fn the_reported_analyze_measurement_serves_on_both_halves_of_the_local_pai
         offer.budget_tokens
     );
     // The two figures as the sentence spells them. `bytes_figure` rounds to the
-    // nearest KB, so a measurement one byte over a 32,768 B budget renders as
-    // the *same* `33 KB` the budget does: at the boundary the sentence quotes
+    // nearest KB, so a measurement one byte over a 63,488 B budget renders as
+    // the *same* `63 KB` the budget does: at the boundary the sentence quotes
     // two identical byte figures and only the word halves differ — and here the
-    // word halves are 4,097 against 10,240, which look like they fit. **A user
+    // word halves are 4,097 against 21,162, which look like they fit. **A user
     // at this boundary cannot tell from the sentence which currency refused
     // them.** Pinned rather than avoided, because it is what they actually read;
     // recorded as a REQ-590 finding rather than fixed here, because changing the
     // figure's precision is a decision about every budget sentence, not this one.
     //
     // The bound closes it with REQ-590 AC-16's account of itself — the window
-    // and the reservation that produced the word half, and the byte half named
-    // as fixed so a reader does not try to reconcile 33 KB against 16,384.
-    let quoted = "about 4,097 words / 33 KB, and the budget is 10,240 words / 33 KB \
-                  (bound: local engine — the word half comes from the engine's 16,384-token \
-                  window, less the 1,024 reserved for the reply; the byte half is fixed)";
+    // and the reservation that produced both halves, so a reader can reconcile
+    // 63 KB against 32,768 − 1,024 at 2 B/token.
+    let quoted = "about 4,097 words / 63 KB, and the budget is 21,162 words / 63 KB \
+                  (bound: local engine — both halves come from the engine's 32,768-token \
+                  window, less the 1,024 reserved for the reply)";
     assert!(
         offer.sentence.contains(quoted),
         "the offer must quote the figures it measured: {}",
@@ -1456,7 +1461,7 @@ async fn declining_is_todays_refusal_in_every_byte() {
         .map(|(a, _)| a)
         .collect();
     assert!(
-        shared.ends_with("; the byte half is fixed). "),
+        shared.ends_with("reserved for the reply). "),
         "the question and its decline must share the whole head — the subject, \
          the stage clause, both figure pairs and the spoken bound, which since \
          REQ-590 AC-16 ends by accounting for the local pair. They diverge \
@@ -1820,12 +1825,13 @@ fn route_for(bound: BudgetBound, verdict: WindowVerdict) -> (Fixture, Option<Moc
 /// The `RedactScan` cell, and the one fixture here that needs an argument
 /// string.
 ///
-/// The redact clamp is a fixed 88,196 bytes and `SKILL.md` is capped at 64 KiB
-/// by discovery, so no skill **body** can reach past that ceiling on its own.
-/// The expansion is therefore pushed over with `$ARGUMENTS`, which is bounded
-/// only by the RPC frame. The declared window is 50,000 so the window-derived
-/// byte pair (97,952 B) sits *above* the clamp — which is what makes the clamp
-/// the bound rather than the window.
+/// The redact clamp is a fixed 141,224 bytes and `SKILL.md` is capped at
+/// 128 KiB by discovery, so no skill **body** can reach past that ceiling on its
+/// own. The expansion is therefore pushed over with `$ARGUMENTS`, which is
+/// bounded only by the RPC frame. The declared window is 100,000 so the
+/// window-derived byte pair (197,952 B) sits *above* the clamp — which is what
+/// makes the clamp the bound rather than the window. (50,000 / 97,952 against
+/// the 88,196-byte clamp of the 16,384-token engine window.)
 fn redact_scan_route() -> (Fixture, Option<MockProvider>) {
     let provider = vendor();
     let fx = Fixture::new(
@@ -1834,13 +1840,13 @@ fn redact_scan_route() -> (Fixture, Option<MockProvider>) {
             remote_route_with_privacy(
                 &provider.openai_endpoint(),
                 UNRECOGNIZED_MODEL,
-                Some(50_000),
+                Some(100_000),
                 None,
                 true,
             ),
             format!("{} $ARGUMENTS", sized_body(20_000, 60_000)),
         )
-        .with_arguments(sized_body(7_000, 29_500)),
+        .with_arguments(sized_body(24_000, 96_000)),
     );
     (fx, Some(provider))
 }
