@@ -1,7 +1,7 @@
 ---
 id: TASK-361
 title: "Protocol: transcript_state, session/transcript, and ConfigUpdate::SetTranscriptEnabled"
-status: draft
+status: complete
 parent: REQ-611
 repo: teton-code
 created: 2026-09-03
@@ -30,18 +30,18 @@ Covers BR-15's shape rule (the event has no path) and the wire halves of AC-3, A
 
 ## Acceptance Criteria
 
-- [ ] `transcript_state` round-trips through serde with the flat envelope shape
+- [x] `transcript_state` round-trips through serde with the flat envelope shape
       `{ "session_id": …, "seq": …, "event": "transcript_state", "enabled": …, "reason": … }`.
-- [ ] BR-15: the `TranscriptState` struct has no `path` field; a test deserializes a payload that
+- [x] BR-15: the `TranscriptState` struct has no `path` field; a test deserializes a payload that
       carries a stray `path` key and asserts it is dropped (or refused, matching the crate's
       posture for unknown keys — copy whichever sibling events use).
-- [ ] `TranscriptStateReason` and `TranscriptAction` are closed enums: an unknown string is a
+- [x] `TranscriptStateReason` and `TranscriptAction` are closed enums: an unknown string is a
       deserialization error, never a default.
-- [ ] `session/transcript` round-trips each action; `ENDS_TURN` is `false` and the ends-turn
+- [x] `session/transcript` round-trips each action; `ENDS_TURN` is `false` and the ends-turn
       table test passes with the new row.
-- [ ] `ConfigUpdate::SetTranscriptEnabled(true)` round-trips and appears in
+- [x] `ConfigUpdate::SetTranscriptEnabled { enabled: true }` round-trips and appears in
       `config_set_round_trips_each_update_variant` (line ~4459).
-- [ ] `cargo test -p teton-protocol --no-fail-fast` is green; the layering test (no crate above
+- [x] `cargo test -p teton-protocol --no-fail-fast` is green; the layering test (no crate above
       protocol becomes a dependency of it) still passes.
 
 ## Verification
@@ -60,3 +60,32 @@ closed for the same reason `AttachConsentOutcome` is — there is no safe defaul
 when a client cannot read a state change.
 
 Do **not** add the sink-local record kinds here (ADR-2). They are `tetond` types.
+
+## Implementation notes
+
+**Deviation: `SetTranscriptEnabled { enabled: bool }`, not `SetTranscriptEnabled(bool)`.**
+`ConfigUpdate` is internally tagged (`#[serde(tag = "op")]`), and serde cannot serialize a
+tagged newtype variant whose content is a primitive. The specified newtype spelling compiles
+and `cargo check`s clean, then fails at **runtime** with `cannot serialize tagged newtype
+variant ConfigUpdate::SetTranscriptEnabled containing a boolean` — a refusal the user would
+meet at `teton transcript enable`, not one the author meets at build time (observed, then
+fixed). The struct variant gives the flat
+`{"op":"set_transcript_enabled","enabled":true}` and names the field after the config key.
+`config_set_round_trips_each_update_variant` asserts the wire object explicitly so reverting
+to the newtype reds there rather than shipping.
+
+**`ENDS_TURN` is the trait default.** `RpcMethod::ENDS_TURN` defaults to `false` and no impl in
+the crate states `false` explicitly (only `PromptTurnParams` states `true`); the twin
+`SessionPermissionsParams` omits it. The value is pinned from the outside by the new row in
+`only_the_prompt_method_ends_a_turn`.
+
+**`lib.rs` needed no edit.** The crate re-exports no types from `events`/`methods` — the modules
+are `pub` and every sibling type is reached as `teton_protocol::events::…` /
+`teton_protocol::methods::…`. `TranscriptState`, `TranscriptStateReason`, `TranscriptAction`,
+`SessionTranscriptParams`, `SessionTranscriptResult` are reachable the same way.
+
+**Downstream compilation.** Adding an `Event` variant reds `crates/teton/src/session_ui.rs`'s
+exhaustive render match, and the new `ConfigUpdate` variant reds `tetond`'s exhaustive matches
+in `runtime/mod.rs` and `runtime/turn.rs`. Both are owned by later tasks in this REQ
+(architecture component map) and are out of this task's scope; `cargo test -p teton-protocol`
+is green.
