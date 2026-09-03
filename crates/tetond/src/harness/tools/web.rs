@@ -2351,6 +2351,22 @@ mod tests {
     /// REQ added a 347-byte output-format clause to the resident prompt; this
     /// shape is still the looser of the two, now by 47 bytes exactly as before.
     ///
+    /// **Recorded headroom at REQ-612:** `worst` **16,415**, `spent` **22,763**,
+    /// margin **789** — against an overhead raised 14 → 23 KiB by that REQ,
+    /// with the floor unmoved at 48 and this shape still the looser of the two
+    /// by 47 B. Both shapes pay the same **8,603**: 8,192 of capped file text
+    /// for BR-3's repository-notes block, 331 for the block's own frame, and 80
+    /// for BR-8's fourth amendment to the guide's capability sentence, which
+    /// now names the file the notes come from. The account of the raise — why
+    /// it is 9 KiB and not the 8 the cap names, and what it does to the chunk
+    /// count, the total cap and every scanned route's budget — is
+    /// `egress::redact`'s twin of this paragraph.
+    ///
+    /// **Mutation run for REQ-612:** dropping `repo_context` from the config
+    /// rows below turns this red at the block self-check, naming the reason,
+    /// rather than quietly re-pinning the margin of a prompt no session with a
+    /// `TETON.md` at its root ever builds.
+    ///
     /// **Corrected 2026-08-26 (BUG-193).** This paragraph used to end with a
     /// pad-method figure — "757 bytes of filler leaves this shape at exactly
     /// the floor and passes, 758 fails" — and its sibling in `egress::redact`
@@ -2372,6 +2388,7 @@ mod tests {
         use crate::harness::turn_loop::{
             build_system_prompt, worst_case_session_root, HarnessConfig, SkillToolDocs,
         };
+        use crate::repo_context::RepoContextBlock;
 
         let dir = temp_dir("budget");
         // The largest shape: `search` (the longer description) and
@@ -2436,7 +2453,13 @@ mod tests {
         // block can render and with no root at all — the same row the
         // opted-out sweep in `egress::redact` measures, from the same fixture,
         // so the two shapes cannot come to hold different worst cases.
+        //
+        // And, since REQ-612, with the repository-notes block at its cap
+        // (ADR-1, AC-4) — synthesized by the same `worst_case` shape its twin
+        // in `egress::redact` builds, so the two sweeps cannot come to hold
+        // different ceilings for the block they share.
         let roots = [None, Some(worst_case_session_root())];
+        let repo_context = RepoContextBlock::worst_case();
         let widest = [
             None,
             Some(WebCapabilityState::Ready(WebTier::Search)),
@@ -2457,6 +2480,7 @@ mod tests {
                 &HarnessConfig {
                     web_capability,
                     session_root,
+                    repo_context: Some(repo_context.clone()),
                     ..base.clone()
                 },
             )
@@ -2470,6 +2494,19 @@ mod tests {
             widest.contains("Session root: "),
             "the widest prompt measured carries no environment block, so the sweep is \
              not measuring the row it claims to:\n{widest}"
+        );
+        // REQ-612 AC-4, and the twin of `egress::redact`'s: dropping
+        // `repo_context` from the config rows *shrinks* the prompt, so every
+        // arithmetic assertion below would still pass while this sweep
+        // measured a ceiling no session with a `TETON.md` at its root ever has.
+        assert!(
+            widest.contains(&repo_context.text),
+            "the widest prompt measured carries no repository-notes block, so the sweep \
+             is not measuring the ceiling it claims to: a session with a `TETON.md` at \
+             its root is resident an 8,192-byte block on every turn (REQ-612 ADR-1, \
+             AC-4). Build the config rows with \
+             `repo_context: Some(RepoContextBlock::worst_case())` — do not delete this \
+             check:\n{widest}"
         );
         let worst = widest.len();
 

@@ -5513,6 +5513,25 @@ mod tests {
     /// and the reason each exists is that dropping it passes CI while silently
     /// removing a guard.
     ///
+    /// **REQ-612 is the fourth amendment, and it adds two needles rather than
+    /// widening one** (BR-8, AC-11). The sentence now names a third source the
+    /// session reads — the repository's own `TETON.md` (or `AGENTS.md`) at the
+    /// session root — and the two claims split the same way REQ-585's did:
+    /// `repository notes from` says the loading happens, `TETON.md` says which
+    /// file to write. Drop the first and the model, asked how it knows the
+    /// project's layout, credits a tool call it never made; drop the second and
+    /// the fact is true but unusable, because nobody is told what to create.
+    /// Seven needles now, each one a guard whose deletion is green. Note the
+    /// direction of the claim: it is true of the *product*, not of this test's
+    /// fixtures — the loading is TASK-374's, and this sentence is written for
+    /// the build that ships it (LESSON-570).
+    ///
+    /// **Mutations run for REQ-612.** Dropping `repository notes from` from
+    /// `self_config.md` → red, naming that clause. Dropping `TETON.md` and
+    /// leaving the `AGENTS.md` fallback → red, naming that needle alone, which is
+    /// what the two separate `assert!`s buy over a loop. Both re-worded rather
+    /// than deleted is what the next amendment is asked to do.
+    ///
     /// What is deliberately **not** pinned here: the skill roster (REQ-585
     /// OQ-2). The names are `/help`'s and the `skill` tool's to carry; the
     /// guide names the pointer and nothing that grows with the user's
@@ -5588,6 +5607,33 @@ mod tests {
                  sentence — do not delete them.\nline: {line}"
             );
         }
+        // REQ-612 BR-8 / AC-11, the fourth amendment, and asserted as **two**
+        // needles for the reason the pair above is two: the sentence now makes
+        // two claims about the repository's own file, and dropping either
+        // leaves it false in one direction. Separate `assert!`s rather than a
+        // loop, so the failure names the clause that went and nothing else —
+        // BUG-181's rule, and the loop above would report only the first.
+        assert!(
+            line.contains("repository notes from"),
+            "the capability sentence no longer says `repository notes from`. Since \
+             REQ-612 the session loads a `TETON.md` at its root into every turn's \
+             prompt, and this clause is the only place the model is told so: without \
+             it, asked how it knows the project's layout, the model names a tool call \
+             it never made instead of the file it was handed (BUG-181's shape, \
+             inverted). If the wording changed deliberately, re-word this needle with \
+             the sentence — do not delete it.\nline: {line}"
+        );
+        assert!(
+            line.contains("TETON.md"),
+            "the capability sentence no longer names `TETON.md`. Naming the loading \
+             without naming the file leaves the user with nothing to create and the \
+             model with nothing to point at, which is the half of BUG-181's fix that \
+             makes the fact actionable (REQ-612 BR-8). Asserted apart from the clause \
+             above so a re-wording that keeps one and loses the other cannot pass. \
+             The `(or `AGENTS.md`)` fallback beside it is ADR-7 OQ-1's decision: if \
+             product overturns it, drop the parenthetical and *that* is a re-word of \
+             this sentence too — this needle stays.\nline: {line}"
+        );
         // Before the first numbered step: a model reading top-down meets the
         // capability fact before the first setup recipe (the REQ-579 A1–A3
         // finding — the model follows the numbered steps, so what precedes them

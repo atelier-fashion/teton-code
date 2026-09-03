@@ -11,11 +11,18 @@
 //! # Why a tool and not more prompt
 //!
 //! The bundled guide ([`SELF_CONFIG_GUIDE`](crate::harness::turn_loop)) is the
-//! right vehicle for the always-needed surface, and it is nearly full: the
-//! system prompt sits under a pinned byte ceiling with little headroom — BUG-168
-//! had to shorten one phrase to pay for another, and BUG-181 had to move the
-//! ceiling (with its arithmetic re-checked) to land one capability sentence.
-//! Depth cannot live there. It lives here instead, and the only resident cost is
+//! right vehicle for the always-needed surface, and the room it has is decided
+//! rather than found: the system prompt sits under a pinned byte ceiling
+//! ([`REDACT_BODY_OVERHEAD_BYTES`](crate::egress::redact), 23 KiB) with a
+//! measured margin above it, pinned in turn so it cannot drift (BUG-193).
+//! BUG-168 had to shorten one phrase to pay for another; BUG-181 had to move
+//! the ceiling, with its arithmetic re-checked, to land one capability
+//! sentence; and REQ-612 moved it again — 14 → 23 KiB — because the
+//! repository's own notes are now resident, 8 KiB of them, and that raise took
+//! the redact chunk count with it. Every one of those was a reviewed diff, and
+//! that is the posture: headroom here is spent on purpose, never discovered.
+//! Depth still cannot live in the guide. It lives here instead, and the only
+//! resident cost is
 //! [`DESCRIPTION`] — one line naming the topic index — so adding a sixth topic
 //! later costs the prompt one word rather than a page (BR-10).
 //!
