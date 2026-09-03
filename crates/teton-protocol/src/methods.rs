@@ -1964,6 +1964,46 @@ pub struct ConfigSnapshot {
     /// older daemon's silence is not evidence for it.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub web_capability: Option<WebCapabilityState>,
+    /// The transcript posture: the durable default, the effective directory,
+    /// and the retention window (REQ-611 AC-20).
+    ///
+    /// On the existing snapshot rather than behind a new RPC, for
+    /// [`Self::effort`]'s reason — `teton doctor` says this in the same breath
+    /// it says everything else — and because the *effective directory* is a
+    /// fact only the daemon holds: it is `[transcript] dir` when the user wrote
+    /// one and `<data dir>/transcripts` otherwise, and the data directory is
+    /// resolved from the **daemon's** environment. A client deriving it from
+    /// its own would report a path the daemon does not write to whenever the
+    /// two environments differ, which is precisely the second-source drift
+    /// LESSON-456 is about.
+    ///
+    /// `Option` for wire additivity only, like the three fields above: a daemon
+    /// that has this field always populates it, so `None` reads as "this daemon
+    /// predates the field" and never as "transcripts are off".
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub transcript: Option<TranscriptPosture>,
+}
+
+/// What `doctor` says about transcripts (REQ-611 BR-15, AC-20).
+///
+/// **Deliberately not the path of any session's file.** BR-15 splits news from
+/// location, and this is neither: it is the *configuration* — the directory a
+/// transcript would be written into, which the user either wrote themselves or
+/// can read off `teton doctor`. An individual session's file is named only by
+/// [`SessionTranscriptResult::path`], on the connection that asked.
+///
+/// `enabled` is the **durable default** from `[transcript] enabled`, not any
+/// session's effective state: `config/get` reports configuration, and a
+/// per-session override that showed up here would make one session's
+/// `/transcript on` look like a machine-wide setting (BR-2's two lifetimes).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptPosture {
+    /// The durable `[transcript] enabled` default new sessions start from.
+    pub enabled: bool,
+    /// The directory transcripts are written to, as the daemon resolves it.
+    pub dir: String,
+    /// Days a file is kept before the daemon prunes it; `0` means never.
+    pub retain_days: u32,
 }
 
 /// The global effort setting, plus what it resolves to for each registered
@@ -4184,6 +4224,14 @@ mod tests {
                 redact_enabled: true,
                 web_capability: Some(WebCapabilityState::Ready {
                     tier: WebTier::FetchUserUrl,
+                }),
+                // REQ-611 AC-20: the posture a daemon that has the field always
+                // sends — the durable default, the resolved directory, and the
+                // retention window.
+                transcript: Some(TranscriptPosture {
+                    enabled: true,
+                    dir: "/Users/dev/.local/share/teton/transcripts".to_owned(),
+                    retain_days: 30,
                 }),
             },
         });

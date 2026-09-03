@@ -188,6 +188,12 @@ impl TestDaemon {
             // is covered by `tetond/tests/daemon_lifetime.rs`.
             .args(["--shutdown-policy", "never"])
             .env("XDG_RUNTIME_DIR", &runtime_dir)
+            // REQ-611 TASK-364: `resolve_data_dir` falls back to the
+            // developer's own home when this is unset, and every daemon prunes
+            // its transcript directory at start — so an unset variable would
+            // have this fixture run a deletion pass over the machine it is
+            // testing on. Under `root`, which `Drop` removes.
+            .env("XDG_DATA_HOME", root.join("d"))
             .env("TETON_CONFIG", &config_path)
             .env("TETON_REPO_ROOT", &root)
             .env("TETON_LOCAL_SCRIPT", &script)
@@ -291,6 +297,9 @@ fn an_idle_session_renders_an_event_with_nothing_typed() {
 
     let mut cmd = CommandBuilder::new(teton_bin());
     cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+    // CLI that autostarts one lands in `root` rather than the developer's home.
+    cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
     cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
     cmd.env("TETON_REPO_ROOT", &daemon.root);
     let mut session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
@@ -326,6 +335,8 @@ fn an_idle_session_renders_an_event_with_nothing_typed() {
     let doctor = std::process::Command::new(teton_bin())
         .arg("doctor")
         .env("XDG_RUNTIME_DIR", &daemon.runtime_dir)
+        // REQ-611 TASK-364: the same data directory the fixture daemon got.
+        .env("XDG_DATA_HOME", daemon.root.join("d"))
         .env("TETON_CONFIG", daemon.root.join("config.toml"))
         .env("TETON_REPO_ROOT", &daemon.root)
         .output()
@@ -405,6 +416,9 @@ fn the_status_row_shows_the_session_s_web_capability() {
 
     let mut cmd = CommandBuilder::new(teton_bin());
     cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+    // CLI that autostarts one lands in `root` rather than the developer's home.
+    cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
     cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
     cmd.env("TETON_REPO_ROOT", &daemon.root);
     let mut session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
@@ -506,6 +520,9 @@ fn the_status_row_renders_below_the_frame_and_survives_a_redraw() {
 
     let mut cmd = CommandBuilder::new(teton_bin());
     cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+    // CLI that autostarts one lands in `root` rather than the developer's home.
+    cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
     cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
     cmd.env("TETON_REPO_ROOT", &daemon.root);
     let mut session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
@@ -704,6 +721,9 @@ fn the_key_step_does_not_echo_and_the_key_reaches_nothing() {
 
     let mut cmd = CommandBuilder::new(teton_bin());
     cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+    // CLI that autostarts one lands in `root` rather than the developer's home.
+    cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
     cmd.env("TETON_CONFIG", &config_path);
     cmd.env("TETON_REPO_ROOT", &daemon.root);
     let mut session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
@@ -934,6 +954,9 @@ fn a_reply_reciting_the_cli_earns_the_hand_off_line_at_a_terminal() {
 
     let mut cmd = CommandBuilder::new(teton_bin());
     cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+    // CLI that autostarts one lands in `root` rather than the developer's home.
+    cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
     cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
     cmd.env("TETON_REPO_ROOT", &daemon.root);
     let mut session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
@@ -1114,6 +1137,9 @@ fn a_session_provider_add_asks_for_its_key_echo_off_and_stores_nothing_untyped()
 
     let mut cmd = CommandBuilder::new(teton_bin());
     cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+    // CLI that autostarts one lands in `root` rather than the developer's home.
+    cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
     cmd.env("TETON_CONFIG", &config_path);
     cmd.env("TETON_REPO_ROOT", &daemon.root);
     // `read_secret` takes this variable ahead of the prompt, so an exported
@@ -1291,6 +1317,9 @@ fn a_move_to_a_non_project_root_re_fires_the_notice_at_a_terminal() {
         let mut cmd = CommandBuilder::new(teton_bin());
         cmd.args(["--cwd", cwd.to_str().unwrap()]);
         cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+        // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+        // CLI that autostarts one lands in `root` rather than the developer's home.
+        cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
         cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
         cmd.env("TETON_REPO_ROOT", &daemon.root);
         cmd.env("HOME", &home);
@@ -1470,6 +1499,9 @@ fn a_skill_consent_asks_once_at_a_terminal_and_lists_every_command_verbatim() {
     let mut cmd = CommandBuilder::new(teton_bin());
     cmd.args(["--cwd", project.to_str().unwrap()]);
     cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+    // CLI that autostarts one lands in `root` rather than the developer's home.
+    cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
     cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
     cmd.env("TETON_REPO_ROOT", &daemon.root);
     cmd.env("HOME", &home);
@@ -1616,6 +1648,9 @@ fn the_acknowledgment_prompt_names_the_root_its_skills_and_what_it_left_out() {
     let mut cmd = CommandBuilder::new(teton_bin());
     cmd.args(["--cwd", project.to_str().unwrap()]);
     cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+    // CLI that autostarts one lands in `root` rather than the developer's home.
+    cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
     cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
     cmd.env("TETON_REPO_ROOT", &daemon.root);
     cmd.env("HOME", &home);
@@ -1758,6 +1793,9 @@ fn a_permanent_acknowledgment_writes_its_row_only_where_presence_is_satisfied() 
         let mut cmd = CommandBuilder::new(teton_bin());
         cmd.args(["--cwd", project.to_str().unwrap()]);
         cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+        // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+        // CLI that autostarts one lands in `root` rather than the developer's home.
+        cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
         cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
         cmd.env("TETON_REPO_ROOT", &daemon.root);
         cmd.env("HOME", &home);
@@ -2192,6 +2230,9 @@ fn park_at_the_over_budget_offer(tag: &str) -> OfferSession {
     let mut cmd = CommandBuilder::new(teton_bin());
     cmd.args(["--cwd", project.to_str().unwrap()]);
     cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+    // CLI that autostarts one lands in `root` rather than the developer's home.
+    cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
     cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
     cmd.env("TETON_REPO_ROOT", &daemon.root);
     cmd.env("HOME", &home);
@@ -2575,6 +2616,9 @@ fn a_resized_window_lays_the_next_turn_out_at_the_new_width() {
 
     let mut cmd = CommandBuilder::new(teton_bin());
     cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+    // CLI that autostarts one lands in `root` rather than the developer's home.
+    cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
     cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
     cmd.env("TETON_REPO_ROOT", &daemon.root);
     let mut session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
@@ -2862,6 +2906,9 @@ impl RenderedSession {
 
         let mut cmd = CommandBuilder::new(teton_bin());
         cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+        // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+        // CLI that autostarts one lands in `root` rather than the developer's home.
+        cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
         cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
         cmd.env("TETON_REPO_ROOT", &daemon.root);
         cmd.env_remove("NO_COLOR");

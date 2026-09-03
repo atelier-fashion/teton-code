@@ -127,10 +127,10 @@ use teton_protocol::methods::{
     ProviderSetupCommitParams, ProviderSetupPlanParams, ProviderSetupPreviewParams,
     ProviderTestParams, RootKind, RpcMethod, SessionAttachParams, SessionAttachResult,
     SessionClearParams, SessionCreateParams, SessionCreateResult, SessionListParams,
-    SessionListResult, SessionPermissionsParams, SessionSetCwdParams, SessionSummary, SkillSkipped,
-    SkillView, SkillsListParams, SkillsListResult, SkillsPreflightParams, SkillsPreflightResult,
-    WebOverrideParams, WebRefreshParams, WebSetupCommitParams, WebSetupPlanParams,
-    WebSetupPreviewParams,
+    SessionListResult, SessionPermissionsParams, SessionSetCwdParams, SessionSummary,
+    SessionTranscriptParams, SkillSkipped, SkillView, SkillsListParams, SkillsListResult,
+    SkillsPreflightParams, SkillsPreflightResult, WebOverrideParams, WebRefreshParams,
+    WebSetupCommitParams, WebSetupPlanParams, WebSetupPreviewParams,
 };
 use teton_protocol::{RequestId, SessionId};
 
@@ -1686,10 +1686,19 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
         // name reads "a human *or* the network"; the branch chain below is the
         // routing.
         //
+        // `session/transcript` (REQ-611 ADR-6) is the second member that waits
+        // on neither: it waits on **the disk**, flushing the transcript sink so
+        // that its reply describes a file the writer thread has really opened,
+        // refused or resumed (`DaemonRuntime::session_transcript`). Same rule,
+        // third kind of wait — and the branch name is now two-thirds
+        // historical, kept because renaming it would touch every comment that
+        // cites it while changing nothing about what it does.
+        //
         // Membership in this list decides where the work *runs*. It does not
         // decide what teardown does with it: `provider/test` ends up on
         // `prompt_tasks` (drained) rather than `attach_tasks` (aborted), for the
-        // reason spelled out at the push below.
+        // reason spelled out at the push below, and `session/transcript` joins
+        // it there for a reason of its own.
         let blocks_on_a_human = matches!(
             method,
             m if m == SessionAttachParams::METHOD
@@ -1700,6 +1709,7 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
                 || m == ProviderSetupCommitParams::METHOD
                 || m == ConfigSetParams::METHOD
                 || m == ProviderTestParams::METHOD
+                || m == SessionTranscriptParams::METHOD
         );
         if blocks_on_a_human {
             let daemon = Arc::clone(&daemon);
@@ -1729,6 +1739,18 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
             // aborts — bounded by `TURN_DRAIN_TIMEOUT` on that side and by
             // `PROBE_DEADLINE` on the probe's own.
             let is_probe = method == ProviderTestParams::METHOD;
+            // REQ-611 ADR-6: `session/transcript` is drained rather than
+            // aborted, and not for the probe's reason — it spends no money and
+            // has no ledger row. It is because the **switch has already
+            // happened** by the time this task is awaiting anything: the sink
+            // took it synchronously, and what remains after the flush is the
+            // `transcript_state` publish that tells the session's *other*
+            // attached connections the record started or stopped. Aborting
+            // there would leave a session recording with nobody told, which is
+            // the one outcome BR-15 exists to prevent. It carries no activity
+            // guard: a flush is bounded by the disk, and `shutdown_transcripts`
+            // closes the file on the way out whether or not this task ran.
+            let drained_at_teardown = is_probe || method == SessionTranscriptParams::METHOD;
             // …and the drain alone is not enough to make that true.
             //
             // Teardown drops `client_guard` *before* it drains (the ordering is
@@ -1775,10 +1797,12 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
                     handle_config_set(&daemon, &conn, id, params).await
                 } else if method == ProviderTestParams::METHOD {
                     handle_provider_test(&daemon, &conn, id, params).await
+                } else if method == SessionTranscriptParams::METHOD {
+                    handle_session_transcript(&daemon, &conn, id, params).await
                 } else {
                     // Unreachable: the `blocks_on_a_human` `matches!` guard admits
-                    // exactly the eight methods branched above. Made explicit rather
-                    // than a catch-all so a future ninth member that updates the
+                    // exactly the nine methods branched above. Made explicit rather
+                    // than a catch-all so a future tenth member that updates the
                     // guard but forgets a branch fails loudly here instead of being
                     // silently misrouted into the last handler.
                     unreachable!("blocks_on_a_human admitted an unrouted method: {method}")
@@ -1791,7 +1815,7 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
                 }
                 let _ = out_tx.send(response).await;
             });
-            if is_probe {
+            if drained_at_teardown {
                 prompt_tasks.retain(|h| !h.is_finished());
                 prompt_tasks.push(task);
             } else {
@@ -2458,6 +2482,12 @@ fn dispatch(
         // is: both run on their own task (see `handle_client`), because both
         // await something this reader loop has to stay free to read.
         SessionClearParams::METHOD => Some(handle_session_clear(daemon, conn, id, params)),
+        // `session/transcript` (REQ-611 ADR-6) belongs beside `session/clear` —
+        // same `may_drive` gate, same "one session, one user act", `ENDS_TURN`
+        // false for both — and is deliberately absent from this match for
+        // `session/attach`'s reason rather than for a different one: it awaits
+        // the transcript sink's flush, so it runs on `handle_client`'s
+        // `blocks_on_a_human` task. See [`handle_session_transcript`].
         // REQ-583 ADR-4: `session/set_cwd` sits beside `session/clear` for the
         // same reason it is modelled on it — no human, no network; it takes the
         // turn claim, rewrites one path, clears, publishes, and answers — so it
@@ -3084,6 +3114,61 @@ fn handle_session_permissions(daemon: &Daemon, conn: &ConnState, id: Id, params:
     ok_string(
         id,
         &daemon.runtime.session_permissions(&params, &daemon.events),
+    )
+}
+
+/// Switch or read a session's transcript (`session/transcript`, REQ-611 ADR-6).
+///
+/// **Modelled on [`handle_session_permissions`], including the argument that
+/// makes BR-3 structural.** Tool dispatch holds a `ToolContext`, not a
+/// `DaemonRuntime`, so a model that emits a tool call named
+/// `session/transcript` — or a tool result containing the text `/transcript
+/// off` — reaches the tool registry, finds no such tool, and is told so. "The
+/// model cannot turn the record off" is a fact about which channel this
+/// function hangs off, not a check that could be omitted or forgotten.
+///
+/// Gated on [`ConnState::may_drive`] for **all three** actions, `Status`
+/// included, and that is ADR-6 rather than an over-tight read. On and off are
+/// mutations; and the status answer names the *file*, which is boundary content
+/// of the class REQ-569 BR-10 gives `cwd`. A monitor is entitled to see
+/// `transcript_state` — that it is recording — and entitled to none of where.
+/// Do not relax this to `may_receive` for the convenience of a read.
+///
+/// The gate sits before the runtime is touched, so an unattached caller cannot
+/// read a session's existence out of which refusal it got (ADR-B).
+///
+/// # Why it is `async`, and what that costs
+///
+/// [`DaemonRuntime::session_transcript`] flushes the sink so that its answer
+/// describes a file the writer thread has actually opened, refused or resumed —
+/// see that method for why answering earlier would be answering wrongly. A
+/// flush waits on the disk, and a method that waits on anything outside this
+/// process must not wait on the reader loop (LESSON-518), so this runs on its
+/// own task in [`handle_client`] rather than inline in [`dispatch`]. That is a
+/// deliberate departure from its `session/permissions` twin, which computes its
+/// answer in memory and can reply from the loop.
+async fn handle_session_transcript(
+    daemon: &Daemon,
+    conn: &ConnState,
+    id: Id,
+    params: Value,
+) -> String {
+    let params: SessionTranscriptParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+    if let Some(refusal) = refuse_unmintable_session_id(&id, &params.session_id) {
+        return refusal;
+    }
+    if !conn.may_drive(&params.session_id) {
+        return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
+    }
+    ok_string(
+        id,
+        &daemon
+            .runtime
+            .session_transcript(&params, &daemon.events)
+            .await,
     )
 }
 

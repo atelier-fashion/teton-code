@@ -5090,6 +5090,9 @@ mod tests {
             // state that *is* present belongs with the surface that draws it
             // (TASK-131/132), not with this routing-table fixture.
             web_capability: None,
+            // REQ-611: likewise absent — this fixture is about the routing
+            // table, and the transcript posture's own rendering is TASK-365's.
+            transcript: None,
         }
     }
 

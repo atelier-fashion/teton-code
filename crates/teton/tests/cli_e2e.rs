@@ -254,6 +254,13 @@ impl TestDaemon {
             // the real default.
             .args(["--shutdown-policy", "never"])
             .env("XDG_RUNTIME_DIR", &runtime_dir)
+            // REQ-611 TASK-364: `socket_path::resolve_data_dir` falls back to
+            // the developer's own `~/Library/Application Support/teton` when
+            // this is unset, and every daemon prunes its transcript directory
+            // at start — so an unset variable makes this fixture run a deletion
+            // pass over the machine it is testing on. Under `root`, which
+            // `Drop` removes with everything else.
+            .env("XDG_DATA_HOME", root.join("d"))
             .env("TETON_CONFIG", &config_path)
             .env("TETON_REPO_ROOT", &root)
             // A deterministic machine, so the proposal is the same everywhere
@@ -428,6 +435,12 @@ impl TestDaemon {
         command
             .args(args)
             .env("XDG_RUNTIME_DIR", &self.runtime_dir)
+            // REQ-611 TASK-364: the CLI autostarts a daemon when it cannot
+            // reach one, and that child inherits this environment — so the
+            // isolation has to travel with the *client* too, or an autostarted
+            // daemon prunes the developer's real data directory. Same value the
+            // fixture daemon was spawned with, so both see one directory.
+            .env("XDG_DATA_HOME", self.root.join("d"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -801,6 +814,10 @@ fn a_refused_config_is_reported_by_the_cli_that_autostarted_the_daemon() {
     let output = Command::new(teton_bin())
         .arg("cost")
         .env("XDG_RUNTIME_DIR", &runtime_dir)
+        // REQ-611 TASK-364: this command autostarts a daemon, and that
+        // daemon prunes its transcript directory at start — under `root`, not
+        // under the developer's home (`resolve_data_dir`'s fallback).
+        .env("XDG_DATA_HOME", root.join("d"))
         .env("TETON_CONFIG", &config_path)
         .env("TETON_REPO_ROOT", &root)
         .stdin(Stdio::null())
@@ -5621,6 +5638,10 @@ fn a_missing_cwd_is_refused_by_the_cli_itself_with_no_daemon_to_reach() {
         let mut child = Command::new(teton_bin())
             .args(args)
             .env("XDG_RUNTIME_DIR", &runtime_dir)
+            // REQ-611 TASK-364: isolation travels with the client, since a
+            // CLI that cannot reach a daemon autostarts one that inherits
+            // this environment and prunes whatever it resolves to.
+            .env("XDG_DATA_HOME", root.join("d"))
             .env("TETON_CONFIG", &config_path)
             .env("TETON_REPO_ROOT", &root)
             .stdin(Stdio::piped())

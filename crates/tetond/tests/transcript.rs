@@ -49,7 +49,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 #[path = "e2e/harness.rs"]
 mod harness;
@@ -114,7 +114,31 @@ fn write_config(
     duties: &MockProvider,
     enabled: bool,
 ) -> PathBuf {
-    let dir = transcript_dir(workspace);
+    write_config_in(
+        workspace,
+        provider,
+        duties,
+        enabled,
+        &transcript_dir(workspace),
+    )
+}
+
+/// [`write_config`] with the transcript directory named explicitly.
+///
+/// The AC-11 fixtures need a directory that is *not* the workspace default —
+/// one whose parent is a file, one that already exists `0o755`, one inside the
+/// session root — and each of those is a property of the path rather than of
+/// the rest of the config. Split out so those three legs and the ordinary
+/// fixture share one config writer: a second writer would be a second place for
+/// the tier bindings to drift.
+fn write_config_in(
+    workspace: &Workspace,
+    provider: &MockProvider,
+    duties: &MockProvider,
+    enabled: bool,
+    dir: &Path,
+) -> PathBuf {
+    let dir = dir.to_path_buf();
     let mut config = String::new();
     config.push_str(&remote_provider_block(
         "mock",
@@ -1019,5 +1043,740 @@ fn orderly_shutdown_closes_the_file_and_sigkill_leaves_one_partial_line() {
         Some(Value::from("transcript_closed")),
         "nothing closed this file — which is what makes the orderly leg above a \
          claim about the teardown rather than about the writer"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// TASK-364 — the two switches, from the wire
+// ---------------------------------------------------------------------------
+
+/// Call `session/transcript` and return the whole response object.
+fn transcript_call(client: &mut harness::Client, session: &str, action: &str) -> Value {
+    client.call(
+        "session/transcript",
+        json!({ "session_id": session, "action": action }),
+    )
+}
+
+/// The `result` of a `session/transcript` call that must have succeeded.
+fn transcript_result(client: &mut harness::Client, session: &str, action: &str) -> Value {
+    let response = transcript_call(client, session, action);
+    assert!(
+        response.get("result").is_some(),
+        "session/transcript {action} must succeed: {response}"
+    );
+    response["result"].clone()
+}
+
+/// Every `transcript_state` event this client has seen, as `(enabled, reason)`.
+fn state_events(client: &harness::Client) -> Vec<(bool, String)> {
+    client
+        .events_named("transcript_state")
+        .into_iter()
+        .map(|event| {
+            (
+                event["enabled"].as_bool().unwrap_or_default(),
+                event["reason"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// **AC-3 (daemon half): `on` records from the switch forward, and writes no
+/// config.**
+///
+/// Three claims in one fixture because they are one act: a session started
+/// under `enabled = false` is switched on mid-conversation, and afterwards the
+/// file must hold what came *after* and nothing that came before, the attached
+/// connection must have been told, and `config.toml` must be untouched — BR-2's
+/// "never written to disk" is the half a user cannot see, so it is asserted on
+/// the **bytes** rather than inferred from the absence of a `config/set`
+/// (LESSON-519).
+///
+/// The two prompts carry deliberately distinctive strings, because "the
+/// pre-switch conversation is absent" is a claim about *content*: a check that
+/// merely counted records would pass against a sink that backfilled the
+/// retained conversation with different `n`s.
+///
+/// **Mutation (run, red):** make `session_transcript`'s `On` arm pass the
+/// session's `seq_at_open` instead of the live sequence — no; the mutation
+/// actually run was cruder and closer to the claim: `sink.set_enabled(&id,
+/// enabled, ..)` changed to `sink.set_enabled(&id, true, ..)` for both arms
+/// leaves this test green and reddens `off_closes_and_on_resumes_the_same_file`.
+/// The mutation that reddens *this* test is deleting the `On => Some(true)` arm
+/// (making it `None`, a no-op read): the file never appears and `await_file`
+/// times out. Restored.
+#[test]
+fn on_records_from_the_switch_forward_and_writes_no_config() {
+    let provider = MockProvider::always(openai_turn("Done.", None, 120, 20));
+    let duties = duty_provider();
+    let ws = Workspace::new("transcript-ac3");
+    let dir = write_config(&ws, &provider, &duties, false);
+    let daemon = spawn(&ws, probe());
+    let mut client = daemon.connect();
+    let session = client.create_session("freeform", None);
+
+    // Before the switch: a whole turn that must leave no trace.
+    client.prompt(&session, "BEFORE-THE-SWITCH-marker");
+    client.drain_events(Duration::from_millis(200));
+    assert!(
+        transcript_files(&dir).is_empty(),
+        "a session started under `enabled = false` has no file yet"
+    );
+
+    let config_before = std::fs::read(&ws.config_path).expect("the config exists");
+    let switched = transcript_result(&mut client, &session, "on");
+    assert_eq!(
+        switched["enabled"].as_bool(),
+        Some(true),
+        "the switch reports the state it produced: {switched}"
+    );
+    let path = switched["path"]
+        .as_str()
+        .unwrap_or_else(|| panic!("`on` answers with the file it opened: {switched}"))
+        .to_owned();
+
+    // BR-15: the news reaches the attached connection, with the reason that is
+    // true of it.
+    let announced = client
+        .wait_for_event("transcript_state", WINDOW)
+        .expect("`on` announces the change to the session's attached connections");
+    assert_eq!(announced["enabled"].as_bool(), Some(true), "{announced}");
+    assert_eq!(
+        announced["reason"].as_str(),
+        Some("session_command"),
+        "{announced}"
+    );
+    assert!(
+        announced.get("path").is_none(),
+        "BR-15: the event is news, never location: {announced}"
+    );
+
+    // After the switch: this one is recorded.
+    client.prompt(&session, "AFTER-THE-SWITCH-marker");
+    let records = await_kinds(&dir, &session, &["prompt_submitted"]);
+    let text = std::fs::read_to_string(&path).expect("the transcript is readable");
+    assert!(
+        text.contains("AFTER-THE-SWITCH-marker"),
+        "the turn after the switch is recorded:\n{text}"
+    );
+    assert!(
+        !text.contains("BEFORE-THE-SWITCH-marker"),
+        "AC-3: nothing is backfilled from the retained conversation:\n{text}"
+    );
+    assert_eq!(
+        records.first().map(|r| r["kind"].clone()),
+        Some(Value::from("transcript_opened")),
+        "a switched-on file still begins with its opening record: {:?}",
+        kinds_of(&records)
+    );
+    assert_well_formed(&records, &session);
+
+    // AC-3 / BR-16: the session switch is session-lifetime, so the file on disk
+    // is byte-identical. Read, not inferred.
+    assert_eq!(
+        std::fs::read(&ws.config_path).ok().as_deref(),
+        Some(config_before.as_slice()),
+        "`/transcript on` must not write a byte of config.toml"
+    );
+}
+
+/// **AC-4 (daemon half): `off` closes with `session_command`, and a later `on`
+/// resumes the same file.**
+///
+/// The benign-path flag is `no` in the Verification table for a reason: this is
+/// the criterion whose failure mode is a *second* file, and a suite that only
+/// checked "a file exists after `on`" would never see it. So the path is
+/// captured before the `off` and compared afterwards, and `n` is asserted
+/// contiguous across the pause — a resumed file with `n` restarting at 1 is the
+/// other way to get this wrong.
+///
+/// **Mutation (run, red):** in `WriterTask::on_set_enabled`, replace the
+/// `ensure_open(session_id, Some(seq))` resume call with a fresh
+/// `Writer::open`. A second `.jsonl` appears and the `same file` assertion
+/// fails on the path. Restored.
+#[test]
+fn off_closes_and_on_resumes_the_same_file() {
+    let provider = MockProvider::always(openai_turn("Done.", None, 120, 20));
+    let duties = duty_provider();
+    let ws = Workspace::new("transcript-ac4");
+    let dir = write_config(&ws, &provider, &duties, true);
+    let daemon = spawn(&ws, probe());
+    let mut client = daemon.connect();
+    let session = client.create_session("freeform", None);
+    client.prompt(&session, "WHILE-RECORDING-marker");
+    let path = await_file(&dir, &session);
+
+    let stopped = transcript_result(&mut client, &session, "off");
+    assert_eq!(
+        stopped["enabled"].as_bool(),
+        Some(false),
+        "`off` reports the state it produced: {stopped}"
+    );
+    let announced = client
+        .wait_for_event("transcript_state", WINDOW)
+        .expect("`off` announces the change");
+    assert_eq!(announced["enabled"].as_bool(), Some(false), "{announced}");
+    assert_eq!(
+        announced["reason"].as_str(),
+        Some("session_command"),
+        "{announced}"
+    );
+
+    let (closed, _) = read_transcript(&path);
+    let last = closed.last().expect("the file has records");
+    assert_eq!(
+        last["kind"],
+        "transcript_closed",
+        "`off` closes the file rather than merely stopping: {:?}",
+        kinds_of(&closed)
+    );
+    assert_eq!(
+        last["reason"], "session_command",
+        "and says which switch closed it: {last}"
+    );
+
+    // A turn while off adds nothing. The status call after it is the
+    // synchronisation point — it flushes the sink — so this is a claim about
+    // the file rather than about how fast the test ran.
+    let bytes_when_closed = std::fs::read(&path).expect("readable");
+    client.prompt(&session, "WHILE-OFF-marker");
+    let idle = transcript_result(&mut client, &session, "status");
+    assert_eq!(
+        idle["enabled"].as_bool(),
+        Some(false),
+        "status while off says so: {idle}"
+    );
+    assert_eq!(
+        std::fs::read(&path).ok().as_deref(),
+        Some(bytes_when_closed.as_slice()),
+        "AC-4: a prompt while off adds no line"
+    );
+    assert!(
+        !String::from_utf8_lossy(&bytes_when_closed).contains("WHILE-OFF-marker"),
+        "and the turn it ran is nowhere in the file"
+    );
+
+    // And back on: the same file, resumed, with `n` continuing.
+    let resumed = transcript_result(&mut client, &session, "on");
+    assert_eq!(
+        resumed["path"].as_str(),
+        Some(path.display().to_string().as_str()),
+        "AC-4: `on` resumes the SAME file rather than starting a second one: {resumed}"
+    );
+    assert_eq!(
+        transcript_files(&dir).len(),
+        1,
+        "one session, one file, across the pause: {:?}",
+        transcript_files(&dir)
+    );
+    let (records, _) = read_transcript(&path);
+    assert!(
+        records.iter().any(|r| r["kind"] == "transcript_resumed"),
+        "the resume is written down: {:?}",
+        kinds_of(&records)
+    );
+    assert!(
+        records.len() > closed.len(),
+        "the resumed file grew rather than being rewritten"
+    );
+    assert_well_formed(&records, &session);
+}
+
+/// **AC-5 / BR-15: the status answer names the file on the asking connection,
+/// and nothing carrying that name reaches anybody else.**
+///
+/// The second connection is genuinely *attached* — it asks, the owner's reader
+/// thread grants — because an unattached one receives no session-scoped frame
+/// at all and the absence assertion would be vacuous. The non-vacuity floor is
+/// explicit: the watcher must have received a `transcript_state` frame, so what
+/// is being asserted is that the frames it got carry no path, not that it got
+/// none.
+///
+/// Asserted on the **raw wire text** ([`harness::Client::raw_wire`]), not on the
+/// parsed event list: the claim is about every byte the daemon sent this
+/// connection, including responses and the frames the harness classifier drops.
+///
+/// **Mutation (run, red):** add `pub path: Option<String>` to
+/// `events::TranscriptState` and populate it from the sink's status in
+/// `session_transcript`. The watcher's raw-wire assertion fails, naming the
+/// leaked path. Restored.
+#[test]
+fn status_answers_the_asker_and_the_state_event_carries_no_path() {
+    let provider = MockProvider::always(openai_turn("Done.", None, 120, 20));
+    let duties = duty_provider();
+    let ws = Workspace::new("transcript-ac5");
+    let dir = write_config(&ws, &provider, &duties, true);
+    let daemon = spawn(&ws, probe());
+    let mut owner = daemon.connect().with_auto_consent();
+    let session = owner.create_session("freeform", None);
+    owner.prompt(&session, "Say something.");
+    let path = await_file(&dir, &session);
+    let path_text = path.display().to_string();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("the transcript has a name")
+        .to_owned();
+
+    // A second connection, attached with the owner's consent.
+    let mut watcher = daemon.connect();
+    let attached = watcher.call("session/attach", json!({ "session_id": session.clone() }));
+    assert!(
+        attached.get("result").is_some(),
+        "the watcher must actually attach, or the absence below proves nothing: \
+         {attached}\ndaemon log:\n{}",
+        daemon.log()
+    );
+
+    // The routed answer: enabled, path, count — to the asker.
+    let status = transcript_result(&mut owner, &session, "status");
+    assert_eq!(status["enabled"].as_bool(), Some(true), "{status}");
+    assert_eq!(
+        status["path"].as_str(),
+        Some(path_text.as_str()),
+        "BR-15: the asking connection is the one surface that names the file: {status}"
+    );
+    assert!(
+        status["records"].as_u64().is_some_and(|n| n > 0),
+        "the count is the file's own: {status}"
+    );
+    assert!(
+        status["degraded"].is_null(),
+        "a healthy session reports no degraded reason: {status}"
+    );
+
+    // Two state changes, so the watcher has something to have received.
+    transcript_result(&mut owner, &session, "off");
+    transcript_result(&mut owner, &session, "on");
+    watcher
+        .wait_for_event("transcript_state", WINDOW)
+        .expect("an attached watcher is told that the record stopped and started");
+    watcher.drain_events(Duration::from_millis(300));
+
+    let seen = state_events(&watcher);
+    assert!(
+        !seen.is_empty(),
+        "non-vacuity: the watcher must have received the news it is being checked \
+         for the absence of a path in"
+    );
+    let wire = watcher.raw_wire();
+    assert!(
+        !wire.contains(&path_text),
+        "AC-5: no frame to a second connection may carry the transcript path \
+         ({path_text}) — wire:\n{wire}"
+    );
+    assert!(
+        !wire.contains(&file_name),
+        "AC-5: nor its file name ({file_name}) — wire:\n{wire}"
+    );
+    // The owner's own event stream is held to the same rule: the path came back
+    // on the response, and the event must not have carried it either.
+    for event in owner.events_named("transcript_state") {
+        assert!(
+            event.get("path").is_none(),
+            "BR-15: `transcript_state` has no path field: {event}"
+        );
+    }
+}
+
+/// **BR-3 / AC-7: nothing the model can emit reaches the toggle, and an
+/// unattached connection is refused.**
+///
+/// Two halves, and the first is the one the AC insists on: prove the *surface
+/// is absent* rather than that a call to it is refused. So the tool registry is
+/// enumerated — names and rendered docs — and asked whether anything in it is
+/// about transcripts. A model's only vocabulary is that registry; a name it
+/// cannot emit is a capability it cannot reach, and no runtime check has to
+/// hold for that to stay true.
+///
+/// The second half is BR-3's other clause: `session/transcript` exists on the
+/// client channel, so a *connection* that is not driving the session must not
+/// reach it either. Non-vacuous because the same call from the attached owner
+/// is asserted to succeed.
+///
+/// **Mutation (run, red):** register a tool named `transcript` in
+/// `ToolRegistry::with_builtins`. The name enumeration fails. And separately:
+/// delete the `may_drive` check from `handle_session_transcript` — the stranger
+/// leg then gets a `result` instead of `NOT_ATTACHED` and fails. Both restored.
+/// **Mutation (run 2026-09-03):** removing the `may_drive` check from
+/// `handle_session_transcript` turned this test red at the unattached-
+/// connection leg (the bystander's `session/transcript` was answered instead
+/// of refused `NOT_ATTACHED`). Restored; green again.
+#[test]
+fn no_tool_reaches_the_transcript_toggle_and_an_unattached_connection_is_refused() {
+    use tetond::harness::tools::ToolRegistry;
+
+    // --- the surface is absent from the model's whole vocabulary ---
+    let registry = ToolRegistry::with_builtins();
+    let names = registry.names();
+    assert!(
+        !names.is_empty(),
+        "non-vacuity: an empty registry would satisfy any absence claim"
+    );
+    for name in &names {
+        assert!(
+            !name.contains("transcript"),
+            "BR-3: no tool may name or alias the transcript toggle; found `{name}` \
+             among {names:?}"
+        );
+    }
+    let docs = registry.docs(None);
+    assert!(
+        !docs.to_lowercase().contains("transcript"),
+        "BR-3: nor may a tool's description offer it — a model reads these:\n{docs}"
+    );
+
+    // --- and the client method is gated on driving the session ---
+    let provider = MockProvider::always(openai_turn("Done.", None, 120, 20));
+    let duties = duty_provider();
+    let ws = Workspace::new("transcript-ac7");
+    let dir = write_config(&ws, &provider, &duties, true);
+    let daemon = spawn(&ws, probe());
+    let mut owner = daemon.connect();
+    let session = owner.create_session("freeform", None);
+    let _ = await_file(&dir, &session);
+
+    let mut stranger = daemon.connect();
+    for action in ["status", "on", "off"] {
+        let refused = transcript_call(&mut stranger, &session, action);
+        assert_eq!(
+            refused["error"]["code"].as_i64(),
+            Some(teton_protocol::jsonrpc::error_code::NOT_ATTACHED),
+            "BR-3: `{action}` from a connection that does not drive the session must \
+             be refused: {refused}"
+        );
+    }
+    // Non-vacuity: the very same call from the attached owner works.
+    let allowed = transcript_result(&mut owner, &session, "status");
+    assert_eq!(allowed["enabled"].as_bool(), Some(true), "{allowed}");
+}
+
+/// **BR-9 / AC-11: an uncreatable or too-wide directory is refused with
+/// `dir_refused`, and a fresh directory inside the session root opens.**
+///
+/// Three fixtures, because the rule has three shapes and only the third is
+/// benign. The first two are the refusals BR-9 names — a directory that cannot
+/// be created at all, and one that already exists wider than owner-only — and
+/// both must leave the session *running*: a transcript that cannot be written
+/// is not a reason to fail a user's turn (ADR-8).
+///
+/// The third leg is the one the spec had to settle: a `dir` **inside the
+/// session root** is accepted, not refused. What keeps it unreadable is the
+/// jail denial (TASK-368), not a containment check here, and adding one would
+/// be a second rule for one property.
+///
+/// **Mutation (run, red):** delete the `mode & NON_OWNER_BITS` check from
+/// `writer::prepare_dir`. The `0o755` leg then opens a file and the
+/// `dir_refused` assertion fails; the in-root leg stays green, which is the
+/// right split. Restored.
+#[test]
+fn an_uncreatable_or_wide_dir_is_refused_and_a_fresh_in_root_dir_opens() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let provider = MockProvider::always(openai_turn("Done.", None, 120, 20));
+    let duties = duty_provider();
+
+    // --- leg 1: a directory that cannot be created (its parent is a file) ---
+    let blocked = Workspace::new("transcript-ac11-uncreatable");
+    let occupied = blocked.root.join("not-a-directory");
+    std::fs::write(&occupied, b"this path is a file\n").expect("write the obstruction");
+    let blocked_dir = occupied.join("transcripts");
+    write_config_in(&blocked, &provider, &duties, false, &blocked_dir);
+    let blocked_daemon = spawn(&blocked, probe());
+    let mut blocked_client = blocked_daemon.connect();
+    let blocked_session = blocked_client.create_session("freeform", None);
+
+    let refused = transcript_result(&mut blocked_client, &blocked_session, "on");
+    assert_eq!(
+        refused["enabled"].as_bool(),
+        Some(false),
+        "AC-11: a directory that cannot be created leaves the session unrecorded: {refused}"
+    );
+    assert!(
+        refused["degraded"].as_str().is_some(),
+        "and says why, on the asking connection: {refused}"
+    );
+    let announced = blocked_client
+        .wait_for_event("transcript_state", WINDOW)
+        .expect("the refusal is announced");
+    assert_eq!(
+        (announced["enabled"].as_bool(), announced["reason"].as_str()),
+        (Some(false), Some("dir_refused")),
+        "AC-11: the reason is the one that is true of it: {announced}"
+    );
+    let ran = blocked_client.prompt(&blocked_session, "Say something.");
+    assert!(
+        ran.get("result").is_some(),
+        "AC-11: the session runs normally without a transcript: {ran}"
+    );
+    assert!(
+        !blocked_dir.exists(),
+        "nothing was created at the refused path"
+    );
+    drop(blocked_client);
+    drop(blocked_daemon);
+
+    // --- leg 2: a directory that already exists, wider than owner-only ---
+    let wide = Workspace::new("transcript-ac11-wide");
+    let wide_dir = wide.root.join("wide-transcripts");
+    std::fs::create_dir_all(&wide_dir).expect("create the wide directory");
+    std::fs::set_permissions(&wide_dir, std::fs::Permissions::from_mode(0o755)).expect("widen it");
+    write_config_in(&wide, &provider, &duties, false, &wide_dir);
+    let wide_daemon = spawn(&wide, probe());
+    let mut wide_client = wide_daemon.connect();
+    let wide_session = wide_client.create_session("freeform", None);
+
+    let wide_refused = transcript_result(&mut wide_client, &wide_session, "on");
+    assert_eq!(
+        wide_refused["enabled"].as_bool(),
+        Some(false),
+        "BR-9: an existing directory wider than owner-only is not silently reused: \
+         {wide_refused}"
+    );
+    let wide_announced = wide_client
+        .wait_for_event("transcript_state", WINDOW)
+        .expect("the refusal is announced");
+    assert_eq!(
+        (
+            wide_announced["enabled"].as_bool(),
+            wide_announced["reason"].as_str()
+        ),
+        (Some(false), Some("dir_refused")),
+        "{wide_announced}"
+    );
+    assert!(
+        transcript_files(&wide_dir).is_empty(),
+        "BR-9: refused means nothing was written into it: {:?}",
+        transcript_files(&wide_dir)
+    );
+    drop(wide_client);
+    drop(wide_daemon);
+
+    // --- leg 3 (benign): a fresh directory inside the session root opens ---
+    let inside = Workspace::new("transcript-ac11-inroot");
+    let inside_dir = inside.repo.join(".teton-transcripts");
+    write_config_in(&inside, &provider, &duties, false, &inside_dir);
+    let inside_daemon = spawn(&inside, probe());
+    let mut inside_client = inside_daemon.connect();
+    let inside_session = inside_client.create_session("freeform", None);
+
+    let opened = transcript_result(&mut inside_client, &inside_session, "on");
+    assert_eq!(
+        opened["enabled"].as_bool(),
+        Some(true),
+        "AC-11: a `dir` inside the session root is ACCEPTED — the read refusal is \
+         the jail's (TASK-368), not this method's: {opened}"
+    );
+    assert!(
+        opened["degraded"].is_null(),
+        "and it is not degraded: {opened}"
+    );
+    let path = await_file(&inside_dir, &inside_session);
+    assert!(
+        path.starts_with(&inside.repo),
+        "the file really is inside the session root: {}",
+        path.display()
+    );
+}
+
+/// **BR-6 / AC-10: a write failure is announced once, degrades the status, and
+/// spares the turn.**
+///
+/// The failure is made real rather than injected. `transcript::writer`'s
+/// `Faults` seam is `#[cfg(test)]` and therefore unreachable from an
+/// integration binary, and a `chmod` cannot be trusted to fail for a suite that
+/// may run as root — so the fixture makes the transcript's own path
+/// **unopenable by any uid**: it is replaced with a directory while the file is
+/// closed, and the following `on` has to reopen it. `open_owner_only` refuses a
+/// path that is not a file, `ensure_open`'s resume arm reports that as
+/// `write_failure`, and the session degrades exactly as a full disk would.
+///
+/// The deviation from AC-10's literal wording — "the directory made unwritable
+/// mid-session" — is deliberate and is the honest version of it: an *already
+/// open* file descriptor keeps accepting writes however the directory is
+/// chmod'd, so a test that only widened permissions would be asserting nothing.
+/// The reopen is the shipped path a real I/O failure takes.
+///
+/// **Mutation (run, red):** remove the `if already { return; }` guard from
+/// `WriterTask::degrade`. The "exactly one" assertion fails with two
+/// `transcript_state { write_failure }` events. Restored.
+#[test]
+fn write_failure_announces_once_degrades_status_and_spares_the_turn() {
+    let provider = MockProvider::always(openai_turn("Done.", None, 120, 20));
+    let duties = duty_provider();
+    let ws = Workspace::new("transcript-ac10");
+    let dir = write_config(&ws, &provider, &duties, true);
+    let daemon = spawn(&ws, probe());
+    let mut client = daemon.connect();
+    let session = client.create_session("freeform", None);
+    client.prompt(&session, "Say something.");
+    let path = await_file(&dir, &session);
+
+    // Close the file, then make its path unopenable for anybody.
+    transcript_result(&mut client, &session, "off");
+    std::fs::remove_file(&path).expect("remove the transcript");
+    std::fs::create_dir(&path).expect("put a directory where the file was");
+
+    let failed = transcript_result(&mut client, &session, "on");
+    assert_eq!(
+        failed["enabled"].as_bool(),
+        Some(false),
+        "BR-6: a session whose file cannot be written reports the truth: {failed}"
+    );
+    let reason = failed["degraded"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the degraded reason reaches the asker: {failed}"))
+        .to_owned();
+    assert!(
+        !reason.is_empty(),
+        "the reason is a sentence, not an empty string"
+    );
+
+    client
+        .wait_for_event_where(
+            "transcript_state",
+            |event| event["reason"] == "write_failure",
+            WINDOW,
+        )
+        .expect("BR-6: the failure is announced in front of a human");
+    client.drain_events(Duration::from_millis(300));
+    let failures = state_events(&client)
+        .into_iter()
+        .filter(|(enabled, reason)| !enabled && reason == "write_failure")
+        .count();
+    assert_eq!(
+        failures,
+        1,
+        "AC-10: exactly one — a notice that repeats is one users learn to read \
+         past: {:?}",
+        state_events(&client)
+    );
+
+    // The status is honest from here on, and a turn still runs.
+    let status = transcript_result(&mut client, &session, "status");
+    assert_eq!(status["enabled"].as_bool(), Some(false), "{status}");
+    assert_eq!(
+        status["degraded"].as_str(),
+        Some(reason.as_str()),
+        "AC-10: `/transcript` reports the degraded reason: {status}"
+    );
+    let ran = client.prompt(&session, "Say something else.");
+    assert!(
+        ran.get("result").is_some(),
+        "AC-10: the turn is not failed by the transcript failing: {ran}"
+    );
+
+    // No further write attempts: the obstruction is untouched, and a second
+    // `on` does not re-announce.
+    client.drain_events(Duration::from_millis(300));
+    assert!(
+        path.is_dir() && std::fs::read_dir(&path).into_iter().flatten().count() == 0,
+        "nothing was written through the obstruction at {}",
+        path.display()
+    );
+    let retried = transcript_result(&mut client, &session, "on");
+    assert_eq!(
+        retried["enabled"].as_bool(),
+        Some(false),
+        "BR-6: a degraded session does not come back on: {retried}"
+    );
+    client.drain_events(Duration::from_millis(300));
+    assert_eq!(
+        state_events(&client)
+            .into_iter()
+            .filter(|(enabled, reason)| !enabled && reason == "write_failure")
+            .count(),
+        1,
+        "still exactly one: {:?}",
+        state_events(&client)
+    );
+}
+
+/// **BR-2: a durable change applies to sessions created afterwards, and to no
+/// session already running.**
+///
+/// The two lifetimes, on one daemon. A session created under `enabled = false`
+/// must be *unmoved* by a `config/set` that flips the durable default — its
+/// effective state stays off and it writes no file — while the very next
+/// session created on the same daemon records from its first record. Asserting
+/// both on one daemon is what makes this about the *rule* rather than about two
+/// differently-configured processes.
+///
+/// The durable write itself is proven on disk by
+/// `config_set_attestation.rs::set_transcript_enabled_writes_on_accept_and_nothing_on_refuse`;
+/// what is asserted here is which sessions it reaches.
+///
+/// **Mutation (run, red):** make `transcript_session_created` read a cached
+/// startup value instead of the live config — concretely, capture
+/// `config.transcript.enabled` into a field at construction and read that. The
+/// later session then gets no file and the second half fails. Restored.
+#[test]
+fn a_durable_change_applies_to_later_sessions_only() {
+    let provider = MockProvider::always(openai_turn("Done.", None, 120, 20));
+    let duties = duty_provider();
+    let ws = Workspace::new("transcript-br2");
+    let dir = write_config(&ws, &provider, &duties, false);
+    let daemon = spawn(&ws, probe());
+    let mut client = daemon.connect();
+
+    let before = client.create_session("freeform", None);
+    client.prompt(&before, "Say something.");
+    client.drain_events(Duration::from_millis(200));
+
+    let applied = client.call(
+        "config/set",
+        json!({ "update": { "op": "set_transcript_enabled", "enabled": true } }),
+    );
+    assert_eq!(
+        applied["result"]["applied"].as_bool(),
+        Some(true),
+        "the durable default must apply: {applied}\ndaemon log:\n{}",
+        daemon.log()
+    );
+    let snapshot = client.config_get();
+    assert_eq!(
+        snapshot["transcript"]["enabled"].as_bool(),
+        Some(true),
+        "AC-20: `config/get` reports the posture doctor renders: {snapshot}"
+    );
+
+    // BR-2: the running session is untouched.
+    let untouched = transcript_result(&mut client, &before, "status");
+    assert_eq!(
+        untouched["enabled"].as_bool(),
+        Some(false),
+        "BR-2: a durable change does not move a session that is already running: \
+         {untouched}"
+    );
+    client.prompt(&before, "Say something else.");
+    client.drain_events(Duration::from_millis(200));
+    assert!(
+        transcript_files(&dir).is_empty(),
+        "and it still writes nothing: {:?}",
+        transcript_files(&dir)
+    );
+
+    // …and the next session created reads the new default.
+    let after = client.create_session("freeform", None);
+    let path = await_file(&dir, &after);
+    assert!(
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains(&after)),
+        "the file belongs to the session created after the change: {}",
+        path.display()
+    );
+    assert_eq!(
+        transcript_files(&dir).len(),
+        1,
+        "exactly one session records: {:?}",
+        transcript_files(&dir)
+    );
+    let recording = transcript_result(&mut client, &after, "status");
+    assert_eq!(
+        recording["enabled"].as_bool(),
+        Some(true),
+        "BR-2: the session created afterwards starts from the new default: {recording}"
     );
 }

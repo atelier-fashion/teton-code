@@ -122,7 +122,7 @@ use teton_protocol::events::{
     ModelLifecycle, ModelLifecycleStage, NotRunReason, PermissionSubject, PrivacyAction,
     ProviderTested, RemedyKind, SessionRootChanged, SessionTitled, SkillInvoked,
     SkillOverBudgetAccepted, SkillOverBudgetOffered, SkillOverBudgetRemedyApplied,
-    SkillStage as WireSkillStage, TierWarming, TurnQueued,
+    SkillStage as WireSkillStage, TierWarming, TranscriptStateReason, TurnQueued,
     WebCapabilityState as WireWebCapabilityState, WebLookup, WebSetupCompleted, WebTaintOverridden,
     WebTier as WireWebTier,
 };
@@ -135,11 +135,11 @@ use teton_protocol::methods::{
     ProviderSetupCandidate, ProviderSetupCommitResult, ProviderSetupPlanResult,
     ProviderSetupPreviewResult, ProviderTestOutcome, ProviderTestResult, SessionClearParams,
     SessionClearResult, SessionPermissionsParams, SessionPermissionsResult, SessionSetCwdParams,
-    SessionSetCwdResult, SkillInvocation, TierBinding as WireTierBinding, TierBindingConfig,
-    TierRouteView, TierSummary, WebOverrideParams, WebOverrideResult, WebRefreshOutcome,
-    WebRefreshParams, WebRefreshResult, WebSetupCommitParams, WebSetupCommitResult,
-    WebSetupPlanResult, WebSetupPreviewParams, WebSetupPreviewResult, WebTableSummary,
-    WebTotalsView,
+    SessionSetCwdResult, SessionTranscriptParams, SessionTranscriptResult, SkillInvocation,
+    TierBinding as WireTierBinding, TierBindingConfig, TierRouteView, TierSummary,
+    TranscriptAction, WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams,
+    WebRefreshResult, WebSetupCommitParams, WebSetupCommitResult, WebSetupPlanResult,
+    WebSetupPreviewParams, WebSetupPreviewResult, WebTableSummary, WebTotalsView,
 };
 use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::{
@@ -3195,7 +3195,16 @@ impl DaemonRuntime {
             self.local_tier_available(),
             &self.health_snapshot(),
         );
-        snapshot_from_config(&config, &router, self.local_model_present())
+        // REQ-611 AC-20: composed here, from the same one-home function the sink
+        // and the tool denial use, and handed to the projection rather than
+        // reached for inside it (see `snapshot_from_config`).
+        let transcript_dir = turn::effective_transcript_dir(&config.transcript);
+        snapshot_from_config(
+            &config,
+            &router,
+            self.local_model_present(),
+            &transcript_dir,
+        )
     }
 
     /// Each provider's health as routing should see it right now: the persisted
@@ -3865,6 +3874,108 @@ impl DaemonRuntime {
             // might not have performed.
             level: gate.level().unwrap_or_default(),
             changed,
+        }
+    }
+
+    /// Switch or read one session's transcript (`session/transcript`, REQ-611
+    /// ADR-6).
+    ///
+    /// The session-lifetime half of BR-2. Nothing here touches `self.config` or
+    /// the config file: `/transcript on` moves one session and writes no byte
+    /// to disk, exactly as `session/permissions` moves one gate and never
+    /// writes `[permissions]`. The durable half is
+    /// [`ConfigUpdate::SetTranscriptEnabled`], which travels through
+    /// `config/set` and its gates.
+    ///
+    /// # Why it awaits
+    ///
+    /// [`crate::transcript::TranscriptSink::set_enabled`] hands the switch to
+    /// the writer thread and returns; the file is opened, refused, or resumed
+    /// over there. Answering before that settles would report `path: None` on a
+    /// successful `on` and, worse, `enabled: true` on an `on` the directory is
+    /// about to refuse — a reply that is wrong for as long as it takes a
+    /// syscall to run, which is exactly the window a test wins on a quiet
+    /// machine and loses on a loaded one. So it flushes: the flush rides the
+    /// same channel as the switch, so the writer has necessarily processed the
+    /// switch by the time it replies, and the status read afterwards is the
+    /// settled truth. The handler runs this off the reader loop for that
+    /// reason (`server::handle_client`).
+    ///
+    /// # What is published, and what is only answered
+    ///
+    /// BR-15: an effective-state *change* publishes `transcript_state` with
+    /// [`TranscriptStateReason::SessionCommand`] to the session's attached
+    /// connections and monitors, carrying no path; the path goes back to the
+    /// asking connection as this result and nowhere else.
+    ///
+    /// Published only when the effective state actually moved. A second
+    /// `/transcript on` changes nothing, and a notice that repeats is one users
+    /// learn to read past (LESSON-513). A refusal publishes nothing here
+    /// either — the sink's degradation hook has already published
+    /// `transcript_state { false, dir_refused }` with the reason that is true,
+    /// and an `enabled: true` ahead of it would be news that never happened.
+    ///
+    /// # A degraded session answers honestly rather than optimistically
+    ///
+    /// The sink refuses to re-enable a session that stopped on a write failure
+    /// (BR-6) and refuses silently, because the refusal has a sentence and the
+    /// sink is not the surface that says it. This is: the result carries
+    /// `enabled: false` and the `degraded` reason, so a client can tell the
+    /// user why their `on` did nothing instead of reporting a recording that
+    /// will never write a byte.
+    ///
+    /// A runtime with no sink — `Self::minimal`, and any future build that
+    /// constructs one — answers "not recording, no file, nothing degraded"
+    /// rather than erroring: there is no transcript, which is a state, not a
+    /// failure.
+    pub async fn session_transcript(
+        &self,
+        params: &SessionTranscriptParams,
+        events: &Arc<EventBus>,
+    ) -> SessionTranscriptResult {
+        let Some(sink) = self.transcript.as_ref() else {
+            return SessionTranscriptResult {
+                enabled: false,
+                path: None,
+                records: 0,
+                degraded: None,
+            };
+        };
+        let before = sink.status(&params.session_id).unwrap_or_default();
+        if let Some(enabled) = match params.action {
+            TranscriptAction::On => Some(true),
+            TranscriptAction::Off => Some(false),
+            TranscriptAction::Status => None,
+        } {
+            // The bus's current sequence number is *peeked*, never minted:
+            // `transcript_resumed` records where in the daemon-wide numbering
+            // the session came back, and spending a number to say so would put
+            // a hole in every attached client's stream for a fact no client
+            // sees (`transcript_session_created`'s reason, verbatim).
+            sink.set_enabled(&params.session_id, enabled, events.current_seq());
+        }
+        // Flushed for **all three** actions, `Status` included. A record handed
+        // to the sink a microsecond ago is not on disk yet, and BR-15 asks
+        // `/transcript` for the record count — a bare read that answered from
+        // an unsettled counter would tell the user a number the file does not
+        // hold, which is the same class of wrong answer as reporting a path
+        // before the file exists.
+        sink.flush().await;
+        let after = sink.status(&params.session_id).unwrap_or_default();
+        if after.enabled != before.enabled {
+            events.publish(
+                Some(params.session_id.clone()),
+                Event::TranscriptState(teton_protocol::events::TranscriptState {
+                    enabled: after.enabled,
+                    reason: TranscriptStateReason::SessionCommand,
+                }),
+            );
+        }
+        SessionTranscriptResult {
+            enabled: after.enabled,
+            path: after.path.map(|path| path.display().to_string()),
+            records: after.records,
+            degraded: after.degraded,
         }
     }
 
@@ -7300,7 +7411,8 @@ pub(crate) mod testsupport;
 #[cfg(test)]
 mod tests {
     use super::testsupport::{
-        config_with_remote, router_for_config, scratch_dir, scratch_root, set_dir_readonly,
+        a_transcript_dir, config_with_remote, router_for_config, scratch_dir, scratch_root,
+        set_dir_readonly,
     };
     use super::*;
     use crate::fixture_id;
@@ -8279,7 +8391,12 @@ provider_id = "on-device"
 
         // And the resolver reports the override as an override, which is what
         // `teton policy show` prints — not a re-derivation from the reason.
-        let snap = snapshot_from_config(&config, &router_for_config(&config), false);
+        let snap = snapshot_from_config(
+            &config,
+            &router_for_config(&config),
+            false,
+            a_transcript_dir(),
+        );
         let review = snap
             .routing
             .iter()
@@ -18966,7 +19083,7 @@ provider_id = \"deepseek\"
             // not what runs.
             let config = config_capped_at(500);
             let router = router_for_config(&config);
-            let snap = snapshot_from_config(&config, &router, false);
+            let snap = snapshot_from_config(&config, &router, false, a_transcript_dir());
             let row = snap
                 .providers
                 .iter()
@@ -18990,7 +19107,12 @@ provider_id = \"deepseek\"
             // The twin, differing only in the cap: an honoured declaration adds
             // no cell at all, so an ordinary `/doctor` is byte-identical.
             let honoured = config_capped_at(0);
-            let snap = snapshot_from_config(&honoured, &router_for_config(&honoured), false);
+            let snap = snapshot_from_config(
+                &honoured,
+                &router_for_config(&honoured),
+                false,
+                a_transcript_dir(),
+            );
             let row = snap
                 .providers
                 .iter()

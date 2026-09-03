@@ -643,3 +643,132 @@ fn the_remedys_gate_sits_at_its_own_door_and_not_in_the_shared_config_body() {
         "…and the production loader agrees with the bytes"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REQ-611 BR-16 / AC-6 — SetTranscriptEnabled, the durable transcript default
+// ---------------------------------------------------------------------------
+
+/// The durable transcript default, as `config/set` carries it (REQ-611 ADR-5).
+///
+/// A payload that **would** persist if the gate were bypassed (LESSON-520):
+/// `base_config` names no `[transcript]` table at all, and `enabled = true` is
+/// not the shipped default, so an applied write necessarily adds bytes and a
+/// refused one necessarily leaves the file alone. A payload that merely
+/// restated the default would leave the file identical either way and the
+/// refusal leg would prove nothing.
+fn enable_transcripts() -> Value {
+    json!({ "update": { "op": "set_transcript_enabled", "enabled": true } })
+}
+
+/// **REQ-611 BR-16 / AC-6: the durable transcript switch writes on an attested
+/// seam and writes nothing on a refused one.**
+///
+/// Both legs in one test, on the same fixture and the same payload, because
+/// each is what makes the other mean something: the accepting leg proves the
+/// payload is persistable, which is what stops the refusing leg's
+/// byte-identical assertion from being satisfied by a write that could never
+/// have happened (LESSON-520, and the shape the two pairs above already take).
+///
+/// The evidence is the **bytes and a re-parse**, never the error code
+/// (LESSON-519): `config.toml` is read back and handed to the production
+/// `Config::load`, so what is asserted is that the daemon's own loader agrees a
+/// durable transcript default is now in force — not that a string appeared in a
+/// file.
+///
+/// ADR-5's inheritance claim is what is really under test. `SetTranscriptEnabled`
+/// adds no gate of its own and gets no exemption; it is refused here **because**
+/// `config/set` refuses, which is the whole argument for putting the durable
+/// switch on this method rather than a new one.
+///
+/// **Mutation (run, red):** delete the `refuse_unattested_commitment` call from
+/// `handle_config_set` — the one gate line, per LESSON-520's instruction for
+/// AC-6. The refusing leg then applies the update, and this test fails on the
+/// `ATTESTATION_FAILED` assertion and again on the byte-identical one, naming
+/// the `[transcript]` table that appeared. The accepting leg stays green, which
+/// is the right split: it is the payload that is being shown persistable, and a
+/// deleted gate does not stop a legitimate write. Restored.
+/// **Mutation (LESSON-520, run 2026-09-03):** deleting the
+/// `refuse_unattested_commitment` line from `handle_config_set` turned this
+/// test red at the refuse leg — `ADR-5: the transcript default inherits
+/// config/set's presence gate with no exemption` with `left: None,
+/// right: Some(-32015)` and `"applied":true` in the response — so the
+/// assertion is load-bearing and the payload would persist if the gate were
+/// bypassed. Restored; green again.
+#[test]
+fn set_transcript_enabled_writes_on_accept_and_nothing_on_refuse() {
+    // --- refused: nothing on disk, nothing in the running config ---
+    let refused_ws = Workspace::new("configset-transcript-refused");
+    refused_ws.write_config(&base_config());
+    let refused_daemon = Daemon::spawn(&refused_ws, probe_with_presence("fail"));
+    let mut refused_client = refused_daemon.connect();
+    let before = std::fs::read(&refused_ws.config_path).expect("config exists");
+    assert!(
+        !String::from_utf8_lossy(&before).contains("transcript"),
+        "the fixture must start with no [transcript] table, or 'nothing was \
+         written' is unfalsifiable"
+    );
+
+    let refused = refused_client.call("config/set", enable_transcripts());
+    assert_eq!(
+        refused["error"]["code"].as_i64(),
+        Some(ATTESTATION_FAILED),
+        "ADR-5: the transcript default inherits config/set's presence gate with no \
+         exemption: {refused}\ndaemon log:\n{}",
+        refused_daemon.log()
+    );
+    assert_eq!(
+        std::fs::read(&refused_ws.config_path).ok().as_deref(),
+        Some(before.as_slice()),
+        "BR-16: a refused SetTranscriptEnabled must leave config.toml byte-identical"
+    );
+    assert!(
+        !Config::load(&String::from_utf8_lossy(
+            &std::fs::read(&refused_ws.config_path).expect("config exists")
+        ))
+        .expect("the untouched document still loads")
+        .transcript
+        .enabled,
+        "BR-16: and the production loader agrees nothing was recorded"
+    );
+    let refused_snapshot = refused_client.call("config/get", json!({}));
+    assert_eq!(
+        refused_snapshot["result"]["snapshot"]["transcript"]["enabled"].as_bool(),
+        Some(false),
+        "the refused default must not appear in the running config: {refused_snapshot}"
+    );
+    drop(refused_client);
+    drop(refused_daemon);
+
+    // --- attested: the same payload lands, and the loader reads it back ---
+    let ws = Workspace::new("configset-transcript-attested");
+    ws.write_config(&base_config());
+    let daemon = Daemon::spawn(&ws, probe_with_presence("1"));
+    let mut client = daemon.connect();
+    let before = std::fs::read(&ws.config_path).expect("config exists");
+
+    let applied = client.call("config/set", enable_transcripts());
+    assert_eq!(
+        applied["result"]["applied"].as_bool(),
+        Some(true),
+        "an attested SetTranscriptEnabled must apply: {applied}\ndaemon log:\n{}",
+        daemon.log()
+    );
+    assert_ne!(
+        std::fs::read(&ws.config_path).ok().as_deref(),
+        Some(before.as_slice()),
+        "the attested write must actually change config.toml (so the refused leg's \
+         byte-identical assertion means something)"
+    );
+    let document = std::fs::read_to_string(&ws.config_path).expect("config exists");
+    let reloaded = Config::load(&document).expect("the written document must load");
+    assert!(
+        reloaded.transcript.enabled,
+        "AC-6: read back and RE-PARSED, not matched as a string:\n{document}"
+    );
+    let snapshot = client.call("config/get", json!({}));
+    assert_eq!(
+        snapshot["result"]["snapshot"]["transcript"]["enabled"].as_bool(),
+        Some(true),
+        "and the live config swapped too: {snapshot}"
+    );
+}
