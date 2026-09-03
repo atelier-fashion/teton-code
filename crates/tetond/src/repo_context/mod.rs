@@ -376,7 +376,11 @@ impl RepoFileReader for RealFiles {
         // refusal has one sentence.
         let handle = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            // `O_NONBLOCK` beside `O_NOFOLLOW`: a FIFO swapped in between the
+            // pre-open `metadata` and this `open` would otherwise block the
+            // opener until a writer appears (REQ-612 verify, Low); with the
+            // flag the open returns at once and `is_file()` below refuses it.
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
             .map_err(map_open)?;
         // And the half `O_NOFOLLOW` cannot do: the caller's `lstat` was of
@@ -878,9 +882,13 @@ impl RepoContext {
     ///
     /// A state with no stored key ([`RepoContextState::Absent`],
     /// `WithheldBoundary`, `Unreadable`) asks the caller to re-run [`Self::load`]
-    /// and to report only a *difference*. That is one or two `stat`s and still no
-    /// read — none of those paths reaches the read — and it is what lets a
-    /// `TETON.md` created mid-session become resident at the next prompt.
+    /// and to report only a *difference*. For `Absent` and `WithheldBoundary`
+    /// that is one or two `stat`s and no read; an `Unreadable` whose reason was
+    /// produced *by* the read (`Changed`, `NotUtf8`, `Unavailable`) re-runs the
+    /// gate chain including the bounded read on every prompt until the file is
+    /// fixed — a stated cost, not a silent one, because the first occurrence is
+    /// announced (REQ-612 verify, Low). This is what lets a `TETON.md` created
+    /// mid-session become resident at the next prompt.
     ///
     /// **A newly created `TETON.md` beside a loaded `AGENTS.md` waits for the
     /// next `session/create` or `/cd`.** Seeing it would cost a second `stat` on
