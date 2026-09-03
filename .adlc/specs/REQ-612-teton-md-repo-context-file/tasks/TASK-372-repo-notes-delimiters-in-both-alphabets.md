@@ -1,7 +1,7 @@
 ---
 id: TASK-372
 title: "The `<repo-notes>` delimiter pair joins the input alphabet and both output marker sets"
-status: draft
+status: complete
 parent: REQ-612
 repo: teton-code
 created: 2026-09-03
