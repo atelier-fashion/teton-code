@@ -3,10 +3,40 @@
   "branch": "feat/REQ-613-generate-teton-md-when-absent",
   "startedAt": "2026-09-03T23:34:45Z",
   "completed": false,
-  "currentPhase": 0,
-  "completedPhases": [],
+  "currentPhase": 4,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3
+  ],
   "integrationBranch": "main",
-  "phaseHistory": [],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Resolve Repos + Worktree + Preflight + Draft PR",
+      "completedAt": "2026-09-03T23:34:50Z",
+      "notes": "single-repo; worktree /Users/brettluelling/GitHub/teton-code/.worktrees/REQ-613 from origin/main af3a1a4+; draft PR #283"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Requirement Spec",
+      "completedAt": "2026-09-03T23:35:28Z",
+      "verdict": "APPROVED (validated 2026-09-03 earlier this session, AC-14 ordinal fixed; re-checked at gate)"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Break Into Tasks",
+      "completedAt": "2026-09-03T23:35:28Z",
+      "notes": "architecture.md (8 ADRs) and TASK-379..389 produced by /architect earlier this session, landed in #280; single repo, mergeOrder [teton-code]"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-09-03T23:35:28Z",
+      "verdict": "VALIDATED \u2014 11 tasks, DAG acyclic, max 3 deps, 23/24 obligations mapped (AC-13 dogfood unmapped by design), benign paths present"
+    }
+  ],
   "repos": {
     "teton-code": {
       "primary": true,
@@ -14,9 +44,9 @@
       "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-613",
       "branch": "feat/REQ-613-generate-teton-md-when-absent",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
-      "prCreatedAt": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/283",
+      "prNumber": 283,
+      "prCreatedAt": "2026-09-03T23:34:48Z",
       "merged": false,
       "snapshotBranch": null,
       "snapshotPR": null
