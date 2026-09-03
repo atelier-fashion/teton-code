@@ -552,7 +552,13 @@ fn attribute_field(raw: &str, max_chars: usize) -> String {
 /// round-trips, and a `&quot;` in it would be a second thing to explain. One
 /// character out for one character in, so the bound above still holds after
 /// this runs.
-fn escape_attribute(raw: &str) -> String {
+///
+/// `pub(crate)` for the second frame line in the daemon that has an attribute
+/// list: `repo_context::render` opens its block with `file="TETON.md"` and
+/// renders that value through this helper as ADR-4 asks (REQ-612). A copy there
+/// would be a second rule for one structural question, and the two would be
+/// identical only until one of them was edited.
+pub(crate) fn escape_attribute(raw: &str) -> String {
     raw.chars()
         .map(|c| match c {
             '"' => '\'',

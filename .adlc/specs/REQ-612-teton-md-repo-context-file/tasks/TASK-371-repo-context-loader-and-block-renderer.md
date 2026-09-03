@@ -1,7 +1,7 @@
 ---
 id: TASK-371
 title: "The `repo_context` module: load, bound, strip, truncate, frame, and mint provenance"
-status: draft
+status: complete
 parent: REQ-612
 repo: teton-code
 created: 2026-09-03
@@ -35,27 +35,27 @@ of BR-5 (mint the identity, refuse a covered file).
 
 ## Acceptance Criteria
 
-- [ ] BR-1: only a `project`-kind root is read; `TETON.md` wins over `AGENTS.md`; a symlinked
+- [x] BR-1: only a `project`-kind root is read; `TETON.md` wins over `AGENTS.md`; a symlinked
       entry is not followed (state `Unreadable` naming the reason); `EPERM` is `Unreadable`
       with a bounded reason; a missing file is `Absent` after exactly one `stat` per candidate
       and no read; nothing above or below the root is opened (the fixture records every path
       asked for).
-- [ ] BR-3: a file of cap + 1 byte is `Truncated` at the last `\n` under the cap with the
+- [x] BR-3: a file of cap + 1 byte is `Truncated` at the last `\n` under the cap with the
       marker naming the cap and the bytes dropped; a file exactly at the cap is `Loaded` whole
       with no marker; a 10 MiB file is read to `REPO_CONTEXT_READ_CEILING_BYTES` and no further
       (the fixture counts bytes served).
-- [ ] BR-4: control characters and bidi overrides are stripped **before** the cap is measured
+- [x] BR-4: control characters and bidi overrides are stripped **before** the cap is measured
       (a file of 8,192 printable bytes plus 500 NULs is `Loaded` whole); the frame lines are
       byte-exact against a golden; `escape_attribute` is used for the file attribute.
-- [ ] BR-5 (load half): a covered identity (planted `local-only` glob) yields
+- [x] BR-5 (load half): a covered identity (planted `local-only` glob) yields
       `WithheldBoundary` with no block; an uncovered one yields a block whose `provenance` equals
       `ProvenanceId::from_resolved(root, path)`; the switch off yields `WithheldOff` with zero
       reader calls.
-- [ ] `refresh` returns `None` when `mtime` and `len` match and the boundary verdict is
+- [x] `refresh` returns `None` when `mtime` and `len` match and the boundary verdict is
       unchanged; `Some` on either change; it never reads when it returns `None`.
-- [ ] `worst_case().text.len()` equals the rendered length of a cap-sized file plus the frame —
+- [x] `worst_case().text.len()` equals the rendered length of a cap-sized file plus the frame —
       asserted against `render` of a synthesized file, not a literal.
-- [ ] Rendering the same file at an effective cap of 4,096 (a floored route) truncates at that
+- [x] Rendering the same file at an effective cap of 4,096 (a floored route) truncates at that
       figure and the marker names 4,096, not 8,192.
 
 ## Verification

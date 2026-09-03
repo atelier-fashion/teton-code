@@ -86,6 +86,12 @@
 //!   up with, and the age-based prune over its own files. Its record kinds are
 //!   daemon types on purpose (ADR-2) — nothing here widens the bus, and the one
 //!   thing that *is* published, `transcript_state`, carries no path.
+//! - [`repo_context`] — the repository's own notes at the session root
+//!   (REQ-612 BR-1): `TETON.md`, then `AGENTS.md`, read behind a two-method
+//!   filesystem seam, jailed and identified by `ToolContext::resolve`, refused
+//!   when a privacy boundary covers it, and rendered as the bounded, sanitized
+//!   block that is the last region of the system prompt. Pure over the seam;
+//!   the sessions and turns that carry the block are elsewhere.
 //! - [`single_instance`] — the `flock`-based single-instance guard.
 //!
 //! Socket and lock path resolution lives in the shared
@@ -115,6 +121,7 @@ pub mod model_consent;
 pub mod peer;
 pub mod projects;
 pub mod provider_recipes;
+pub mod repo_context;
 pub mod router;
 pub mod runtime;
 pub mod selection_store;
