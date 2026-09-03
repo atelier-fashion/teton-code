@@ -53,5 +53,9 @@ withheld advisories.
 
 ## Technical Notes
 
+**Already landed by the orchestrator (commit after TASK-370):** a minimal `Event::RepoContextState` arm in
+`crates/teton/src/session_ui.rs::render_event` (truncated/withheld/unreadable lines always; `loaded` under
+`/verbose`; `absent` silent). Replace it with the full rendering this task specifies rather than adding a second arm.
+
 The status line is TTY-gated and its content is a pure function (REQ-560 BR-8); do not add a
 status-row field for this — `/context` bare is the non-visual read path (REQ-560 BR-10).

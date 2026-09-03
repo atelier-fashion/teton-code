@@ -65,6 +65,10 @@ ordering half of AC-2.
 
 ## Technical Notes
 
+**Already landed by the orchestrator (commit after TASK-370):** the `ConfigUpdate::SetRepoContextEnabled`
+arms in `runtime/turn.rs` (restates: None), `runtime/mod.rs::reject_unusable_binding` (Ok) and
+`runtime/mod.rs::apply_update` (`config.context.repo_file = enabled`). Do not re-add them; build on them.
+
 The refresh runs on the claiming turn only (REQ-583 ADR-4: re-read after the claim). Do not put
 the event on `EventBus::publish` from inside the sessions mutex — publish after the store, as
 `set_session_cwd` does. Never use `block_in_place` for a `stat`; it is one syscall.

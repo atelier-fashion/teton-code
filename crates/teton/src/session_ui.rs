@@ -759,6 +759,34 @@ pub fn render_event(
             surface.line(LineKind::Notice, &line);
             EventOutcome::Rendered
         }
+        Event::RepoContextState(rc) => {
+            // REQ-612 BR-3/BR-7: a truncated or withheld notes file is never
+            // silent; a plain `loaded` is chrome and rides `/verbose` like the
+            // routing notices. TASK-376 owns the full rendering (bytes, cap,
+            // source); this arm is the minimum that keeps the exhaustive match
+            // honest after TASK-370 added the event.
+            use teton_protocol::methods::RepoContextStateKind as K;
+            let line = match rc.state {
+                K::Truncated => Some(format!(
+                    "context: repository notes truncated — {} of {} bytes resident (see /context)",
+                    rc.resident_bytes, rc.bytes_on_disk
+                )),
+                K::WithheldBoundary => Some(
+                    "context: repository notes are inside a local-only boundary and were not loaded".to_owned(),
+                ),
+                K::WithheldOff => Some("context: repository notes are off (see /context)".to_owned()),
+                K::Unreadable => Some("context: repository notes could not be read (see /context)".to_owned()),
+                K::Loaded if state.verbose => Some(format!(
+                    "context: repository notes loaded ({} bytes resident)",
+                    rc.resident_bytes
+                )),
+                K::Loaded | K::Absent => None,
+            };
+            if let Some(line) = line {
+                surface.line(LineKind::Notice, &line);
+            }
+            EventOutcome::Rendered
+        }
         Event::PrefixCache(cache) => {
             // Diagnostic chrome, not news: prefix reuse is a pure latency
             // optimization and BR-1 makes it unobservable in output, so a user

@@ -2977,7 +2977,8 @@ impl DaemonRuntime {
                 | ConfigUpdate::SetCategoryBinding(_)
                 | ConfigUpdate::SetPrivacyBoundary(_)
                 | ConfigUpdate::SetEffort(_)
-                | ConfigUpdate::SetTranscriptEnabled { .. } => None,
+                | ConfigUpdate::SetTranscriptEnabled { .. }
+                | ConfigUpdate::SetRepoContextEnabled { .. } => None,
             };
             self.apply_config_update_guarded(update, |config| {
                 if let Some(restates) = &restates {

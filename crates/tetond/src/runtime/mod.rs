@@ -7094,7 +7094,8 @@ fn reject_unusable_binding(config: &Config, update: &ConfigUpdate) -> Result<(),
         ConfigUpdate::RegisterProvider(_)
         | ConfigUpdate::SetPrivacyBoundary(_)
         | ConfigUpdate::SetEffort(_)
-        | ConfigUpdate::SetTranscriptEnabled { .. } => {
+        | ConfigUpdate::SetTranscriptEnabled { .. }
+        | ConfigUpdate::SetRepoContextEnabled { .. } => {
             return Ok(());
         }
     };
@@ -7129,6 +7130,11 @@ fn apply_update(config: &mut Config, update: ConfigUpdate) {
         // persisted config so sessions created afterwards start from it; a
         // running session's effective state is the sink's and is untouched.
         ConfigUpdate::SetTranscriptEnabled { enabled } => config.transcript.enabled = enabled,
+        // REQ-612 BR-2: the durable `[context] repo_file` switch, through the
+        // same write path as the transcript's (ADR-6). TASK-374 owns the
+        // behaviour that reads it; this arm exists so the variant TASK-370
+        // added compiles at every exhaustive match.
+        ConfigUpdate::SetRepoContextEnabled { enabled } => config.context.repo_file = enabled,
         ConfigUpdate::RegisterProvider(pc) => {
             let id = pc.id.0;
             // BUG-155: re-registering an existing id keeps the capability
