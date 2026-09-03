@@ -98,15 +98,8 @@
     ]
   },
   "conflictsResolved": [],
-  "blockers": [
-    {
-      "kind": "reflector-questions",
-      "phase": 5,
-      "questions": [
-        "floored-route headroom: MIN_BUDGET_BYTES (16,384) vs system prompt with a 4,096-byte block = 11,274 bytes (69% of the floor) \u2014 raise MIN_BUDGET_BYTES to >= 22,548, withhold notes on floored routes, or accept and amend BR-3?",
-        "teton_docs context topic: four pre-existing facts were trimmed to fit the 4,096-byte ceiling (bound wire spellings, /provider setup window recording, cap-above-window advisory, >256k declaration notice) \u2014 accept, or restore by raising the topic ceiling?",
-        "AC-13 dogfood is OUTSTANDING and needs a local engine build and a TETON.md at this repo's root \u2014 who runs it, and does this repo's TETON.md land in REQ-612 or REQ-613?"
-      ]
-    }
+  "blockers": [],
+  "notes": [
+    "2026-09-03T22:41:57Z halt #2 resolved by product owner: (1) MIN_BUDGET_BYTES raised to 50,000 so a floored route carries the full 8 KiB block under the 2x invariant; (2) MAX_TOPIC_BYTES raised to 50,000 and the four trimmed context-topic facts restored; (3) not decided \u2014 assumed: AC-13 stays OUTSTANDING and this repo's own TETON.md waits for REQ-613 to generate it"
   ]
 }
