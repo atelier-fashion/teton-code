@@ -18,6 +18,59 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [0.1.29] - 2026-09-03
+
+### Added
+
+- **A per-session transcript you can switch on and off (REQ-611).** Until now
+  nothing a session did survived it: the conversation lived in daemon memory
+  and the only durable trace was the daemon's own stderr. A session can now be
+  recorded to one append-only JSONL file — every event the session's clients
+  saw, plus the prompt, each tool's input and result, and each permission
+  decision — with a contiguous record number, an explicit `transcript_gap`
+  record whenever the sink could not keep up, marked truncation of oversized
+  fields, and age-based retention. The format is plain JSONL and is documented
+  in [`docs/transcript-format.md`](docs/transcript-format.md).
+
+  **Two switches, two lifetimes.** `[transcript] enabled = true` in
+  `config.toml` records every session created afterwards; `/transcript on` and
+  `/transcript off` switch the current session only and are never written to
+  disk; bare `/transcript` prints the state, the file, the record count and any
+  degraded reason. `teton transcript enable|disable|status` is the shell
+  surface of the durable switch (it is deliberately not a twin of the session
+  command). `teton doctor` and `/doctor` print one `transcript:` line.
+
+  **Upgrading changes nothing until you opt in.** The default is off, and off
+  means no file, no directory and no sink. When on, files live under
+  `~/Library/Application Support/teton/transcripts` on macOS and
+  `$XDG_DATA_HOME/teton/transcripts` (`~/.local/share/teton/transcripts`) on
+  Linux, owner-only (`0700`/`0600`), pruned after `retain_days` (30; `0` keeps
+  them forever). A directory that is wider than owner-only is refused rather
+  than reused.
+
+  **The session's own tools cannot read it.** The transcript directory is a
+  denied prefix for `read`, `edit`, `grep` and `glob`, inside or outside the
+  session root, so a prompt-injected model cannot pull a transcript back into
+  context. `shell` remains the one named exception (as for every path rule);
+  what it prints carries unknown provenance and is held at egress while any
+  privacy boundary is in force — which, since 0.1.26, is every stock install.
+
+  **What never lands in the file:** the transcript records wire events
+  verbatim, and no event carries a credential — keys entered through
+  `/web setup` or `/provider add` reach the keychain and nothing else. The
+  `[privacy] redact` scan does not run over transcript writes; the file is
+  written unredacted on purpose, and its `transcript_opened` record states
+  what the egress posture was.
+
+### Changed
+
+- **Internal: the event bus gained a tap.** A daemon-side consumer that must
+  not be evicted (the transcript sink) observes every session-scoped envelope
+  before fan-out; clients and monitors are unaffected. The wire protocol stays
+  at version 2: the new `transcript_state` event, the `session/transcript`
+  method and the `config/get` `transcript` field are additive, on the same
+  footing as `context_pressure` and `skills/preflight` before them.
+
 ## [0.1.28] - 2026-09-03
 
 ### Changed
