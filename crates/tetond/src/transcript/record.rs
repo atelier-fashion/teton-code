@@ -646,6 +646,116 @@ mod tests {
         );
     }
 
+    /// BR-14 / TASK-367 — every `kind` a [`Record`] can write is described in
+    /// `docs/transcript-format.md`.
+    ///
+    /// The enum is the source of truth and the document is what has to keep up,
+    /// so the names are read off [`Record::kind`]'s own arms rather than
+    /// re-typed here. `kind` matches without a wildcard, so a ninth sink-local
+    /// variant cannot compile without an arm; the arm's literal is then picked
+    /// up by the scan below and has to reach the document before this test is
+    /// green again. A hand-written list would go stale in exactly the case the
+    /// test exists for.
+    ///
+    /// The scan is bounded and floored, per the conventions' rules for a check
+    /// that reads its own source: the corpus is cut at this file's
+    /// `#[cfg(test)]` so the scanner cannot match its own patterns, it is then
+    /// sliced to the one function body rather than to the rest of the file, and
+    /// the eight sink-local kinds are a vacuity floor — a slice that stopped
+    /// matching the function would otherwise pass forever, having found nothing
+    /// to check.
+    ///
+    /// [`Record::BusEnvelope`] contributes no literal: its `kind` is the
+    /// envelope's own wire name, which `teton-protocol` defines and the
+    /// document describes as a class. The last leg pins the worked example the
+    /// document uses for it.
+    ///
+    /// **Shown to fail** (mutation, restored): renaming every `transcript_gap`
+    /// mention in the document makes it red — `` `transcript_gap` is written by
+    /// the sink but not described in … ``. Renaming only the *row* in the kind
+    /// table does not, because the prose above it names the kind too; the
+    /// assertion is "the document says this word", which is the weakest claim
+    /// worth making mechanically and the strongest one a substring can carry.
+    /// Raising `FLOOR` to 9 shows the other arm red at "the scan found 8".
+    #[test]
+    fn every_record_kind_is_documented_in_the_format_doc() {
+        /// The sink-local kinds that exist today; a floor, not a count.
+        const FLOOR: usize = 8;
+
+        let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/transcript-format.md");
+        let doc = std::fs::read_to_string(&doc_path).unwrap_or_else(|err| {
+            panic!(
+                "the format document is the contract this test checks and must be \
+                 readable at {}: {err}",
+                doc_path.display()
+            )
+        });
+
+        let kinds = sink_local_kinds();
+        assert!(
+            kinds.len() >= FLOOR,
+            "the scan found {} kind literal(s) in `Record::kind`, fewer than the \
+             {FLOOR} sink-local kinds that exist — the slice has stopped matching \
+             the function and is checking nothing",
+            kinds.len()
+        );
+        for kind in &kinds {
+            assert!(
+                doc.contains(&format!("`{kind}`")),
+                "`{kind}` is written by the sink but not described in {}",
+                doc_path.display()
+            );
+        }
+
+        // The envelope arm names no kind of its own — a bus record's `kind` is
+        // its event's wire name — so the document carries that form as a class,
+        // and this is the example it works through.
+        let envelope = Record::BusEnvelope(EventEnvelope::new(
+            1,
+            Some(session()),
+            Event::SessionUpdate(SessionUpdate {
+                update: SessionUpdatePayload::AgentMessageChunk {
+                    text: String::new(),
+                },
+            }),
+        ));
+        assert!(
+            doc.contains(&format!("`{}`", envelope.kind())),
+            "a bus record's `kind` is its event's wire name, and the document must \
+             work the form through at least the `{}` example",
+            envelope.kind()
+        );
+    }
+
+    /// The `kind` literals [`Record::kind`] maps its sink-local variants to,
+    /// read out of this file's own source.
+    ///
+    /// See `every_record_kind_is_documented_in_the_format_doc` for why the
+    /// names are scanned rather than listed, and for the two bounds on the
+    /// corpus.
+    fn sink_local_kinds() -> Vec<String> {
+        const MARKER: &str = "pub fn kind(&self) -> &str {";
+
+        let source = include_str!("record.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(before, _)| before);
+        let start = production
+            .find(MARKER)
+            .expect("`Record::kind` is the source of truth this scan reads");
+        let body = &production[start..];
+        let end = body
+            .find("\n    }\n")
+            .expect("`Record::kind`'s body ends at a column-4 closing brace");
+
+        body[..end]
+            .split("=> \"")
+            .skip(1)
+            .filter_map(|arm| arm.split_once('"').map(|(kind, _)| kind.to_owned()))
+            .collect()
+    }
+
     /// BR-14 — the timestamp is RFC 3339 UTC, and the file stamp is the
     /// `\d{8}T\d{6}Z` form [`super::super::retention`] matches.
     ///

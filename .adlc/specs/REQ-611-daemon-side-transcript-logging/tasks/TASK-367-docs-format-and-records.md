@@ -1,7 +1,7 @@
 ---
 id: TASK-367
 title: "The transcript format document, README and doctor topic, context additions, and the follow-up filings"
-status: draft
+status: complete
 parent: REQ-611
 repo: teton-code
 created: 2026-09-03
@@ -36,14 +36,14 @@ follow-ups are filed rather than absorbed.
 
 ## Acceptance Criteria
 
-- [ ] `docs/transcript-format.md` lists every `kind` that `transcript/record.rs` defines — a
+- [x] `docs/transcript-format.md` lists every `kind` that `transcript/record.rs` defines — a
       unit test in that module enumerates `Record` variants and asserts each name appears in the
       doc (the doc is the contract, the test keeps it honest).
-- [ ] The partial-trailing-line rule and the `seq` note are present verbatim as the spec words
+- [x] The partial-trailing-line rule and the `seq` note are present verbatim as the spec words
       them.
-- [ ] README and the doctor topic name both switches with their lifetimes.
-- [ ] The two follow-ups exist with the spec's wording of the problem.
-- [ ] `.adlc/context/architecture.md` diff is additive; no existing pattern text changed.
+- [x] README and the doctor topic name both switches with their lifetimes.
+- [x] The two follow-ups exist with the spec's wording of the problem.
+- [x] `.adlc/context/architecture.md` diff is additive; no existing pattern text changed.
 
 ## Verification
 

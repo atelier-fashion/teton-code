@@ -66,6 +66,7 @@ prompts:
 | `/verbose` | Toggle routing and turn-end notices for this session |
 | `/effort [level]` | Show, or change, the global reasoning effort |
 | `/permissions [level]` | Show, or change, what this session may run without asking |
+| `/transcript [on\|off]` | Record this session to a file, or stop; bare, print the state and the file's path |
 | `/web setup` | Set up web lookup: pick a tier, name a backend, confirm before anything is written |
 | `/web allow` | Lift this session's web taint restriction (grants no new tier) |
 | `/web refresh <url>` | Drop a URL's cached copy so the next lookup re-fetches |
@@ -80,6 +81,20 @@ it. Outside a project — your home folder, `/`, or a
 plain directory — the session says so under the banner, because every search
 then walks all of it and no project's privacy boundaries apply; `/cd <path>`
 moves the root of a live session and starts the conversation fresh.
+
+**Transcripts are off until you ask for one.** Two switches, with two
+lifetimes: `[transcript] enabled = true` in `config.toml` records every session
+created afterwards, and `/transcript on` / `/transcript off` switch the session
+you are in without writing anything to disk. A recording session gets one JSONL
+file — a line per prompt, tool call, tool result and event — in
+`[transcript] dir`, which defaults to Teton's data directory:
+`~/Library/Application Support/teton/transcripts` on macOS,
+`$XDG_DATA_HOME/teton/transcripts` (usually `~/.local/share/teton/transcripts`)
+on Linux. Files are kept 30 days unless `retain_days` says otherwise. The
+directory is yours alone — `0700`, files `0600` — nothing ships it anywhere,
+and the session's own file tools refuse to read it: a `read`, `edit`, `grep` or
+`glob` under it is denied whether or not it sits inside the session root.
+`docs/transcript-format.md` describes the file.
 
 Everything you would otherwise open a second terminal for is here too. The ten
 commands below that have a `teton …` twin *are* that twin — the same arguments,
