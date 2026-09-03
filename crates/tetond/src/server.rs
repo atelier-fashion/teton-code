@@ -4930,9 +4930,10 @@ impl StampedRoutes {
         else {
             return false;
         };
+        let budget_bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
         let budget = RouteBudget {
             budget_tokens: usize::try_from(tokens).unwrap_or(usize::MAX),
-            budget_bytes: usize::try_from(bytes).unwrap_or(usize::MAX),
+            budget_bytes,
             bound,
             // Absent on a daemon predating the field; `false` is what that
             // daemon meant — it floored nothing it could report.
@@ -4944,6 +4945,11 @@ impl StampedRoutes {
             window_label: String::new(),
             digest_threshold_tokens: 0,
             digest_threshold_bytes: 0,
+            // Not on the wire either, but unlike the three above it is a pure
+            // function of `budget_bytes`, which *is* — so it is derived through
+            // the same quarter rule `derive` runs rather than zeroed or
+            // restated (REQ-612 ADR-5).
+            repo_context_cap: crate::harness::budget::repo_context_cap(budget_bytes),
         };
         self.stamped
             .lock()

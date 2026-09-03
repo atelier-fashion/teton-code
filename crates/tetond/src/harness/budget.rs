@@ -136,6 +136,7 @@ use super::context::{ContextManager, Fit, APPROX_BYTES_PER_TOKEN};
 use super::duty::DUTY_REQUEST_BYTES_PER_TOKEN;
 use super::permissions::{OverBudgetOptionLabels, OverBudgetRemedyLabels};
 use crate::egress::redact::REDACT_SCANNABLE_CONTEXT_BYTES;
+use crate::repo_context::REPO_CONTEXT_MAX_BYTES;
 use crate::runtime::LOCAL_ENGINE_N_CTX;
 use crate::skills::SkillSource;
 
@@ -598,6 +599,42 @@ pub struct RouteBudget {
     ///   by whoever is improving that prose, who has no reason to know an id
     ///   was being read out of it. That break is silent in both directions.
     pub provider_id: Option<String>,
+    /// How many bytes of the repository's own notes this route may carry
+    /// (REQ-612 BR-3, ADR-5): `min(REPO_CONTEXT_MAX_BYTES, budget_bytes / 4)`.
+    ///
+    /// Derived **here**, beside the pair it is a quarter of, for REQ-586's own
+    /// reason: the loader, the block renderer, the truncation marker's figure
+    /// and `/verbose` all quote this number, and four call sites each dividing
+    /// a budget by four is four places the quarter rule can drift. The local
+    /// tier reaches the pinned 8 KiB (`63,488 / 4 = 15,872`, capped); a floored
+    /// 16,384-byte route carries 4,096.
+    ///
+    /// It is a quarter of the budget the turn **actually runs under**, so the
+    /// redact clamp — which lands before [`budget_of`] — takes its bytes off
+    /// this too. That is the intended reading of BR-3's "no route ever spends
+    /// more than a quarter of its context on the notes": the context in
+    /// question is the clamped one, because that is the one the turn has.
+    pub repo_context_cap: usize,
+}
+
+/// The route-aware repository-notes cap (REQ-612 BR-3, ADR-5) — **the one
+/// home** of the quarter rule.
+///
+/// A free function rather than a method on [`RouteBudget`] so the two
+/// constructors below cannot build a budget whose field disagrees with it: a
+/// getter would have left the field settable to anything, and every literal
+/// `RouteBudget` in the tree is a place that could then have set it wrong.
+///
+/// `pub(crate)` for exactly one caller outside this module: `StampedRoutes`
+/// rebuilds a [`RouteBudget`] from a `route_decided` event, and `budget_bytes`
+/// *is* on that wire — so the cap is derivable there and deriving it is
+/// strictly better than the empty value its wire-less neighbours take.
+pub(crate) const fn repo_context_cap(budget_bytes: usize) -> usize {
+    if budget_bytes / 4 < REPO_CONTEXT_MAX_BYTES {
+        budget_bytes / 4
+    } else {
+        REPO_CONTEXT_MAX_BYTES
+    }
 }
 
 /// Turn a route's window facts into its budget — the one classifier (BR-8,
@@ -837,6 +874,9 @@ fn budget_of(
         digest_threshold_bytes,
         floored: pair.floored,
         provider_id,
+        // After the redact clamp, like the thresholds above and for the same
+        // reason: a quarter of the budget the turn runs under (REQ-612 ADR-5).
+        repo_context_cap: repo_context_cap(pair.bytes),
     }
 }
 
@@ -859,6 +899,7 @@ fn default_pair(bound: BudgetBound, labelled: (String, Option<String>)) -> Route
         digest_threshold_bytes,
         // The default pair is the answer, not a clamp of a smaller one.
         floored: false,
+        repo_context_cap: repo_context_cap(LOCAL_BUDGET_BYTES),
     }
 }
 
@@ -3088,6 +3129,97 @@ mod tests {
         }
     }
 
+    /// **REQ-612 BR-3 / ADR-5: the repository-notes cap is a quarter of the
+    /// route's byte budget, held under the pinned maximum.**
+    ///
+    /// Four rows, chosen so that each half of the `min` binds on at least one
+    /// of them and neither half can be dropped without a row going red:
+    ///
+    /// | route | byte budget | quarter | cap |
+    /// |---|---|---|---|
+    /// | local | 63,488 | 15,872 | 8,192 (the pin binds) |
+    /// | floored | 16,384 | 4,096 | 4,096 (the quarter binds) |
+    /// | 128k | 253,952 | 63,488 | 8,192 (the pin binds) |
+    /// | 1M | 1,997,952 | 499,488 | 8,192 (the pin binds) |
+    ///
+    /// The floored row is the one BR-3 names by its numbers — REQ-586's
+    /// smallest pair, "the smallest that still holds the system prompt" — and
+    /// it is reached through the real floor rather than by handing `derive` a
+    /// budget: Ollama's shipped 4,096-token window, the live sub-floor case
+    /// `MIN_BUDGET_BYTES` documents.
+    ///
+    /// **Mutations, both run red.** Returning `REPO_CONTEXT_MAX_BYTES`
+    /// unconditionally (the quarter dropped) fails the floored row with
+    /// `8192 != 4096`, which is a 16 KiB route spending half its context on the
+    /// notes. Returning `budget_bytes / 4` (the pin dropped) fails local, 128k
+    /// and 1M — 15,872, 63,488 and 499,488 against 8,192 — which is a block
+    /// past the ceiling both resident-prompt sweeps measure.
+    #[test]
+    fn the_repo_context_cap_is_a_quarter_of_the_byte_budget_up_to_the_pinned_max() {
+        let rows: &[(&str, BudgetInputs<'_>, usize, usize)] = &[
+            (
+                "local",
+                BudgetInputs::local(),
+                63_488,
+                REPO_CONTEXT_MAX_BYTES,
+            ),
+            // The floor's pair, through the floor: usable = 3,072 → 2,048
+            // words / 6,144 bytes, both raised to (MIN_BUDGET_TOKENS,
+            // MIN_BUDGET_BYTES) = (2,048, 16,384).
+            (
+                "floored (ollama's 4,096-token window)",
+                remote(4_096, 0, false),
+                MIN_BUDGET_BYTES,
+                MIN_BUDGET_BYTES / 4,
+            ),
+            (
+                "128k",
+                remote(128_000, 0, false),
+                253_952,
+                REPO_CONTEXT_MAX_BYTES,
+            ),
+            // usable = 998,976; ×2 = 1,997,952.
+            (
+                "1M",
+                remote(1_000_000, 0, false),
+                1_997_952,
+                REPO_CONTEXT_MAX_BYTES,
+            ),
+        ];
+        for (name, inputs, bytes, cap) in rows {
+            let got = derive(*inputs);
+            assert_eq!(
+                got.budget_bytes, *bytes,
+                "{name}: the row's byte budget moved, so its quarter is no longer \
+                 the number below"
+            );
+            assert_eq!(got.repo_context_cap, *cap, "{name}: repo_context_cap");
+            assert!(
+                got.repo_context_cap <= got.budget_bytes / 4,
+                "{name}: the notes may never take more than a quarter of the route"
+            );
+            assert!(
+                got.repo_context_cap <= REPO_CONTEXT_MAX_BYTES,
+                "{name}: the pinned maximum is what both resident-prompt sweeps \
+                 measure the widest prompt at"
+            );
+        }
+
+        // The floored row is BR-3's own pair, named: 2,048 words / 16,384 bytes
+        // carrying 4,096 bytes of notes.
+        let floored = derive(remote(4_096, 0, false));
+        assert_eq!(
+            (
+                floored.budget_tokens,
+                floored.budget_bytes,
+                floored.repo_context_cap
+            ),
+            (2_048, 16_384, 4_096),
+            "BR-3 states this triple in words; it is one derivation here"
+        );
+        assert!(floored.floored, "the floor is what produced that pair");
+    }
+
     /// **AC-4 (REQ-590): the local route's pair fits the engine in both
     /// currencies, and both halves are the window's.**
     ///
@@ -5011,6 +5143,9 @@ mod tests {
             digest_threshold_bytes: 1,
             floored: false,
             provider_id: None,
+            // Unread by every surface under test here, and a figure `derive`
+            // never mints — the same posture as the one-word pair above.
+            repo_context_cap: 0,
         };
         let message = refusal(
             SkillStage::Body,
@@ -5202,6 +5337,9 @@ mod tests {
             digest_threshold_bytes: 1,
             floored: false,
             provider_id: None,
+            // Unread by every surface under test here, and a figure `derive`
+            // never mints — the same posture as the one-word pair above.
+            repo_context_cap: 0,
         };
 
         assert_eq!(
@@ -6998,6 +7136,9 @@ mod tests {
             digest_threshold_bytes: 1,
             floored: false,
             provider_id: None,
+            // Unread by every surface under test here, and a figure `derive`
+            // never mints — the same posture as the one-word pair above.
+            repo_context_cap: 0,
         };
         let offer = OverBudgetOffer::new(
             "analyze",

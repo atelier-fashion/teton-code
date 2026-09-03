@@ -47,6 +47,7 @@ use teton_protocol::{ProviderId, SessionId};
 use teton_providers::{BlockDetail, HarnessProfile, ProviderError, ToolCall};
 
 use crate::broadcast::EventBus;
+use crate::repo_context::RepoContextBlock;
 
 use super::budget::{
     self, skill_append_fit, BudgetInputs, RouteBudget, SkillCaller, SkillStage,
@@ -467,6 +468,29 @@ pub struct HarnessConfig {
     /// The default is the local derivation, which is also the
     /// unresolvable-route case (`bound: local_engine`).
     pub budget: RouteBudget,
+    /// The repository's own notes, rendered for this turn's route — or `None`
+    /// when the session has none, has them switched off, or the caller has not
+    /// said (REQ-612 BR-1, ADR-1).
+    ///
+    /// The same contract as [`session_root`](Self::session_root), and for the
+    /// same reason: the *file* is the daemon's fact — it lives at a probed root,
+    /// under a boundary matcher, behind a session switch — and none of those
+    /// three are things this module may see. The `assemble` stage loads it,
+    /// renders it at [`RouteBudget::repo_context_cap`], and puts the finished
+    /// block here beside the root it was read under.
+    ///
+    /// `None` is not a seventh state. It means "no block this turn", and
+    /// [`build_system_prompt`] then renders the prompt every existing caller
+    /// had, byte for byte — `HarnessConfig::default()`, `for_strong_model()`
+    /// and `from_harness_profile()` all inherit it through `..Self::default()`,
+    /// so the two resident-prompt ceiling sweeps and every fixture in the tree
+    /// keep the bytes they had.
+    ///
+    /// It is a rendered block rather than the file because rendering needs the
+    /// route's cap and the route is decided above this config: a config holding
+    /// the file would have to be re-rendered by whoever read it, which is the
+    /// second derivation ADR-5 exists to prevent.
+    pub repo_context: Option<RepoContextBlock>,
 }
 
 impl Default for HarnessConfig {
@@ -515,6 +539,9 @@ impl Default for HarnessConfig {
             session_root: None,
             known_projects: Vec::new(),
             budget,
+            // Unsupplied: no repository-notes block until the daemon's turn
+            // path loads the file and renders it at the route's cap (REQ-612).
+            repo_context: None,
         }
     }
 }
@@ -2917,8 +2944,29 @@ impl super::tools::Tool for SkillToolDocs {
 }
 
 /// Build the system prompt: the agent's instructions, Teton's bundled
-/// self-configuration guide, the exposed tool docs, and the tool-call format
-/// the local model must follow.
+/// self-configuration guide, the exposed tool docs, the tool-call format the
+/// local model must follow, and — last — the repository's own notes.
+///
+/// # The order, and why the notes are last (REQ-612 ADR-1)
+///
+/// Every region above the notes is harness-authored or harness-framed, and the
+/// notes are the one region a *repository* wrote. Putting them last means
+/// nothing harness-authored follows the file's text except the block's own
+/// closing sentence, so a file that tries to impersonate Teton's instructions
+/// has nothing after it to impersonate them *to*. The tool docs directly above
+/// already carry third-party text — an MCP server's tool description, BUG-148 —
+/// so the containment story for the prompt's tail is one story rather than two.
+///
+/// It is also where a small model weights a fact (LESSON-532), which is the
+/// affirmative reason rather than only the defensive one. Between the
+/// environment line and the bundled guide was the rejected alternative: that
+/// region is what a top-down reader treats as Teton speaking, and repository
+/// prose inside it is BUG-181's shape with the repository as author.
+///
+/// With `config.repo_context` `None` this function returns exactly the bytes it
+/// returned before REQ-612 — the whole block is inside the `if let`, and
+/// `the_repo_context_block_is_the_last_region_of_both_harness_shapes` asserts
+/// the byte identity rather than leaving it to inspection.
 #[must_use]
 pub fn build_system_prompt(tools: &ToolRegistry, config: &HarnessConfig) -> String {
     let mut s = String::from(
@@ -2974,6 +3022,20 @@ pub fn build_system_prompt(tools: &ToolRegistry, config: &HarnessConfig) -> Stri
     s.push_str(SELF_CONFIG_GUIDE);
     s.push_str("\nAvailable tools:\n");
     s.push_str(&tools.docs(config.max_tools));
+    // REQ-612 ADR-1: the last region, after the tool docs. See this function's
+    // own docs for why the order is what it is; what is decided here is only
+    // the place, exactly as the environment block's place is decided above.
+    if let Some(block) = &config.repo_context {
+        // The block's opening tag, its marker line and its closing tag are all
+        // flush-left frame, and the neutralizers that defused the file's text
+        // are line-anchored — so the block has to *start* a line whatever the
+        // tool docs happened to end with. Asking rather than assuming: the docs
+        // are assembled from tool descriptions, which are third-party strings.
+        if !s.ends_with('\n') {
+            s.push('\n');
+        }
+        s.push_str(&block.text);
+    }
     s
 }
 
@@ -6522,6 +6584,119 @@ mod tests {
             // Everything else is untouched: removing the block gives back the
             // prompt the caller had without one, byte for byte.
             assert_eq!(with.replacen(&block, "", 1), without);
+        }
+    }
+
+    /// A repository-notes block rendered from a real file by the real renderer.
+    ///
+    /// LESSON-544: a block assembled here as a `RepoContextBlock { text: "…" }`
+    /// literal would prove only that this function appends a string it was
+    /// handed. What AC-1 is about is the bytes the *producer* makes, frame and
+    /// all, so the producer runs.
+    fn repo_block(text: &str) -> RepoContextBlock {
+        let file = crate::repo_context::RepoContextFile {
+            source: teton_protocol::methods::RepoContextSource::TetonMd,
+            path: std::path::PathBuf::from("/repo/TETON.md"),
+            provenance: crate::fixture_id("TETON.md"),
+            bytes_on_disk: text.len() as u64,
+            key: crate::repo_context::FileStat {
+                len: text.len() as u64,
+                mtime: None,
+                is_symlink: false,
+                is_regular: true,
+            },
+            text: text.to_owned(),
+        };
+        RepoContextBlock::render(&file, crate::repo_context::REPO_CONTEXT_MAX_BYTES)
+    }
+
+    /// `base` with a repository-notes block stated.
+    fn with_notes(base: &HarnessConfig, block: RepoContextBlock) -> HarnessConfig {
+        HarnessConfig {
+            repo_context: Some(block),
+            ..base.clone()
+        }
+    }
+
+    /// **REQ-612 AC-1 / ADR-1: the notes are the prompt's last region, on both
+    /// harness shapes, and `None` renders the prompt every caller already had.**
+    ///
+    /// Three claims, and the third is the one that keeps the two
+    /// resident-prompt ceiling sweeps and every prompt fixture in the tree
+    /// honest: removing the block from the tail gives back the `None` prompt
+    /// **byte for byte**, so the append is purely additive and the pre-REQ-612
+    /// bytes are what `HarnessConfig::default()` still produces.
+    ///
+    /// `for_strong_model()` is here beside `default()` rather than assumed to
+    /// follow, because it builds itself with `..Self::default()` — the
+    /// inheritance ADR-1 relies on — and a future literal spelling of that
+    /// config would break the inheritance silently.
+    ///
+    /// **Mutations, both run red (verified).** Moving the append above
+    /// `s.push_str("\nAvailable tools:\n")` fails `ends_with` on both shapes;
+    /// deleting the append entirely fails it too.
+    ///
+    /// **One assertion here is a property, not a mutation, and says so.**
+    /// Dropping the composer's `if !s.ends_with('\n')` guard leaves this test
+    /// green, because `ToolRegistry::docs` ends every line it writes and the
+    /// prompt therefore already ends in a newline. The `head.ends_with('\n')`
+    /// assertion pins the *property* the frame needs — the block opens a line —
+    /// so it fires the day a tool description stops ending one, which is the
+    /// day the guard starts earning its keep. Claiming a red mutation for it
+    /// would be the green-oracle LESSON-569 is about.
+    #[test]
+    fn the_repo_context_block_is_the_last_region_of_both_harness_shapes() {
+        let block = repo_block("Run `cargo test -p tetond` before pushing.\n");
+        for base in both_profiles() {
+            let tools = ToolRegistry::with_builtins();
+            let without = build_system_prompt(&tools, &base);
+            assert!(
+                !without.contains("<repo-notes"),
+                "no block was supplied, so no frame may be rendered:\n{without}"
+            );
+
+            let with = build_system_prompt(&tools, &with_notes(&base, block.clone()));
+
+            // (1) It is the *last* region — after the tool docs, which is what
+            // ADR-1 decided and what the containment argument rests on.
+            assert!(
+                with.ends_with(&block.text),
+                "the notes must be the final bytes of the prompt:\n{with}"
+            );
+            assert_eq!(
+                with.matches(&block.text).count(),
+                1,
+                "the block must appear exactly once:\n{with}"
+            );
+            let docs = tools.docs(base.max_tools);
+            let docs_at = with.find(&docs).expect("the tool docs are present");
+            let block_at = with.find(&block.text).expect("the block is present");
+            assert!(
+                docs_at < block_at,
+                "the notes sit after the tool docs, which are the other region \
+                 carrying third-party text (BUG-148):\n{with}"
+            );
+            assert!(
+                with.find(SELF_CONFIG_GUIDE).expect("the guide is present") < block_at,
+                "the bundled guide is harness prose and precedes the notes:\n{with}"
+            );
+
+            // (2) It starts a line, so the frame's flush-left tags and the
+            // line-anchored neutralizers inside it mean what they say.
+            let head = &with[..block_at];
+            assert!(
+                head.ends_with('\n'),
+                "the block must open a line of its own:\n{head:?}"
+            );
+
+            // (3) Removing it gives back the `None` prompt, byte for byte.
+            assert_eq!(
+                with.strip_suffix(&block.text)
+                    .expect("the block is the suffix"),
+                without,
+                "appending the block changed something above it — the `None` \
+                 prompt is no longer the prompt this build had before REQ-612"
+            );
         }
     }
 

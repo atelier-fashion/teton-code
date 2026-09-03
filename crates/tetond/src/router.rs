@@ -2711,12 +2711,20 @@ mod tests {
     ///
     /// The other three rows are byte-identical to the capture, which is what
     /// says the window touched the two window-derived arms and nothing else.
+    ///
+    /// **REQ-612 appended a field to every row.** `repo_context_cap` is a
+    /// quarter of each row's byte half capped at `REPO_CONTEXT_MAX_BYTES`
+    /// (ADR-5), and every one of the five reaches the cap — the narrowest byte
+    /// half here is 32,768, whose quarter is exactly 8,192. So the addition
+    /// moved no derived figure; it added a column, and this table is what says
+    /// the column is the same on all five bounds. A row that stops reaching the
+    /// cap is a route below 32 KB of bytes, which is news.
     const BUDGET_FOR_GOLDEN: [&str; 5] = [
-        "local_engine: RouteBudget { budget_tokens: 21162, budget_bytes: 63488, bound: LocalEngine, window_label: \"the local context window\", digest_threshold_tokens: 7749, digest_threshold_bytes: 23250, floored: false, provider_id: None }",
-        "default_unknown: RouteBudget { budget_tokens: 4096, budget_bytes: 32768, bound: DefaultUnknown, window_label: \"silent's context window\", digest_threshold_tokens: 1500, digest_threshold_bytes: 12000, floored: false, provider_id: Some(\"silent\") }",
-        "window: RouteBudget { budget_tokens: 84650, budget_bytes: 253952, bound: Window, window_label: \"wide's context window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 93000, floored: false, provider_id: Some(\"wide\") }",
-        "user_cap: RouteBudget { budget_tokens: 25984, budget_bytes: 77952, bound: UserCap, window_label: \"capped's context window\", digest_threshold_tokens: 9515, digest_threshold_bytes: 28546, floored: false, provider_id: Some(\"capped\") }",
-        "redact_scan: RouteBudget { budget_tokens: 84650, budget_bytes: 141224, bound: RedactScan, window_label: \"the redact-scannable window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 51717, floored: false, provider_id: Some(\"wide\") }",
+        "local_engine: RouteBudget { budget_tokens: 21162, budget_bytes: 63488, bound: LocalEngine, window_label: \"the local context window\", digest_threshold_tokens: 7749, digest_threshold_bytes: 23250, floored: false, provider_id: None, repo_context_cap: 8192 }",
+        "default_unknown: RouteBudget { budget_tokens: 4096, budget_bytes: 32768, bound: DefaultUnknown, window_label: \"silent's context window\", digest_threshold_tokens: 1500, digest_threshold_bytes: 12000, floored: false, provider_id: Some(\"silent\"), repo_context_cap: 8192 }",
+        "window: RouteBudget { budget_tokens: 84650, budget_bytes: 253952, bound: Window, window_label: \"wide's context window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 93000, floored: false, provider_id: Some(\"wide\"), repo_context_cap: 8192 }",
+        "user_cap: RouteBudget { budget_tokens: 25984, budget_bytes: 77952, bound: UserCap, window_label: \"capped's context window\", digest_threshold_tokens: 9515, digest_threshold_bytes: 28546, floored: false, provider_id: Some(\"capped\"), repo_context_cap: 8192 }",
+        "redact_scan: RouteBudget { budget_tokens: 84650, budget_bytes: 141224, bound: RedactScan, window_label: \"the redact-scannable window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 51717, floored: false, provider_id: Some(\"wide\"), repo_context_cap: 8192 }",
     ];
 
     /// **REQ-589 TASK-259.** What the accessor is *for*: the provider's declared
