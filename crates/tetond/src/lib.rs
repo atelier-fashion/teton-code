@@ -80,6 +80,12 @@
 //!   frontmatter parser, and the name contest that decides which file a
 //!   spelling reaches. Pure over the seam; the turn that runs one is
 //!   [`runtime`]'s.
+//! - [`transcript`] — the opt-in, per-session transcript sink (REQ-611): one
+//!   writer thread behind a bounded channel, one append-only JSONL file per
+//!   session, truncation with a marker, gap records for what it could not keep
+//!   up with, and the age-based prune over its own files. Its record kinds are
+//!   daemon types on purpose (ADR-2) — nothing here widens the bus, and the one
+//!   thing that *is* published, `transcript_state`, carries no path.
 //! - [`single_instance`] — the `flock`-based single-instance guard.
 //!
 //! Socket and lock path resolution lives in the shared
@@ -118,6 +124,7 @@ pub mod sessions;
 pub mod single_instance;
 pub mod skills;
 pub mod structured;
+pub mod transcript;
 pub mod turn_context;
 pub mod web;
 pub mod web_setup_catalog;

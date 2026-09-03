@@ -1,7 +1,7 @@
 ---
 id: TASK-362
 title: "The transcript sink: records, the per-session writer, truncation, gaps, retention"
-status: draft
+status: complete
 parent: REQ-611
 repo: teton-code
 created: 2026-09-03
@@ -37,27 +37,27 @@ BR-14, AC-13, AC-15, AC-16, AC-17.
 
 ## Acceptance Criteria
 
-- [ ] AC-13 / BR-9: after `open`, dir mode is `0o700` and file mode `0o600`; a pre-existing
+- [x] AC-13 / BR-9: after `open`, dir mode is `0o700` and file mode `0o600`; a pre-existing
       `0o644` file at the path makes `open` return `Err(Refused::Mode)` and the file is not
       appended to.
-- [ ] AC-17 / BR-14: every written line parses with `serde_json` alone and carries `n`, `ts`,
+- [x] AC-17 / BR-14: every written line parses with `serde_json` alone and carries `n`, `ts`,
       `session_id`, `kind`; `n` runs from 1 with no holes across open, resume, and close.
-- [ ] AC-15 / BR-12: a content field of `max_record_bytes + 1` is cut to `max_record_bytes` with
+- [x] AC-15 / BR-12: a content field of `max_record_bytes + 1` is cut to `max_record_bytes` with
       `truncated: true, original_bytes: <len>`; a field of exactly `max_record_bytes` carries no
       marker. The same two fields appear whether one byte or a mebibyte was cut.
-- [ ] BR-5 (sink half): `dropped(session, k)` followed by any record writes a `transcript_gap {
+- [x] BR-5 (sink half): `dropped(session, k)` followed by any record writes a `transcript_gap {
       dropped: k }` line **before** that record, and `n` stays contiguous.
-- [ ] BR-6 / ADR-8: an injected `io::Error` on append sets `status().degraded = Some(reason)`,
+- [x] BR-6 / ADR-8: an injected `io::Error` on append sets `status().degraded = Some(reason)`,
       attempts one `transcript_closed { write_failure }`, and every later `record()` for that
       session is a no-op returning `()`; the sink's `on_degraded` callback fires exactly once.
-- [ ] BR-7: two sessions recording concurrently produce two files with no shared lines; a record
+- [x] BR-7: two sessions recording concurrently produce two files with no shared lines; a record
       for an unknown session is dropped, not written to a fresh file.
-- [ ] AC-16 / BR-13: with `retain_days = 1` and three two-day-old entries — a matching file, a
+- [x] AC-16 / BR-13: with `retain_days = 1` and three two-day-old entries — a matching file, a
       non-matching file, a symlink to a file outside `dir` — `prune` removes only the first and
       reports `removed = 1`; the symlink target is untouched; `retain_days = 0` removes nothing.
-- [ ] `transcript_opened` records daemon version, session id, root display form, redact posture,
+- [x] `transcript_opened` records daemon version, session id, root display form, redact posture,
       `max_record_bytes`, and `seq_at_open`.
-- [ ] `cargo test -p tetond transcript:: --no-fail-fast` is green on macOS and the ubuntu CI leg
+- [x] `cargo test -p tetond transcript:: --no-fail-fast` is green on macOS and the ubuntu CI leg
       (mode bits differ on no platform CI runs, but umask does — set modes explicitly).
 
 ## Verification
