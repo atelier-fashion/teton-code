@@ -763,6 +763,8 @@ async fn the_marker_names_the_routes_window_when_the_turn_is_seeded_by_carried_t
         format!("review this paste:\n{}", filler(6_000)),
         std::collections::BTreeSet::new(),
         false,
+        // No notes in this fixture, so a reroute has nothing to re-render.
+        None,
     );
     // Non-vacuity: the pasted block really is over the route's byte budget, so
     // the clamp has to fire and a marker has to be written.

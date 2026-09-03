@@ -526,6 +526,25 @@ pub struct RouteDecided {
     /// always populates it, and `None` means a daemon that predates it.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub bound_floored: Option<bool>,
+    /// How many bytes of the repository's own notes this route may carry
+    /// (REQ-612 BR-3, BR-7): `min(8192, budget_bytes / 4)`.
+    ///
+    /// The **ceiling** the route stamps, not what is resident — the resident
+    /// figure is a property of the file and rides
+    /// [`RepoContextState::resident_bytes`]. Both are on the wire because
+    /// `/verbose` renders them as a pair (`notes 2,310 B / cap 4,096 B`) and a
+    /// user weighing a file against a budget needs to know whether the number
+    /// they are looking at is against the cap or well under it.
+    ///
+    /// Derived where the budget is, so a floored route's quarter and the cap the
+    /// truncation marker names are one number asked twice rather than two that
+    /// can drift.
+    ///
+    /// Same additivity as [`Self::budget_tokens`]: a daemon that has this field
+    /// always populates it, and `None` means a daemon that predates it — which
+    /// renders the pre-REQ-612 clause byte for byte.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub repo_context_cap: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3968,9 +3987,13 @@ pub struct RepoContextState {
     /// client renders the byte figures above beside a flag rather than by
     /// matching on an enum whose future values it may not know.
     pub truncated: bool,
-    /// Why, in the daemon's own words, when the state has words to give:
-    /// the filesystem error behind an `unreadable`, or the boundary glob behind
-    /// a `withheld_boundary`.
+    /// Why, in the daemon's own words, when the state has words to give.
+    ///
+    /// **Only `unreadable` has any.** The reason names the filesystem verdict —
+    /// a symlinked entry, a permission, bytes that are not text — from a closed
+    /// set of harness-authored sentences. A `withheld_boundary` carries none and
+    /// never will: the glob that covered the file is configuration, not a fact
+    /// about the file, and the state word already names the remedy.
     ///
     /// **Bounded and neutralised by the daemon before it reaches the wire**
     /// (`session_root::bounded_field`, the [`crate::methods::SkillView`] rule).
@@ -4067,6 +4090,7 @@ mod tests {
             bound: Some(BudgetBound::Window),
             bound_floored: None,
             spend_ceiling_micro_cents: None,
+            repo_context_cap: None,
         }));
         // Flattened: envelope metadata and the payload share one object.
         assert_eq!(wire["event"], "route_decided");
@@ -4104,6 +4128,7 @@ mod tests {
                     bound: None,
                     bound_floored: None,
                     spend_ceiling_micro_cents: None,
+                    repo_context_cap: None,
                 }),
                 "route_decided",
             ),
@@ -4676,10 +4701,13 @@ mod tests {
         );
 
         // Every state, spelled as the System Model spells it, with the payload
-        // each one actually carries. A truncated file is resident *and* cut; the
-        // three withheld/unreadable states have bytes on disk and none of them
-        // in the prompt; `absent` and `withheld_off` opened nothing, so they
-        // name no source.
+        // each one actually carries. A truncated file is resident *and* cut.
+        // `withheld_boundary` and an `unreadable` the daemon `stat`ed carry the
+        // file's size with **none** of it resident — the pair is the point: a
+        // user is told a file is there, how big it is, and that none of it is in
+        // the prompt. `absent` and `withheld_off` opened nothing, so they name
+        // no source and carry no size: `off` never `stat`ed, and `absent` has
+        // nothing to `stat`.
         for (state, spelling, source, on_disk, resident) in [
             (
                 RepoContextStateKind::Truncated,
@@ -5014,6 +5042,7 @@ mod tests {
             bound: Some(BudgetBound::UserCap),
             bound_floored: Some(true),
             spend_ceiling_micro_cents: None,
+            repo_context_cap: None,
         };
         round_trip(&decided);
         let wire = serde_json::to_value(&decided).unwrap();
@@ -5158,6 +5187,7 @@ mod tests {
             bound: None,
             bound_floored: None,
             spend_ceiling_micro_cents: None,
+            repo_context_cap: None,
         });
 
         // REQ-586: the budget pair and its bound ride the same frame, and every
@@ -5183,6 +5213,7 @@ mod tests {
                 bound: Some(bound),
                 bound_floored: None,
                 spend_ceiling_micro_cents: None,
+                repo_context_cap: None,
             };
             round_trip(&decided);
             let wire: serde_json::Value =
@@ -5240,6 +5271,7 @@ mod tests {
             bound: Some(BudgetBound::UserCap),
             bound_floored: None,
             spend_ceiling_micro_cents: None,
+            repo_context_cap: None,
         })
         .unwrap();
         assert!(
@@ -6402,6 +6434,7 @@ mod tests {
             bound: None,
             bound_floored: None,
             spend_ceiling_micro_cents: None,
+            repo_context_cap: None,
         };
         round_trip(&decided);
         let wire: serde_json::Value =

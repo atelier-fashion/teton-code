@@ -349,11 +349,11 @@ pub(crate) const REDACT_ESCAPING_DIVISOR: usize = 10;
 /// **The raise is 9 KiB, not the 8 the cap names, and the difference is
 /// measured rather than argued.** Both sweeps now build their widest prompt
 /// with `RepoContextBlock::worst_case()` (ADR-1), and the opted-out shape went
-/// 7,859 → **16,462** bytes. That is **8,603**, spent as:
+/// 7,859 → **16,471** bytes. That is **8,612**, spent as:
 ///
 /// ```text
 ///   the capped file text                     8,192   REPO_CONTEXT_MAX_BYTES
-///   the block's own frame                      331   opening tag with the longer
+///   the block's own frame                      340   opening tag with the longer
 ///                                                    of the two file names, the
 ///                                                    attribution line, the
 ///                                                    truncation marker at its
@@ -361,18 +361,27 @@ pub(crate) const REDACT_ESCAPING_DIVISOR: usize = 10;
 ///                                                    tag and the closing sentence
 ///   BR-8's amendment to the guide                80   the capability sentence now
 ///                                                    names the file it reads
-///   = what the prompt actually pays          8,603
+///   = what the prompt actually pays          8,612
 /// ```
 ///
-/// With `escaping` unchanged at 6,348, `spent` is 22,810 and the floor asks for
-/// 22,858. **22 KiB (22,528) — the architecture's figure, reached by adding
+/// **REQ-612 verify pass: +9 bytes on the frame** (331 → 340), and with it
+/// `spent` 22,810 → 22,819 and both margins 9 bytes narrower. The truncation
+/// marker now reads `[… truncated: at least N bytes over the C-byte cap were
+/// dropped]`: the loader stops at the 64 KiB read ceiling, so `N` counts what it
+/// held rather than what is on disk, and a 10 MiB `TETON.md` would otherwise
+/// carry a marker understating the loss by four orders of magnitude. Nine bytes
+/// of qualifier, paid once, in the widest block the renderer can produce.
+///
+/// With `escaping` unchanged at 6,348, `spent` is 22,819 and the floor asks for
+/// 22,867. **22 KiB (22,528) — the architecture's figure, reached by adding
 /// 8,192 to 14,336 — does not cover the body at all**, by 282 bytes, which is
 /// LESSON-593's point restated in this ledger's own currency: a ceiling derived
 /// from a cap rather than from the prompt misses everything the cap does not
-/// name. 23 KiB leaves **742** ([`RECORDED_PROMPT_MARGIN_BYTES`]) and **789** on
+/// name. 23 KiB leaves **733** ([`RECORDED_PROMPT_MARGIN_BYTES`]) and **780** on
 /// the web-enabled twin ([`RECORDED_WEB_PROMPT_MARGIN_BYTES`]) — the same 47
 /// bytes apart the two shapes have always been, which is the check that this
-/// raise spent the same bytes on both.
+/// raise spent the same bytes on both. (Both were 9 higher until the verify
+/// pass above.)
 ///
 /// **Every figure below re-derives, and the chunk count moves for the first
 /// time since the engine window doubled:**
@@ -461,12 +470,12 @@ pub(crate) const MIN_PROMPT_HEADROOM_BYTES: usize = 48;
 /// edit that cost 20 of them was a fifth of what was left and had to announce
 /// itself.
 ///
-/// REQ-612's raise leaves **742** and therefore 694 of usable room, which is
+/// REQ-612's raise leaves **733** and therefore 685 of usable room, which is
 /// the loosest this has been since the pin was written — an artefact of the
 /// overhead moving in whole KiB while the prompt moves in sentences, not a
 /// decision to relax. The pin earns its keep at any margin for the *other*
 /// reason: it is what says the resident prompt moved. Drift is what went
-/// unnoticed for six REQs (BUG-193), and drift is invisible at 742 exactly as
+/// unnoticed for six REQs (BUG-193), and drift is invisible at 733 exactly as
 /// it was at 129.
 ///
 /// # Updating it
@@ -475,7 +484,7 @@ pub(crate) const MIN_PROMPT_HEADROOM_BYTES: usize = 48;
 /// last time. Add a ledger line to [`REDACT_BODY_OVERHEAD_BYTES`] saying which
 /// REQ spent the bytes, then move this number in the same diff.
 #[cfg(test)]
-pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 742;
+pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 733;
 
 /// The same pin for the **web-enabled** prompt shape measured by
 /// `harness::tools::web::tests::the_web_tool_docs_clear_the_outbound_body_overhead`.
@@ -487,7 +496,7 @@ pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 742;
 /// holds the budget vocabulary, so the two shapes cannot come to disagree about
 /// which constant they are measuring against.
 #[cfg(test)]
-pub(crate) const RECORDED_WEB_PROMPT_MARGIN_BYTES: usize = 789;
+pub(crate) const RECORDED_WEB_PROMPT_MARGIN_BYTES: usize = 780;
 
 /// How many per-chunk windows the total cap is worth — the multiple that turns
 /// [`REDACT_CHUNK_MAX_BYTES`] into [`REDACT_INPUT_MAX_BYTES`].
@@ -2449,14 +2458,16 @@ mod tests {
     /// [`RECORDED_PROMPT_MARGIN_BYTES`], and it is now *asserted*, not narrated.
     /// Against the 48-byte floor that was **81 bytes of usable room**.
     ///
-    /// **Recorded headroom at REQ-612:** `worst` **16,462** + `escaping` 6,348
-    /// = `spent` **22,810** against an overhead raised 14 → 23 KiB by this REQ,
-    /// leaving a margin of **742**. The opted-in twin is 16,415 / 22,763 /
-    /// **789** and stays the looser of the two by the same 47 bytes it always
-    /// has. REQ-612 spent **8,603** on both shapes: 8,192 of capped file text,
-    /// 331 of block frame, 80 on BR-8's amendment to the guide's capability
+    /// **Recorded headroom at REQ-612:** `worst` **16,471** + `escaping` 6,348
+    /// = `spent` **22,819** against an overhead raised 14 → 23 KiB by this REQ,
+    /// leaving a margin of **733**. The opted-in twin is 16,424 / 22,772 /
+    /// **780** and stays the looser of the two by the same 47 bytes it always
+    /// has. REQ-612 spent **8,612** on both shapes: 8,192 of capped file text,
+    /// 340 of block frame, 80 on BR-8's amendment to the guide's capability
     /// sentence — the account, and the reason the raise is 9 KiB rather than
-    /// the 8 the cap names, is on [`REDACT_BODY_OVERHEAD_BYTES`].
+    /// the 8 the cap names, is on [`REDACT_BODY_OVERHEAD_BYTES`]. The frame's
+    /// 340 was 331 until this REQ's verify pass qualified the truncation
+    /// marker with "at least"; both margins moved by those nine bytes.
     ///
     /// **Mutations run for REQ-612.** Dropping `repo_context` from the config
     /// rows below → red at the block self-check, naming the reason (the sweep

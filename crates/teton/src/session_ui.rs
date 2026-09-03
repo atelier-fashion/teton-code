@@ -3993,8 +3993,10 @@ fn format_route(rd: &RouteDecided, notes_resident_bytes: Option<u64>) -> String 
         rd.reason,
         budget_clause(rd).unwrap_or_default(),
         // After the budget it is spent out of (BR-7), and before the money
-        // clause, which is about a different currency entirely.
-        notes_clause(notes_resident_bytes).unwrap_or_default(),
+        // clause, which is about a different currency entirely. The cap is the
+        // route's own, projected onto this event beside the budget it is a
+        // quarter of — never re-derived here (BR-3, ADR-5).
+        notes_clause(notes_resident_bytes, rd.repo_context_cap).unwrap_or_default(),
         spend_clause(rd).unwrap_or_default()
     )
 }
@@ -4051,24 +4053,58 @@ fn budget_clause(rd: &RouteDecided) -> Option<String> {
 }
 
 /// The resident repository-notes clause a `/verbose` route line carries
-/// (REQ-612 BR-7), or `None` when this session is carrying no notes.
+/// (REQ-612 BR-3, BR-7), or `None` when this session is carrying no notes.
 ///
-/// `· notes 2,310 B`, in the same ` · ` idiom [`budget_clause`] and
-/// [`spend_clause`] use, and after the budget it qualifies: the notes are bytes
-/// *inside* that budget, and a clause that led would read as a second budget.
+/// `· notes 2,310 B / cap 4,096 B`, in the same ` · ` idiom [`budget_clause`]
+/// and [`spend_clause`] use, and after the budget it qualifies: the notes are
+/// bytes *inside* that budget, and a clause that led would read as a second
+/// budget.
 ///
-/// The figure is exact bytes rather than [`bytes_figure`]'s rounded form, which
-/// is the opposite choice from the budget beside it and is deliberate. A budget
-/// is an approximation of a ceiling; this is a file's measured contribution, and
-/// the number a user compares against `/context`'s own line and against the cap
-/// — three surfaces that must agree digit for digit or the comparison is worse
-/// than no figure at all.
+/// **Both halves, because one of them is BR-3's last sentence.** The cap is a
+/// quarter of *this route's* byte budget, so a fallback to a floored route
+/// silently halves it; a resident figure with nothing to compare it against
+/// cannot show a user that their notes are now up against a ceiling they were
+/// nowhere near a moment ago. The cap comes off `route_decided`'s own
+/// `repo_context_cap` — the router's number, projected beside the budget it is
+/// a quarter of — and the resident figure off the latest `repo_context_state`
+/// this client saw. A daemon that states no cap renders the resident figure
+/// alone, which is the pre-field line byte for byte.
+///
+/// The figures are exact bytes rather than [`bytes_figure`]'s rounded form,
+/// which is the opposite choice from the budget beside it and is deliberate. A
+/// budget is an approximation of a ceiling; these are a file's measured
+/// contribution and the ceiling it is measured against, and they are the numbers
+/// a user compares with `/context`'s own line — three surfaces that must agree
+/// digit for digit or the comparison is worse than no figure at all.
+///
+/// # The first route line of a session may show the load-time figure
+///
+/// The two facts arrive from different events and in an order this surface does
+/// not control. `session/create` publishes a `repo_context_state` measured at
+/// [`REPO_CONTEXT_MAX_BYTES`](teton_protocol) — the widest cap any route can ask
+/// for, because between turns there is no route — while a turn's own
+/// assemble-time state, measured at *that* route's cap, is published after the
+/// turn's `route_decided`. So on the first prompt of a session on a floored
+/// route this clause can pair a resident figure of 8,192 with a cap of 4,096,
+/// and the `context:` notes line printed immediately below it carries the
+/// corrected pair.
+///
+/// That correction is guaranteed rather than hoped for: the daemon's publish
+/// gate keys on the rendered `(state, truncated, resident_bytes)` triple, so a
+/// render at a narrower cap is news even when the file did not move.
 ///
 /// Zero renders no clause: a session with an empty notes file is spending
 /// nothing, and a `notes 0 B` would be chrome claiming a cost.
-fn notes_clause(resident_bytes: Option<u64>) -> Option<String> {
+fn notes_clause(resident_bytes: Option<u64>, cap: Option<u64>) -> Option<String> {
     let bytes = resident_bytes.filter(|bytes| *bytes > 0)?;
-    Some(format!(" · notes {} B", thousands(bytes)))
+    let Some(cap) = cap else {
+        return Some(format!(" · notes {} B", thousands(bytes)));
+    };
+    Some(format!(
+        " · notes {} B / cap {} B",
+        thousands(bytes),
+        thousands(cap)
+    ))
 }
 
 /// What a `repo_context_state` says is resident, folded to what the route line
@@ -4097,6 +4133,13 @@ fn notes_resident_bytes(rc: &events::RepoContextState) -> Option<u64> {
 /// outright: no file is the normal case, and a line for it would fire in every
 /// session in every directory that has no notes.
 ///
+/// **"Truncated" is [`events::RepoContextState::truncated`], not the state
+/// word.** A file well inside the 8,192-byte ceiling is cut anyway on a floored
+/// route, whose cap is a quarter of its own byte budget — so the flag is the
+/// route-aware fact and the word is not. Reading the word alone is how a
+/// truncation reaches a user as silence: the daemon renders at the route's cap,
+/// the state stays `loaded`, and `/verbose` off prints nothing at all.
+///
 /// Each line names a **different remedy**, because the states do: trim the file,
 /// relax the boundary, flip the switch, fix the file. The file is named from
 /// [`events::RepoContextState::source`], a closed two-value enum this build
@@ -4115,17 +4158,29 @@ fn format_repo_context(rc: &events::RepoContextState, verbose: bool) -> Option<S
         // reaches a line that names a file.
         None => "the repository notes",
     };
-    let line = match rc.state {
-        K::Absent => return None,
-        K::Loaded if !verbose => return None,
-        K::Loaded => format!(
-            "context: {file} is resident — {} bytes",
-            thousands(rc.resident_bytes)
-        ),
-        K::Truncated => format!(
+    // BR-3: **the flag decides, not the word.** `truncated` is asked before the
+    // state and before the `/verbose` gate, so a `loaded` beside a set flag
+    // still prints the cut. The daemon derives the two from one render and they
+    // agree; keying the line on the flag is what makes the agreement structural
+    // rather than something this surface merely relies on — and the failure it
+    // guards against is the silent one, a route-capped file rendering
+    // "is resident — 4,096 bytes" under `/verbose` and nothing at all without it.
+    if rc.truncated || rc.state == K::Truncated {
+        return Some(format!(
             "context: {file} is {} bytes; the first {} are resident — trim the file or move \
              detail below the fold",
             thousands(rc.bytes_on_disk),
+            thousands(rc.resident_bytes)
+        ));
+    }
+    let line = match rc.state {
+        K::Absent => return None,
+        K::Loaded | K::Truncated if !verbose => return None,
+        // `K::Truncated` is answered by the flag check above and never reaches
+        // here; it is named so the match stays exhaustive without a panic on a
+        // value that arrived over a wire.
+        K::Loaded | K::Truncated => format!(
+            "context: {file} is resident — {} bytes",
             thousands(rc.resident_bytes)
         ),
         K::WithheldBoundary => format!(
@@ -4468,6 +4523,7 @@ mod tests {
                 bound: None,
                 bound_floored: None,
                 spend_ceiling_micro_cents: None,
+                repo_context_cap: None,
             })),
             &mut surface,
             &mut state,
@@ -4518,6 +4574,7 @@ mod tests {
                     bound: None,
                     bound_floored: None,
                     spend_ceiling_micro_cents: None,
+                    repo_context_cap: None,
                 })),
                 &mut surface,
                 &mut state,
@@ -4555,6 +4612,7 @@ mod tests {
                 bound: None,
                 bound_floored: None,
                 spend_ceiling_micro_cents: None,
+                repo_context_cap: None,
             }),
             Event::PrivacyBlock(PrivacyBlock {
                 path: "secrets/prod.env".to_owned(),
@@ -4761,6 +4819,7 @@ mod tests {
                 bound: None,
                 bound_floored: None,
                 spend_ceiling_micro_cents: None,
+                repo_context_cap: None,
             }),
             Event::PrivacyBlock(PrivacyBlock {
                 path: "secrets/prod.env".to_owned(),
@@ -5182,6 +5241,7 @@ mod tests {
                     bound: Some(BudgetBound::UserCap),
                     bound_floored,
                     spend_ceiling_micro_cents: None,
+                    repo_context_cap: None,
                 },
                 None,
             )
@@ -5256,6 +5316,7 @@ mod tests {
                     bound,
                     bound_floored: None,
                     spend_ceiling_micro_cents: None,
+                    repo_context_cap: None,
                 },
                 None,
             )
@@ -5289,6 +5350,7 @@ mod tests {
                     bound: Some(BudgetBound::LocalEngine),
                     bound_floored: None,
                     spend_ceiling_micro_cents: None,
+                    repo_context_cap: None,
                 },
                 None
             ),
@@ -5325,6 +5387,7 @@ mod tests {
                     bound: None,
                     bound_floored: None,
                     spend_ceiling_micro_cents: ceiling,
+                    repo_context_cap: None,
                 },
                 None,
             )
@@ -12105,6 +12168,119 @@ mod repo_context_tests {
             format_route(&rd, Some(0)),
             bare,
             "a session spending nothing renders no clause"
+        );
+    }
+
+    /// **Verify (MAJOR 5) — BR-3's last sentence, BR-7.** The `/verbose` clause
+    /// names the route's own notes cap beside the resident figure, so a user can
+    /// see that a floored route has put their file up against a ceiling.
+    ///
+    /// The cap is read off `route_decided`'s `repo_context_cap`, never derived
+    /// here: it is a quarter of *that route's* byte budget, and a client
+    /// dividing the budget itself would be a second derivation of a number the
+    /// truncation marker and `/context` also quote.
+    ///
+    /// A daemon that states no cap renders the pre-field clause byte for byte,
+    /// which is the additivity rule every other clause on this line follows.
+    ///
+    /// **Mutation, run and observed:** deleting `repo_context_cap` from the
+    /// router's `route_decided` projection makes every route line render the
+    /// bare `· notes N B`, which fails the first assertion here; deriving the
+    /// cap from `budget_bytes / 4` on this side instead of reading the field
+    /// renders `cap 8,192 B` for the floored row and fails the second.
+    #[test]
+    fn the_route_line_names_the_caps_the_notes_are_measured_against() {
+        let route = |budget_bytes: u64, cap: Option<u64>| -> RouteDecided {
+            let mut value = serde_json::json!({
+                "provider_id": "kimi",
+                "model": "kimi-k3",
+                "reason": "a reason.",
+                "budget_tokens": 4_096,
+                "budget_bytes": budget_bytes,
+                "bound": "local_engine",
+            });
+            if let Some(cap) = cap {
+                value["repo_context_cap"] = serde_json::json!(cap);
+            }
+            serde_json::from_value(value).expect("a route event")
+        };
+
+        // The local tier: 8 KiB of room, and 2,310 bytes of it spent.
+        let local = route(63_488, Some(8_192));
+        assert!(
+            format_route(&local, Some(2_310)).ends_with(" · notes 2,310 B / cap 8,192 B"),
+            "{}",
+            format_route(&local, Some(2_310))
+        );
+
+        // A floored route: the same file, now at the ceiling — which is the
+        // fact the pair exists to make visible, and which the resident figure
+        // alone cannot say.
+        let floored = route(16_384, Some(4_096));
+        assert!(
+            format_route(&floored, Some(4_096)).ends_with(" · notes 4,096 B / cap 4,096 B"),
+            "{}",
+            format_route(&floored, Some(4_096))
+        );
+
+        // A daemon predating the field: the clause it always rendered.
+        let old = route(63_488, None);
+        assert!(
+            format_route(&old, Some(2_310)).ends_with(" · notes 2,310 B"),
+            "{}",
+            format_route(&old, Some(2_310))
+        );
+        assert!(!format_route(&old, Some(2_310)).contains("cap 8,192"));
+
+        // And no notes is still no clause, cap or not.
+        assert!(!format_route(&local, None).contains("notes"));
+        assert!(!format_route(&local, Some(0)).contains("notes"));
+    }
+
+    /// **Verify (MAJOR 1c) — BR-3 / AC-3: the flag decides, not the word.**
+    ///
+    /// The daemon renders at the route's own cap, so a file well inside the
+    /// 8,192-byte ceiling is `truncated` on a floored route while the state word
+    /// it was classified under stays whatever the load decided. A client that
+    /// branched on the word alone printed "is resident — 4,096 bytes" under
+    /// `/verbose`, and **nothing at all** without it — the silence BR-3 forbids.
+    ///
+    /// **Mutation, run and observed:** replacing the `rc.truncated ||` guard
+    /// with `rc.state == K::Truncated` alone fails both legs here — the first
+    /// with `None` where a line is owed, the second with the `is resident` line.
+    #[test]
+    fn a_truncated_flag_draws_the_truncation_line_whatever_the_state_word_says() {
+        // The shape a floored route publishes for a 6,000-byte file: the flag is
+        // set, the figures are the route's, and the word is the loader's.
+        let mut route_capped = state_event(K::Loaded);
+        route_capped.bytes_on_disk = 6_000;
+        route_capped.resident_bytes = 4_096;
+        route_capped.truncated = true;
+
+        assert_eq!(
+            format_repo_context(&route_capped, false).as_deref(),
+            Some(
+                "context: TETON.md is 6,000 bytes; the first 4,096 are resident — trim the \
+                 file or move detail below the fold"
+            ),
+            "a route-capped truncation must not ride the /verbose gate"
+        );
+        // And identically with `/verbose` on: the line is the same one, not a
+        // second, louder spelling of it.
+        assert_eq!(
+            format_repo_context(&route_capped, true),
+            format_repo_context(&route_capped, false)
+        );
+
+        // The flag clear is still the loaded line, so the guard is about the
+        // flag and not about the byte figures happening to differ.
+        let mut whole = route_capped.clone();
+        whole.truncated = false;
+        whole.resident_bytes = 6_000;
+        assert_eq!(format_repo_context(&whole, false), None);
+        assert_eq!(
+            format_repo_context(&whole, true).as_deref(),
+            Some("context: TETON.md is resident — 6,000 bytes")
         );
     }
 

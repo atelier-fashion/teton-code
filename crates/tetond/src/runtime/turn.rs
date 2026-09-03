@@ -126,8 +126,8 @@ struct ClaimedTurn {
 /// What the harness stage produces: the turn's tools and the prompt built from
 /// them. A parameter bundle — no behaviour, no I/O, no ids.
 ///
-/// **REQ-606 — kept, Rule R (return position, four values).** Returned, so the
-/// argument limit does not apply; four heterogeneous values are past the width
+/// **REQ-606 — kept, Rule R (return position, five values).** Returned, so the
+/// argument limit does not apply; five heterogeneous values are past the width
 /// where a tuple stays readable. `system` is lent onward to two stages and is
 /// **not** re-derived by either: REQ-606 deleted a `PreparedAttempts` field
 /// that was a clone of it (see [`DaemonRuntime::prepare_the_attempts`]).
@@ -136,6 +136,14 @@ struct AssembledHarness {
     tool_ctx: ToolContext,
     stream_events: SessionEvents,
     system: String,
+    /// The two pieces `system` was joined from, for a mid-turn reroute to
+    /// re-join at a different notes cap (REQ-612 BR-3) — `None` for a turn with
+    /// no notes, which is every turn that has nothing to re-render.
+    ///
+    /// It rides beside the finished prompt rather than replacing it because the
+    /// ordinary turn never reroutes and must not pay to assemble the string
+    /// twice.
+    repo_context: Option<RepoContextCarry>,
 }
 
 /// The facts the attempt loop reads and never changes.
@@ -324,6 +332,9 @@ struct TurnProducts {
     skill_turn: Option<SkillTurn>,
     prompt: String,
     accepted: Option<AcceptedExpansion>,
+    /// The assemble stage's [`RepoContextCarry`], on its way to the guard that
+    /// will re-render it if this turn reroutes (REQ-612 BR-3).
+    repo_context: Option<RepoContextCarry>,
 }
 
 impl DaemonRuntime {
@@ -511,6 +522,7 @@ impl DaemonRuntime {
             tool_ctx,
             stream_events,
             system,
+            repo_context,
         } = self
             .assemble_harness(tctx, sessions, &skills, &probed, &mut route)
             .await;
@@ -538,6 +550,7 @@ impl DaemonRuntime {
                 skill_turn,
                 prompt,
                 accepted,
+                repo_context,
             },
         );
         // Whether an accepted expansion was withdrawn from this conversation
@@ -1010,12 +1023,22 @@ impl DaemonRuntime {
         // tool iterations is resident at the *next* prompt and not inside this
         // one.
         //
-        // The quiet answer costs one `stat` and no allocation (`refresh`
-        // returns `None` when the key and the boundary verdict both still
-        // hold), which is why it is taken inline rather than on a blocking
-        // thread: one syscall does not earn a hand-off, and a turn whose notes
-        // actually changed is already paying for a read.
-        let enabled = self.repo_context_enabled(sessions, session_id);
+        // The quiet answer costs one `stat` and no allocation
+        // ([`RepoContext::verdict`] answers `Unchanged` when the key and the
+        // boundary verdict both still hold), which is why *it* is taken inline
+        // rather than on a blocking thread: one syscall does not earn a
+        // hand-off. The re-load behind a `Reload` verdict is a different
+        // animal — up to a 64 KiB read of a user-controlled path, and under
+        // `~/Documents` on macOS a TCC dialog that blocks for as long as the
+        // user takes to answer it — so that branch, and only that branch, takes
+        // `block_in_place_if_multithread` (BUG-184's rule).
+        //
+        // The switch reads **this turn's config snapshot** rather than the
+        // runtime's live mutex, so the one fact that decides whether the file
+        // may be opened is decided against the same config the route, the gate
+        // and the tool registry were (REQ-572 verify) — and no mutex is taken
+        // on the async turn path.
+        let enabled = repo_context_enabled_from(sessions, session_id, config.context.repo_file);
         let boundaries = config.effective_boundaries();
         let current = sessions.repo_context(session_id);
         // The route's **effective** cap, not the build's ceiling (ADR-5): the
@@ -1023,36 +1046,76 @@ impl DaemonRuntime {
         // 16,384-byte route carries 4 KiB of notes and the local tier the full
         // 8 KiB — one derivation, asked where the route is known.
         let cap = route.budget.repo_context_cap;
-        let state = match refresh_repo_context(
-            &current,
-            probed,
-            &boundaries,
-            enabled,
-            self.repo_files.as_ref(),
-        ) {
-            Some(fresh) => {
-                // Published on the change and only on the change (BR-6's "one
-                // event"), from outside the registry lock, before the prompt
-                // that carries it is built.
-                let event = repo_context_event(&fresh, cap);
-                if sessions.set_repo_context(session_id, fresh) {
-                    events.publish(Some(session_id.clone()), event);
-                }
-                sessions.repo_context(session_id)
-            }
-            None => current,
+        let files = self.repo_files.as_ref();
+        // Store and read back rather than keeping the value: the registry owns
+        // the `Arc`, and a session that vanished under this turn answers
+        // `Absent` — `store_session_repo_context`'s reading of the same `false`.
+        let store = |fresh| {
+            sessions.set_repo_context(session_id, fresh);
+            sessions.repo_context(session_id)
         };
-        // The block, rendered from the state the two lines above settled. The
-        // manager's `system_sources` follows from it through `CarriedTurn::begin`
-        // — read off this same value, so the prompt's bytes and the provenance
-        // of those bytes are seeded from one fact (ADR-2, REQ-585 BR-7).
+        let (state, state_moved) =
+            match repo_context_verdict(&current, probed, &boundaries, enabled, files) {
+                RefreshVerdict::Unchanged => (current, false),
+                RefreshVerdict::Settled(fresh) => (store(fresh), true),
+                RefreshVerdict::Reload { always_store } => {
+                    let fresh = block_in_place_if_multithread(|| {
+                        load_repo_context(probed, &boundaries, enabled, files)
+                    });
+                    if always_store || fresh != *current {
+                        (store(fresh), true)
+                    } else {
+                        (current, false)
+                    }
+                }
+            };
+        // BR-3 / AC-3: the news is what a client is *shown*, not what the daemon
+        // stored. The state above can be byte-identical from turn to turn while
+        // the route's cap moves under it — a fallback to a floored route renders
+        // the same untruncated file as a 4,096-byte truncated block — so the
+        // publish is gated on the rendered triple as well as on the state. That
+        // is the whole of "nothing is clamped in silence" for this feature:
+        // measured at the cap the prompt was actually built at, published from
+        // outside the registry lock, before the prompt that carries it is built.
+        let figures = repo_context_figures(&state, cap);
+        let triple = figures.triple();
+        let event = figures.into_event(&state);
+        if sessions.claim_repo_context_publish(session_id, triple, state_moved) {
+            events.publish(Some(session_id.clone()), event);
+        }
+        // The prompt is built in two pieces so a mid-turn reroute can rebuild
+        // the second one at a different cap (REQ-612 BR-3, `CarriedTurn::rebudget`):
+        // everything above the notes is a function of the tools and the route's
+        // *harness*, which a reroute does not move, and the block is a function
+        // of the file and the route's cap, which it does. Building the base with
+        // the field still `None` is what makes the two halves separable without
+        // rendering the prompt twice.
+        route.harness.repo_context = None;
+        let mut base_system = build_system_prompt(&tools, &route.harness);
+        // The block, rendered from the state settled above. The manager's
+        // `system_sources` follows from it through `CarriedTurn::begin` — read
+        // off this same value, so the prompt's bytes and the provenance of
+        // those bytes are seeded from one fact (ADR-2, REQ-585 BR-7).
         route.harness.repo_context = state.file().map(|file| RepoContextBlock::render(file, cap));
-        let system = build_system_prompt(&tools, &route.harness);
+        let (system, repo_context) = match &route.harness.repo_context {
+            Some(block) => (
+                append_repo_context(&base_system, block),
+                Some(RepoContextCarry {
+                    base_system: std::mem::take(&mut base_system),
+                    state: Arc::clone(&state),
+                }),
+            ),
+            // Moved rather than cloned: a session with no notes is the common
+            // case and must not pay a copy of the whole prompt for a feature it
+            // is not using.
+            None => (std::mem::take(&mut base_system), None),
+        };
         AssembledHarness {
             tools,
             tool_ctx,
             stream_events,
             system,
+            repo_context,
         }
     }
 
@@ -1337,6 +1400,7 @@ impl DaemonRuntime {
             skill_turn,
             prompt,
             accepted,
+            repo_context,
         } = products;
         let skill_refit: Vec<(String, String, String)> = skill_turn
             .as_ref()
@@ -1379,6 +1443,10 @@ impl DaemonRuntime {
             // skill outside the root. It is the same block either way.
             prompt_sources,
             prompt_unknown,
+            // REQ-612 BR-3: the two halves of this turn's prompt, so a reroute
+            // re-renders the notes at the cap of the route it lands on rather
+            // than carrying a block sized for the route it left.
+            repo_context,
         );
 
         // The loop's carried state, bundled so the stage below takes three

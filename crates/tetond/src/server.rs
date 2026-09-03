@@ -11835,6 +11835,7 @@ mod tests {
             bound: Some(derived.bound),
             spend_ceiling_micro_cents: None,
             bound_floored: Some(derived.floored),
+            repo_context_cap: None,
         };
         (derived, decided)
     }

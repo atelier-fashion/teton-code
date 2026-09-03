@@ -130,7 +130,16 @@ impl RepoContextBlock {
             text.push('\n');
         }
         if dropped > 0 {
-            text.push_str("[… truncated: ");
+            // "**at least**", because `dropped` counts what the *loader* held,
+            // and the loader stops at `REPO_CONTEXT_READ_CEILING_BYTES`: a 10 MiB
+            // `TETON.md` reaches here as 64 KiB, and a marker saying "57,344
+            // bytes were dropped" would understate it by four orders of
+            // magnitude. `sanitized.len() - kept.len()` is a true lower bound on
+            // the file's dropped bytes either way — each surviving byte of the
+            // stripped text came from at least one byte on disk — so the
+            // qualifier makes the sentence true rather than merely cautious.
+            // The size on disk is `/context`'s to state, where it is exact.
+            text.push_str("[… truncated: at least ");
             text.push_str(&thousands(dropped as u64));
             text.push_str(" bytes over the ");
             text.push_str(&thousands(effective_cap as u64));
@@ -321,7 +330,7 @@ mod tests {
         assert!(
             block
                 .text
-                .contains("[… truncated: 1 bytes over the 8,192-byte cap were dropped]\n"),
+                .contains("[… truncated: at least 1 bytes over the 8,192-byte cap were dropped]\n"),
             "the marker is not the one ADR-4 specifies: {}",
             &block.text[block.text.len() - 300..]
         );
@@ -358,9 +367,9 @@ mod tests {
             "the cut was at the cap rather than at the last line boundary under it"
         );
         assert!(
-            block
-                .text
-                .contains("[… truncated: 200 bytes over the 8,192-byte cap were dropped]\n"),
+            block.text.contains(
+                "[… truncated: at least 200 bytes over the 8,192-byte cap were dropped]\n"
+            ),
             "the marker does not count the dropped line: {}",
             &block.text[block.text.len() - 300..]
         );
@@ -370,9 +379,9 @@ mod tests {
         assert!(floored.truncated);
         assert_eq!(floored.resident_bytes, 4_096);
         assert!(
-            floored
-                .text
-                .contains("[… truncated: 4,097 bytes over the 4,096-byte cap were dropped]\n"),
+            floored.text.contains(
+                "[… truncated: at least 4,097 bytes over the 4,096-byte cap were dropped]\n"
+            ),
             "the marker names the constant rather than the route's cap: {}",
             &floored.text[floored.text.len() - 300..]
         );

@@ -2351,13 +2351,16 @@ mod tests {
     /// REQ added a 347-byte output-format clause to the resident prompt; this
     /// shape is still the looser of the two, now by 47 bytes exactly as before.
     ///
-    /// **Recorded headroom at REQ-612:** `worst` **16,415**, `spent` **22,763**,
-    /// margin **789** — against an overhead raised 14 → 23 KiB by that REQ,
+    /// **Recorded headroom at REQ-612:** `worst` **16,424**, `spent` **22,772**,
+    /// margin **780** — against an overhead raised 14 → 23 KiB by that REQ,
     /// with the floor unmoved at 48 and this shape still the looser of the two
-    /// by 47 B. Both shapes pay the same **8,603**: 8,192 of capped file text
-    /// for BR-3's repository-notes block, 331 for the block's own frame, and 80
+    /// by 47 B. Both shapes pay the same **8,612**: 8,192 of capped file text
+    /// for BR-3's repository-notes block, 340 for the block's own frame, and 80
     /// for BR-8's fourth amendment to the guide's capability sentence, which
-    /// now names the file the notes come from. The account of the raise — why
+    /// now names the file the notes come from. The frame's 340 was 331 until
+    /// the REQ's verify pass qualified the truncation marker with "at least"
+    /// (nine bytes; see `REDACT_BODY_OVERHEAD_BYTES`), and both margins moved
+    /// with it. The account of the raise — why
     /// it is 9 KiB and not the 8 the cap names, and what it does to the chunk
     /// count, the total cap and every scanned route's budget — is
     /// `egress::redact`'s twin of this paragraph.

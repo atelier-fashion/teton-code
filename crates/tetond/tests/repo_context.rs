@@ -28,6 +28,8 @@
 //! | BR-4, AC-5 | [`the_injection_corpus_is_defused_on_both_arms_and_plain_notes_render_verbatim`] |
 //! | BR-4, AC-6 | [`directives_in_the_file_change_no_level_route_effort_config_or_boundary`] |
 //! | BR-1, BR-8, AC-1 | [`a_fresh_session_carries_the_block_last_and_no_file_means_no_block`] |
+//! | BR-3, AC-3 | [`a_floored_routes_smaller_cap_is_announced_once_and_widening_it_is_announced_again`] |
+//! | BR-2, verify | [`a_withheld_file_reports_the_size_the_stat_saw_on_both_surfaces`] |
 //!
 //! TASK-377 added the last three. They reach one layer further than the four
 //! above: those are about *when* the file is read, these are about what the
@@ -56,6 +58,11 @@
 //! | `neutralize_envelope_tags` dropped from the block renderer | [`the_injection_corpus_is_defused_on_both_arms_and_plain_notes_render_verbatim`] |
 //! | `render_prompt`'s `Flat` arm stops defusing control tokens | [`the_injection_corpus_is_defused_on_both_arms_and_plain_notes_render_verbatim`] |
 //! | the block appended anywhere but last in `build_system_prompt` | [`a_fresh_session_carries_the_block_last_and_no_file_means_no_block`] |
+//! | the wire `state` taken from the stored state rather than the rendered block | [`a_floored_routes_smaller_cap_is_announced_once_and_widening_it_is_announced_again`] |
+//! | the turn's publish gated on the stored state alone | [`a_floored_routes_smaller_cap_is_announced_once_and_widening_it_is_announced_again`] |
+//! | the published-triple record dropped (an event on every prompt) | [`a_floored_routes_smaller_cap_is_announced_once_and_widening_it_is_announced_again`] |
+//! | `repo_context_cap` dropped from `route_decided` | [`a_floored_routes_smaller_cap_is_announced_once_and_widening_it_is_announced_again`] |
+//! | `bytes_on_disk` dropped from `WithheldBoundary` | [`a_withheld_file_reports_the_size_the_stat_saw_on_both_surfaces`] |
 //!
 //! ## What is not here
 //!
@@ -1584,6 +1591,29 @@ async fn directives_in_the_file_change_no_level_route_effort_config_or_boundary(
     );
 }
 
+/// Every `repo_context_state` and every `route_decided` on `sub`, drained
+/// together in one pass.
+///
+/// One pass because the two are interleaved: the notes are announced inside the
+/// assemble stage and the route when it is settled, so a helper that skipped
+/// ahead to one of them would consume and discard the other.
+async fn drain_repo_and_routes(
+    sub: &mut tetond::broadcast::Subscription,
+) -> (
+    Vec<teton_protocol::events::RepoContextState>,
+    Vec<teton_protocol::events::RouteDecided>,
+) {
+    let (mut notes, mut routes) = (Vec::new(), Vec::new());
+    while let Ok(Some(envelope)) = timeout(Duration::from_millis(50), sub.recv()).await {
+        match envelope.event {
+            Event::RepoContextState(state) => notes.push(state),
+            Event::RouteDecided(route) => routes.push(route),
+            _ => {}
+        }
+    }
+    (notes, routes)
+}
+
 /// The first `route_decided` on `sub`.
 async fn route_decided(
     sub: &mut tetond::broadcast::Subscription,
@@ -1832,4 +1862,237 @@ impl TestClient {
         )
         .await
     }
+}
+
+// ---------------------------------------------------------------------------
+// BR-3 / AC-3 verify — a route-cap truncation is never silent, and never twice
+// ---------------------------------------------------------------------------
+
+/// **BR-3 / AC-3 (verify).** A file the daemon classified `loaded` is announced
+/// as **truncated** the moment a route renders it at a smaller cap — once, on
+/// the turn that does it, and not again while the route holds.
+///
+/// # The defect this pins
+///
+/// `Loaded` versus `Truncated` is decided at load time against
+/// `REPO_CONTEXT_MAX_BYTES`, the widest cap any route can ask for. The block is
+/// rendered at `route.budget.repo_context_cap`, a quarter of *that route's* byte
+/// budget. A 6,000-byte `TETON.md` is therefore `loaded` in the registry and cut
+/// in half on a floored route — and the event used to carry the load-time word
+/// beside the route-aware flag, while the publish itself was gated on the
+/// *stored state* changing, which it had not. So the truncation reached the user
+/// as: a `loaded` line under `/verbose`, and nothing at all without it.
+///
+/// Three seams had to move together and all three are asserted here: the wire
+/// `state` is derived from the block that was rendered; the publish is gated on
+/// the rendered `(state, truncated, resident_bytes)` triple rather than on the
+/// stored state; and — in `session_ui`'s own suite, which is the only place a
+/// client renderer can be driven from — the line keys on `truncated` rather than
+/// on the word.
+///
+/// # The route
+///
+/// A `context_budget_cap` below the floor derives *under* `MIN_BUDGET_BYTES`, so
+/// the pair is raised to it and `floored` is set — 16,384 bytes of budget and
+/// 4,096 of notes. Widening the cap mid-session moves the same session back to a
+/// route with the full 8,192, which is the third leg.
+///
+/// # Mutation
+///
+/// | change | result |
+/// |---|---|
+/// | publish `state.kind()` instead of the rendered block's | leg 1's `Truncated` assertion fails with `Loaded` |
+/// | gate the publish on `set_repo_context` alone | leg 1 announces nothing at all |
+/// | gate it on the state only, ignoring the triple | leg 3 is silent when the cap widens |
+/// | drop the triple record, publishing on every turn | leg 2 sees a duplicate |
+/// | drop `repo_context_cap` from `route_decided` | the cap assertions fail |
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_floored_routes_smaller_cap_is_announced_once_and_widening_it_is_announced_again() {
+    // 6,000 bytes: inside the 8,192 ceiling the loader classifies against, and
+    // well past a floored route's 4,096. Whole 64-byte lines, so the
+    // line-boundary cut lands on 4,096 exactly and the figures below are the
+    // renderer's rather than an approximation of them.
+    let notes = format!(
+        "{}{}\n",
+        format!("{}\n", "n".repeat(63)).repeat(93),
+        "n".repeat(47)
+    );
+    assert_eq!(notes.len(), 6_000, "the fixture is not 6,000 bytes");
+    let repo = Tree::with_notes("routecap", &notes);
+    let h = Harness::new();
+
+    // A budget cap under the floor: the pair is raised to `MIN_BUDGET_BYTES`
+    // and the route is a floored one, whose notes cap is a quarter of 16,384.
+    let reregister = |cap: Option<u32>| {
+        h.runtime
+            .apply_config_update(ConfigUpdate::RegisterProvider(ProviderConfig {
+                id: ProviderId::from("mock"),
+                kind: ProtoProviderKind::OpenaiCompatible,
+                endpoint: Some(h.vendor.endpoint.clone()),
+                model: Some("mock-1".to_owned()),
+                auth_ref: None,
+                max_context: Some(128_000),
+                context_budget_cap: cap,
+                allow_cleartext: None,
+                floored_budget: None,
+            }))
+            .expect("re-registering the provider merges its window fields");
+    };
+    reregister(Some(1_024));
+
+    let mut bus = h.events.subscribe(64);
+    let session = h.session_at(repo.path());
+
+    // Create: measured at the ceiling, because between turns there is no route.
+    let announced = repo_context_events(&mut bus).await;
+    assert_eq!(
+        announced
+            .iter()
+            .map(|e| (e.state, e.truncated, e.resident_bytes))
+            .collect::<Vec<_>>(),
+        vec![(RepoContextStateKind::Loaded, false, 6_000)],
+        "`session/create` measures at the build's ceiling: {announced:?}"
+    );
+
+    // Leg 1 — the first prompt on the floored route says the file was cut.
+    //
+    // Both event kinds are drained in **one** pass: `repo_context_state` is
+    // published inside the assemble stage and `route_decided` when the route is
+    // settled, and a helper that skipped to one of them would swallow the other
+    // (which is how the first version of this test read "nothing was announced"
+    // off a bus that had announced it).
+    h.turn(&session, "first").await;
+    let (announced, routes) = drain_repo_and_routes(&mut bus).await;
+    assert_eq!(
+        routes.last().and_then(|r| r.repo_context_cap),
+        Some(4_096),
+        "the route line must carry the cap the block was rendered at: {routes:?}"
+    );
+    assert_eq!(
+        announced
+            .iter()
+            .map(|e| (e.state, e.truncated, e.resident_bytes, e.bytes_on_disk))
+            .collect::<Vec<_>>(),
+        vec![(RepoContextStateKind::Truncated, true, 4_096, 6_000)],
+        "a route-cap truncation was announced as something else, or not at all: \
+         {announced:?}"
+    );
+    // The stored state did **not** move — which is exactly why gating the
+    // publish on it was the defect.
+    assert_eq!(
+        h.stored(&session).kind(),
+        RepoContextStateKind::Loaded,
+        "the loader classifies against the ceiling, not against the route"
+    );
+    let first = wire_systems(&h.vendor)
+        .last()
+        .cloned()
+        .expect("the turn reached the vendor");
+    assert!(
+        first.contains("[… truncated: at least 1,904 bytes over the 4,096-byte cap were dropped]"),
+        "the prompt's own marker disagrees with the event: {}",
+        &first[first.len().saturating_sub(400)..]
+    );
+
+    // Leg 2 — a second prompt on the same route is not news.
+    h.turn(&session, "second").await;
+    let (announced, _) = drain_repo_and_routes(&mut bus).await;
+    assert!(
+        announced.is_empty(),
+        "the same file at the same cap was announced twice: {announced:?}"
+    );
+
+    // Leg 3 — widening the cap puts the whole file back, and that is news.
+    reregister(Some(64_000));
+    h.turn(&session, "third").await;
+    let (announced, routes) = drain_repo_and_routes(&mut bus).await;
+    assert_eq!(
+        routes.last().and_then(|r| r.repo_context_cap),
+        Some(8_192),
+        "{routes:?}"
+    );
+    assert_eq!(
+        announced
+            .iter()
+            .map(|e| (e.state, e.truncated, e.resident_bytes))
+            .collect::<Vec<_>>(),
+        vec![(RepoContextStateKind::Loaded, false, 6_000)],
+        "a file that stopped being truncated was not announced: {announced:?}"
+    );
+    let third = wire_systems(&h.vendor)
+        .last()
+        .cloned()
+        .expect("the third turn reached the vendor");
+    assert!(
+        !third.contains("truncated:"),
+        "the block is still cut at the wider cap"
+    );
+}
+
+/// **BR-2 / verify (MAJOR 4).** A withheld file still has a size, and both
+/// surfaces report it.
+///
+/// `WithheldBoundary` is reached **before** the read (ADR-2), so the daemon
+/// never holds the bytes — but it has already `stat`ed the entry, and that
+/// `stat` is the one figure a state that read nothing can honestly give.
+/// Dropping it made `/context` print `0 bytes on disk` beside a file the user
+/// can see in `ls`, which is not merely uninformative: it is the first thing
+/// they would check, and it was wrong.
+///
+/// Both projections are asserted because BR-2 splits them — the broadcast event
+/// is news and the routed `session/context` answer names the file — and they
+/// read the figure through one derivation, so a build that fixed one and not the
+/// other is what this pair exists to catch.
+///
+/// # Mutation
+///
+/// | change | result |
+/// |---|---|
+/// | drop `bytes_on_disk` from `WithheldBoundary` | both assertions fail with `0` |
+/// | report it only on the event | the `/context` assertion fails |
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withheld_file_reports_the_size_the_stat_saw_on_both_surfaces() {
+    // Exactly 2,048 bytes, so the figure asserted on is the file's own.
+    let notes = format!("{}\n", "w".repeat(63)).repeat(32);
+    assert_eq!(notes.len(), 2_048, "the fixture is not 2,048 bytes");
+    let repo = Tree::with_notes("withheld-size", &notes);
+    let h = Harness::new();
+    h.runtime
+        .apply_config_update(ConfigUpdate::SetPrivacyBoundary(PrivacyBoundaryConfig {
+            path_glob: "**/TETON.md".to_owned(),
+            mode: PrivacyMode::LocalOnly,
+            origin: teton_protocol::methods::BoundaryOriginConfig::User,
+        }))
+        .expect("a boundary is a config update");
+
+    let mut bus = h.events.subscribe(64);
+    let session = h.session_at(repo.path());
+
+    let announced = repo_context_events(&mut bus).await;
+    assert_eq!(
+        announced
+            .iter()
+            .map(|e| (e.state, e.bytes_on_disk, e.resident_bytes))
+            .collect::<Vec<_>>(),
+        vec![(RepoContextStateKind::WithheldBoundary, 2_048, 0)],
+        "the event reports a covered file's size as something other than its \
+         size on disk: {announced:?}"
+    );
+    // And it never read the bytes, which is the property the size must not have
+    // cost: one `stat` for the winner and nothing else.
+    assert_eq!(
+        h.files.reads(),
+        0,
+        "a covered file was read to find out how big it is: {:?}",
+        h.files.drain()
+    );
+
+    let status = h.context(&session, ContextAction::Status);
+    assert_eq!(status.state, RepoContextStateKind::WithheldBoundary);
+    assert_eq!(
+        (status.bytes_on_disk, status.resident_bytes),
+        (2_048, 0),
+        "`/context` reports a visible file as zero bytes on disk: {status:?}"
+    );
+    assert_eq!(status.file.as_deref(), Some("TETON.md"));
 }

@@ -2881,7 +2881,13 @@ fn context_state_words(state: RepoContextStateKind) -> &'static str {
     match state {
         RepoContextStateKind::Loaded => "on — the repository notes are resident",
         RepoContextStateKind::Truncated => "on — the repository notes are resident, truncated",
-        RepoContextStateKind::Absent => "off — no TETON.md or AGENTS.md at the session root",
+        // Not "there is no file". `absent` is also what a non-`project` root
+        // answers, what a present-but-empty file answers, and what an
+        // uncompilable boundary set fails closed to — so a sentence claiming the
+        // filesystem is empty would be wrong in three ways a user standing next
+        // to their own `TETON.md` would notice immediately. What the daemon
+        // actually knows, and all it knows, is that nothing is resident.
+        RepoContextStateKind::Absent => "off — no repository notes are resident",
         RepoContextStateKind::WithheldBoundary => {
             "off — withheld: a local-only boundary covers the file"
         }

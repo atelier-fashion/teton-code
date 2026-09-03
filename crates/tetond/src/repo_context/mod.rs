@@ -54,18 +54,41 @@
 //! answered about the target, which is exactly the check the entry rule exists to
 //! make.
 //!
+//! The `lstat` is a **check**, not a guarantee: between it and the open, a
+//! same-UID process can put a symlink where the regular file was. So the open
+//! carries `O_NOFOLLOW` as well ([`RealFiles::read`]), the `transcript::writer`
+//! discipline — the check names the refusal, the flag makes it unraceable.
+//!
+//! # Accepted residual: a hardlink
+//!
+//! A **hardlinked** `TETON.md` passes every rule here. `lstat` says regular file
+//! and not a symlink because that is what a hardlink is — a second name for one
+//! inode — and `O_NOFOLLOW` has nothing to refuse. A user who can create a
+//! hardlink at the session root to a file outside it can therefore make its
+//! bytes resident.
+//!
+//! This is accepted, not overlooked, and it is shared with the `read` tool's own
+//! jail (REQ-571): the same hardlink is readable by `read` at the same path, so
+//! closing it here alone would buy nothing and would put a second, stricter
+//! classifier of what may be read beside the one REQ-583 BR-10 makes canonical.
+//! The party who can plant the link is the party who owns the working tree, and
+//! a privacy boundary still judges the identity that is minted for the *link's*
+//! path — so `local_only = ["TETON.md"]` withholds it whatever it points at.
+//!
 //! # What is deliberately not here
 //!
 //! No call into [`crate::projects::scan`] — `scan.rs`'s forbid list guards the
 //! `session/create` derivation, and a one-file `stat` + `read` has no reason to
-//! reach for a scanner. No watcher: BR-6's staleness check is [`RepoContext::refresh`],
+//! reach for a scanner. No watcher: BR-6's staleness check is [`RepoContext::verdict`],
 //! run by the turn's `assemble` stage, and REQ-585 BR-1 already decided against
 //! watching. No wiring: `HarnessConfig`, the session record and the runtime are
 //! TASK-373/374's, and nothing in this module knows they exist.
 
 pub mod render;
 
+use std::fs::OpenOptions;
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -140,7 +163,7 @@ pub const REPO_CONTEXT_READ_CEILING_BYTES: u64 = 65_536;
 /// the two facts that decide whether the file may be opened at all.
 ///
 /// `mtime` is optional because a filesystem may not report one, and the
-/// comparison in [`RepoContext::refresh`] treats a missing timestamp as
+/// comparison in [`RepoContext::verdict`] treats a missing timestamp as
 /// **changed**: an absent fact cannot prove sameness, and the cost of being
 /// wrong in that direction is one re-read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,12 +193,30 @@ pub enum RepoFileError {
     /// No such file. Not a fault — BR-1's normal case.
     NotFound,
     /// It exists and could not be opened: `EPERM`, or macOS's TCC consent gate.
+    ///
+    /// **`PermissionDenied` and nothing else.** Every other `io::Error` is
+    /// [`Self::Unavailable`], because the two name different remedies: a user
+    /// told "permission denied" about a file they own and can `cat` will go
+    /// looking for a permission that was never the problem.
     Denied,
     /// Not a regular file — a directory, FIFO, socket or device.
     NotRegular,
     /// Not valid UTF-8. Reported separately so the state names the reason
     /// rather than blaming a permission the user has.
     NotUtf8,
+    /// The entry is a symlink and the open refused to follow it (`ELOOP` from
+    /// `O_NOFOLLOW`).
+    ///
+    /// The same verdict [`RepoContext::load`]'s `lstat` reaches, from the other
+    /// end: the check runs first and this closes the window behind it.
+    Symlink,
+    /// It exists, it is not a permission problem, and it could not be read
+    /// anyway — an I/O error, a device that went away, a filesystem that
+    /// answered `EIO`.
+    ///
+    /// Its own variant so the sentence a user is shown is neutral about cause
+    /// rather than wrong about it (see [`Self::Denied`]).
+    Unavailable,
 }
 
 /// The filesystem, as the repository-notes loader is allowed to see it.
@@ -235,26 +276,103 @@ impl RepoFileReader for RealFiles {
         if !metadata.is_file() {
             return Err(RepoFileError::NotRegular);
         }
-        let handle = std::fs::File::open(path).map_err(map_io)?;
+        // `O_NOFOLLOW`, the `transcript::writer` discipline (REQ-611 BR-9): the
+        // caller's `lstat` refused a symlinked entry, and this closes the window
+        // between that check and this open — a same-UID process that swaps a
+        // symlink in between would otherwise redirect the read at any file the
+        // user owns. `ELOOP` is the answer `O_NOFOLLOW` gives for a symlink, and
+        // it is mapped to the *same* verdict the `lstat` reaches so one refusal
+        // has one sentence.
+        let handle = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(map_open)?;
+        // The other half of the same window, narrowed rather than closed: the
+        // type check above ran against a path and this runs against the *open
+        // descriptor*, so a file that was replaced between the two is refused
+        // instead of read. Cheap — one `fstat`, no path resolution — and it
+        // cannot be made exact without a syscall this seam does not have: a
+        // regular file whose size changes under an editor answers the same way,
+        // which is the right direction to be wrong in, because the alternative
+        // is reading half of each of two files.
+        let opened = handle.metadata().map_err(map_io)?;
+        if !opened.is_file() || opened.len() != metadata.len() {
+            return Err(RepoFileError::NotRegular);
+        }
         let mut bytes = Vec::new();
         // `take` as well as the ceiling argument, so a file that grows under the
         // read stays bounded. `read_to_end` and then a conversion rather than
         // `read_to_string`, so "not UTF-8" is a verdict rather than an inference
         // from a flattened `io::Error`.
-        handle
+        (&handle)
             .take(ceiling)
             .read_to_end(&mut bytes)
-            .map_err(|_| RepoFileError::Denied)?;
-        String::from_utf8(bytes).map_err(|_| RepoFileError::NotUtf8)
+            .map_err(map_io)?;
+        decode_at_ceiling(bytes, ceiling)
     }
 }
 
-/// Map an `io::Error` to this module's two-value answer for an opening call.
+/// `bytes` as text, forgiving **only** a codepoint the read ceiling cut in half.
+///
+/// `take(ceiling)` cuts on a byte, and a byte is not a character: a perfectly
+/// valid `TETON.md` whose 65,536th byte is the middle of an em dash would
+/// otherwise be reported [`RepoFileError::NotUtf8`] — the daemon calling the
+/// repository's own file corrupt because of where the daemon chose to stop.
+///
+/// Two conditions, together, and neither alone:
+///
+/// - **the buffer is exactly at the ceiling**, so this is a file the read cut
+///   rather than a file that ended;
+/// - **the invalid bytes are the last three or fewer**, which is the whole of
+///   what an incomplete UTF-8 sequence can be (the longest encoding is four
+///   bytes, so at most three of them can be a valid prefix).
+///
+/// Anything else is `NotUtf8`, unchanged: a file with a stray `0x80` in the
+/// middle is not text, and saying so is the honest answer.
+///
+/// The recovery keeps the **valid prefix** and never `from_utf8_lossy`: a
+/// replacement character would put bytes in the prompt that are not in the file,
+/// which is exactly what [`RepoContextFile::text`] must not contain.
+fn decode_at_ceiling(bytes: Vec<u8>, ceiling: u64) -> Result<String, RepoFileError> {
+    let error = match String::from_utf8(bytes) {
+        Ok(text) => return Ok(text),
+        Err(error) => error,
+    };
+    let valid_up_to = error.utf8_error().valid_up_to();
+    let mut bytes = error.into_bytes();
+    let at_ceiling = bytes.len() as u64 == ceiling;
+    let straddles = bytes.len() - valid_up_to <= 3;
+    if !(at_ceiling && straddles) {
+        return Err(RepoFileError::NotUtf8);
+    }
+    bytes.truncate(valid_up_to);
+    String::from_utf8(bytes).map_err(|_| RepoFileError::NotUtf8)
+}
+
+/// Map an `io::Error` to this module's named answer for an opening call.
+///
+/// `PermissionDenied` alone is [`RepoFileError::Denied`]; everything else that
+/// is not a missing file is [`RepoFileError::Unavailable`], because the two lead
+/// a user to different remedies and only one of them can be right.
 fn map_io(error: std::io::Error) -> RepoFileError {
     match error.kind() {
         std::io::ErrorKind::NotFound => RepoFileError::NotFound,
-        _ => RepoFileError::Denied,
+        std::io::ErrorKind::PermissionDenied => RepoFileError::Denied,
+        _ => RepoFileError::Unavailable,
     }
+}
+
+/// [`map_io`], plus the one answer only the `O_NOFOLLOW` open can give.
+///
+/// `libc::ELOOP` rather than either literal: the number differs by platform (62
+/// on macOS, 40 on Linux) and `io::ErrorKind` has no stable value for it, so the
+/// platform's own constant is the only spelling that is right on both.
+fn map_open(error: std::io::Error) -> RepoFileError {
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        return RepoFileError::Symlink;
+    }
+    map_io(error)
 }
 
 /// A file that was read, and everything a later turn needs to know about it.
@@ -316,6 +434,14 @@ pub enum RepoContextState {
         /// Which name is on disk. Named, because "which file" is the first
         /// question this state raises.
         source: RepoContextSource,
+        /// Its size on disk, from the `stat` that reached it — see
+        /// [`Self::bytes_on_disk`].
+        ///
+        /// Always `Some` here: the boundary verdict is taken after the entry
+        /// rule, so a withheld file is always one whose `lstat` succeeded and
+        /// said *regular file*. It is an `Option` because it shares the
+        /// accessor with [`Self::Unreadable`], where it is not.
+        bytes_on_disk: Option<u64>,
     },
     /// The switch is off, durably or for this session: the file was never
     /// opened, and no reader call was made (BR-2).
@@ -331,6 +457,10 @@ pub enum RepoContextState {
         /// can reach a surface through it — which is the failure mode a
         /// formatted `io::Error` would have.
         reason: &'static str,
+        /// Its size on disk, when the `stat` that would have said got an answer
+        /// **and** that answer was about a regular file — see
+        /// [`Self::bytes_on_disk`].
+        bytes_on_disk: Option<u64>,
     },
 }
 
@@ -342,6 +472,15 @@ const REASON_DENIED: &str = "it could not be opened (permission denied)";
 const REASON_NOT_REGULAR: &str = "it is not a regular file";
 /// The reason for bytes that are not text.
 const REASON_NOT_UTF8: &str = "it is not valid UTF-8";
+/// The reason for a filesystem that failed for some other reason entirely.
+///
+/// Neutral about cause on purpose: the daemon knows the read did not happen and
+/// does not know why, and [`REASON_DENIED`] would send the user after a
+/// permission that is not the problem. Worded as the *filesystem's* answer
+/// rather than as "it could not be read", because the sentence this rides
+/// inside already says that — `TETON.md could not be read — it is not resident
+/// (the filesystem reported an error)`.
+const REASON_UNAVAILABLE: &str = "the filesystem reported an error";
 /// The reason for a candidate the jail will not resolve to a file under the
 /// root — a root that no longer resolves, or a leaf with no root-relative
 /// identity to mint.
@@ -379,7 +518,37 @@ impl RepoContextState {
     pub fn source(&self) -> Option<RepoContextSource> {
         match self {
             Self::Loaded(file) | Self::Truncated(file) => Some(file.source),
-            Self::WithheldBoundary { source } | Self::Unreadable { source, .. } => Some(*source),
+            Self::WithheldBoundary { source, .. } | Self::Unreadable { source, .. } => {
+                Some(*source)
+            }
+            Self::Absent | Self::WithheldOff => None,
+        }
+    }
+
+    /// The file's size on disk, for every state that got an answer about it.
+    ///
+    /// **A withheld or unreadable file still has a size**, and every surface
+    /// that reports one reads it here. Dropping it would make `/context` print
+    /// `0 bytes on disk` for a file the user can see — a figure that is not
+    /// merely uninformative but wrong, and the first thing they would check.
+    ///
+    /// `None` where the daemon genuinely does not know, and the set is exactly:
+    ///
+    /// - [`Self::Absent`] and [`Self::WithheldOff`] — nothing was `stat`ed, or
+    ///   nothing is there;
+    /// - the [`Self::Unreadable`] refusals whose `stat` **failed**, which had no
+    ///   answer to keep;
+    /// - the two whose `stat` succeeded about something that is not a regular
+    ///   file — a symlinked entry, a directory. `lstat`'s `len` for those is the
+    ///   target path's length or a directory block, not a file's size, and
+    ///   reporting it as "bytes on disk" would be a number that means nothing
+    ///   dressed as one that means something.
+    #[must_use]
+    pub fn bytes_on_disk(&self) -> Option<u64> {
+        match self {
+            Self::Loaded(file) | Self::Truncated(file) => Some(file.bytes_on_disk),
+            Self::WithheldBoundary { bytes_on_disk, .. }
+            | Self::Unreadable { bytes_on_disk, .. } => *bytes_on_disk,
             Self::Absent | Self::WithheldOff => None,
         }
     }
@@ -388,9 +557,11 @@ impl RepoContextState {
 /// The loader (ADR-3): one file, one place, two entry points.
 ///
 /// A namespace rather than a value. ADR-3 spells the second entry point
-/// `refresh(&self, ..)`; it takes the current state by reference instead,
-/// because a wrapper struct holding a `RepoContextState` would be a second place
-/// the session's state lives and the session record (TASK-373) is the first.
+/// `refresh(&self, ..)`; it is [`Self::verdict`], taking the current state by
+/// reference, because a wrapper struct holding a `RepoContextState` would be a
+/// second place the session's state lives and the session record (TASK-373) is
+/// the first — and it answers a verdict rather than a state, because the re-read
+/// a stale key implies is a blocking call the caller has to place (see there).
 pub struct RepoContext;
 
 impl RepoContext {
@@ -439,31 +610,41 @@ impl RepoContext {
             let key = match files.stat(&spelled) {
                 Ok(key) => key,
                 Err(RepoFileError::NotFound) => continue,
-                Err(_) => return unreadable(source, REASON_DENIED),
+                // No `key`, so no size to report: the `stat` is what would have
+                // said, and it is what failed.
+                Err(other) => return unreadable(source, reason_for(other), None),
             };
+            // Past this point the `stat` answered, and from the two checks below
+            // onward it answered about a *regular file* — which is the condition
+            // under which `key.len` is a size worth showing anyone.
             if key.is_symlink {
-                return unreadable(source, REASON_SYMLINK);
+                return unreadable(source, REASON_SYMLINK, None);
             }
             if !key.is_regular {
-                return unreadable(source, REASON_NOT_REGULAR);
+                return unreadable(source, REASON_NOT_REGULAR, None);
             }
+            let on_disk = Some(key.len);
             // The jail's own resolution, and the identity it mints — never a
             // second parse of the same path (LESSON-494, LESSON-623).
             let Ok(resolved) = jail.resolve(name) else {
-                return unreadable(source, REASON_UNRESOLVED);
+                return unreadable(source, REASON_UNRESOLVED, on_disk);
             };
             if boundaries
                 .match_path(resolved.provenance.as_str())
                 .is_some()
             {
-                return RepoContextState::WithheldBoundary { source };
+                return RepoContextState::WithheldBoundary {
+                    source,
+                    // The one figure a withheld state may carry, and it is not
+                    // the file's content: BR-5 withholds the *bytes*, and a size
+                    // the user can read off `ls` is what makes the withholding
+                    // legible rather than mysterious.
+                    bytes_on_disk: on_disk,
+                };
             }
             let text = match files.read(&resolved.path, REPO_CONTEXT_READ_CEILING_BYTES) {
                 Ok(text) => text,
-                Err(RepoFileError::NotFound) => return unreadable(source, REASON_UNRESOLVED),
-                Err(RepoFileError::NotRegular) => return unreadable(source, REASON_NOT_REGULAR),
-                Err(RepoFileError::NotUtf8) => return unreadable(source, REASON_NOT_UTF8),
-                Err(RepoFileError::Denied) => return unreadable(source, REASON_DENIED),
+                Err(other) => return unreadable(source, reason_for(other), on_disk),
             };
             // Stripped here as well as in the renderer (BR-4, ADR-4: before the
             // cap is measured). The pass is deletion-only and idempotent, so the
@@ -495,44 +676,95 @@ impl RepoContext {
         RepoContextState::Absent
     }
 
-    /// BR-6's start-of-turn staleness check: `Some` when the session's state has
-    /// to change, `None` when it has not.
+    /// BR-6's start-of-turn staleness check: what the session's state has to
+    /// become, or [`RefreshVerdict::Unchanged`] when it has not.
     ///
-    /// `None` is the answer that has to be cheap, because it is the answer on
-    /// every turn of every session: one `stat` and a glob match, no read, no
+    /// `Unchanged` is the answer that has to be cheap, because it is the answer
+    /// on every turn of every session: one `stat` and a glob match, no read, no
     /// allocation of the file's bytes. It is returned only when **both** halves
     /// of the verdict still hold — the `mtime`/`len` key is identical *and* the
     /// boundary set still does not cover the identity (OQ-4: a boundary added
     /// mid-session drops the block at the next prompt).
     ///
     /// A state with no stored key ([`RepoContextState::Absent`],
-    /// `WithheldBoundary`, `Unreadable`) re-runs [`Self::load`] and reports only
-    /// a *difference*. That is one or two `stat`s and still no read — none of
-    /// those paths reaches the read — and it is what lets a `TETON.md` created
-    /// mid-session become resident at the next prompt.
+    /// `WithheldBoundary`, `Unreadable`) asks the caller to re-run [`Self::load`]
+    /// and to report only a *difference*. That is one or two `stat`s and still no
+    /// read — none of those paths reaches the read — and it is what lets a
+    /// `TETON.md` created mid-session become resident at the next prompt.
     ///
     /// **A newly created `TETON.md` beside a loaded `AGENTS.md` waits for the
     /// next `session/create` or `/cd`.** Seeing it would cost a second `stat` on
     /// every turn of every session carrying a fallback file, and ADR-3's budget
     /// for this check is one.
-    pub fn refresh(
+    ///
+    /// # The key is `mtime` + `len`, and `mtime` has a granularity
+    ///
+    /// Two edits inside one filesystem timestamp tick that leave the file the
+    /// same length are indistinguishable here, and the second one is not
+    /// resident until something else moves the key. HFS+ stamps whole seconds;
+    /// APFS and ext4 are nanosecond-resolution and do not have the problem in
+    /// practice. It is the same key `read`'s own staleness check uses, and the
+    /// alternative — hashing up to 64 KiB on every turn of every session — is
+    /// far past ADR-3's budget of one `stat` for the quiet answer. A user who
+    /// hits it is one `/cd .` (or one more edit) away from the new bytes.
+    ///
+    /// # It decides; it does not re-read
+    ///
+    /// The answer is a [`RefreshVerdict`], and the re-load a
+    /// [`RefreshVerdict::Reload`] names is the **caller's** to run. The two
+    /// halves cost different things and therefore run in different places: the
+    /// decision is one `stat` and a glob match, taken inline on the turn path,
+    /// while the re-load can open and read 64 KiB of a user-controlled path and
+    /// on macOS raise a TCC dialog that blocks for as long as the user takes to
+    /// answer it — so the caller takes `block_in_place_if_multithread` for that
+    /// branch and nothing else (BUG-184's rule).
+    ///
+    /// There is deliberately **no** composed `refresh(..) -> Option<..>` beside
+    /// this. It had exactly one caller, that caller now needs the halves apart,
+    /// and a composition nothing in production runs is a composition its own
+    /// test agrees with while production drifts (LESSON-451). The four lines
+    /// that compose it live at the call site, where the blocking wrap is.
+    ///
+    /// # The gates before the key comparison
+    ///
+    /// They are the ones a session can walk out from under mid-flight:
+    ///
+    /// - **the switch** (BR-2) — off means unopened, on every path in here;
+    /// - **the root kind** — a session whose root stopped being a `project`
+    ///   re-derives, because BR-1 reads only a project root and the stored file
+    ///   was read under one that was;
+    /// - **the root itself** — a stored file that is no longer *under* the
+    ///   probed root is a file from the repository the session has left. The
+    ///   `stat` below would happily find a same-named file at the new root and
+    ///   compare it against the old one's key, which is how a `/cd` that raced
+    ///   the rebuild would keep the old repository's bytes resident.
+    pub fn verdict(
         current: &RepoContextState,
         root: &ProbedRoot,
         boundaries: &BoundaryMatcher<'_>,
         enabled: bool,
         files: &dyn RepoFileReader,
-    ) -> Option<RepoContextState> {
+    ) -> RefreshVerdict {
         if !enabled {
             // Off means unopened, on every path into this function.
             return match current {
-                RepoContextState::WithheldOff => None,
-                _ => Some(RepoContextState::WithheldOff),
+                RepoContextState::WithheldOff => RefreshVerdict::Unchanged,
+                _ => RefreshVerdict::Settled(RepoContextState::WithheldOff),
             };
         }
         let (RepoContextState::Loaded(file) | RepoContextState::Truncated(file)) = current else {
-            let fresh = Self::load(root, boundaries, enabled, files);
-            return (fresh != *current).then_some(fresh);
+            return RefreshVerdict::Reload {
+                always_store: false,
+            };
         };
+        // The two facts about the *root* that the stored key cannot speak for.
+        // Both fall through to a full re-load, which answers `Absent` for a
+        // non-project root and re-reads at the root the session now stands on.
+        if root.view.kind != RootKind::Project || !under_root(&file.path, &root.path) {
+            return RefreshVerdict::Reload {
+                always_store: false,
+            };
+        }
         let spelled = root.path.join(file_name(file.source));
         match files.stat(&spelled) {
             // `mtime.is_some()` is part of the equality on purpose: two `None`s
@@ -540,17 +772,19 @@ impl RepoContext {
             // otherwise pin the first copy read for the life of the session.
             Ok(key) if key == file.key && key.mtime.is_some() => {
                 if boundaries.match_path(file.provenance.as_str()).is_some() {
-                    Some(RepoContextState::WithheldBoundary {
+                    RefreshVerdict::Settled(RepoContextState::WithheldBoundary {
                         source: file.source,
+                        bytes_on_disk: Some(key.len),
                     })
                 } else {
-                    None
+                    RefreshVerdict::Unchanged
                 }
             }
             // Any change to the key — and any `stat` that now fails — is a full
             // re-load, so the state that comes back carries the new key. Compare
-            // the *states* here and a `touch` with no edit would leave the stale
-            // key stored and re-read on every turn thereafter.
+            // the *states* and a `touch` with no edit would leave the stale key
+            // stored and re-read on every turn thereafter, which is what
+            // `always_store` is for.
             //
             // The re-load `stat`s again rather than being handed the key just
             // read, and that second syscall buys the whole gate chain: a file
@@ -559,15 +793,79 @@ impl RepoContext {
             // it at `session/create`. One `stat` is the budget for the *quiet*
             // turn (ADR-3); a turn where the notes actually changed is already
             // paying for a read.
-            _ => Some(Self::load(root, boundaries, enabled, files)),
+            _ => RefreshVerdict::Reload { always_store: true },
         }
     }
 }
 
+/// What [`RepoContext::verdict`] decided, with the expensive half named rather
+/// than taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshVerdict {
+    /// The stored state still holds: one `stat`, no read, nothing to publish.
+    Unchanged,
+    /// A new state, reached **without** opening anything — the switch went off,
+    /// or a boundary came to cover a file that was already resident.
+    Settled(RepoContextState),
+    /// The gates have to run again, and doing so may open the file.
+    ///
+    /// `always_store` when the stored **key** moved: the re-load's answer
+    /// replaces the stored state even when the two compare equal, so a `touch`
+    /// with no edit does not leave the stale key behind to be re-read on every
+    /// turn thereafter.
+    Reload {
+        /// See above.
+        always_store: bool,
+    },
+}
+
+/// Whether `path` — a canonical path the jail resolved — lies under `root` as
+/// the session spells it.
+///
+/// [`ToolContext::resolve`] canonicalizes the root before it resolves, so the
+/// stored path is under `root.canonicalize()` and **not** necessarily under
+/// `root` as written: `/tmp` is `/private/tmp` on macOS, and a root reached
+/// through any symlink has the same shape. The textual comparison is tried
+/// first and answers for every root that is already canonical, which is the
+/// ordinary one; the `realpath` behind it runs only for a root spelled through a
+/// link, and only to save that turn a full re-read.
+fn under_root(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
+        || root
+            .canonicalize()
+            .is_ok_and(|canonical| path.starts_with(canonical))
+}
+
 /// One spelling of the `Unreadable` construction, so every refusal above is one
 /// line and the reason set stays visibly closed.
-fn unreadable(source: RepoContextSource, reason: &'static str) -> RepoContextState {
-    RepoContextState::Unreadable { source, reason }
+fn unreadable(
+    source: RepoContextSource,
+    reason: &'static str,
+    bytes_on_disk: Option<u64>,
+) -> RepoContextState {
+    RepoContextState::Unreadable {
+        source,
+        reason,
+        bytes_on_disk,
+    }
+}
+
+/// The daemon's sentence for a seam error — one `match`, so a reader-side answer
+/// and the words a user sees cannot come apart.
+///
+/// [`RepoFileError::NotFound`] is [`REASON_UNRESOLVED`] rather than a refusal of
+/// its own: the only call that reaches this with it is the *read*, whose path
+/// was resolved by the jail moments earlier, so a file that is now missing is a
+/// file that stopped resolving.
+fn reason_for(error: RepoFileError) -> &'static str {
+    match error {
+        RepoFileError::NotFound => REASON_UNRESOLVED,
+        RepoFileError::Denied => REASON_DENIED,
+        RepoFileError::NotRegular => REASON_NOT_REGULAR,
+        RepoFileError::NotUtf8 => REASON_NOT_UTF8,
+        RepoFileError::Symlink => REASON_SYMLINK,
+        RepoFileError::Unavailable => REASON_UNAVAILABLE,
+    }
 }
 
 #[cfg(test)]
@@ -828,6 +1126,9 @@ mod tests {
             RepoContextState::Unreadable {
                 source: RepoContextSource::TetonMd,
                 reason: REASON_SYMLINK,
+                // A symlink's `lstat` length is its target path, not a file
+                // size, so the state reports none.
+                bytes_on_disk: None,
             }
         );
         assert_eq!(
@@ -842,6 +1143,8 @@ mod tests {
             RepoContextState::Unreadable {
                 source: RepoContextSource::TetonMd,
                 reason: REASON_DENIED,
+                // The `stat` itself failed, so there is no size to report.
+                bytes_on_disk: None,
             }
         );
         assert_eq!(files.calls(&root.path), vec!["stat TETON.md".to_owned()]);
@@ -938,6 +1241,9 @@ mod tests {
             RepoContext::load(&root, &matcher, true, &files),
             RepoContextState::WithheldBoundary {
                 source: RepoContextSource::TetonMd,
+                // BR-3/verify: a withheld file still has a size, and it is the
+                // `stat`'s — the one figure a state that read nothing can give.
+                bytes_on_disk: Some("secret layout\n".len() as u64),
             }
         );
         assert_eq!(
@@ -970,19 +1276,45 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// BR-6: `refresh` reads only when the `mtime`/`len` key moved or the
-    /// boundary verdict changed, and its `None` costs one `stat`.
+    /// BR-6: the staleness check re-reads only when the `mtime`/`len` key moved
+    /// or the boundary verdict changed, and its quiet answer costs one `stat`.
     ///
-    /// Mutation: dropping `key == file.key` from the guard returns `None`
-    /// forever and fails the edited leg; dropping the boundary re-check returns
-    /// `None` on the covered leg and leaves a `local-only` file resident, which
-    /// is OQ-4's hole.
+    /// Driven through [`RepoContext::verdict`] and — where the verdict asks for
+    /// one — [`RepoContext::load`], which is the pair the turn path runs; the
+    /// local `settle` below is those two lines and nothing else, so it cannot
+    /// hide a branch production does not have.
+    ///
+    /// Mutation: dropping `key == file.key` from the guard answers `Unchanged`
+    /// forever and fails the edited leg; dropping the boundary re-check answers
+    /// `Unchanged` on the covered leg and leaves a `local-only` file resident,
+    /// which is OQ-4's hole; deleting the root-kind or under-the-root gate makes
+    /// the two `/cd` legs answer `Unchanged` and keep the departed repository's
+    /// bytes.
     #[test]
     fn refresh_reads_only_when_mtime_len_or_verdict_changed() {
         let (dir, root) = project_root("refresh", RootKind::Project);
         let open = no_boundaries();
         let matcher = BoundaryMatcher::new(&open).unwrap();
         let path = root.path.join("TETON.md");
+
+        /// The turn path's own composition: decide, then re-load if the verdict
+        /// asked for one. `None` is "the stored state still holds".
+        fn settle(
+            current: &RepoContextState,
+            root: &ProbedRoot,
+            matcher: &BoundaryMatcher<'_>,
+            enabled: bool,
+            files: &dyn RepoFileReader,
+        ) -> Option<RepoContextState> {
+            match RepoContext::verdict(current, root, matcher, enabled, files) {
+                RefreshVerdict::Unchanged => None,
+                RefreshVerdict::Settled(state) => Some(state),
+                RefreshVerdict::Reload { always_store } => {
+                    let fresh = RepoContext::load(root, matcher, enabled, files);
+                    (always_store || fresh != *current).then_some(fresh)
+                }
+            }
+        }
 
         let files = Recorded::new(vec![(path.clone(), Planted::regular("first\n", 10))]);
         let loaded = RepoContext::load(&root, &matcher, true, &files);
@@ -991,22 +1323,31 @@ mod tests {
         // Unchanged: one stat, no read, no new state.
         files.forget();
         assert_eq!(
-            RepoContext::refresh(&loaded, &root, &matcher, true, &files),
-            None
+            RepoContext::verdict(&loaded, &root, &matcher, true, &files),
+            RefreshVerdict::Unchanged
         );
         assert_eq!(files.calls(&root.path), vec!["stat TETON.md".to_owned()]);
 
-        // Edited: the key moved, so the bytes are re-read.
+        // Edited: the key moved, so the bytes are re-read — and the verdict says
+        // *store it either way*, so a `touch` with no edit cannot leave the old
+        // key behind to be re-read on every turn after it.
         let files = Recorded::new(vec![(path.clone(), Planted::regular("second\n", 11))]);
-        let fresh = RepoContext::refresh(&loaded, &root, &matcher, true, &files)
-            .expect("an edited file is a new state");
+        assert_eq!(
+            RepoContext::verdict(&loaded, &root, &matcher, true, &files),
+            RefreshVerdict::Reload { always_store: true }
+        );
+        let fresh =
+            settle(&loaded, &root, &matcher, true, &files).expect("an edited file is a new state");
         assert_eq!(fresh.file().unwrap().text, "second\n");
         assert_eq!(
             files.calls(&root.path),
             vec![
-                // The comparison `stat`, then the re-load's own — the second one
-                // is what re-runs the entry rule and the jail on a file that may
-                // have changed into something else entirely.
+                // The verdict's own stat, then the composition's second one —
+                // the assertion above ran the first, and `settle` runs the
+                // whole pair again. What matters is the shape: the re-load
+                // `stat`s for itself, which is what re-runs the entry rule and
+                // the jail on a file that may have changed into something else.
+                "stat TETON.md".to_owned(),
                 "stat TETON.md".to_owned(),
                 "stat TETON.md".to_owned(),
                 "read TETON.md".to_owned()
@@ -1018,9 +1359,10 @@ mod tests {
         let matcher_covered = BoundaryMatcher::new(&covered).unwrap();
         let files = Recorded::new(vec![(path.clone(), Planted::regular("first\n", 10))]);
         assert_eq!(
-            RepoContext::refresh(&loaded, &root, &matcher_covered, true, &files),
+            settle(&loaded, &root, &matcher_covered, true, &files),
             Some(RepoContextState::WithheldBoundary {
                 source: RepoContextSource::TetonMd,
+                bytes_on_disk: Some("first\n".len() as u64),
             })
         );
         assert_eq!(files.calls(&root.path), vec!["stat TETON.md".to_owned()]);
@@ -1028,12 +1370,12 @@ mod tests {
         // The switch, both ways, with no filesystem call on the way down.
         let files = Recorded::new(vec![(path.clone(), Planted::regular("first\n", 10))]);
         assert_eq!(
-            RepoContext::refresh(&loaded, &root, &matcher, false, &files),
+            settle(&loaded, &root, &matcher, false, &files),
             Some(RepoContextState::WithheldOff)
         );
         assert!(files.calls(&root.path).is_empty());
         assert_eq!(
-            RepoContext::refresh(
+            settle(
                 &RepoContextState::WithheldOff,
                 &root,
                 &matcher,
@@ -1042,7 +1384,7 @@ mod tests {
             ),
             None
         );
-        let back_on = RepoContext::refresh(
+        let back_on = settle(
             &RepoContextState::WithheldOff,
             &root,
             &matcher,
@@ -1055,13 +1397,46 @@ mod tests {
         // A state with no stored key: unchanged is still `None`, and still no read.
         let files = Recorded::new(Vec::new());
         assert_eq!(
-            RepoContext::refresh(&RepoContextState::Absent, &root, &matcher, true, &files),
+            settle(&RepoContextState::Absent, &root, &matcher, true, &files),
             None
         );
         assert_eq!(
             files.calls(&root.path),
             vec!["stat TETON.md".to_owned(), "stat AGENTS.md".to_owned()],
         );
+
+        // Verify (minor i): the root the session stands on is re-checked, and a
+        // stored file that belongs to a root the session has left never wins the
+        // key comparison. Both fall through to a full re-load.
+        let (other_dir, other) = project_root("refresh-moved", RootKind::Project);
+        let files = Recorded::new(vec![(
+            other.path.join("TETON.md"),
+            // Byte-identical to the loaded copy, key and all: only the *root*
+            // differs, which is precisely what the stat comparison cannot see.
+            Planted::regular("first\n", 10),
+        )]);
+        assert_eq!(
+            RepoContext::verdict(&loaded, &other, &matcher, true, &files),
+            RefreshVerdict::Reload {
+                always_store: false
+            },
+            "a file under the root the session left was compared against the new root's"
+        );
+        let (home_dir, home) = project_root("refresh-home", RootKind::Home);
+        assert_eq!(
+            RepoContext::verdict(&loaded, &home, &matcher, true, &files),
+            RefreshVerdict::Reload {
+                always_store: false
+            },
+            "a root that stopped being a project kept its notes"
+        );
+        assert_eq!(
+            settle(&loaded, &home, &matcher, true, &files),
+            Some(RepoContextState::Absent),
+            "BR-1: a non-project root carries no notes"
+        );
+        std::fs::remove_dir_all(&other_dir).ok();
+        std::fs::remove_dir_all(&home_dir).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1095,5 +1470,182 @@ mod tests {
             "the size on disk counts the bytes that were stripped"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // `RealFiles` — the three claims only the real filesystem can settle
+    // -----------------------------------------------------------------------
+
+    /// A real, empty directory to plant real files in.
+    ///
+    /// [`project_root`] above needs a `ProbedRoot`; these three tests drive
+    /// [`RealFiles`] directly and want only the directory.
+    fn scratch(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "teton-real-files-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::canonicalize(&dir).unwrap()
+    }
+
+    /// **Verify (MAJOR 2).** A codepoint the read ceiling cuts in half is a cut,
+    /// not a corrupt file: the valid prefix is kept. Anything else that is not
+    /// UTF-8 is still [`RepoFileError::NotUtf8`].
+    ///
+    /// Driven against [`RealFiles`] on a real file rather than through the
+    /// [`Recorded`] double, and that is the whole point of the test: the double
+    /// walks back to a character boundary itself before it answers, so it hides
+    /// the defect it would be asserting about. The ceiling is a *parameter* of
+    /// the seam, so a 64-byte one exercises the same arithmetic as 65,536
+    /// without a 64 KiB fixture.
+    ///
+    /// Mutation, run and observed: deleting the recovery from
+    /// [`decode_at_ceiling`] — `String::from_utf8(bytes).map_err(|_| NotUtf8)` —
+    /// fails the first leg with `Err(NotUtf8)` on a file that is valid UTF-8
+    /// throughout. Widening the guard to drop `at_ceiling`, or to allow more
+    /// than three trailing bytes, fails the third and fourth legs by returning
+    /// a silently shortened file where the honest answer is a refusal.
+    #[test]
+    fn a_codepoint_straddling_the_read_ceiling_keeps_the_valid_prefix() {
+        let dir = scratch("utf8-ceiling");
+        const CEILING: u64 = 64;
+
+        // An em dash whose first byte is the ceiling's last: three bytes, one
+        // inside and two past.
+        let straddling = dir.join("straddle.md");
+        std::fs::write(&straddling, format!("{}\u{2014}tail\n", "a".repeat(63))).unwrap();
+        assert_eq!(
+            RealFiles.read(&straddling, CEILING),
+            Ok("a".repeat(63)),
+            "the read stopped mid-codepoint and called the file corrupt"
+        );
+
+        // The same file read past its end is whole, so the fixture is not a
+        // file that was broken to begin with.
+        assert_eq!(
+            RealFiles.read(&straddling, 4_096),
+            Ok(format!("{}\u{2014}tail\n", "a".repeat(63)))
+        );
+
+        // A genuinely non-UTF-8 file, shorter than the ceiling: still refused.
+        let corrupt = dir.join("corrupt.md");
+        std::fs::write(&corrupt, [b'o', b'k', 0xFF, b'\n']).unwrap();
+        assert_eq!(
+            RealFiles.read(&corrupt, CEILING),
+            Err(RepoFileError::NotUtf8),
+            "a file that is not text was quietly truncated instead of refused"
+        );
+
+        // At the ceiling, but the invalid bytes are nowhere near the cut: the
+        // recovery must not fire, because this file is not text.
+        let mut deep = vec![b'x'; 64];
+        deep[20] = 0xFF;
+        deep.extend_from_slice(&[b'y'; 64]);
+        let deep_path = dir.join("deep.md");
+        std::fs::write(&deep_path, &deep).unwrap();
+        assert_eq!(
+            RealFiles.read(&deep_path, CEILING),
+            Err(RepoFileError::NotUtf8)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **Verify (MAJOR 3).** The open itself refuses a symlink, so the entry
+    /// rule is not the only thing standing between the daemon and a link.
+    ///
+    /// [`RepoContext::load`]'s `lstat` short-circuits long before the read, so
+    /// this calls [`RepoFileReader::read`] **directly** with the link's path —
+    /// which is exactly the state a same-UID process creates by swapping a
+    /// symlink in between the two syscalls. The pre-open `metadata` follows the
+    /// link and says "regular file"; only `O_NOFOLLOW` catches it.
+    ///
+    /// Mutation, run and observed: dropping `.custom_flags(libc::O_NOFOLLOW)`
+    /// returns `Ok("the target's own bytes\n")` — the daemon reading a file the
+    /// entry rule exists to refuse.
+    #[test]
+    fn a_symlinked_path_is_refused_by_the_open_and_not_only_by_the_entry_rule() {
+        let dir = scratch("nofollow");
+        let target = dir.join("target.md");
+        std::fs::write(&target, "the target's own bytes\n").unwrap();
+        let link = dir.join("TETON.md");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(
+            RealFiles.read(&link, REPO_CONTEXT_READ_CEILING_BYTES),
+            Err(RepoFileError::Symlink),
+            "the open followed a symlink"
+        );
+        // Non-vacuity: the same reader reads the target at its own name, so the
+        // refusal above is about the link and not about the fixture.
+        assert_eq!(
+            RealFiles.read(&target, REPO_CONTEXT_READ_CEILING_BYTES),
+            Ok("the target's own bytes\n".to_owned())
+        );
+        // And the loader's own answer for a symlinked candidate is the same
+        // sentence, from the other end of the pair.
+        assert_eq!(reason_for(RepoFileError::Symlink), REASON_SYMLINK);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **Verify (MINOR iv).** A permission is a permission and everything else
+    /// is not: the two lead a user to different remedies, and only one of them
+    /// can be right.
+    ///
+    /// Asserted on [`map_io`] against synthesized `io::Error`s rather than on a
+    /// tree, because the input that matters — an `EIO`, a device that went away
+    /// — is not one a test can reliably provoke, and the mapping *is* the fix.
+    ///
+    /// Mutation: restoring `_ => RepoFileError::Denied` fails the third leg,
+    /// and with it the sentence a user is shown for a file they own and can
+    /// `cat`.
+    #[test]
+    fn only_a_permission_error_is_denied_and_every_other_one_is_named_neutrally() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(
+            map_io(Error::from(ErrorKind::NotFound)),
+            RepoFileError::NotFound
+        );
+        assert_eq!(
+            map_io(Error::from(ErrorKind::PermissionDenied)),
+            RepoFileError::Denied
+        );
+        for kind in [
+            ErrorKind::Other,
+            ErrorKind::BrokenPipe,
+            ErrorKind::InvalidData,
+            ErrorKind::TimedOut,
+        ] {
+            assert_eq!(
+                map_io(Error::from(kind)),
+                RepoFileError::Unavailable,
+                "{kind:?} was reported as a permission the user has"
+            );
+        }
+
+        // The two sentences are different sentences, which is the point of the
+        // split — and every reason in the closed set is distinct, so no two
+        // verdicts can reach a user as one.
+        assert_ne!(REASON_DENIED, REASON_UNAVAILABLE);
+        let reasons = [
+            RepoFileError::NotFound,
+            RepoFileError::Denied,
+            RepoFileError::NotRegular,
+            RepoFileError::NotUtf8,
+            RepoFileError::Symlink,
+            RepoFileError::Unavailable,
+        ]
+        .map(reason_for);
+        let unique: std::collections::BTreeSet<&str> = reasons.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            reasons.len(),
+            "two seam errors share one sentence: {reasons:?}"
+        );
     }
 }

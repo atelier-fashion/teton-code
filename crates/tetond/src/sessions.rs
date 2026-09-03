@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use teton_core::session_root::CwdRefusal;
-use teton_protocol::methods::SessionSummary;
+use teton_protocol::methods::{RepoContextStateKind, SessionSummary};
 use teton_protocol::{Phase, SessionId, SessionMode, TurnId};
 
 use crate::harness::context::{ContextBlock, RetainedContext};
@@ -99,6 +99,25 @@ struct SessionRecord {
     /// state carries up to 64 KiB of file text, and a turn reading it under the
     /// registry lock would hold that lock for the copy.
     repo_context: Arc<RepoContextState>,
+    /// The last `repo_context_state` this session **published**, as the triple
+    /// a client actually renders (REQ-612 BR-3, AC-3).
+    ///
+    /// Separate from [`Self::repo_context`] because the two answer different
+    /// questions, and conflating them let a truncation go out in silence. The
+    /// stored state is the *file*, classified once at the widest cap any route
+    /// can ask for; what a client is told is the file **as this route rendered
+    /// it**, and a floored route renders the same unchanged file as a truncated
+    /// block. So a session that moves from an 8,192-cap route to a 4,096-cap one
+    /// has a stored state that did not move and news that did.
+    ///
+    /// The triple is `(state, truncated, resident_bytes)` — the three fields a
+    /// route can move without the file moving; `source`, `bytes_on_disk` and
+    /// `reason` are facts about the file, and a change to one of *those* is
+    /// announced through [`SessionRegistry::claim_repo_context_publish`]'s
+    /// `always`.
+    ///
+    /// Seeded rather than `Option`: see the constructor.
+    repo_context_published: (RepoContextStateKind, bool, u64),
     /// This session's `/context on|off`, or `None` while it follows the durable
     /// `[context] repo_file` default (REQ-612 BR-2).
     ///
@@ -552,6 +571,14 @@ impl SessionRegistry {
                 // — the id being returned here is the first anyone learns of the
                 // session.
                 repo_context: Arc::new(RepoContextState::Absent),
+                // Seeded with `absent` rather than left unstated, because
+                // `absent` is what silence *means* on this event: a client that
+                // has heard nothing correctly renders no notes line, which is
+                // the same thing an `absent` event would tell it. Leaving this
+                // unset would make the first turn of every session in every
+                // directory without a `TETON.md` publish an `absent` nobody
+                // asked for — the line LESSON-513 is about.
+                repo_context_published: (RepoContextStateKind::Absent, false, 0),
                 // No session has said anything about itself yet, so every one of
                 // them follows `[context] repo_file` until someone types
                 // `/context`.
@@ -807,6 +834,67 @@ impl SessionRegistry {
                 || Arc::new(RepoContextState::Absent),
                 |record| Arc::clone(&record.repo_context),
             )
+    }
+
+    /// Claim the right to publish `triple` as this session's
+    /// `repo_context_state`, and record it (REQ-612 BR-3, AC-3).
+    ///
+    /// `true` when the caller should announce — which is when the triple differs
+    /// from the last one published for this session, **or** when `always` says
+    /// the stored state itself moved. `false` when a client has already been
+    /// told exactly this, and the news would be a duplicate line on every prompt
+    /// of a session whose notes have not moved.
+    ///
+    /// # Two reasons to publish, and both are needed
+    ///
+    /// `always` is the *file* moving: a `/cd` between two repositories whose
+    /// notes happen to be the same size renders an identical triple and is
+    /// still a different file, so the client is owed the line.
+    ///
+    /// The triple is the *render* moving. The turn path renders at the route's
+    /// own cap, so a session that reroutes from an 8,192-cap route to a floored
+    /// 4,096-cap one has a stored state that did not change and a truncation the
+    /// user has not been told about — which is exactly the silence BR-3 forbids.
+    /// Gating the publish on [`Self::set_repo_context`]'s `false` (the shape
+    /// this replaced) could not see that, because nothing about the *file*
+    /// moved.
+    ///
+    /// The triple is `(state, truncated, resident_bytes)` — the three fields a
+    /// route can move on its own. `source`, `bytes_on_disk` and `reason` are
+    /// facts about the file and are covered by `always`.
+    ///
+    /// # The record moves only when the announcement does
+    ///
+    /// A triple stored without being published would let a later, identical
+    /// render be suppressed against a line no client ever saw. So this writes
+    /// exactly when it returns `true`, read and write under one lock, so two
+    /// turns of one session cannot both decide they are the change. The publish
+    /// itself is the caller's and happens after this returns, outside the mutex
+    /// — the [`Self::set_repo_context`] discipline.
+    ///
+    /// `false` for a session the registry does not have: a session that is gone
+    /// has no client to tell.
+    pub fn claim_repo_context_publish(
+        &self,
+        id: &SessionId,
+        triple: (RepoContextStateKind, bool, u64),
+        always: bool,
+    ) -> bool {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .expect("session registry mutex poisoned");
+        let Some(record) = sessions
+            .iter_mut()
+            .find(|record| &record.summary.session_id == id)
+        else {
+            return false;
+        };
+        if !always && record.repo_context_published == triple {
+            return false;
+        }
+        record.repo_context_published = triple;
+        true
     }
 
     /// Set this session's `/context` switch (REQ-612 BR-2).

@@ -755,6 +755,8 @@ async fn probe_spelling(repo: &std::path::Path, path_arg: &str) -> (SessionProbe
         PROMPT,
         std::collections::BTreeSet::new(),
         false,
+        // No notes in this fixture, so a reroute has nothing to re-render.
+        None,
     );
 
     let args = serde_json::json!({ "path": path_arg }).to_string();
@@ -2362,6 +2364,8 @@ async fn a_boundary_covered_notes_file_never_leaves_and_an_uncovered_one_is_in_t
         NOTES_PROMPT,
         std::collections::BTreeSet::new(),
         false,
+        // No notes in this fixture, so a reroute has nothing to re-render.
+        None,
     );
     let (result, captured, names) = drive_notes_turn(
         &repo,
@@ -2437,6 +2441,8 @@ async fn a_boundary_covered_notes_file_never_leaves_and_an_uncovered_one_is_in_t
         NOTES_PROMPT,
         std::collections::BTreeSet::new(),
         false,
+        // No notes in this fixture, so a reroute has nothing to re-render.
+        None,
     );
     let (result, captured, names) =
         drive_notes_turn(&repo, &open.session_id, &config, turn.ctx_mut(), Vec::new()).await;

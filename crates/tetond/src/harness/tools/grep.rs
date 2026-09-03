@@ -940,6 +940,7 @@ mod tests {
                     .to_owned(),
                 bound_floored: None,
                 spend_ceiling_micro_cents: None,
+                repo_context_cap: None,
             }),
         );
         let announced = |sub: &mut crate::broadcast::Subscription| -> Vec<RouteDecided> {

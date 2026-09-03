@@ -331,6 +331,10 @@ impl Route {
             // A surface printing the bound without it reports a ceiling the
             // route is not running under.
             bound_floored: Some(self.budget.floored),
+            // REQ-612 BR-7: the same projection again — the notes cap is derived
+            // with the pair it is a quarter of, so `/verbose` renders the route's
+            // own ceiling rather than the build's constant.
+            repo_context_cap: Some(self.budget.repo_context_cap as u64),
             spend_ceiling_micro_cents: None,
         })
     }

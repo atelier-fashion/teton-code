@@ -3025,17 +3025,34 @@ pub fn build_system_prompt(tools: &ToolRegistry, config: &HarnessConfig) -> Stri
     // REQ-612 ADR-1: the last region, after the tool docs. See this function's
     // own docs for why the order is what it is; what is decided here is only
     // the place, exactly as the environment block's place is decided above.
-    if let Some(block) = &config.repo_context {
-        // The block's opening tag, its marker line and its closing tag are all
-        // flush-left frame, and the neutralizers that defused the file's text
-        // are line-anchored — so the block has to *start* a line whatever the
-        // tool docs happened to end with. Asking rather than assuming: the docs
-        // are assembled from tool descriptions, which are third-party strings.
-        if !s.ends_with('\n') {
-            s.push('\n');
-        }
-        s.push_str(&block.text);
+    match &config.repo_context {
+        Some(block) => append_repo_context(&s, block),
+        None => s,
     }
+}
+
+/// Put `block` where [`build_system_prompt`] puts it, on a prompt built without
+/// one (REQ-612 ADR-1).
+///
+/// One spelling of the join, because there are two callers and they must not be
+/// able to differ. `build_system_prompt` uses it to finish the prompt, and
+/// [`CarriedTurn::rebudget`](crate::carry::CarriedTurn::rebudget) uses it to
+/// rebuild the prompt at a **new** route's cap after a mid-turn reroute — a
+/// second spelling there would put the notes on the wrong line, or on no line at
+/// all, in exactly the case nothing else in the tree renders.
+#[must_use]
+pub fn append_repo_context(base: &str, block: &RepoContextBlock) -> String {
+    let mut s = String::with_capacity(base.len() + block.text.len() + 1);
+    s.push_str(base);
+    // The block's opening tag, its marker line and its closing tag are all
+    // flush-left frame, and the neutralizers that defused the file's text are
+    // line-anchored — so the block has to *start* a line whatever the tool docs
+    // happened to end with. Asking rather than assuming: the docs are assembled
+    // from tool descriptions, which are third-party strings.
+    if !s.ends_with('\n') {
+        s.push('\n');
+    }
+    s.push_str(&block.text);
     s
 }
 

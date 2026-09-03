@@ -631,6 +631,8 @@ impl Carry {
             text,
             std::collections::BTreeSet::new(),
             false,
+            // No notes in this fixture, so a reroute has nothing to re-render.
+            None,
         );
 
         // Metered exactly as dispatch meters it, so the ledger rows below are
@@ -1646,4 +1648,209 @@ fn drain_pressure(events: &mut tetond::broadcast::Subscription) -> Vec<ContextPr
          here would prove nothing"
     );
     out
+}
+
+// ---------------------------------------------------------------------------
+// REQ-612 BR-3 verify — a reroute re-renders the notes at the route it lands on
+// ---------------------------------------------------------------------------
+
+/// **REQ-612 BR-3 (verify).** A turn assembled on a route with 8,192 bytes of
+/// room for repository notes, rerouted to a floored one with 4,096, ends with a
+/// 4,096-byte block **and still carrying the user's own message**.
+///
+/// # The defect this pins
+///
+/// The notes cap is a quarter of the route's byte budget, so it moves with the
+/// route. `CarriedTurn::rebudget` used to restate `system_sources` and leave the
+/// *block* as the assemble stage rendered it — so a 15,292-byte system prompt
+/// built for the local tier met a floored route's 16,384-byte budget. On a first
+/// attempt there is only one block to drop and it is the prompt the user just
+/// typed, so `truncate_to_budget` reaches its second step instead: `room` for
+/// that block's text collapses to its own 1,024-byte floor, and anything the
+/// user wrote past that is middle-elided. The turn reaches the model carrying
+/// the repository's description of itself and half the question about it.
+///
+/// **The message here is 2,000 bytes for that reason** — a pasted snippet, a
+/// stack trace, a paragraph of context. Under ~1,024 the floor absorbs it and
+/// the defect is invisible, which is what a 66-byte fixture would have proved
+/// nothing about (measured on a synthetic message: 66 and 1,024 bytes survive
+/// the unfixed reroute intact; 1,500 loses 476, 2,000 loses 976, 4,000 loses
+/// 2,976 — the floor is the only thing standing between the user and the loss).
+///
+/// The fix re-renders the block at the new route's cap before the refit, which
+/// is the party to the prompt a reroute *should* shrink. With it, a 4,000-byte
+/// message survives whole.
+///
+/// # Why this is driven through `CarriedTurn`
+///
+/// The guard is the only value that lives for exactly one turn, and `rebudget`
+/// is the only seam a reroute crosses. Both halves of the prompt — the base and
+/// the file — are handed to `begin` the way the assemble stage hands them, and
+/// the block itself is built by the **real** renderer from a real file
+/// (LESSON-544: a hand-built `RepoContextBlock` would prove only that this
+/// module can read a field it was handed).
+///
+/// # Mutation, run and observed
+///
+/// Deleting the `rerender_repo_context` call from `CarriedTurn::rebudget` fails
+/// this test twice over, each half observed on its own by suppressing the other:
+/// the block keeps the 8,192 bytes rendered for the route the turn left, and the
+/// refit reports `newest_user_elided` with 883 bytes of this fixture's message
+/// gone.
+/// Passing `None` for the carry at `begin` fails it the same way, which is why
+/// the parameter is a parameter and not a builder call.
+#[test]
+fn a_reroute_to_a_floored_route_re_renders_the_notes_and_keeps_the_users_message() {
+    use std::sync::Arc as StdArc;
+    use tetond::carry::RepoContextCarry;
+    use tetond::harness::append_repo_context;
+    use tetond::repo_context::{
+        FileStat, RepoContextBlock, RepoContextFile, RepoContextState, REPO_CONTEXT_MAX_BYTES,
+    };
+
+    // 2,000 bytes: past `truncate_to_budget`'s 1,024-byte floor for the last
+    // block's text, which is the threshold the defect hides below. See above.
+    let message = format!(
+        "Which crate owns the router, and what did REQ-590 change about it? \
+         Here is the failing output I pasted in:\n{}",
+        "  at crate::router::resolve (router.rs:1904)\n".repeat(40)
+    );
+    assert!(
+        message.len() > 1_024 && message.len() < 4_096,
+        "the fixture's message must be past the elision floor and inside the \
+         room the fix leaves: {} bytes",
+        message.len()
+    );
+
+    let sessions = SessionRegistry::new();
+    let session = sessions
+        .create(SessionMode::Freeform, None, None)
+        .expect("a freeform session needs no phase")
+        .session_id;
+    let tools = ToolRegistry::with_builtins();
+
+    // A `TETON.md` of exactly the ceiling, in whole 64-byte lines so the
+    // line-boundary cut lands on the cap itself at both figures.
+    let text = format!("{}\n", "n".repeat(63)).repeat(REPO_CONTEXT_MAX_BYTES / 64);
+    assert_eq!(text.len(), REPO_CONTEXT_MAX_BYTES);
+    let root = PathBuf::from("/repo");
+    let path = root.join("TETON.md");
+    let file = RepoContextFile {
+        source: teton_protocol::methods::RepoContextSource::TetonMd,
+        provenance: teton_core::ProvenanceId::from_resolved(&root, &path)
+            .expect("`/repo/TETON.md` is a file under `/repo`"),
+        bytes_on_disk: text.len() as u64,
+        key: FileStat {
+            len: text.len() as u64,
+            mtime: None,
+            is_symlink: false,
+            is_regular: true,
+        },
+        path,
+        text,
+    };
+    let state = StdArc::new(RepoContextState::Loaded(file));
+
+    // The local tier's route, and the prompt the assemble stage builds from it:
+    // base with no block, then the block appended at the route's own cap.
+    let local = HarnessConfig::default();
+    assert_eq!(
+        local.budget.repo_context_cap, REPO_CONTEXT_MAX_BYTES,
+        "the fixture's first route must be one with the full cap, or the \
+         re-render below has nothing to shrink"
+    );
+    let base_system = build_system_prompt(&tools, &local);
+    assert!(
+        !base_system.contains("<repo-notes"),
+        "the base prompt is the one built with no block"
+    );
+    let block = RepoContextBlock::render(
+        state.file().expect("the fixture's state carries a file"),
+        local.budget.repo_context_cap,
+    );
+    assert_eq!(block.resident_bytes, REPO_CONTEXT_MAX_BYTES);
+    let config = HarnessConfig {
+        repo_context: Some(block.clone()),
+        ..local
+    };
+    let system = append_repo_context(&base_system, &block);
+
+    let mut turn = CarriedTurn::begin(
+        &sessions,
+        &session,
+        system,
+        &config,
+        Arc::new(SessionTaint::new()),
+        Vec::new(),
+        message.clone(),
+        std::collections::BTreeSet::new(),
+        false,
+        Some(RepoContextCarry {
+            base_system,
+            state: StdArc::clone(&state),
+        }),
+    );
+    assert!(
+        turn.ctx().blocks().iter().any(|b| b.text == message),
+        "the fixture seeded no user message, so the claim below is vacuous"
+    );
+
+    // The reroute: a provider whose declared window derives the floor, which is
+    // where the quarter rule bites — 16,384 bytes of budget, 4,096 of notes.
+    let floored = derive(BudgetInputs {
+        window: 4_096,
+        cap: 0,
+        reservation: 1_024,
+        is_local: false,
+        redact_scan: false,
+        provider_id: Some("tiny"),
+    });
+    assert!(
+        floored.floored,
+        "the fixture's second route is not a floored one"
+    );
+    assert_eq!(floored.repo_context_cap, 4_096);
+    let report = turn.rebudget(&floored);
+
+    // The block is the new route's, marker and all.
+    let rendered = turn.ctx().system();
+    let body = rendered
+        .split_once("):\n")
+        .expect("the block's naming sentence opens its body")
+        .1;
+    let kept = body
+        .split_once("[… truncated")
+        .expect("a block cut to the floored cap carries the marker")
+        .0;
+    assert_eq!(
+        kept.len(),
+        4_096,
+        "the reroute kept the block rendered for the route it left"
+    );
+    assert!(
+        rendered.contains("4,096-byte cap"),
+        "the marker names the cap the block was actually rendered at"
+    );
+    // Everything above the notes is untouched: a reroute re-renders the block,
+    // not the prompt.
+    assert!(rendered.starts_with("You are Teton Code"));
+
+    // And the whole point: the user's message survived the refit, whole.
+    assert!(
+        !report.newest_user_elided,
+        "the refit reported eliding the newest user block — {} bytes of the \
+         user's own message were spent on the repository's notes",
+        report.elided_bytes
+    );
+    assert!(
+        turn.ctx().blocks().iter().any(|b| b.text == message),
+        "the user's own message was elided to make room for the repository's \
+         notes: {:?}",
+        turn.ctx()
+            .blocks()
+            .iter()
+            .map(|b| b.text.chars().take(60).collect::<String>())
+            .collect::<Vec<_>>()
+    );
+    turn.abandon();
 }

@@ -135,9 +135,9 @@ use teton_protocol::methods::{
     ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig,
     ProviderHealth as WireProviderHealth, ProviderSetupCandidate, ProviderSetupCommitResult,
     ProviderSetupPlanResult, ProviderSetupPreviewResult, ProviderTestOutcome, ProviderTestResult,
-    SessionClearParams, SessionClearResult, SessionContextParams, SessionContextResult,
-    SessionPermissionsParams, SessionPermissionsResult, SessionSetCwdParams, SessionSetCwdResult,
-    SessionTranscriptParams, SessionTranscriptResult, SkillInvocation,
+    RepoContextStateKind, SessionClearParams, SessionClearResult, SessionContextParams,
+    SessionContextResult, SessionPermissionsParams, SessionPermissionsResult, SessionSetCwdParams,
+    SessionSetCwdResult, SessionTranscriptParams, SessionTranscriptResult, SkillInvocation,
     TierBinding as WireTierBinding, TierBindingConfig, TierRouteView, TierSummary,
     TranscriptAction, WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams,
     WebRefreshResult, WebSetupCommitParams, WebSetupCommitResult, WebSetupPlanResult,
@@ -159,7 +159,7 @@ use teton_providers::{
 
 use crate::broadcast::EventBus;
 use crate::call_sites::has_call_site;
-use crate::carry::CarriedTurn;
+use crate::carry::{CarriedTurn, RepoContextCarry};
 use crate::classify::Classification;
 use crate::cost::{
     CostAttribution, CostLedger, CostReport, GroupTotals, PriceTable, WebLookupRow, WebOverrideRow,
@@ -185,10 +185,10 @@ use crate::harness::turn_loop::{
     pressure_kind, run_session_turn_with_pressure_policy, HarnessError, PressurePolicy,
 };
 use crate::harness::{
-    build_system_prompt, CommitmentAttestation, ContextManager, DutyKind, DutyRoute,
-    LocalEngineSource, PendingPermissions, PermissionGate, ProjectTrustPersistence, SessionEvents,
-    ToolContext, ToolDuties, ToolRegistry, WebTierPersistence, COMPACT_DUTY, DIGEST_DUTY,
-    REDACT_DUTY, SHELL_DUTY, TITLE_DUTY, TRIAGE_DUTY,
+    append_repo_context, build_system_prompt, CommitmentAttestation, ContextManager, DutyKind,
+    DutyRoute, LocalEngineSource, PendingPermissions, PermissionGate, ProjectTrustPersistence,
+    SessionEvents, ToolContext, ToolDuties, ToolRegistry, WebTierPersistence, COMPACT_DUTY,
+    DIGEST_DUTY, REDACT_DUTY, SHELL_DUTY, TITLE_DUTY, TRIAGE_DUTY,
 };
 use crate::install::{CapFreeSpace, FetchCause, HostFreeSpace, LifecycleProgress, WeightsInstall};
 use crate::keychain::SecretResolver;
@@ -198,7 +198,7 @@ use crate::model_consent::{
     ModelConsentGate, NoInstaller, PendingModelDecisions, WeightsInstaller,
 };
 use crate::repo_context::{
-    RealFiles, RepoContext, RepoContextBlock, RepoContextState, RepoFileReader,
+    RealFiles, RefreshVerdict, RepoContext, RepoContextBlock, RepoContextState, RepoFileReader,
     REPO_CONTEXT_MAX_BYTES,
 };
 use crate::router::{
@@ -3553,6 +3553,13 @@ impl DaemonRuntime {
     /// (LESSON-513). A `/cd` **out** of a repository with notes publishes
     /// `absent`, because the block being dropped is news.
     ///
+    /// The publish also **records the triple it announced**
+    /// ([`SessionRegistry::claim_repo_context_publish`]), because the turn path
+    /// measures its own news against what a client was last actually told: a
+    /// route whose cap is smaller than this one's renders the same unmoved file
+    /// as a truncated block, and that is news the stored state cannot see
+    /// (BR-3). The two sites therefore share one record and one derivation.
+    ///
     /// # Visibility
     ///
     /// `pub` rather than `pub(crate)`, which production alone would satisfy —
@@ -3590,12 +3597,20 @@ impl DaemonRuntime {
         if *sessions.repo_context(session_id) == loaded {
             return;
         }
-        let event = repo_context_event(&loaded, REPO_CONTEXT_MAX_BYTES);
+        let figures = repo_context_figures(&loaded, REPO_CONTEXT_MAX_BYTES);
+        let triple = figures.triple();
+        let event = figures.into_event(&loaded);
         // A session that vanished between the caller's claim and this write
         // stores nothing and announces nothing — `set_skills`'s reading of the
         // same `false`, and the reason the publish is guarded by it rather than
         // unconditional.
-        if sessions.set_repo_context(session_id, loaded) {
+        if sessions.set_repo_context(session_id, loaded)
+            // `always`: the *state* moved, which is news whatever the rendered
+            // triple happens to be — two repositories' notes can be the same
+            // size. The claim also records the triple, so the turn path's own
+            // gate measures against what a client was actually last told.
+            && sessions.claim_repo_context_publish(session_id, triple, true)
+        {
             // After the store and after the lock — see above.
             events.publish(Some(session_id.clone()), event);
         }
@@ -3606,22 +3621,28 @@ impl DaemonRuntime {
     /// `[context] repo_file` default when it has not been switched.
     ///
     /// **One composition, three readers** — the two lifecycle loads, the turn's
-    /// staleness check and `session/context` all ask this function, so a session
-    /// that said `off` cannot have its file read by a path that consulted only
-    /// the config (BR-2's "off means unopened" is a claim about every path, not
-    /// about the one the user typed at).
+    /// staleness check and `session/context` all ask this composition, so a
+    /// session that said `off` cannot have its file read by a path that
+    /// consulted only the config (BR-2's "off means unopened" is a claim about
+    /// every path, not about the one the user typed at).
+    ///
+    /// This spelling reads the **live** config under its mutex, which is right
+    /// for the two lifecycle sites: they run on a connection's own reader loop
+    /// with no snapshot in hand. The turn path holds the config it was routed
+    /// under and calls [`repo_context_enabled_from`] with that value instead —
+    /// see there for why a second read of the mutex mid-turn is the wrong fact.
     pub(crate) fn repo_context_enabled(
         &self,
         sessions: &SessionRegistry,
         session_id: &SessionId,
     ) -> bool {
-        sessions.context_switch(session_id).unwrap_or_else(|| {
-            self.config
-                .lock()
-                .expect("config mutex poisoned")
-                .context
-                .repo_file
-        })
+        let durable = self
+            .config
+            .lock()
+            .expect("config mutex poisoned")
+            .context
+            .repo_file;
+        repo_context_enabled_from(sessions, session_id, durable)
     }
 
     /// The choke point an MCP `tools/call` crosses (ADR-003, REQ-562 ADR-1).
@@ -7274,63 +7295,152 @@ fn load_repo_context(
     }
 }
 
-/// [`RepoContext::refresh`] through [`load_repo_context`]'s composition — BR-6's
-/// start-of-turn staleness check, with the same fail-closed answer.
+/// [`RepoContext::verdict`] through [`load_repo_context`]'s composition — the
+/// half of BR-6's
+/// staleness check that is one `stat` and no read.
 ///
-/// `Some` only when the session's state has to change, so the turn path's quiet
-/// answer stays one `stat` and no allocation.
-fn refresh_repo_context(
+/// Split from the re-load it may name so the turn path can keep the quiet answer
+/// inline (one syscall does not earn a thread hand-off) and take
+/// `block_in_place_if_multithread` only for the branch that opens a file: that
+/// read is up to 64 KiB of a user-controlled path and, under `~/Documents` on
+/// macOS, a TCC dialog that blocks for as long as the user takes to answer it.
+///
+/// The fail-closed answer for an uncompilable boundary set is
+/// [`load_repo_context`]'s: nothing is read and nothing stays resident.
+fn repo_context_verdict(
     current: &RepoContextState,
     probed: &ProbedRoot,
     boundaries: &[PrivacyBoundary],
     enabled: bool,
     files: &dyn RepoFileReader,
-) -> Option<RepoContextState> {
+) -> RefreshVerdict {
     match BoundaryMatcher::new(boundaries) {
-        Ok(matcher) => RepoContext::refresh(current, probed, &matcher, enabled, files),
-        Err(_) => (*current != RepoContextState::Absent).then_some(RepoContextState::Absent),
+        Ok(matcher) => RepoContext::verdict(current, probed, &matcher, enabled, files),
+        Err(_) => {
+            if *current == RepoContextState::Absent {
+                RefreshVerdict::Unchanged
+            } else {
+                RefreshVerdict::Settled(RepoContextState::Absent)
+            }
+        }
     }
 }
 
-/// The one shaping of `repo_context_state` from a state and the cap it is
-/// measured at (REQ-612 ADR-6).
+/// Whether this session's repository notes may be read, composed from the
+/// session's own `/context` switch and a **durable default the caller supplies**
+/// (REQ-612 BR-2).
+///
+/// The turn path calls this with `config.context.repo_file` off the config
+/// snapshot the turn was routed under, rather than taking the runtime's config
+/// mutex a second time. Two reasons, and the first is the requirement's: a
+/// `config/set` that lands between a turn's routing and its `assemble` stage
+/// would otherwise decide this one fact against a config no other part of the
+/// turn is running under. The second is the lock — `assemble` is on the async
+/// turn path, and a mutex taken there is one every other session's turn can wait
+/// behind (LESSON-448).
+fn repo_context_enabled_from(
+    sessions: &SessionRegistry,
+    session_id: &SessionId,
+    durable_default: bool,
+) -> bool {
+    sessions
+        .context_switch(session_id)
+        .unwrap_or(durable_default)
+}
+
+/// Everything both repository-notes surfaces report about a state, derived
+/// **once** from that state and the cap it is measured at (REQ-612 ADR-6).
+///
+/// One derivation rather than two, because the event and the routed result were
+/// assembling the same four figures side by side and the state word had already
+/// come apart from the flag beside it: the loader classifies `Loaded` versus
+/// `Truncated` against [`REPO_CONTEXT_MAX_BYTES`], while a floored route renders
+/// the same file at 4,096 — so a stored `Loaded` was being published beside
+/// `truncated: true`, and every surface that keyed on the *word* said the file
+/// was whole (BR-3, AC-3).
+///
+/// So [`Self::state`] is derived from the **block that was actually rendered**,
+/// not from the stored state's own kind. The two agree wherever the cap is the
+/// ceiling and differ exactly where a route floored it, which is the case BR-3
+/// exists for.
+struct RepoContextFigures {
+    /// The state word, taken from the block this cap produced.
+    state: RepoContextStateKind,
+    /// The size on disk, for every state that got an answer about it — see
+    /// [`RepoContextState::bytes_on_disk`].
+    bytes_on_disk: u64,
+    /// The bytes of the **file** in the prompt; not the block's own length,
+    /// because the harness frame around the notes is this build's text and is
+    /// not what a user is weighing against their budget.
+    resident_bytes: u64,
+    /// Whether this cap cut the file.
+    truncated: bool,
+}
+
+impl RepoContextFigures {
+    /// The three fields a **route** can move on its own, which is what decides
+    /// whether a `repo_context_state` is news
+    /// ([`SessionRegistry::claim_repo_context_publish`]).
+    fn triple(&self) -> (RepoContextStateKind, bool, u64) {
+        (self.state, self.truncated, self.resident_bytes)
+    }
+
+    /// The broadcast event these figures shape, with `state`'s own two
+    /// file-derived fields beside them.
+    ///
+    /// Takes the state back rather than carrying `source`/`reason` through,
+    /// because those two are not measurements: they do not depend on the cap and
+    /// have no business in a struct whose whole reason to exist is that the cap
+    /// changes the answer.
+    fn into_event(self, state: &RepoContextState) -> Event {
+        Event::RepoContextState(teton_protocol::events::RepoContextState {
+            state: self.state,
+            source: state.source(),
+            bytes_on_disk: self.bytes_on_disk,
+            resident_bytes: self.resident_bytes,
+            truncated: self.truncated,
+            reason: repo_context_reason(state),
+        })
+    }
+}
+
+/// Derive [`RepoContextFigures`] for `state` at `cap`.
 ///
 /// `cap` is a parameter for [`RepoContextBlock::render`]'s reason: between turns
 /// there is no route, so the two lifecycle sites measure at
-/// [`REPO_CONTEXT_MAX_BYTES`] — the widest any route can ask for, and the figure
-/// the loader itself classified `Loaded` against — while the turn's `assemble`
-/// stage measures at the route's own effective cap. One function either way, so
-/// the byte pair a client renders cannot be assembled two ways.
-///
-/// The bytes are the **file's**, not the block's: the harness frame around the
-/// notes is this build's own text and is not what a user is weighing against
-/// their budget.
-fn repo_context_event(state: &RepoContextState, cap: usize) -> Event {
+/// [`REPO_CONTEXT_MAX_BYTES`] — the widest any route can ask for — while the
+/// turn's `assemble` stage measures at the route's own effective cap.
+fn repo_context_figures(state: &RepoContextState, cap: usize) -> RepoContextFigures {
     let block = state.file().map(|file| RepoContextBlock::render(file, cap));
-    Event::RepoContextState(teton_protocol::events::RepoContextState {
-        state: state.kind(),
-        source: state.source(),
-        bytes_on_disk: state.file().map_or(0, |file| file.bytes_on_disk),
+    RepoContextFigures {
+        state: match &block {
+            // The route-aware word. `Loaded`/`Truncated` are the only two kinds a
+            // state carrying a file can have, so this decides between exactly
+            // those two and defers to the state for every other one.
+            Some(block) if block.truncated => RepoContextStateKind::Truncated,
+            Some(_) => RepoContextStateKind::Loaded,
+            None => state.kind(),
+        },
+        bytes_on_disk: state.bytes_on_disk().unwrap_or(0),
         resident_bytes: block
             .as_ref()
             .map_or(0, |block| block.resident_bytes as u64),
         truncated: block.is_some_and(|block| block.truncated),
-        reason: repo_context_reason(state),
-    })
+    }
 }
 
-/// [`repo_context_event`]'s routed twin — the answer `session/context` returns
+/// [`RepoContextFigures::into_event`]'s routed twin — the answer `session/context` returns
 /// on the asking connection, which is the one surface that names the file
 /// (REQ-612 BR-2).
 ///
-/// Both projections read the same state through the same accessors, so the
-/// broadcast line and the routed answer cannot come to disagree about what is
-/// resident; what differs is exactly the two fields BR-2 splits on — this one
-/// carries the file's name and the cap, and the event carries neither.
+/// Both projections read [`repo_context_figures`], so the broadcast line and the
+/// routed answer cannot come to disagree about what is resident; what differs is
+/// exactly the two fields BR-2 splits on — this one carries the file's name and
+/// the cap, and the event carries neither.
 fn repo_context_result(state: &RepoContextState, cap: usize) -> SessionContextResult {
-    let block = state.file().map(|file| RepoContextBlock::render(file, cap));
+    let figures = repo_context_figures(state, cap);
     SessionContextResult {
-        state: state.kind(),
+        state: figures.state,
         source: state.source(),
         // Bounded on the way out like every other file-derived field on the
         // wire (the `SkillView` rule). The set is two harness-authored literals,
@@ -7340,12 +7450,10 @@ fn repo_context_result(state: &RepoContextState, cap: usize) -> SessionContextRe
         file: state
             .source()
             .map(|source| bounded_field(crate::repo_context::file_name(source), NAME_MAX_CHARS)),
-        bytes_on_disk: state.file().map_or(0, |file| file.bytes_on_disk),
-        resident_bytes: block
-            .as_ref()
-            .map_or(0, |block| block.resident_bytes as u64),
+        bytes_on_disk: figures.bytes_on_disk,
+        resident_bytes: figures.resident_bytes,
         cap: cap as u64,
-        truncated: block.is_some_and(|block| block.truncated),
+        truncated: figures.truncated,
     }
 }
 
@@ -16254,6 +16362,8 @@ provider_id = \"deepseek\"
                     prompt.to_owned(),
                     std::collections::BTreeSet::new(),
                     false,
+                    // No notes in this fixture, so a reroute has nothing to re-render.
+                    None,
                 )
             };
 
@@ -17954,6 +18064,100 @@ provider_id = \"deepseek\"
             );
         }
 
+        /// **REQ-612 MINOR (iii): the notes switch reads the turn's own config
+        /// snapshot.**
+        ///
+        /// `run_prompt_turn` takes one snapshot and hands it down, so the route,
+        /// the gate, the tool registry and the capability clause are four
+        /// readings of one value: a `config/set` that lands mid-turn moves the
+        /// *next* turn rather than leaving this one's prompt disagreeing with
+        /// its own tool set (REQ-572 verify). The repository-notes switch was
+        /// the one that got away — it took `self.config`'s mutex again inside
+        /// the assemble stage, which is both a second fact and a lock on the
+        /// async turn path (LESSON-448).
+        ///
+        /// Two claims, and the second is the smaller one:
+        ///
+        /// 1. **the composition** — `repo_context_enabled_from` is the whole of
+        ///    BR-2's rule, and a session that said `off` beats a durable `on`
+        ///    whichever way the default points. This is what the fix moved, and
+        ///    it is asserted directly;
+        /// 2. **the door** — the assemble stage's own body reaches for neither
+        ///    `self.config` nor the mutex-taking `self.repo_context_enabled`.
+        ///
+        /// Claim 2 **watches one door**, and says so (LESSON-596): a stage that
+        /// re-read the config through some third `&self` method would pass it.
+        /// It is here because it is the door this fix closed, and because the
+        /// mid-turn window it protects — between `run_prompt_turn`'s snapshot
+        /// and the assemble stage, microseconds wide — has no seam a test can
+        /// land a config write inside.
+        ///
+        /// Mutation, run and observed: restoring
+        /// `self.repo_context_enabled(sessions, session_id)` in
+        /// `assemble_harness` fails claim 2 naming that line.
+        #[test]
+        fn the_notes_switch_reads_the_turns_config_snapshot_and_not_the_live_one() {
+            // 1. The composition: three inputs, and the session always wins.
+            let sessions = SessionRegistry::new();
+            let session = sessions
+                .create(teton_protocol::SessionMode::Freeform, None, None)
+                .expect("a freeform session needs no phase")
+                .session_id;
+            for durable in [false, true] {
+                assert_eq!(
+                    repo_context_enabled_from(&sessions, &session, durable),
+                    durable,
+                    "a session that has said nothing follows the durable default"
+                );
+            }
+            for switched in [false, true] {
+                sessions.set_context_switch(&session, switched);
+                for durable in [false, true] {
+                    assert_eq!(
+                        repo_context_enabled_from(&sessions, &session, durable),
+                        switched,
+                        "`/context {}` must survive a durable default of {durable}",
+                        if switched { "on" } else { "off" }
+                    );
+                }
+            }
+
+            // 2. The door, bounded to the stage's own body.
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("runtime/turn.rs");
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("unreadable {}: {err}", path.display()));
+            let at = source
+                .find("    async fn assemble_harness(")
+                .expect("the assemble stage is defined in this file");
+            let body = &source[at..at
+                + source[at..]
+                    .find("\n    }\n")
+                    .expect("the assemble stage's body closes")];
+            // Vacuity floor: the slice really is the stage, not whatever the
+            // file has become around it.
+            //
+            // Keyed on things the *hazard* does not remove — a floor that named
+            // the remedy would fire on the mutation instead of the check below,
+            // which is a red for the wrong reason and reads like a passing
+            // guard the next time someone edits this.
+            assert!(
+                body.contains("build_system_prompt") && body.contains("route.harness.repo_context"),
+                "the extracted slice is not `assemble_harness`"
+            );
+            for door in ["self.config", "self.repo_context_enabled("] {
+                assert!(
+                    !body.contains(door),
+                    "the assemble stage reads the live config through `{door}`. \
+                     Every stage below `run_prompt_turn`'s snapshot takes \
+                     `tctx.core.config`: a second reading is a second fact, and \
+                     on the async turn path it is also a mutex every other \
+                     session's turn can wait behind."
+                );
+            }
+        }
+
         /// **BR-3, invariant 4 (LESSON-518, BUG-184): the turn path takes no
         /// blocking wait.**
         ///
@@ -18037,6 +18241,54 @@ provider_id = \"deepseek\"
                     text.len()
                 );
             }
+
+            // ── The remedy, counted and argued before the hazards are scanned ──
+            //
+            // `block_in_place_if_multithread` is the *mitigation*, and a check
+            // that forbade it outright would forbid the mitigation and permit
+            // the bare syscall (LESSON-585). It is not free either, so every
+            // call is listed here with what it is for: a call this list does not
+            // know about fails, and so does one that disappears.
+            //
+            // The count is of the **call** spelling (with its paren); prose that
+            // names the helper is not a call and is stripped below so the bare
+            // `block_in_place` hazard can still be scanned for underneath it.
+            const REMEDY_CALL: &str = "block_in_place_if_multithread(";
+            const ARGUED: &[(&str, usize, &str)] = &[(
+                "runtime/turn.rs",
+                1,
+                "REQ-612 BR-6: the repository-notes re-read behind a moved `stat` \
+                 key opens and reads up to 64 KiB of a user-controlled path at \
+                 the session root — BUG-184's own hazard, taking BUG-184's own \
+                 remedy. The quiet turn (an unchanged key) stays inline at one \
+                 `stat`, which is what the split of `RepoContext::verdict` from \
+                 the load exists for.",
+            )];
+            let corpus: Vec<(String, String)> = corpus
+                .into_iter()
+                .map(|(name, text)| {
+                    let calls = text.matches(REMEDY_CALL).count();
+                    let (allowed, why) = ARGUED
+                        .iter()
+                        .find(|(suffix, _, _)| name.ends_with(suffix))
+                        .map_or((0, "no argued blocking call in this file"), |(_, n, w)| {
+                            (*n, *w)
+                        });
+                    assert_eq!(
+                        calls, allowed,
+                        "{name} makes {calls} `block_in_place_if_multithread` \
+                         call(s); {allowed} are argued. The argument on record \
+                         is: {why}\nA blocking call on the turn path is allowed \
+                         only when it is written down here with its reason — the \
+                         point is that it is argued, not that it is spelled \
+                         safely."
+                    );
+                    // Both spellings go, so prose naming the helper does not
+                    // read as a bare `block_in_place` below.
+                    let text = text.replace("block_in_place_if_multithread", "");
+                    (name, text)
+                })
+                .collect();
 
             // The hazards, with their wider spellings enumerated (LESSON-596):
             // a guard that watches one spelling watches one door.
@@ -18981,6 +19233,8 @@ provider_id = \"deepseek\"
                 "the opening prompt",
                 std::collections::BTreeSet::new(),
                 false,
+                // No notes in this fixture, so a reroute has nothing to re-render.
+                None,
             );
             let filler = vec!["lorem"; words].join(" ");
             for _ in 0..blocks {

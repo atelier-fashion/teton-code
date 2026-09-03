@@ -1208,6 +1208,30 @@ impl ContextManager {
         &self.system
     }
 
+    /// Replace the system prompt mid-turn (REQ-612 BR-3).
+    ///
+    /// **One caller, and it is the reroute**:
+    /// [`CarriedTurn::rebudget`](crate::carry::CarriedTurn::rebudget) rebuilds
+    /// the prompt with the repository-notes block rendered at the new route's
+    /// cap, because that cap is a quarter of the route's byte budget and moves
+    /// with it. Everything else about a head is rebuilt *between* turns and
+    /// seeded through [`Self::new`]; a second in-turn writer would be a second
+    /// spelling of "what is this turn running under".
+    ///
+    /// `&mut self` rather than a consuming builder because the reroute already
+    /// holds the manager mutably and the pair of currencies is set the same way
+    /// ([`Self::rebudget`]) — and because this must happen *before* that gate
+    /// runs, so it cannot be a step the caller could reorder past it by
+    /// accident.
+    ///
+    /// It changes what the budget gate measures and nothing else: the blocks,
+    /// the request, the dropped-provenance record and `system_sources` are all
+    /// untouched. Restating the identities is the caller's, for
+    /// [`Self::with_system_sources`]'s "replaces, never merges" reason.
+    pub fn set_system(&mut self, system: impl Into<String>) {
+        self.system = system.into();
+    }
+
     /// [`Self::estimated_tokens`] over an arbitrary block sequence.
     ///
     /// Split out so a *candidate* conversation can be measured before it is
