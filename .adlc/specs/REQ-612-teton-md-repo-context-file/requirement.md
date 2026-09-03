@@ -1,7 +1,7 @@
 ---
 id: REQ-612
 title: "TETON.md — a per-repository context file the session reads at its root and carries as resident data, so a project's shape is known without a walk"
-status: approved
+status: complete
 deployable: true
 created: 2026-09-03
 updated: 2026-09-03
