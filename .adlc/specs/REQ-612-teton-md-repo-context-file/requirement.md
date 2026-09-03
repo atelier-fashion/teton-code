@@ -471,6 +471,18 @@ _Leg F — cost, and what the model is told_
 - Honoring frontmatter, YAML, or any structured key inside the file.
 - Windows.
 
+## Deferred
+
+- AC-13 (by-hand dogfood: first prompt of a fresh session answers from the notes with zero
+  `glob`/`grep` calls on the local tier) is recorded `OUTSTANDING` in
+  `docs/manual-verification.md`; it needs a local-engine build and a `TETON.md` at this
+  repository's root, which is deferred to REQ-613 (generation when absent).
+- A skill's over-budget refusal measures its fit against the assemble-time system prompt; a
+  mid-turn reroute can now change that prompt by up to the cap (verify Minor, TODO at
+  `crates/tetond/src/runtime/turn.rs`).
+- `WithheldOff` prints its line at every `session/create` on a machine with
+  `[context] repo_file = false` (verify Minor; BR-7 keeps withheld lines ungated).
+
 ## Retrieved Context
 
 Retrieval query: component `daemon/harness`, domain `harness`, stack
