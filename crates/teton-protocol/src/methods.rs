@@ -405,6 +405,7 @@ pub const RESERVED_SKILL_NAMES: &[&str] = &[
     "provider",
     "quit",
     "teton",
+    "transcript",
     "verbose",
     "web",
 ];
@@ -1964,6 +1965,46 @@ pub struct ConfigSnapshot {
     /// older daemon's silence is not evidence for it.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub web_capability: Option<WebCapabilityState>,
+    /// The transcript posture: the durable default, the effective directory,
+    /// and the retention window (REQ-611 AC-20).
+    ///
+    /// On the existing snapshot rather than behind a new RPC, for
+    /// [`Self::effort`]'s reason — `teton doctor` says this in the same breath
+    /// it says everything else — and because the *effective directory* is a
+    /// fact only the daemon holds: it is `[transcript] dir` when the user wrote
+    /// one and `<data dir>/transcripts` otherwise, and the data directory is
+    /// resolved from the **daemon's** environment. A client deriving it from
+    /// its own would report a path the daemon does not write to whenever the
+    /// two environments differ, which is precisely the second-source drift
+    /// LESSON-456 is about.
+    ///
+    /// `Option` for wire additivity only, like the three fields above: a daemon
+    /// that has this field always populates it, so `None` reads as "this daemon
+    /// predates the field" and never as "transcripts are off".
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub transcript: Option<TranscriptPosture>,
+}
+
+/// What `doctor` says about transcripts (REQ-611 BR-15, AC-20).
+///
+/// **Deliberately not the path of any session's file.** BR-15 splits news from
+/// location, and this is neither: it is the *configuration* — the directory a
+/// transcript would be written into, which the user either wrote themselves or
+/// can read off `teton doctor`. An individual session's file is named only by
+/// [`SessionTranscriptResult::path`], on the connection that asked.
+///
+/// `enabled` is the **durable default** from `[transcript] enabled`, not any
+/// session's effective state: `config/get` reports configuration, and a
+/// per-session override that showed up here would make one session's
+/// `/transcript on` look like a machine-wide setting (BR-2's two lifetimes).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptPosture {
+    /// The durable `[transcript] enabled` default new sessions start from.
+    pub enabled: bool,
+    /// The directory transcripts are written to, as the daemon resolves it.
+    pub dir: String,
+    /// Days a file is kept before the daemon prunes it; `0` means never.
+    pub retain_days: u32,
 }
 
 /// The global effort setting, plus what it resolves to for each registered
@@ -2029,6 +2070,39 @@ pub enum ConfigUpdate {
     /// A new `ConfigUpdate` variant, not a new RPC — `config/set` already
     /// carries every configuration mutation.
     SetEffort(EffortLevel),
+    /// Turn daemon-side transcript recording on or off for **every future
+    /// session** (REQ-611 BR-15, architecture ADR-5) — the `[transcript]
+    /// enabled` key in `config.toml`.
+    ///
+    /// **Persisted**, and the durable counterpart of
+    /// [`SessionTranscriptParams`]: this variant is what survives a restart,
+    /// while `/transcript on` moves one live session and writes nothing. The
+    /// pairing is [`Self::SetEffort`]'s, and the asymmetry is the same one —
+    /// what a user typed for this session should not silently become what the
+    /// daemon does forever.
+    ///
+    /// A new variant, not a new RPC, so it inherits `config/set`'s gates whole
+    /// rather than carving the first per-variant exemption out of them
+    /// (ADR-5, LESSON-578): `refuse_daemon_wide` (REQ-570 BR-10 layer a) and
+    /// `refuse_unattested_commitment` (layer b, REQ-575 BR-3) both run before
+    /// this is deserialized, for every variant, and REQ-575 BR-5's
+    /// classification is discharged as **BR-10(b) by inheritance**.
+    ///
+    /// **A struct variant rather than the newtype `SetTranscriptEnabled(bool)`
+    /// the task specified**, and the reason is the wire rather than taste: this
+    /// enum is internally tagged (`#[serde(tag = "op")]`), and serde cannot
+    /// serialize a tagged newtype variant whose content is a primitive — the
+    /// tag and the value have no object to share. The newtype spelling compiles
+    /// and then fails at *runtime* with `cannot serialize tagged newtype
+    /// variant ConfigUpdate::SetTranscriptEnabled containing a boolean`, which
+    /// is a refusal the user meets at `teton transcript enable` rather than a
+    /// build error the author meets. `{ enabled }` gives the flat
+    /// `{"op":"set_transcript_enabled","enabled":true}` and names the field the
+    /// config key is spelled with.
+    SetTranscriptEnabled {
+        /// Whether every future session records a transcript.
+        enabled: bool,
+    },
 }
 
 /// Apply a configuration mutation.
@@ -2302,6 +2376,111 @@ pub struct SessionPermissionsResult {
 impl RpcMethod for SessionPermissionsParams {
     const METHOD: &'static str = "session/permissions";
     type Result = SessionPermissionsResult;
+}
+
+/// Switch a session's transcript on or off, or ask what it is doing (REQ-611
+/// BR-15, architecture ADR-6) — the `/transcript` verb, modelled on
+/// [`SessionPermissionsParams`] line for line.
+///
+/// One method for all three answers for that type's reason: they are one
+/// question asked three ways, and a set that did not read back would let a
+/// client's status row drift from what the sink is actually doing. The state it
+/// moves is **session-scoped and not persisted**, again like the permission
+/// level: the durable half is [`ConfigUpdate::SetTranscriptEnabled`] through
+/// `config/set`, and `/transcript on` writes nothing to `config.toml`.
+///
+/// Like [`SessionPermissionsParams`], this is a **client** RPC and never a
+/// harness tool, and the placement is the enforcement rather than a convention:
+/// tool dispatch and the client socket are structurally distinct channels, so a
+/// model that emits a tool call named `session/transcript` — or tool output
+/// containing the text `/transcript off` — reaches nothing at all. Nothing the
+/// model can say turns a user's record of the session off.
+///
+/// [`Self::action`] takes the `may_drive` gate for **all three** values,
+/// including [`TranscriptAction::Status`], and that is deliberate rather than
+/// an oversight of the read: on/off is a mutation, and the status answer names
+/// the file. A monitor sees [`crate::events::TranscriptState`] and must not
+/// learn the path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTranscriptParams {
+    /// The session whose transcript is being switched or read.
+    pub session_id: SessionId,
+    /// What to do.
+    pub action: TranscriptAction,
+}
+
+/// The three things `/transcript` can ask of a session.
+///
+/// A **closed** enum with no catch-all and no `Default`, for
+/// [`AttachConsentOutcome`]'s reason: an action this build cannot read is a
+/// deserialization error the daemon returns as
+/// [`crate::jsonrpc::error_code::INVALID_PARAMS`], never a silent reading of
+/// one of these three. There is no safe default — one value starts recording a
+/// user's session to disk and another stops it, so guessing is the one thing a
+/// daemon must not do with an unreadable verb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptAction {
+    /// Start recording this session from here on. Never retroactive: the
+    /// conversation retained before the switch is not written (AC-3).
+    On,
+    /// Stop recording. The file is closed and kept; a later `On` resumes into
+    /// the same file rather than starting a second one (AC-4).
+    Off,
+    /// Change nothing — answer with the state as it stands.
+    Status,
+}
+
+/// Result of [`SessionTranscriptParams`] — the state after the call, and the
+/// one surface that names the file (REQ-611 BR-15).
+///
+/// **This is the routed half of BR-15.** It goes back on the asking connection
+/// as the RPC response and is broadcast to nobody, because
+/// [`Self::path`] is boundary content — a transcript path names the user's
+/// home, the class REQ-569 BR-10 gives `cwd`. The *news* that recording started
+/// or stopped is [`crate::events::TranscriptState`], which carries no path and
+/// reaches every attached client and declared monitor. Splitting the two is the
+/// whole shape: everyone learns the session is being recorded, only the person
+/// who asked learns where.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTranscriptResult {
+    /// Whether the session is recording after this call — the effective state,
+    /// so a session whose config says `true` but whose writer failed reads
+    /// `false` here.
+    pub enabled: bool,
+    /// Where the file is, when there is one.
+    ///
+    /// Absent when this session has never opened a transcript. Present for a
+    /// session that stopped recording as well as one that is: the file from
+    /// before `/transcript off` is still on disk, and a user asking where it
+    /// went has asked the only question this field answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// How many records the file holds — `0` before anything is written.
+    ///
+    /// Records rather than bytes: the file's unit is one JSON object per line
+    /// and `n` runs contiguously from 1 (BR-14), so this is the count the
+    /// daemon can state exactly rather than estimate.
+    pub records: u64,
+    /// Why this session stopped recording without being asked, when it did
+    /// (BR-6): the write failure or the refused directory, in the daemon's own
+    /// words.
+    ///
+    /// Absent for every healthy session, so `enabled: false` with no
+    /// `degraded` is "switched off" and `enabled: false` with one is "broken" —
+    /// two states a status line must not render the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<String>,
+}
+
+impl RpcMethod for SessionTranscriptParams {
+    // `ENDS_TURN` is left at the trait's `false` default, like
+    // `session/permissions` and every other slash-command RPC: this streams no
+    // assistant reply, and a client that treated it as a turn would clear its
+    // markdown fence inside somebody else's streaming code block (REQ-592
+    // BR-6). Pinned from the outside by `only_the_prompt_method_ends_a_turn`.
+    const METHOD: &'static str = "session/transcript";
+    type Result = SessionTranscriptResult;
 }
 
 /// Evict a cached document so the next lookup of that URL re-fetches (BR-12's
@@ -3440,6 +3619,13 @@ mod tests {
                 WebSetupCommitParams::METHOD,
                 ends_turn::<WebSetupCommitParams>(),
             ),
+            // REQ-611 ADR-6: `/transcript` is a switch, not a turn — it streams
+            // nothing, and it can be typed while a reply from another client is
+            // still streaming into this one's fence.
+            (
+                SessionTranscriptParams::METHOD,
+                ends_turn::<SessionTranscriptParams>(),
+            ),
         ] {
             assert!(
                 !ends,
@@ -4040,6 +4226,14 @@ mod tests {
                 web_capability: Some(WebCapabilityState::Ready {
                     tier: WebTier::FetchUserUrl,
                 }),
+                // REQ-611 AC-20: the posture a daemon that has the field always
+                // sends — the durable default, the resolved directory, and the
+                // retention window.
+                transcript: Some(TranscriptPosture {
+                    enabled: true,
+                    dir: "/Users/dev/.local/share/teton/transcripts".to_owned(),
+                    retain_days: 30,
+                }),
             },
         });
     }
@@ -4488,9 +4682,36 @@ mod tests {
                 mode: PrivacyMode::RedactThenRemote,
                 origin: Default::default(),
             }),
+            // REQ-611 AC-6 / ADR-5: the durable transcript switch is a variant
+            // of this update, so it travels behind `config/set`'s gates rather
+            // than through a method of its own.
+            ConfigUpdate::SetTranscriptEnabled { enabled: true },
+            // Both directions, spelled out: `false` is a user turning recording
+            // *off* for every future session, and a round trip that dropped the
+            // payload would still read as a legal update — just the wrong one.
+            ConfigUpdate::SetTranscriptEnabled { enabled: false },
         ] {
             round_trip(&ConfigSetParams { update });
         }
+
+        // AC-6's wire half, asserted rather than left to `round_trip`'s
+        // symmetry, because `round_trip` would pass on a shape that never
+        // reaches the daemon: this enum is internally tagged, and a *newtype*
+        // variant carrying a primitive fails to serialize at runtime with
+        // `cannot serialize tagged newtype variant ... containing a boolean`.
+        // Reverting `{ enabled }` to `SetTranscriptEnabled(bool)` therefore
+        // compiles, passes `cargo check`, and reds right here — which is the
+        // whole reason the assertion is spelled out on the wire object.
+        let wire = serde_json::to_value(ConfigSetParams {
+            update: ConfigUpdate::SetTranscriptEnabled { enabled: true },
+        })
+        .expect("the update must serialize at all — see the comment above");
+        assert_eq!(wire["update"]["op"], "set_transcript_enabled", "{wire}");
+        assert_eq!(wire["update"]["enabled"], true, "{wire}");
+        assert!(
+            wire["update"].as_object().is_some_and(|o| o.len() == 2),
+            "the update carries its tag and its value and nothing else: {wire}"
+        );
         round_trip(&ConfigSetResult {
             applied: true,
             budget_notice: None,
@@ -4691,6 +4912,10 @@ mod tests {
         // deliberately reads as "this daemon has no skills", so every `/name`
         // would quietly become `unknown command` on a daemon that has them.
         assert_eq!(SkillsListParams::METHOD, "skills/list");
+        // REQ-611's one method, pinned beside the verb it is modelled on: the
+        // daemon's dispatch match, the CLI's `/transcript` row and `teton
+        // transcript` are all written against this literal.
+        assert_eq!(SessionTranscriptParams::METHOD, "session/transcript");
         assert_eq!(
             request(Id::Number(2), ModelStatusParams::default()).method,
             "model/status"
@@ -6284,6 +6509,104 @@ mod tests {
             serde_json::from_str::<AttachConsentParams>(unknown).is_err(),
             "an unreadable decision must not deserialize to one the daemon acts on"
         );
+    }
+
+    /// **REQ-611 AC-5, the RPC leg.** `session/transcript` round-trips all
+    /// three actions under its own method name, an action this build cannot
+    /// read is an error rather than a default, and the result carries the path
+    /// that the event deliberately does not (BR-15).
+    ///
+    /// The result's two optionals are asserted at both ends because their
+    /// *absence* is a distinct answer, not a placeholder: a healthy session
+    /// that is simply switched off emits neither key, and a status line that
+    /// could not tell that from `degraded` would render a broken transcript and
+    /// a deliberate one identically (BR-6).
+    ///
+    /// The rejection half matters for the same reason it does on
+    /// [`AttachConsentOutcome`]: one value starts writing a user's session to
+    /// disk and another stops it, so an unreadable verb has no safe reading and
+    /// must fail to parse.
+    #[test]
+    fn session_transcript_round_trips_each_action() {
+        assert_eq!(SessionTranscriptParams::METHOD, "session/transcript");
+
+        for (action, spelling) in [
+            (TranscriptAction::On, "on"),
+            (TranscriptAction::Off, "off"),
+            (TranscriptAction::Status, "status"),
+        ] {
+            let params = SessionTranscriptParams {
+                session_id: SessionId::from("s1"),
+                action,
+            };
+            round_trip(&params);
+            let wire = serde_json::to_value(&params).expect("serializes");
+            assert_eq!(wire["session_id"], "s1", "{wire}");
+            assert_eq!(wire["action"], spelling, "{wire}");
+        }
+
+        // The answer a `/transcript` status gets from a recording session: the
+        // one surface that names the file (BR-15's routed half).
+        let recording = SessionTranscriptResult {
+            enabled: true,
+            path: Some("/Users/dev/.local/share/teton/transcripts/s1.jsonl".to_owned()),
+            records: 42,
+            degraded: None,
+        };
+        round_trip(&recording);
+        let wire = serde_json::to_value(&recording).expect("serializes");
+        assert_eq!(wire["enabled"], true, "{wire}");
+        assert_eq!(
+            wire["path"], "/Users/dev/.local/share/teton/transcripts/s1.jsonl",
+            "the asking connection is the one surface told where the file is: {wire}"
+        );
+        assert_eq!(wire["records"], 42, "{wire}");
+        assert!(
+            wire.get("degraded").is_none(),
+            "a healthy session emits no degraded key: {wire}"
+        );
+
+        // A session that never opened one: no path, no reason, zero records —
+        // and `records: 0` on the wire as a number rather than skipped, because
+        // "recording, nothing written yet" is a real report.
+        let never = SessionTranscriptResult {
+            enabled: false,
+            path: None,
+            records: 0,
+            degraded: None,
+        };
+        round_trip(&never);
+        let wire = serde_json::to_value(&never).expect("serializes");
+        assert!(wire.get("path").is_none(), "{wire}");
+        assert_eq!(wire["records"], 0, "{wire}");
+
+        // And one the daemon stopped without being asked (BR-6): off, with the
+        // reason, and the file it wrote before it failed still named.
+        let degraded = SessionTranscriptResult {
+            enabled: false,
+            path: Some("/Users/dev/.local/share/teton/transcripts/s1.jsonl".to_owned()),
+            records: 7,
+            degraded: Some("write failed: No space left on device".to_owned()),
+        };
+        round_trip(&degraded);
+        let wire = serde_json::to_value(&degraded).expect("serializes");
+        assert_eq!(wire["degraded"], "write failed: No space left on device");
+
+        // Closed: an action this build cannot read must not become one it acts
+        // on — neither by defaulting nor by reading as its neighbour.
+        for unknown in [r#""pause""#, r#""ON""#, r#"true"#] {
+            let payload = format!(r#"{{"session_id":"s1","action":{unknown}}}"#);
+            assert!(
+                serde_json::from_str::<SessionTranscriptParams>(&payload).is_err(),
+                "an unreadable action deserialized: {payload}"
+            );
+        }
+        // Non-vacuity: the fixture those three are derived from does parse, so
+        // the refusals above are about the action and not about the envelope.
+        assert!(serde_json::from_str::<SessionTranscriptParams>(
+            r#"{"session_id":"s1","action":"status"}"#
+        )
+        .is_ok());
     }
 
     /// REQ-589 ASSUME-B: the over-budget offer ships **without** widening

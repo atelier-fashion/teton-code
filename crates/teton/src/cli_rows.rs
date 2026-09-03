@@ -151,7 +151,14 @@ pub(crate) const DOCTOR: Mirror = Mirror {
 /// [`refusal_for_path`]'s reason rather than sent to the model (ADR-1), so the
 /// same list that exempts a command from having a row is what tells a user why
 /// it has none.
-pub(crate) const SHELL_ONLY: &[&str] = &["uninstall"];
+pub(crate) const SHELL_ONLY: &[&str] = &[
+    "uninstall",
+    // REQ-611: the durable transcript default is a shell command by design —
+    // the session's `/transcript on|off` is a different lifetime, not a twin.
+    "transcript enable",
+    "transcript disable",
+    "transcript status",
+];
 
 /// What [`write_gate`] decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -696,10 +703,19 @@ pub(crate) fn family_help(path: &[&str], help_flag: &str) -> Option<String> {
 #[must_use]
 pub(crate) fn refusal_for_path(path: &[&str]) -> String {
     let spelling = path.join(" ");
+    // REQ-611: the durable transcript default is a `config.toml` write with
+    // the machine as its blast radius; the session's own switch is
+    // `/transcript on|off`, a different lifetime, so the refusal points at both.
+    if spelling.starts_with("transcript ") && SHELL_ONLY.contains(&spelling.as_str()) {
+        return format!(
+            "`teton {spelling}` is shell-only: it sets the machine's durable transcript default, \
+             so nothing was run — run `teton {spelling}` from a shell; this session's own \
+             switch is `/transcript on` and `/transcript off`."
+        );
+    }
     if SHELL_ONLY.contains(&spelling.as_str()) {
-        // The reason is `SHELL_ONLY`'s single entry's reason, and a unit test
-        // pins that it is still the only entry: a second shell-only command
-        // would need a reason of its own rather than this one.
+        // `uninstall`'s reason; the unit test pins that every other entry has
+        // a reason of its own above rather than borrowing this one.
         return format!(
             "`teton {spelling}` is shell-only: it stops the daemon this session is attached to \
              and removes its data, so nothing was run — run `teton {spelling}` from a shell \

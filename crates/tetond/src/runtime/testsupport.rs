@@ -60,6 +60,18 @@ pub(super) fn set_dir_readonly(dir: &Path, readonly: bool) {
 // original lift, one module tree later.
 // ---------------------------------------------------------------------------
 
+/// A stand-in for the machine's resolved transcript directory (REQ-611 AC-20).
+///
+/// `snapshot_from_config` takes the directory as an argument precisely so the
+/// projection stays a function of its arguments; calling the real
+/// [`crate::runtime::turn::effective_transcript_dir`] here would hand the suite
+/// a different answer on every developer's machine, for no gain — the
+/// composition itself is tested where it lives. Shared rather than written per
+/// module for [`router_for_config`]'s reason.
+pub(super) fn a_transcript_dir() -> &'static Path {
+    Path::new("/var/tmp/teton-snapshot-test/transcripts")
+}
+
 /// A router over `config` with a healthy local tier — what `config/get`
 /// builds, minus the daemon.
 pub(super) fn router_for_config(config: &Config) -> Router {

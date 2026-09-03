@@ -25,6 +25,40 @@ use teton_protocol::SessionId;
 /// small enough that a truly stuck client is evicted promptly.
 pub const DEFAULT_CAPACITY: usize = 256;
 
+/// An observer of every **session-scoped** envelope, called on the publish path
+/// (REQ-611 ADR-1).
+///
+/// # Not a subscriber, and the difference is the whole point
+///
+/// A subscriber whose channel fills is evicted and never re-admitted — the
+/// right contract for a client and the wrong one for a record (LESSON-513). A
+/// tap cannot be evicted: it is offered every envelope for as long as it is
+/// installed, and what it does with one it cannot take is its own business to
+/// count. That is what lets the transcript promise "never a silent hole"
+/// (REQ-611 BR-5).
+///
+/// # `observe` runs under the bus mutex, so it must not block
+///
+/// [`EventBus::publish`] calls this with the lock held and before the
+/// subscriber fan-out, which is safe **only** because the implementation
+/// cannot wait. The signature is the enforcement: no return value, so there is
+/// nothing for a caller to await or handle, and the one shipped implementation
+/// (`crate::transcript::TranscriptSink`) is a `try_send` and nothing else. An
+/// implementation that acquired a lock, allocated unboundedly, logged, or —
+/// the mutation `the_tap_never_blocks_publish_and_counts_its_drops` is written
+/// against — did a blocking send would stall every publisher in the daemon
+/// (LESSON-518).
+///
+/// Only envelopes carrying a `session_id` are offered (REQ-611 BR-7): a
+/// daemon-scoped envelope belongs to no session, and a file that held one would
+/// be putting other sessions' activity into a record its owner may share.
+pub trait EventTap: Send + Sync {
+    /// Observe one session-scoped envelope, in its published wire form.
+    ///
+    /// Called synchronously under the bus lock. Never blocks, never fails.
+    fn observe(&self, envelope: &EventEnvelope);
+}
+
 /// One registered subscriber, held by the bus.
 struct SubscriberHandle {
     id: u64,
@@ -37,6 +71,15 @@ struct Inner {
     next_id: u64,
     seq: u64,
     subscribers: Vec<SubscriberHandle>,
+    /// The installed tap (REQ-611 ADR-1), offered every session-scoped envelope
+    /// before the fan-out below it.
+    ///
+    /// Inside `Inner` rather than beside it so that `publish` reads it under the
+    /// lock it already holds: a second mutex on the publish path would be a
+    /// second thing to acquire per event, and a lock-free slot read would let a
+    /// tap installed between the mint and the fan-out see an envelope whose
+    /// predecessor it never saw.
+    tap: Option<Arc<dyn EventTap>>,
 }
 
 /// A many-subscriber event fan-out with bounded, non-blocking delivery.
@@ -53,8 +96,21 @@ impl EventBus {
                 next_id: 0,
                 seq: 0,
                 subscribers: Vec::new(),
+                tap: None,
             }),
         }
+    }
+
+    /// Install the observer every session-scoped envelope is offered to
+    /// (REQ-611 ADR-1).
+    ///
+    /// One tap, last writer wins. The daemon installs exactly one — the
+    /// transcript sink, from `DaemonRuntime::from_env` — and a second consumer
+    /// of every envelope is a subscriber, which is what `subscribe` is for. A
+    /// list here would invite a caller to add a slow observer to a path whose
+    /// whole contract is that nothing on it waits.
+    pub fn install_tap(&self, tap: Arc<dyn EventTap>) {
+        self.inner.lock().expect("event bus mutex poisoned").tap = Some(tap);
     }
 
     /// Registers a subscriber with a bounded channel of `capacity` events.
@@ -97,6 +153,20 @@ impl EventBus {
         inner.seq += 1;
         let envelope = EventEnvelope::new(seq, session_id, event);
 
+        // REQ-611 ADR-1: the tap sees the envelope **before** the fan-out, with
+        // the `seq` already minted, so a transcript's bus-sourced records are
+        // the wire form verbatim. Before rather than after because the retain
+        // below consumes the subscriber list and can evict — an observer placed
+        // after it would be reading a path whose failures it must not share.
+        //
+        // REQ-611 BR-7: session-scoped only. A daemon-scoped envelope belongs to
+        // no session's file, and this is the seam that knows which it is.
+        if envelope.session_id.is_some() {
+            if let Some(tap) = inner.tap.as_ref() {
+                tap.observe(&envelope);
+            }
+        }
+
         inner.subscribers.retain(|handle| {
             match handle.tx.try_send(envelope.clone()) {
                 Ok(()) => {
@@ -138,6 +208,21 @@ impl EventBus {
         let seq = inner.seq;
         inner.seq += 1;
         seq
+    }
+
+    /// The number the **next** publish will mint, without minting it.
+    ///
+    /// [`Self::next_seq`]'s read-only twin, and the distinction matters: that
+    /// one *reserves*, which leaves a gap in every client's sequence, and is
+    /// right for a routed frame that will wear the number. This one is for a
+    /// caller that wants to say *where in the numbering it started* — REQ-611's
+    /// `transcript_opened` records it so a reader of a file knows which part of
+    /// the daemon-wide stream it covers. Burning a sequence number to answer
+    /// that would put a hole in every attached client's stream for a fact no
+    /// client ever sees.
+    #[must_use]
+    pub fn current_seq(&self) -> u64 {
+        self.inner.lock().expect("event bus mutex poisoned").seq
     }
 
     /// Number of currently registered subscribers.
@@ -232,7 +317,10 @@ impl Drop for Subscription {
 mod tests {
     use super::*;
     use std::time::Duration;
-    use teton_protocol::events::DaemonClientAttach;
+    use teton_protocol::events::{
+        DaemonClientAttach, ModelLifecycle, ModelLifecycleStage, SessionUpdate,
+        SessionUpdatePayload,
+    };
     use teton_protocol::{ClientKind, PROTOCOL_VERSION};
 
     fn an_event() -> Event {
@@ -240,6 +328,272 @@ mod tests {
             client_kind: ClientKind::Cli,
             protocol_version: PROTOCOL_VERSION,
         })
+    }
+
+    /// A daemon-scoped event by nature: the local tier's lifecycle belongs to
+    /// the machine, not to any session (REQ-611 BR-7 names it).
+    fn a_daemon_scoped_event() -> Event {
+        Event::ModelLifecycle(ModelLifecycle {
+            model_id: "on-device".to_owned(),
+            stage: ModelLifecycleStage::Probed {
+                ram_bytes: 0,
+                above_floor: false,
+            },
+        })
+    }
+
+    /// A session-scoped event by nature: streamed turn text.
+    fn a_session_scoped_event(text: &str) -> Event {
+        Event::SessionUpdate(SessionUpdate {
+            update: SessionUpdatePayload::AgentMessageChunk {
+                text: text.to_owned(),
+            },
+        })
+    }
+
+    /// A tap with the shipped sink's contract in miniature: a bounded channel,
+    /// `try_send` only, and a count of what it could not take (REQ-611 ADR-1).
+    ///
+    /// Stands in for `crate::transcript::TranscriptSink` deliberately. What
+    /// these tests assert is a property of the **bus** — that a tap which
+    /// cannot take an envelope costs the publisher nothing — so the double is
+    /// the smallest thing that can be full, and the sink's own drop accounting
+    /// is tested where it lives.
+    struct CountingTap {
+        tx: mpsc::Sender<EventEnvelope>,
+        taken: Arc<AtomicU64>,
+        dropped: Arc<AtomicU64>,
+    }
+
+    /// What [`CountingTap::holding`] hands back: the tap, the receiver the
+    /// caller must keep alive, and the two counters.
+    ///
+    /// The receiver is returned rather than kept inside the tap because a
+    /// `Receiver` is not `Sync` and a tap must be — and it must be *held*
+    /// rather than dropped, because a closed channel fails `try_send` as
+    /// `Closed`, which would make every publish look full for the wrong reason.
+    type TapFixture = (
+        Arc<CountingTap>,
+        mpsc::Receiver<EventEnvelope>,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+    );
+
+    impl CountingTap {
+        /// A tap whose channel holds `capacity` envelopes and is never drained.
+        fn holding(capacity: usize) -> TapFixture {
+            let (tx, rx) = mpsc::channel(capacity);
+            let taken = Arc::new(AtomicU64::new(0));
+            let dropped = Arc::new(AtomicU64::new(0));
+            let tap = Arc::new(Self {
+                tx,
+                taken: Arc::clone(&taken),
+                dropped: Arc::clone(&dropped),
+            });
+            (tap, rx, taken, dropped)
+        }
+    }
+
+    /// "One tap, last writer wins" (REQ-611 ADR-1): a second `install_tap`
+    /// replaces the first, which then observes nothing further.
+    ///
+    /// **Mutation (run 2026-09-03):** making `install_tap` keep the existing
+    /// tap when one is set reddened the second assertion; restored.
+    #[tokio::test]
+    async fn a_second_install_tap_replaces_the_first() {
+        let bus = Arc::new(EventBus::new());
+        let (tx1, _rx1) = mpsc::channel(8);
+        let first = Arc::new(CountingTap {
+            tx: tx1,
+            taken: Arc::new(AtomicU64::new(0)),
+            dropped: Arc::new(AtomicU64::new(0)),
+        });
+        let (tx2, _rx2) = mpsc::channel(8);
+        let second = Arc::new(CountingTap {
+            tx: tx2,
+            taken: Arc::new(AtomicU64::new(0)),
+            dropped: Arc::new(AtomicU64::new(0)),
+        });
+        let session: SessionId =
+            serde_json::from_value(serde_json::json!("sess-tap-replace")).expect("an id");
+        let state = || {
+            Event::TranscriptState(teton_protocol::events::TranscriptState {
+                enabled: true,
+                reason: teton_protocol::events::TranscriptStateReason::SessionCommand,
+            })
+        };
+        bus.install_tap(Arc::clone(&first) as Arc<dyn EventTap>);
+        bus.publish(Some(session.clone()), state());
+        bus.install_tap(Arc::clone(&second) as Arc<dyn EventTap>);
+        bus.publish(Some(session.clone()), state());
+        bus.publish(Some(session), state());
+        assert_eq!(
+            first.taken.load(Ordering::SeqCst),
+            1,
+            "the first tap saw only the first publish"
+        );
+        assert_eq!(
+            second.taken.load(Ordering::SeqCst),
+            2,
+            "the second tap took over"
+        );
+    }
+
+    impl EventTap for CountingTap {
+        fn observe(&self, envelope: &EventEnvelope) {
+            // THE MUTATION for `the_tap_never_blocks_publish_and_counts_its_drops`
+            // is this line as `self.tx.blocking_send(envelope.clone())`.
+            match self.tx.try_send(envelope.clone()) {
+                Ok(()) => self.taken.fetch_add(1, Ordering::SeqCst),
+                Err(_) => self.dropped.fetch_add(1, Ordering::SeqCst),
+            };
+        }
+    }
+
+    /// **REQ-611 BR-5, ADR-1: a full tap never delays a publish, and the
+    /// shortfall is counted rather than lost.**
+    ///
+    /// The tap's channel holds exactly one envelope and nothing drains it, so
+    /// 99 of the 100 publishes below meet a full channel. Three things must all
+    /// hold: every `publish` returns, the bus's ordinary subscriber still
+    /// receives all 100, and `taken + dropped` is 100 — a hole the tap knows
+    /// the size of, which is what a transcript turns into one `transcript_gap`
+    /// record instead of a silent gap in the file (LESSON-513).
+    ///
+    /// **Mutation (run, red):** `CountingTap::observe`'s `try_send` →
+    /// `blocking_send`. The test does not merely fail — the process aborts.
+    /// The first full send panics with *"Cannot block the current thread from
+    /// within a runtime"*, and because it panics **while holding the bus
+    /// mutex** the next publisher meets *"event bus mutex poisoned"* and the
+    /// run ends in `SIGABRT`. That cascade is the whole argument for the
+    /// signature: a tap that waits does not slow one publisher down, it takes
+    /// the bus with it (LESSON-518). Restored.
+    #[tokio::test]
+    async fn the_tap_never_blocks_publish_and_counts_its_drops() {
+        let bus = Arc::new(EventBus::new());
+        let (tap, _rx, taken, dropped) = CountingTap::holding(1);
+        bus.install_tap(tap as Arc<dyn EventTap>);
+        let mut client = bus.subscribe(256);
+
+        let session = SessionId::from("s1");
+        for n in 0..100 {
+            bus.publish(
+                Some(session.clone()),
+                a_session_scoped_event(&format!("chunk {n}")),
+            );
+        }
+
+        // The publisher was never held up: reaching this line at all is the
+        // claim, and the counts below say the tap really was full while it ran.
+        assert_eq!(taken.load(Ordering::SeqCst), 1, "the channel holds one");
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            99,
+            "every envelope the tap could not take is counted"
+        );
+        assert_eq!(
+            taken.load(Ordering::SeqCst) + dropped.load(Ordering::SeqCst),
+            100,
+            "counted + taken accounts for every publish: no silent hole"
+        );
+
+        // The bus's own audience is untouched by any of it.
+        let mut received = 0;
+        while client.try_recv().is_some() {
+            received += 1;
+        }
+        assert_eq!(received, 100, "the subscriber still got every envelope");
+    }
+
+    /// **REQ-611 BR-7: a daemon-scoped envelope is never offered to the tap.**
+    ///
+    /// `model_lifecycle` belongs to the machine, not to a session, and a
+    /// transcript that recorded one would be putting another session's activity
+    /// — or none at all — into a file its owner may share. The zero is paired
+    /// with a one on the same instrument (LESSON-479): the session-scoped
+    /// envelope published afterwards *is* observed, so the tap was installed,
+    /// live, and capable of counting the whole time.
+    ///
+    /// **Mutation (run, red):** drop the `envelope.session_id.is_some()` guard
+    /// in `publish` — `taken` becomes 2 and the first assertion fails. Restored.
+    #[tokio::test]
+    async fn daemon_scoped_envelopes_are_not_offered_to_the_tap() {
+        let bus = Arc::new(EventBus::new());
+        let (tap, _rx, taken, dropped) = CountingTap::holding(64);
+        bus.install_tap(tap as Arc<dyn EventTap>);
+
+        bus.publish(None, a_daemon_scoped_event());
+        assert_eq!(
+            taken.load(Ordering::SeqCst),
+            0,
+            "a daemon-scoped envelope reaches no transcript"
+        );
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            0,
+            "and it is not counted as a drop either — it was never offered"
+        );
+
+        // The positive control, on the same tap.
+        bus.publish(Some(SessionId::from("s1")), a_session_scoped_event("hello"));
+        assert_eq!(
+            taken.load(Ordering::SeqCst),
+            1,
+            "a session-scoped envelope is offered"
+        );
+    }
+
+    /// **REQ-611 ADR-1: evicting a lagging subscriber costs the tap nothing.**
+    ///
+    /// The reason the sink is a tap and not a subscriber. The slow client's
+    /// channel fills at 2 and it is evicted on the third publish; the tap keeps
+    /// being offered every envelope after that, because the eviction acts on
+    /// the subscriber list the tap is not in.
+    #[tokio::test]
+    async fn a_subscriber_evicted_for_lag_does_not_cost_the_tap_an_envelope() {
+        let bus = Arc::new(EventBus::new());
+        let (tap, _rx, taken, _dropped) = CountingTap::holding(64);
+        bus.install_tap(tap as Arc<dyn EventTap>);
+        let slow = bus.subscribe(2); // deliberately never drained
+
+        let session = SessionId::from("s1");
+        for n in 0..10 {
+            bus.publish(
+                Some(session.clone()),
+                a_session_scoped_event(&format!("chunk {n}")),
+            );
+        }
+
+        assert!(slow.is_lagged(), "the subscriber was evicted");
+        assert_eq!(bus.subscriber_count(), 0);
+        assert_eq!(
+            taken.load(Ordering::SeqCst),
+            10,
+            "the tap observed every envelope, including those published after \
+             the eviction"
+        );
+    }
+
+    /// `current_seq` reports the next number without spending it — the
+    /// distinction `transcript_opened` depends on (REQ-611).
+    #[tokio::test]
+    async fn peeking_the_sequence_does_not_mint_one() {
+        let bus = Arc::new(EventBus::new());
+        let mut client = bus.subscribe(8);
+
+        bus.publish(Some(SessionId::from("s1")), an_event());
+        let peeked = bus.current_seq();
+        assert_eq!(peeked, 1, "one publish has happened");
+        assert_eq!(bus.current_seq(), peeked, "peeking twice reads the same");
+
+        bus.publish(Some(SessionId::from("s1")), an_event());
+        let first = client.recv().await.unwrap();
+        let second = client.recv().await.unwrap();
+        assert_eq!(first.seq, 0);
+        assert_eq!(
+            second.seq, peeked,
+            "the peeked number is the one the next publish wore: no gap"
+        );
     }
 
     #[tokio::test]

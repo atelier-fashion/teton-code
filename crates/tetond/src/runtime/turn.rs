@@ -42,6 +42,64 @@
 
 use super::*;
 
+/// Where this daemon writes session transcripts, for the config it is handed —
+/// REQ-611 ADR-4, the one place that pairing is spelled.
+///
+/// Two halves, and neither belongs to the other's crate. `TranscriptConfig::
+/// effective_dir` is pure and answers *"the user's `dir`, or `transcripts`
+/// under whatever data directory you give me"*; `socket_path::data_dir` reads
+/// the environment and answers *"which data directory this machine has"*.
+/// Composing them anywhere but one function invites a second caller to compose
+/// them differently — and the pair that matters here is that the directory the
+/// tools are told to refuse (`assemble_harness`, below) is byte-for-byte the
+/// one the sink will write to. A denial aimed at a directory nothing writes to
+/// is a denial of nothing at all.
+///
+/// **Not `DaemonRuntime::data_dir`.** That field is the *base* directory — the
+/// socket's, which on Linux is `$XDG_RUNTIME_DIR`, a tmpfs cleared at logout.
+/// A thirty-day retention policy under a directory that does not survive a
+/// logout is a promise the daemon cannot keep, which is the whole reason ADR-4
+/// added a second resolver instead of reusing the first. Relocating `cost.db`
+/// to match is a filed follow-up (TASK-367), not a side effect of this.
+///
+/// `pub(super)`, which is what `runtime_visibility.rs` requires of everything
+/// under `runtime/` that no other module needs — and it reaches `runtime/mod.rs`,
+/// where the sink is constructed. A consumer outside `runtime/` promotes it to
+/// `pub(crate)` **and** registers it in that suite's `CRATE_WIDE` with its
+/// consumer named; the ratchet is the argument, not a grep (LESSON-596).
+pub(super) fn effective_transcript_dir(
+    transcript: &teton_core::config::TranscriptConfig,
+) -> PathBuf {
+    transcript.effective_dir(&teton_protocol::socket_path::data_dir())
+}
+
+/// The turn's prompt as the blocks its `prompt_submitted` record carries
+/// (REQ-611).
+///
+/// **One text block holding the flattened prompt, and that is a stated
+/// approximation.** The wire form is a `Vec<PromptBlock>` and `session/prompt`
+/// flattens it (`server::flatten_prompt`) before the turn is spawned: a
+/// resource link becomes `[resource: name (uri)]` in the one string every layer
+/// below reads. `run_prompt_turn` receives that string and never the blocks, so
+/// this is the prompt *the turn actually ran on* rather than a re-derivation of
+/// something the daemon threw away. Threading the original vector down would
+/// widen the turn's entry signature — already at the argument ceiling — to
+/// carry a second spelling of a value the turn does not otherwise have.
+///
+/// An empty prompt yields no blocks rather than one empty block: a skill turn's
+/// `prompt` is `""` by ADR-3 (the invocation travels as a name, and rides on
+/// the record's `skill` field), and a text block holding nothing would tell a
+/// reader the user typed an empty line.
+fn transcript_prompt_blocks(prompt: &str) -> Vec<teton_protocol::methods::PromptBlock> {
+    if prompt.is_empty() {
+        Vec::new()
+    } else {
+        vec![teton_protocol::methods::PromptBlock::Text {
+            text: prompt.to_owned(),
+        }]
+    }
+}
+
 /// What [`DaemonRuntime::claim_the_turn`] establishes before anything else runs.
 ///
 /// A parameter bundle, not a stage object: it holds no behaviour, mints no ids,
@@ -344,6 +402,25 @@ impl DaemonRuntime {
             claim: _claim,
             probed,
         } = self.claim_the_turn(sessions, &session_id, session_cwd)?;
+
+        // REQ-611 BR-4 / AC-2: the prompt, to the transcript, here.
+        //
+        // **After the claim**, because the record carries `turn_id` and the id
+        // is minted with the claim — reading a session's facts before holding
+        // its claim is what LESSON-539 is about. **Before the route**, because
+        // `prompt_submitted` preceding `route_decided` is one of the three
+        // orderings AC-2 asserts, and `resolve_the_route` below publishes that
+        // event. A refused turn — a skill this session does not dispatch, an
+        // expansion that does not fit — still has its prompt in the file, which
+        // is the honest record of what was asked.
+        //
+        // A short-lived emitter rather than the turn's `stream_events`: that one
+        // is assembled with the tools, well below the route, and the ordering
+        // above is the whole point. It is two `Arc` clones on a path that is
+        // about to run a model.
+        SessionEvents::new(Arc::clone(events), session_id.clone())
+            .with_sink(self.transcript())
+            .prompt_submitted(&turn_id, &transcript_prompt_blocks(&prompt), skill.as_ref());
 
         // REQ-585 BR-4/ADR-3: **expand before routing.** A skill turn's `prompt`
         // is empty by ADR-3 — the invocation crosses the wire as a name — and
@@ -873,8 +950,22 @@ impl DaemonRuntime {
         // REQ-585 moved the probe itself to the top of the turn — the expansion
         // needs it, and the expansion runs before the route — so `probed` here
         // is that same single reading, not a second one.
-        let tool_ctx = ToolContext::for_root(probed);
-        let stream_events = SessionEvents::new(events.clone(), session_id.clone());
+        //
+        // REQ-611 BR-8 / ADR-7: and the session's transcript directory is
+        // denied to every file tool the turn runs, at both seams the jail and
+        // the walkers give a path. Composed on **every** turn, not only while a
+        // transcript is being recorded: `enabled` is a fact about what the sink
+        // writes next, and last week's file is still on disk after
+        // `/transcript off`. Nothing here reads `transcript.enabled`, and that
+        // is the point.
+        let tool_ctx = ToolContext::for_root(probed)
+            .with_denied_prefix(effective_transcript_dir(&config.transcript));
+        // REQ-611 BR-4: the turn's streaming surface also carries the sink, so
+        // the tool input and the tool result — neither of which the bus has ever
+        // carried — reach the transcript in-process from the two points in the
+        // loop that hold them.
+        let stream_events =
+            SessionEvents::new(events.clone(), session_id.clone()).with_sink(self.transcript());
 
         // REQ-572 BR-3: the prompt's capability clause reads the same classifier
         // that decides tool exposure — stated here, where both inputs live, so
@@ -2885,7 +2976,8 @@ impl DaemonRuntime {
                 ConfigUpdate::SetTierBinding(_)
                 | ConfigUpdate::SetCategoryBinding(_)
                 | ConfigUpdate::SetPrivacyBoundary(_)
-                | ConfigUpdate::SetEffort(_) => None,
+                | ConfigUpdate::SetEffort(_)
+                | ConfigUpdate::SetTranscriptEnabled { .. } => None,
             };
             self.apply_config_update_guarded(update, |config| {
                 if let Some(restates) = &restates {
@@ -3118,7 +3210,17 @@ impl DaemonRuntime {
             Arc::clone(self.projects()),
             home(),
             // BR-11's hand-off record goes to the session that asked.
-            Some(SessionEvents::new(Arc::clone(events), session_id.clone())),
+            //
+            // REQ-611: carries the sink like every other production
+            // `SessionEvents`, so that "an emitter without a sink is a test
+            // fixture" stays a rule with no exceptions. This one only
+            // publishes — the tap records what it publishes — so the sink is
+            // never used here; the alternative is a second shape of emitter
+            // whose difference a reader has to work out.
+            Some(
+                SessionEvents::new(Arc::clone(events), session_id.clone())
+                    .with_sink(self.transcript()),
+            ),
         );
         // REQ-563 BR-1: `register_web_tool` is the one place the "tier is above
         // off" condition is expressed, so a machine that never opted in has no

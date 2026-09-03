@@ -31,13 +31,13 @@
 
 use std::fs;
 use std::ops::ControlFlow;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use teton_core::ProvenanceId;
 use teton_protocol::methods::RootKind;
 
-use super::skip_symlink_entry;
+use super::{denied_prefix_forms, skip_symlink_entry, under_denied_prefix};
 
 /// Directory names **never** descended into, at any depth, from any root kind,
 /// and whatever the pattern names: VCS internals and build output hold no
@@ -145,6 +145,11 @@ pub struct WalkPolicy {
     home_top: &'static [&'static str],
     bundles: &'static [&'static str],
     budget: WalkBudget,
+    /// Absolute directories no walk under this policy lists or enters (REQ-611
+    /// BR-8) — the session's transcript directory. Not `&'static` like the
+    /// three name sets above: this one is a fact about the running daemon's
+    /// configuration, not a constant of the harness.
+    denied_prefixes: Vec<PathBuf>,
 }
 
 impl Default for WalkPolicy {
@@ -154,6 +159,7 @@ impl Default for WalkPolicy {
             home_top: HOME_TOP_LEVEL_SKIPS,
             bundles: MEDIA_BUNDLE_SUFFIXES,
             budget: WalkBudget::default(),
+            denied_prefixes: Vec::new(),
         }
     }
 }
@@ -164,6 +170,28 @@ impl WalkPolicy {
     pub fn with_budget(mut self, budget: WalkBudget) -> Self {
         self.budget = budget;
         self
+    }
+
+    /// The same policy with `dir` denied — REQ-611 BR-8 / ADR-7, the walker
+    /// half of the transcript denial.
+    ///
+    /// Composed by
+    /// [`ToolContext::with_denied_prefix`](super::ToolContext::with_denied_prefix),
+    /// which sets the jail's half in the same call so the two cannot be given
+    /// different directories. Additive, and the forms are
+    /// [`denied_prefix_forms`]'s — see there for why the prefix is
+    /// canonicalized and why a directory that does not exist yet still counts.
+    #[must_use]
+    pub fn with_denied_prefix(mut self, dir: impl AsRef<Path>) -> Self {
+        self.denied_prefixes
+            .extend(denied_prefix_forms(dir.as_ref()));
+        self
+    }
+
+    /// The directories no walk under this policy lists or enters (BR-8).
+    #[must_use]
+    pub fn denied_prefixes(&self) -> &[PathBuf] {
+        &self.denied_prefixes
     }
 
     /// The budget every walk under this policy runs under.
@@ -215,6 +243,18 @@ pub struct WalkReport {
     /// (BR-13: a vanished directory keeps today's skip-and-continue but is
     /// counted in the same line).
     pub unreadable_total: usize,
+    /// Entries skipped because they sit under a denied prefix (REQ-611 BR-8) —
+    /// neither handed to the tool nor descended into.
+    ///
+    /// **A count, and deliberately no trailer line.** Every other thing this
+    /// report carries is rendered by [`trailer_lines`] for the model to read.
+    /// This one is not, for the reason the denial exists: a transcript path is
+    /// boundary content (REQ-569 BR-10, REQ-611 BR-15), and a walk that
+    /// announced *"skipped 1 transcript directory"* would hand back a fact
+    /// about where the file lives to the caller it was hidden from. It is the
+    /// posture [`WALK_SKIP_DIRS`] already has — a prune nothing names — and the
+    /// count exists so a test can tell a pruned tree from an absent one.
+    pub denied: usize,
 }
 
 /// Walk `root` under `policy`, handing every entry seen to `on_entry` as
@@ -237,6 +277,9 @@ pub struct WalkReport {
 /// - Symlinks are skipped before anything else ([`skip_symlink_entry`],
 ///   REQ-571 BR-5): a link is never followed, so a walk cannot cycle and one
 ///   file cannot surface under two names.
+/// - An entry under one of the policy's denied prefixes is skipped before
+///   anything else sees it (REQ-611 BR-8): not listed, not entered, counted on
+///   the report as [`WalkReport::denied`] and named nowhere.
 /// - An entry whose identity cannot be minted surfaces nothing (REQ-571).
 /// - Every entry seen — file or directory — is counted against the entry
 ///   budget and handed to `on_entry` **before** the driver decides whether to
@@ -333,6 +376,19 @@ impl Walk<'_> {
             // rather than inferred from `!is_dir()`. See `skip_symlink_entry` for
             // both halves of why.
             if skip_symlink_entry(file_type) {
+                continue;
+            }
+            // REQ-611 BR-8 / ADR-7: a denied prefix is pruned **before** the
+            // entry is handed over — the one prune that is. Every other one
+            // below still lists the directory and only declines to descend
+            // (`glob` can list `Library/` from `~`), which is right for a tree
+            // whose *name* is unremarkable and wrong for a transcript
+            // directory: a listed name is content, and BR-8 says a transcript
+            // is never listed either. The entry has already been counted
+            // against the budget, because `read_dir` did the work of producing
+            // it whatever happens next.
+            if under_denied_prefix(&self.policy.denied_prefixes, &path) {
+                self.report.denied += 1;
                 continue;
             }
             let Ok(id) = ProvenanceId::from_resolved(self.root, &path) else {
@@ -660,6 +716,108 @@ mod tests {
         assert_eq!(policy.budget(), WalkBudget::default());
         assert_eq!(WalkBudget::default().max_entries, 100_000);
         assert_eq!(WalkBudget::default().max_wall, Duration::from_secs(10));
+        // REQ-611 BR-8: nothing is denied until a caller names a directory, so
+        // every existing walker keeps the reach it had.
+        assert!(policy.denied_prefixes().is_empty());
+    }
+
+    /// **REQ-611 BR-8 / ADR-7 — the walker seam of the transcript denial.**
+    ///
+    /// A denied prefix is pruned *before* the entry is handed over, which is
+    /// what makes it different from every other prune here: the directory is
+    /// never listed, nothing under it is walked, and the report counts it. The
+    /// sibling tree beside it is walked exactly as before — the benign path,
+    /// without which a walk that had simply found nothing would pass.
+    ///
+    /// The prefix is also named by the caller's `named_prefix` in the last leg.
+    /// BR-12's sets are entered when a pattern names them; this one is not, and
+    /// that is the whole difference between "an unremarkable tree you did not
+    /// ask for" and "a file the tools do not read".
+    ///
+    /// **Mutation, run (conventions: show the test can fail).** Neutering the
+    /// `under_denied_prefix` guard in `Walk::dir` takes `harness::tools` to
+    /// **3 failed / 248 passed**: this test (the listing grows back to all
+    /// seven entries, transcript directory included) and the `grep` legs of
+    /// `tools/mod.rs::each_file_tool_refuses_an_in_root_transcript` and
+    /// `the_transcript_denial_ignores_the_boundary_set`. Neutering the guard in
+    /// `ToolContext::resolve` instead gives the same 3 / 248 the other way
+    /// round, with **this** test green — the two seams are genuinely two
+    /// (LESSON-502).
+    #[test]
+    fn visit_prunes_a_denied_prefix_and_walks_its_sibling() {
+        let root = temp_root("denied");
+        plant(&root, "transcripts/2026-09-03-abcdef.jsonl");
+        plant(&root, "transcripts/nested/older.jsonl");
+        plant(&root, "sibling/notes.jsonl");
+        plant(&root, "top.rs");
+
+        // Non-vacuity: with nothing denied the walk finds all three files, so a
+        // shrunken result below is the denial and not a broken fixture.
+        let (all, _) = files_seen(&root, RootKind::Project, &[], &WalkPolicy::default());
+        assert_eq!(
+            all,
+            vec![
+                "sibling/notes.jsonl",
+                "top.rs",
+                "transcripts/2026-09-03-abcdef.jsonl",
+                "transcripts/nested/older.jsonl",
+            ],
+            "the fixture is not the one this test was written against"
+        );
+
+        let policy = WalkPolicy::default().with_denied_prefix(root.join("transcripts"));
+        assert!(
+            !policy.denied_prefixes().is_empty(),
+            "the prefix composed to nothing, so the legs below would pass for the \
+             wrong reason"
+        );
+
+        // Every entry, directories included — `files_seen` reports files only,
+        // and BR-8's claim is that the directory is never *listed* either.
+        let canonical = root.canonicalize().unwrap();
+        let mut seen = Vec::new();
+        let report = visit(
+            &canonical,
+            RootKind::Project,
+            &[],
+            &policy,
+            &mut |_, _, id| {
+                seen.push(id.as_str().to_owned());
+                ControlFlow::Continue(())
+            },
+        );
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec!["sibling", "sibling/notes.jsonl", "top.rs"],
+            "a denied prefix was listed or entered"
+        );
+        assert_eq!(
+            report.denied, 1,
+            "the prune was not counted, so a future walk could stop pruning and \
+             report exactly the same thing as one with no transcript directory"
+        );
+        assert_eq!(report.truncated_by, None, "{report:?}");
+        assert_eq!(report.unreadable_total, 0, "{report:?}");
+
+        // Naming the tree does not enter it (contrast BR-12's `UnlessNamed`).
+        let mut named_seen = Vec::new();
+        visit(
+            &canonical,
+            RootKind::Project,
+            &["transcripts"],
+            &policy,
+            &mut |_, _, id| {
+                named_seen.push(id.as_str().to_owned());
+                ControlFlow::Continue(())
+            },
+        );
+        assert!(
+            named_seen.iter().all(|id| !id.starts_with("transcripts")),
+            "naming the transcript directory walked into it: {named_seen:?}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// The skip set applies at any depth and from any root kind.
@@ -966,6 +1124,7 @@ mod tests {
                 "e/".into(),
             ],
             unreadable_total: 7,
+            ..WalkReport::default()
         };
         let line = unreadable_line(&report);
         assert!(
@@ -978,6 +1137,7 @@ mod tests {
             truncated_by: None,
             unreadable: vec![],
             unreadable_total: 2,
+            ..WalkReport::default()
         };
         assert_eq!(
             unreadable_line(&counted_only),
@@ -992,6 +1152,7 @@ mod tests {
             truncated_by: Some(TruncatedBy::Entries(5)),
             unreadable: vec!["x/".into()],
             unreadable_total: 1,
+            ..WalkReport::default()
         };
         let lines = trailer_lines(&report);
         assert_eq!(lines.len(), 2);
@@ -1150,6 +1311,9 @@ mod tests {
     /// shape belongs in the recogniser, in the same change.
     #[test]
     fn every_harness_line_writer_is_recognised() {
+        // `WalkReport::denied` (REQ-611 BR-8) is absent from this enumeration on
+        // purpose: it writes no harness line, because naming a transcript
+        // directory in tool output is exactly what the denial exists to stop.
         let reports = [
             WalkReport {
                 truncated_by: Some(TruncatedBy::Entries(100_000)),
@@ -1167,22 +1331,26 @@ mod tests {
                 truncated_by: None,
                 unreadable: vec!["a/".into()],
                 unreadable_total: 1,
+                ..WalkReport::default()
             },
             WalkReport {
                 truncated_by: None,
                 unreadable: vec!["a/".into(), "b/".into()],
                 unreadable_total: 9,
+                ..WalkReport::default()
             },
             WalkReport {
                 truncated_by: None,
                 unreadable: vec![],
                 unreadable_total: 3,
+                ..WalkReport::default()
             },
             // Both halves at once, in order.
             WalkReport {
                 truncated_by: Some(TruncatedBy::Entries(7)),
                 unreadable: vec!["x/".into()],
                 unreadable_total: 1,
+                ..WalkReport::default()
             },
         ];
         let mut lines: Vec<String> = reports.iter().flat_map(trailer_lines).collect();

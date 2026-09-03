@@ -43,6 +43,11 @@
 - **Egress** — every remote call flows through one choke point where privacy
   boundaries (BR-1) and cost recording (BR-2) are enforced. No adapter may
   bypass it.
+- **Transcript sink (`crates/tetond/src/transcript/`)** — opt-in, per-session
+  JSONL records: a bounded channel, one writer thread, one owner-only file per
+  session, pruned by age. Fed by a tap on the event bus and by in-process
+  hand-offs from the turn path for what the bus does not carry; it publishes
+  only `transcript_state` and never the file's path (REQ-611).
 
 ## Key Patterns
 
@@ -466,6 +471,46 @@
   Actions log parser reads `::command::` at the start of any line. The `gated`
   job it exists to protect was green on every PR for months while unable to
   block one (BUG-167, LESSON-464).
+
+- **A record that may not lose anything is a tap on the publish path, not a
+  subscriber** (REQ-611). A subscriber whose channel fills is evicted and never
+  re-admitted — the right contract for a client and the wrong one for a record,
+  whose promise is *never a silent hole*: that needs the drop **counted**, not
+  the consumer removed. `EventBus::publish` mints the sequence number, builds
+  the envelope, calls the tap, and only then fans out, so the tap sees every
+  envelope in exactly the wire form the subscribers will. Three properties keep
+  it honest. The tap's `observe` returns nothing and reaches the sink by
+  `try_send` alone, because it runs **under the bus mutex** and anything that
+  could wait there stalls every publisher in the daemon (LESSON-518). A full
+  channel increments a per-session dropped count that the sink writes as a
+  `transcript_gap` record *in front of* the next record that lands, so the
+  per-file counter never has a hole while the bus's own `seq` skips freely
+  (LESSON-503). And the sink never publishes: a second publisher is a second
+  sequence space. What the bus does not carry — prompt text, tool input, tool
+  result, a permission answer — reaches the same sink in-process down the same
+  channel, and is never added to the bus to get there, because the bus's
+  audience is every attached client and every declared monitor (REQ-611
+  ADR-1/ADR-2, BR-4, LESSON-513).
+
+- **A directory tools must not read is a denied prefix in the jail, not a
+  privacy boundary** (REQ-611). A boundary row cannot do this job: outside the
+  session root there is no provenance id for a glob to match, and inside it a
+  boundary would only *taint* a read that should not happen at all. So the
+  transcript directory is a canonicalized denied prefix on `ToolContext`,
+  refused in `resolve` — the one jail every read/edit path and every walker seed
+  passes through — after the outside-root check and before a `ProvenanceId` is
+  minted; `WalkPolicy` carries the same list so `walk::visit` prunes what
+  `resolve` would refuse, and a walker never lists what a `read` may not open.
+  The refusal is deliberately **not** a privacy control: it touches
+  `effective_boundaries` not at all and is unaffected by
+  `disable_default_boundaries`, which is what lets the user-visible rule stay
+  one sentence — *tools do not read transcripts* — and what keeps the denial
+  composed whenever a transcript directory is known rather than only while
+  recording, since last week's file is still there. Two enforcement seams means
+  two adversarial tests plus an end-to-end case per tool (LESSON-502), and
+  `shell` remains the one named exception, fail-closed at egress by unknown
+  provenance like every other file on the machine (REQ-611 ADR-7, REQ-596 BR-6,
+  REQ-597).
 
 ## ADRs
 

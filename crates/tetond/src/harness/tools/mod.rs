@@ -165,6 +165,16 @@ pub struct ToolContext {
     kind: RootKind,
     /// The walk policy every walker under this context runs under (ADR-3).
     walk: walk::WalkPolicy,
+    /// Directories no file tool may reach into, whatever the root (REQ-611
+    /// BR-8, ADR-7) — today exactly one, the session's effective transcript
+    /// directory. Empty on every context that was not given one, which is what
+    /// makes the check free for a caller that has no transcript directory to
+    /// name.
+    ///
+    /// Each configured directory contributes the forms
+    /// [`denied_prefix_forms`] derives for it, so the list is longer than the
+    /// set of directories it came from.
+    denied_prefixes: Vec<PathBuf>,
 }
 
 impl ToolContext {
@@ -184,6 +194,7 @@ impl ToolContext {
             display,
             kind: RootKind::Plain,
             walk: walk::WalkPolicy::default(),
+            denied_prefixes: Vec::new(),
         }
     }
 
@@ -201,6 +212,7 @@ impl ToolContext {
             display: bounded_field_bytes(&probed.view.display, DISPLAY_MAX_CHARS),
             kind: probed.view.kind,
             walk: walk::WalkPolicy::default(),
+            denied_prefixes: Vec::new(),
         }
     }
 
@@ -222,10 +234,43 @@ impl ToolContext {
         self
     }
 
+    /// The same context with `dir` denied to every file tool under it —
+    /// REQ-611 BR-8 / ADR-7, the session's transcript directory.
+    ///
+    /// **One call, both seams.** A path can be seen in exactly two places: it
+    /// is named by the caller and passed through [`Self::resolve`] (`read`,
+    /// `edit`), or it is met by a walk (`grep`, `glob`). This composes the
+    /// denial onto both — the context's own list and the [`walk::WalkPolicy`]
+    /// riding on it — because a denial that reached only one of them would be a
+    /// tool-shaped hole, and the two seams are far enough apart that nothing
+    /// else would notice (ADR-7's "two seams", LESSON-502).
+    ///
+    /// `dir` need not exist: a transcript directory is denied before the first
+    /// file is written to it, which is the point of landing this ahead of the
+    /// sink. See [`denied_prefix_forms`] for how a not-yet-created directory
+    /// under a symlinked ancestor is still recognised.
+    ///
+    /// Additive, so a second call denies a second directory rather than
+    /// replacing the first.
+    #[must_use]
+    pub fn with_denied_prefix(mut self, dir: impl AsRef<Path>) -> Self {
+        let dir = dir.as_ref();
+        self.denied_prefixes.extend(denied_prefix_forms(dir));
+        self.walk = self.walk.with_denied_prefix(dir);
+        self
+    }
+
     /// The walk policy every walker under this context reads (ADR-3, BR-11).
     #[must_use]
     pub fn walk_policy(&self) -> &walk::WalkPolicy {
         &self.walk
+    }
+
+    /// The prefixes [`Self::resolve`] refuses under (REQ-611 BR-8), in the
+    /// forms it compares against — the test seam for the composition above.
+    #[must_use]
+    pub fn denied_prefixes(&self) -> &[PathBuf] {
+        &self.denied_prefixes
     }
 
     /// The session root's path — the jail. Named for its call sites and for
@@ -298,6 +343,17 @@ impl ToolContext {
     /// attacker-controlled value, and the boundary would then be matched against
     /// something the daemon never opened. The operation is refused instead.
     ///
+    /// # A transcript is refused inside the root too (REQ-611 BR-8)
+    ///
+    /// The one refusal that is not about the jail's *edge*: a path under a
+    /// denied prefix ([`Self::with_denied_prefix`]) is refused wherever it
+    /// sits. It is a jail refusal and not a privacy boundary on purpose
+    /// (ADR-7) — outside the root there is no provenance id for a boundary
+    /// glob to match, and inside it a boundary would only *taint* a read that
+    /// must not happen at all. So the rule a model reads is one sentence,
+    /// *tools do not read transcripts*, and it is unaffected by
+    /// `[privacy] disable_default_boundaries` (AC-21).
+    ///
     /// # The escape refusal names the root (REQ-583 BR-2)
     ///
     /// An outside-the-jail refusal is one shape for every tool: the caller's own
@@ -331,6 +387,19 @@ impl ToolContext {
             return Err(ToolError::jail(format!(
                 "path `{raw}` is outside the session root {}",
                 self.display
+            )));
+        }
+        // REQ-611 BR-8 / ADR-7: a denied prefix — the session's transcript
+        // directory — is refused here, after the outside-root check and before
+        // any identity is minted. Both positions are deliberate. *After*, so a
+        // transcript directory outside the root keeps the out-of-root refusal
+        // it already had rather than telling the model that a path it cannot
+        // reach is a transcript. *Before* the mint, because a `ProvenanceId` is
+        // the value a privacy boundary is matched on, and this is not a
+        // boundary: there is nothing to taint, the read simply does not happen.
+        if under_denied_prefix(&self.denied_prefixes, &checked) {
+            return Err(ToolError::jail(format!(
+                "path `{raw}` is a session transcript; tools do not read transcripts"
             )));
         }
         // The `starts_with` above is exactly `strip_prefix`'s precondition, so the
@@ -461,6 +530,70 @@ fn canonical_through_existing_ancestor(path: &Path) -> Option<PathBuf> {
         tail.push(cursor.file_name()?);
         cursor = cursor.parent()?;
     }
+}
+
+/// The forms of `dir` a denial is decided on — REQ-611 BR-8, the shared half of
+/// both seams ([`ToolContext::resolve`] and [`walk::WalkPolicy`]).
+///
+/// # Canonicalized the way a candidate is, or the check is a no-op on macOS
+///
+/// [`ToolContext::resolve`] compares a **canonical** path, and a walk's entries
+/// are canonical too (its root is canonicalized by the caller and no symlink is
+/// ever traversed). A prefix that is not canonicalized the same way therefore
+/// fails `starts_with` against every path it is supposed to catch: the default
+/// transcript directory sits under the temp or data directory, `/var` is a
+/// symlink to `/private/var` on macOS, and the two spellings share no prefix at
+/// all. So the prefix goes through [`canonical_through_existing_ancestor`], the
+/// same resolver `resolve` uses for candidates.
+///
+/// # A directory that does not exist yet is still denied
+///
+/// The denial is composed whenever a transcript directory is *known*, which is
+/// before the sink has created one (ADR-7). `canonical_through_existing_ancestor`
+/// already answers that case — it canonicalizes the deepest existing ancestor
+/// and re-joins the rest — so a not-yet-created `transcripts/` under a symlinked
+/// `/var` still yields the `/private/var` spelling.
+///
+/// The lexical form is kept **as well**, when it differs, for the residue that
+/// resolver cannot answer: a component that does not exist at construction and
+/// later becomes a symlink. Keeping both is free at the check (a `starts_with`
+/// against a two-element slice) and cannot over-deny, since a canonical path
+/// contains no symlink and so can only match the lexical form when the two are
+/// the same string.
+///
+/// # An unusable prefix denies nothing, and says so here
+///
+/// An empty or relative `dir` yields no forms. An empty one would make
+/// `starts_with` true for every path and deny the whole filesystem; a relative
+/// one names no location a containment check can be decided against, and
+/// `Config::validate` already refuses a relative `[transcript] dir` at load, so
+/// this is a floor rather than a policy.
+pub(crate) fn denied_prefix_forms(dir: &Path) -> Vec<PathBuf> {
+    if !dir.is_absolute() {
+        return Vec::new();
+    }
+    let lexical = lexical_normalize(dir);
+    if lexical.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    let mut forms = Vec::with_capacity(2);
+    if let Some(canonical) = canonical_through_existing_ancestor(&lexical) {
+        forms.push(canonical);
+    }
+    if !forms.contains(&lexical) {
+        forms.push(lexical);
+    }
+    forms
+}
+
+/// Whether `path` is one of `prefixes` or sits under one (REQ-611 BR-8).
+///
+/// [`Path::starts_with`] compares whole components, so `/a/bcd` is not under
+/// `/a/bc` — the string-prefix bug this would otherwise have. An empty
+/// `prefixes` (every context that names no transcript directory) answers
+/// `false` without touching `path`.
+pub(crate) fn under_denied_prefix(prefixes: &[PathBuf], path: &Path) -> bool {
+    prefixes.iter().any(|prefix| path.starts_with(prefix))
 }
 
 /// Collapse `.` and `..` components lexically, without touching the filesystem.
@@ -1307,6 +1440,400 @@ mod tests {
             shape(&edit.content, "/etc/hosts")
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ---- REQ-611 BR-8 / ADR-7: the transcript directory is a denied prefix ---
+
+    /// The one sentence a denied path is refused with (ADR-7), minus the
+    /// caller's own path. Spelled once here so the four tools' assertions and
+    /// the jail's own cannot drift into four sentences.
+    const TRANSCRIPT_REASON: &str = "is a session transcript; tools do not read transcripts";
+
+    /// A root holding an in-root transcript directory with one file in it, a
+    /// benign sibling file carrying the same needle, and the transcript
+    /// directory's path. Shared by the three REQ-611 tests below so all of them
+    /// judge the same shape.
+    fn transcript_fixture(tag: &str, needle: &str) -> (PathBuf, PathBuf) {
+        let root = temp_root(tag);
+        let dir = root.join(".teton/transcripts");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("2026-09-03-sess.jsonl"),
+            format!("{{\"kind\":\"prompt_submitted\",\"text\":\"{needle}\"}}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("notes.jsonl"),
+            format!("{needle} lives here too\n"),
+        )
+        .unwrap();
+        (root, dir)
+    }
+
+    /// **REQ-611 BR-8 / ADR-7 — the jail seam of the transcript denial.**
+    ///
+    /// Four legs. **In-root**: the refusal names the path as a transcript, in
+    /// the one sentence ADR-7 fixed. **Out-of-root**: still refused, and with
+    /// the *out-of-root* sentence — a model must not be told that a path it
+    /// could never reach is a transcript, and the AC accepts that reason
+    /// explicitly. **Benign**: the sibling file beside the directory resolves
+    /// normally, without which a jail that refused everything would pass here.
+    ///
+    /// The fourth leg is the hazard the task's Technical Notes name. The prefix
+    /// is handed over through a symlink, so a prefix stored as given fails
+    /// `starts_with` against the canonical path `resolve` checks. On macOS the
+    /// shipped default hits this for real — the data and temp directories live
+    /// under `/var`, which is a symlink to `/private/var` — and the link here
+    /// makes the same case fail on Linux too, where `/var` is not.
+    ///
+    /// **Mutation, run (conventions: show the test can fail).** Neutering the
+    /// `under_denied_prefix` guard in `ToolContext::resolve` takes
+    /// `harness::tools` to **3 failed / 248 passed**: this test (leg 1, on
+    /// `unwrap_err` of an `Ok(Resolved)`),
+    /// [`each_file_tool_refuses_an_in_root_transcript`] (its `read` leg) and
+    /// [`the_transcript_denial_ignores_the_boundary_set`] (the unrefused
+    /// `edit` rewrites the transcript). Leg 2 stays green throughout — it is
+    /// the pre-existing out-of-root refusal — and so does
+    /// `walk.rs::visit_prunes_a_denied_prefix_and_walks_its_sibling`.
+    /// Neutering the guard in `Walk::dir` instead gives the mirror image, also
+    /// 3 failed / 248 passed, with **this** test green (LESSON-502: two seams,
+    /// two adversarial tests, and each one's mutation leaves the other's test
+    /// passing).
+    #[test]
+    fn resolve_refuses_a_transcript_path_and_admits_its_sibling() {
+        let (root, dir) = transcript_fixture("transcript-jail", "NEEDLE");
+        let ctx = ToolContext::new(&root).with_denied_prefix(&dir);
+        assert!(
+            !ctx.denied_prefixes().is_empty(),
+            "the prefix composed to nothing, so every leg below would pass for the \
+             wrong reason"
+        );
+
+        // 1. In-root: refused, and named as a transcript.
+        let raw = ".teton/transcripts/2026-09-03-sess.jsonl";
+        let err = ctx.resolve(raw).unwrap_err();
+        assert!(matches!(err, ToolError::Jail(_)), "{err:?}");
+        assert!(err.to_string().contains(&format!("`{raw}`")), "{err}");
+        assert!(err.to_string().contains(TRANSCRIPT_REASON), "{err}");
+        assert!(
+            !err.to_string().contains("outside the session root"),
+            "an in-root transcript must not be refused as an escape: {err}"
+        );
+
+        // 2. Out-of-root: refused, with the reason it already had.
+        let elsewhere = temp_root("transcript-outside");
+        let outside_ctx = ToolContext::new(&root).with_denied_prefix(&elsewhere);
+        let outside_raw = elsewhere.join("x.jsonl");
+        let outside_raw = outside_raw.to_string_lossy().into_owned();
+        let err = outside_ctx.resolve(&outside_raw).unwrap_err();
+        assert!(matches!(err, ToolError::Jail(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("is outside the session root"),
+            "{err}"
+        );
+
+        // 3. Benign: the sibling beside the directory resolves as it always did.
+        let ok = ctx
+            .resolve("notes.jsonl")
+            .expect("the sibling must resolve");
+        assert_eq!(ok.provenance.as_str(), "notes.jsonl");
+
+        // 4. The prefix named through a symlink still catches the canonical path.
+        std::os::unix::fs::symlink(root.join(".teton"), root.join("link")).unwrap();
+        let linked = ToolContext::new(&root).with_denied_prefix(root.join("link/transcripts"));
+        assert!(
+            linked
+                .denied_prefixes()
+                .iter()
+                .any(|p| !p.components().any(|c| c.as_os_str() == "link")),
+            "the prefix was never canonicalized, so this leg would pass only where \
+             the spellings happen to agree: {:?}",
+            linked.denied_prefixes()
+        );
+        let err = linked.resolve(raw).unwrap_err();
+        assert!(err.to_string().contains(TRANSCRIPT_REASON), "{err}");
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&elsewhere).ok();
+    }
+
+    /// Assert that `content` names nothing under the transcript directory —
+    /// the walkers' form of the refusal, where "refused" means "never
+    /// surfaced" rather than an error string.
+    fn assert_names_no_transcript(label: &str, content: &str) {
+        for token in ["transcripts", "sess.jsonl", "prompt_submitted"] {
+            assert!(
+                !content.contains(token),
+                "{label} surfaced the transcript (found {token:?}): {content}"
+            );
+        }
+    }
+
+    /// **REQ-611 AC-12, the unit legs — four tools, four cases.**
+    ///
+    /// The seams differ, so one case cannot stand for all four (LESSON-502).
+    /// `read` and `edit` name a path and are refused by `ToolContext::resolve`
+    /// with the transcript sentence. `grep` and `glob` never name one: they
+    /// walk, so their refusal is that the file is *never surfaced* — not as a
+    /// match, not as a listed name — including when the caller's own pattern
+    /// names the directory, which is what separates this prune from BR-12's
+    /// "entered when named" sets.
+    ///
+    /// Every leg carries its benign twin on the same fixture: the sibling
+    /// `notes.jsonl` holds the same needle and must still be read, edited,
+    /// matched and listed. A denial of the whole root would otherwise pass
+    /// three of the four assertions.
+    ///
+    /// **Mutation, run.** Neutering the `ToolContext::resolve` guard reddens
+    /// this test at its `read` leg (`read must refuse: 1\t{"kind":…`) and
+    /// leaves the walkers' legs green; neutering the `Walk::dir` guard reddens
+    /// it at its `grep` leg (the transcript's own line comes back as a match)
+    /// and leaves `read`/`edit` green. Both runs: 3 failed / 248 passed across
+    /// `harness::tools`. See
+    /// [`resolve_refuses_a_transcript_path_and_admits_its_sibling`] for the
+    /// whole picture.
+    #[test]
+    fn each_file_tool_refuses_an_in_root_transcript() {
+        use serde_json::json;
+        const NEEDLE: &str = "TRANSCRIPT-NEEDLE";
+        const RAW: &str = ".teton/transcripts/2026-09-03-sess.jsonl";
+        let (root, dir) = transcript_fixture("transcript-tools", NEEDLE);
+        let ctx = ToolContext::new(&root).with_denied_prefix(&dir);
+
+        // read — refused at the jail, and the sibling still reads.
+        let refused = ReadTool.run(&ctx, &json!({ "path": RAW }));
+        assert!(refused.is_error, "read must refuse: {}", refused.content);
+        assert!(
+            refused.content.contains(TRANSCRIPT_REASON),
+            "read: {}",
+            refused.content
+        );
+        assert!(
+            !refused.content.contains(NEEDLE),
+            "read returned the transcript's bytes: {}",
+            refused.content
+        );
+        let benign = ReadTool.run(&ctx, &json!({ "path": "notes.jsonl" }));
+        assert!(!benign.is_error, "read of the sibling: {}", benign.content);
+        assert!(benign.content.contains(NEEDLE), "{}", benign.content);
+
+        // edit — the same jail, so the same sentence; the sibling still edits.
+        let refused = EditTool.run(
+            &ctx,
+            &json!({ "path": RAW, "old_string": NEEDLE, "new_string": "x" }),
+        );
+        assert!(refused.is_error, "edit must refuse: {}", refused.content);
+        assert!(
+            refused.content.contains(TRANSCRIPT_REASON),
+            "edit: {}",
+            refused.content
+        );
+        assert!(
+            std::fs::read_to_string(dir.join("2026-09-03-sess.jsonl"))
+                .unwrap()
+                .contains(NEEDLE),
+            "edit rewrote the transcript"
+        );
+        let benign = EditTool.run(
+            &ctx,
+            &json!({ "path": "notes.jsonl", "old_string": "lives here", "new_string": "still lives here" }),
+        );
+        assert!(!benign.is_error, "edit of the sibling: {}", benign.content);
+
+        // grep — the transcript is never matched, by a bare pattern or by one
+        // whose own glob names the directory; the sibling still matches.
+        let broad = GrepTool.run(&ctx, &json!({ "pattern": NEEDLE }));
+        assert!(!broad.is_error, "{}", broad.content);
+        assert!(
+            broad.content.contains("notes.jsonl"),
+            "grep lost the benign match: {}",
+            broad.content
+        );
+        assert_names_no_transcript("grep", &broad.content);
+        let named = GrepTool.run(
+            &ctx,
+            &json!({ "pattern": NEEDLE, "glob": ".teton/transcripts/*.jsonl" }),
+        );
+        assert!(
+            named.content.starts_with("no matches"),
+            "grep entered a directory the pattern named: {}",
+            named.content
+        );
+
+        // glob — the transcript is never listed, by a broad pattern or by one
+        // that names it; the sibling still lists.
+        let broad = GlobTool.run(&ctx, &json!({ "pattern": "**/*.jsonl" }));
+        assert!(!broad.is_error, "{}", broad.content);
+        assert!(
+            broad.content.contains("notes.jsonl"),
+            "glob lost the benign listing: {}",
+            broad.content
+        );
+        assert_names_no_transcript("glob", &broad.content);
+        let named = GlobTool.run(&ctx, &json!({ "pattern": ".teton/transcripts/*.jsonl" }));
+        assert!(
+            named.content.starts_with("no matches"),
+            "glob listed a directory the pattern named: {}",
+            named.content
+        );
+        // A directory listing is content too (REQ-583 BR-9): the directory
+        // itself must not come back as a name either. Asserted on the shape of
+        // the empty answer rather than through `assert_names_no_transcript`,
+        // because that answer quotes the caller's own pattern back — the one
+        // place "transcripts" in the output is the model's own word.
+        let dirs = GlobTool.run(&ctx, &json!({ "pattern": "**/transcripts" }));
+        assert_eq!(
+            dirs.content, "no matches for `**/transcripts`",
+            "glob listed the transcript directory itself"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **REQ-611 AC-21 (unit leg) — the denial reads no boundary state.**
+    ///
+    /// `[privacy] disable_default_boundaries` is the switch that empties the
+    /// shipped boundary set, and the four refusals must not move with it.
+    ///
+    /// Two legs, because the behavioural one alone would be vacuous in the
+    /// comfortable direction: a `ToolContext` is handed no `Config` at all, so
+    /// of course two runs agree. What makes it mean something is the control —
+    /// the two configs really do compose different boundary sets, asserted
+    /// before anything else — plus the structural leg, which reads
+    /// `ToolContext::resolve`'s **own body**, bounded to that function
+    /// (conventions: *bound the slice to the item you mean*) and stripped of
+    /// comments (LESSON-599: a prose mention is not a read), and asserts it
+    /// names no boundary API. Together: the refusal is boundary-independent
+    /// today, and it cannot quietly stop being so.
+    ///
+    /// **Mutation, run.** Neutering the `resolve` guard reddens the behavioural
+    /// leg — the unrefused `edit` rewrites the transcript and the run's own
+    /// "the transcript was rewritten" assertion fires before the comparison
+    /// does. Neutering the `Walk::dir` guard reddens it at the `grep` leg.
+    /// Adding a single `boundaries`-named binding to `resolve`'s body — the
+    /// smallest form of "a boundary value entered this function" — reddens the
+    /// structural leg alone, with the behavioural one still green.
+    #[test]
+    fn the_transcript_denial_ignores_the_boundary_set() {
+        use serde_json::json;
+        use teton_core::config::Config;
+        const NEEDLE: &str = "AC21-NEEDLE";
+        const RAW: &str = ".teton/transcripts/2026-09-03-sess.jsonl";
+        const RECORD: &str = "2026-09-03-sess.jsonl";
+
+        // The control: the switch under test changes the boundary set. Without
+        // this the legs below would agree for a reason that has nothing to do
+        // with the denial.
+        let config_for = |disabled: bool| {
+            let mut cfg = Config::default();
+            cfg.privacy.disable_default_boundaries = disabled;
+            cfg
+        };
+        assert_ne!(
+            config_for(false).effective_boundaries(),
+            config_for(true).effective_boundaries(),
+            "the boundary switch composed the same set either way, so this test \
+             proves nothing about independence from it"
+        );
+
+        // The four tools under each posture, driven through the same path the
+        // runtime builds the denial by (`TranscriptConfig::effective_dir`).
+        //
+        // **A fixture each.** The `edit` leg mutates when it is not refused, so
+        // two postures sharing one tree would make the second run's answers
+        // depend on the first's — and the difference would then be reported as
+        // "the boundary set moved it", which is the one thing this test must
+        // not say wrongly. Both trees are root-relative in every answer, so
+        // identical output is a real comparison and not an artefact.
+        let four = |tag: &str, disabled: bool| -> Vec<String> {
+            let (root, dir) = transcript_fixture(tag, NEEDLE);
+            let mut cfg = config_for(disabled);
+            cfg.transcript.dir = Some(dir.clone());
+            let ctx = ToolContext::new(&root)
+                .with_denied_prefix(cfg.transcript.effective_dir(Path::new("/nowhere")));
+            let answers = vec![
+                ReadTool.run(&ctx, &json!({ "path": RAW })).content,
+                EditTool
+                    .run(
+                        &ctx,
+                        &json!({ "path": RAW, "old_string": NEEDLE, "new_string": "x" }),
+                    )
+                    .content,
+                GrepTool.run(&ctx, &json!({ "pattern": NEEDLE })).content,
+                GlobTool
+                    .run(&ctx, &json!({ "pattern": "**/*.jsonl" }))
+                    .content,
+            ];
+            assert!(
+                std::fs::read_to_string(dir.join(RECORD))
+                    .unwrap()
+                    .contains(NEEDLE),
+                "the transcript was rewritten with disable_default_boundaries = {disabled}"
+            );
+            std::fs::remove_dir_all(&root).ok();
+            answers
+        };
+        let bounded = four("transcript-ac21-on", false);
+        let unbounded = four("transcript-ac21-off", true);
+        assert_eq!(
+            bounded, unbounded,
+            "a tool's answer about the transcript changed with the boundary set"
+        );
+        assert!(
+            bounded[0].contains(TRANSCRIPT_REASON) && bounded[1].contains(TRANSCRIPT_REASON),
+            "the refusals are not the transcript refusal: {bounded:?}"
+        );
+        for (label, content) in ["grep", "glob"].iter().zip(&bounded[2..]) {
+            assert_names_no_transcript(label, content);
+        }
+
+        // The structural leg: `resolve`'s body reads no boundary state.
+        let body = function_body(include_str!("mod.rs"), "    pub fn resolve(", "    }");
+        let code: String = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Floors first: a slice that has stopped containing the check would
+        // satisfy the prohibition below without asserting anything (BUG-159).
+        for anchor in ["under_denied_prefix", "starts_with(&root)", "from_resolved"] {
+            assert!(
+                code.contains(anchor),
+                "the extracted body is not `resolve` — it is missing {anchor:?}: {code}"
+            );
+        }
+        for hazard in [
+            "effective_boundaries",
+            "BoundaryMatcher",
+            "disable_default_boundaries",
+            "match_path",
+            "boundaries",
+        ] {
+            assert!(
+                !code.contains(hazard),
+                "`resolve` reads boundary state ({hazard:?}); the transcript denial \
+                 is a jail refusal and AC-21 requires it be independent of the \
+                 boundary set: {code}"
+            );
+        }
+    }
+
+    /// The lines of `text` from the one starting with `signature` through the
+    /// first later line equal to `closer` — rustfmt's indentation is the
+    /// delimiter, the same rule `boundary_coverage.rs` uses.
+    ///
+    /// Panics rather than returning an option: a caller that cannot find its
+    /// subject has no assertion left to make, and a silently empty slice is the
+    /// vacuous pass every source-reading check in this workspace is written to
+    /// avoid.
+    fn function_body<'a>(text: &'a str, signature: &str, closer: &str) -> &'a str {
+        let start = text
+            .find(signature)
+            .unwrap_or_else(|| panic!("no definition line starting {signature:?}"));
+        let end = text[start..]
+            .find(&format!("\n{closer}\n"))
+            .unwrap_or_else(|| panic!("no closing {closer:?} after {signature:?}"));
+        &text[start..start + end]
     }
 
     /// The refusal prints the *probed* display when the context was built from a

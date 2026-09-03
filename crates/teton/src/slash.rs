@@ -108,6 +108,7 @@ use teton_protocol::methods::{
     SessionRoot, SessionSetCwdParams, SkillSkipped, SkillSource, SkillView, SkillsListResult,
     WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams, WebRefreshResult,
 };
+use teton_protocol::methods::{SessionTranscriptParams, SessionTranscriptResult, TranscriptAction};
 use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::SessionId;
 
@@ -649,6 +650,18 @@ const COMMANDS: &[CommandSpec] = &[
         args: Args::None,
         mirror: None,
         handler: handle_verbose,
+    },
+    // REQ-611's session-lifetime transcript switch. Beside `/verbose` and
+    // `/permissions` because it, too, is about *this session* and is never
+    // written to disk; the durable default is `teton transcript enable`.
+    CommandSpec {
+        name: "transcript",
+        aliases: &[],
+        summary:
+            "Record this session to a file, or stop: /transcript [on|off]; bare, show the state.",
+        args: Args::Optional,
+        mirror: None,
+        handler: handle_transcript,
     },
     // REQ-560's permission level. Placed beside `/clear` and `/verbose` because
     // all three are about *this session* rather than about the machine's
@@ -1465,6 +1478,11 @@ pub fn run_cli_line(
     let row_args = match cli.command {
         Some(crate::Command::Cost) => String::new(),
         Some(crate::Command::Effort { level }) => level.unwrap_or_default(),
+        Some(crate::Command::Transcript { action }) => match action {
+            crate::TranscriptCli::Enable => "enable".to_owned(),
+            crate::TranscriptCli::Disable => "disable".to_owned(),
+            crate::TranscriptCli::Status => "status".to_owned(),
+        },
         Some(crate::Command::Model {
             action: crate::ModelAction::Set { name },
         }) => name,
@@ -2606,6 +2624,79 @@ const PERMISSIONS_UNAVAILABLE: &str =
 /// Sent unvalidated on purpose — the cache is keyed by a normalization the
 /// daemon owns, and a client-side opinion about what a URL is would be a second
 /// definition that could disagree with the one the entry was written under.
+/// `/transcript [on|off]` (REQ-611 BR-2, BR-3, BR-15). A session command
+/// and nothing else: no tool reaches it, and its answer — the path included —
+/// comes back on this connection as the RPC result, while the bus carries
+/// only `transcript_state` (rendered by `session_ui`). Piped input may drive
+/// it (spec OQ-2): it writes an owner-only file, not an escalation.
+fn handle_transcript(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    args: &str,
+) -> anyhow::Result<CommandOutcome> {
+    let Some(session_id) = ctx.session_id.clone() else {
+        ctx.surface
+            .line(LineKind::Error, TRANSCRIPT_NEEDS_A_SESSION);
+        return Ok(CommandOutcome::Continue);
+    };
+    let action = match args.trim() {
+        "" => TranscriptAction::Status,
+        "on" => TranscriptAction::On,
+        "off" => TranscriptAction::Off,
+        other => {
+            ctx.surface.line(
+                LineKind::Error,
+                &format!(
+                    "unknown transcript argument `{other}` — use `/transcript`, \
+                     `/transcript on` or `/transcript off`."
+                ),
+            );
+            return Ok(CommandOutcome::Continue);
+        }
+    };
+    let is_status = matches!(action, TranscriptAction::Status);
+    match conn.call(SessionTranscriptParams { session_id, action }, ctx)? {
+        Ok(result) => ctx
+            .surface
+            .line(LineKind::Notice, &render_transcript(is_status, &result)),
+        Err(err) if err.code == error_code::METHOD_NOT_FOUND => {
+            ctx.surface.line(LineKind::Notice, TRANSCRIPT_UNAVAILABLE);
+        }
+        Err(err) => ctx.surface.line(
+            LineKind::Error,
+            &format!("the transcript is unavailable: {}", err.message),
+        ),
+    }
+    Ok(CommandOutcome::Continue)
+}
+
+/// The one line `/transcript` draws. A bare call reports the state, the path,
+/// the record count and any degraded reason (AC-5); `on`/`off` report what
+/// the daemon now holds, so a switch refused by a degraded session says
+/// `off` and why rather than echoing the request.
+fn render_transcript(is_status: bool, result: &SessionTranscriptResult) -> String {
+    let mut line = String::from("transcript: ");
+    line.push_str(if result.enabled { "on" } else { "off" });
+    match (&result.path, is_status) {
+        (Some(path), true) => line.push_str(&format!(" — {path} ({} records)", result.records)),
+        (Some(path), false) if result.enabled => {
+            line.push_str(&format!(" — recording to {path}"));
+        }
+        (Some(_), false) => line.push_str(" — stopped"),
+        (None, _) => {}
+    }
+    if let Some(reason) = &result.degraded {
+        line.push_str(&format!(" — degraded: {reason}"));
+    }
+    line
+}
+
+const TRANSCRIPT_NEEDS_A_SESSION: &str =
+    "no session is attached, so there is no transcript to switch or show.";
+
+const TRANSCRIPT_UNAVAILABLE: &str =
+    "this daemon does not serve transcripts — restart it after upgrading to use /transcript.";
+
 fn handle_web_refresh(
     conn: &mut Connection,
     ctx: &mut UiContext<'_>,
@@ -3409,6 +3500,7 @@ mod tests {
             "model",
             "model set",
             "verbose",
+            "transcript",
             "quit",
             // REQ-563 BR-13 / BR-12: the two user-only web actions. Added here
             // first, deliberately — this list is where a new row is declared to
@@ -6177,9 +6269,25 @@ mod tests {
     fn shell_only_still_names_exactly_the_command_its_refusal_explains() {
         assert_eq!(
             cli_rows::SHELL_ONLY,
-            ["uninstall"],
-            "a second shell-only command needs its own reason in `refusal_for_path`"
+            [
+                "uninstall",
+                "transcript enable",
+                "transcript disable",
+                "transcript status",
+            ],
+            "a new shell-only command needs its own reason in `refusal_for_path`"
         );
+        // REQ-611: each family names its own reason, never the other's.
+        let uninstall = cli_rows::refusal_for_path(&["uninstall"]);
+        assert!(uninstall.contains("removes its data"), "{uninstall}");
+        for leaf in ["enable", "disable", "status"] {
+            let line = cli_rows::refusal_for_path(&["transcript", leaf]);
+            assert!(
+                line.contains("durable transcript default") && line.contains("/transcript on"),
+                "{line}"
+            );
+            assert!(!line.contains("removes its data"), "{line}");
+        }
     }
 
     /// **ADR-8, reverse direction.** A line that opens with `teton` but names no
@@ -6870,6 +6978,48 @@ mod tests {
             CLI_FLAGS.len(),
             cli_pinned.len(),
             "CLI_FLAGS carries a duplicate spelling"
+        );
+    }
+}
+
+#[cfg(test)]
+mod transcript_render_tests {
+    use super::*;
+
+    /// **Mutation (run 2026-09-03):** dropping the `degraded` suffix reddened
+    /// the last assertion; restored.
+    #[test]
+    fn the_transcript_line_reports_state_path_count_and_degradation() {
+        let on = SessionTranscriptResult {
+            enabled: true,
+            path: Some("/d/t/x.jsonl".to_owned()),
+            records: 12,
+            degraded: None,
+        };
+        assert_eq!(
+            render_transcript(true, &on),
+            "transcript: on — /d/t/x.jsonl (12 records)"
+        );
+        assert_eq!(
+            render_transcript(false, &on),
+            "transcript: on — recording to /d/t/x.jsonl"
+        );
+        let off = SessionTranscriptResult {
+            enabled: false,
+            path: Some("/d/t/x.jsonl".to_owned()),
+            records: 12,
+            degraded: None,
+        };
+        assert_eq!(render_transcript(false, &off), "transcript: off — stopped");
+        let never = SessionTranscriptResult {
+            enabled: false,
+            path: None,
+            records: 0,
+            degraded: Some("directory refused: mode 0755".to_owned()),
+        };
+        assert_eq!(
+            render_transcript(true, &never),
+            "transcript: off — degraded: directory refused: mode 0755"
         );
     }
 }

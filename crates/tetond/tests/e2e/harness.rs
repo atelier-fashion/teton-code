@@ -527,6 +527,25 @@ impl Workspace {
         self.runtime_dir.join("teton")
     }
 
+    /// A fresh `XDG_DATA_HOME` for the next daemon spawned on this workspace
+    /// (REQ-611 TASK-364).
+    ///
+    /// Not a field, because the *data* directory is per-daemon while the
+    /// workspace is per-test: `Daemon::spawn` is called more than once on one
+    /// workspace, and two daemons sharing a transcript directory would prune
+    /// each other's files at start (BR-13 runs a deletion pass on every open).
+    /// The counter is process-wide for `Workspace::new`'s reason — two tests on
+    /// one clock tick must not collide.
+    ///
+    /// The directory is **not** created: `resolve_data_dir` composes a path and
+    /// the sink creates what it needs, so a suite that pre-created one would be
+    /// hiding the creation step from the code under test.
+    pub fn data_dir_for_spawn(&self) -> PathBuf {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        self.root
+            .join(format!("data{}", SEQ.fetch_add(1, Ordering::SeqCst)))
+    }
+
     /// Where installed weights land. Local display only — this path never
     /// crosses the protocol boundary (BR-11), which is why a test that wants it
     /// derives it the same way the CLI does.
@@ -619,6 +638,15 @@ impl Daemon {
 
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_teton-code"));
         cmd.env("XDG_RUNTIME_DIR", &workspace.runtime_dir)
+            // REQ-611 TASK-364, and it is isolation rather than tidiness.
+            // `socket_path::resolve_data_dir` falls back to the **home** form
+            // when this variable is unset — `~/Library/Application
+            // Support/teton` on macOS — and since TASK-362 every daemon runs
+            // `prune` over its transcript directory at start. Left unset, every
+            // spawned daemon in this suite would run a deletion pass over the
+            // developer's own machine. Per-daemon, so two daemons in one test
+            // never prune each other's files either.
+            .env("XDG_DATA_HOME", workspace.data_dir_for_spawn())
             .env("TETON_CONFIG", &workspace.config_path)
             .env("TETON_REPO_ROOT", &workspace.repo)
             // DECISION 3: the acceptance suite drives the daemon through gated
@@ -810,6 +838,16 @@ pub struct Client {
     /// `granted` (REQ-569 BR-6). Shared with that thread, so a test can arm it
     /// after the client is connected.
     auto_consent: Arc<AtomicBool>,
+    /// Every line this connection has read off the socket, verbatim
+    /// (REQ-611 AC-5).
+    ///
+    /// [`Self::events`] holds only what the classifier kept — events, parsed,
+    /// with responses consumed by whoever awaited them. A criterion of the form
+    /// *"no frame carrying X reaches this connection"* cannot be checked
+    /// against that: it has to be checked against the bytes, including the
+    /// frames the classifier drops (lag notices) and the responses to somebody
+    /// else's request. Filled by the reader thread, which is why it is shared.
+    raw: Arc<Mutex<Vec<String>>>,
 }
 
 impl Client {
@@ -823,6 +861,8 @@ impl Client {
         let mut consent_writer = writer.try_clone().unwrap();
         let auto_consent = Arc::new(AtomicBool::new(false));
         let armed = Arc::clone(&auto_consent);
+        let raw = Arc::new(Mutex::new(Vec::new()));
+        let raw_sink = Arc::clone(&raw);
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let mut reader = BufReader::new(reader_stream);
@@ -838,6 +878,12 @@ impl Client {
                 if trimmed.is_empty() {
                     continue;
                 }
+                // Recorded before the classifier runs, so a frame this harness
+                // drops is still evidence (REQ-611 AC-5).
+                raw_sink
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(trimmed.to_owned());
                 let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
                     continue;
                 };
@@ -892,9 +938,24 @@ impl Client {
             events: Vec::new(),
             auto_approve: true,
             auto_consent,
+            raw,
         };
         client.handshake();
         client
+    }
+
+    /// Every byte this connection has been sent, as one string (REQ-611 AC-5).
+    ///
+    /// The instrument for *"no frame carrying X reached this connection"*: a
+    /// substring search over this is a claim about the wire, not about what the
+    /// harness chose to keep. Callers pump first (`drain_events`) — a frame
+    /// still in flight has not reached anybody yet, and asserting on absence
+    /// without pumping would pass by being early.
+    pub fn raw_wire(&self) -> String {
+        self.raw
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .join("\n")
     }
 
     /// Disable the automatic allow-once answer to permission prompts (so a test

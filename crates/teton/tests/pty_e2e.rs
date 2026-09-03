@@ -188,6 +188,12 @@ impl TestDaemon {
             // is covered by `tetond/tests/daemon_lifetime.rs`.
             .args(["--shutdown-policy", "never"])
             .env("XDG_RUNTIME_DIR", &runtime_dir)
+            // REQ-611 TASK-364: `resolve_data_dir` falls back to the
+            // developer's own home when this is unset, and every daemon prunes
+            // its transcript directory at start — so an unset variable would
+            // have this fixture run a deletion pass over the machine it is
+            // testing on. Under `root`, which `Drop` removes.
+            .env("XDG_DATA_HOME", root.join("d"))
             .env("TETON_CONFIG", &config_path)
             .env("TETON_REPO_ROOT", &root)
             .env("TETON_LOCAL_SCRIPT", &script)
@@ -291,6 +297,9 @@ fn an_idle_session_renders_an_event_with_nothing_typed() {
 
     let mut cmd = CommandBuilder::new(teton_bin());
     cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+    // CLI that autostarts one lands in `root` rather than the developer's home.
+    cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
     cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
     cmd.env("TETON_REPO_ROOT", &daemon.root);
     let mut session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
@@ -326,6 +335,8 @@ fn an_idle_session_renders_an_event_with_nothing_typed() {
     let doctor = std::process::Command::new(teton_bin())
         .arg("doctor")
         .env("XDG_RUNTIME_DIR", &daemon.runtime_dir)
+        // REQ-611 TASK-364: the same data directory the fixture daemon got.
+        .env("XDG_DATA_HOME", daemon.root.join("d"))
         .env("TETON_CONFIG", daemon.root.join("config.toml"))
         .env("TETON_REPO_ROOT", &daemon.root)
         .output()
@@ -405,6 +416,9 @@ fn the_status_row_shows_the_session_s_web_capability() {
 
     let mut cmd = CommandBuilder::new(teton_bin());
     cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+    // CLI that autostarts one lands in `root` rather than the developer's home.
+    cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
     cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
     cmd.env("TETON_REPO_ROOT", &daemon.root);
     let mut session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
@@ -506,6 +520,9 @@ fn the_status_row_renders_below_the_frame_and_survives_a_redraw() {
 
     let mut cmd = CommandBuilder::new(teton_bin());
     cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+    // CLI that autostarts one lands in `root` rather than the developer's home.
+    cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
     cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
     cmd.env("TETON_REPO_ROOT", &daemon.root);
     let mut session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
@@ -704,6 +721,9 @@ fn the_key_step_does_not_echo_and_the_key_reaches_nothing() {
 
     let mut cmd = CommandBuilder::new(teton_bin());
     cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+    // CLI that autostarts one lands in `root` rather than the developer's home.
+    cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
     cmd.env("TETON_CONFIG", &config_path);
     cmd.env("TETON_REPO_ROOT", &daemon.root);
     let mut session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
@@ -934,6 +954,9 @@ fn a_reply_reciting_the_cli_earns_the_hand_off_line_at_a_terminal() {
 
     let mut cmd = CommandBuilder::new(teton_bin());
     cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+    // CLI that autostarts one lands in `root` rather than the developer's home.
+    cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
     cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
     cmd.env("TETON_REPO_ROOT", &daemon.root);
     let mut session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
@@ -1114,6 +1137,9 @@ fn a_session_provider_add_asks_for_its_key_echo_off_and_stores_nothing_untyped()
 
     let mut cmd = CommandBuilder::new(teton_bin());
     cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+    // CLI that autostarts one lands in `root` rather than the developer's home.
+    cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
     cmd.env("TETON_CONFIG", &config_path);
     cmd.env("TETON_REPO_ROOT", &daemon.root);
     // `read_secret` takes this variable ahead of the prompt, so an exported
@@ -1291,6 +1317,9 @@ fn a_move_to_a_non_project_root_re_fires_the_notice_at_a_terminal() {
         let mut cmd = CommandBuilder::new(teton_bin());
         cmd.args(["--cwd", cwd.to_str().unwrap()]);
         cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+        // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+        // CLI that autostarts one lands in `root` rather than the developer's home.
+        cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
         cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
         cmd.env("TETON_REPO_ROOT", &daemon.root);
         cmd.env("HOME", &home);
@@ -1470,6 +1499,9 @@ fn a_skill_consent_asks_once_at_a_terminal_and_lists_every_command_verbatim() {
     let mut cmd = CommandBuilder::new(teton_bin());
     cmd.args(["--cwd", project.to_str().unwrap()]);
     cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+    // CLI that autostarts one lands in `root` rather than the developer's home.
+    cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
     cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
     cmd.env("TETON_REPO_ROOT", &daemon.root);
     cmd.env("HOME", &home);
@@ -1616,6 +1648,9 @@ fn the_acknowledgment_prompt_names_the_root_its_skills_and_what_it_left_out() {
     let mut cmd = CommandBuilder::new(teton_bin());
     cmd.args(["--cwd", project.to_str().unwrap()]);
     cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+    // CLI that autostarts one lands in `root` rather than the developer's home.
+    cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
     cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
     cmd.env("TETON_REPO_ROOT", &daemon.root);
     cmd.env("HOME", &home);
@@ -1758,6 +1793,9 @@ fn a_permanent_acknowledgment_writes_its_row_only_where_presence_is_satisfied() 
         let mut cmd = CommandBuilder::new(teton_bin());
         cmd.args(["--cwd", project.to_str().unwrap()]);
         cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+        // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+        // CLI that autostarts one lands in `root` rather than the developer's home.
+        cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
         cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
         cmd.env("TETON_REPO_ROOT", &daemon.root);
         cmd.env("HOME", &home);
@@ -2192,6 +2230,9 @@ fn park_at_the_over_budget_offer(tag: &str) -> OfferSession {
     let mut cmd = CommandBuilder::new(teton_bin());
     cmd.args(["--cwd", project.to_str().unwrap()]);
     cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+    // CLI that autostarts one lands in `root` rather than the developer's home.
+    cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
     cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
     cmd.env("TETON_REPO_ROOT", &daemon.root);
     cmd.env("HOME", &home);
@@ -2575,6 +2616,9 @@ fn a_resized_window_lays_the_next_turn_out_at_the_new_width() {
 
     let mut cmd = CommandBuilder::new(teton_bin());
     cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+    // CLI that autostarts one lands in `root` rather than the developer's home.
+    cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
     cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
     cmd.env("TETON_REPO_ROOT", &daemon.root);
     let mut session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
@@ -2862,6 +2906,9 @@ impl RenderedSession {
 
         let mut cmd = CommandBuilder::new(teton_bin());
         cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+        // REQ-611 TASK-364: the same data directory the fixture daemon got, so a
+        // CLI that autostarts one lands in `root` rather than the developer's home.
+        cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
         cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
         cmd.env("TETON_REPO_ROOT", &daemon.root);
         cmd.env_remove("NO_COLOR");
@@ -3307,5 +3354,361 @@ fn a_turn_boundary_closes_an_unclosed_fence_at_a_terminal() {
         AUDIT_PARAGRAPH,
         "the turn after a fenced one must lay out exactly as any other turn does; \
          transcript:\n{seen}"
+    );
+}
+
+/// A `teton` session under a pty against `daemon`, ready at the entry prompt.
+/// Returns the child, its transcript, and the pty writer (REQ-611 tests).
+fn transcript_session(
+    daemon: &TestDaemon,
+) -> (
+    Box<dyn portable_pty::Child + Send + Sync>,
+    Transcript,
+    Box<dyn Write + Send>,
+) {
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 40,
+            cols: 160,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+    let mut cmd = CommandBuilder::new(teton_bin());
+    cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
+    cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
+    cmd.env("TETON_REPO_ROOT", &daemon.root);
+    let session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
+    drop(pty.slave);
+    let transcript = spawn_reader(pty.master.try_clone_reader().expect("pty reader"));
+    let writer = pty.master.take_writer().expect("pty writer");
+    assert!(
+        wait_for(&transcript, "ready (freeform)"),
+        "the session never reached the entry prompt; transcript:\n{}",
+        snapshot(&transcript)
+    );
+    (session, transcript, writer)
+}
+
+fn count_lines_containing(text: &str, needle: &str) -> usize {
+    text.lines().filter(|line| line.contains(needle)).count()
+}
+
+/// Wait until `text` holds at least `n` lines containing `needle`, bounded.
+fn wait_for_count(transcript: &Transcript, needle: &str, n: usize) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if count_lines_containing(&snapshot(transcript), needle) >= n {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+/// REQ-611 AC-3 (CLI half): `/transcript on` prints the handler's one line
+/// (naming the file) and the `transcript_state` notice arrives exactly once.
+///
+/// **Mutation (run 2026-09-03):** suppressing the `transcript_state` render
+/// arm in `session_ui` (line composed, never drawn) reddened "the
+/// transcript_state notice must render"; restored.
+#[test]
+fn transcript_on_prints_one_line_and_one_state_notice() {
+    let daemon = TestDaemon::spawn(&daemon_bin());
+    let (mut session, transcript, mut writer) = transcript_session(&daemon);
+
+    writer
+        .write_all(b"/transcript on\r")
+        .expect("type the command");
+    writer.flush().ok();
+    assert!(
+        wait_for(&transcript, "recording to"),
+        "`/transcript on` must name the file it records to; transcript:\n{}",
+        snapshot(&transcript)
+    );
+    let landed = wait_for_count(&transcript, "transcript: on", 2);
+    let text = snapshot(&transcript);
+    let _ = session.kill();
+    let _ = session.wait();
+
+    assert!(
+        landed,
+        "the transcript_state notice must render; transcript:\n{text}"
+    );
+    assert_eq!(
+        count_lines_containing(&text, "recording to"),
+        1,
+        "the handler prints one line; transcript:\n{text}"
+    );
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.trim_end().ends_with("transcript: on"))
+            .count(),
+        1,
+        "the state notice arrives once, not twice; transcript:\n{text}"
+    );
+    assert!(
+        text.contains("/transcripts/") && text.contains(".jsonl"),
+        "the path under the data directory is shown to the asker (BR-15); transcript:\n{text}"
+    );
+}
+
+/// REQ-611 AC-4 (CLI half): `off` stops, `on` again resumes the same file.
+///
+/// **Mutation (run 2026-09-03):** making `off` print the `recording to` form
+/// reddened the `stopped` count; restored.
+#[test]
+fn transcript_off_then_on_prints_the_resume() {
+    let daemon = TestDaemon::spawn(&daemon_bin());
+    let (mut session, transcript, mut writer) = transcript_session(&daemon);
+
+    writer.write_all(b"/transcript on\r").expect("type on");
+    writer.flush().ok();
+    assert!(
+        wait_for(&transcript, "recording to"),
+        "on; transcript:\n{}",
+        snapshot(&transcript)
+    );
+    let first = snapshot(&transcript);
+    let path = first
+        .lines()
+        .find_map(|line| line.split("recording to ").nth(1))
+        .map(|p| p.trim().to_owned())
+        .expect("the first `on` names a path");
+
+    writer.write_all(b"/transcript off\r").expect("type off");
+    writer.flush().ok();
+    assert!(
+        wait_for(&transcript, "stopped"),
+        "off; transcript:\n{}",
+        snapshot(&transcript)
+    );
+
+    writer
+        .write_all(b"/transcript on\r")
+        .expect("type on again");
+    writer.flush().ok();
+    let resumed = wait_for_count(&transcript, "recording to", 2);
+    let text = snapshot(&transcript);
+    let _ = session.kill();
+    let _ = session.wait();
+
+    assert!(resumed, "the second `on` prints again; transcript:\n{text}");
+    let second = text
+        .lines()
+        .filter_map(|line| line.split("recording to ").nth(1))
+        .nth(1)
+        .map(|p| p.trim().to_owned())
+        .expect("the second `on` names a path");
+    assert_eq!(
+        second, path,
+        "the second `on` resumes the SAME file (AC-4); transcript:\n{text}"
+    );
+    assert_eq!(
+        count_lines_containing(&text, "stopped"),
+        1,
+        "one stop; transcript:\n{text}"
+    );
+    assert_eq!(
+        count_lines_containing(&text, "recording to"),
+        2,
+        "two starts; transcript:\n{text}"
+    );
+}
+
+/// REQ-611 AC-5 (CLI half): bare `/transcript` reports the state, the path,
+/// the record count, and — after the daemon refuses a directory that is wider
+/// than owner-only — the degraded reason.
+///
+/// **Mutation (run 2026-09-03):** dropping the `degraded:` suffix from the
+/// render reddened the final assertion; restored.
+#[test]
+fn bare_transcript_prints_status_with_path_and_degraded_reason() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let daemon = TestDaemon::spawn(&daemon_bin());
+    // A pre-existing, group-readable transcript directory: the daemon refuses
+    // it at `on` (BR-9 / AC-11) and the session is degraded from then on.
+    let dir = daemon.root.join("d").join("teton").join("transcripts");
+    std::fs::create_dir_all(&dir).expect("plant the directory");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("widen it");
+
+    let (mut session, transcript, mut writer) = transcript_session(&daemon);
+
+    writer.write_all(b"/transcript\r").expect("type bare");
+    writer.flush().ok();
+    assert!(
+        wait_for(&transcript, "transcript: off"),
+        "bare `/transcript` reports the state; transcript:\n{}",
+        snapshot(&transcript)
+    );
+
+    writer.write_all(b"/transcript on\r").expect("type on");
+    writer.flush().ok();
+    assert!(
+        wait_for(&transcript, "degraded:"),
+        "a refused directory is reported as degraded; transcript:\n{}",
+        snapshot(&transcript)
+    );
+
+    writer.write_all(b"/transcript\r").expect("type bare again");
+    writer.flush().ok();
+    let reported = wait_for_count(&transcript, "degraded:", 2);
+    let text = snapshot(&transcript);
+    let _ = session.kill();
+    let _ = session.wait();
+
+    assert!(
+        reported,
+        "bare `/transcript` reports the degraded reason (AC-5); transcript:\n{text}"
+    );
+    assert!(
+        count_lines_containing(&text, "transcript: off") >= 2,
+        "the state stays off on a degraded session (BR-6); transcript:\n{text}"
+    );
+}
+
+/// REQ-611 AC-14: with the transcript on, the REQ-572 key step (typed
+/// echo-off, declined at the confirm) leaves no trace of the planted key in
+/// any `*.jsonl` under the transcript directory — while the transcript itself
+/// is non-empty, so the sweep is over a real file and not an absence.
+///
+/// **Mutation (run 2026-09-03):** planting `PLANTED_KEY` into a throwaway
+/// `decoy.jsonl` in the directory before the sweep reddened the "never
+/// reaches" assertion, proving the sweep fires; restored.
+#[test]
+fn the_fixture_key_never_reaches_the_transcript_directory() {
+    let daemon_path = daemon_bin();
+    // Every tier bound to the scripted local tier, so the session is servable
+    // and — the part this test needs — the daemon reports a local model, which
+    // is what makes the `search` tier (the only branch that asks for a key)
+    // offerable at all.
+    let tiers: String = ["reflex", "scan", "build", "think"]
+        .iter()
+        .map(|t| format!("[[tiers]]\ntier = \"{t}\"\nprovider_id = \"local\"\n\n"))
+        .collect();
+    let config = format!("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n{tiers}");
+    let daemon = TestDaemon::spawn_with(&daemon_path, &config, &["a scripted reply."]);
+    let config_path = daemon.root.join("config.toml");
+    let (mut session, transcript, mut writer) = {
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: 40,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new(teton_bin());
+        cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+        cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
+        cmd.env("TETON_CONFIG", &config_path);
+        cmd.env("TETON_REPO_ROOT", &daemon.root);
+        let session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
+        drop(pty.slave);
+        let transcript = spawn_reader(pty.master.try_clone_reader().expect("pty reader"));
+        let writer = pty.master.take_writer().expect("pty writer");
+        assert!(
+            wait_for(&transcript, "ready (freeform)"),
+            "the session never reached the entry prompt; transcript:\n{}",
+            snapshot(&transcript)
+        );
+        (session, transcript, writer)
+    };
+
+    let step = |writer: &mut Box<dyn Write + Send>, text: &str, until: &str| {
+        writer
+            .write_all(text.as_bytes())
+            .expect("type into the pty");
+        writer.flush().ok();
+        assert!(
+            wait_for(&transcript, until),
+            "the walk never reached {until:?}; transcript:\n{}",
+            snapshot(&transcript)
+        );
+    };
+
+    step(&mut writer, "/transcript on\r", "recording to");
+    step(&mut writer, "/web setup\r", "tier [1-3");
+    step(&mut writer, "3\r", "search endpoint");
+    step(
+        &mut writer,
+        "https://api.search.brave.com/res/v1/web/search\r",
+        "does this backend need an API key?",
+    );
+    step(
+        &mut writer,
+        &format!("{ECHO_WITNESS}\r"),
+        "auth header template",
+    );
+    step(&mut writer, "\r", "API key (not shown");
+    step(
+        &mut writer,
+        &format!("{PLANTED_KEY}\r"),
+        "write this to your config?",
+    );
+    writer.write_all(b"n\r").expect("decline the confirm");
+    writer.flush().ok();
+    assert!(
+        wait_for(&transcript, "no key was stored"),
+        "the decline must land; transcript:\n{}",
+        snapshot(&transcript)
+    );
+    step(&mut writer, "/transcript off\r", "stopped");
+    let _ = session.kill();
+    let _ = session.wait();
+
+    let dir = daemon.root.join("d").join("teton").join("transcripts");
+    let files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("the transcript directory exists after `/transcript on`: {e}"))
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+        .collect();
+    assert!(
+        !files.is_empty(),
+        "the session wrote a transcript under {}",
+        dir.display()
+    );
+    for file in &files {
+        let text = std::fs::read_to_string(file).expect("the transcript is readable");
+        assert!(
+            text.contains("transcript_opened"),
+            "the sweep runs over a real transcript: {}",
+            file.display()
+        );
+        assert!(
+            !text.contains(PLANTED_KEY) && !text.contains("PLANTED-DO-NOT-ECHO"),
+            "the planted key never reaches the transcript (AC-14): {}",
+            file.display()
+        );
+    }
+}
+
+/// REQ-611 AC-5 (usage leg): an argument that is neither `on` nor `off` prints
+/// the usage line and sends nothing.
+///
+/// **Mutation (run 2026-09-03):** treating an unknown argument as `Status`
+/// reddened the assertion (a status line printed instead); restored.
+#[test]
+fn transcript_unknown_argument_prints_the_usage_line() {
+    let daemon = TestDaemon::spawn(&daemon_bin());
+    let (mut session, transcript, mut writer) = transcript_session(&daemon);
+    writer
+        .write_all(b"/transcript maybe\r")
+        .expect("type the command");
+    writer.flush().ok();
+    let printed = wait_for(&transcript, "unknown transcript argument `maybe`");
+    let text = snapshot(&transcript);
+    let _ = session.kill();
+    let _ = session.wait();
+    assert!(
+        printed,
+        "the usage line names the argument; transcript:\n{text}"
+    );
+    assert!(
+        !text.contains("recording to") && !text.contains("transcript: on"),
+        "nothing was switched or reported; transcript:\n{text}"
     );
 }

@@ -361,10 +361,20 @@ pub(super) fn has_remote_provider(config: &Config) -> bool {
 /// live (REQ-563 BR-14), and that lives in the daemon's engine slot. Passed in
 /// rather than reached for, so the whole projection stays a function of its
 /// arguments and every cell of it is testable without a daemon.
+///
+/// `transcript_dir` is the second such fact and arrives the same way (REQ-611
+/// AC-20). It is composed by [`super::turn::effective_transcript_dir`], the one
+/// function that pairs `TranscriptConfig::effective_dir` with the machine's
+/// data directory — the same composition the sink is constructed from, so the
+/// directory `doctor` prints and the directory the daemon writes to cannot come
+/// from two readings (LESSON-456). Reaching for the environment here instead
+/// would buy one fewer argument and cost this projection the property the
+/// paragraph above is about.
 pub(super) fn snapshot_from_config(
     config: &Config,
     router: &Router,
     local_model_present: bool,
+    transcript_dir: &Path,
 ) -> ConfigSnapshot {
     // REQ-559 BR-9 / AC-8: every row comes from `Router::effort_for`, the SAME
     // function the router calls per model call. The surfaces therefore cannot
@@ -471,6 +481,22 @@ pub(super) fn snapshot_from_config(
             &config.web,
             local_model_present,
         ))),
+        // REQ-611 AC-20: the posture `doctor` renders in one line. `enabled` is
+        // the **durable default** — the config's own key, which is what a
+        // machine-wide report is about — and never a session's effective state;
+        // BR-2's two lifetimes are two different questions, and `/transcript`
+        // answers the other one on the connection that asked.
+        //
+        // The directory is stated even when nothing is recording, because it is
+        // where last week's files still are: a user asking "where are my
+        // transcripts" after `/transcript off` is asking about the directory,
+        // not about the switch (the same reason ADR-7 composes the tool denial
+        // on every turn rather than only while recording).
+        transcript: Some(teton_protocol::methods::TranscriptPosture {
+            enabled: config.transcript.enabled,
+            dir: transcript_dir.display().to_string(),
+            retain_days: config.transcript.retain_days,
+        }),
     }
 }
 
@@ -533,7 +559,7 @@ pub(super) fn category_route_view(resolution: &CategoryResolution) -> CategoryRo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::testsupport::{config_with_remote, router_for_config};
+    use crate::runtime::testsupport::{a_transcript_dir, config_with_remote, router_for_config};
     use teton_protocol::Category as ProtoCategory;
 
     #[test]
@@ -577,7 +603,12 @@ mod tests {
         // AC-9: no phase-keyed routing row is written by any config op.
         assert!(config.legacy_routing.is_empty());
 
-        let snap = snapshot_from_config(&config, &router_for_config(&config), false);
+        let snap = snapshot_from_config(
+            &config,
+            &router_for_config(&config),
+            false,
+            a_transcript_dir(),
+        );
         assert_eq!(snap.providers.len(), 1);
         assert_eq!(snap.providers[0].kind, ProtoProviderKind::OpenaiCompatible);
         assert_eq!(snap.privacy[0].mode, PrivacyMode::LocalOnly);
@@ -604,7 +635,12 @@ mod tests {
                 floored_budget: None,
             }),
         );
-        let snap = snapshot_from_config(&config, &router_for_config(&config), false);
+        let snap = snapshot_from_config(
+            &config,
+            &router_for_config(&config),
+            false,
+            a_transcript_dir(),
+        );
         assert_eq!(snap.providers[0].max_context, Some(131_072));
         assert_eq!(snap.providers[0].context_budget_cap, Some(65_536));
     }
@@ -633,7 +669,13 @@ mod tests {
             "the fixture must model the default, or the `false` leg proves nothing"
         );
         assert!(
-            !snapshot_from_config(&absent, &router_for_config(&absent), false).redact_enabled,
+            !snapshot_from_config(
+                &absent,
+                &router_for_config(&absent),
+                false,
+                a_transcript_dir()
+            )
+            .redact_enabled,
             "an un-opted-in daemon must report the scan as off"
         );
 
@@ -646,7 +688,13 @@ mod tests {
             ..Config::default()
         };
         assert!(
-            snapshot_from_config(&opted_in, &router_for_config(&opted_in), false).redact_enabled,
+            snapshot_from_config(
+                &opted_in,
+                &router_for_config(&opted_in),
+                false,
+                a_transcript_dir()
+            )
+            .redact_enabled,
             "`[privacy] redact = true` must reach the client that asked for the config"
         );
     }
@@ -662,7 +710,12 @@ mod tests {
         let mut config = config_with_remote("cheap");
         config.default_provider = Some("cheap".to_owned());
         config.judgment_default = teton_core::category::JudgmentCategory::Debug;
-        let snap = snapshot_from_config(&config, &router_for_config(&config), false);
+        let snap = snapshot_from_config(
+            &config,
+            &router_for_config(&config),
+            false,
+            a_transcript_dir(),
+        );
 
         assert_eq!(snap.routing.len(), 11, "every category gets a row");
         let unreached: Vec<&str> = snap
@@ -734,7 +787,12 @@ mod tests {
                 fallback_id: None,
             }),
         );
-        let snap = snapshot_from_config(&config, &router_for_config(&config), false);
+        let snap = snapshot_from_config(
+            &config,
+            &router_for_config(&config),
+            false,
+            a_transcript_dir(),
+        );
         let row = |tier: ProtoTier| {
             snap.tiers
                 .iter()

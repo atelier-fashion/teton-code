@@ -34,6 +34,7 @@ use crate::mcp::{McpServerConfig, McpTransport};
 use crate::phase::Phase;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use teton_protocol::permissions::PermissionLevel;
 
 /// User-authored inputs for the local model tier (the `[local_model]` table).
@@ -894,6 +895,136 @@ impl ShellConfig {
     }
 }
 
+/// The default `[transcript] retain_days` — thirty days (REQ-611 BR-13).
+///
+/// A free function rather than a literal in one place, because serde needs a
+/// path for the field-level `default` and [`TranscriptConfig::default`] needs
+/// the same number: two spellings of a retention policy is one policy the day
+/// they disagree.
+fn default_retain_days() -> u32 {
+    30
+}
+
+/// The default `[transcript] max_record_bytes` — 64 KiB (REQ-611 BR-12).
+///
+/// Here for [`default_retain_days`]'s reason: serde's field default and
+/// [`TranscriptConfig::default`] must be the same number by construction.
+fn default_max_record_bytes() -> usize {
+    65_536
+}
+
+/// The smallest `max_record_bytes` a transcript will accept (REQ-611 BR-12).
+///
+/// A truncation marker plus the record's own envelope keys (`n`, `ts`,
+/// `session_id`, `kind`, `truncated`, `original_bytes`) already run to a few
+/// hundred bytes, so a budget below a kilobyte cannot hold a record that says
+/// anything about what it cut. Refused at load rather than clamped silently:
+/// a clamp would leave the user reading a number in their own file that the
+/// daemon does not use.
+const MIN_MAX_RECORD_BYTES: usize = 1024;
+
+/// Opt-in session transcripts (the `[transcript]` table, REQ-611).
+///
+/// **Off by default, and "off" means the sink does not exist** (BR-1) rather
+/// than a sink that runs and discards: with `enabled = false` and no
+/// `/transcript on`, the daemon opens no file and creates no directory. That is
+/// the posture [`PrivacyConfig::redact`] takes, for the same reason — an
+/// un-opted-in machine pays nothing, and the surface it does not have cannot
+/// leak.
+///
+/// # Two switches, and only one of them is here
+///
+/// This table is the **durable default** read when a session is created (BR-2).
+/// The session-lifetime override (`/transcript on|off`) is deliberately not a
+/// field here and is never written to disk — the same split `/permissions`
+/// already makes between a level and `[permissions]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TranscriptConfig {
+    /// Record a transcript for every session created from this config.
+    ///
+    /// **Defaults to `false`** (BR-1). Serialized unconditionally within the
+    /// table (no `skip_serializing_if`), like [`PrivacyConfig::redact`]: a
+    /// config that names `[transcript]` at all states its posture rather than
+    /// leaving a reader to infer it from an absence.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Where transcripts are written, overriding the data-directory default.
+    ///
+    /// `None` — the ordinary case — means `<data dir>/transcripts`, derived by
+    /// [`TranscriptConfig::effective_dir`] from
+    /// [`teton_protocol::socket_path::resolve_data_dir`]. The derived path is
+    /// **never** written back into the user's file: it is a function of the
+    /// machine, not a setting, and AC-19 requires that an unrelated config
+    /// write never grow a `dir` key the user did not type.
+    ///
+    /// Must be absolute when set ([`Config::validate`]). A relative path would
+    /// resolve against the daemon's working directory, which is not a place any
+    /// user means, and it would resolve differently for a daemon started from a
+    /// different shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<PathBuf>,
+
+    /// Days a transcript file is kept before the daemon prunes it (BR-13).
+    ///
+    /// Defaults to `30`; `0` means never prune, and is a valid setting rather
+    /// than an error — "keep everything" is a policy, not a malformed number.
+    /// Serialized unconditionally for [`Self::enabled`]'s reason: BR-13 calls
+    /// retention a *stated* policy, and a retention window that vanishes from
+    /// the file whenever it holds its default is a hidden constant.
+    #[serde(default = "default_retain_days")]
+    pub retain_days: u32,
+
+    /// The per-field content budget, in bytes, before a record is truncated
+    /// with an explicit marker (BR-12).
+    ///
+    /// Defaults to 64 KiB, and must be at least [`MIN_MAX_RECORD_BYTES`].
+    /// Serialized unconditionally, for [`Self::retain_days`]'s reason.
+    #[serde(default = "default_max_record_bytes")]
+    pub max_record_bytes: usize,
+}
+
+impl Default for TranscriptConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: None,
+            retain_days: default_retain_days(),
+            max_record_bytes: default_max_record_bytes(),
+        }
+    }
+}
+
+impl TranscriptConfig {
+    /// Whether every field still holds its default, used to keep the
+    /// `[transcript]` table out of a config that never opted in — the same
+    /// treatment [`PrivacyConfig::is_unset`] gives `[privacy]`.
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The directory this config's transcripts are written to (REQ-611 ADR-4).
+    ///
+    /// The user's [`Self::dir`] when they set one, else `<data dir>/transcripts`.
+    /// `data_dir` is the caller's — [`teton_protocol::socket_path::data_dir`] in
+    /// the daemon — because this crate performs no I/O and reads no environment.
+    ///
+    /// **Pure**: it touches no filesystem, creates nothing, and canonicalizes
+    /// nothing. That is what lets `teton doctor` print the effective directory
+    /// without a daemon round-trip for the default case (AC-20), and what keeps
+    /// the derived path out of every code path that could write it back into the
+    /// user's config.
+    #[must_use]
+    pub fn effective_dir(&self, data_dir: &Path) -> PathBuf {
+        match &self.dir {
+            Some(dir) => dir.clone(),
+            None => data_dir.join("transcripts"),
+        }
+    }
+}
+
 /// Top-level configuration document.
 ///
 /// Field order matters for TOML serialization: the scalar `pinned_local_model`
@@ -979,6 +1110,14 @@ pub struct Config {
     /// before the array-of-table fields, for the TOML-ordering reason above.
     #[serde(default, skip_serializing_if = "ShellConfig::is_unset")]
     pub shell: ShellConfig,
+    /// Opt-in session transcripts (`[transcript]`, REQ-611): the durable
+    /// default every new session starts from, where the files go, how long they
+    /// are kept, and the per-field truncation budget. Absent means `enabled =
+    /// false` and no sink is constructed at all (BR-1) — see
+    /// [`TranscriptConfig`]. Declared here among the tables, before the
+    /// array-of-table fields, for the TOML-ordering reason above.
+    #[serde(default, skip_serializing_if = "TranscriptConfig::is_unset")]
+    pub transcript: TranscriptConfig,
     /// Registered providers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ModelProvider>,
@@ -1655,6 +1794,46 @@ pub enum ConfigError {
         /// value itself is deliberately not echoed.
         position: usize,
     },
+
+    /// `[transcript] max_record_bytes` is below the floor a truncated record
+    /// needs to describe itself (REQ-611 BR-12).
+    ///
+    /// **Structural, so it is fatal at load**, for [`ConfigError::UnusableSpendCeiling`]'s
+    /// reason: the user set a budget, and starting with it silently raised to
+    /// something else means every truncation marker in their file reports a
+    /// number they did not choose. The value *is* echoed here — it is an
+    /// integer the user typed, with nothing on the right-hand side that could
+    /// be a secret, and it is the fastest way to recognize the line.
+    #[error(
+        "[transcript] max_record_bytes = {bytes} is too small; a truncated record still carries \
+         its own `n`, `ts`, `session_id`, `kind`, `truncated` and `original_bytes` keys, so the \
+         budget must be at least 1024 bytes. The default is 65536."
+    )]
+    TranscriptRecordSizeTooSmall {
+        /// The budget as written, so the user can find the line.
+        bytes: usize,
+    },
+
+    /// `[transcript] dir` is set to a relative path (REQ-611 BR-8).
+    ///
+    /// A relative directory resolves against the daemon's working directory —
+    /// which is not a place any user means, and is a *different* place for a
+    /// daemon autostarted by the CLI than for one started by hand. Left
+    /// unchecked it would scatter transcripts across the filesystem and hand the
+    /// tool jail a denied prefix that names a different tree on every start.
+    ///
+    /// The value is **not** echoed, unlike
+    /// [`ConfigError::MalformedTrustedProjectRoot`]: that one locates a row
+    /// inside a list, whereas this names a single key the user can find by its
+    /// own name, and a transcript path is boundary content (REQ-569 BR-10) in a
+    /// message that reaches the daemon log.
+    #[error(
+        "[transcript] dir must be an absolute path. A relative one would resolve against \
+         whatever directory the daemon happened to start in, which differs between an \
+         autostarted daemon and one you launched yourself. Write the full path (`~` is not \
+         expanded), or remove the key to use the default transcripts directory."
+    )]
+    TranscriptDirNotAbsolute,
 }
 
 impl Config {
@@ -1794,6 +1973,34 @@ impl Config {
         Ok(())
     }
 
+    /// `[transcript]`'s structural check (REQ-611 BR-12, BR-13).
+    ///
+    /// **Structure only**, and the omissions are the interesting half. It does
+    /// not ask whether the directory exists, whether it is writable, or whether
+    /// its permissions are owner-only: those are runtime conditions the sink
+    /// answers where it opens the file, degrading that one session per BR-6
+    /// while the daemon keeps running — and `validate` is fail-closed and gates
+    /// daemon *startup*, so enforcing them here would make an unplugged external
+    /// drive a machine that will not start (conventions.md, "config validity vs
+    /// usability"; REQ-557 ADR-E).
+    ///
+    /// It also does not police `retain_days`: `0` is "never prune", every other
+    /// value is a window, and there is no unusable number to catch.
+    fn validate_transcript(&self) -> Result<(), ConfigError> {
+        let transcript = &self.transcript;
+        if transcript.max_record_bytes < MIN_MAX_RECORD_BYTES {
+            return Err(ConfigError::TranscriptRecordSizeTooSmall {
+                bytes: transcript.max_record_bytes,
+            });
+        }
+        if let Some(dir) = &transcript.dir {
+            if !dir.is_absolute() {
+                return Err(ConfigError::TranscriptDirNotAbsolute);
+            }
+        }
+        Ok(())
+    }
+
     /// Validate cross-field invariants and the BR-7 no-raw-keys rule.
     ///
     /// # Errors
@@ -1804,6 +2011,7 @@ impl Config {
         self.validate_lifetime()?;
         self.validate_cost()?;
         self.validate_skills()?;
+        self.validate_transcript()?;
 
         let mut ids: HashSet<&str> = HashSet::with_capacity(self.providers.len());
         for p in &self.providers {
@@ -3283,6 +3491,10 @@ effort_ladder = []
             // so the round trip proves `[shell]` stays out of a config that
             // never opted in.
             shell: ShellConfig::default(),
+            // REQ-611 BR-1: likewise the shipped default (no transcript), so
+            // the round trip proves `[transcript]` stays out of a config that
+            // never opted in.
+            transcript: TranscriptConfig::default(),
             providers: vec![
                 ModelProvider {
                     id: "local".to_owned(),
@@ -4382,6 +4594,265 @@ provider_id = "on-device"
         // opt-in cannot smuggle a provider back in.
         let written = cfg.to_toml().expect("serialize");
         assert!(!written.contains("anthropic"), "toml: {written}");
+    }
+
+    // ---- REQ-611: the `[transcript]` table (BR-1, BR-13, AC-19) ------------
+
+    /// **REQ-611 BR-1 / TASK-360.** Off by default, from every direction a
+    /// config can arrive, and a written-out table states the posture rather
+    /// than leaving it to be inferred.
+    ///
+    /// The two arrivals are deliberately separate cases: a file with **no**
+    /// `[transcript]` table and a file that names the table but writes no
+    /// `enabled` key are different serde paths (the struct-level `default`
+    /// versus the field-level one), and a schema that gets one right and the
+    /// other wrong is the shape BR-1 has to rule out — "on" arriving by
+    /// omission is exactly the failure the default exists to prevent.
+    ///
+    /// **Mutation** (LESSON-441): set `enabled: true` in
+    /// `impl Default for TranscriptConfig` — this goes red on the first four
+    /// assertions (`assert!(!…enabled)`), while nothing else in
+    /// `teton-core` notices. Restored.
+    #[test]
+    fn transcript_table_defaults_to_off_and_states_its_posture() {
+        // No table at all — the stock install, and a config authored before
+        // this REQ existed.
+        for (label, document) in [
+            ("empty document", ""),
+            ("an unrelated table", "[privacy]\nredact = true\n"),
+        ] {
+            let cfg = Config::load(document).expect("must load");
+            assert!(
+                !cfg.transcript.enabled,
+                "{label}: a config that never named [transcript] opted in"
+            );
+            assert!(cfg.transcript.is_unset(), "{label}");
+        }
+        assert!(
+            !Config::default().transcript.enabled,
+            "the in-memory default opted in"
+        );
+
+        // The table named, the key omitted: still off, and indistinguishable
+        // from the absence.
+        let named = Config::load("[transcript]\n").expect("must load");
+        assert!(!named.transcript.enabled);
+        assert_eq!(named.transcript, TranscriptConfig::default());
+        assert_eq!(
+            named.transcript,
+            Config::load("[transcript]\nenabled = false\n")
+                .expect("must load")
+                .transcript,
+            "writing the default explicitly is not a third state"
+        );
+
+        // Reading the opt-in rather than defaulting it.
+        let on = Config::load("[transcript]\nenabled = true\n").expect("must load");
+        assert!(on.transcript.enabled);
+
+        // "States its posture": whenever the table is emitted at all, `enabled`
+        // is in it — including when the thing that made it non-default was some
+        // other key. A reader of the file never has to infer the switch.
+        let written = on.to_toml().expect("serialize");
+        assert!(written.contains("[transcript]"), "toml: {written}");
+        assert!(written.contains("enabled = true"), "toml: {written}");
+        let only_retention = Config::load("[transcript]\nretain_days = 7\n").expect("must load");
+        let written = only_retention.to_toml().expect("serialize");
+        assert!(
+            written.contains("enabled = false"),
+            "an emitted [transcript] table must state the switch: {written}"
+        );
+
+        // And BR-1's other half: a config that never opted in does not grow the
+        // table on a write, exactly as `[privacy]` does not.
+        let untouched = Config::load("[privacy]\nredact = true\n").expect("must load");
+        let written = untouched.to_toml().expect("serialize");
+        assert!(
+            !written.contains("[transcript]"),
+            "an unset table was written into the user's config: {written}"
+        );
+    }
+
+    /// **REQ-611 BR-13 / TASK-360.** The retention window and the record
+    /// budget carry the declared defaults, and `retain_days = 0` — "never
+    /// prune" — is a setting rather than an error.
+    ///
+    /// The table-present-key-absent case is repeated from BR-1's test on
+    /// purpose: `retain_days` and `max_record_bytes` reach their defaults
+    /// through a *named function* (`#[serde(default = "…")]`), which is a
+    /// different mechanism from `bool`'s `Default`, and it is the mechanism
+    /// that silently yields `0` if the attribute is ever dropped.
+    ///
+    /// **Mutation** (LESSON-441): change `default_retain_days` to return `7`
+    /// — three assertions go red (the absent table, the named-but-empty table,
+    /// and the in-memory default). Restored.
+    #[test]
+    fn transcript_retention_and_record_size_defaults() {
+        for (label, document) in [
+            ("no table", ""),
+            (
+                "table present, keys absent",
+                "[transcript]\nenabled = true\n",
+            ),
+        ] {
+            let cfg = Config::load(document).expect("must load");
+            assert_eq!(cfg.transcript.retain_days, 30, "{label}");
+            assert_eq!(cfg.transcript.max_record_bytes, 65_536, "{label}");
+        }
+        assert_eq!(TranscriptConfig::default().retain_days, 30);
+        assert_eq!(TranscriptConfig::default().max_record_bytes, 65_536);
+
+        // `0` is "never prune" (BR-13), not a malformed window: it parses, it
+        // validates, and it is not silently promoted to the default.
+        let forever = Config::load("[transcript]\nenabled = true\nretain_days = 0\n")
+            .expect("retain_days = 0 must load");
+        assert_eq!(forever.transcript.retain_days, 0);
+        forever
+            .validate()
+            .expect("never-prune is a policy, not a validation failure");
+
+        // Both keys are read from the file when written.
+        let set = Config::load("[transcript]\nretain_days = 1\nmax_record_bytes = 4096\n")
+            .expect("must load");
+        assert_eq!(set.transcript.retain_days, 1);
+        assert_eq!(set.transcript.max_record_bytes, 4096);
+        set.validate().expect("a valid table passes");
+    }
+
+    /// **REQ-611 ADR-4 / TASK-360.** `effective_dir` is the user's `dir` when
+    /// set and `<data dir>/transcripts` otherwise — and it is pure.
+    ///
+    /// Purity is asserted by handing it a data directory that does not exist
+    /// and checking nothing appeared: `teton-core` performs no I/O, and this is
+    /// the one method in it that holds a filesystem path and would be tempting
+    /// to make create its own directory.
+    #[test]
+    fn the_effective_transcript_dir_is_the_users_dir_or_the_data_dir_default() {
+        let data_dir = Path::new("/does/not/exist/teton");
+
+        let default = TranscriptConfig::default();
+        assert_eq!(
+            default.effective_dir(data_dir),
+            PathBuf::from("/does/not/exist/teton/transcripts")
+        );
+
+        let chosen = TranscriptConfig {
+            dir: Some(PathBuf::from("/srv/records/teton")),
+            ..TranscriptConfig::default()
+        };
+        assert_eq!(
+            chosen.effective_dir(data_dir),
+            PathBuf::from("/srv/records/teton"),
+            "a configured dir is used as written, not joined under the data dir"
+        );
+
+        assert!(
+            !data_dir.exists(),
+            "effective_dir must not create anything — teton-core performs no I/O"
+        );
+    }
+
+    /// **REQ-611 BR-12 / TASK-360.** A record budget too small to describe its
+    /// own truncation is a structural error, refused at load.
+    ///
+    /// **Mutation** (LESSON-441, "invert the gate and count what fails"): drop
+    /// `self.validate_transcript()?` from `Config::validate`. **Three** tests go
+    /// red — this one, `a_relative_transcript_dir_is_refused_by_validate`, and
+    /// `every_config_error_variant_validate_can_raise_is_asserted_by_a_test`,
+    /// which sees the two raises leave the call tree it walks. Restored.
+    #[test]
+    fn a_transcript_record_budget_below_the_floor_is_refused_by_validate() {
+        let mut cfg = sample_config();
+        cfg.transcript.max_record_bytes = 10;
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ConfigError::TranscriptRecordSizeTooSmall { bytes: 10 }
+        );
+
+        // The message names the key the user has to edit, and the floor.
+        let err = Config::load("[transcript]\nmax_record_bytes = 10\n")
+            .expect_err("a sub-kilobyte budget must be refused at load");
+        let rendered = format!("{err}");
+        assert!(rendered.contains("max_record_bytes"), "{rendered}");
+        assert!(rendered.contains("1024"), "{rendered}");
+
+        // The boundary itself is valid — the rule is "below 1024", not "below
+        // or at".
+        cfg.transcript.max_record_bytes = 1024;
+        cfg.validate().expect("the floor itself is a valid budget");
+    }
+
+    /// **REQ-611 BR-8 / TASK-360.** A relative `dir` is a structural error: it
+    /// would name a different tree depending on where the daemon was started,
+    /// and the tool jail's denied prefix is derived from it.
+    ///
+    /// **Mutation**: the gate inversion recorded on
+    /// `a_transcript_record_budget_below_the_floor_is_refused_by_validate`
+    /// reddens this one too — it is the second of that mutation's three.
+    #[test]
+    fn a_relative_transcript_dir_is_refused_by_validate() {
+        let mut cfg = sample_config();
+        cfg.transcript.dir = Some(PathBuf::from("transcripts"));
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ConfigError::TranscriptDirNotAbsolute
+        );
+
+        // `~` is not expanded by this crate, so a tilde path is relative too —
+        // the case a user is most likely to write by hand.
+        cfg.transcript.dir = Some(PathBuf::from("~/teton-transcripts"));
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ConfigError::TranscriptDirNotAbsolute
+        );
+
+        // An absolute one passes, and so does an absent one.
+        cfg.transcript.dir = Some(PathBuf::from("/srv/records/teton"));
+        cfg.validate().expect("an absolute dir is valid");
+        cfg.transcript.dir = None;
+        cfg.validate().expect("an absent dir is the ordinary case");
+    }
+
+    /// **REQ-611 AC-19 (schema half) / TASK-360.** The table round-trips, and
+    /// the *effective* directory never reaches the file — only a `dir` the user
+    /// wrote does.
+    ///
+    /// The rendering half of AC-19 lives in
+    /// `config_doc::tests::the_transcript_table_is_written_only_when_the_user_named_it`;
+    /// this is the schema's own share of it, which is what makes the derived
+    /// path unwritable rather than merely unwritten.
+    #[test]
+    fn the_transcript_table_round_trips_and_never_carries_the_derived_directory() {
+        let cfg =
+            Config::load("[transcript]\nenabled = true\nretain_days = 7\n").expect("must load");
+        let toml_text = cfg.to_toml().expect("serialize");
+        let back = Config::from_toml(&toml_text).expect("deserialize");
+        assert_eq!(cfg, back, "round-trip mismatch; toml was:\n{toml_text}");
+        Config::load(&toml_text).expect("a re-serialized config must still validate");
+
+        // `dir` was not written, so it is not emitted — and neither is the
+        // directory `effective_dir` would derive for it.
+        assert!(!toml_text.contains("dir ="), "toml: {toml_text}");
+        let derived = cfg.transcript.effective_dir(Path::new("/var/lib/teton"));
+        assert!(
+            !toml_text.contains(&derived.display().to_string()),
+            "the derived transcript directory reached the user's config: {toml_text}"
+        );
+
+        // A `dir` the user did write survives verbatim.
+        let with_dir = Config::load("[transcript]\nenabled = true\ndir = \"/srv/records/teton\"\n")
+            .expect("must load");
+        let toml_text = with_dir.to_toml().expect("serialize");
+        assert!(
+            toml_text.contains("/srv/records/teton"),
+            "toml: {toml_text}"
+        );
+        assert_eq!(
+            Config::from_toml(&toml_text)
+                .expect("deserialize")
+                .transcript,
+            with_dir.transcript
+        );
     }
 
     #[test]

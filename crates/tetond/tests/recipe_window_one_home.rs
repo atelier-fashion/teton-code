@@ -123,6 +123,16 @@ const KNOWN_UNRELATED_HOMES: &[(u32, &str, usize, &str)] = &[
     ),
     (
         4_096,
+        "transcript/mod.rs",
+        1,
+        "`CHANNEL_CAPACITY` (REQ-611 ADR-1) — how many *records* the transcript \
+         sink's bounded channel holds before a producer's `try_send` starts \
+         counting drops. A queue depth, not a token count: nothing reads it \
+         against a model, and re-verifying Ollama's served window must not \
+         resize a channel",
+    ),
+    (
+        4_096,
         "web/reduce.rs",
         1,
         "`REDUCTION_ENVELOPE_RESERVE_BYTES` — headroom kept for a reduction's \

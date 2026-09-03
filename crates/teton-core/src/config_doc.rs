@@ -2071,6 +2071,161 @@ mood = "curious"
         assert_eq!(reloaded, candidate);
     }
 
+    /// **REQ-611 AC-19 / TASK-360.** The `[transcript]` table appears in a
+    /// user's config file only because the user named it — an unrelated write
+    /// never adds it, and never adds the directory the daemon derived.
+    ///
+    /// Four legs — AC-19's three claims, and the one that makes the schema
+    /// choice behind them falsifiable:
+    ///
+    /// 1. a document that never named `[transcript]` does not grow it;
+    /// 2. one that did keeps it byte-for-byte, with the user's keys and no
+    ///    others — in particular no `dir`, and nowhere the *effective*
+    ///    directory `TranscriptConfig::effective_dir` would derive;
+    /// 3. a `dir` the user wrote survives as written;
+    /// 4. a table that goes back to the shipped default loses its keys, the way
+    ///    `[web]` does in
+    ///    `a_table_falling_back_to_its_defaults_loses_its_keys_not_its_unknown_neighbours`.
+    ///
+    /// The unrelated write is an `effort` change: a top-level scalar, so the
+    /// delta is one line and `changed_lines` can assert *which* one — the shape
+    /// BR-1 asks for, rather than a spot check of survivors.
+    ///
+    /// **Why leg 4 is here.** Legs 1–3 make an unrelated write, and the delta is
+    /// `diff(current, candidate)` — so `[transcript]` is identical on both sides
+    /// and cannot enter the delta *whatever* the schema says. They are therefore
+    /// green under every plausible mutation of this table's serde attributes,
+    /// which was measured, not assumed: dropping `skip_serializing_if =
+    /// "TranscriptConfig::is_unset"` from `Config::transcript` left all three
+    /// passing. Leg 4 is the leg where the attribute decides the outcome.
+    ///
+    /// **Mutation** (LESSON-441): drop `skip_serializing_if =
+    /// "TranscriptConfig::is_unset"` from `Config::transcript` — leg 4 goes red
+    /// (the document keeps `enabled = false` instead of shedding the key),
+    /// while legs 1–3 stay green. Restored.
+    #[test]
+    fn the_transcript_table_is_written_only_when_the_user_named_it() {
+        use crate::effort::EffortLevel;
+        use std::path::Path;
+
+        // Leg 1: the README's own config, which says nothing about transcripts.
+        let current = hand_written();
+        let mut candidate = current.clone();
+        candidate.effort = EffortLevel::Low;
+        let edited = apply_config_delta(HAND_WRITTEN_CONFIG, &current, &candidate)
+            .expect("an unrelated write must apply");
+
+        let changed = changed_lines(HAND_WRITTEN_CONFIG, &edited);
+        let effort_line = HAND_WRITTEN_CONFIG
+            .lines()
+            .position(|line| line == r#"effort = "high""#)
+            .expect("fixture holds the effort line");
+        assert_eq!(
+            changed,
+            vec![effort_line],
+            "an unrelated write touched more than the key it was about:\n{edited}"
+        );
+        assert!(
+            !edited.contains("transcript"),
+            "a config that never named [transcript] grew the table:\n{edited}"
+        );
+        assert!(
+            Config::load(&edited)
+                .expect("the edited document must load")
+                .transcript
+                .is_unset(),
+            "the absent table must still read as the shipped default"
+        );
+
+        // Leg 2: a document that *did* name it, with the user's own comments.
+        const NAMED: &str = r#"effort = "high"
+
+[transcript]
+# On, because I want to be able to read back what this machine did.
+enabled = true
+# Two weeks is plenty.
+retain_days = 14
+"#;
+        let current = Config::load(NAMED).expect("a hand-written [transcript] must load");
+        assert!(current.transcript.enabled);
+        let mut candidate = current.clone();
+        candidate.effort = EffortLevel::Low;
+        let edited =
+            apply_config_delta(NAMED, &current, &candidate).expect("an unrelated write applies");
+
+        let effort_line = NAMED
+            .lines()
+            .position(|line| line == r#"effort = "high""#)
+            .expect("fixture holds the effort line");
+        assert_eq!(
+            changed_lines(NAMED, &edited),
+            vec![effort_line],
+            "the user's [transcript] table was rewritten by an unrelated edit:\n{edited}"
+        );
+        assert!(edited.contains("# Two weeks is plenty."), "{edited}");
+        assert!(
+            !edited.contains("max_record_bytes"),
+            "a key the user never wrote was added to their table:\n{edited}"
+        );
+        assert!(
+            !edited.contains("dir ="),
+            "a `dir` the user never wrote was added to their table:\n{edited}"
+        );
+        let derived = current
+            .transcript
+            .effective_dir(Path::new("/var/lib/teton"))
+            .display()
+            .to_string();
+        assert!(
+            !edited.contains(&derived),
+            "the effective transcript directory reached the user's file:\n{edited}"
+        );
+        let reloaded = Config::load(&edited).expect("the edited document must load");
+        assert_eq!(reloaded, candidate);
+
+        // Leg 3: a `dir` the user wrote is the one thing that puts a path in
+        // the file, and it survives an unrelated write as written.
+        const WITH_DIR: &str = r#"effort = "high"
+
+[transcript]
+enabled = true
+dir = "/srv/records/teton"
+"#;
+        let current = Config::load(WITH_DIR).expect("must load");
+        let mut candidate = current.clone();
+        candidate.effort = EffortLevel::Low;
+        let edited = apply_config_delta(WITH_DIR, &current, &candidate).expect("edit applies");
+        assert!(edited.contains(r#"dir = "/srv/records/teton""#), "{edited}");
+        assert_eq!(
+            Config::load(&edited)
+                .expect("the edited document must load")
+                .transcript,
+            candidate.transcript
+        );
+
+        // Leg 4: turning it back off durably returns the table to the shipped
+        // default, and a default table is not a table the file carries — the
+        // same treatment `[web]` gets. The empty header is what `toml_edit`
+        // leaves behind when the last key is removed; what matters is that no
+        // key survives to state a posture the config no longer holds.
+        let current = Config::load(NAMED).expect("must load");
+        let mut candidate = current.clone();
+        candidate.transcript = crate::config::TranscriptConfig::default();
+        let edited = apply_config_delta(NAMED, &current, &candidate).expect("edit applies");
+        assert!(
+            !edited.contains("enabled"),
+            "a table back at its default kept a key:\n{edited}"
+        );
+        assert!(
+            !edited.contains("retain_days"),
+            "a table back at its default kept a key:\n{edited}"
+        );
+        assert!(Config::load(&edited)
+            .expect("the edited document must load")
+            .transcript
+            .is_unset());
+    }
+
     #[test]
     fn a_table_falling_back_to_its_defaults_loses_its_keys_not_its_unknown_neighbours() {
         let current = hand_written();

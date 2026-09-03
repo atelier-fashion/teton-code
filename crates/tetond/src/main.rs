@@ -191,7 +191,7 @@ fn main() -> anyhow::Result<ExitCode> {
         // `accept` against the shutdown signal.
         server::serve(listener, Arc::clone(&daemon)).await?;
 
-        shutdown(&daemon, &supervisor, &socket_path_for_teardown);
+        shutdown(&daemon, &supervisor, &socket_path_for_teardown).await;
         Ok::<(), anyhow::Error>(())
     });
 
@@ -237,17 +237,31 @@ fn main() -> anyhow::Result<ExitCode> {
 ///    half-written ledger rows" is a property of the storage engine here; what
 ///    actually threatened it was a turn killed mid-flight, which `server.rs`
 ///    teardown now waits for instead of aborting.
-/// 4. **unlink the socket** — while the single-instance lock is still held by
+/// 4. **flush and close every transcript** (REQ-611 AC-18). Each open file
+///    takes a `transcript_closed { daemon_shutdown }` and is flushed, and the
+///    call is awaited: the writer is a dedicated OS thread and `main` ends in
+///    `_exit`, which joins nothing and runs no destructor. Ordered here — after
+///    `serve` returned, so no turn is still recording, and before the unlink, so
+///    the last thing a departing daemon does to the filesystem is finish its
+///    own files rather than start a race with its successor.
+/// 5. **unlink the socket** — while the single-instance lock is still held by
 ///    `main`'s `_instance`. A successor that wins the lock therefore cannot
 ///    find a stale socket, because the only process that could have left one
 ///    still owns the lock (BR-3).
-/// 5. **report** the exit.
+/// 6. **report** the exit.
 ///
 /// The lock is released last, when the process dies — `main` ends in `_exit`
 /// (BUG-169), so `_instance`'s flock is released by process death rather than
 /// by its drop, at the same point in the order.
-fn shutdown(daemon: &Arc<Daemon>, supervisor: &Arc<LifetimeSupervisor>, socket: &std::path::Path) {
+async fn shutdown(
+    daemon: &Arc<Daemon>,
+    supervisor: &Arc<LifetimeSupervisor>,
+    socket: &std::path::Path,
+) {
     let sessions_closed = u32::try_from(daemon.sessions.list().len()).unwrap_or(u32::MAX);
+
+    // REQ-611 AC-18: step 4 of the order above.
+    daemon.runtime.shutdown_transcripts().await;
 
     // An unlink failure is reported, never fatal: a missing socket is the
     // desired end state either way, and the next daemon's `bind_listener`

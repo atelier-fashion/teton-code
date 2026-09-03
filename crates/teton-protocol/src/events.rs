@@ -42,6 +42,13 @@
 //! rather than refused outright, what was answered, and what durable write
 //! the answer caused — the three facts that tell "nobody was asked" from
 //! "somebody was asked and said no".
+//! REQ-611 adds `transcript_state` (BR-15), the **only** thing the daemon-side
+//! transcript puts on the bus: whether a session is recording and why that
+//! changed. Everything the transcript writes to its file — the prompt, the tool
+//! input and result, the permission decision, the file's own open and close —
+//! is a `tetond` record type and deliberately **not** an [`Event`]
+//! (REQ-611 architecture ADR-2, BR-4): widening the bus would change who learns
+//! a session's content, which is the one thing that REQ must not do.
 //!
 //! This list is an index, not decoration: a new variant of [`Event`] that is not
 //! named here makes the paragraph above wrong.
@@ -218,6 +225,8 @@ pub enum Event {
     /// The shipped default boundary set contributed rows to a starting
     /// session's effective set (REQ-597 System Model).
     BoundaryDefaultsApplied(BoundaryDefaultsApplied),
+    /// A session's transcript started or stopped recording (REQ-611 BR-15).
+    TranscriptState(TranscriptState),
 }
 
 impl Event {
@@ -264,6 +273,7 @@ impl Event {
             Event::SkillOverBudgetRemedyApplied(_) => "skill_over_budget_remedy_applied",
             Event::UnboundedRootWarning(_) => "unbounded_root_warning",
             Event::BoundaryDefaultsApplied(_) => "boundary_defaults_applied",
+            Event::TranscriptState(_) => "transcript_state",
         }
     }
 }
@@ -3812,6 +3822,74 @@ pub struct SkillOverBudgetRemedyApplied {
     pub new_value: String,
 }
 
+// ---------------------------------------------------------------------------
+// transcript_state (REQ-611)
+// ---------------------------------------------------------------------------
+
+/// Why a session's transcript state changed (REQ-611 System Model, BR-15).
+///
+/// A **closed** enum with no catch-all and no `Default`, for
+/// [`crate::methods::AttachConsentOutcome`]'s reason: a reason this build
+/// cannot read is a deserialization error, never a silent reading of one of
+/// these four. There is no safe value to fall back *to* — `config_default` says
+/// the user asked for this, `session_command` says they just typed it,
+/// `write_failure` and `dir_refused` say the daemon stopped recording without
+/// being asked — so a client that guessed would tell somebody their session is
+/// being recorded for a reason that is not the true one, or that a failure was
+/// a choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptStateReason {
+    /// The session opened with `[transcript] enabled = true` in the config file
+    /// — the durable switch, in force before anybody typed anything.
+    ConfigDefault,
+    /// The user switched it for this session with `/transcript on` / `off`
+    /// (`session/transcript`, architecture ADR-6). Nothing durable was written.
+    SessionCommand,
+    /// A write failed, so the sink closed this session's file and stopped
+    /// (BR-6). The turn in flight was **not** failed; only the recording was.
+    WriteFailure,
+    /// The transcript directory could not be created, or existed wider than
+    /// owner-only, and was refused at open (BR-9). The session runs normally
+    /// with no transcript.
+    DirRefused,
+}
+
+/// A session's effective transcript state changed (REQ-611 BR-15).
+///
+/// Published session-scoped on every effective-state change, so every attached
+/// client and every declared monitor learns that recording started or stopped
+/// — including the two changes nobody asked for
+/// ([`TranscriptStateReason::WriteFailure`],
+/// [`TranscriptStateReason::DirRefused`]), which is the half a user could not
+/// otherwise find out about.
+///
+/// **There is no `path` field, and that is BR-15 rather than an omission.**
+/// The event is *news*; the file's location is *boundary content* — a
+/// transcript path names the user's home, the same class REQ-569 BR-10 gives
+/// `cwd` — so it is answered on the asking connection as
+/// [`crate::methods::SessionTranscriptResult`]'s routed reply and broadcast to
+/// nobody. A monitor is told a session is recording and is not told where to
+/// read it. Adding a path here would hand every declared monitor the filename
+/// of the session's full content, which is precisely the split this struct
+/// exists to hold.
+///
+/// The session is named by [`EventEnvelope::session_id`], not by a field here:
+/// [`Event`] is internally tagged and flattened, so a `session_id` on this
+/// struct would emit the key twice and fail to deserialize — the same shape
+/// [`ContextCleared`], [`SessionTitled`] and [`PrefixCache`] document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptState {
+    /// Whether the session is recording **after** this change.
+    ///
+    /// The effective state, not the config default: a session whose config says
+    /// `true` and which then failed a write reports `false` here, because what
+    /// a client renders has to be what is actually happening to the file.
+    pub enabled: bool,
+    /// What changed it.
+    pub reason: TranscriptStateReason,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4144,6 +4222,13 @@ mod tests {
                 }),
                 "skill_invoked",
             ),
+            (
+                Event::TranscriptState(TranscriptState {
+                    enabled: true,
+                    reason: TranscriptStateReason::ConfigDefault,
+                }),
+                "transcript_state",
+            ),
         ];
 
         for (event, expected) in cases {
@@ -4276,6 +4361,121 @@ mod tests {
         assert_eq!(wire["root"]["kind"], "home");
         assert!(wire["root"].get("project_name").is_none(), "{wire}");
         assert!(wire["root"].get("vcs_branch").is_none(), "{wire}");
+    }
+
+    /// **REQ-611 BR-15's wire half.** A transcript state change reaches a
+    /// client as a flat `transcript_state` object naming its session, whether
+    /// the session is recording now, and why that changed — and carrying **no
+    /// path**.
+    ///
+    /// The absent path is what this test is for, and it is asserted from both
+    /// sides. Outbound: the payload's key set is exactly `{enabled, reason}`,
+    /// asserted whole rather than by probing for `path`, so any *other* field
+    /// added later fails here too — the transcript's location is boundary
+    /// content and this event goes to every declared monitor. Inbound: a frame
+    /// that arrives carrying a stray `path` parses with the key dropped, which
+    /// is this crate's posture for unknown fields (serde's default, which no
+    /// type here opts out of), so a daemon that grew one could not smuggle a
+    /// location into a client through this event.
+    ///
+    /// All four reasons ride along spelled out, so a fifth has to be added here
+    /// by hand, and the closed-enum half is asserted from the other side: an
+    /// unknown reason is a deserialization error rather than a default, because
+    /// [`TranscriptStateReason`] has no safe value to fall back to — see its
+    /// own doc comment.
+    ///
+    /// `session_id` is asserted on the wire object rather than on the payload
+    /// for [`ContextCleared`]'s reason: the envelope is what carries it, and
+    /// `envelope_wire` round-trips before returning, so re-adding `session_id`
+    /// to [`TranscriptState`] fails here on the duplicate key rather than
+    /// reaching a client.
+    ///
+    /// **Shown to fail** (conventions: show the test can fail before trusting
+    /// that it passed). The mutation was the regression BR-15 forbids, not a
+    /// proxy for it: `pub path: Option<String>` added to [`TranscriptState`]
+    /// (which costs the struct its `Copy`, hence a few `clone()`s in the
+    /// fixtures) and populated with a plausible transcript path. This test went
+    /// red on the key-set assertion — `the event must carry no path (BR-15):
+    /// left ["enabled", "path", "reason"]` — and
+    /// `session_transcript_round_trips_each_action` stayed green, which is the
+    /// right split: the path belongs on the routed result and nowhere else.
+    /// Restored after observing.
+    #[test]
+    fn transcript_state_carries_enabled_and_reason_and_no_path() {
+        let opened = TranscriptState {
+            enabled: true,
+            reason: TranscriptStateReason::ConfigDefault,
+        };
+        round_trip(&opened);
+
+        let wire = envelope_wire(Event::TranscriptState(opened));
+        assert_eq!(wire["event"], "transcript_state");
+        assert_eq!(wire["session_id"], "s1");
+        assert_eq!(wire["enabled"], true);
+        assert_eq!(wire["reason"], "config_default");
+
+        assert_eq!(Event::TranscriptState(opened).name(), "transcript_state");
+
+        // BR-15 outbound: the news says *that* it is recording, never *where*.
+        let payload = serde_json::to_value(opened).unwrap();
+        let keys: Vec<&str> = payload
+            .as_object()
+            .expect("the payload is a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["enabled", "reason"],
+            "the event must carry no path (BR-15): {payload}"
+        );
+
+        // Every reason, under the spec table's spelling, and both states of the
+        // flag — a stop is the half a client most needs to render.
+        for (reason, spelling) in [
+            (TranscriptStateReason::ConfigDefault, "config_default"),
+            (TranscriptStateReason::SessionCommand, "session_command"),
+            (TranscriptStateReason::WriteFailure, "write_failure"),
+            (TranscriptStateReason::DirRefused, "dir_refused"),
+        ] {
+            let stopped = TranscriptState {
+                enabled: false,
+                reason,
+            };
+            round_trip(&stopped);
+            let wire = envelope_wire(Event::TranscriptState(stopped));
+            assert_eq!(wire["reason"], spelling, "{wire}");
+            assert_eq!(
+                wire["enabled"], false,
+                "a transcript that stopped must say so on the wire: {wire}"
+            );
+        }
+
+        // BR-15 inbound: a frame carrying a path — a future daemon, or
+        // something hand-rolled — is read without one, and re-emits without
+        // one.
+        let stray = r#"{"enabled":true,"reason":"session_command","path":"/Users/dev/.local/share/teton/transcripts/s1.jsonl"}"#;
+        let parsed: TranscriptState =
+            serde_json::from_str(stray).expect("an unknown key is dropped, not refused");
+        assert_eq!(
+            parsed,
+            TranscriptState {
+                enabled: true,
+                reason: TranscriptStateReason::SessionCommand,
+            }
+        );
+        let back = serde_json::to_value(parsed).unwrap();
+        assert!(
+            back.get("path").is_none(),
+            "a stray path must not survive into what a client is handed: {back}"
+        );
+
+        // Closed: an unreadable reason is an error, never one of these four.
+        assert!(
+            serde_json::from_str::<TranscriptState>(r#"{"enabled":false,"reason":"vibes"}"#)
+                .is_err(),
+            "a reason this build cannot read must not deserialize to one it acts on"
+        );
     }
 
     /// **REQ-586 BR-7's wire half.** A clamp reaches a client as a flat

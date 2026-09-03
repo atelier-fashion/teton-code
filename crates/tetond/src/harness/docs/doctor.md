@@ -2,8 +2,8 @@
 
 `teton doctor` is the first thing to ask a user for when something is wrong. It
 is read-only and prints, in order: the socket and lock paths, whether a daemon
-is running and which build it is, the providers config holds, and two notices
-about the local model and provider reachability.
+is running and which build it is, the providers config holds, the transcript
+posture, and two notices about the local model and provider reachability.
 
 ## Version skew is the commonest fault
 
@@ -44,6 +44,21 @@ at its first call. See topic `providers` for what a 401 usually means.
 Each row carries `window:` — the declared context window, or `unknown`. Doctor
 advises on one that declares none, and on an inert `context_budget_cap` (at or
 above its window). Topic `context`.
+
+## The transcript line
+
+`transcript:` reports the **durable** posture and nothing about the session
+asking: whether `[transcript] enabled` is on in config, the directory
+transcripts are written to, and how many days files are kept. Off is the stock
+answer, and off means no directory and no file — nothing is recorded until
+someone opts in.
+
+The other switch never appears here. `/transcript on` and `/transcript off`
+last one session and are never written to config, so doctor cannot see them;
+bare `/transcript` answers for the session it is typed in, with that session's
+file path and whether recording stopped. No tool may read the directory doctor
+names — `read`, `edit`, `grep` and `glob` refuse it, `shell` excepted — so
+asking to open a transcript gets a refusal, not a file.
 
 ## Where config lives
 
