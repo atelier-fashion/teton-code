@@ -4449,7 +4449,7 @@ mod tests {
                 SkillSkipped {
                     path: "~/.claude/commands/huge.md".to_owned(),
                     name: "huge".to_owned(),
-                    reason: "over 64 KiB (67,184 B)".to_owned(),
+                    reason: "over 128 KiB (135,184 B)".to_owned(),
                 },
             ],
         );
@@ -4459,7 +4459,7 @@ mod tests {
             lines.iter().any(|line| line
                 == "0 skills (user 0, project 0); 2 skipped: \
                     ~/.claude/skills/broken/SKILL.md — malformed frontmatter; \
-                    ~/.claude/commands/huge.md — over 64 KiB (67,184 B)"),
+                    ~/.claude/commands/huge.md — over 128 KiB (135,184 B)"),
             "{lines:#?}"
         );
     }

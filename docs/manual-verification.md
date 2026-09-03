@@ -913,7 +913,8 @@ is the correctness bug the offset arithmetic exists to avoid.
 
 **Also worth measuring while you are there.** Peak RSS during a duty call. With
 the cache resident, a duty's own throwaway context coexists with the agent's, so
-peak KV is two contexts rather than one (~1.5 GiB each at `n_ctx` 16384). The
+peak KV is two contexts rather than one (~1.5 GiB each at `n_ctx` 16384 when
+this was written; ~3 GiB each since `n_ctx` went to 32768). The
 architecture accepts this as bounded and transient with eviction as the
 compensating control; a number here would tell us whether sizing duty contexts
 to their own budgets should be promoted from follow-up to urgent.
@@ -3068,13 +3069,15 @@ Notes / findings :
 # Manual verification runbook — REQ-590 AC-14 (the engine-derived local budget)
 
 **Status: OUTSTANDING.** REQ-590 stops the local tier short-circuiting to a fixed
-`(4,096 words, 32,768 B)`. Its **word** half now derives from the window the
-daemon actually loads with: `LOCAL_ENGINE_N_CTX 16,384` less a 1,024-token
-generation reservation, giving **10,240 words**. Its **byte** half stays
-`LOCAL_BUDGET_BYTES`, **32,768 B** — D-4 briefly derived that too (30,720) and
-ADR-9 reversed it, because the derived value refused the very `/analyze` body
-this REQ exists to serve. So the pair is **10,240 words / 32,768 bytes**, one
-half derived and one half the constant. Leave AC-14 unticked in
+`(4,096 words, 32,768 B)`. Its pair now derives from the window the daemon
+actually loads with: `LOCAL_ENGINE_N_CTX 32,768` less a 1,024-token generation
+reservation, giving **21,162 words / 63,488 bytes**. (When this runbook was
+written the window was 16,384 and only the **word** half derived — 10,240 words
+— with the byte half held at the `LOCAL_BUDGET_BYTES` constant, 32,768 B: D-4
+had derived it too (30,720) and ADR-9 reversed that because the derived value
+was the *smaller* one there. The window was raised after a `/analyze` turn's
+55 KB of dynamic context was refused against that fixed half, and at 32,768 the
+derived byte half is 63,488, so both halves derive again.) Leave AC-14 unticked in
 `.adlc/specs/REQ-590-engine-derived-local-context-budget/requirement.md` until a
 person has run the procedure below and filled in the sign-off.
 
@@ -3096,20 +3099,21 @@ What none of it establishes is the one claim the whole REQ rests on: that a
 prompt assembled **to** the new budget is a prompt the **real** engine accepts
 and answers. The default build has no engine — `--features llama` is not built in
 CI — so nothing in the suite has ever handed a full-budget prompt to llama.cpp.
-The zero word-slack ADR-6 accepts (`10,240 × 3/2 = 15,360 = 16,384 − 1,024`,
-exactly) is precisely the kind of thing that is fine in arithmetic and discovers
-a one-token-off error in the field.
+The zero word-slack ADR-6 accepts (`21,162 × 3/2 = 31,743 = 32,768 − 1,024 − 1`;
+the 1 is integer truncation) is precisely the kind of thing that is fine in
+arithmetic and discovers a one-token-off error in the field.
 
-And ADR-9 leaves a second reason to run this by hand: the byte half is the
-32,768 B constant, which at the 2 B/token floor claims 16,384 tokens — the
-engine's *whole* window, 1,024 more than it can hold once the reply is reserved.
-That overclaim predates this REQ and this REQ does not close it, so a
-**byte-saturated** local prompt is the one shape most likely to meet the
-engine's own refusal. Leg (c) is where that would show up.
+The byte half gives a second reason to run this by hand: at the 2 B/token floor
+it claims exactly the usable window, 31,744 tokens, with **no** margin for
+content that tokenizes under two bytes a token. (On the 16,384-token window it
+was the 32,768 B constant and claimed 1,024 *more* than the engine had — an
+overclaim ADR-9 accepted and the raise to 32,768 closed.) A **byte-saturated**
+local prompt is therefore still the shape most likely to meet the engine's own
+refusal. Leg (c) is where that would show up.
 
 | Claim | Proven by CI? | Why not |
 |---|---|---|
-| The pair is `(10,240, 32,768)` | **yes** | `derive` is feature-free |
+| The pair is `(21,162, 63,488)` | **yes** | `derive` is feature-free |
 | The rendered bound names the window and reservation | **yes** | asserted on the string |
 | A full-budget prompt fits the loaded `n_ctx` | **no** | no engine in CI |
 | A full-budget local turn actually answers | **no** | no engine, no weights |
@@ -3135,14 +3139,14 @@ engine's own refusal. Leg (c) is where that would show up.
 1. `teton`, then `/verbose`.
 2. Ask anything short that stays local (`say hello`).
 3. Read the `route [ask/local] → …` line. It must carry a budget clause reading
-   **`budget 10,240 words / 33 KB`** with **`(bound: local engine)`**. (The
+   **`budget 21,162 words / 63 KB`** with **`(bound: local engine)`**. (The
    client's route line renders the plain three-word bound; the *daemon's* own
    sentences — a refusal or an over-budget offer — carry AC-16's fuller
    account, which leg (b') below reads.)
 4. **Check the arithmetic against the source, not against this page**:
-   `16,384 − 1,024 = 15,360` usable tokens; `15,360 × 2 ÷ 3 = 10,240` words.
-   The byte half is **not** derived: it is the 32,768 B constant, which is why
-   `33 KB` does not reconcile against the window (AC-16, BR-12, ADR-9).
+   `32,768 − 1,024 = 31,744` usable tokens; `31,744 × 2 ÷ 3 = 21,162` words;
+   `31,744 × 2 = 63,488` bytes, rendered `63 KB`. Both halves reconcile
+   against the window (AC-16, BR-12).
 5. The bound must **not** offer `set capabilities.max_context` — there is no
    provider declaration behind a local route, and sending a user to edit one is
    BR-6's whole prohibition.
@@ -3217,15 +3221,16 @@ AC-16 added.*
    [30,500, 31,499] — the daemon rendered `31 KB` and `bytes_figure` rounds to
    the nearest KB — so **any** payload you build in that range is faithful to
    it, and under D-4 most of that range would have been refused again, on bytes.
-3. Now make one that genuinely does not fit — the same content grown past 33 KB
-   — and send it **as a skill** (`/something`), which is the only path
-   REQ-589's offer covers. Expect the over-budget question, **not** a silent
-   elision.
+3. Now make one that genuinely does not fit — the same content grown past 63 KB
+   (and under discovery's 128 KiB per-file ceiling, or it is skipped rather
+   than measured) — and send it **as a skill** (`/something`), which is the
+   only path REQ-589's offer covers. Expect the over-budget question, **not** a
+   silent elision.
 4. Read the offer's sentence. Its bound clause must account for the budget:
-   `bound: local engine — the word half comes from the engine's 16,384-token
-   window, less the 1,024 reserved for the reply; the byte half is fixed`
-   (AC-16). Record it verbatim — if the numbers in it do not produce the 10,240
-   beside it, that is the defect this leg exists to catch.
+   `bound: local engine — both halves come from the engine's 32,768-token
+   window, less the 1,024 reserved for the reply` (AC-16). Record it verbatim
+   — if the numbers in it do not produce the 21,162 words / 63 KB beside it,
+   that is the defect this leg exists to catch.
 
 ## Sign-off
 
@@ -3235,7 +3240,7 @@ Machine (chip, RAM, OS)                            :
 Model loaded (name, quant, n_ctx)                  :
 `teton doctor` confirmed a loaded local engine     : yes / no  <-- must be "yes"
 
-(a) route line read `budget 10,240 words / 33 KB`   : yes / no  (verbatim:)
+(a) route line read `budget 21,162 words / 63 KB`   : yes / no  (verbatim:)
 (a) bound read `(bound: local engine)`              : yes / no
 (a) the word half reconciled to the window          : yes / no
 (a) bound did NOT offer capabilities.max_context    : yes / no  <-- must be "yes"
@@ -3251,10 +3256,10 @@ Model loaded (name, quant, n_ctx)                  :
 (d) verbatim message                                 :
 (e) ~4,100 w / ~31 KB turn SERVED                    : yes / no  <-- must be "yes"
 (e) no over-budget offer was raised for it           : yes / no  <-- must be "yes"
-(e) an over-33 KB skill DID raise the offer          : yes / no
+(e) an over-63 KB skill DID raise the offer          : yes / no
 (e) it was NOT silently elided                       : yes / no  <-- must be "yes"
 (e) the bound clause, verbatim                       :
-(e) its numbers reconciled to the 10,240 beside them : yes / no
+(e) its numbers reconciled to the 21,162 beside them : yes / no
 Anything that hung, aborted, or crashed              :
 Notes / findings                                     :
 ```

@@ -7377,10 +7377,12 @@ fn a_model_invocation_echoes_its_line_and_a_refused_one_says_so_instead() {
         out.push_str(SMALL_BODY);
         out
     });
-    // Larger than the local route's byte budget (32 KiB) with the system prompt
-    // beside it, so Stage A in the loop refuses it — the one refusal a local
-    // tier can actually produce, and the reason this leg is scripted local.
-    let filler = "abcdefgh ".repeat(5_000);
+    // Larger than the local route's byte budget (63,488 B on the 32,768-token
+    // window) with the system prompt beside it, and under discovery's 128 KiB
+    // per-file ceiling, so Stage A in the loop refuses it — the one refusal a
+    // local tier can actually produce, and the reason this leg is scripted
+    // local. (`5_000` repeats — 45 KB — while the byte budget was 32 KiB.)
+    let filler = "abcdefgh ".repeat(9_000);
     home.write(
         ".claude/skills/huge/SKILL.md",
         &format!("---\ndescription: the huge skill\n---\nHUGE-BODY-MARKER {filler}\n"),

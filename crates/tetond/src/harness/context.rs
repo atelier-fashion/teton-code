@@ -735,13 +735,12 @@ impl ContextManager {
     /// # It is no longer the relationship `HarnessConfig::default` encodes
     ///
     /// It was, while the local pair was `(4,096, 4,096 × 8)`. Since REQ-590
-    /// ADR-9 the pair's two halves have different provenance — the word half is
-    /// window-derived (10,240) and the byte half is the constant
-    /// [`LOCAL_BUDGET_BYTES`](super::budget::LOCAL_BUDGET_BYTES) (32,768), i.e.
-    /// 3.2 B/word, not 8. A caller that passes `config.context_budget_tokens`
-    /// here and takes this default therefore runs at **81,920** bytes: two and
-    /// a half times the byte guard the route actually derived, on the half that
-    /// binds essentially all real content.
+    /// the pair derives from the engine's window — 21,162 words / 63,488 bytes
+    /// on the 32,768-token window, i.e. 3 B/word, not 8. A caller that passes
+    /// `config.context_budget_tokens` here and takes this default therefore
+    /// runs at **169,296** bytes: two and two-thirds times the byte guard the
+    /// route actually derived, on the half that binds essentially all real
+    /// content.
     ///
     /// So a manager built from a
     /// [`HarnessConfig`](super::turn_loop::HarnessConfig) must chain
@@ -2038,7 +2037,7 @@ pub const APPROX_BYTES_PER_TOKEN: usize = 8;
 /// The summarizer's own prompt must fit the engine window too — sending an
 /// unbounded result to the engine that exists to shrink it just moves the
 /// over-window failure one call earlier (the pre-fix behavior). 16 KiB is at
-/// most ~8k BPE tokens of pathological input, about half the 16,384-token
+/// most ~8k BPE tokens of pathological input, a quarter of the 32,768-token
 /// window (`LOCAL_ENGINE_N_CTX`), leaving ample room for the instruction and
 /// generation.
 pub const SUMMARIZER_INPUT_MAX_BYTES: usize = 16_384;
@@ -3264,22 +3263,20 @@ mod tests {
     /// the *local* harness — now digests at, and the asymmetry that would
     /// otherwise read as a bug.
     ///
-    /// Words go **up** (1,500 → 3,750) and bytes **do not move at all**
-    /// (12,000), because `digest_thresholds` scales each half of the pair by
-    /// its own constant fraction and REQ-590 moved exactly one half: the word
-    /// budget rose 4,096 → 10,240 while the byte budget stayed
-    /// `LOCAL_BUDGET_BYTES`, 32,768. Both are pinned here so that a reader who
-    /// finds one of them surprising finds the arithmetic beside it — including
-    /// the reader who expected *both* to move.
+    /// Both halves go **up** — words 1,500 → 7,749 and bytes 12,000 → 23,250 —
+    /// because `digest_thresholds` scales each half of the pair by its own
+    /// constant fraction (≈36.6%) and both halves of the local pair now derive
+    /// from the 32,768-token window (21,162 words / 63,488 bytes). Both are
+    /// pinned here so that a reader who finds one of them surprising finds the
+    /// arithmetic beside it.
     ///
-    /// **D-4 briefly made the byte half fall too** (32,768 → 30,720), which
-    /// dragged this threshold down to 11,250 — a digest firing on *smaller*
-    /// tool results than before, on the tier least able to afford the extra
-    /// local call. ADR-9 reversed D-4 on the refusal measurement, and this
-    /// threshold returning to 12,000 is one of the things that reversal buys.
-    /// The unchanged figure is asserted rather than deleted, because "it did
-    /// not move" is the claim, and a test that dropped the assertion could not
-    /// make it.
+    /// The byte half has a history worth a line: REQ-590's D-4 briefly made it
+    /// *fall* (32,768 → 30,720, dragging this threshold to 11,250 — a digest
+    /// firing on smaller tool results, on the tier least able to afford the
+    /// extra local call), ADR-9 reversed that and held it at 12,000, and the
+    /// window's raise to 32,768 is what finally moved it up. A threshold that
+    /// rises means a larger tool result enters context raw before the digest
+    /// duty is asked.
     ///
     /// The config's thresholds are asserted against its **own** `budget` as
     /// well as against the figures, because `with_route_budget` exists so a
@@ -3289,8 +3286,9 @@ mod tests {
     #[test]
     fn the_local_harnesss_digest_thresholds_moved_with_its_budget() {
         let config = super::super::turn_loop::HarnessConfig::default();
-        assert_eq!(config.summarize_threshold_tokens, 3_750);
-        assert_eq!(config.summarize_threshold_bytes, 12_000);
+        // 21,162 × 1,500 / 4,096 = 7,749;  63,488 × 12,000 / 32,768 = 23,250.
+        assert_eq!(config.summarize_threshold_tokens, 7_749);
+        assert_eq!(config.summarize_threshold_bytes, 23_250);
         assert_eq!(
             (
                 config.summarize_threshold_tokens,
@@ -3303,26 +3301,24 @@ mod tests {
             "the default config's thresholds and its own RouteBudget must be one \
              pair of figures, not two"
         );
-        // The asymmetry, stated as the arithmetic it is.
+        // The pair, stated as the arithmetic it is.
         assert_eq!(
             (config.budget.budget_tokens, config.budget.budget_bytes),
-            (10_240, 32_768)
+            (21_162, 63_488)
         );
-        assert_eq!(
+        assert_ne!(
             config.budget.budget_bytes,
             crate::harness::budget::LOCAL_BUDGET_BYTES,
-            "ADR-9: the local byte half is the constant, not a window derivation — if that has \
-             changed, the 12,000-byte digest threshold above has changed with it"
+            "the local byte half derives from the window since it went to 32,768 — if it is the \
+             constant again, the 23,250-byte digest threshold above has changed with it"
         );
         assert!(
             config.summarize_threshold_tokens > 1_500,
             "D-3: the word threshold rises with the word budget"
         );
-        assert_eq!(
-            config.summarize_threshold_bytes, 12_000,
-            "ADR-9: and the byte threshold does not move, because the byte budget did not. D-4 \
-             would have put this at 11,250 — a digest firing on smaller results than before, on \
-             the tier least able to afford the extra local call"
+        assert!(
+            config.summarize_threshold_bytes > 12_000,
+            "and the byte threshold rises with the byte budget, now that both halves derive"
         );
     }
 

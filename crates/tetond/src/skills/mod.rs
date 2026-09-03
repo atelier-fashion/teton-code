@@ -90,13 +90,21 @@ pub use expand::{expand, Expansion, Pending, PENDING_PLACEHOLDER};
 /// them is edited).
 pub use teton_protocol::methods::SkillSource;
 
-/// The largest skill file discovery will read: 64 KiB.
+/// The largest skill file discovery will read: 128 KiB.
 ///
-/// A file past it is **named** (`over 64 KiB (N B)`), never silently truncated
+/// A file past it is **named** (`over 128 KiB (N B)`), never silently truncated
 /// — half a body is a body the user did not write. The figure is generous for
 /// a prompt (the largest shipped ADLC skill is a few tens of KiB) and small
 /// enough that four directories' worth cannot be a memory event.
-pub const SKILL_MAX_BYTES: u64 = 64 * 1024;
+///
+/// It was 64 KiB while the local byte budget was 32,768 B. The ceiling has to
+/// sit **well above** that budget (`harness::budget::derive`'s local arm, now
+/// 63,488 B): a body between the budget and the ceiling is *measured* and
+/// draws REQ-589's over-budget offer, whose remedy is to bind the tier remote,
+/// while a body past the ceiling is *skipped* at discovery and never reaches
+/// that door. At 64 KiB the two would have coincided, and the offer would have
+/// had a band of a few hundred bytes to fire in.
+pub const SKILL_MAX_BYTES: u64 = 128 * 1024;
 
 /// The most entries discovery will consider under one root: 512.
 ///
@@ -1075,8 +1083,8 @@ mod tests {
             "unreadable (permission denied)"
         );
         assert_eq!(
-            SkipReason::Oversize { bytes: 67_184 }.to_string(),
-            "over 64 KiB (67,184 B)"
+            SkipReason::Oversize { bytes: 135_184 }.to_string(),
+            "over 128 KiB (135,184 B)"
         );
         assert_eq!(SkipReason::NotUtf8.to_string(), "not UTF-8");
         assert_eq!(

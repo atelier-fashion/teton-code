@@ -19,27 +19,27 @@
 //! | | words | bytes | crosses over at |
 //! |---|---|---|---|
 //! | before | 4,096 | 32,768 | **8 B/word** |
-//! | after | 10,240 | 32,768 | **3 B/word** |
+//! | after (REQ-590, 16,384-token window) | 10,240 | 32,768 | **3 B/word** |
+//! | after (32,768-token window) | 21,162 | 63,488 | **3 B/word** |
 //!
 //! Before this REQ, anything under 8 bytes per whitespace word — prose (≈6),
 //! source (≈4–5), essentially every local conversation — was **word**-bound.
-//! After it, anything over 3 B/word is **byte**-bound, and the byte half did not
-//! move. So the realised gain is not 2.5×: it decays with density, and by
-//! 8 B/word it is **gone** — measured at 1.00×, exactly, because past the old
-//! crossover the only guard that ever binds is one this REQ did not touch.
+//! After it, anything over 3 B/word is **byte**-bound. On the 16,384-token
+//! window the byte half did not move, so the realised gain decayed with density
+//! and by 8 B/word was **gone** — measured at 1.00×, exactly. When the window
+//! went to 32,768 both halves derived from it and the byte half rose 32,768 →
+//! 63,488, so the dense rows gain too: the soft byte threshold moves 22,937 →
+//! 44,441 B and the word threshold 2,867 → 14,813.
 //!
-//! Exactly, in the currency that binds: the soft byte threshold is **22,937 B
-//! before and after**, while the word threshold moves 2,867 → 7,168.
-//!
-//! **This table was measured twice.** Under D-4 the byte half fell 32,768 →
-//! 30,720, which put the byte threshold at 21,504 — a 6.25% *cut*, so a
+//! **This table was measured three times.** Under D-4 the byte half fell 32,768
+//! → 30,720, which put the byte threshold at 21,504 — a 6.25% *cut*, so a
 //! byte-dense local session compacted marginally *sooner* after this REQ than
 //! before it, and the 4 and 6 B/word rows read 14 and 10 rather than 15 and 11.
-//! ADR-9 reversed D-4, and the difference between the two tables is the price
-//! that reversal paid for itself: every row is the same or better, and none is
-//! worse. Both states are recorded because a reader who finds the D-4 figures
-//! in an older revision should be able to tell which measurement they are
-//! holding.
+//! ADR-9 reversed D-4 (rows 15 / 11 / 8 / 4 against a before of 9 / 9 / 8 / 4).
+//! The 32,768-token window is the third measurement, and the first in which the
+//! dense rows move. All three states are recorded because a reader who finds an
+//! older table in an older revision should be able to tell which measurement
+//! they are holding.
 //!
 //! ## Why the counts are equalities
 //!
@@ -281,19 +281,21 @@ fn pair_before_this_req() -> RouteBudget {
     budget
 }
 
-/// The pair the local tier runs under **after** this REQ.
+/// The pair the local tier runs under **after** this REQ, on the 32,768-token
+/// window.
 ///
-/// `(10,240, 32,768)`: the word half window-derived (D-3), the byte half the
-/// constant it has always been (D-4, **reversed** — ADR-9). The two halves
-/// having different sources is the thing this fixture exists to price, so both
-/// numbers are pinned rather than read past.
+/// `(21,162, 63,488)`: both halves window-derived (D-3, and D-4 as restored
+/// when the window doubled — on the 16,384-token window ADR-9 held the byte
+/// half at the 32,768 constant, and the pair was `(10,240, 32,768)`). Both
+/// numbers are pinned rather than read past, because the table below is a
+/// record of exactly this pair.
 fn pair_after_this_req() -> RouteBudget {
     let budget = derive(BudgetInputs::local());
     assert_eq!(budget.bound, BudgetBound::LocalEngine);
     assert_eq!(
         (budget.budget_tokens, budget.budget_bytes),
-        (10_240, 32_768),
-        "D-3's word half, and ADR-9's byte half"
+        (21_162, 63_488),
+        "both halves of the 32,768-token window's derived pair"
     );
     budget
 }
@@ -324,7 +326,9 @@ async fn turns_before_compaction_fires_before_and_after() {
     let after_budget = pair_after_this_req();
 
     // (bytes per word, expected turns before, expected turns after)
-    let rows: [(usize, usize, usize); 4] = [(4, 9, 15), (6, 9, 11), (8, 8, 8), (20, 4, 4)];
+    // (On the 16,384-token window, where only the word half derived, the
+    // `after` column read 15 / 11 / 8 / 4 — the dense rows unmoved.)
+    let rows: [(usize, usize, usize); 4] = [(4, 9, 28), (6, 9, 20), (8, 8, 15), (20, 4, 7)];
 
     println!(
         "\nAC-11 — turns until compaction fires ({} words + {} reply words per turn)",
@@ -376,34 +380,26 @@ async fn turns_before_compaction_fires_before_and_after() {
          {sparse_before} → {sparse_after}"
     );
 
-    // **The ceiling on the gain, which ADR-9 changed the reason for but not the
-    // shape of.** At and above the old crossover density the byte half binds
-    // both before and after, and that half did not move — so these rows must
-    // come out *identical*, not merely no better. Under D-4 the byte half fell
-    // 6.25% and the same rows were pinned `after <= before`; the equality is the
-    // stronger statement the reversal earns, and a row that improved here would
-    // mean the byte budget rose, which is a decision and not a refactor.
-    assert_eq!(
-        after_budget.budget_bytes, before_budget.budget_bytes,
-        "ADR-9: the byte half is the same number before and after — the equality below is only \
-         warranted while that holds"
+    // **The dense rows move now, and only because the byte half did.** At and
+    // above the old crossover density the byte half binds both before and
+    // after; on the 16,384-token window that half did not move and these rows
+    // were pinned *identical* (8 → 8, 4 → 4). On the 32,768-token window the
+    // byte half rose 32,768 → 63,488, so every dense row must hold strictly
+    // more — and a dense row that came out equal would mean the byte half had
+    // stopped deriving from the window again, which is a decision and not a
+    // refactor.
+    assert!(
+        after_budget.budget_bytes > before_budget.budget_bytes,
+        "the byte half derives from the 32,768-token window and is above the old constant — \
+         the strict inequalities below are only warranted while that holds"
     );
     for (bytes_per_word, before, after) in measured.iter().copied().filter(|(d, _, _)| *d >= 8) {
-        assert_eq!(
-            after, before,
-            "at {bytes_per_word} B/word the byte half binds both before and after and it did not \
-             move, so the count cannot change either: {before} → {after}"
+        assert!(
+            after > before,
+            "at {bytes_per_word} B/word the byte half binds both before and after and it rose, \
+             so the count must rise too: {before} → {after}"
         );
     }
-
-    // And the gain is gone by the old crossover density, not merely smaller.
-    let (_, dense_before, dense_after) = measured[2];
-    assert_eq!(
-        (dense_before, dense_after),
-        (8, 8),
-        "at 8 B/word — the density at which the old pair's two guards agree — the \
-         derived budget buys no extra conversation at all"
-    );
 }
 
 /// **AC-11, the mechanism behind the table.** The crossover density — which of
@@ -430,16 +426,16 @@ fn the_binding_guard_crosses_over_at_a_much_lower_density_after_this_req() {
         3,
         "after it, content over 3 B/word is byte-bound — which is all real content"
     );
-    // The crossover moved because the **word** half rose, not because the byte
-    // half fell. Under D-4 both moved and this line read `after.budget_bytes <
-    // before.budget_bytes`; ADR-9 reversed the byte half, so what is true now is
-    // that the half which binds after this REQ is the half that never moved —
-    // which is why the turn counts at 8 and 20 B/word come out identical rather
-    // than worse.
-    assert_eq!(
-        after.budget_bytes, before.budget_bytes,
-        "ADR-9: the byte half — the half that binds on all real content after this REQ — is \
-         unchanged, so the crossover moved entirely on the word half"
+    // The crossover moved because the **word** half rose 5.2× while the byte
+    // half rose 1.94×. Under D-4 the byte half *fell* and this line read
+    // `after.budget_bytes < before.budget_bytes`; ADR-9 reversed that and it
+    // read `==`; on the 32,768-token window both halves derive and the byte
+    // half is above the old constant — which is why the turn counts at 8 and
+    // 20 B/word now come out better rather than identical.
+    assert!(
+        after.budget_bytes > before.budget_bytes,
+        "the byte half — the half that binds on all real content after this REQ — rose with \
+         the 32,768-token window; the crossover still moved because the word half rose more"
     );
     assert!(
         after.budget_tokens > before.budget_tokens,
@@ -448,10 +444,11 @@ fn the_binding_guard_crosses_over_at_a_much_lower_density_after_this_req() {
         after.budget_tokens
     );
 
-    // The soft thresholds themselves, which the turn counts only approximate:
-    // integer turns cannot resolve a move this small, and here there is nothing
-    // to resolve on the byte half — it does not move at all (ADR-9 reversed
-    // D-4's 6.25% cut), while the word half's is 2.5× up.
+    // The soft thresholds themselves, which the turn counts only approximate.
+    // Both move now: the word half's 5.2× up and the byte half's 1.94× up,
+    // both from the 32,768-token window. (On the 16,384-token window the byte
+    // threshold did not move at all — ADR-9 reversed D-4's 6.25% cut — and the
+    // word half's went 2.5× up, to 7,168.)
     let pressure = |budget: usize| budget * COMPACT_PRESSURE_PERCENT / 100;
     assert_eq!(
         (
@@ -463,9 +460,10 @@ fn the_binding_guard_crosses_over_at_a_much_lower_density_after_this_req() {
     );
     assert_eq!(
         (pressure(after.budget_tokens), pressure(after.budget_bytes)),
-        (7_168, 22_937),
-        "and after it — the word half up 2.5×, the byte half not at all. D-4 would have put the \
-         byte threshold at 21,504, compacting a byte-dense local session *sooner* than before \
-         this REQ; ADR-9's reversal is what leaves it where it was"
+        (14_813, 44_441),
+        "and after it — both halves up, from the 32,768-token window. D-4 would have put the \
+         byte threshold at 21,504 on the old window, compacting a byte-dense local session \
+         *sooner* than before this REQ; ADR-9 held it at 22,937, and the window's raise is what \
+         finally moved it up"
     );
 }

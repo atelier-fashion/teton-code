@@ -18,6 +18,53 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [Unreleased]
+
+### Changed
+
+- **The local engine's context window doubled, 16,384 → 32,768 tokens, and
+  the local budget follows it in both currencies.** A `/analyze` turn whose
+  dynamic context came to 7,579 words / 55 KB was refused against the local
+  tier's **fixed 33 KB byte half** while the word half (10,240) had room to
+  spare; analyzing a repository is a baseline task, so the window was raised
+  and the byte half now derives from it like the word half already did
+  (REQ-590 ADR-9 held it at the 32,768-byte constant only because the derived
+  figure was *smaller* on the old window — 30,720; on the new one it is 63,488).
+  The local pair is therefore **21,162 words / 63,488 bytes** (was 10,240 /
+  32,768), and a byte-saturated prompt claims exactly the engine's usable
+  window rather than one generation's worth over it. The bound clause reads
+  `bound: local engine — both halves come from the engine's 32,768-token
+  window, less the 1,024 reserved for the reply`.
+  **What an upgrade changes on a running machine:** every catalogued model
+  holds 32,768 natively, so nothing is re-downloaded and no RoPE scaling is
+  used, but the KV cache per context roughly doubles — about 3 GiB on
+  `qwen3-coder-30b-a3b`, 1.75 GiB on the 7B, 1.1 GiB on the 3B, 0.9 GiB on the
+  1.5B, at fp16 KV — and with the resident agent context beside a duty's the
+  peak is two of those. A turn that genuinely *fills* the new budget waits
+  longer for its first token (REQ-590 measured prefill as super-linear: 4.35×
+  the time for 2.5× the tokens); a turn that does not is unaffected, because
+  the budget is a ceiling. The catalog's `ram_floor_bytes` are unchanged: they
+  were never tight enough to include the KV cache on the old window either,
+  and the 30B-A3B was already over its floor there.
+  **Everything on the chain re-derives:** the `compact` duty's output ceiling
+  and prompt budget (63,488 / 57,289 B), the digest thresholds (7,749 words /
+  23,250 B), and the redact scan — a 56,561-byte chunk window (was 27,070), a
+  169,683-byte total cap in **three** chunks (was 108,280 in four), and a
+  `[privacy] redact = true` route's byte budget of **141,224** (was 88,196),
+  the first move of that bound that widened it. The assumed outbound-body
+  overhead moved 11 → 14 KiB for exactly the 3 KiB the JSON-escaping term
+  grew by with the byte budget; the resident prompt's recorded margins are
+  unchanged to the byte.
+
+- **A skill file may be up to 128 KiB (was 64 KiB).** The per-file discovery
+  ceiling has to sit well above the byte budget so that a body between the two
+  is *measured* and draws REQ-589's over-budget offer — whose remedy is to bind
+  the tier remote — instead of being skipped at discovery; at 64 KiB against a
+  63,488-byte budget the offer would have had a few hundred bytes to fire in.
+  The skip diagnostic now reads `over 128 KiB (N B)`. The largest shipped ADLC
+  skill (`/proceed`, 49.8 KiB) fits the local tier's Stage A budget on its
+  own now.
+
 ## [0.1.27] - 2026-09-02
 
 ### Added

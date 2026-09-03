@@ -80,7 +80,7 @@ const SYSTEM: &str = "You are Teton Code.";
 ///
 /// That now includes the local pair. It was 8 B/word (4,096 / 32,768), where
 /// both guards bound at once; since REQ-590 the local tier's *word* half
-/// derives from the engine's window like every other route (10,240 / 32,768),
+/// derives from the engine's window like every other route (21,162 / 63,488),
 /// so its crossover is 3 B/word too and a 4 B/word fixture presses the byte
 /// guard here as well. The byte half itself did not move — D-4 briefly took it
 /// to 30,720 and ADR-9 reversed that — so the crossover moved entirely on the
@@ -342,10 +342,11 @@ fn drain(sub: &mut tetond::broadcast::Subscription) -> Published {
 ///
 /// ## The shape of the fixture
 ///
-/// Three 12,500-word blocks at 4 B/word (50,000 bytes each) under the **local**
-/// pair — the real one, `derive(BudgetInputs::local())`, not a number invented
-/// here — plus a short newest user message. Both guards are over: 37,500 words
-/// against 10,240, and 150 KB against 32,768. Three drops leave one block, which
+/// Three blocks, each a quarter past the local word half at 4 B/word (26,452
+/// words / ~106 KB on the 32,768-token window), under the **local** pair — the
+/// real one, `derive(BudgetInputs::local())`, not a number invented here — plus
+/// a short newest user message. Both guards are over on every block alone, so
+/// the gate cannot stop early. Three drops leave one block, which
 /// is where the loop stops by construction (`truncate_to_budget` never drops the
 /// most recent), and that one block is small enough that nothing is elided in
 /// place — so this fixture's report is a clean `dropped_blocks: 3` rather than a
@@ -368,10 +369,18 @@ async fn three_dropped_blocks_are_one_event_naming_all_three() {
     let mut ctx = fixture.context(&budget);
     // Three blocks, not three pairs: the drop loop counts blocks, and a fixture
     // that pushed a model reply between each paste would be asserting `3` about
-    // a list of six. 12,500 words × 4 B/word = 50,000 bytes each, so any one of
-    // them alone busts the 32,768-byte budget and the gate cannot stop early.
+    // a list of six. Each block is sized off the derived pair — a quarter past
+    // the word half, at 4 B/word — so any one of them alone busts both halves
+    // and the gate cannot stop early. (It read `12_500` while the pair was
+    // 10,240 w / 32,768 B; on the 32,768-token window a 50 KB block fits, and
+    // the third drop this test is named for stopped happening.)
+    let block_words = budget.budget_tokens + budget.budget_tokens / 4;
+    assert!(
+        block_words * 4 > budget.budget_bytes,
+        "fixture: one block must bust the byte half on its own"
+    );
     for n in 0..3 {
-        ctx.push_user(format!("paste {n}: {}", filler(12_500)));
+        ctx.push_user(format!("paste {n}: {}", filler(block_words)));
     }
     ctx.push_user("what did those three files have in common?");
     assert_eq!(ctx.blocks().len(), 4);
@@ -634,10 +643,12 @@ async fn a_two_hundred_block_conversation_on_a_big_route_compacts_through_the_lo
         budget.budget_bytes
     );
     // Non-vacuity for the bound itself: rendering this conversation whole is
-    // many times what the local engine could be handed.
+    // several times what the local engine could be handed (~205 KB against a
+    // 57,289-byte prompt budget; it was 4× the 24,521 of the 16,384-token
+    // window).
     let unbounded = compact_prompt(ctx.blocks(), usize::MAX).len();
     assert!(
-        unbounded > COMPACT_PROMPT_BUDGET_BYTES * 4,
+        unbounded > COMPACT_PROMPT_BUDGET_BYTES * 3,
         "an offer that would have fitted anyway proves nothing about the bound: \
          {unbounded} against {COMPACT_PROMPT_BUDGET_BYTES}"
     );
@@ -829,7 +840,7 @@ fn a_report_with_nothing_in_it_is_the_one_that_says_nothing() {
 // | `max_context = 128000` | ≈250 KB | the skill expands and reaches the provider |
 // | `max_context = 0` | the default pair, stated | refused, `bound: unknown window`, remedy named |
 // | `max_context = 4096` | floored to (2,048 / 16 KiB) | refused, and the message says it was floored |
-// | the local tier | (10,240 / 32 KiB) | refused, `bound: local engine` |
+// | the local tier | (21,162 / 63,488 B) | refused, `bound: local engine` |
 //
 // **And the silence (BR-8c).** A refused turn emits **no** `context_pressure`
 // event of any kind — not a drop, not an elision, not a "nothing was clamped"
@@ -864,7 +875,10 @@ const BIG_SKILL_MARKER: &str = "BIG-SKILL-BODY-MARKER";
 /// binds first — the correction the REQ's own description records.
 fn big_skill_body() -> String {
     let mut body = format!("{BIG_SKILL_MARKER}\n");
-    while body.len() < 40_000 {
+    // Past the local tier's 63,488-byte half with the system prompt's room to
+    // spare, and under discovery's 128 KiB ceiling. (40,000 while the local
+    // byte half was 32,768.)
+    while body.len() < 90_000 {
         body.push_str("padding padding padding padding padding padding padding\n");
     }
     body

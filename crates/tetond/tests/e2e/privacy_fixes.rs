@@ -341,20 +341,20 @@ fn a_128k_turn_blocked_by_privacy_is_refitted_before_the_local_pin_serves_it() {
         Some("local_engine"),
         "the pin is the local tier, whatever the blocked provider declared: {event}"
     );
-    // The local tier's pair (REQ-590). The **word** half is derived: the
-    // engine's 16,384-token window less the 1,024-token generation reservation,
-    // run through the same formula a declared window runs. The **byte** half is
-    // `LOCAL_BUDGET_BYTES`, unchanged — D-4 took the window derivation for it
-    // too (30,720) and ADR-9 reversed that. Spelled as literals because what
-    // this test is entitled to read is the *wire* — a client sees these two
-    // numbers and nothing about how they were made.
-    assert_eq!(event["budget_tokens"].as_u64(), Some(10_240), "{event}");
-    assert_eq!(event["budget_bytes"].as_u64(), Some(32_768), "{event}");
+    // The local tier's pair (REQ-590): both halves derived from the engine's
+    // 32,768-token window less the 1,024-token generation reservation, run
+    // through the same formula a declared window runs — 31,744 × 2/3 words,
+    // 31,744 × 2 bytes. (On the 16,384-token window the byte half was the
+    // 32,768 constant — ADR-9.) Spelled as literals because what this test is
+    // entitled to read is the *wire* — a client sees these two numbers and
+    // nothing about how they were made.
+    assert_eq!(event["budget_tokens"].as_u64(), Some(21_162), "{event}");
+    assert_eq!(event["budget_bytes"].as_u64(), Some(63_488), "{event}");
     assert!(
         event["dropped_blocks"].as_u64().unwrap_or(0) > 0
             || event["elided_bytes"].as_u64().unwrap_or(0) > 0,
         "a refit that cut nothing would leave this vacuous — 120 KB does not fit \
-         32,768 bytes: {event}"
+         63,488 bytes: {event}"
     );
     assert_eq!(
         client.events_named("context_pressure").len(),

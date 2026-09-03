@@ -382,6 +382,27 @@ source-shaped content, ~1.2× for prose, and nothing at all once content passes 
 whitespace word — because past that density the guard that binds is one this REQ does not
 touch.*
 
+#### Addendum — re-measured on the 32,768-token window (2026-09-02)
+
+The engine window was later doubled, 16,384 → 32,768, after a `/analyze` turn's 55 KB of dynamic
+context was refused against the fixed 32,768-byte half this REQ kept (ADR-9). At 32,768 the
+window-derived byte half is 63,488 — 1.94× the constant, so ADR-9's premise (the derived figure
+being the *smaller* one) inverts — and both halves derive again. `compaction_cadence.rs` pins the
+new table; the "after" column above is now the middle column here:
+
+| bytes/word | before (4,096 w / 32,768 B) | after, 16,384 window (10,240 w / 32,768 B) | after, 32,768 window (21,162 w / 63,488 B) | ratio to before |
+|---|---|---|---|---|
+| 4 | 9 turns | 15 turns | **28 turns** | 3.11× |
+| 6 | 9 turns | 11 turns | **20 turns** | 2.22× |
+| 8 | 8 turns | 8 turns | **15 turns** | 1.88× |
+| 20 | 4 turns | 4 turns | **7 turns** | 1.75× |
+
+The soft thresholds moved 7,168 → 14,813 words and 22,937 → 44,441 bytes. The dense rows move
+for the first time, and only because the byte half did — the sentence to carry forward is now
+*"about 2× for prose and code, and 1.75× even for the densest content, because the guard that
+binds there finally moved."* AC-10's timings were **not** re-taken on the larger window; the
+super-linear prefill finding stands and is the cost to expect a full-budget turn to pay.
+
 ### AC-14 — the by-hand leg
 
 Written, not run: `docs/manual-verification.md`, "REQ-590 AC-14 (the engine-derived local budget)",

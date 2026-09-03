@@ -214,7 +214,7 @@
 //! ### REQ-562 round 3 — the model pass is chunked, and the mutations that pin it
 //!
 //! The scan's cap was one number doing two jobs: the engine's window *and* the
-//! bound on what could be scanned. Because the window (27,070 bytes) sits under
+//! bound on what could be scanned. Because the window (27,070 bytes then; 56,561 now) sits under
 //! `HarnessConfig::context_budget_bytes` (32,768), every context-budget-full
 //! remote turn assembled a body the scan refused, and blocked. The model pass
 //! now cuts the payload into overlapping windows and scans each one

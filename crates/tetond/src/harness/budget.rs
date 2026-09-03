@@ -11,13 +11,11 @@
 //!
 //! ```text
 //! derive(inputs):
-//!   if is_local                → words = window_pair(LOCAL_ENGINE_N_CTX,
-//!                                                    LOCAL_GENERATION_RESERVATION).tokens
-//!                                bytes = LOCAL_BUDGET_BYTES   (the constant)
+//!   if is_local                → window_pair(LOCAL_ENGINE_N_CTX,
+//!                                            LOCAL_GENERATION_RESERVATION)
 //!                                bound = LocalEngine
-//!                                (the floor may not raise the words above the
-//!                                 engine; the byte half is not window-derived
-//!                                 at all — see below)
+//!                                (both halves; the floor may not raise either
+//!                                 above the engine — see below)
 //!   elif window == 0           → default pair, bound = DefaultUnknown
 //!   else:
 //!     window_eff = cap if 0 < cap < window (bound = UserCap) else window (Window)
@@ -32,35 +30,33 @@
 //!                       absolute ceiling
 //! ```
 //!
-//! ## The local tier's word half derives; its byte half does not (REQ-590)
+//! ## The local tier's pair derives from the engine's window (REQ-590)
 //!
 //! The local arm used to return the default pair, which is how a 4,097-word
 //! turn came to be refused against a 4,096-word budget on an engine holding
-//! 16,384 tokens. Its **word** half now runs the same formula as a declared
-//! window, over the window the daemon actually loads with: `16,384 − 1,024 =
-//! 15,360` usable → **10,240 words**. The bound stays `LocalEngine` because
-//! the source of the number is the engine, not a provider declaration anyone
-//! can edit (BR-6).
+//! 16,384 tokens. It now runs the same formula as a declared window, over the
+//! window the daemon actually loads with: `32,768 − 1,024 = 31,744` usable →
+//! **21,162 words / 63,488 bytes**. The bound stays `LocalEngine` because the
+//! source of the number is the engine, not a provider declaration anyone can
+//! edit (BR-6).
 //!
-//! Its **byte** half stays [`LOCAL_BUDGET_BYTES`] — 32,768, unchanged since
-//! before REQ-586. The pair is therefore **asymmetric on purpose**: one half
-//! window-derived, one half the constant. REQ-590's D-4 originally took the
-//! window-derived byte half too (30,720) and was **reversed** on the
-//! arithmetic: the 2 B/token bridge makes a window-derived byte half *smaller*
-//! than the constant, so it beats the constant only below **7.5 B/word** — a
-//! regression on code, which is the local tier's own workload — while catching
-//! nothing a real tokenizer does not already catch. The reasoning is at
-//! [`derive`]'s local arm.
+//! **Both halves derive.** That was not always so: while the window was 16,384
+//! the byte half stayed [`LOCAL_BUDGET_BYTES`] (32,768), because the 2 B/token
+//! bridge gave 30,720 there — *smaller* than the constant, beating it only
+//! below 7.5 B/word and so regressing on code (REQ-590 D-4, reversed by ADR-9).
+//! The window was raised to 32,768 after a `/analyze` turn's 55 KB of dynamic
+//! context was refused against that fixed byte half, and at 32,768 the bridge
+//! gives 63,488 — 1.94× the constant, larger at every density — so the
+//! reversal's premise is gone and the pair is symmetric again. The reasoning,
+//! and why the constant is not kept as a floor, is at [`derive`]'s local arm.
 //!
-//! The two arms differ in a **second** place, beside the byte half above: the
-//! floor. `MIN_BUDGET_*` raises a pair derived from a **declaration** — a
-//! provider's promise, which the provider may then refuse against, saying so.
-//! The engine's `n_ctx` is an allocation, and a budget above it buys nothing a
-//! turn can spend, so the floor is held to the engine's own window there
-//! (BR-8). At 16,384 the floor
-//! never bites either way; the rule is latent, stated, and tested at a
-//! synthetic window so that whoever lowers that constant inherits the rule
-//! rather than the bug.
+//! The two arms differ in one place: the floor. `MIN_BUDGET_*` raises a pair
+//! derived from a **declaration** — a provider's promise, which the provider
+//! may then refuse against, saying so. The engine's `n_ctx` is an allocation,
+//! and a budget above it buys nothing a turn can spend, so the floor is held to
+//! the engine's own window there (BR-8). At 32,768 the floor never bites either
+//! way; the rule is latent, stated, and tested at a synthetic window so that
+//! whoever lowers that constant inherits the rule rather than the bug.
 //!
 //! Precedence, stated once and tested pairwise: `LocalEngine` >
 //! `DefaultUnknown` > (`RedactScan` when it bites) > `UserCap` > `Window`.
@@ -100,8 +96,8 @@
 //! * **random base64** (≈1.45 B/token) — byte-dense past the 2 B/token floor:
 //!   4,150 B of it costs 2,868 tokens against a `max(81, 2_075)` estimate.
 //! * **`numeric_grid.txt`** (REQ-590 AC-9) — the *other* quadrant, token-dense
-//!   and byte-**light**: 10,240 words / 20,480 B costs 20,480 real tokens
-//!   against `max(15,360, 10,240) = 15,360`, short by 25%. This one was added
+//!   and byte-**light**: 21,162 words / 42,324 B costs 42,324 real tokens
+//!   against `max(31,743, 21,162) = 31,743`, short by 25%. This one was added
 //!   by REQ-590 itself, to exercise the budget rather than the estimator, and
 //!   it is why D-3's zero-margin word half is stated as a known cost (ADR-6).
 //!
@@ -154,15 +150,10 @@ use crate::skills::SkillSource;
 ///
 /// **The local tier is no longer one of its callers** (REQ-590 ADR-2/ADR-4).
 /// The local route has a window fact — [`LOCAL_ENGINE_N_CTX`], the allocation
-/// the daemon loads with — so [`derive`]'s local arm derives its **word** half
-/// from that window instead of reaching for this constant. This constant is
-/// unchanged and stays exactly where it was: what moved is which routes read
-/// it, not what it says.
-///
-/// Its byte twin [`LOCAL_BUDGET_BYTES`] *is* still read by the local arm — the
-/// two halves parted company when D-4 was reversed (ADR-9). Nothing about this
-/// constant changed; it simply stopped being the local route's word half while
-/// its twin never stopped being the local route's byte half.
+/// the daemon loads with — so [`derive`]'s local arm derives both halves of its
+/// pair from that window instead of reaching for this constant or its byte
+/// twin. This constant is unchanged and stays exactly where it was: what moved
+/// is which routes read it, not what it says.
 pub const LOCAL_BUDGET_TOKENS: usize = 4_096;
 
 /// The default context budget's byte half: [`LOCAL_BUDGET_TOKENS`] bridged at
@@ -174,16 +165,13 @@ pub const LOCAL_BUDGET_TOKENS: usize = 4_096;
 /// the window with [`DUTY_REQUEST_BYTES_PER_TOKEN`] instead; see [`derive`].
 /// Pinned by REQ-586 AC-1, on the `max_context = 0` route that runs under it.
 ///
-/// **This is also the local route's byte half, and it is the one half of that
-/// route's pair which is not window-derived** (REQ-590 ADR-9, D-4 reversed).
-/// The two bridges disagree in the direction nobody expects: at 16,384 −
-/// 1,024 usable the BPE floor gives 30,720, *below* this constant, so deriving
-/// the local byte half from the window would have **lowered** it — a byte
-/// budget that beats this one only below 7.5 B/word, which is a regression on
-/// the code the `/analyze` body this REQ exists to serve is made of, and which
-/// catches no content class that a whitespace-byte count can catch at all. So
-/// the local arm takes the window for words and this constant for bytes. See
-/// [`derive`].
+/// **It was also the local route's byte half while the engine window was
+/// 16,384** (REQ-590 ADR-9, D-4 reversed): at 16,384 − 1,024 usable the BPE
+/// floor gives 30,720, *below* this constant, so deriving the local byte half
+/// from the window would have **lowered** it — a byte budget that beats this
+/// one only below 7.5 B/word, a regression on code. At the 32,768 window the
+/// bridge gives 63,488 and the local arm derives both halves again; this
+/// constant is read by the default pair alone. See [`derive`].
 pub const LOCAL_BUDGET_BYTES: usize = LOCAL_BUDGET_TOKENS * APPROX_BYTES_PER_TOKEN;
 
 /// The smallest byte budget a route with a **declared** window may derive —
@@ -634,68 +622,55 @@ pub fn derive(inputs: BudgetInputs<'_>) -> RouteBudget {
         // one about binding the tier remote rather than the one about editing a
         // field that does not exist.
         //
-        // # The two halves have different sources, deliberately (REQ-590 D-4
-        //   REVERSED, TASK-276)
+        // # Both halves derive from the window (REQ-590 D-4, restored at 32,768)
         //
         // The **word** half is window-derived, through the same
-        // [`window_pair`] every declared window runs: `15,360 usable × 2/3 =
-        // 10,240 words`. That is the whole point of this REQ — 4,096 words
+        // [`window_pair`] every declared window runs: `31,744 usable × 2/3 =
+        // 21,162 words`. That is the whole point of REQ-590 — 4,096 words
         // against a 16,384-token engine refused a turn the engine could hold.
         //
-        // The **byte** half is [`LOCAL_BUDGET_BYTES`], the constant, and it is
-        // *not* `pair.bytes`. `window_pair` bridges bytes at the 2 B/token BPE
-        // floor, which on this window gives 30,720 — **smaller** than the
-        // 32,768 the local route has always run under. That trade was measured
-        // rather than argued, and it fails on both counts:
+        // The **byte** half is window-derived too: `31,744 × 2 B/token =
+        // 63,488`. It was not, between REQ-590 ADR-9 and the window's raise to
+        // 32,768, and the reason is worth keeping because it is what decides
+        // the question at *any* window: `window_pair` bridges bytes at the
+        // 2 B/token BPE floor, and at 16,384 that gave 30,720 — **smaller**
+        // than the 32,768 the local route had always run under, beating the
+        // constant only below 7.5 B/word (`30,720 / d = 4,096 ⇒ d = 7.5`) and
+        // so regressing on code, the local tier's own workload. ADR-9 kept the
+        // constant on that measurement.
         //
-        // * **The window-derived pair only beats the old one below 7.5
-        //   B/word.** The crossover is exact and needs no field data:
-        //   `30,720 / d = 4,096 ⇒ d = 7.5`. Prose (≈5) gains 50%; code (≈8)
-        //   *loses* 6.25%. For analyzing code — the local tier's own workload —
-        //   a window-derived byte half is a regression.
-        // * **It very likely does not fix the case this REQ exists for.** The
-        //   record gives the reported `/analyze` body as 4,097 words (exact)
-        //   and `31 KB` (rounded to the nearest KB by `bytes_figure`, so the
-        //   true count is in [30,500, 31,499] — no exact byte count for it was
-        //   ever recorded). At 4,097 words the 7.5 B/word crossover falls at
-        //   30,727.5 bytes, which sits 228 above that interval's floor: across
-        //   the interval the window-derived pair is worth between **+0.7% and
-        //   −2.4%**, and over most of it the refusal would simply have moved
-        //   from the word guard to the byte guard. It never plausibly helped
-        //   this case by as much as one percent.
-        // * **The restore is non-regressive by inspection (BR-7).** At every
-        //   density `min(10_240, 32_768/d) ≥ min(4_096, 32_768/d)`, because
-        //   only the word half moved and it moved up. Nothing that serves
-        //   today is newly refused, whatever the reported body's real size was.
-        // * **It protects nothing measurable.** The one sample that overruns
-        //   the engine at full budget is `token_corpus.rs`'s `numeric_grid.txt`
-        //   at 2.00 tokens/word: 20,480 bytes, admitted at 30,720 *and* at
-        //   32,768, and 20,480 real tokens against 15,360 usable either way. No
-        //   byte value in this range catches it; only a real tokenizer does.
+        // At 32,768 the same arithmetic points the other way. The window
+        // bridge gives 63,488, 1.94× the constant, and the crossover is gone:
+        // the derived half admits more at *every* density. Keeping the constant
+        // would have refused the very case the raise exists for — a `/analyze`
+        // turn whose dynamic context came to 55 KB against a 33 KB byte half
+        // while the word half (7,579 against 21,162) had room to spare. And the
+        // residual ADR-9 accepted — a byte-saturated prompt out-claiming the
+        // engine by exactly one generation's worth — closes with it: `63,488 /
+        // 2 = 31,744 = usable`, so a prompt saturated in either currency now
+        // claims exactly what the engine has (ADR-6a again).
         //
-        // The honest cost of keeping 32,768, stated because it is the thing the
-        // window derivation would have fixed: at the 2 B/token floor the byte
-        // half claims 16,384 tokens against 15,360 usable, so a *byte-saturated*
-        // local prompt is over the engine's window by 1,024 tokens before it is
-        // assembled. That was true before this REQ and stays true after it.
+        // `LOCAL_BUDGET_BYTES` is *not* a floor here, deliberately. Under
+        // `Floor::HeldToTheEngine` nothing may raise the pair above the
+        // engine, and at a window below 17,408 tokens the constant would (it
+        // claims 16,384 tokens at the 2 B/token floor). Whoever lowers the
+        // window inherits OQ-2 rather than a silent overclaim.
         //
-        // The catch is the engine's own typed `context_length_exceeded`
-        // (`teton-inference/src/engine.rs` `over_window`) — and it is the *only*
-        // one, which is worth saying because REQ-589's over-budget offer looks
-        // like a second one and is not. That offer fires only where a **skill
-        // expansion** does not fit (`skill_append_fit`); a turn that saturates
-        // this byte budget is *at* it, not over it, so the fit check returns
-        // `SkillFit::Fits` and no offer is reachable — and a turn carrying no
-        // skill never reaches that check at all. Same for the
-        // token-dense/byte-light quadrant, where both guards admit. This is the
-        // same single catch ADR-6 relies on for the word half's zero slack,
-        // which no byte value can supply either.
-        let mut pair = window_pair(
+        // The catch for content denser than the bridge assumes is the engine's
+        // own typed `context_length_exceeded` (`teton-inference/src/engine.rs`
+        // `over_window`) — and it is the *only* one, which is worth saying
+        // because REQ-589's over-budget offer looks like a second one and is
+        // not. That offer fires only where a **skill expansion** does not fit
+        // (`skill_append_fit`); a turn that saturates a budget is *at* it, not
+        // over it, so the fit check returns `SkillFit::Fits` and no offer is
+        // reachable — and a turn carrying no skill never reaches that check at
+        // all. Same for the token-dense/byte-light quadrant, where both guards
+        // admit (`tests/token_corpus.rs`'s `numeric_grid.txt`).
+        let pair = window_pair(
             LOCAL_ENGINE_N_CTX,
             LOCAL_GENERATION_RESERVATION,
             Floor::HeldToTheEngine,
         );
-        pair.bytes = LOCAL_BUDGET_BYTES;
         return budget_of(pair, BudgetBound::LocalEngine, labelled_provider(None));
     }
     if inputs.window == 0 {
@@ -760,21 +735,18 @@ enum Floor {
     /// allocation.
     ///
     /// **Latent at today's constants** — at [`LOCAL_ENGINE_N_CTX`] *this
-    /// helper* derives 10,240 words / 30,720 bytes, both well clear of the
+    /// helper* derives 21,162 words / 63,488 bytes, both well clear of the
     /// 2,048-word / 16,384-byte floor, so this arm and
     /// [`Self::RaisesADeclaration`] agree there and AC-1's "one formula" claim
-    /// is exact for the word half. Read that 30,720 as `window_pair`'s own
-    /// figure and **not** as the local route's pair, which is (10,240, 32,768);
-    /// the paragraph below is the whole of the difference. It
+    /// is exact in both currencies. It
     /// becomes live only if that constant falls, which is precisely when
     /// nobody will be thinking about this file, so it is written down and
     /// tested at a synthetic window now (AC-15).
     ///
-    /// Note the local *route* takes only this helper's **word** half (ADR-9):
-    /// its byte half is [`LOCAL_BUDGET_BYTES`], which this floor never sees. So
-    /// the byte leg of AC-15 is a property of this helper, not a statement
-    /// about the local route's own byte budget — which, at 32,768, deliberately
-    /// exceeds what a 16,384-token engine holds. [`derive`] says why.
+    /// The local *route* takes both halves of this helper (ADR-9's split —
+    /// word half derived, byte half the constant — held only while the window
+    /// was 16,384; see [`derive`]), so both legs of AC-15 are statements about
+    /// the local route's own pair.
     ///
     /// It does **not** claim a small engine would then work: at a
     /// 4,096-token `n_ctx` the derived byte half is 6,144, which
@@ -802,11 +774,11 @@ struct WindowPair {
 /// `usable` provider tokens (REQ-586 AC-3). Bytes: the 2 B/token BPE floor
 /// (reused from `duty.rs` — gotcha #12: not a third number).
 ///
-/// **[`derive`]'s local arm takes the word half of this and discards the byte
-/// half** (REQ-590 ADR-9). AC-1's "one formula" therefore reads on the word
-/// half only: local and a same-sized declaration agree at 10,240 words, and
-/// deliberately disagree on bytes (32,768 against 30,720). The reason the byte
-/// halves part company is measured at [`derive`], not asserted here.
+/// [`derive`]'s local arm takes both halves of this, so AC-1's "one formula"
+/// reads on both: local and a same-sized declaration agree at 21,162 words /
+/// 63,488 bytes, and differ only in the floor they run under. (Between REQ-590
+/// ADR-9 and the window's raise to 32,768 the local arm discarded the byte
+/// half for [`LOCAL_BUDGET_BYTES`]; [`derive`] records why, and why not now.)
 ///
 /// Both are held at [`Floor`] rather than allowed to fall to nothing, and a
 /// reservation that swallows the whole window lands there too — a small or
@@ -1507,15 +1479,15 @@ fn sentence_tail(caller: SkillCaller, bound: BudgetBound, sentence: &SkillSenten
 /// to go to find out why. It is now derived, which makes it *more* mysterious
 /// rather than less unless the derivation is said out loud, so the clause
 /// carries the two numbers that produce it: the window the daemon loads with
-/// and the tokens held back for the reply. `16,384 − 1,024 = 15,360`, and
-/// `15,360 × 2/3` is the word figure standing beside this clause — the whole
+/// and the tokens held back for the reply. `32,768 − 1,024 = 31,744`, and
+/// `31,744 × 2/3` is the word figure standing beside this clause — the whole
 /// arithmetic, checkable by the reader who was surprised by it.
 ///
-/// **The byte half is named as *not* derived**, which is the honest half of
-/// the sentence after D-4's reversal (ADR-9). It is [`LOCAL_BUDGET_BYTES`], a
-/// constant, and a clause implying both halves came from the window would send
-/// a reader to divide 32,768 by something and get an answer that does not
-/// reconcile. Saying "the byte half is fixed" costs six words and is true.
+/// **Both halves are named as derived**, because both are: `31,744 × 2/3` is
+/// the word figure and `31,744 × 2` the byte figure beside this clause. While
+/// the window was 16,384 the clause said "the byte half is fixed", which was
+/// true then (ADR-9) and would now send a reader to reconcile 63 KB against a
+/// constant it no longer is.
 ///
 /// **No `capabilities.max_context` remedy, ever, on this arm** (BR-6). There is
 /// no provider declaration behind a local budget for anyone to edit, and the
@@ -1553,8 +1525,8 @@ fn bound_clause(budget: &RouteBudget, provider_id: Option<&str>) -> String {
         // sentence that did not would be the LESSON-491 shape this REQ spent
         // three ADRs on.
         clause.push_str(&format!(
-            " — the word half comes from the engine's {}-token window, less the {} reserved for \
-             the reply; the byte half is fixed",
+            " — both halves come from the engine's {}-token window, less the {} reserved for \
+             the reply",
             thousands(u64::from(LOCAL_ENGINE_N_CTX)),
             thousands(u64::from(LOCAL_GENERATION_RESERVATION)),
         ));
@@ -2977,24 +2949,25 @@ mod tests {
     fn derivation_table() {
         let rows: &[(&str, BudgetInputs<'_>, usize, usize, BudgetBound)] = &[
             (
-                // REQ-590: usable = 16,384 − 1,024 = 15,360; ×2/3 = 10,240
-                // words. The engine's window, run through the same formula as
-                // any declaration — the row below is that same window declared
-                // by a provider, and the two must agree on **words** (AC-1).
-                // The byte half is `LOCAL_BUDGET_BYTES` and deliberately does
-                // not agree: the window bridge would give 30,720, which is
-                // lower, and ADR-9 records why that reversed.
-                "local route derives its words from the engine's window",
+                // REQ-590: usable = 32,768 − 1,024 = 31,744; ×2/3 = 21,162
+                // words, ×2 = 63,488 bytes. The engine's window, run through
+                // the same formula as any declaration — the row below is that
+                // same window declared by a provider, and the two must agree on
+                // both halves (AC-1). (While the window was 16,384 the byte
+                // half was `LOCAL_BUDGET_BYTES` instead, because the window
+                // bridge gave 30,720 there — lower; `derive` records why that
+                // reversed and why it no longer applies.)
+                "local route derives its pair from the engine's window",
                 BudgetInputs::local(),
-                10_240,
-                LOCAL_BUDGET_BYTES,
+                21_162,
+                63_488,
                 BudgetBound::LocalEngine,
             ),
             (
-                "a declared 16,384-token window derives the same words, its own bytes",
+                "a declared 32,768-token window derives the same pair under `Window`",
                 remote(LOCAL_ENGINE_N_CTX, 0, false),
-                10_240,
-                30_720,
+                21_162,
+                63_488,
                 BudgetBound::Window,
             ),
             (
@@ -3030,11 +3003,13 @@ mod tests {
                 BudgetBound::RedactScan,
             ),
             (
-                // usable = 58,976; ×2/3 = 39,317; ×2 = 117,952 > scannable →
-                // the clamp applies after the cap and names the bound.
-                "cap 60k + redact on 200k: the clamp is last",
-                remote(200_000, 60_000, true),
-                39_317,
+                // usable = 78,976; ×2/3 = 52,650; ×2 = 157,952 > scannable
+                // (141,224) → the clamp applies after the cap and names the
+                // bound. (A 60k cap did this against the 88,196 bound of the
+                // 16,384-token engine window; 117,952 sits under 141,224.)
+                "cap 80k + redact on 200k: the clamp is last",
+                remote(200_000, 80_000, true),
+                52_650,
                 REDACT_SCANNABLE_CONTEXT_BYTES,
                 BudgetBound::RedactScan,
             ),
@@ -3113,51 +3088,34 @@ mod tests {
         }
     }
 
-    /// **AC-4, rewritten (REQ-590 ADR-9): the local route's word half is the
-    /// engine's window and its byte half is the constant — one pair, two
-    /// sources, and the split is asserted rather than left to be discovered.**
+    /// **AC-4 (REQ-590): the local route's pair fits the engine in both
+    /// currencies, and both halves are the window's.**
     ///
-    /// # What AC-4 used to say, and why it was dropped rather than deleted
+    /// # What AC-4 says, and what it said in between
     ///
-    /// AC-4 read: `budget_bytes / DUTY_REQUEST_BYTES_PER_TOKEN ≤
-    /// LOCAL_ENGINE_N_CTX − LOCAL_GENERATION_RESERVATION`, i.e. 32,768 / 2 =
-    /// 16,384 ≤ 15,360 — false, and D-4 was going to make it true by taking the
-    /// window-derived byte half (30,720). **D-4 reversed** and this assertion is
-    /// now knowingly violated: 16,384 > 15,360 by exactly one generation's
-    /// worth. It is recorded here rather than quietly removed because a
-    /// criterion that is deleted looks like one that was never written.
+    /// AC-4 reads: `budget_bytes / DUTY_REQUEST_BYTES_PER_TOKEN ≤
+    /// LOCAL_ENGINE_N_CTX − LOCAL_GENERATION_RESERVATION`. On the 16,384-token
+    /// window that was **knowingly violated** — the local byte half was the
+    /// 32,768 constant, which claims 16,384 tokens against 15,360 usable
+    /// (ADR-9: the window-derived 30,720 was *lower*, beat the constant only
+    /// below 7.5 B/word, and so regressed on code) — and this test asserted the
+    /// one-generation overshoot as a stated residual instead.
     ///
-    /// Three findings reversed it, all at [`derive`]'s local arm: the
-    /// window-derived byte half beats 32,768 only below 7.5 B/word, so it is a
-    /// **regression** on code; across the whole byte interval the field report
-    /// admits it was worth between +0.7% and −2.4% on the very `/analyze` body
-    /// this REQ exists to serve; and it catches no content class —
-    /// `token_corpus.rs`'s `numeric_grid.txt` overruns the engine at 20,480
-    /// real tokens while sitting at 20,480 bytes, admitted under either value.
-    ///
-    /// ADR-6a is the second reason: after ADR-2 the derivation *defined*
-    /// `budget_bytes = usable × DUTY_REQUEST_BYTES_PER_TOKEN`, so the old AC-4
-    /// reduced to `usable ≤ usable` and could not fail while the byte half was
-    /// window-derived. It was a coupling guard wearing a bound check's clothes.
-    ///
-    /// # What is asserted instead
-    ///
-    /// The two facts that are true, that a reader would otherwise have to
-    /// reconstruct, and that a future edit could silently break:
-    ///
-    /// * the **word** half fits the window — the claim AC-4 was reaching for,
-    ///   in the currency where it holds (and holds *exactly*; see
-    ///   [`the_local_word_budgets_slack_is_exactly_zero_by_design`]);
-    /// * the **byte** half is [`LOCAL_BUDGET_BYTES`], read rather than
-    ///   restated, and is **not** what the window bridge would give — so
-    ///   re-deriving it from the window reddens here with the reason attached.
+    /// At 32,768 the window bridge gives 63,488, nearly twice the constant, so
+    /// the local arm derives both halves again and AC-4 holds as written, with
+    /// equality: `63,488 / 2 = 31,744 = usable`. The residual is gone. What is
+    /// asserted is that it stays gone, and — since after ADR-2 the derivation
+    /// *defines* `budget_bytes = usable × DUTY_REQUEST_BYTES_PER_TOKEN`, so
+    /// `usable ≤ usable` could never fail on its own — that the byte half really
+    /// is the window's and not the constant's, which is the coupling a future
+    /// edit could silently undo.
     #[test]
-    fn the_local_word_half_is_the_window_and_the_byte_half_is_the_constant() {
+    fn the_local_pair_is_the_window_in_both_currencies() {
         let usable = (LOCAL_ENGINE_N_CTX - LOCAL_GENERATION_RESERVATION) as usize;
         let local = derive(BudgetInputs::local());
 
-        // The word half: the claim the old AC-4 wanted, in the currency that
-        // can carry it.
+        // The word half: the claim AC-4 wants, in words (exact up to integer
+        // truncation; see `the_local_word_budgets_slack_is_exactly_zero_by_design`).
         let words_claim =
             local.budget_tokens * REMOTE_TOKENS_PER_WORD_NUM / REMOTE_TOKENS_PER_WORD_DEN;
         assert!(
@@ -3166,47 +3124,47 @@ mod tests {
              engine can hold"
         );
 
-        // The byte half: the constant, and not the window bridge.
-        assert_eq!(
-            local.budget_bytes, LOCAL_BUDGET_BYTES,
-            "REQ-590 reversed D-4 (ADR-9): the local byte half is the constant. If you meant to \
-             derive it from the window instead, read `derive`'s local arm first — that value is \
-             30,720, which is *lower*, beats this constant only below 7.5 B/word so it regresses \
-             on code, and catches nothing a real tokenizer does not already catch"
-        );
+        // The byte half: the window bridge, and not the constant.
         let window_bridge = usable * DUTY_REQUEST_BYTES_PER_TOKEN;
-        assert_eq!(window_bridge, 30_720);
+        assert_eq!(window_bridge, 63_488);
+        assert_eq!(
+            local.budget_bytes, window_bridge,
+            "the local byte half is the window's 2 B/token bridge. If you meant to hold it at \
+             `LOCAL_BUDGET_BYTES` instead, read `derive`'s local arm first: that was ADR-9's \
+             answer on a 16,384-token window, where the bridge gave 30,720 and was the smaller \
+             number, and it inverts at 32,768"
+        );
         assert!(
-            window_bridge < local.budget_bytes,
-            "the two bridges have stopped disagreeing in the direction ADR-9 measured \
-             ({window_bridge} B from the window against {} B from the words); the reversal's \
-             whole premise is that the window bridge is the *smaller* one here",
-            local.budget_bytes
+            window_bridge > LOCAL_BUDGET_BYTES,
+            "the two bridges have stopped disagreeing in the direction that retires ADR-9 \
+             ({window_bridge} B from the window against {LOCAL_BUDGET_BYTES} B from the \
+             words); if the window bridge is the smaller one again, ADR-9's reasoning is live \
+             again and the local arm should say so"
         );
 
-        // And the cost of that choice, stated as an assertion so nobody reads
-        // the reversal as free: at the 2 B/token floor a byte-saturated local
-        // prompt is over the engine's window, by exactly the generation the
-        // daemon reserved. The catch is `over_window`, and it is the only one:
-        // REQ-589's offer fires only when a *skill expansion* does not fit, and
-        // a turn sitting *at* this budget fits, so no offer is reachable.
+        // AC-4 itself, and with equality: a byte-saturated local prompt claims
+        // exactly the usable window, not one generation more. The catch for
+        // content denser than the bridge is `over_window`, and it is the only
+        // one: REQ-589's offer fires only when a *skill expansion* does not
+        // fit, and a turn sitting *at* this budget fits, so no offer is
+        // reachable.
         let bytes_claim = local.budget_bytes / DUTY_REQUEST_BYTES_PER_TOKEN;
         assert_eq!(
-            bytes_claim - usable,
-            LOCAL_GENERATION_RESERVATION as usize,
-            "the accepted overshoot is one generation's worth ({bytes_claim} claimed against \
-             {usable} usable); if it has changed size, the trade ADR-9 priced has changed too"
+            bytes_claim, usable,
+            "the byte half claims {bytes_claim} provider tokens against {usable} usable; ADR-9's \
+             one-generation residual is closed and must stay closed"
         );
     }
 
     /// **REQ-590 ADR-6 (BR-10): the local word budget's slack is exactly zero,
     /// and that is a decision — asserted here so it stops being invisible.**
     ///
-    /// `10_240 × 3/2 = 15_360 = 16_384 − 1_024`. The word budget claims
+    /// `21_162 × 3/2 = 31_743 = 32_768 − 1_024 − 1`. The word budget claims
     /// *precisely* the tokens the engine has left after the generation it has
-    /// already promised itself, not one token fewer. Before REQ-590 the same
-    /// relation carried 2.5× headroom — 4,096 × 3/2 = 6,144 against 15,360
-    /// usable — and nothing at either definition site said so, in either era.
+    /// already promised itself, less the one token integer division leaves —
+    /// truncation, not headroom, and pinned as exactly one below. Before
+    /// REQ-590 the same relation carried 2.5× headroom — 4,096 × 3/2 = 6,144
+    /// against 15,360 usable — and nothing at either definition site said so.
     ///
     /// # Why an equality, and why here
     ///
@@ -3222,8 +3180,9 @@ mod tests {
     /// reddens a test that explains itself.
     ///
     /// This is the word twin of
-    /// [`the_local_word_half_is_the_window_and_the_byte_half_is_the_constant`]
-    /// (AC-4 as rewritten). The byte half has **no** such relation to assert
+    /// [`the_local_pair_is_the_window_in_both_currencies`] (AC-4). The byte
+    /// half's relation is asserted there, with equality; it has no truncation
+    /// residue because the 2 B/token bridge is a multiplication. The word half
     /// since ADR-9: it is [`LOCAL_BUDGET_BYTES`], which claims 16,384 tokens
     /// against these 15,360 usable and is over the engine by design. So this
     /// equality is the only place either half of the local pair is pinned
@@ -3252,16 +3211,18 @@ mod tests {
     ///
     /// The residual 1 that the sweeps allow is integer truncation, not
     /// headroom: it appears exactly when `usable` is not a multiple of `num`.
-    /// 15,360 = 3 × 5,120, so today it is 0 and the equality above is exact.
+    /// 31,744 = 3 × 10,581 + 1, so today it is **1** and the pin below says so
+    /// (on the 16,384-token window it was 0: 15,360 = 3 × 5,120).
     ///
-    /// **The equality is deliberately the brittle one and the sweeps are the
+    /// **The pin is deliberately the brittle one and the sweeps are the
     /// durable one**, and that division of labour is the point. Move the
-    /// reservation to 2,048 and the equality reddens by exactly 1 (14,335
-    /// against 14,336) while the sweeps stay green — mutation-run, 2026-08-25.
-    /// That is the intended experience: a human reads the failure, sees the
-    /// message say "1 is truncation, not headroom", and re-pins it. What must
-    /// never happen silently is the other direction — slack reappearing, or
-    /// growing, with nobody looking.
+    /// reservation to 2,048 and the pin reddens (the residue goes to 0: 30,720
+    /// = 3 × 10,240) while the sweeps stay green — the same mutation REQ-590
+    /// ran on 2026-08-25 in the other direction. That is the intended
+    /// experience: a human reads the failure, sees the message say "1 is
+    /// truncation, not headroom", and re-pins it. What must never happen
+    /// silently is the other direction — slack reappearing, or growing, with
+    /// nobody looking.
     ///
     /// # What the zero actually costs
     ///
@@ -3271,11 +3232,11 @@ mod tests {
     /// already fails that test — what saves Rust turns is the byte guard
     /// binding first, at 6.8 B/word. The class the byte guard does not save is
     /// AC-9's `numeric_grid.txt` (2.00 tokens/word at 2.00 B/word), measured in
-    /// `tests/token_corpus.rs` at 20,480 real tokens against these 15,360.
+    /// `tests/token_corpus.rs` at 42,324 real tokens against these 31,744.
     ///
     /// So "raise the ratio" — not lower it — is the change that would buy
     /// coverage, and it costs words on every route: at 2/1 the local budget
-    /// would be 7,680 words rather than 10,240. That trade is REQ-590's to
+    /// would be 15,872 words rather than 21,162. That trade is REQ-590's to
     /// leave open, not this test's to make.
     #[test]
     fn the_local_word_budgets_slack_is_exactly_zero_by_design() {
@@ -3292,24 +3253,26 @@ mod tests {
         let claimed = local.budget_tokens * REMOTE_TOKENS_PER_WORD_NUM / REMOTE_TOKENS_PER_WORD_DEN;
 
         assert_eq!(
-            claimed, usable,
+            usable - claimed,
+            1,
             "the local word budget ({} words) claims {claimed} provider tokens against {usable} \
              the engine has left after the {LOCAL_GENERATION_RESERVATION}-token generation. \
-             REQ-590 D-3 chose a gap of exactly 0 (ADR-6): if you meant to restore a margin, say \
-             so here and record what it costs. If this moved by 1, it is integer truncation — \
-             usable ({usable}) is no longer a multiple of {REMOTE_TOKENS_PER_WORD_NUM} — which is \
-             a rounding artifact rather than headroom",
+             REQ-590 D-3 chose a gap of exactly 0 (ADR-6), and on the 32,768-token window \
+             integer division leaves exactly 1 — usable ({usable}) is not a multiple of \
+             {REMOTE_TOKENS_PER_WORD_NUM} — which is a rounding artifact rather than headroom. \
+             If the gap is 0 the window or reservation moved to a multiple of three; re-pin it. \
+             If it is larger, a margin has appeared: say so here and record what it costs",
             local.budget_tokens
         );
         // The same round trip, straight out of the production constants, so the
-        // equality above cannot be read as a property of 15,360 alone.
+        // pin above cannot be read as a property of 31,744 alone.
         assert_eq!(
             claim_at(
                 usable,
                 REMOTE_TOKENS_PER_WORD_NUM,
                 REMOTE_TOKENS_PER_WORD_DEN
             ),
-            usable
+            usable - 1
         );
 
         // Guess 1: the reservation is a margin dial. It is not — measured over
@@ -3378,23 +3341,21 @@ mod tests {
         );
     }
 
-    /// **AC-1: one formula, driven from both sides — on the word half.** The
-    /// local tier's word budget is exactly what a *provider* declaring the same
-    /// window under the same reservation derives.
+    /// **AC-1: one formula, driven from both sides.** The local tier's pair is
+    /// exactly what a *provider* declaring the same window under the same
+    /// reservation derives — both halves, since the window went to 32,768.
     ///
-    /// Two things differ, and both are deliberate: the **bound** they stamp,
-    /// because only one of them has a `capabilities.max_context` behind it
-    /// (BR-6); and the **byte** half, because ADR-9 reversed D-4 and the local
-    /// arm takes [`LOCAL_BUDGET_BYTES`] where a declaration takes the window's
-    /// 2 B/token bridge. The byte disagreement is asserted here rather than
-    /// merely tolerated — it is the one place a reader sees both numbers at
-    /// once and can check which is larger.
+    /// One thing differs, deliberately: the **bound** they stamp, because only
+    /// one of them has a `capabilities.max_context` behind it (BR-6). (On the
+    /// 16,384-token window the byte halves differed too — ADR-9 held the local
+    /// one at [`LOCAL_BUDGET_BYTES`] because the window bridge was the smaller
+    /// number there; the agreement asserted below is what retires that.)
     ///
     /// The hand arithmetic is asserted too, so the two sides moving together
     /// cannot hide a move: an equality between two calls into one function is a
     /// tautology the moment the function is wrong in both.
     #[test]
-    fn the_local_word_half_is_what_the_same_window_declared_would_derive() {
+    fn the_local_pair_is_what_the_same_window_declared_would_derive() {
         assert_eq!(
             RESERVATION, LOCAL_GENERATION_RESERVATION,
             "the declared side must run under the reservation the local arm reads, or `the same \
@@ -3413,27 +3374,24 @@ mod tests {
              not really shared"
         );
         assert_eq!((local.floored, declared.floored), (false, false));
-        // usable = 16,384 − 1,024 = 15,360; ×2/3 = 10,240 words, both sides.
-        assert_eq!(local.budget_tokens, 10_240);
+        // usable = 32,768 − 1,024 = 31,744; ×2/3 = 21,162 words, both sides.
+        assert_eq!(local.budget_tokens, 21_162);
 
-        // The byte halves part company, by 2,048 B, in the direction ADR-9
-        // measured: the window bridge is the *smaller* one, which is why
-        // deriving it was a regression on byte-dense content rather than a fix.
+        // And the byte halves agree too: both are the window's 2 B/token
+        // bridge, 31,744 × 2 = 63,488.
         assert_eq!(
             (local.budget_bytes, declared.budget_bytes),
-            (32_768, 30_720),
-            "REQ-590 ADR-9: local keeps the word-bridged constant, a declaration takes the \
-             window's 2 B/token bridge"
+            (63_488, 63_488),
+            "the local arm and a same-sized declaration take the same window bridge"
         );
-        assert!(declared.budget_bytes < local.budget_bytes);
-        // …and so do the byte thresholds that scale off them: 32,768 × 12,000 /
-        // 32,768 = 12,000 against 30,720 × 12,000 / 32,768 = 11,250.
+        // …and so do the byte thresholds that scale off them: 63,488 × 12,000 /
+        // 32,768 = 23,250, both sides.
         assert_eq!(
             (
                 local.digest_threshold_bytes,
                 declared.digest_threshold_bytes
             ),
-            (12_000, 11_250)
+            (23_250, 23_250)
         );
 
         // The one thing that differs, and the reason the arm exists at all.
@@ -3492,7 +3450,7 @@ mod tests {
     /// reason is REQ-591's LESSON-564: a claim about `RouteBudget`'s fields is
     /// a claim about a struct, and the struct was never the thing in doubt.
     /// What was in doubt is whether a user whose local budget moved from 4,096
-    /// to 10,240 words can find out *why*. So every assertion here is a
+    /// to 21,162 words can find out *why*. So every assertion here is a
     /// substring of the sentence, and the two numbers are recomputed from the
     /// constants rather than written out — a reservation that moved and a
     /// sentence that did not is the failure this test exists to catch, and it
@@ -3500,9 +3458,10 @@ mod tests {
     ///
     /// # The arithmetic is stated so the reader can check it
     ///
-    /// `16,384 − 1,024 = 15,360`, `15,360 × 2/3 = 10,240` — the word figure the
-    /// sentence quotes beside this clause. Asserted here as a relation so that
-    /// a clause naming numbers which no longer produce the pair goes red.
+    /// `32,768 − 1,024 = 31,744`, `31,744 × 2/3 = 21,162` and `31,744 × 2 =
+    /// 63,488` — the two figures the sentence quotes beside this clause.
+    /// Asserted here as relations so that a clause naming numbers which no
+    /// longer produce the pair goes red.
     ///
     /// # AC-6's pairing, and the one place it differs from the criterion
     ///
@@ -3558,17 +3517,18 @@ mod tests {
             local.budget_tokens
         );
 
-        // And it does not claim the byte half, which is the constant
-        // ([`LOCAL_BUDGET_BYTES`]) and not window-derived at all since ADR-9.
+        // And it claims the byte half too, which is honest only because both
+        // halves really do derive from the window since it went to 32,768.
         assert!(
-            clause.contains("the byte half is fixed"),
-            "ADR-9: the clause must not imply both halves came from the window — the byte half \
-             is a constant, and a reader who tries to reconcile it against the window cannot: \
-             {clause}"
+            clause.contains("both halves come from the engine's"),
+            "the clause must say both halves came from the window, now that they do: {clause}"
         );
         assert_eq!(
-            local.budget_bytes, LOCAL_BUDGET_BYTES,
-            "…which is only honest while it really is the constant"
+            usable * DUTY_REQUEST_BYTES_PER_TOKEN,
+            local.budget_bytes,
+            "…which is only honest while the byte half really is the window bridge; on the \
+             16,384-token window it was the constant and the clause said `the byte half is \
+             fixed` (ADR-9)"
         );
 
         // -- AC-6: no remedy on this arm, against one that has it ------------
@@ -3618,10 +3578,10 @@ mod tests {
     /// engine's window would be caught here rather than in a surface that
     /// prints a window nobody declared.
     ///
-    /// It is asserted on the word half specifically, because since ADR-9 the
-    /// two arms *do* return the same byte half — both read
-    /// [`LOCAL_BUDGET_BYTES`] — so an inequality on the pair as a whole would
-    /// be carried entirely by words while reading as though it covered both.
+    /// Both halves differ now: on the 16,384-token window the two arms shared
+    /// the byte half (both read [`LOCAL_BUDGET_BYTES`], ADR-9), so the
+    /// inequality was on words alone; at 32,768 the local byte half derives
+    /// too, and the second inequality below is what says so.
     #[test]
     fn a_declared_window_of_zero_still_yields_the_default_pair() {
         assert_eq!(LOCAL_BUDGET_TOKENS, 4_096);
@@ -3640,29 +3600,30 @@ mod tests {
             defaulted.budget_tokens, local.budget_tokens,
             "the two arms return different word budgets now, which is what makes this row a test"
         );
-        assert_eq!(
+        assert_ne!(
             defaulted.budget_bytes, local.budget_bytes,
-            "and they return the same byte budget, because ADR-9 left the local byte half on this \
-             very constant — so the row above must be read as the word half's, not the pair's"
+            "and different byte budgets too, since the local byte half derives from the \
+             32,768-token window rather than reading this constant (it did read it on the \
+             16,384-token window — ADR-9)"
         );
     }
 
     /// **AC-15 (BR-8): the floor may never raise the local pair above what the
     /// engine can hold.**
     ///
-    /// Latent at today's constants — the helper's 10,240 words / 30,720 bytes
+    /// Latent at today's constants — the helper's 21,162 words / 63,488 bytes
     /// are nowhere near the 2,048-word / 16,384-byte floor — so it is exercised
     /// at a **synthetic** window, on the same helper the local arm runs, paired
     /// with a window large enough that the floor does not bite. A criterion
     /// that can only run on a configuration nobody ships is a criterion that
     /// never runs.
     ///
-    /// **Scope, since ADR-9.** This is a property of [`window_pair`]. The local
-    /// route takes only the helper's *word* half; its byte half is
-    /// [`LOCAL_BUDGET_BYTES`], which the floor never touches and which is
-    /// deliberately larger than a 16,384-token engine holds. So the byte
-    /// assertions below say what the helper would give a small engine, not what
-    /// the local route runs under today.
+    /// **Scope.** This is a property of [`window_pair`], and since the window
+    /// went to 32,768 the local route takes both of the helper's halves, so the
+    /// assertions below are about the local route's own pair at every window
+    /// swept. (On the 16,384-token window the byte half was
+    /// [`LOCAL_BUDGET_BYTES`] instead — ADR-9 — and the byte leg here was a
+    /// statement about the helper alone.)
     ///
     /// The last block is what makes the small row non-vacuous: put the *same*
     /// window through [`Floor::RaisesADeclaration`] and the floor does raise it
@@ -3692,7 +3653,7 @@ mod tests {
         }
 
         // The large window is not passing because the floor never applies: at
-        // 16,384 both policies agree, which is exactly AC-1's claim.
+        // 32,768 both policies agree, which is exactly AC-1's claim.
         assert_eq!(
             window_pair(
                 LOCAL_ENGINE_N_CTX,
@@ -4134,7 +4095,7 @@ mod tests {
         assert_eq!(got.bound, BudgetBound::LocalEngine);
         assert_eq!(
             (got.budget_tokens, got.budget_bytes),
-            (10_240, LOCAL_BUDGET_BYTES),
+            (21_162, 63_488),
             "a 200k window on a local route must not move the engine's pair"
         );
         assert_eq!(derive(local_all), got, "nor must the window move it at all");
@@ -4150,9 +4111,10 @@ mod tests {
             derive(remote(0, 0, true)).bound,
             BudgetBound::DefaultUnknown
         );
-        // RedactScan > UserCap: both bite, the clamp is last and names it.
+        // RedactScan > UserCap: both bite, the clamp is last and names it
+        // (an 80k cap derives 157,952 B, over the 141,224 scannable bound).
         assert_eq!(
-            derive(remote(200_000, 60_000, true)).bound,
+            derive(remote(200_000, 80_000, true)).bound,
             BudgetBound::RedactScan
         );
         // RedactScan > Window.
@@ -4186,32 +4148,32 @@ mod tests {
     }
 
     /// **D-3, accepted**: the local route's `digest` thresholds follow its
-    /// pair — so exactly the half of the pair that moved is the half of the
-    /// thresholds that moved.
+    /// pair — both halves, now that both halves of the pair derive.
     ///
-    /// Words rise 1,500 → 3,750 because the word budget rose 4,096 → 10,240.
-    /// Bytes stay **byte-identical at 12,000** because ADR-9 reversed D-4 and
-    /// the byte budget never left [`LOCAL_BUDGET_BYTES`]. The earlier draft of
-    /// this REQ moved them in *opposite* directions (12,000 → 11,250) as a
-    /// consequence of a byte half that fell; that is gone with the fall.
+    /// Words rise 1,500 → 7,749 because the word budget rose 4,096 → 21,162;
+    /// bytes rise 12,000 → 23,250 because the byte budget rose 32,768 → 63,488
+    /// with the window. (On the 16,384-token window the byte half stayed
+    /// byte-identical at 12,000, because ADR-9 held the byte budget at
+    /// [`LOCAL_BUDGET_BYTES`]; REQ-590's earlier draft even moved it *down*, to
+    /// 11,250, as a consequence of a byte half that fell.)
     ///
-    /// The `assert_ne!`/`assert_eq!` pair below is what makes this a test of
-    /// the *scaling* rather than of two literals: one half tracks a budget that
-    /// moved, the other tracks one that did not, and both come out of the same
-    /// `digest_thresholds` call.
+    /// Both halves are asserted above the constants' own thresholds, so this
+    /// is a test of the *scaling* rather than of two literals: both track a
+    /// budget that moved, and both come out of the same `digest_thresholds`
+    /// call.
     #[test]
     fn digest_thresholds_on_the_local_route_follow_its_derived_pair() {
         let local = derive(BudgetInputs::local());
-        // 10,240 × 1,500 / 4,096 = 3,750;  32,768 × 12,000 / 32,768 = 12,000.
+        // 21,162 × 1,500 / 4,096 = 7,749;  63,488 × 12,000 / 32,768 = 23,250.
         assert_eq!(
             (local.digest_threshold_tokens, local.digest_threshold_bytes),
-            (3_750, 12_000)
+            (7_749, 23_250)
         );
         assert!(local.digest_threshold_tokens > LOCAL_DIGEST_THRESHOLD_TOKENS);
-        assert_eq!(
-            local.digest_threshold_bytes, LOCAL_DIGEST_THRESHOLD_BYTES,
-            "the local byte budget is the constant, so its byte threshold is the constant's own \
-             threshold — unchanged since before REQ-586"
+        assert!(
+            local.digest_threshold_bytes > LOCAL_DIGEST_THRESHOLD_BYTES,
+            "the local byte budget derives from the window, so its byte threshold is above the \
+             constant's own"
         );
     }
 
@@ -4550,8 +4512,18 @@ mod tests {
     const STATUS_BODY_BYTES: usize = 5_323;
 
     /// The measured size of `~/.claude/skills/proceed/SKILL.md` on the same
-    /// day: 49.8 KiB, the largest skill BR-8's 64 KiB discovery cap admits.
+    /// day: 49.8 KiB, the largest skill in the ADLC toolkit (BR-8's discovery
+    /// cap was 64 KiB then; it is 128 KiB since the engine window went to
+    /// 32,768).
     const PROCEED_BODY_BYTES: usize = 51_037;
+
+    /// A body that does **not** fit the local tier: ~88 KiB at the corpus
+    /// density, 1.4× the 63,488-byte local budget and under the 128 KiB
+    /// discovery cap. `/proceed` used to play this part — it was over the
+    /// 32,768-byte budget of the 16,384-token window — and fits now, so the
+    /// tests that need a local-tier refusal read this instead of a real
+    /// skill's size.
+    const OVERSIZED_BODY_BYTES: usize = 90_000;
 
     /// What `/status`'s four `` !`command` `` slots really produce in this
     /// repository, measured the same day: the ethos include (3,812 B) plus
@@ -4610,10 +4582,17 @@ mod tests {
     ///
     /// | route | budget | `/status` (5,323 B) | `/proceed` (51,037 B) |
     /// |---|---|---|---|
-    /// | local tier | 4,096 w / 32,768 B | 12,572 B ✓ | 58,286 B ✗ |
+    /// | local tier | 21,162 w / 63,488 B | 12,572 B ✓ | 58,286 B ✓ |
     /// | `max_context = 128000` | 84,650 w / 253,952 B | ✓ | 58,286 B ✓ |
     /// | `max_context = 0` | 4,096 w / 32,768 B | ✓ | 58,286 B ✗ |
     /// | `max_context = 4096` | 2,048 w / 16,384 B | 12,572 B ✓ | ✗ |
+    ///
+    /// The local row's `/proceed` cell flipped when the engine window went to
+    /// 32,768: the largest shipped ADLC skill fits the local tier's Stage A
+    /// budget with ~5 KB to spare (it was refused against 4,096 w / 32,768 B,
+    /// and again against REQ-590's 10,240 w / 32,768 B on bytes). The tests
+    /// that need a local-tier refusal size their body off
+    /// [`OVERSIZED_BODY_BYTES`] instead.
     ///
     /// The last row is BR-8(d) in one line, and why the stages exist: on the
     /// Ollama-shaped route `/status`'s **body** fits with room to spare, so it
@@ -4640,7 +4619,7 @@ mod tests {
                 derive(BudgetInputs::local()),
                 "proceed",
                 &proceed,
-                false,
+                true,
             ),
             (
                 "max_context = 128000",
@@ -4705,7 +4684,7 @@ mod tests {
     #[test]
     fn the_refusal_names_the_skill_its_size_the_budget_and_the_bound() {
         let system = real_system_prompt();
-        let proceed = corpus_body(PROCEED_BODY_BYTES);
+        let proceed = corpus_body(OVERSIZED_BODY_BYTES);
         let budget = derive(BudgetInputs::local());
         let message = refusal(
             SkillStage::Body,
@@ -4730,10 +4709,10 @@ mod tests {
             )),
             "the measured size, surcharge included ({words} words / {bytes} B): {message}"
         );
-        // The budget — the local route's own pair, `10,240 words / 32 KB`
-        // since REQ-590, read off the value the refusal was handed rather than
-        // off `LOCAL_BUDGET_TOKENS`, which this route's word half no longer
-        // runs under (ADR-2/ADR-4; its byte half still does — ADR-9).
+        // The budget — the local route's own pair, `21,162 words / 63 KB`
+        // since REQ-590 and the 32,768-token window, read off the value the
+        // refusal was handed rather than off `LOCAL_BUDGET_*`, which this route
+        // no longer runs under in either currency (ADR-2/ADR-4).
         assert!(
             message.contains(&format!(
                 "the budget is {} words / {}",
@@ -4762,7 +4741,7 @@ mod tests {
     #[test]
     fn the_bound_is_spoken_never_spelled() {
         let system = real_system_prompt();
-        let proceed = corpus_body(PROCEED_BODY_BYTES);
+        let proceed = corpus_body(OVERSIZED_BODY_BYTES);
 
         let local = refusal(
             SkillStage::Body,
@@ -5073,7 +5052,7 @@ mod tests {
     #[test]
     fn a_model_invoked_refusal_names_the_skill_without_a_slash_and_says_what_did_not_happen() {
         let system = real_system_prompt();
-        let proceed = corpus_body(PROCEED_BODY_BYTES);
+        let proceed = corpus_body(OVERSIZED_BODY_BYTES);
         let message = message_of(skill_append_fit(
             SkillCaller::Model,
             SkillStage::Body,
@@ -5180,7 +5159,7 @@ mod tests {
             "proceed",
             &system,
             "run it",
-            &corpus_body(PROCEED_BODY_BYTES),
+            &corpus_body(OVERSIZED_BODY_BYTES),
             &derive(BudgetInputs::local()),
             None,
         );
@@ -5692,7 +5671,7 @@ mod tests {
                  pair's",
                 BudgetInputs::local(),
                 BudgetBound::LocalEngine,
-                measured(5_000, 40_000, false),
+                measured(25_000, 100_000, false),
                 WindowVerdict::WindowUnknown,
                 RemedyKind::BindTierRemote,
             ),
@@ -6137,7 +6116,7 @@ mod tests {
     #[test]
     fn the_three_sentences_share_one_head_and_differ_only_in_the_tail() {
         let system = real_system_prompt();
-        let proceed = corpus_body(PROCEED_BODY_BYTES);
+        let proceed = corpus_body(OVERSIZED_BODY_BYTES);
         let words = crate::harness::context::approx_tokens(&system)
             + crate::harness::context::approx_tokens(&proceed);
         let bytes = system.len() + proceed.len() + SEED_OVERHEAD_BYTES;
@@ -6284,7 +6263,7 @@ mod tests {
             (
                 "the local engine has no window fact",
                 BudgetInputs::local(),
-                measured(5_000, 40_000, false),
+                measured(25_000, 100_000, false),
                 WindowVerdict::WindowUnknown,
             ),
             (
@@ -6528,7 +6507,7 @@ mod tests {
     fn a_local_engine_offer_names_both_halves_and_what_rebinding_costs() {
         let offer = offer_over(
             BudgetInputs::local(),
-            measured(5_000, 40_000, false),
+            measured(25_000, 100_000, false),
             Some(kimi_proposal()),
             Some(Tier::Think),
         );
@@ -6612,7 +6591,7 @@ mod tests {
         for (name, window, provenance) in rows {
             let mut offer = offer_over(
                 BudgetInputs::local(),
-                measured(5_000, 40_000, false),
+                measured(25_000, 100_000, false),
                 Some(proposal.clone()),
                 Some(Tier::Think),
             );
@@ -6683,7 +6662,7 @@ mod tests {
     fn an_unnamed_rebind_states_the_fix_without_naming_a_provider() {
         let offer = offer_over(
             BudgetInputs::local(),
-            measured(5_000, 40_000, false),
+            measured(25_000, 100_000, false),
             Some(kimi_proposal()),
             Some(Tier::Think),
         );
@@ -6805,7 +6784,7 @@ mod tests {
             (
                 "bind a tier",
                 BudgetInputs::local(),
-                measured(5_000, 40_000, false),
+                measured(25_000, 100_000, false),
                 Some(Tier::Build),
                 "bind the `build` tier to a remote provider",
             ),
@@ -7064,7 +7043,7 @@ mod tests {
     fn a_project_sourced_name_is_marked_and_the_refusal_is_left_alone() {
         let offer = offer_over(
             BudgetInputs::local(),
-            measured(5_000, 40_000, false),
+            measured(25_000, 100_000, false),
             None,
             Some(Tier::Think),
         );

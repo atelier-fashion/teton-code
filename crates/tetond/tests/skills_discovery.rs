@@ -827,7 +827,7 @@ fn every_entry_that_is_not_registered_is_counted_and_named() {
         ),
         (
             fixture.path("home/.claude/commands/big.md"),
-            "over 64 KiB (65,553 B)".to_owned(),
+            "over 128 KiB (131,089 B)".to_owned(),
         ),
         (
             fixture.path("home/.claude/commands/binary.md"),
@@ -853,7 +853,7 @@ fn every_entry_that_is_not_registered_is_counted_and_named() {
          for `agents/`, `.git/`, `notes.txt`, or the two absent project roots"
     );
     assert_eq!(
-        big_bytes, 65_553,
+        big_bytes, 131_089,
         "the fixture's size is the figure the reason quotes"
     );
 }

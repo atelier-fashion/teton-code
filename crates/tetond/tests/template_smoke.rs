@@ -43,7 +43,7 @@ use tetond::harness::{
 /// The generation window the daemon loads the local tier with
 /// (`runtime::LOCAL_ENGINE_N_CTX`), mirrored here so the smoke runs the same
 /// shape production does.
-const SMOKE_N_CTX: u32 = 16_384;
+const SMOKE_N_CTX: u32 = 32_768;
 
 #[tokio::test]
 #[ignore = "requires real weights at $TETON_TEST_GGUF and cmake to build llama.cpp"]

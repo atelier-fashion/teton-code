@@ -52,7 +52,7 @@ pub const DOCS_TOOL_NAME: &str = "teton_docs";
 ///
 /// A topic is a *tool result*, not resident prompt, so the constraint is not the
 /// prompt budget but the conversation it lands in: against the local engine's
-/// 16,384-token window, 4 KiB is roughly a thousand tokens, which keeps a full
+/// 32,768-token window, 4 KiB is roughly a thousand tokens, which keeps a full
 /// docs read a small fraction of the window. A topic that grew past this could
 /// evict the very turn it was fetched to serve — the failure that reads to a
 /// user as the agent forgetting what they asked (LESSON-482).

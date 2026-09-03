@@ -2567,14 +2567,14 @@ mod tests {
         assert_eq!(silent.bound, BudgetBound::DefaultUnknown);
 
         // The local tier: **its own** pair since REQ-590, derived from the
-        // engine's `n_ctx` (16,384) less the generation reservation (1,024) by
+        // engine's `n_ctx` (32,768) less the generation reservation (1,024) by
         // the same formula every declared window runs — not the no-better-fact
         // pair above. Classified from the routing table's local provider id
         // (gotcha #9): it has no `[[providers]]` entry at all, so a
         // "capabilities look defaulted" test would have called `silent` local
         // too.
         let local = router.budget_for(Some("local"));
-        assert_eq!((local.budget_tokens, local.budget_bytes), (10_240, 32_768));
+        assert_eq!((local.budget_tokens, local.budget_bytes), (21_162, 63_488));
         assert_eq!(local.bound, BudgetBound::LocalEngine);
         // Two facts, and REQ-590 moved one of them. The bound was the *only*
         // discriminator while the two arms returned one pair; the pair is now a
@@ -2693,28 +2693,30 @@ mod tests {
     /// running code at `5a2ee33`, not hand-computed, so it is a record of
     /// behaviour rather than a restatement of the arithmetic.
     ///
-    /// **One half of one row has moved since, deliberately** (REQ-590
-    /// TASK-270, D-3 as amended by ADR-9). `local_engine` no longer returns the
-    /// no-better-fact pair's *word* half: it derives from the engine's own
-    /// window like every other window-derived route, so `10240` replaces
-    /// `4096`. Its word digest threshold follows, `1500 → 3750`.
+    /// **One row has moved since, deliberately, in two steps.** REQ-590
+    /// (TASK-270, D-3 as amended by ADR-9) stopped `local_engine` returning the
+    /// no-better-fact pair's *word* half: it derived from the engine's own
+    /// 16,384-token window like every other window-derived route, so `10240`
+    /// replaced `4096` and the word digest threshold followed, `1500 → 3750`,
+    /// while the byte half stayed the `32768` constant (D-4 had derived it —
+    /// `30720` — and was reversed on measurement; see ADR-9). Then the window
+    /// went to 32,768 and both halves derive: `21162 / 63488`, digest
+    /// thresholds `7749 / 23250`. The reasoning is at
+    /// [`derive`](crate::harness::budget::derive)'s local arm rather than left
+    /// to be inferred from this table.
     ///
-    /// Its **byte** half is unchanged at `32768`, and so is its byte digest
-    /// threshold at `12000`. D-4 briefly took the window-derived byte half here
-    /// too (`30720`, which would have dragged the byte digest threshold *down*
-    /// to `11250`) and was reversed on measurement — see ADR-9. The asymmetry
-    /// that survives is that one half of this pair is derived and the other is
-    /// the constant, which is stated at [`derive`](crate::harness::budget::derive)'s
-    /// local arm rather than left to be inferred from this table.
+    /// The `redact_scan` row moved with the window too — its byte half is the
+    /// scannable bound, which derives from the engine window through the scan's
+    /// chunk cap: `88196 → 141224`, byte digest threshold `32298 → 51717`.
     ///
-    /// The other four rows are byte-identical to the capture, which is what
-    /// says REQ-590 touched the local arm and nothing else.
+    /// The other three rows are byte-identical to the capture, which is what
+    /// says the window touched the two window-derived arms and nothing else.
     const BUDGET_FOR_GOLDEN: [&str; 5] = [
-        "local_engine: RouteBudget { budget_tokens: 10240, budget_bytes: 32768, bound: LocalEngine, window_label: \"the local context window\", digest_threshold_tokens: 3750, digest_threshold_bytes: 12000, floored: false, provider_id: None }",
+        "local_engine: RouteBudget { budget_tokens: 21162, budget_bytes: 63488, bound: LocalEngine, window_label: \"the local context window\", digest_threshold_tokens: 7749, digest_threshold_bytes: 23250, floored: false, provider_id: None }",
         "default_unknown: RouteBudget { budget_tokens: 4096, budget_bytes: 32768, bound: DefaultUnknown, window_label: \"silent's context window\", digest_threshold_tokens: 1500, digest_threshold_bytes: 12000, floored: false, provider_id: Some(\"silent\") }",
         "window: RouteBudget { budget_tokens: 84650, budget_bytes: 253952, bound: Window, window_label: \"wide's context window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 93000, floored: false, provider_id: Some(\"wide\") }",
         "user_cap: RouteBudget { budget_tokens: 25984, budget_bytes: 77952, bound: UserCap, window_label: \"capped's context window\", digest_threshold_tokens: 9515, digest_threshold_bytes: 28546, floored: false, provider_id: Some(\"capped\") }",
-        "redact_scan: RouteBudget { budget_tokens: 84650, budget_bytes: 88196, bound: RedactScan, window_label: \"the redact-scannable window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 32298, floored: false, provider_id: Some(\"wide\") }",
+        "redact_scan: RouteBudget { budget_tokens: 84650, budget_bytes: 141224, bound: RedactScan, window_label: \"the redact-scannable window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 51717, floored: false, provider_id: Some(\"wide\") }",
     ];
 
     /// **REQ-589 TASK-259.** What the accessor is *for*: the provider's declared

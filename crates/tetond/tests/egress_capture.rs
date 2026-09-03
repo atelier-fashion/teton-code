@@ -1183,12 +1183,13 @@ fn over_budget_skill_trees(tag: &str) -> (std::path::PathBuf, std::path::PathBuf
     let root = base.join("repo");
     let home = base.join("home");
     // Comfortably past the local pair in **both** currencies, at four bytes a
-    // word (`"abc "`), and comfortably inside discovery's 64 KiB ceiling for one
-    // `SKILL.md`.
+    // word (`"abc "`), and comfortably inside discovery's 128 KiB ceiling for
+    // one `SKILL.md`.
     //
     // Sized off the derived pair rather than a literal, and that is not a
     // tidiness point: this fixture read `6_000` — chosen when the local word
-    // budget was 4,096 — and REQ-590 raised that budget to 10,240, at which
+    // budget was 4,096 — and REQ-590 raised that budget to 10,240 (21,162 on
+    // the 32,768-token window), at which
     // point the bodies were no longer over budget in words at all. The
     // `skill_fit` guard below is what said so, which is the shape this file's
     // own doc promises ("shrink them and this test says so"). Reading the

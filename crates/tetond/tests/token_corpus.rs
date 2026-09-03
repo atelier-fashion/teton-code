@@ -99,13 +99,15 @@ const EXPECTED_SAMPLES: [&str; 6] = [
 const PROSE_SAMPLE: &str = "prose.txt";
 
 /// The token-dense, **byte-light** sample REQ-590 AC-9 measures the local word
-/// budget against: a 160 × 64 matrix of space-separated single digits — the
+/// budget against: a 3,527 × 6 matrix of space-separated single digits — the
 /// shape `numpy.savetxt(fmt="%d")` writes, and the shape a quantized raster,
-/// an occupancy mask or an adjacency matrix arrives in.
+/// an occupancy mask or a pose stream arrives in.
 ///
-/// Sized deliberately at **exactly one turn's full local word budget** (10,240
-/// words / 20,480 bytes), so the finding below is a measurement rather than an
-/// extrapolation from a smaller file.
+/// Sized deliberately at **exactly one turn's full local word budget** (21,162
+/// words / 42,324 bytes on the 32,768-token window; it was 160 × 64 = 10,240
+/// words on the 16,384-token one), so the finding below is a measurement rather
+/// than an extrapolation from a smaller file. The shape is the budget's
+/// factorisation: 21,162 = 2 × 3 × 3,527, and 3,527 is prime.
 ///
 /// The density is a property of the *format*, not of this field: a random 0-9
 /// grid, a sparse 0/1 mask and a run-heavy grid of the same shape all measure
@@ -127,7 +129,7 @@ const DENSE_BYTE_LIGHT_SAMPLE: &str = "numeric_grid.txt";
 /// * `numeric_grid.txt` — REQ-590 AC-9's sample, and the more uncomfortable
 ///   entry: it is under the floor in **both** currencies at once (1.00 B/token
 ///   *and* 2.00 tokens/word against 1.5), so the estimate falls 25% short —
-///   15,360 against 20,480. Base64 at least spends its byte budget fast enough
+///   31,743 against 42,324. Base64 at least spends its byte budget fast enough
 ///   that a *full-budget* turn of it is small; this one is byte-light, so a
 ///   full-budget turn of it is admitted whole. That is the AC-9 finding, and
 ///   [`a_full_word_budget_turn_of_token_dense_byte_light_content_overruns_the_engine`]
@@ -351,12 +353,12 @@ fn words_guard_alone_covers_prose_but_not_dense_content() {
 /// **REQ-590 AC-9 (BR-10): the quadrant the byte guard cannot see, measured
 /// with a real tokenizer — and it does not fit.**
 ///
-/// D-3 took the full engine window, so the local **word** half is exactly
-/// saturating: `10,240 × 3/2 = 15,360 = usable` (ADR-6; the zero gap is pinned
-/// at its definition site by
+/// D-3 took the full engine window, so the local **word** half is saturating:
+/// `21,162 × 3/2 = 31,743 = usable − 1` (ADR-6; the one-token gap is integer
+/// truncation, pinned at its definition site by
 /// `budget::tests::the_local_word_budgets_slack_is_exactly_zero_by_design`).
-/// Zero margin means every class denser than 1.5 real tokens per whitespace
-/// word overruns the engine at full budget.
+/// No margin means every class denser than 1.5 real tokens per whitespace word
+/// overruns the engine at full budget.
 ///
 /// Ordinary Rust already is denser — 1.69 tokens/word. What saves those turns
 /// is not the ratio but the **byte** guard: at 6.8 B/word, Rust spends the byte
@@ -368,43 +370,38 @@ fn words_guard_alone_covers_prose_but_not_dense_content() {
 ///
 /// | | value |
 /// |---|---|
-/// | sample | 10,240 words / 20,480 bytes — a full-word-budget turn |
-/// | admitted by the word guard | 10,240 ≤ 10,240 — exactly at the budget |
-/// | admitted by the byte guard | 20,480 ≤ 32,768 — 12,288 bytes to spare |
-/// | the budget claims | 15,360 provider tokens |
-/// | it really costs | **20,480** provider tokens |
-/// | overrun | **+5,120 tokens, 1.33× the engine's usable window** |
+/// | sample | 21,162 words / 42,324 bytes — a full-word-budget turn |
+/// | admitted by the word guard | 21,162 ≤ 21,162 — exactly at the budget |
+/// | admitted by the byte guard | 42,324 ≤ 63,488 — 21,164 bytes to spare |
+/// | the budget claims | 31,743 provider tokens |
+/// | it really costs | **42,324** provider tokens |
+/// | overrun | **+10,581 tokens, 1.33× the engine's usable window** |
 ///
 /// So a turn of this class passes both guards and is 33% over the window
-/// before the 1,024-token generation is even counted.
+/// before the 1,024-token generation is even counted. The ratio is the same as
+/// it was on the 16,384-token window (20,480 against 15,360), because it is a
+/// property of the format — 2.00 tokens/word against a 1.5 ratio — and not of
+/// the window.
 ///
-/// **This finding did not move when D-4 did.** The byte half was 30,720 while
-/// D-4 stood and is 32,768 since ADR-9 reversed it; the sample is 20,480 bytes
-/// and is admitted at both, at the same 20,480 real tokens against the same
-/// 15,360 usable. That is not a coincidence to note in passing — it is the
-/// evidence ADR-9 turned on. No byte value in this range catches this class,
-/// so lowering the byte half bought nothing here while costing a 6.25% refusal
-/// regression on ordinary code. Only a real tokenizer catches it, which is what
-/// this test is.
+/// **This finding did not move when D-4 did, either way.** On the 16,384-token
+/// window the byte half was 30,720 while D-4 stood and 32,768 after ADR-9
+/// reversed it; the 20,480-byte sample was admitted at both. On the
+/// 32,768-token window both halves derive and the byte half is 63,488; the
+/// 42,324-byte sample is admitted with a third of the byte budget to spare. No
+/// byte value in any of these ranges catches this class. Only a real tokenizer
+/// catches it, which is what this test is.
 ///
-/// # The two halves no longer claim the same number, and the difference is
-///   exactly the reservation (ADR-9)
+/// # Both halves claim the same number again (ADR-6a)
 ///
-/// While both halves were window-derived the pair was saturating in *both*
-/// currencies — `bytes / 2 = usable` as well (ADR-6a). Since ADR-9 the byte
-/// half is [`LOCAL_BUDGET_BYTES`](tetond::harness::budget::LOCAL_BUDGET_BYTES),
-/// 32,768, which at the 2 B/token floor claims **16,384** provider tokens: the
-/// engine's *whole* window, with nothing left for the reply. The word half
-/// claims 15,360, the usable window. The gap between the two claims is
-/// therefore `LOCAL_GENERATION_RESERVATION` exactly, 1,024 tokens.
-///
-/// **That 1,024-token overclaim is the residual ADR-9 knowingly accepted, not
-/// a new defect.** It is the state the local route ran under before REQ-590
-/// existed — 32,768 bytes has always claimed the whole window — and ADR-9's
-/// reasoning is that closing it would have cost the very case the REQ was
-/// opened for while catching nothing this test does not already catch. It is
-/// asserted below as a stated equality rather than left as an inequality,
-/// because a residual nobody can name the size of is one that grows.
+/// While both halves are window-derived the pair is saturating in *both*
+/// currencies — `bytes / 2 = usable` as well as `words × 3/2 ≈ usable`. Between
+/// REQ-590 ADR-9 and the window's raise to 32,768 that was not so: the byte
+/// half was the 32,768 constant, which at the 2 B/token floor claimed the
+/// engine's *whole* 16,384-token window, one generation's worth more than the
+/// word half — a residual ADR-9 accepted knowingly, and this test pinned as a
+/// stated equality. At 32,768 both halves derive from the window, the byte
+/// half claims exactly the usable window, and the residual is **zero** — pinned
+/// below in the same place, so that it cannot come back unnoticed.
 ///
 /// # Why this is recorded rather than fixed
 ///
@@ -437,33 +434,31 @@ fn a_full_word_budget_turn_of_token_dense_byte_light_content_overruns_the_engine
     // here it is the denominator every figure below is quoted against.
     let usable = words_estimate(local.budget_tokens as u64);
 
-    // **The residual ADR-9 accepted, pinned as a stated fact rather than
-    // hidden.** The byte half is the constant, so at the 2 B/token floor it
-    // claims the engine's *whole* window while the word half claims the usable
-    // one. The difference is the generation reservation, to the token — and
-    // saying so is the point: a byte-saturated local prompt is over the engine
-    // by 1,024 tokens before it is assembled, it was over by the same 1,024
-    // before REQ-590 existed, and nothing in this REQ closed it. ADR-9 records
-    // why closing it was declined: the byte value that would have closed it
-    // does not catch this sample either, and refuses ordinary code that serves
-    // today.
-    assert_eq!(
+    // **The residual ADR-9 accepted is closed, and pinned closed.** Both
+    // halves derive from the 32,768-token window, so at the 2 B/token floor the
+    // byte half claims exactly the usable window — the same number the word
+    // half claims, up to the one token integer division leaves on the word
+    // side. On the 16,384-token window the byte half was the constant and
+    // claimed one generation's worth more; that is the residual this block
+    // used to pin, and a byte half that stops deriving reddens here with the
+    // reason attached.
+    assert_ne!(
         local.budget_bytes,
         tetond::harness::budget::LOCAL_BUDGET_BYTES,
-        "ADR-9: the local byte half is the constant. If it has become window-derived again, the \
-         residual below is gone and this whole section needs rewriting rather than re-tuning"
+        "the local byte half derives from the window since it went to 32,768. If it is the \
+         constant again, ADR-9's one-generation residual is back and this section needs \
+         rewriting rather than re-tuning"
     );
-    assert_eq!(
-        bytes_estimate(local.budget_bytes as u64) - usable,
-        u64::from(LOCAL_GENERATION_RESERVATION),
-        "ADR-9's residual has changed size. The byte half ({} B) claims {} provider tokens and \
-         the word half claims {usable}; the two are supposed to differ by exactly the \
-         {LOCAL_GENERATION_RESERVATION}-token generation reservation, because the byte half \
-         bridges the *whole* window at the 2 B/token floor while the word half bridges the \
-         usable one. A different number here means one of the halves moved — record the new \
-         figure in ADR-9 rather than relaxing this assertion",
-        local.budget_bytes,
-        bytes_estimate(local.budget_bytes as u64)
+    let bytes_claim = bytes_estimate(local.budget_bytes as u64);
+    assert!(
+        bytes_claim >= usable && bytes_claim - usable <= 1,
+        "the byte half ({} B) claims {bytes_claim} provider tokens and the word half claims \
+         {usable}; the two are supposed to agree to within the one token integer division \
+         leaves on the word side, because both halves bridge the engine's usable window \
+         (31,744 = 32,768 − the {LOCAL_GENERATION_RESERVATION}-token generation reservation). \
+         A larger gap means one half has acquired a residual — record it rather than \
+         relaxing this assertion",
+        local.budget_bytes
     );
 
     // 1. The sample IS a full-budget turn, not a small file scaled up. The

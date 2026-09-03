@@ -83,7 +83,10 @@ fn degraded() -> CapabilityProfile {
     CapabilityProfile {
         tool_call_tier: ToolCallTier::Degraded,
         parallel_calls: false,
-        max_context: 32_000,
+        // Above the local engine's own 32,768-token window, so the declared
+        // window's pair is distinguishable from the default config's (which
+        // derives from that window).
+        max_context: 64_000,
         ..CapabilityProfile::default()
     }
 }

@@ -928,10 +928,10 @@ async fn a_payload_past_the_input_cap_blocks_unscanned_and_costs_no_model_call()
 /// **The blocker this change exists for, end to end.** A context-heavy remote
 /// send crosses the gate and reaches the wire.
 ///
-/// 40 KiB is the shape of an ordinary context-budget-full turn:
-/// `HarnessConfig::context_budget_bytes` is 32,768 and the system prompt, the
+/// ~66 KB is the shape of an ordinary context-budget-full turn:
+/// `HarnessConfig::context_budget_bytes` is 63,488 and the system prompt, the
 /// JSON envelope and the escaping ride on top of it. That is *over* one engine
-/// window ([`REDACT_CHUNK_MAX_BYTES`], 27,070) and *under* the total cap, and
+/// window ([`REDACT_CHUNK_MAX_BYTES`], 56,561) and *under* the total cap, and
 /// before chunked scanning it was refused: `ScanUnavailable`, fail-closed, and
 /// every such turn dead with `[privacy] redact = true`.
 ///
@@ -953,7 +953,7 @@ async fn a_context_budget_full_payload_is_scanned_across_windows_and_forwards() 
     );
     let egress = choke_point(&capture, &sink, Arc::clone(&gate));
 
-    let big = "the retry helper reads the manifest and writes one report line. ".repeat(640);
+    let big = "the retry helper reads the manifest and writes one report line. ".repeat(1_000);
     assert!(
         big.len() > REDACT_CHUNK_MAX_BYTES && big.len() < REDACT_INPUT_MAX_BYTES,
         "the fixture must be over one engine window and under the total cap: {}",
@@ -994,7 +994,7 @@ async fn a_context_budget_full_payload_is_scanned_across_windows_and_forwards() 
     // and it still blocks — so the scan really did look at the whole thing.
     let planted = format!(
         "{} {} at the end.",
-        "the retry helper reads the manifest and writes one report line. ".repeat(640),
+        "the retry helper reads the manifest and writes one report line. ".repeat(1_000),
         PATTERN_SENTINEL
     );
     let at = planted.find(PATTERN_SENTINEL).expect("fixture");
@@ -1042,7 +1042,7 @@ async fn a_context_budget_full_payload_is_scanned_across_windows_and_forwards() 
 /// true if a body assembled *at* the budget is a body the redactor will read.
 /// So the budget is derived here by the production function and then spent —
 /// the whole of it — through the real choke point, the real chunked scan and a
-/// real engine. Nothing in this file restates 89,127.
+/// real engine. Nothing in this file restates 141,224.
 ///
 /// ## The mutation this is TASK-192's target for
 ///
