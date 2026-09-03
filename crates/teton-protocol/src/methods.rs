@@ -2103,6 +2103,38 @@ pub enum ConfigUpdate {
         /// Whether every future session records a transcript.
         enabled: bool,
     },
+    /// Turn the repository-notes block on or off for **every future session**
+    /// (REQ-612 BR-2, architecture ADR-6) — the `[context] repo_file` key in
+    /// `config.toml`.
+    ///
+    /// **Persisted**, and the durable counterpart of [`SessionContextParams`],
+    /// exactly as [`Self::SetTranscriptEnabled`] is [`SessionTranscriptParams`]'s:
+    /// this variant is what survives a restart, while `/context off` moves one
+    /// live session and writes nothing. The asymmetry is the same one — what a
+    /// user typed for this session should not silently become what the daemon
+    /// does forever.
+    ///
+    /// A new variant, not a new RPC, so it inherits `config/set`'s gates whole
+    /// (ADR-5's reasoning, one REQ over): `refuse_daemon_wide` and
+    /// `refuse_unattested_commitment` both run before this is deserialized, for
+    /// every variant.
+    ///
+    /// **A struct variant** for [`Self::SetTranscriptEnabled`]'s reason, which is
+    /// the wire rather than taste: this enum is internally tagged
+    /// (`#[serde(tag = "op")]`), and serde cannot serialize a tagged newtype
+    /// variant whose content is a primitive. `SetRepoContextEnabled(bool)`
+    /// compiles and then fails at *runtime* with `cannot serialize tagged
+    /// newtype variant ... containing a boolean`, which is a refusal the user
+    /// meets at `teton context disable` rather than a build error the author
+    /// meets. `{ enabled }` gives the flat
+    /// `{"op":"set_repo_context_enabled","enabled":true}` and names the field
+    /// close to the config key it writes.
+    SetRepoContextEnabled {
+        /// Whether every future session reads the file at its root and carries
+        /// it. `false` means the mechanism does not run: no `stat`, no read, no
+        /// block (BR-2's "off means unopened").
+        enabled: bool,
+    },
 }
 
 /// Apply a configuration mutation.
@@ -2481,6 +2513,224 @@ impl RpcMethod for SessionTranscriptParams {
     // BR-6). Pinned from the outside by `only_the_prompt_method_ends_a_turn`.
     const METHOD: &'static str = "session/transcript";
     type Result = SessionTranscriptResult;
+}
+
+// ---------------------------------------------------------------------------
+// session/context (REQ-612)
+// ---------------------------------------------------------------------------
+
+/// Switch a session's repository notes on or off, or ask what they are doing
+/// (REQ-612 BR-2, architecture ADR-6) — the `/context` verb, modelled on
+/// [`SessionTranscriptParams`] line for line.
+///
+/// One method for all three answers for that type's reason: they are one
+/// question asked three ways, and a set that did not read back would let a
+/// client's status row drift from what the daemon actually made resident. The
+/// state it moves is **session-scoped and not persisted**, again like the
+/// transcript switch: the durable half is
+/// [`ConfigUpdate::SetRepoContextEnabled`] through `config/set`, and `/context
+/// off` writes nothing to `config.toml`.
+///
+/// Like [`SessionTranscriptParams`], this is a **client** RPC and never a
+/// harness tool, and the placement is the enforcement rather than a convention:
+/// tool dispatch and the client socket are structurally distinct channels, so a
+/// model that emits a tool call named `session/context` reaches nothing at all.
+/// That matters more here than it does for the transcript, because the content
+/// this switch governs is *itself* repository-authored: a `TETON.md` whose text
+/// reads `/context on` is describing nothing but itself, and there is no channel
+/// by which those bytes could turn the mechanism that carries them on or off
+/// (REQ-612 Permissions table, BR-4).
+///
+/// [`Self::action`] takes the `may_drive` gate for **all three** values,
+/// including [`ContextAction::Status`], for the reason
+/// [`SessionTranscriptParams`] takes it: on/off is a mutation, and the status
+/// answer names the file ([`SessionContextResult::file`]), which the broadcast
+/// [`crate::events::RepoContextState`] deliberately does not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionContextParams {
+    /// The session whose repository notes are being switched or read.
+    pub session_id: SessionId,
+    /// What to do.
+    pub action: ContextAction,
+}
+
+/// The three things `/context` can ask of a session.
+///
+/// A **closed** enum with no catch-all and no `Default`, for
+/// [`TranscriptAction`]'s reason: an action this build cannot read is a
+/// deserialization error the daemon returns as
+/// [`crate::jsonrpc::error_code::INVALID_PARAMS`], never a silent reading of one
+/// of these three. There is no safe default — one value puts a repository file
+/// into every turn of this session's system prompt and another keeps it out, so
+/// guessing is the one thing a daemon must not do with an unreadable verb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextAction {
+    /// Read the file at the session root now and carry it from here on. BR-2's
+    /// `on` **re-loads at once** rather than waiting for the next turn's
+    /// staleness check, so the answer to this call reports what is now resident
+    /// rather than what will be.
+    On,
+    /// Stop carrying it, for this session only and writing nothing durable. Off
+    /// means **unopened** (BR-2): no read, and the answer is
+    /// [`RepoContextStateKind::WithheldOff`] rather than a stale report of what
+    /// the file used to hold.
+    Off,
+    /// Change nothing — answer with the state as it stands. The bare `/context`
+    /// line, which BR-2 requires to work on a pipe as well as a TTY.
+    Status,
+}
+
+/// What a session's repository notes are doing, in one word (REQ-612 System
+/// Model, BR-2).
+///
+/// Carried by **both** halves of the feature — [`SessionContextResult`]'s routed
+/// answer and [`crate::events::RepoContextState`]'s broadcast news — because
+/// architecture ADR-6 folded the spec's two event names (`repo_context_loaded`,
+/// `repo_context_withheld`) into one event whose `state` field carries the
+/// distinction. One enum spells the answer once, so `/context` and the event
+/// line cannot come to disagree about what a withheld file is called.
+///
+/// A **closed** enum with no catch-all and no `Default`, for
+/// [`crate::events::TranscriptStateReason`]'s reason: there is no safe value to
+/// fall back to. The three states that mean "there are bytes on disk and they
+/// are not in the prompt" each name a **different remedy** — a boundary to
+/// relax, a switch to flip, a file to fix — and the two that mean "they are in
+/// the prompt" differ by whether the model is seeing all of them. A client that
+/// guessed would send the user to the wrong remedy, or tell them the model has
+/// read a file it has only partly read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoContextStateKind {
+    /// The file was read whole and is resident in every turn's system prompt.
+    Loaded,
+    /// Resident, but cut at the last line boundary under the cap; the block ends
+    /// with the marker naming the cap and the bytes dropped (BR-3). Distinct
+    /// from [`Self::Loaded`] because "the model has your notes" and "the model
+    /// has the first 8 KiB of your notes" are different facts about the same
+    /// turn.
+    Truncated,
+    /// No `TETON.md` and no fallback at the session root. The **normal case**:
+    /// one `stat`, no read, and a system prompt byte-identical to a build
+    /// without this feature (BR-1).
+    Absent,
+    /// A file is there and a privacy boundary covers it, so it was not made
+    /// resident (architecture ADR-2). Not folded into [`Self::Absent`]: the
+    /// session that would silently pin local on every turn is exactly the one
+    /// whose user needs to be told why.
+    WithheldBoundary,
+    /// The switch is off — `[context] repo_file = false`, or `/context off` for
+    /// this session — so the file was **never opened** (BR-2). Which is why the
+    /// fields beside this state report nothing about the file's contents: the
+    /// daemon does not know them and did not look.
+    WithheldOff,
+    /// A file is there and could not be read: an `EPERM`/TCC refusal, an I/O
+    /// error, or a symlinked entry this build will not follow (BR-1, REQ-571
+    /// BR-5). Named rather than silent, and not a crash — the session runs, and
+    /// [`crate::events::RepoContextState::reason`] carries the daemon's own
+    /// words, bounded.
+    Unreadable,
+}
+
+/// Which of the two names at the session root was read (REQ-612 System Model,
+/// architecture ADR-7 / OQ-1).
+///
+/// A **closed** two-name enum, and closed is load-bearing beyond the usual
+/// argument. The block's opening line names the file, rendered through
+/// `escape_attribute` the way `SkillFrame::opening` renders its own attributes
+/// (ADR-4), so what reaches that line has to come from a fixed set rather than
+/// from anything the repository chose. A `String` here would be a filename the
+/// repository picked, one layer away from the frame it would sit in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoContextSource {
+    /// `TETON.md` — the name this build prefers, and the one it looks for first.
+    TetonMd,
+    /// `AGENTS.md` — read only when there is no `TETON.md`. The vendor-neutral
+    /// fallback; `CLAUDE.md` is deliberately **not** a third value (ADR-7 /
+    /// OQ-1: it names another tool's commands, which is BUG-181's shape with the
+    /// repository as author).
+    AgentsMd,
+}
+
+/// Result of [`SessionContextParams`] — the state after the call, and the one
+/// surface that names the file (REQ-612 BR-2).
+///
+/// **This is the routed half, and the split is [`SessionTranscriptResult`]'s.**
+/// It goes back on the asking connection and is broadcast to nobody, because
+/// [`Self::file`] names a path inside the user's working tree. The *news* that
+/// the notes loaded, truncated, or were withheld is
+/// [`crate::events::RepoContextState`], which carries no file name and reaches
+/// every attached client and declared monitor. Everyone learns the session is
+/// carrying repository notes; only the person who asked learns which file they
+/// came out of.
+///
+/// Every figure here is the daemon's, not a client's to recompute:
+/// [`Self::cap`] is the route's **effective** cap (ADR-5's `min(8 KiB,
+/// budget_bytes / 4)`), which no thin client can derive because it has no
+/// `harness::budget::derive`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionContextResult {
+    /// What the notes are doing after this call.
+    pub state: RepoContextStateKind,
+    /// Which name was read, when one was.
+    ///
+    /// Absent for [`RepoContextStateKind::Absent`] and
+    /// [`RepoContextStateKind::WithheldOff`], where there is no file to name —
+    /// `off` never opened one, so the daemon does not know which of the two
+    /// names is on disk and must not imply that it does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<RepoContextSource>,
+    /// The file, as the user should see it spelled — root-relative, bounded and
+    /// neutralised by the daemon with `session_root::bounded_field` before it
+    /// goes on the wire (the [`SkillView`] rule).
+    ///
+    /// Absent whenever [`Self::source`] is, and for the same reason. Present for
+    /// a withheld or unreadable file as well as a resident one: "which file"
+    /// is the first question either of those states raises.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// The file's size on disk, in bytes — `0` when nothing was opened.
+    ///
+    /// Reported beside [`Self::resident_bytes`] rather than instead of it,
+    /// because the pair is what makes a truncation legible: 40,000 on disk and
+    /// 8,192 resident says what one figure alone cannot.
+    pub bytes_on_disk: u64,
+    /// How many bytes of the file are in the system prompt — `0` for every
+    /// state but [`RepoContextStateKind::Loaded`] and
+    /// [`RepoContextStateKind::Truncated`].
+    ///
+    /// The file's bytes, not the block's: the harness frame around them is this
+    /// build's own text and is not what a user is deciding about when they weigh
+    /// the notes against their budget.
+    pub resident_bytes: u64,
+    /// The **effective** cap on this session's route (ADR-5): the smaller of
+    /// `REPO_CONTEXT_MAX_BYTES` and a quarter of the route's byte budget, so a
+    /// floored 16,384-byte route reports 4,096 here and the local tier 8,192.
+    ///
+    /// One derivation, read by `/verbose`, by the truncation marker and by this
+    /// field (REQ-586's one-derivation rule), which is why it travels rather
+    /// than being a constant a client could hard-code and get wrong on a floored
+    /// route.
+    pub cap: u64,
+    /// Whether the file was cut to fit.
+    ///
+    /// Redundant with `state == `[`RepoContextStateKind::Truncated`] **on
+    /// purpose**: a client renders the byte figures above beside a flag, and a
+    /// client that had to match the state word to know whether to say "of which
+    /// N were dropped" would be reading an enum whose future values it may not
+    /// know. The daemon derives both from one value, so they cannot disagree.
+    pub truncated: bool,
+}
+
+impl RpcMethod for SessionContextParams {
+    // `ENDS_TURN` is left at the trait's `false` default, like
+    // `session/transcript` and every other slash-command RPC: this streams no
+    // assistant reply, and a client that treated it as a turn would clear its
+    // markdown fence inside somebody else's streaming code block (REQ-592
+    // BR-6). Pinned from the outside by `only_the_prompt_method_ends_a_turn`.
+    const METHOD: &'static str = "session/context";
+    type Result = SessionContextResult;
 }
 
 /// Evict a cached document so the next lookup of that URL re-fetches (BR-12's
@@ -3626,6 +3876,14 @@ mod tests {
                 SessionTranscriptParams::METHOD,
                 ends_turn::<SessionTranscriptParams>(),
             ),
+            // REQ-612 ADR-6: `/context` is a switch too, and the twin of the
+            // row above — it streams nothing, and a bare `/context` can be
+            // typed while a reply from another client is still streaming into
+            // this one's fence.
+            (
+                SessionContextParams::METHOD,
+                ends_turn::<SessionContextParams>(),
+            ),
         ] {
             assert!(
                 !ends,
@@ -4690,6 +4948,11 @@ mod tests {
             // *off* for every future session, and a round trip that dropped the
             // payload would still read as a legal update — just the wrong one.
             ConfigUpdate::SetTranscriptEnabled { enabled: false },
+            // REQ-612 BR-2 / ADR-6: the durable repository-notes switch, the
+            // twin of the two rows above and behind the same `config/set`
+            // gates.
+            ConfigUpdate::SetRepoContextEnabled { enabled: true },
+            ConfigUpdate::SetRepoContextEnabled { enabled: false },
         ] {
             round_trip(&ConfigSetParams { update });
         }
@@ -4712,6 +4975,26 @@ mod tests {
             wire["update"].as_object().is_some_and(|o| o.len() == 2),
             "the update carries its tag and its value and nothing else: {wire}"
         );
+        // REQ-612's twin of the assertion above, spelled out for the identical
+        // reason: `SetRepoContextEnabled(bool)` compiles, passes `cargo check`,
+        // survives `round_trip`'s symmetry — and reds right here, because a
+        // tagged newtype variant carrying a primitive cannot serialize at all.
+        let wire = serde_json::to_value(ConfigSetParams {
+            update: ConfigUpdate::SetRepoContextEnabled { enabled: false },
+        })
+        .expect("the update must serialize at all — see the comment above");
+        assert_eq!(wire["update"]["op"], "set_repo_context_enabled", "{wire}");
+        assert_eq!(
+            wire["update"]["enabled"], false,
+            "`false` is a user turning the notes off for every future session, \
+             and a round trip that dropped the payload would still read as a \
+             legal update — just the wrong one: {wire}"
+        );
+        assert!(
+            wire["update"].as_object().is_some_and(|o| o.len() == 2),
+            "the update carries its tag and its value and nothing else: {wire}"
+        );
+
         round_trip(&ConfigSetResult {
             applied: true,
             budget_notice: None,
@@ -4916,6 +5199,10 @@ mod tests {
         // daemon's dispatch match, the CLI's `/transcript` row and `teton
         // transcript` are all written against this literal.
         assert_eq!(SessionTranscriptParams::METHOD, "session/transcript");
+        // REQ-612's one method, pinned beside the verb it is modelled on, for
+        // the same reason: the daemon's dispatch match, the CLI's `/context`
+        // row and `teton context` are all written against this literal.
+        assert_eq!(SessionContextParams::METHOD, "session/context");
         assert_eq!(
             request(Id::Number(2), ModelStatusParams::default()).method,
             "model/status"
@@ -6607,6 +6894,276 @@ mod tests {
             r#"{"session_id":"s1","action":"status"}"#
         )
         .is_ok());
+    }
+
+    /// **REQ-612 BR-2, the RPC leg.** `session/context` round-trips all three
+    /// actions and every state a session's repository notes can be in, an
+    /// action this build cannot read is an error rather than a default, the
+    /// result carries the file name that the event deliberately does not, and
+    /// the method does not end a turn.
+    ///
+    /// The result's two optionals are asserted at both ends because their
+    /// *absence* is a distinct answer rather than a placeholder: `off` never
+    /// opened a file, so it can name neither the file nor which of the two
+    /// names is on disk, and a surface that could not tell that from "there is
+    /// no file" would tell a user their repository has no notes when what
+    /// happened is that they switched them off.
+    ///
+    /// The six state spellings are pinned literally, not derived, for
+    /// [`crate::events::TranscriptStateReason`]'s reason: they are the words
+    /// `/context`, the doctor line and the event line all render, and the three
+    /// `withheld_* / unreadable` states each send the user to a **different**
+    /// remedy — a boundary to relax, a switch to flip, a file to fix.
+    ///
+    /// The ends-turn half is asserted here as well as in
+    /// [`only_the_prompt_method_ends_a_turn`] deliberately: that sweep is a
+    /// standing invariant over every method, and this is REQ-612's own claim
+    /// about its own method, which is what the requirement's verification row
+    /// names.
+    ///
+    /// **Shown to fail** (conventions: show the test can fail before trusting
+    /// that it passed). Three mutations, each the regression it guards:
+    /// `const ENDS_TURN: bool = true` on [`SessionContextParams`] — red here on
+    /// the ends-turn assertion *and* in `only_the_prompt_method_ends_a_turn`;
+    /// dropping `#[serde(rename_all = "snake_case")]` from
+    /// [`RepoContextStateKind`] — red here and in
+    /// `repo_context_state_is_additive_in_both_directions`, because
+    /// `withheld_boundary` arrives as `WithheldBoundary`, which is the one
+    /// enum both halves of the feature share; and reverting
+    /// [`ConfigUpdate::SetRepoContextEnabled`] to the newtype
+    /// `SetRepoContextEnabled(bool)` — red here **and** in
+    /// `config_set_round_trips_each_update_variant`, on the serialize call
+    /// rather than on an assertion, with the message `cannot serialize tagged
+    /// newtype variant ConfigUpdate::SetRepoContextEnabled containing a
+    /// boolean`. That is exactly the runtime failure the struct variant exists
+    /// to avoid, observed rather than quoted from the sibling doc. Restored
+    /// after observing.
+    #[test]
+    fn session_context_params_and_result_round_trip_and_do_not_end_a_turn() {
+        assert_eq!(SessionContextParams::METHOD, "session/context");
+
+        // BR-6 / REQ-592 BR-6: a switch, not a turn.
+        assert!(
+            !ends_turn::<SessionContextParams>(),
+            "`/context` streams no assistant reply, and a client that treated \
+             it as a turn would clear its markdown fence in the middle of \
+             somebody else's streaming code block"
+        );
+
+        for (action, spelling) in [
+            (ContextAction::On, "on"),
+            (ContextAction::Off, "off"),
+            (ContextAction::Status, "status"),
+        ] {
+            let params = SessionContextParams {
+                session_id: SessionId::from("s1"),
+                action,
+            };
+            round_trip(&params);
+            let wire = serde_json::to_value(&params).expect("serializes");
+            assert_eq!(wire["session_id"], "s1", "{wire}");
+            assert_eq!(wire["action"], spelling, "{wire}");
+        }
+
+        // Every state, under the System Model's spelling, and no two alike.
+        let spellings: Vec<String> = [
+            (RepoContextStateKind::Loaded, "loaded"),
+            (RepoContextStateKind::Truncated, "truncated"),
+            (RepoContextStateKind::Absent, "absent"),
+            (RepoContextStateKind::WithheldBoundary, "withheld_boundary"),
+            (RepoContextStateKind::WithheldOff, "withheld_off"),
+            (RepoContextStateKind::Unreadable, "unreadable"),
+        ]
+        .into_iter()
+        .map(|(state, spelling)| {
+            round_trip(&state);
+            let wire = serde_json::to_value(state).expect("serializes");
+            assert_eq!(wire, spelling, "the wire spelling of {state:?} moved");
+            spelling.to_owned()
+        })
+        .collect();
+        let unique: std::collections::HashSet<&String> = spellings.iter().collect();
+        assert_eq!(unique.len(), spellings.len(), "{spellings:?}");
+
+        for (source, spelling) in [
+            (RepoContextSource::TetonMd, "teton_md"),
+            (RepoContextSource::AgentsMd, "agents_md"),
+        ] {
+            round_trip(&source);
+            assert_eq!(
+                serde_json::to_value(source).expect("serializes"),
+                spelling,
+                "{source:?}"
+            );
+        }
+
+        // A truncated file: on disk, resident, the route's effective cap, and
+        // the flag beside them. The three figures are what make the state
+        // legible, so they are asserted together rather than one at a time.
+        let truncated = SessionContextResult {
+            state: RepoContextStateKind::Truncated,
+            source: Some(RepoContextSource::TetonMd),
+            file: Some("TETON.md".to_owned()),
+            bytes_on_disk: 40_000,
+            resident_bytes: 8_100,
+            cap: 8_192,
+            truncated: true,
+        };
+        round_trip(&truncated);
+        let wire = serde_json::to_value(&truncated).expect("serializes");
+        assert_eq!(wire["state"], "truncated", "{wire}");
+        assert_eq!(wire["source"], "teton_md", "{wire}");
+        assert_eq!(
+            wire["file"], "TETON.md",
+            "the asking connection is the one surface told which file the notes \
+             came out of: {wire}"
+        );
+        assert_eq!(wire["bytes_on_disk"], 40_000, "{wire}");
+        assert_eq!(wire["resident_bytes"], 8_100, "{wire}");
+        assert_eq!(wire["cap"], 8_192, "{wire}");
+        assert_eq!(wire["truncated"], true, "{wire}");
+
+        // A floored route carries a quarter of its budget, not the constant —
+        // the reason `cap` travels at all (ADR-5).
+        let floored = SessionContextResult {
+            state: RepoContextStateKind::Loaded,
+            source: Some(RepoContextSource::AgentsMd),
+            file: Some("AGENTS.md".to_owned()),
+            bytes_on_disk: 3_000,
+            resident_bytes: 3_000,
+            cap: 4_096,
+            truncated: false,
+        };
+        round_trip(&floored);
+        let wire = serde_json::to_value(&floored).expect("serializes");
+        assert_eq!(wire["cap"], 4_096, "{wire}");
+        assert_eq!(wire["source"], "agents_md", "{wire}");
+
+        // The normal case, and the two states that name no file. `off` never
+        // opened one, so it knows neither the name nor the size — reporting a
+        // remembered file here would be reporting something the daemon did not
+        // look at.
+        for state in [
+            RepoContextStateKind::Absent,
+            RepoContextStateKind::WithheldOff,
+        ] {
+            let nothing = SessionContextResult {
+                state,
+                source: None,
+                file: None,
+                bytes_on_disk: 0,
+                resident_bytes: 0,
+                cap: 8_192,
+                truncated: false,
+            };
+            round_trip(&nothing);
+            let wire = serde_json::to_value(&nothing).expect("serializes");
+            assert!(
+                wire.get("source").is_none(),
+                "a state that opened no file names no source: {wire}"
+            );
+            assert!(
+                wire.get("file").is_none(),
+                "a state that opened no file names no file: {wire}"
+            );
+            assert_eq!(
+                wire["resident_bytes"], 0,
+                "nothing is resident, and `0` says so as a number rather than \
+                 by omission: {wire}"
+            );
+        }
+
+        // The two states with bytes on disk and none of them in the prompt.
+        // Both name the file, because "which file" is the first question either
+        // one raises.
+        for state in [
+            RepoContextStateKind::WithheldBoundary,
+            RepoContextStateKind::Unreadable,
+        ] {
+            let withheld = SessionContextResult {
+                state,
+                source: Some(RepoContextSource::TetonMd),
+                file: Some("TETON.md".to_owned()),
+                bytes_on_disk: 2_048,
+                resident_bytes: 0,
+                cap: 8_192,
+                truncated: false,
+            };
+            round_trip(&withheld);
+            let wire = serde_json::to_value(&withheld).expect("serializes");
+            assert_eq!(wire["file"], "TETON.md", "{wire}");
+            assert_eq!(
+                wire["bytes_on_disk"], 2_048,
+                "the file is on disk; it is the prompt it is not in: {wire}"
+            );
+            assert_eq!(wire["resident_bytes"], 0, "{wire}");
+        }
+
+        // Closed: an action this build cannot read must not become one it acts
+        // on — neither by defaulting nor by reading as its neighbour. One value
+        // puts a repository file into every turn of this session and another
+        // keeps it out.
+        for unknown in [r#""toggle""#, r#""ON""#, r#"true"#] {
+            let payload = format!(r#"{{"session_id":"s1","action":{unknown}}}"#);
+            assert!(
+                serde_json::from_str::<SessionContextParams>(&payload).is_err(),
+                "an unreadable action deserialized: {payload}"
+            );
+        }
+        // Non-vacuity: the fixture those three are derived from does parse, so
+        // the refusals above are about the action and not about the envelope.
+        assert!(serde_json::from_str::<SessionContextParams>(
+            r#"{"session_id":"s1","action":"status"}"#
+        )
+        .is_ok());
+
+        // And the same for the state kind, from the other side: an unreadable
+        // state is an error rather than a silent reading of one of the six.
+        assert!(
+            serde_json::from_str::<RepoContextStateKind>(r#""withheld_vibes""#).is_err(),
+            "a state this build cannot read must not deserialize to one it renders"
+        );
+
+        // **The additive rule, `ConfigUpdate`'s half (AC-1).** A payload from a
+        // client predating REQ-612 carries only the variants that shipped
+        // before it, and every one of them still deserializes here — adding a
+        // variant to an internally tagged enum takes nothing away from it.
+        for older in [
+            r#"{"update":{"op":"set_transcript_enabled","enabled":true}}"#,
+            r#"{"update":{"op":"set_privacy_boundary","path_glob":"*.env","mode":"local_only"}}"#,
+            r#"{"update":{"op":"set_tier_binding","tier":"build","provider_id":"deepseek"}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ConfigSetParams>(older).is_ok(),
+                "an older client's update stopped parsing: {older}"
+            );
+        }
+        // The other direction is a **refusal, and that is the right answer**: a
+        // new CLI that sends `set_repo_context_enabled` to a daemon predating
+        // the variant gets `INVALID_PARAMS` rather than silence. This enum is
+        // closed with no `#[serde(other)]`, so the old daemon cannot accept a
+        // durable write it would not perform — which is the failure mode worth
+        // having, since the alternative is a user told their config was saved
+        // when nothing was written.
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "op", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum UpdateAsShippedBeforeReq612 {
+            SetTierBinding(TierBindingConfig),
+            SetTranscriptEnabled { enabled: bool },
+        }
+        let wire = serde_json::to_string(&ConfigUpdate::SetRepoContextEnabled { enabled: true })
+            .expect("serializes");
+        assert!(
+            serde_json::from_str::<UpdateAsShippedBeforeReq612>(&wire).is_err(),
+            "a daemon predating the variant must refuse it rather than accept a \
+             write it cannot perform: {wire}"
+        );
+        // Non-vacuity: that same reader still reads the variant it shipped with,
+        // so the refusal above is about the new op and not about the shape.
+        let shipped =
+            serde_json::to_string(&ConfigUpdate::SetTranscriptEnabled { enabled: true }).unwrap();
+        assert!(serde_json::from_str::<UpdateAsShippedBeforeReq612>(&shipped).is_ok());
     }
 
     /// REQ-589 ASSUME-B: the over-budget offer ships **without** widening
