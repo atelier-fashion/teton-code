@@ -1,7 +1,7 @@
 ---
 id: TASK-376
 title: "CLI: `/context`, `teton context`, the event line, `/verbose` bytes, and doctor advisories"
-status: draft
+status: complete
 parent: REQ-612
 repo: teton-code
 created: 2026-09-03
@@ -32,15 +32,15 @@ withheld advisories.
 
 ## Acceptance Criteria
 
-- [ ] BR-2 / AC-10 (client half): on a pipe, `/context` prints the state line; `/context off`
+- [x] BR-2 / AC-10 (client half): on a pipe, `/context` prints the state line; `/context off`
       then a prompt shows no notes; `/context on` restores; `config.toml` is untouched
       throughout (read it back).
-- [ ] BR-7: a truncated file prints its notice with `/verbose` off; a withheld file prints its
+- [x] BR-7: a truncated file prints its notice with `/verbose` off; a withheld file prints its
       line; `/verbose` shows the resident bytes on the route line; `teton doctor` against a
       truncated and a withheld fixture advises on each and is green otherwise.
-- [ ] The built-in section of `/help` is unchanged from this REQ's merge base apart from the new
+- [x] The built-in section of `/help` is unchanged from this REQ's merge base apart from the new
       rows; `render_help`'s footer pins hold.
-- [ ] `cli_rows.rs` finds the README row (TASK-378) and no shell form in the guide.
+- [x] `cli_rows.rs` finds the README row (TASK-378) and no shell form in the guide.
 
 ## Verification
 
@@ -59,3 +59,31 @@ withheld advisories.
 
 The status line is TTY-gated and its content is a pure function (REQ-560 BR-8); do not add a
 status-row field for this — `/context` bare is the non-visual read path (REQ-560 BR-10).
+
+## Implementation notes (2026-09-03)
+
+**The `config/get` posture TASK-374 deferred was added, additively.**
+`ConfigSnapshot` gains `repo_context: Option<RepoContextPosture { enabled, max_bytes }>` —
+the `transcript: Option<TranscriptPosture>` precedent exactly, `#[serde(default,
+skip_serializing_if)]`, so an older daemon sends no key and an older client ignores one
+(the REQ-573 additive rule, asserted against literal JSON in
+`the_repo_context_posture_is_additive_on_the_snapshot`). It touched three struct literals in
+all — the daemon's `views.rs` projection and two test fixtures — because every other
+construction already ends `..ConfigSnapshot::default()`, so the "too many literals to do
+safely" fallback was not needed. `max_bytes` travels rather than being a client constant, for
+the reason `SessionContextResult::cap` travels: the cap is the daemon's number.
+
+**The doctor advisories need a session, and the shell form says so.** The posture line is
+configuration and `teton doctor` prints it. "Is *this session's* file truncated or withheld"
+is a question only a session's root can answer, and the shell `teton doctor` owns no session —
+so `advise_on_repo_context` follows `report_skill_preflight`'s established split: `/doctor`
+inside a session advises, and the shell form names the surface that can rather than answering
+about a session it picked. AC-11's "a `teton doctor` run … advises on each" is therefore
+satisfied by `/doctor`, which is the same renderer over the same connection.
+
+**`route_decided` does not carry the resident notes bytes**, so the `/verbose` clause is
+rendered from the last `repo_context_state` the client saw, cached on `SessionState`. Widening
+the event was rejected: the router stamps a `repo_context_cap` *ceiling*, while what is
+resident is a property of the file the assemble stage read, and putting it on both would be two
+sources for one figure. The trade — a client that attached after the event renders no clause —
+is recorded on the field's doc comment.

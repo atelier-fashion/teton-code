@@ -174,6 +174,13 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: TranscriptCli,
     },
+    /// The durable repository-notes default (REQ-612): `enable` / `disable`
+    /// write `[context] repo_file` through `config/set`; `status` prints the
+    /// posture `teton doctor` prints.
+    Context {
+        #[command(subcommand)]
+        action: ContextCli,
+    },
     /// Diagnose the daemon, socket, model state, and providers.
     Doctor,
     /// Remove Teton Code from this machine: stop the daemon, delete its data
@@ -528,6 +535,7 @@ fn main() -> ExitCode {
         Some(Command::Cost) => run_cost(&paths),
         Some(Command::Effort { level }) => run_effort(&paths, level.as_deref()),
         Some(Command::Transcript { action }) => run_transcript(&paths, action),
+        Some(Command::Context { action }) => run_context(&paths, action),
         Some(Command::Model { action }) => match action {
             ModelAction::List => run_model_list(&paths),
             ModelAction::Set { name } => run_model_set(&paths, &name, cli.yes),
@@ -747,6 +755,11 @@ pub(crate) fn run_mirrored_command(
         Command::Transcript { .. } => {
             ctx.surface
                 .line(LineKind::Error, &not_a_mirrored_row("transcript"));
+            Ok(())
+        }
+        Command::Context { .. } => {
+            ctx.surface
+                .line(LineKind::Error, &not_a_mirrored_row("context"));
             Ok(())
         }
         Command::Uninstall { .. } => {
@@ -2047,6 +2060,7 @@ pub(crate) fn doctor_report_on(
         Ok(cfg) => {
             render_config(&cfg.snapshot.providers, ctx.surface);
             render_transcript_posture(cfg.snapshot.transcript.as_ref(), ctx.surface);
+            render_repo_context_posture(cfg.snapshot.repo_context.as_ref(), ctx.surface);
             advise_on_base_url_endpoints(&cfg.snapshot.providers, ctx.surface);
             advise_on_context_windows(&cfg.snapshot.providers, ctx.surface);
         }
@@ -2060,7 +2074,110 @@ pub(crate) fn doctor_report_on(
         ),
     }
     report_skill_preflight(conn, ctx)?;
+    advise_on_repo_context(conn, ctx)?;
     doctor_trailer(ctx.surface);
+    Ok(())
+}
+
+/// The two repository-notes advisories (REQ-612 BR-7, AC-11): a file that was
+/// cut to fit, and a file that is on disk and not in the prompt.
+///
+/// # Why it needs a session, and what the shell says instead
+///
+/// The posture line above this one is *configuration* and comes off
+/// `config/get`. These two are about a **file at a session's root**, and only a
+/// session has one: `teton doctor` from a shell owns none, so — exactly as
+/// [`report_skill_preflight`] does for the skill pre-flight, and for the same
+/// reason — it names the surface that can answer instead of answering about a
+/// session it picked. `/doctor` inside a session is that surface, and it is the
+/// one this REQ's `cli_e2e` case drives. AC-11 asks for a `doctor` run against a
+/// truncated and a withheld fixture to advise on each; this is that run, on the
+/// only `doctor` that has a session's root in scope.
+///
+/// # An advisory, not an error
+///
+/// REQ-578's posture, unchanged: one line, a remedy in it, and **no** effect on
+/// the exit status. A truncated `TETON.md` is a session that works, carrying
+/// less than its author meant; a withheld one is a session that works, carrying
+/// none of it. Neither is a broken machine, and a `doctor` that failed on them
+/// would change what every script wrapping it does.
+///
+/// Every figure is the daemon's own, read off `session/context` — the same
+/// answer bare `/context` prints — so the advisory and the command cannot
+/// describe one file differently (LESSON-456).
+///
+/// # Errors
+///
+/// Propagates a transport error from the call, as the calls above it do; a
+/// daemon that answers is reported on the surface and returns `Ok`.
+fn advise_on_repo_context(conn: &mut Connection, ctx: &mut UiContext<'_>) -> anyhow::Result<()> {
+    use teton_protocol::methods::{ContextAction, RepoContextStateKind, SessionContextParams};
+
+    let Some(session_id) = ctx.session_id.clone() else {
+        ctx.surface.line(
+            LineKind::Notice,
+            "repo notes: no session here — `/doctor` inside a session reports whether that \
+             session's `TETON.md` is resident, truncated, or withheld.",
+        );
+        return Ok(());
+    };
+    let answered = conn.call(
+        SessionContextParams {
+            session_id,
+            // `Status` and never `On`: a diagnostic that switched something on
+            // would change the session it was asked to describe.
+            action: ContextAction::Status,
+        },
+        ctx,
+    )?;
+    match answered {
+        Ok(result) => {
+            let file = result.file.as_deref().unwrap_or("the repository notes");
+            match result.state {
+                RepoContextStateKind::Truncated => ctx.surface.line(
+                    LineKind::Notice,
+                    &status::repo_notes_truncated_advisory(
+                        file,
+                        result.bytes_on_disk,
+                        result.resident_bytes,
+                    ),
+                ),
+                RepoContextStateKind::WithheldBoundary => ctx.surface.line(
+                    LineKind::Notice,
+                    &status::repo_notes_withheld_advisory(
+                        file,
+                        "a local-only boundary covers it, and a session-long pin is not what a \
+                         boundary means. Relax the boundary, or leave it and let the model \
+                         `read` the file when it needs it",
+                    ),
+                ),
+                RepoContextStateKind::Unreadable => ctx.surface.line(
+                    LineKind::Notice,
+                    &status::repo_notes_withheld_advisory(
+                        file,
+                        "it could not be read. Check its permissions, and that it is a regular \
+                         file rather than a symlink",
+                    ),
+                ),
+                // A session carrying its notes whole, a session whose switch is
+                // off, and a root with no file are three healthy states. Doctor
+                // stays quiet about all three: the posture line above already
+                // said what the machine's default is, and bare `/context` is
+                // the read path for the rest.
+                RepoContextStateKind::Loaded
+                | RepoContextStateKind::WithheldOff
+                | RepoContextStateKind::Absent => {}
+            }
+        }
+        Err(err) if err.code == error_code::METHOD_NOT_FOUND => ctx.surface.line(
+            LineKind::Notice,
+            "repo notes: this daemon build does not serve session/context yet.",
+        ),
+        Err(err) => ctx.surface.line(
+            LineKind::Error,
+            &format!("repository-notes check failed: {}", err.message),
+        ),
+    }
     Ok(())
 }
 
@@ -2240,6 +2357,101 @@ pub(crate) fn transcript_on(
         Err(err) => ctx.surface.line(
             LineKind::Error,
             &format!("could not read the transcript posture: {}", err.message),
+        ),
+    }
+    Ok(())
+}
+
+/// The `teton context` subcommands (REQ-612 BR-2): the durable default's shell
+/// surface. Not a twin of `/context`, whose `on`/`off` is a session-lifetime
+/// switch — the two grammars differ on purpose, exactly as
+/// [`TranscriptCli`]'s do, so a user cannot mistake one lifetime for the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+pub(crate) enum ContextCli {
+    /// Carry `TETON.md` in every session created from now on
+    /// (`[context] repo_file = true`).
+    Enable,
+    /// Stop opening the file in new sessions (`[context] repo_file = false`).
+    Disable,
+    /// Print the durable default and the resident cap.
+    Status,
+}
+
+/// REQ-612 AC-11: the one `repo notes:` line, shared by `teton doctor`,
+/// `/doctor` and `teton context status`. An older daemon that reports no
+/// posture says so rather than printing a default it did not read — the
+/// [`render_transcript_posture`] rule, and the reason
+/// `ConfigSnapshot::repo_context` is an `Option` at all.
+fn render_repo_context_posture(
+    posture: Option<&teton_protocol::methods::RepoContextPosture>,
+    surface: &mut dyn Surface,
+) {
+    match posture {
+        Some(p) => surface.line(
+            LineKind::Info,
+            &status::repo_notes_line(p.enabled, p.max_bytes),
+        ),
+        None => surface.line(
+            LineKind::Notice,
+            "repo notes: not reported by this daemon build (config/get predates REQ-612).",
+        ),
+    }
+}
+
+fn run_context(paths: &DaemonPaths, action: ContextCli) -> anyhow::Result<()> {
+    let mut surface = stdout_surface();
+    let mut conn = client::ensure_connected(paths, &mut surface)?;
+    let mut state = SessionState::new();
+    let mut prompter = StdinPrompter::new();
+    let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
+    context_on(&mut conn, &mut ctx, action)
+}
+
+/// The body `teton context …` runs. `enable`/`disable` go through `config/set`
+/// and inherit its gates unchanged (architecture ADR-6); every arm then reads
+/// the posture back off `config/get`, so the line printed is what the daemon
+/// holds, never what was asked for.
+///
+/// This is the **only** place in the client that sends
+/// [`ConfigUpdate::SetRepoContextEnabled`]. `slash::handle_context` sends
+/// `session/context` and never `config/set`, which is BR-2's two-switch rule as
+/// a property of the code rather than a convention: there is one durable writer
+/// and it is a shell command.
+pub(crate) fn context_on(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    action: ContextCli,
+) -> anyhow::Result<()> {
+    let enabled = match action {
+        ContextCli::Enable => Some(true),
+        ContextCli::Disable => Some(false),
+        ContextCli::Status => None,
+    };
+    if let Some(enabled) = enabled {
+        if let Err(err) = conn.call(
+            ConfigSetParams {
+                update: ConfigUpdate::SetRepoContextEnabled { enabled },
+            },
+            ctx,
+        )? {
+            ctx.surface.line(
+                LineKind::Error,
+                &format!(
+                    "could not set the repository-notes default: {}",
+                    err.message
+                ),
+            );
+            return Ok(());
+        }
+    }
+    match conn.call(ConfigGetParams::default(), ctx)? {
+        Ok(cfg) => render_repo_context_posture(cfg.snapshot.repo_context.as_ref(), ctx.surface),
+        Err(err) => ctx.surface.line(
+            LineKind::Error,
+            &format!(
+                "could not read the repository-notes posture: {}",
+                err.message
+            ),
         ),
     }
     Ok(())
@@ -5187,6 +5399,10 @@ mod tests {
             // REQ-611: likewise absent — this fixture is about the routing
             // table, and the transcript posture's own rendering is TASK-365's.
             transcript: None,
+            // REQ-612: and likewise. `render_repo_context_posture`'s own two
+            // arms are covered where they are rendered, not from a routing
+            // fixture.
+            repo_context: None,
         }
     }
 

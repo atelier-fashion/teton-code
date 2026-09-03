@@ -393,6 +393,11 @@ pub const RESERVED_SKILL_NAMES: &[&str] = &[
     "boundary",
     "cd",
     "clear",
+    // REQ-612: `/context` is a built-in row, so no skill may take the name —
+    // a repository-supplied `.claude/skills/context/SKILL.md` answering
+    // `/context` would be a repository deciding whether its own notes are
+    // resident.
+    "context",
     "cost",
     "doctor",
     "effort",
@@ -1983,6 +1988,46 @@ pub struct ConfigSnapshot {
     /// predates the field" and never as "transcripts are off".
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub transcript: Option<TranscriptPosture>,
+    /// The repository-notes posture: the durable `[context] repo_file` default
+    /// and the pinned resident cap (REQ-612 BR-2, BR-7).
+    ///
+    /// On the existing snapshot rather than behind a new RPC, for
+    /// [`Self::transcript`]'s reason, and additive in exactly the same way: a
+    /// daemon that has this field always populates it, so `None` reads as "this
+    /// daemon predates the field" and never as "the notes are off". A client
+    /// that reported `off` from a silent daemon would tell a user their
+    /// repository notes are not being loaded while the daemon was loading them.
+    ///
+    /// [`RepoContextPosture::max_bytes`] travels rather than being a client-side
+    /// constant for the reason [`SessionContextResult::cap`] travels: the cap is
+    /// a daemon fact, and a client that hard-coded `8192` would keep printing it
+    /// after the day the daemon's own constant moved.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub repo_context: Option<RepoContextPosture>,
+}
+
+/// What `doctor` says about repository notes (REQ-612 BR-2, BR-7, AC-11).
+///
+/// **Configuration, not a session's state**, exactly as [`TranscriptPosture`]
+/// is: `enabled` is the durable `[context] repo_file` key that new sessions
+/// start from, never any session's effective switch — BR-2's two lifetimes are
+/// two different questions, and `session/context` answers the other one on the
+/// connection that asked. A per-session `/context off` showing up here would
+/// make one session's choice look like a machine-wide setting.
+///
+/// There is no directory or file name here, for the reason
+/// [`SessionContextResult`] holds one and the event does not: the file lives
+/// inside the user's working tree, and a machine-wide posture line is not the
+/// place a path belongs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoContextPosture {
+    /// The durable `[context] repo_file` default new sessions start from.
+    pub enabled: bool,
+    /// The pinned resident cap in bytes — the widest block any route can carry
+    /// (`REPO_CONTEXT_MAX_BYTES`), before ADR-5's per-route quarter rule floors
+    /// it further. Stated so `doctor` can name the worst case BR-7 asks it to
+    /// state, without a second copy of the constant on this side of the wire.
+    pub max_bytes: u64,
 }
 
 /// What `doctor` says about transcripts (REQ-611 BR-15, AC-20).
@@ -4492,8 +4537,80 @@ mod tests {
                     dir: "/Users/dev/.local/share/teton/transcripts".to_owned(),
                     retain_days: 30,
                 }),
+                // REQ-612 BR-2/BR-7: likewise what a daemon that has the field
+                // always sends — the durable `[context] repo_file` default and
+                // the pinned cap, so `doctor` names the worst case from the
+                // daemon's own constant.
+                repo_context: Some(RepoContextPosture {
+                    enabled: true,
+                    max_bytes: 8_192,
+                }),
             },
         });
+    }
+
+    /// **REQ-612 BR-2/BR-7, the wire-additivity leg.** The repository-notes
+    /// posture is a key an older client ignores and an older daemon never
+    /// sends, so it moves neither [`crate::PROTOCOL_VERSION`] nor
+    /// [`crate::PROTOCOL_VERSION_MIN`] — the REQ-573 rule, asserted against
+    /// literal JSON rather than left as a claim.
+    ///
+    /// The half that matters for the CLI is the second assertion: a snapshot
+    /// with no key reads `None`, **not** `Some(false)`. `teton context status`
+    /// branches on exactly that distinction, and a `Default` that filled in
+    /// `enabled: false` would make an old daemon's silence look like a user
+    /// who had switched the notes off.
+    ///
+    /// **Mutation (run 2026-09-03):** dropping `skip_serializing_if` from the
+    /// field reddened the "omits the key entirely" assertion; changing the
+    /// field to a bare `RepoContextPosture` reddened the `is_none` one.
+    /// Restored both.
+    #[test]
+    fn the_repo_context_posture_is_additive_on_the_snapshot() {
+        #[derive(Deserialize)]
+        struct PreNotesSnapshot {
+            privacy: Vec<PrivacyBoundaryConfig>,
+            redact_enabled: bool,
+        }
+
+        let wire = serde_json::to_string(&ConfigSnapshot {
+            privacy: vec![PrivacyBoundaryConfig {
+                path_glob: "secrets/**".to_owned(),
+                mode: PrivacyMode::LocalOnly,
+                origin: Default::default(),
+            }],
+            redact_enabled: true,
+            repo_context: Some(RepoContextPosture {
+                enabled: true,
+                max_bytes: 8_192,
+            }),
+            ..ConfigSnapshot::default()
+        })
+        .unwrap();
+        assert!(
+            wire.contains(r#""repo_context":{"enabled":true,"max_bytes":8192}"#),
+            "the fixture must actually carry the new key: {wire}"
+        );
+
+        let old: PreNotesSnapshot = serde_json::from_str(&wire).unwrap();
+        assert_eq!(old.privacy.len(), 1, "the old reader still gets its fields");
+        assert!(old.redact_enabled, "and the ones beside the new key");
+
+        // A daemon predating the field sends no key, and that reads as "unknown"
+        // rather than as "off" — the distinction `teton context status` renders.
+        let without_the_key = serde_json::json!({
+            "providers": [], "tiers": [], "routing": [], "privacy": []
+        });
+        let snapshot: ConfigSnapshot = serde_json::from_value(without_the_key).unwrap();
+        assert!(
+            snapshot.repo_context.is_none(),
+            "an absent posture must not read as a switched-off one"
+        );
+        let empty = serde_json::to_value(ConfigSnapshot::default()).unwrap();
+        assert!(
+            empty.get("repo_context").is_none(),
+            "a default snapshot omits the key rather than sending null: {empty}"
+        );
     }
 
     /// A snapshot from a daemon that predates `redact_enabled` reads as **off**
