@@ -1663,7 +1663,7 @@ fn drain_pressure(events: &mut tetond::broadcast::Subscription) -> Vec<ContextPr
 /// The notes cap is a quarter of the route's byte budget, so it moves with the
 /// route. `CarriedTurn::rebudget` used to restate `system_sources` and leave the
 /// *block* as the assemble stage rendered it — so a 15,292-byte system prompt
-/// built for the local tier met a floored route's 16,384-byte budget. On a first
+/// built for the local tier met a narrower route's 16,384-byte budget. On a first
 /// attempt there is only one block to drop and it is the prompt the user just
 /// typed, so `truncate_to_budget` reaches its second step instead: `room` for
 /// that block's text collapses to its own 1,024-byte floor, and anything the
@@ -1708,6 +1708,18 @@ fn drain_pressure(events: &mut tetond::broadcast::Subscription) -> Vec<ContextPr
 /// silent, so a fallback onto a floored route cut the file with the marker
 /// visible only inside a system prompt no client ever sees — BR-3's silence,
 /// one seam over.
+///
+/// # The second route is synthetic since REQ-612's decision (2026-09-03)
+///
+/// It used to be `derive`'s own answer for Ollama's 4,096-token window. Raising
+/// `MIN_BUDGET_BYTES` to 50,000 — so a floored route holds the whole
+/// repository-notes block — put every derived route at the pinned 8,192-byte
+/// cap, so nothing the derivation can return narrows the notes any more. The
+/// pair is therefore built by hand at the figures the floor used to produce
+/// (16,384 bytes of budget, 4,096 of notes), and the quarter rule it carries is
+/// asserted at the fixture rather than taken on trust. What is under test is
+/// the *seam*, which is unchanged and is where a future narrower route would
+/// arrive.
 ///
 /// **This is why the test drives `refit_for_reroute` rather than
 /// `CarriedTurn::rebudget`.** The publish is the *runtime's*, and a fixture that
@@ -1828,21 +1840,43 @@ async fn a_reroute_to_a_floored_route_re_renders_the_notes_and_keeps_the_users_m
         "the fixture seeded no user message, so the claim below is vacuous"
     );
 
-    // The reroute: a provider whose declared window derives the floor, which is
-    // where the quarter rule bites — 16,384 bytes of budget, 4,096 of notes.
-    let floored = derive(BudgetInputs {
-        window: 4_096,
-        cap: 0,
-        reservation: 1_024,
-        is_local: false,
-        redact_scan: false,
-        provider_id: Some("tiny"),
-    });
-    assert!(
-        floored.floored,
-        "the fixture's second route is not a floored one"
-    );
+    // The reroute: a **synthetic sub-floor** budget — 16,384 bytes, 4,096 of
+    // notes — because REQ-612's decision of 2026-09-03 put the quarter rule out
+    // of reach of the derivation. `MIN_BUDGET_BYTES` is 50,000, so a route that
+    // used to derive this pair (Ollama's 4,096-token window) now derives
+    // (6,250, 50,000) and carries the whole 8,192-byte block; the smallest
+    // budget any arm of `derive` returns is the default pair's 32,768, whose
+    // quarter is 8,192 exactly. No route can narrow the notes cap any more.
+    //
+    // The seam under test — `refit_for_reroute` re-rendering at the new route's
+    // cap, claiming the triple, and publishing — is unchanged by that, and it
+    // is still the seam a *future* narrower route would arrive through. So the
+    // budget is built here rather than derived, and the quarter rule it carries
+    // is asserted rather than assumed. It is the pair REQ-586's floor used to
+    // produce, kept as the fixture it always was.
+    let floored = {
+        let mut budget = derive(BudgetInputs {
+            window: 4_096,
+            cap: 0,
+            reservation: 1_024,
+            is_local: false,
+            redact_scan: false,
+            provider_id: Some("tiny"),
+        });
+        assert!(
+            budget.floored,
+            "the fixture's second route is not a floored one"
+        );
+        budget.budget_tokens = 2_048;
+        budget.budget_bytes = 16_384;
+        budget.repo_context_cap = budget.budget_bytes / 4;
+        budget
+    };
     assert_eq!(floored.repo_context_cap, 4_096);
+    assert!(
+        floored.repo_context_cap < REPO_CONTEXT_MAX_BYTES,
+        "the second route must narrow the cap, or the re-render has nothing to cut"
+    );
     // The daemon's own reroute seam — the function both of `run_prompt_turn`'s
     // reroute arms call — so the re-render, the claim, the publish and the
     // refit run in the order and under the gate production runs them.

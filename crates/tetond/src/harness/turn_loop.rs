@@ -2618,6 +2618,12 @@ fn effective_web_clause(tools: &ToolRegistry, config: &HarnessConfig) -> Option<
 /// | [`REDACT_BODY_OVERHEAD_BYTES`](crate::egress::redact::REDACT_BODY_OVERHEAD_BYTES) margin | 476 | 129 |
 /// | `MIN_BUDGET_BYTES >= 2 ×` default prompt | 6,411 / 8,192 | 6,758 / 8,192 |
 ///
+/// Both halves of that second row have since moved and the row is kept as the
+/// record it was: the default prompt is 6,838 bytes today, and REQ-612 took the
+/// budget half from 8,192 (`MIN_BUDGET_BYTES / 2` at 16,384) to 25,000 — half
+/// of a 50,000-byte floor sized to hold the prompt **with** an 8 KiB
+/// repository-notes block, which the invariant test now measures at 15,370.
+///
 /// The redact margin binds first and is measured against a 48-byte floor, so
 /// the real room this clause had was **428 bytes, not the 710** the spec
 /// originally quoted from that constant's ledger: those figures were already

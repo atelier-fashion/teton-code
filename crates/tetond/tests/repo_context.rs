@@ -28,7 +28,7 @@
 //! | BR-4, AC-5 | [`the_injection_corpus_is_defused_on_both_arms_and_plain_notes_render_verbatim`] |
 //! | BR-4, AC-6 | [`directives_in_the_file_change_no_level_route_effort_config_or_boundary`] |
 //! | BR-1, BR-8, AC-1 | [`a_fresh_session_carries_the_block_last_and_no_file_means_no_block`] |
-//! | BR-3, AC-3 | [`a_floored_routes_smaller_cap_is_announced_once_and_widening_it_is_announced_again`] |
+//! | BR-3, AC-3 | [`a_floored_route_carries_the_whole_file_and_a_narrower_cap_is_answered_at`] |
 //! | BR-2, verify | [`a_withheld_file_reports_the_size_the_stat_saw_on_both_surfaces`] |
 //!
 //! TASK-377 added the last three. They reach one layer further than the four
@@ -58,13 +58,13 @@
 //! | `neutralize_envelope_tags` dropped from the block renderer | [`the_injection_corpus_is_defused_on_both_arms_and_plain_notes_render_verbatim`] |
 //! | `render_prompt`'s `Flat` arm stops defusing control tokens | [`the_injection_corpus_is_defused_on_both_arms_and_plain_notes_render_verbatim`] |
 //! | the block appended anywhere but last in `build_system_prompt` | [`a_fresh_session_carries_the_block_last_and_no_file_means_no_block`] |
-//! | the wire `state` taken from the stored state rather than the rendered block | [`a_floored_routes_smaller_cap_is_announced_once_and_widening_it_is_announced_again`] |
-//! | the turn's publish gated on the stored state alone | [`a_floored_routes_smaller_cap_is_announced_once_and_widening_it_is_announced_again`] |
-//! | the published-triple record dropped (an event on every prompt) | [`a_floored_routes_smaller_cap_is_announced_once_and_widening_it_is_announced_again`] |
-//! | `repo_context_cap` dropped from `route_decided` | [`a_floored_routes_smaller_cap_is_announced_once_and_widening_it_is_announced_again`] |
+//! | the wire `state` taken from the stored state rather than the rendered block | [`a_floored_route_carries_the_whole_file_and_a_narrower_cap_is_answered_at`] |
+//! | the turn's publish gated on the stored state alone | [`a_floored_route_carries_the_whole_file_and_a_narrower_cap_is_answered_at`] |
+//! | the published-triple record dropped (an event on every prompt) | [`a_floored_route_carries_the_whole_file_and_a_narrower_cap_is_answered_at`] |
+//! | `repo_context_cap` dropped from `route_decided` | [`a_floored_route_carries_the_whole_file_and_a_narrower_cap_is_answered_at`] |
 //! | `bytes_on_disk` dropped from `WithheldBoundary` | [`a_withheld_file_reports_the_size_the_stat_saw_on_both_surfaces`] |
 //! | `bytes_on_disk` flattened to `Some(0)` for a state that measured nothing | [`a_withheld_file_reports_the_size_the_stat_saw_on_both_surfaces`] |
-//! | `/context` reporting `REPO_CONTEXT_MAX_BYTES` instead of the stamped route's cap | [`a_floored_routes_smaller_cap_is_announced_once_and_widening_it_is_announced_again`] |
+//! | `/context` reporting `REPO_CONTEXT_MAX_BYTES` instead of the stamped route's cap | [`a_floored_route_carries_the_whole_file_and_a_narrower_cap_is_answered_at`] |
 //! | `always_store` read as "the state moved" (a `touch` announced) | [`an_edit_between_prompts_is_resident_on_the_next_and_a_mid_turn_edit_is_not`] |
 //!
 //! ## What is not here
@@ -582,6 +582,23 @@ impl Harness {
             .routes
             .stamped(id)
             .map(|budget| budget.repo_context_cap);
+        self.context_at(id, action, route_cap)
+    }
+
+    /// The same call with the route's cap **supplied**, for a cap no route can
+    /// derive since REQ-612 raised the budget floor to 50,000.
+    ///
+    /// Not a re-implementation of anything: `DaemonRuntime::session_context`
+    /// takes the cap as a parameter, because the stamped-route memo lives in
+    /// `server` and the method must answer without it. Passing a narrower one
+    /// is asking that method the question a narrower route would have asked it
+    /// — the same argument [`Self::context`] computes.
+    fn context_at(
+        &self,
+        id: &SessionId,
+        action: ContextAction,
+        route_cap: Option<usize>,
+    ) -> teton_protocol::methods::SessionContextResult {
         self.runtime.session_context(
             &SessionContextParams {
                 session_id: id.clone(),
@@ -1987,48 +2004,75 @@ impl TestClient {
 // BR-3 / AC-3 verify — a route-cap truncation is never silent, and never twice
 // ---------------------------------------------------------------------------
 
-/// **BR-3 / AC-3 (verify).** A file the daemon classified `loaded` is announced
-/// as **truncated** the moment a route renders it at a smaller cap — once, on
-/// the turn that does it, and not again while the route holds.
+/// **BR-3 / AC-3 (verify).** A render that moves is announced — once, on the
+/// turn that does it, and not again while it holds — and `/context` answers at
+/// the route's own cap rather than at the build's ceiling.
 ///
 /// # The defect this pins
 ///
 /// `Loaded` versus `Truncated` is decided at load time against
 /// `REPO_CONTEXT_MAX_BYTES`, the widest cap any route can ask for. The block is
-/// rendered at `route.budget.repo_context_cap`, a quarter of *that route's* byte
-/// budget. A 6,000-byte `TETON.md` is therefore `loaded` in the registry and cut
-/// in half on a floored route — and the event used to carry the load-time word
-/// beside the route-aware flag, while the publish itself was gated on the
-/// *stored state* changing, which it had not. So the truncation reached the user
-/// as: a `loaded` line under `/verbose`, and nothing at all without it.
+/// rendered at `route.budget.repo_context_cap`. The event used to carry the
+/// load-time word beside the route-aware flag, while the publish itself was
+/// gated on the *stored state* changing, which it had not — so a truncation
+/// reached the user as a `loaded` line under `/verbose`, and nothing at all
+/// without it.
 ///
-/// Three seams had to move together and all three are asserted here: the wire
-/// `state` is derived from the block that was rendered; the publish is gated on
-/// the rendered `(state, truncated, resident_bytes)` triple rather than on the
-/// stored state; and — in `session_ui`'s own suite, which is the only place a
-/// client renderer can be driven from — the line keys on `truncated` rather than
-/// on the word.
+/// Three seams had to move together: the wire `state` is derived from the block
+/// that was rendered; the publish is gated on the rendered
+/// `(state, truncated, resident_bytes)` triple rather than on the stored state;
+/// and — in `session_ui`'s own suite, which is the only place a client renderer
+/// can be driven from — the line keys on `truncated` rather than on the word.
 ///
-/// # The route
+/// # Why the narrow cap is now supplied rather than routed to (REQ-612
+/// decision, 2026-09-03)
 ///
-/// A `context_budget_cap` below the floor derives *under* `MIN_BUDGET_BYTES`, so
-/// the pair is raised to it and `floored` is set — 16,384 bytes of budget and
-/// 4,096 of notes. Widening the cap mid-session moves the same session back to a
-/// route with the full 8,192, which is the third leg.
+/// This test used to reach a 4,096-byte notes cap by declaring a
+/// `context_budget_cap` under the floor: the pair was raised to
+/// `MIN_BUDGET_BYTES` (16,384) and its quarter was 4,096. Raising that floor to
+/// 50,000 — so a floored route holds the whole 8,192-byte block — put the
+/// quarter rule out of reach of **every** route the derivation can produce: the
+/// smallest budget any arm returns is now the default pair's 32,768, whose
+/// quarter is 8,192 exactly. There is no seam for stamping a budget on a live
+/// daemon route, and inventing one for a test would be a production surface
+/// bought by a fixture.
+///
+/// So the legs are split by what each can still be asked honestly:
+///
+/// * **Leg 1 is the decision itself, end to end.** The floored route really is
+///   floored (`bound_floored`), and it carries the **whole** file: cap 8,192,
+///   no marker in the prompt, and nothing announced because nothing about the
+///   render moved. That is a stronger claim than the old leg 1 and it is the
+///   one a user now gets.
+/// * **Leg 2 is the route-aware `/context` answer, at a synthetic cap.**
+///   `session_context` takes the route's cap as a *parameter*, so a narrower
+///   one is passed straight to the daemon's own method — no re-implementation.
+///   The stored state is `Loaded` and the answer is `Truncated / true / 4,096`,
+///   which is precisely the word-versus-flag divergence MAJOR 3 fixed, still
+///   asserted against the real derivation.
+/// * **Leg 3 is announce-once-and-again, through the real assemble-stage
+///   gate**, driven by the file rather than by the route: growing `TETON.md`
+///   past the ceiling truncates it (announced), a second turn on the same file
+///   says nothing, and shrinking it back is news again.
+///
+/// The reroute half of the gate — a triple that moves while the *state* does
+/// not — is exercised at `conversation_carry`'s
+/// `a_reroute_to_a_floored_route_re_renders_the_notes_and_keeps_the_users_message`,
+/// on a synthetic sub-floor budget, for the same reason.
 ///
 /// # Mutation
 ///
 /// | change | result |
 /// |---|---|
-/// | publish `state.kind()` instead of the rendered block's | leg 1's `Truncated` assertion fails with `Loaded` |
-/// | gate the publish on `set_repo_context` alone | leg 1 announces nothing at all |
-/// | gate it on the state only, ignoring the triple | leg 3 is silent when the cap widens |
-/// | drop the triple record, publishing on every turn | leg 2 sees a duplicate |
-/// | drop `repo_context_cap` from `route_decided` | the cap assertions fail |
+/// | publish `state.kind()` instead of the rendered block's | leg 3's `Truncated` assertion fails with `Loaded` |
+/// | gate the publish on `set_repo_context` alone | leg 3 announces nothing when the file grows |
+/// | drop the triple record, publishing on every turn | leg 1 and leg 3's second turn see a duplicate |
+/// | drop `repo_context_cap` from `route_decided` | leg 1's cap assertion fails |
+/// | `/context` answering at `REPO_CONTEXT_MAX_BYTES` | leg 2 fails with `8,192 / false / 6,000` |
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_floored_routes_smaller_cap_is_announced_once_and_widening_it_is_announced_again() {
+async fn a_floored_route_carries_the_whole_file_and_a_narrower_cap_is_answered_at() {
     // 6,000 bytes: inside the 8,192 ceiling the loader classifies against, and
-    // well past a floored route's 4,096. Whole 64-byte lines, so the
+    // well past leg 2's synthetic 4,096. Whole 64-byte lines, so the
     // line-boundary cut lands on 4,096 exactly and the figures below are the
     // renderer's rather than an approximation of them.
     let notes = format!(
@@ -2041,7 +2085,8 @@ async fn a_floored_routes_smaller_cap_is_announced_once_and_widening_it_is_annou
     let h = Harness::new();
 
     // A budget cap under the floor: the pair is raised to `MIN_BUDGET_BYTES`
-    // and the route is a floored one, whose notes cap is a quarter of 16,384.
+    // and the route is a floored one — which, since REQ-612's raise, still
+    // carries the notes at the build's ceiling.
     let reregister = |cap: Option<u32>| {
         h.runtime
             .apply_config_update(ConfigUpdate::RegisterProvider(ProviderConfig {
@@ -2073,7 +2118,8 @@ async fn a_floored_routes_smaller_cap_is_announced_once_and_widening_it_is_annou
         "`session/create` measures at the build's ceiling: {announced:?}"
     );
 
-    // Leg 1 — the first prompt on the floored route says the file was cut.
+    // Leg 1 — the floored route carries the whole file, and says so by saying
+    // nothing: the render did not move, so there is no news.
     //
     // Both event kinds are drained in **one** pass: `repo_context_state` is
     // published inside the assemble stage and `route_decided` when the route is
@@ -2082,20 +2128,60 @@ async fn a_floored_routes_smaller_cap_is_announced_once_and_widening_it_is_annou
     // off a bus that had announced it).
     h.turn(&session, "first").await;
     let (announced, routes) = drain_repo_and_routes(&mut bus).await;
+    let route = routes.last().expect("the turn decided a route");
     assert_eq!(
-        routes.last().and_then(|r| r.repo_context_cap),
-        Some(4_096),
-        "the route line must carry the cap the block was rendered at: {routes:?}"
+        route.bound_floored,
+        Some(true),
+        "non-vacuity: this route must be a floored one, or leg 1 says nothing \
+         about the floor: {route:?}"
     );
     assert_eq!(
-        announced
-            .iter()
-            .map(|e| (e.state, e.truncated, e.resident_bytes, e.bytes_on_disk))
-            .collect::<Vec<_>>(),
-        vec![(RepoContextStateKind::Truncated, true, 4_096, Some(6_000))],
-        "a route-cap truncation was announced as something else, or not at all: \
-         {announced:?}"
+        route.repo_context_cap,
+        Some(8_192),
+        "REQ-612's decision, end to end: a floored route carries the whole \
+         block: {route:?}"
     );
+    assert!(
+        announced.is_empty(),
+        "the floored route rendered the same block the create did, so there is \
+         nothing to announce: {announced:?}"
+    );
+    let first = wire_systems(&h.vendor)
+        .last()
+        .cloned()
+        .expect("the turn reached the vendor");
+    assert!(
+        !first.contains("truncated:"),
+        "a floored route cut the file: {}",
+        &first[first.len().saturating_sub(400)..]
+    );
+    h.await_route_stamp(&session, 8_192).await;
+    let status = h.context(&session, ContextAction::Status);
+    assert_eq!(
+        (status.cap, status.truncated, status.resident_bytes),
+        (8_192, false, 6_000),
+        "`/context` reported a cap the block was never rendered at: {status:?}"
+    );
+
+    // Leg 2 — **verify (MAJOR 3)**, at a cap no route can derive any more. The
+    // answer used to report `REPO_CONTEXT_MAX_BYTES` unconditionally, so a
+    // session on a narrower route was told `cap 8192, truncated false` while
+    // `/verbose` said `cap 4,096` on every prompt and the block in the prompt
+    // carried the marker — two surfaces, two answers, one file. The cap is a
+    // *parameter* of the daemon's own method, so this is that method answering,
+    // not a re-derivation of it.
+    let narrow = h.context_at(&session, ContextAction::Status, Some(4_096));
+    assert_eq!(
+        (narrow.cap, narrow.truncated, narrow.resident_bytes),
+        (4_096, true, 4_096),
+        "`/context` did not re-derive the file at the cap it was given: {narrow:?}"
+    );
+    assert_eq!(
+        narrow.state,
+        RepoContextStateKind::Truncated,
+        "the wire word follows the render, not the load: {narrow:?}"
+    );
+    assert_eq!(narrow.bytes_on_disk, Some(6_000));
     // The stored state did **not** move — which is exactly why gating the
     // publish on it was the defect.
     assert_eq!(
@@ -2103,49 +2189,45 @@ async fn a_floored_routes_smaller_cap_is_announced_once_and_widening_it_is_annou
         RepoContextStateKind::Loaded,
         "the loader classifies against the ceiling, not against the route"
     );
-    // **Verify (MAJOR 3).** And `/context` says what the prompt says. The
-    // answer used to report `REPO_CONTEXT_MAX_BYTES` unconditionally, so a
-    // session pinned to this route was told `cap 8192, truncated false` while
-    // `/verbose` said `cap 4,096` on every prompt and the block in the prompt
-    // carried the marker — two surfaces, two answers, one file. The cap is now
-    // the session's **stamped** route's, and `truncated` is re-derived at it.
-    h.await_route_stamp(&session, 4_096).await;
-    let status = h.context(&session, ContextAction::Status);
-    assert_eq!(
-        (status.cap, status.truncated, status.resident_bytes),
-        (4_096, true, 4_096),
-        "`/context` reported a cap the block was never rendered at: {status:?}"
-    );
-    assert_eq!(status.state, RepoContextStateKind::Truncated);
-    assert_eq!(status.bytes_on_disk, Some(6_000));
 
-    let first = wire_systems(&h.vendor)
+    // Leg 3 — a render that really does move is announced, once. The file grows
+    // past the ceiling, so the next turn's block is cut and the marker is in
+    // the prompt.
+    let big = format!("{}\n", "n".repeat(63)).repeat(160);
+    assert_eq!(big.len(), 10_240, "the fixture is not 10,240 bytes");
+    repo.write_notes(&big);
+    h.turn(&session, "second").await;
+    let (announced, _) = drain_repo_and_routes(&mut bus).await;
+    assert_eq!(
+        announced
+            .iter()
+            .map(|e| (e.state, e.truncated, e.resident_bytes, e.bytes_on_disk))
+            .collect::<Vec<_>>(),
+        vec![(RepoContextStateKind::Truncated, true, 8_192, Some(10_240))],
+        "a truncation was announced as something else, or not at all: {announced:?}"
+    );
+    let second = wire_systems(&h.vendor)
         .last()
         .cloned()
-        .expect("the turn reached the vendor");
+        .expect("the second turn reached the vendor");
     assert!(
-        first.contains("[… truncated: at least 1,904 bytes over the 4,096-byte cap were dropped]"),
+        second.contains("[… truncated: at least 2,048 bytes over the 8,192-byte cap were dropped]"),
         "the prompt's own marker disagrees with the event: {}",
-        &first[first.len().saturating_sub(400)..]
+        &second[second.len().saturating_sub(400)..]
     );
 
-    // Leg 2 — a second prompt on the same route is not news.
-    h.turn(&session, "second").await;
+    // …and a third turn on the same file is not news.
+    h.turn(&session, "third").await;
     let (announced, _) = drain_repo_and_routes(&mut bus).await;
     assert!(
         announced.is_empty(),
         "the same file at the same cap was announced twice: {announced:?}"
     );
 
-    // Leg 3 — widening the cap puts the whole file back, and that is news.
-    reregister(Some(64_000));
-    h.turn(&session, "third").await;
-    let (announced, routes) = drain_repo_and_routes(&mut bus).await;
-    assert_eq!(
-        routes.last().and_then(|r| r.repo_context_cap),
-        Some(8_192),
-        "{routes:?}"
-    );
+    // …and putting the file back inside the ceiling is news again.
+    repo.write_notes(&notes);
+    h.turn(&session, "fourth").await;
+    let (announced, _) = drain_repo_and_routes(&mut bus).await;
     assert_eq!(
         announced
             .iter()
@@ -2154,22 +2236,19 @@ async fn a_floored_routes_smaller_cap_is_announced_once_and_widening_it_is_annou
         vec![(RepoContextStateKind::Loaded, false, 6_000)],
         "a file that stopped being truncated was not announced: {announced:?}"
     );
-    let third = wire_systems(&h.vendor)
+    let fourth = wire_systems(&h.vendor)
         .last()
         .cloned()
-        .expect("the third turn reached the vendor");
+        .expect("the fourth turn reached the vendor");
     assert!(
-        !third.contains("truncated:"),
-        "the block is still cut at the wider cap"
+        !fourth.contains("truncated:"),
+        "the block is still cut after the file shrank"
     );
-    // And the routed answer follows the route back up, which is the half a
-    // constant could never have got right in either direction.
-    h.await_route_stamp(&session, 8_192).await;
     let status = h.context(&session, ContextAction::Status);
     assert_eq!(
         (status.cap, status.truncated, status.resident_bytes),
         (8_192, false, 6_000),
-        "`/context` kept the floored route's cap after the route widened: {status:?}"
+        "`/context` did not follow the file back down: {status:?}"
     );
 }
 

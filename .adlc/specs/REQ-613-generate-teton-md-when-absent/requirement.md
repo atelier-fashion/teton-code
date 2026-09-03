@@ -303,8 +303,16 @@ _Leg E — on demand, failure, and posture_
   call gets the best model the policy has and `digest`'s local pin does not drag it down.
 - [x] OQ-5: **Is REQ-612's cap the right size for a solid file?** Resolved 2026-09-03: the
   owner raised REQ-612's cap to 8 KiB, route-aware (a quarter of the route's byte budget, up to
-  8 KiB). The draft is bounded at 8 KiB less the header; on a floored route REQ-612's loader
-  truncates it to that route's effective cap with the usual marker.
+  8 KiB). The draft is bounded at 8 KiB less the header.
+
+  **Amended the same day**, by the owner's second decision: rather than let a floored route
+  carry half a block, REQ-612 raised the daemon's budget floor
+  (`budget::MIN_BUDGET_BYTES`) from 16,384 to a pinned 50,000 bytes, whose quarter (12,500)
+  is above the 8 KiB cap. So **every route the daemon can derive carries the whole 8 KiB**,
+  a floored one included, and a generated draft written at 8 KiB less the header is resident
+  whole on every route. The route-aware truncation path still exists and still applies to any
+  future budget below the floor; it is simply not reachable today, so a draft sized to the cap
+  is not silently halved by a provider fallback.
 - [ ] OQ-3: **The draft prompt's shape** is architecture's, but one product question stands:
   should the draft be asked to follow a fixed section order (Layout, Build, Test, Conventions)
   so generated files look alike across repositories? Recommendation: yes.

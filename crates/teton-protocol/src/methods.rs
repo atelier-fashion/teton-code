@@ -1517,7 +1517,7 @@ pub struct ProviderConfig {
 /// carries it to a surface.
 ///
 /// Carried as a pair rather than as a boolean because the advisory that renders
-/// it has to say *what the turn gets instead* — "2,048 words / 16 KB" — and
+/// it has to say *what the turn gets instead* — "6,250 words / 50 KB" — and
 /// those two numbers are the daemon's derivation to state, not the client's to
 /// compute. Only one currency may have been raised, so this is the derived pair
 /// rather than the floor constants.
@@ -2025,7 +2025,8 @@ pub struct RepoContextPosture {
     pub enabled: bool,
     /// The pinned resident cap in bytes — the widest block any route can carry
     /// (`REPO_CONTEXT_MAX_BYTES`), before ADR-5's per-route quarter rule floors
-    /// it further. Stated so `doctor` can name the worst case BR-7 asks it to
+    /// it further (which, at the 50,000-byte budget floor REQ-612 settled on,
+    /// no derived route does). Stated so `doctor` can name the worst case BR-7 asks it to
     /// state, without a second copy of the constant on this side of the wire.
     pub max_bytes: u64,
 }
@@ -2763,8 +2764,13 @@ pub struct SessionContextResult {
     /// the notes against their budget.
     pub resident_bytes: u64,
     /// The **effective** cap on this session's route (ADR-5): the smaller of
-    /// `REPO_CONTEXT_MAX_BYTES` and a quarter of the route's byte budget, so a
-    /// floored 16,384-byte route reports 4,096 here and the local tier 8,192.
+    /// `REPO_CONTEXT_MAX_BYTES` and a quarter of the route's byte budget.
+    ///
+    /// Since REQ-612's decision of 2026-09-03 raised the daemon's budget floor
+    /// to 50,000 bytes, every route the derivation can produce reports 8,192
+    /// here — a floored route included, which is what that raise bought. The
+    /// quarter is still what this field means and is still what travels, so a
+    /// narrower budget would narrow it.
     ///
     /// One derivation, read by `/verbose`, by the truncation marker and by this
     /// field (REQ-586's one-derivation rule), which is why it travels rather

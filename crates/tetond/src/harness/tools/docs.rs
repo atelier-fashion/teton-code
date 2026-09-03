@@ -57,13 +57,47 @@ pub const DOCS_TOOL_NAME: &str = "teton_docs";
 /// `every_bundled_topic_is_under_the_ceiling` and its fencepost twin in this
 /// module's test block.
 ///
-/// A topic is a *tool result*, not resident prompt, so the constraint is not the
-/// prompt budget but the conversation it lands in: against the local engine's
-/// 32,768-token window, 4 KiB is roughly a thousand tokens, which keeps a full
-/// docs read a small fraction of the window. A topic that grew past this could
-/// evict the very turn it was fetched to serve — the failure that reads to a
-/// user as the agent forgetting what they asked (LESSON-482).
-pub const MAX_TOPIC_BYTES: usize = 4096;
+/// A topic is a *tool result*, not resident prompt: nothing here is in the
+/// system prompt except [`DESCRIPTION`], so the ceiling has never been about
+/// the prompt budget. It is about the conversation the body lands in.
+///
+/// # Raised 4,096 → 50,000 (REQ-612 decision, 2026-09-03)
+///
+/// The old figure was chosen so a full docs read could never be condensed: it
+/// sat under `HarnessConfig`'s digest threshold, and
+/// `the_topic_ceiling_stays_under_the_summarize_threshold` pinned that. The
+/// cost was paid in the pages themselves — REQ-577, BUG-181, REQ-585 and
+/// TASK-378 each had to cut a true sentence out of one topic to land another,
+/// and TASK-378 cut four facts out of `context.md` to make room for the
+/// repository-notes section. The product owner's decision reverses that trade:
+/// **a topic may say everything it knows**, and the condensing machinery the
+/// daemon already has is what bounds the cost.
+///
+/// **The mechanism, read rather than assumed.** [`DocsTool::run`] answers with
+/// `ToolOutcome::ok(body)`, whose `disposition` is the default
+/// [`ResultDisposition::Data`](super::ResultDisposition::Data). The turn loop
+/// bypasses the digest for `ResultDisposition::Expansion` **only** — a skill
+/// body, which must be carried whole or refused (REQ-587 BR-7) — so a
+/// `teton_docs` result goes through
+/// [`summarize_if_large`](crate::harness::context::summarize_if_large) exactly
+/// as a large `read` does: under the route's `digest` threshold it is delivered
+/// verbatim; over it, the `digest` duty condenses it, and if that duty cannot
+/// be served the result is mechanically truncated under a marker. **The docs
+/// tool is not exempt**, and `the_topic_ceiling_is_bounded_by_the_digest_duty`
+/// pins both halves of that sentence.
+///
+/// So the honest statement of what this ceiling now buys is narrower than the
+/// one it used to make, and it is the one that matters: a topic can never
+/// evict the conversation it was fetched to serve, because the digest duty
+/// bounds it at the route's own threshold — not because the ceiling sits under
+/// that threshold. What the ceiling still does is bound the *worst case* the
+/// duty has to handle, and keep a bundled page from silently becoming a book.
+///
+/// The price, stated: a topic past the route's digest threshold (23,250 bytes
+/// on the local pair) costs one model call and reaches the model as a summary
+/// of itself rather than verbatim. That is the same bargain every large `read`
+/// makes, and it is why the pages are still written to be read, not skimmed.
+pub const MAX_TOPIC_BYTES: usize = 50_000;
 
 /// Every bundled topic, as `(name, body)`, in the order a reader should meet
 /// them: how to connect a provider, where work is then routed, what each turn
@@ -903,6 +937,13 @@ mod tests {
     /// covered the moment it is added rather than the moment someone remembers.
     /// The floor below is the other half of BUG-159's lesson: an empty or
     /// stub-length body would pass a ceiling check by having nothing in it.
+    ///
+    /// **The remedy in the message changed with REQ-612's raise.** While the
+    /// ceiling was 4,096 the instruction was "trim it, never raise the
+    /// ceiling", because the ceiling's whole job was to sit under the digest
+    /// threshold. It no longer does (see [`MAX_TOPIC_BYTES`]), so the honest
+    /// remedy for a page that has outgrown 50,000 bytes is to *split* it —
+    /// which is also the only remedy that keeps a single read useful.
     #[test]
     fn every_bundled_topic_is_under_the_ceiling() {
         for (name, body) in TOPICS {
@@ -915,10 +956,11 @@ mod tests {
             assert!(
                 fits_ceiling(body.len()),
                 "the `{name}` topic is {} bytes against a ceiling of {MAX_TOPIC_BYTES}. \
-                 Trim it, or split it into a second topic and add that topic to `TOPICS` \
-                 and to the index in `DESCRIPTION`. Do not raise the ceiling and do not \
-                 delete this assertion: the ceiling exists so one docs read can never \
-                 evict the conversation it was fetched to serve (REQ-577 BR-9).",
+                 Split it into a second topic and add that topic to `TOPICS` and to the \
+                 index in `DESCRIPTION`. Do not raise the ceiling and do not delete this \
+                 assertion: a page this long is one no read returns from usefully, and \
+                 past the route's digest threshold it reaches the model as a summary of \
+                 itself (REQ-577 BR-9, REQ-612's raise).",
                 body.len()
             );
         }
@@ -951,37 +993,69 @@ mod tests {
         );
     }
 
-    /// **The ceiling is only a zero-eviction claim while it stays under the
-    /// threshold that would summarize a result instead of delivering it.**
+    /// **What bounds a docs read is the `digest` duty, not the ceiling
+    /// (REQ-612 decision, 2026-09-03).**
     ///
-    /// [`MAX_TOPIC_BYTES`] is justified against the conversation a topic lands
-    /// in, and the number that decides whether a tool result lands whole is
-    /// `HarnessConfig::summarize_threshold_tokens` — above it, a result is sent
-    /// to the summarizer rather than delivered. A docs read that crossed that
-    /// line would stop being the zero-egress, zero-model-call lookup this
-    /// module's header promises: summarizing a result is a model call, and on a
-    /// remote-bound tier it is a model call carrying the body. The two
-    /// constants are set in different files by different rationales, so the
-    /// coupling is written down here rather than left to hold by luck.
+    /// This test used to assert the opposite relation — `MAX_TOPIC_BYTES <
+    /// summarize_threshold_bytes`, so a full docs read could never be
+    /// condensed. Raising the ceiling to 50,000 so a topic may say everything
+    /// it knows reverses it, and the reversal is a decision rather than a
+    /// regression **only if the condensing machinery really does apply here**.
+    /// So that is what is asserted now, in the two halves the claim is made of:
+    ///
+    /// 1. **The ceiling is above the threshold**, deliberately — the fact that
+    ///    used to be forbidden, pinned in its new direction so nobody
+    ///    "restores" the old invariant by lowering the ceiling in silence.
+    /// 2. **The docs tool is not exempt from the digest.** The turn loop
+    ///    bypasses `summarize_if_large` for [`ResultDisposition::Expansion`]
+    ///    alone, and [`DocsTool`]'s outcome is
+    ///    [`ResultDisposition::Data`](super::ResultDisposition::Data) — so an
+    ///    over-threshold topic is condensed exactly as a large `read` is. This
+    ///    half is the load-bearing one: were the docs tool ever given
+    ///    `Expansion` (to stop its pages being summarized, say), the ceiling
+    ///    would become the *only* bound on what a docs read can push into a
+    ///    conversation, and 50,000 bytes is not a bound anyone chose for that.
+    ///
+    /// **Mutation, run and observed:** giving the `providers` outcome
+    /// `.with_disposition(ResultDisposition::Expansion)` fails the second
+    /// assertion; lowering `MAX_TOPIC_BYTES` back to 4,096 fails the first.
     #[test]
-    fn the_topic_ceiling_stays_under_the_summarize_threshold() {
+    fn the_topic_ceiling_is_bounded_by_the_digest_duty() {
+        use crate::harness::tools::ResultDisposition;
         use crate::harness::turn_loop::HarnessConfig;
 
         // The byte twin is read off the config rather than recomputed from the
         // word threshold (REQ-586 BR-6, gotcha #3): the two thresholds scale
-        // from two different currencies on a remote route, so a topic must clear
-        // the byte one the harness will actually apply.
-        let threshold_bytes = HarnessConfig::default().summarize_threshold_bytes;
+        // from two different currencies on a remote route, so this is the one
+        // the harness will actually apply.
+        let config = HarnessConfig::default();
         assert!(
-            MAX_TOPIC_BYTES < threshold_bytes,
+            MAX_TOPIC_BYTES > config.summarize_threshold_bytes,
             "the per-topic ceiling is {MAX_TOPIC_BYTES} bytes and the default harness \
-             summarizes a tool result past {threshold_bytes} bytes \
-             ({} tokens). A topic at the ceiling would be \
-             summarized instead of served — a model call, and on a remote tier a model call \
-             carrying the body, which is not what `teton_docs` promises. Lower \
-             `MAX_TOPIC_BYTES`, or raise the threshold deliberately and say why here.",
-            HarnessConfig::default().summarize_threshold_tokens
+             summarizes a tool result past {} bytes ({} words). REQ-612 raised the \
+             ceiling *past* the threshold on purpose — a topic may say everything it \
+             knows, and the `digest` duty is what bounds the result. If the ceiling has \
+             come back under the threshold, say why here rather than leaving the old \
+             invariant to look like it was never abandoned.",
+            config.summarize_threshold_bytes,
+            config.summarize_threshold_tokens
         );
+
+        // And the duty really is what bounds it: `Data`, so the turn loop's
+        // `disposition == Expansion` bypass does not apply.
+        for (name, _) in TOPICS {
+            let outcome = call(name);
+            assert_eq!(
+                outcome.disposition,
+                ResultDisposition::Data,
+                "`{name}` is served with a disposition the turn loop exempts from the \
+                 `digest` duty, which would leave `MAX_TOPIC_BYTES` as the only bound on \
+                 what one docs read can push into a conversation"
+            );
+        }
+        // The unknown-topic error takes the same path, so a runaway page can
+        // never be smuggled in through the didactic arm either.
+        assert_eq!(call("nope").disposition, ResultDisposition::Data);
     }
 
     /// **The resident cost of this tool, pinned.**

@@ -106,7 +106,7 @@ struct SessionRecord {
     /// questions, and conflating them let a truncation go out in silence. The
     /// stored state is the *file*, classified once at the widest cap any route
     /// can ask for; what a client is told is the file **as this route rendered
-    /// it**, and a floored route renders the same unchanged file as a truncated
+    /// it**, and a narrower route cap renders the same unchanged file as a truncated
     /// block. So a session that moves from an 8,192-cap route to a 4,096-cap one
     /// has a stored state that did not move and news that did.
     ///
@@ -852,8 +852,8 @@ impl SessionRegistry {
     /// still a different file, so the client is owed the line.
     ///
     /// The triple is the *render* moving. The turn path renders at the route's
-    /// own cap, so a session that reroutes from an 8,192-cap route to a floored
-    /// 4,096-cap one has a stored state that did not change and a truncation the
+    /// own cap, so a session that reroutes from an 8,192-cap route to a
+    /// narrower-cap one has a stored state that did not change and a truncation the
     /// user has not been told about — which is exactly the silence BR-3 forbids.
     /// Gating the publish on [`Self::set_repo_context`]'s `false` (the shape
     /// this replaced) could not see that, because nothing about the *file*

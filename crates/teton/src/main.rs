@@ -5090,9 +5090,11 @@ mod tests {
                 allow_cleartext: None,
                 floored_budget,
             };
+        // The pair `budget::derive` really produces on a sub-floor route since
+        // REQ-612 raised `MIN_BUDGET_BYTES` to 50,000 (it was 2,048 / 16,384).
         let floor = Some(FlooredBudget {
-            budget_tokens: 2_048,
-            budget_bytes: 16_384,
+            budget_tokens: 6_250,
+            budget_bytes: 50_000,
         });
 
         let mut surface = RecordingSurface::new();
@@ -5125,7 +5127,7 @@ mod tests {
             "{capped:#?}"
         );
         assert!(
-            capped[0].contains("2,048 words / 16 KB"),
+            capped[0].contains("6,250 words / 50 KB"),
             "the pair in force is named, not only the fact: {capped:#?}"
         );
 

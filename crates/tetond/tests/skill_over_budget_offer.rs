@@ -1753,19 +1753,27 @@ fn route_for(bound: BudgetBound, verdict: WindowVerdict) -> (Fixture, Option<Moc
             (fx, Some(provider))
         }
         (BudgetBound::Window, WindowVerdict::FitsWindow) => {
-            // 20,000 declared: the budget is (12,650 words / 37,952 B). The body
+            // 30,000 declared: the budget is (19,317 words / 57,952 B). The body
             // is over in **bytes only**, and half the measured bytes still sit
-            // under the raw window.
+            // under the raw window — the band this cell lives in is
+            // `(window − reservation) × 2 < measured ≤ window × 2`, 2,048 bytes
+            // wide at any window.
+            //
+            // It was 20,000 declared with a 31,000-byte body until REQ-612
+            // raised `MIN_BUDGET_BYTES` to 50,000: that floored the 20,000-token
+            // route to (12,650, 50,000), and a body inside the old band was no
+            // longer over budget at all, so the cell stopped producing an offer.
+            // 30,000 is the narrowest round window that is **not** floored.
             let provider = vendor();
             let fx = Fixture::new(Spec::new(
                 "v6wfit",
                 remote_route(
                     &provider.openai_endpoint(),
                     UNRECOGNIZED_MODEL,
-                    Some(20_000),
+                    Some(30_000),
                     None,
                 ),
-                sized_body(10_000, 31_000),
+                sized_body(10_000, 51_700),
             ));
             (fx, Some(provider))
         }
@@ -1787,6 +1795,11 @@ fn route_for(bound: BudgetBound, verdict: WindowVerdict) -> (Fixture, Option<Moc
             // The ADR-15 discriminator: a 200,000-token declaration under a
             // 6,000-token cap. Over budget, over the cap, and still comfortably
             // inside the window the provider actually declared.
+            //
+            // The cap derives (3,317 words / 9,952 B) and the floor raises that
+            // to (6,250, 50,000) — the pair REQ-612 moved — so the body is
+            // sized against the **floor**, not against the cap. It was
+            // (6,000, 24,000) while the floor was 16,384.
             let provider = vendor();
             let fx = Fixture::new(Spec::new(
                 "v6cfit",
@@ -1796,7 +1809,7 @@ fn route_for(bound: BudgetBound, verdict: WindowVerdict) -> (Fixture, Option<Moc
                     Some(200_000),
                     Some(6_000),
                 ),
-                sized_body(6_000, 24_000),
+                sized_body(15_000, 60_000),
             ));
             (fx, Some(provider))
         }
@@ -2016,6 +2029,9 @@ fn remedy_route(bound: BudgetBound) -> (Fixture, Option<MockProvider>) {
             (fx, Some(provider))
         }
         BudgetBound::UserCap => {
+            // The 6,000-token cap derives (3,317 / 9,952) and the floor raises
+            // it to (6,250 / 50,000), so the body is sized against the floor —
+            // it was (6,000, 24,000) while that floor was 16,384 (REQ-612).
             let provider = vendor();
             let fx = Fixture::new(Spec::new(
                 "v7cap",
@@ -2025,21 +2041,27 @@ fn remedy_route(bound: BudgetBound) -> (Fixture, Option<MockProvider>) {
                     Some(200_000),
                     Some(6_000),
                 ),
-                sized_body(6_000, 24_000),
+                sized_body(15_000, 60_000),
             ));
             (fx, Some(provider))
         }
         BudgetBound::Window => {
+            // 30,000 rather than 20,000, and a bigger body: REQ-612's floor
+            // (50,000) is above a 20,000-token window's derived 37,952 bytes, so
+            // that route is now a *floored* one and the old 31,000-byte body no
+            // longer went over anything. 30,000 is the narrowest round window
+            // the floor leaves alone, which keeps this row about the window it
+            // names.
             let provider = vendor();
             let fx = Fixture::new(Spec::new(
                 "v7win",
                 remote_route(
                     &provider.openai_endpoint(),
                     RECIPE_MODEL,
-                    Some(20_000),
+                    Some(30_000),
                     None,
                 ),
-                sized_body(10_000, 31_000),
+                sized_body(15_000, 70_000),
             ));
             (fx, Some(provider))
         }
@@ -2075,11 +2097,14 @@ async fn a_raise_window_offer_cannot_be_rendered_without_its_risk() {
         ("v7arec", RECIPE_MODEL, true),
         ("v7anon", UNRECOGNIZED_MODEL, false),
     ] {
+        // 30,000 / 70,000 rather than 20,000 / 31,000: REQ-612's 50,000-byte
+        // floor made a 20,000-token window a floored route, and the old body
+        // was under the floored pair, so no offer was composed at all.
         let provider = vendor();
         let fx = Fixture::new(Spec::new(
             tag,
-            remote_route(&provider.openai_endpoint(), model, Some(20_000), None),
-            sized_body(10_000, 31_000),
+            remote_route(&provider.openai_endpoint(), model, Some(30_000), None),
+            sized_body(15_000, 70_000),
         ));
         let session = fx.session();
         let mut sub = fx.events.subscribe(512);

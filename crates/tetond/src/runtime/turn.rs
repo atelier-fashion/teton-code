@@ -1051,9 +1051,11 @@ impl DaemonRuntime {
         let boundaries = config.effective_boundaries();
         let current = sessions.repo_context(session_id);
         // The route's **effective** cap, not the build's ceiling (ADR-5): the
-        // loader stored the file and this stage renders it, so a floored
-        // 16,384-byte route carries 4 KiB of notes and the local tier the full
-        // 8 KiB — one derivation, asked where the route is known.
+        // loader stored the file and this stage renders it, so a 16,384-byte
+        // budget would carry 4 KiB of notes and the local tier carries the full
+        // 8 KiB — one derivation, asked where the route is known. Since
+        // REQ-612's floor went to 50,000 every derived route reaches 8,192; the
+        // cap is still read off the route, never assumed.
         let cap = route.budget.repo_context_cap;
         let files = self.repo_files.as_ref();
         // Store and read back rather than keeping the value: the registry owns
@@ -1089,8 +1091,8 @@ impl DaemonRuntime {
             };
         // BR-3 / AC-3: the news is what a client is *shown*, not what the daemon
         // stored. The state above can be byte-identical from turn to turn while
-        // the route's cap moves under it — a fallback to a floored route renders
-        // the same untruncated file as a 4,096-byte truncated block — so the
+        // the route's cap moves under it — a fallback to a narrower route would
+        // render the same untruncated file as a truncated block — so the
         // publish is gated on the rendered triple as well as on the state. That
         // is the whole of "nothing is clamped in silence" for this feature:
         // measured at the cap the prompt was actually built at, published from

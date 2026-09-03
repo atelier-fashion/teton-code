@@ -4061,10 +4061,14 @@ fn budget_clause(rd: &RouteDecided) -> Option<String> {
 /// budget.
 ///
 /// **Both halves, because one of them is BR-3's last sentence.** The cap is a
-/// quarter of *this route's* byte budget, so a fallback to a floored route
-/// silently halves it; a resident figure with nothing to compare it against
-/// cannot show a user that their notes are now up against a ceiling they were
-/// nowhere near a moment ago. The cap comes off `route_decided`'s own
+/// quarter of *this route's* byte budget, held under a pinned maximum, so a
+/// route narrow enough would halve it under the user; a resident figure with
+/// nothing to compare it against cannot show them that their notes are now up
+/// against a ceiling they were nowhere near a moment ago. (Since REQ-612 raised
+/// the daemon's budget floor to 50,000 bytes, no route it derives is that
+/// narrow — every one states 8,192 — so this pair reads as "your file against
+/// the ceiling" today. The client still renders whatever the daemon states,
+/// which is the whole rule here.) The cap comes off `route_decided`'s own
 /// `repo_context_cap` — the router's number, projected beside the budget it is
 /// a quarter of — and the resident figure off the latest `repo_context_state`
 /// this client saw. A daemon that states no cap renders the resident figure
@@ -4084,10 +4088,10 @@ fn budget_clause(rd: &RouteDecided) -> Option<String> {
 /// [`REPO_CONTEXT_MAX_BYTES`](teton_protocol) — the widest cap any route can ask
 /// for, because between turns there is no route — while a turn's own
 /// assemble-time state, measured at *that* route's cap, is published after the
-/// turn's `route_decided`. So on the first prompt of a session on a floored
-/// route this clause can pair a resident figure of 8,192 with a cap of 4,096,
-/// and the `context:` notes line printed immediately below it carries the
-/// corrected pair.
+/// turn's `route_decided`. So on the first prompt of a session whose route
+/// states a narrower cap, this clause can pair a create-time resident figure
+/// with a smaller cap, and the `context:` notes line printed immediately below
+/// it carries the corrected pair.
 ///
 /// That correction is guaranteed rather than hoped for: the daemon's publish
 /// gate keys on the rendered `(state, truncated, resident_bytes)` triple, so a
@@ -4134,9 +4138,10 @@ fn notes_resident_bytes(rc: &events::RepoContextState) -> Option<u64> {
 /// session in every directory that has no notes.
 ///
 /// **"Truncated" is [`events::RepoContextState::truncated`], not the state
-/// word.** A file well inside the 8,192-byte ceiling is cut anyway on a floored
-/// route, whose cap is a quarter of its own byte budget — so the flag is the
-/// route-aware fact and the word is not. Reading the word alone is how a
+/// word.** A file well inside the 8,192-byte ceiling is cut anyway wherever the
+/// effective cap is narrower — the cap is a quarter of the route's own byte
+/// budget, and `/context` answers at whatever cap it is given — so the flag is
+/// the route-aware fact and the word is not. Reading the word alone is how a
 /// truncation reaches a user as silence: the daemon renders at the route's cap,
 /// the state stays `loaded`, and `/verbose` off prints nothing at all.
 ///
@@ -5221,19 +5226,19 @@ mod tests {
                 dropped_blocks: 1,
                 elided_bytes: 0,
                 newest_user_elided: false,
-                budget_tokens: 2_048,
-                budget_bytes: 16_384,
+                budget_tokens: 6_250,
+                budget_bytes: 50_000,
                 bound: BudgetBound::UserCap,
                 bound_floored,
             })
         };
         assert_eq!(
             line(false),
-            "context: 1 older block dropped to fit the 2,048-word budget (bound: user cap)"
+            "context: 1 older block dropped to fit the 6,250-word budget (bound: user cap)"
         );
         assert_eq!(
             line(true),
-            "context: 1 older block dropped to fit the 2,048-word budget (bound: user cap — \
+            "context: 1 older block dropped to fit the 6,250-word budget (bound: user cap — \
              floored: below the smallest budget that holds the system prompt)"
         );
 
@@ -5247,8 +5252,8 @@ mod tests {
                     model: Some("kimi-k3".to_owned()),
                     reason: "a reason.".to_owned(),
                     effort: None,
-                    budget_tokens: Some(2_048),
-                    budget_bytes: Some(16_384),
+                    budget_tokens: Some(6_250),
+                    budget_bytes: Some(50_000),
                     bound: Some(BudgetBound::UserCap),
                     bound_floored,
                     spend_ceiling_micro_cents: None,
@@ -5258,13 +5263,13 @@ mod tests {
             )
         };
         assert!(
-            route(Some(false)).ends_with(" · budget 2,048 words / 16 KB (bound: user cap)"),
+            route(Some(false)).ends_with(" · budget 6,250 words / 50 KB (bound: user cap)"),
             "{}",
             route(Some(false))
         );
         assert!(
             route(Some(true)).ends_with(
-                " · budget 2,048 words / 16 KB (bound: user cap — floored: below the smallest \
+                " · budget 6,250 words / 50 KB (bound: user cap — floored: below the smallest \
                  budget that holds the system prompt)"
             ),
             "{}",
@@ -12198,7 +12203,11 @@ mod repo_context_tests {
     /// router's `route_decided` projection makes every route line render the
     /// bare `· notes N B`, which fails the first assertion here; deriving the
     /// cap from `budget_bytes / 4` on this side instead of reading the field
-    /// renders `cap 8,192 B` for the floored row and fails the second.
+    /// renders `cap 8,192 B` for the narrow row and fails the second. That
+    /// second mutation is the whole reason the narrow row is kept now that no
+    /// daemon derives one (REQ-612's floor put every route at cap 8,192): a
+    /// table of 8,192-cap rows cannot tell a client that reads the field from
+    /// one that divides the budget itself.
     #[test]
     fn the_route_line_names_the_caps_the_notes_are_measured_against() {
         let route = |budget_bytes: u64, cap: Option<u64>| -> RouteDecided {
@@ -12224,14 +12233,24 @@ mod repo_context_tests {
             format_route(&local, Some(2_310))
         );
 
-        // A floored route: the same file, now at the ceiling — which is the
-        // fact the pair exists to make visible, and which the resident figure
-        // alone cannot say.
-        let floored = route(16_384, Some(4_096));
+        // A route at a narrower cap: the same file, now at the ceiling — which
+        // is the fact the pair exists to make visible, and which the resident
+        // figure alone cannot say.
+        //
+        // **Synthetic since REQ-612's decision of 2026-09-03.** This row used
+        // to be a floored route's own pair: a 16,384-byte budget carrying
+        // 4,096 of notes. Raising `MIN_BUDGET_BYTES` to 50,000 so a floored
+        // route holds the whole 8 KiB block put every derived route at cap
+        // 8,192, so no daemon emits this pair today. The row is kept because
+        // this is a *rendering* test over a wire event: the client's job is to
+        // print the cap the daemon states, whatever it states, and a row that
+        // only ever carried 8,192 could not tell "reads the field" from
+        // "prints the ceiling".
+        let narrow = route(16_384, Some(4_096));
         assert!(
-            format_route(&floored, Some(4_096)).ends_with(" · notes 4,096 B / cap 4,096 B"),
+            format_route(&narrow, Some(4_096)).ends_with(" · notes 4,096 B / cap 4,096 B"),
             "{}",
-            format_route(&floored, Some(4_096))
+            format_route(&narrow, Some(4_096))
         );
 
         // A daemon predating the field: the clause it always rendered.
@@ -12251,8 +12270,12 @@ mod repo_context_tests {
     /// **Verify (MAJOR 1c) — BR-3 / AC-3: the flag decides, not the word.**
     ///
     /// The daemon renders at the route's own cap, so a file well inside the
-    /// 8,192-byte ceiling is `truncated` on a floored route while the state word
-    /// it was classified under stays whatever the load decided. A client that
+    /// 8,192-byte ceiling can be `truncated` while the state word it was
+    /// classified under stays whatever the load decided. Since REQ-612's floor
+    /// went to 50,000 the surface that still produces that pair is `/context`
+    /// answered at a cap narrower than the ceiling
+    /// (`tetond`'s `a_floored_route_carries_the_whole_file_and_a_narrower_cap_is_answered_at`),
+    /// and the client's rule is unchanged either way: the flag decides. A client that
     /// branched on the word alone printed "is resident — 4,096 bytes" under
     /// `/verbose`, and **nothing at all** without it — the silence BR-3 forbids.
     ///
@@ -12261,8 +12284,9 @@ mod repo_context_tests {
     /// with `None` where a line is owed, the second with the `is resident` line.
     #[test]
     fn a_truncated_flag_draws_the_truncation_line_whatever_the_state_word_says() {
-        // The shape a floored route publishes for a 6,000-byte file: the flag is
-        // set, the figures are the route's, and the word is the loader's.
+        // The shape a narrower-than-ceiling render publishes for a 6,000-byte
+        // file: the flag is set, the figures are the render's, and the word is
+        // the loader's.
         let mut route_capped = state_event(K::Loaded);
         route_capped.bytes_on_disk = Some(6_000);
         route_capped.resident_bytes = 4_096;

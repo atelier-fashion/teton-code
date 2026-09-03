@@ -170,13 +170,21 @@ pub fn file_name(source: RepoContextSource) -> &'static str {
 /// The resident byte cap (BR-3, ADR-5): 8 KiB, a quarter of the local tier's
 /// 32,768-byte budget, decided as product on 2026-09-03.
 ///
-/// This is the **maximum**, not the figure every route uses. ADR-5 makes the cap
+/// This is the **maximum**, and since REQ-612's second decision of the same day
+/// it is also the figure every derived route uses. ADR-5 makes the cap
 /// route-aware — the effective cap is `min(REPO_CONTEXT_MAX_BYTES,
-/// route.budget_bytes / 4)` — so a floored 16,384-byte route renders the same
-/// file at 4,096. That is why
-/// [`RepoContextBlock::render`](render::RepoContextBlock::render) takes the cap
-/// as a **parameter**: the route decides it, and the loader here classifies
-/// against this ceiling because it is the widest any route can ask for.
+/// route.budget_bytes / 4)` — and a 16,384-byte budget renders the same file at
+/// 4,096; but the owner then raised the daemon's budget floor
+/// (`budget::MIN_BUDGET_BYTES`) to 50,000 precisely so a floored route carries
+/// the **whole** block, and the smallest budget any arm of `budget::derive`
+/// returns is the default pair's 32,768, whose quarter is 8,192 exactly.
+///
+/// So the quarter is a live *rule* on a latent *path*. That is why
+/// [`RepoContextBlock::render`](render::RepoContextBlock::render) still takes
+/// the cap as a **parameter** — the route decides it, and the loader here
+/// classifies against this ceiling because it is the widest any route can ask
+/// for — and why nothing downstream may replace the parameter with this
+/// constant.
 pub const REPO_CONTEXT_MAX_BYTES: usize = 8_192;
 
 /// The bound on the *read* itself (ADR-5, the REQ-585 body cap): 64 KiB.
@@ -527,7 +535,7 @@ pub struct RepoContextFile {
 /// function of it; the rest carry only what a surface has to say.
 ///
 /// [`Self::Loaded`] versus [`Self::Truncated`] is decided against
-/// [`REPO_CONTEXT_MAX_BYTES`], the widest cap any route can ask for. A floored
+/// [`REPO_CONTEXT_MAX_BYTES`], the widest cap any route can ask for. A narrower
 /// route renders the same `Loaded` file as a truncated *block*, and the block's
 /// [`RepoContextBlock::truncated`] is the route-aware answer — one derivation,
 /// asked at the route (ADR-5).

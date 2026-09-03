@@ -112,12 +112,20 @@ pub struct CarriedTurn {
 ///
 /// The notes cap is a **quarter of the route's byte budget**, so it moves when
 /// the route does: a turn assembled on the local tier renders 8,192 bytes of
-/// notes, and the same turn rerouted to a floored 16,384-byte route may spend
-/// only 4,096. Keeping the block already rendered pushes a ~16.4 KB system
-/// prompt into a 16,384-byte budget, and `truncate_to_budget` then makes room by
-/// dropping conversation oldest-first — which on a fresh turn is the user's own
-/// message. The user asks a question, the notes stay whole, and the model is
-/// shown the notes without the question.
+/// notes, and a turn rerouted to a 16,384-byte budget may spend only 4,096.
+/// Keeping the block already rendered pushes a ~16.4 KB system prompt into a
+/// 16,384-byte budget, and `truncate_to_budget` then makes room by dropping
+/// conversation oldest-first — which on a fresh turn is the user's own message.
+/// The user asks a question, the notes stay whole, and the model is shown the
+/// notes without the question.
+///
+/// **No route derives a narrower cap today** (REQ-612's decision of
+/// 2026-09-03: `MIN_BUDGET_BYTES` is 50,000, so every derived route reaches the
+/// pinned 8,192). This seam is therefore latent rather than dead: it is the one
+/// place a narrower route would arrive, its behaviour is pinned at a synthetic
+/// sub-floor budget in `conversation_carry.rs`, and it still re-renders on
+/// every reroute — a cheap no-op when the cap has not moved, and the guard that
+/// stops the failure above the day it does.
 ///
 /// So the block is re-rendered at the new cap instead, which is the only party
 /// to the prompt that a reroute *should* shrink: the notes are the repository's

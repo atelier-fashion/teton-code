@@ -161,8 +161,7 @@ figure). The **effective** cap on a route is `min(REPO_CONTEXT_MAX_BYTES, route.
 derived in `harness/budget.rs` beside the budget it reads (REQ-586's one-derivation rule) and
 stamped on `RouteBudget` as `repo_context_cap`, so `/verbose`, the truncation marker and the
 loader read one number. The loader stores the stripped file; the `assemble` stage renders the
-block at the route's effective cap, so a floored 16,384-byte route carries a 4 KiB block and
-the local tier the full 8 KiB. A reroute mid-turn keeps the block already rendered — the
+block at the route's effective cap. A reroute mid-turn keeps the block already rendered — the
 system prompt is fixed for the turn — and the refit is the conversation's, as REQ-586 BR-1
 already defines it. `REPO_CONTEXT_READ_CEILING_BYTES = 65_536` bounds the read itself (`Read::take`; the
 REQ-585 body cap) so a gigantic file costs 64 KiB, not its size. Truncation cuts at the last
@@ -178,6 +177,38 @@ it lives and re-stated in its doc ledger**, and the two recorded margins are re-
 sweeps measure — by measurement, never by adding 8,192 to a number (LESSON-593, LESSON-597). The
 docs state the consequence: a redact-scanning route's budget shrinks by the same bytes (REQ-586
 verify (b)).
+
+**Amended by the product owner, 2026-09-03 (second decision of the day): the floor moves, not
+the block.** This ADR shipped with "a floored 16,384-byte route carries a 4 KiB block". The owner
+rejected it — a floored route is the one whose model needs the repository's description most, and
+a notes cap that halves under a provider fallback is a fact moving under the user. So
+`budget::MIN_BUDGET_BYTES` was raised from `LOCAL_BUDGET_BYTES / 2` (16,384) to a pinned
+**50,000**, sized against the invariant it exists for: the widest default system prompt carrying a
+worst-case 8,192-byte block measures 15,370 bytes, and `50,000 ≥ 2 × 15,370` with 19,260 to spare
+(`min_budget_bytes_holds_the_harnesss_own_system_prompt`, which now builds its config with
+`repo_context: Some(RepoContextBlock::worst_case())` so the invariant is measured for the prompt
+that ships). `MIN_BUDGET_TOKENS` follows by the same bridge: 6,250.
+
+Three consequences, all intended:
+
+1. **A floored route carries the whole 8 KiB** — `50,000 / 4 = 12,500`, so the pin binds there
+   too.
+2. **Every route this build derives carries the whole 8 KiB.** The smallest budget any arm of
+   `derive` returns is the default pair's 32,768, whose quarter is 8,192 exactly. The quarter half
+   of the `min` is therefore a live *rule* on a latent *path*: it stays derived where the route is
+   decided, nothing downstream may replace the parameter with the constant, and it is pinned at a
+   **synthetic sub-floor** `RouteBudget` (16,384 → 4,096) in
+   `the_repo_context_cap_is_a_quarter_of_the_byte_budget_up_to_the_pinned_max` rather than at a
+   route, so lowering the floor again inherits the rule rather than the bug.
+3. **`MIN_BUDGET_BYTES` no longer derives from `LOCAL_BUDGET_BYTES`.** The two answer different
+   questions — the default pair's byte half, and the smallest assembled prompt plus room for a
+   conversation — and re-deriving one from the other is how the floor came to be smaller than the
+   prompt it exists to hold.
+
+The redact arithmetic does **not** move with it: the scannable bound is the chunk cap less the
+body overhead, neither of which reads the floor, and 50,000 is far under the 184,265-byte clamp,
+so a floored route is never redact-clamped (pinned by
+`the_floor_is_reported_where_it_bites_and_nowhere_else`).
 
 **Alternatives rejected.** Refusing an oversized file (the top of the file is what an author
 puts first; a marker is honest, a refusal loses the whole file). A configurable cap (OQ-6: a knob
@@ -263,10 +294,21 @@ chunks hold twice a body only while the overhead is ≤ 21,353, so the raise pus
 cost moved to scan calls (`REDACT_MAX_CHUNKS` 4 → 5) rather than to context. The ledger states
 both halves; TASK-378 documents the actual consequence, not the predicted one.
 
-**The local tier spends about an eighth of its byte budget on the notes, a floored route a quarter.** That is the trade the
-feature makes; BR-2's switch and the cap bound it, and AC-13's dogfood is where the trade is
-checked (ASSUME-1 in the spec). If the local model does not use the notes, the remedy is
-`/context off` per session or `repo_file = false` durably, not a larger cap.
+**The local tier spends about an eighth of its byte budget on the notes, a floored route about a
+sixth.** That is the trade the feature makes; BR-2's switch and the cap bound it, and AC-13's
+dogfood is where the trade is checked (ASSUME-1 in the spec). If the local model does not use the
+notes, the remedy is `/context off` per session or `repo_file = false` durably, not a larger cap.
+
+**The floor's own cost, restated after the amendment above.** `MIN_BUDGET_BYTES` is what a
+sub-floor route's turns are actually sent under, and raising it from 16,384 to 50,000 widens the
+band in which the daemon knowingly sends more than a provider declared: a window under ~26,000
+tokens is now floored where the old figure floored only windows under ~9,200. The trade is
+REQ-586's own and is unchanged in kind — a budget that cannot hold the system prompt fails every
+turn and explains nothing — but it is now taken on more routes, and the guard is the same one:
+the declaration is recorded, `floored` rides `route_decided`, `context_pressure` and `/doctor`,
+and the pair actually in force is named. On the pinned vendors the backstop is the typed
+`context_length_exceeded`; on Ollama (the case `MIN_BUDGET_BYTES` documents) it is still a
+silently truncated prompt, which is why the marks exist.
 
 **Two neutralization passes over the same text.** The renderer defuses frame labels and envelope
 tags as it writes the frame; `render_prompt` defuses control tokens again on both arms. Insertion-only

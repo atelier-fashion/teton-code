@@ -84,8 +84,10 @@ pub struct RepoContextBlock {
     /// Whether the file was cut to fit the cap this block was rendered at.
     ///
     /// The **route-aware** answer: the same file is untruncated at 8,192 and
-    /// truncated at a floored route's 4,096, so this is a fact about the block
-    /// rather than about the file (ADR-5).
+    /// truncated at a narrower cap, so this is a fact about the block rather
+    /// than about the file (ADR-5). No route derives a narrower cap since
+    /// REQ-612 raised the budget floor to 50,000, but `/context` still answers
+    /// at whatever cap it is given, and this stays the block's own fact.
     pub truncated: bool,
     /// How many bytes of the (sanitized) file text are in the block — the
     /// figure `/context` and `/verbose` report, and not the block's own length:
@@ -99,9 +101,10 @@ impl RepoContextBlock {
     ///
     /// The cap is a **parameter**, not a constant read from below: ADR-5 makes it
     /// `min(REPO_CONTEXT_MAX_BYTES, route.budget_bytes / 4)` and derives it where
-    /// the route is decided, so the local tier's 8,192 and a floored route's
-    /// 4,096 are one derivation asked twice rather than two numbers that can
-    /// drift.
+    /// the route is decided, so 8,192 and any narrower figure are one
+    /// derivation asked twice rather than two numbers that can drift. Every
+    /// route derives 8,192 today (REQ-612's 50,000-byte budget floor), and this
+    /// must **not** become a constant read from below because of it.
     #[must_use]
     pub fn render(file: &RepoContextFile, effective_cap: usize) -> Self {
         let attribute = escape_attribute(file_name(file.source));
@@ -311,11 +314,11 @@ mod tests {
 
     /// BR-3 / AC-3: cap + 1 byte is cut at the last line boundary under the cap
     /// and ends with the marker naming the cap and the bytes dropped; exactly at
-    /// the cap is whole, with no marker. And the same file at a floored route's
+    /// the cap is whole, with no marker. And the same file at a narrower
     /// 4,096 names 4,096 — the cap is the route's, not the constant.
     ///
     /// Mutation: replacing `effective_cap` with `REPO_CONTEXT_MAX_BYTES` inside
-    /// `render` passes the first two legs and fails the floored one on both the
+    /// `render` passes the first two legs and fails the narrow one on both the
     /// kept length and the marker's figure; deleting the `rposition` branch from
     /// `truncate_at_line_boundary` — so the cut falls at the cap — passes every
     /// leg whose lines divide the cap and fails the ragged one, which is why
@@ -384,7 +387,10 @@ mod tests {
             &block.text[block.text.len() - 300..]
         );
 
-        // AC: a floored route renders the same file at its own cap.
+        // AC: a narrower cap renders the same file at that cap. Synthetic
+        // since REQ-612's floor went to 50,000 — no route derives 4,096 — and
+        // it is the pure function's own rule, which is the thing this file
+        // tests.
         let floored = RepoContextBlock::render(&over, 4_096);
         assert!(floored.truncated);
         assert_eq!(floored.resident_bytes, 4_096);

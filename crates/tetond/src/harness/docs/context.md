@@ -6,50 +6,75 @@ either, the oldest are dropped and the newest is middle-elided in place.
 
 A remote route derives both from the declared window
 (`capabilities.max_context`) less the 1,024 tokens reserved for the reply:
-words `usable × 2/3`, bytes `usable × 2` — ≈3 bytes per word, and real text is
-denser, so **the byte guard binds on a remote route**. A provider declaring no
-window gets 4,096 words / 32,768 bytes; the local tier derives its pair from the
-engine's window (21,162 / 63,488).
+words are `usable × 2/3`, bytes `usable × 2`. That is ≈3 bytes per word, and
+real text is denser (`o200k_base`: prose 4.6 B/token, Rust 4.0, minified JSON
+and path-heavy shell output 3.6), so **on a remote route the byte guard binds**
+for prose and code. Random base64 (1.45 B/token) is the one class neither
+covers.
 
-The backstop is the provider's typed "context length exceeded", ending the turn
-without faulting its health; Teton pins that wording for OpenAI-compatible,
-Anthropic, Moonshot/Kimi and `llama-server`. **Not Ollama** — it truncates an
-over-long prompt instead, so the answer comes from a shortened one.
+A provider declaring no window gets 4,096 words / 32,768 bytes. The local tier
+is not on that pair: it derives from the engine's own window, 21,162 words /
+63,488 bytes.
+
+The backstop is the provider's own "context length exceeded" — a typed error
+ending the turn rather than retrying or faulting its health. It covers the
+vendors whose wording Teton pins: OpenAI-compatible, Anthropic, Moonshot/Kimi,
+`llama-server`. **Ollama is not among them** — it truncates an over-long
+prompt instead of refusing, so the answer comes from a shortened prompt.
 
 ## The bound
 
-`/verbose` prints it on the route line, one of five: `window`; `unknown window`
-(none declared); `user cap` (`context_budget_cap` below the window); `redact
-scan` (bytes held to what the scan covers); `local engine`.
+Computed once, where the route is decided; `/verbose` prints it on the route
+line (`· budget 665,984 words / 2 MB (bound: window)`). One of five:
+
+- `window` — the declared window.
+- `unknown window` — none declared, so the default pair; doctor says so.
+- `user cap` — `context_budget_cap` below the window.
+- `redact scan` — bytes held to what the scan covers.
+- `local engine` — a local-tier route.
+
+On the wire they are snake_case (`default_unknown` reads as `unknown window`).
 
 ## Declaring a window
 
     teton provider add <id> … --max-context 128000 [--context-budget-cap <n>]
 
-`teton doctor` and `teton provider list` print a `window:` column, and doctor
-advises on a provider declaring none. `context_budget_cap` is the cost knob;
-absent it, the window is the cap.
+`/provider setup` records the recipe's window when the chosen model is that
+recipe's example; `config/set` carries both keys. `teton doctor` and `teton
+provider list` print a `window:` column; doctor advises on a provider
+declaring none and on a cap at or above its window (inert, not invalid).
 
-A window or cap deriving below **2,048 words / 16,384 bytes** is *floored* — the
-smallest pair that still holds the system prompt. `/verbose` says `floored` and
-doctor names the pair; such a route sends more than its window declares, and an
-unpinned provider reports nothing.
+`context_budget_cap` is the cost knob — it holds a large window to a smaller
+budget. Absent, the declared window is the cap.
+
+A window or cap deriving below **6,250 words / 50,000 bytes** is *floored*,
+not honored — that pair is the smallest that holds the system prompt twice
+over, repository notes included. The declaration is recorded, the floor runs,
+`/verbose` adds `floored` to the bound, and doctor names the pair in force.
+A floored route sends more than its window declares, and on an unpinned
+provider nothing reports the overflow — which is why those marks exist.
 
 ## Nothing is clamped in silence
 
 Dropping blocks, eliding one in place, or re-fitting after a mid-turn reroute
-emits `context_pressure` and prints a line naming what was dropped and the
-budget it was fitted to, whether or not `/verbose` is on. An elided *newest*
-message is also a notice in the turn's output: that is where the model would
-answer a prompt nobody sent.
+emits `context_pressure` and prints one line — `context: 3 older blocks
+dropped to fit the 21,162-word budget (bound: local engine)` — whether or not
+`/verbose` is on. An elided *newest* message is additionally a notice in the
+turn's output: that is where the model would answer a prompt nobody sent. A
+context the gate could **not** fit says so under its own name, once per turn.
 
 ## What one prompt can cost
 
 The budget bounds one model call, not a prompt. A prompt runs up to `max_turns`
-tool iterations — **12** on the local profile, **40** on a strong model — each
-re-sending the whole context, so a prompt on a large window can carry tens of
-millions of input tokens. No spend cap: `context_budget_cap` lowers the ceiling,
-`teton cost` shows it.
+tool iterations — **12** on the local profile, **40** on a strong model, 25 on a
+provider's own native profile — each re-sending the whole context, so a prompt
+on a large window can carry tens of millions of input tokens. There is no spend
+cap; `context_budget_cap` lowers the ceiling, `teton cost` shows it.
+
+Recording a window above 256,000 tokens says so once, where it is recorded:
+`/provider setup`'s preview and `teton provider add --max-context` print the
+per-call pair, the 25-call worst case, and the cap key. A notice only — no cap
+is written; the window you declare is still the budget.
 
 ## Repository notes
 
@@ -57,8 +82,10 @@ millions of input tokens. No spend cap: `context_budget_cap` lowers the ceiling,
 `CLAUDE.md` — is read at a **project** root and rendered as the last region of
 the system prompt: the repository's description of itself, not instructions.
 Cap **8,192 bytes**, or a quarter of the route's byte budget where that is
-smaller (a floored route: 4,096); past it the file is cut at a line boundary
-under a marker naming the bytes dropped and the cap.
+smaller; past it the file is cut at a line boundary under a marker naming the
+bytes dropped and the cap. Every route this build derives reaches the full
+8,192 — a floored route included, which is what the 50,000-byte floor above
+buys — so the quarter rule is a bound, not something you will meet.
 
 `[context] repo_file = false` turns it off durably — the file is never opened.
 `/context on|off` is session-scoped and never written; bare `/context` reports
