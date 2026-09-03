@@ -2,8 +2,8 @@
   "req": "REQ-612",
   "branch": "feat/REQ-612-teton-md-repo-context-file",
   "startedAt": "2026-09-03T18:01:58Z",
-  "completed": false,
-  "currentPhase": 7,
+  "completed": true,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
@@ -11,7 +11,9 @@
     3,
     4,
     5,
-    6
+    6,
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -57,6 +59,19 @@
       "completedAt": "2026-09-03T23:20:28Z",
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/281",
       "notes": "draft #281 flipped to ready; body set; requirement status complete"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-09-03T23:26:21Z",
+      "notes": "diff scan clean (one filed TODO); tip commit 3df0afd; all 8 checks green on run 33817198690"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup",
+      "completedAt": "2026-09-03T23:26:21Z",
+      "notes": "squash-merged as af3a1a4 at 2026-09-03T23:24:38Z; worktree .worktrees/REQ-612 removed; terminal record written by /wrapup",
+      "mergeCommit": "af3a1a47d30471dc3aa997a4c29339e7bf68d4c9"
     }
   ],
   "repos": {
@@ -69,9 +84,10 @@
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/281",
       "prNumber": 281,
       "prCreatedAt": "2026-09-03T18:02:01Z",
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
-      "snapshotPR": null
+      "snapshotPR": null,
+      "worktree_removed": true
     }
   },
   "mergeOrder": [
