@@ -394,6 +394,51 @@ mod tests {
         }
     }
 
+    /// "One tap, last writer wins" (REQ-611 ADR-1): a second `install_tap`
+    /// replaces the first, which then observes nothing further.
+    ///
+    /// **Mutation (run 2026-09-03):** making `install_tap` keep the existing
+    /// tap when one is set reddened the second assertion; restored.
+    #[tokio::test]
+    async fn a_second_install_tap_replaces_the_first() {
+        let bus = Arc::new(EventBus::new());
+        let (tx1, _rx1) = mpsc::channel(8);
+        let first = Arc::new(CountingTap {
+            tx: tx1,
+            taken: Arc::new(AtomicU64::new(0)),
+            dropped: Arc::new(AtomicU64::new(0)),
+        });
+        let (tx2, _rx2) = mpsc::channel(8);
+        let second = Arc::new(CountingTap {
+            tx: tx2,
+            taken: Arc::new(AtomicU64::new(0)),
+            dropped: Arc::new(AtomicU64::new(0)),
+        });
+        let session: SessionId =
+            serde_json::from_value(serde_json::json!("sess-tap-replace")).expect("an id");
+        let state = || {
+            Event::TranscriptState(teton_protocol::events::TranscriptState {
+                enabled: true,
+                reason: teton_protocol::events::TranscriptStateReason::SessionCommand,
+            })
+        };
+        bus.install_tap(Arc::clone(&first) as Arc<dyn EventTap>);
+        bus.publish(Some(session.clone()), state());
+        bus.install_tap(Arc::clone(&second) as Arc<dyn EventTap>);
+        bus.publish(Some(session.clone()), state());
+        bus.publish(Some(session), state());
+        assert_eq!(
+            first.taken.load(Ordering::SeqCst),
+            1,
+            "the first tap saw only the first publish"
+        );
+        assert_eq!(
+            second.taken.load(Ordering::SeqCst),
+            2,
+            "the second tap took over"
+        );
+    }
+
     impl EventTap for CountingTap {
         fn observe(&self, envelope: &EventEnvelope) {
             // THE MUTATION for `the_tap_never_blocks_publish_and_counts_its_drops`

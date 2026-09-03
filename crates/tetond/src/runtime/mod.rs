@@ -1962,9 +1962,12 @@ fn transcript_degradation_hook(events: &Arc<EventBus>) -> SinkHooks {
     let events = Arc::clone(events);
     SinkHooks {
         on_degraded: Box::new(move |degradation| {
+            // The path is boundary content (BR-15): the daemon's own record
+            // names the session and the reason, and `/transcript` — a routed
+            // answer to the asker — carries the detail.
             eprintln!(
-                "teton-code: transcript stopped for session {} ({})",
-                degradation.session_id, degradation.detail
+                "teton-code: transcript stopped for session {} ({:?}); `/transcript` names the reason",
+                degradation.session_id, degradation.reason
             );
             events.publish(
                 Some(degradation.session_id.clone()),

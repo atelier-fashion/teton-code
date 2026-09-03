@@ -3850,7 +3850,7 @@ pub enum TranscriptStateReason {
     /// (BR-6). The turn in flight was **not** failed; only the recording was.
     WriteFailure,
     /// The transcript directory could not be created, or existed wider than
-    /// owner-only, and was refused at open (BR-11). The session runs normally
+    /// owner-only, and was refused at open (BR-9). The session runs normally
     /// with no transcript.
     DirRefused,
 }

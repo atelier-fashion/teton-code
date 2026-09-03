@@ -100,3 +100,27 @@ prompt at the turn's entry, after the claim (LESSON-539: claim first, then read)
 
 The shutdown path must not race the writer task: `shutdown()` sends a close for every session
 then awaits the task's join with a bounded timeout, and only then does `main` remove the socket.
+
+## Outcome
+
+- `session_created` is wired at the `session/create` handler
+  (`runtime::transcript_session_created`), not in `SessionRegistry::create`:
+  the registry holds none of the three inputs (config default, root display,
+  bus seq). Architecture ADR-3 was corrected to match at verify.
+- `session_closed(SessionEnded)` has no production call site — the registry
+  exposes no removal, sessions live for the daemon's lifetime — so every
+  shipped transcript closes with `daemon_shutdown`; recorded in
+  `tests/transcript.rs`'s header.
+- `prompt_submitted` carries the flattened prompt as one `PromptBlock::Text`
+  (the turn receives a `String`); a skill turn rides on the `skill` field.
+- `prune` is not called again in `from_env`; the writer thread's first act is
+  the prune and it prints BR-13's line itself.
+- The sink is constructed unconditionally, including under `enabled = false`,
+  so `/transcript on` has something to switch; AC-1 holds on the filesystem.
+- `option_remembers_for_session` was added beside the permission option ids so
+  `remembered` is not re-spelled in `server.rs`.
+- The degradation hook publishes `transcript_state { enabled: false, reason }`
+  and prints one stderr line (the path was dropped from that line at verify,
+  BR-15).
+- `EventBus::current_seq()` was added as a read-only peek: `next_seq` reserves
+  a number and would leave a hole in every client's stream.

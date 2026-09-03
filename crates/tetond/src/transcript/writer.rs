@@ -490,10 +490,15 @@ fn open_owner_only(path: &Path) -> Result<File, Refused> {
         }
     }
 
+    // `O_NOFOLLOW` closes the window between the `symlink_metadata` check above
+    // and this open: a same-UID process that swaps a symlink in between would
+    // otherwise redirect the transcript's bytes into any file the user owns
+    // (verify finding, REQ-611 BR-9).
     let file = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .map_err(|source| Refused::Io {
             path: path.to_path_buf(),

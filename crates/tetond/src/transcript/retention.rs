@@ -258,6 +258,32 @@ mod tests {
     /// dropping the `is_symlink()` arm makes this red on
     /// `only the matching regular file goes`, with `removed` at 2 instead of 1,
     /// and the link gone from the listing behind it.
+    /// A directory that cannot be listed yields the zero report rather than a
+    /// panic on the writer thread (REQ-611 BR-13; verify finding).
+    ///
+    /// **Mutation (run 2026-09-03):** replacing the `let Ok(listing) … else`
+    /// with `.expect(…)` panicked this test; restored.
+    #[test]
+    fn prune_returns_an_empty_report_when_the_directory_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("prune-unreadable");
+        let now = UNIX_EPOCH + Duration::from_secs(1_756_900_272);
+        let matching = dir.join("20250901T115112Z-sess-0123456789abcdefghjkmnpqrs.jsonl");
+        std::fs::write(&matching, b"{}\n").expect("write matching");
+        set_age(&matching, now - Duration::from_secs(2 * SECONDS_PER_DAY));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).expect("seal");
+        let report = prune(&dir, 1, now);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("unseal");
+        assert_eq!(
+            report.removed, 0,
+            "nothing can be removed from a directory that cannot be read"
+        );
+        assert!(
+            matching.exists(),
+            "the aged file survives an unreadable pass"
+        );
+    }
+
     #[test]
     fn prune_removes_only_matching_old_files_and_never_follows_symlinks() {
         let dir = scratch("prune");

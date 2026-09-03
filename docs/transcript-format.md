@@ -68,7 +68,7 @@ owner-only is refused rather than tightened or reused, and so is a symlink at
 either path: the session then runs normally with no transcript and says so once.
 
 Files are pruned by age at daemon start and at every transcript open. Only names
-matching `\d{8}T\d{6}Z-sess-<26 characters>.jsonl` are candidates, symlinks are
+matching `\d{8}T\d{6}Z-sess-<26 lowercase Crockford base32 characters, [0-9a-hjkmnp-tv-z]>.jsonl` are candidates, symlinks are
 skipped whole, and nothing outside the directory is ever touched — so a
 directory of your own that you point `dir` at keeps everything else in it. A
 pass that removed anything says so in one line on the daemon's stderr.

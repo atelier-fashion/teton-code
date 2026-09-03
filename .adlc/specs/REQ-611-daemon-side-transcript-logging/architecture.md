@@ -78,9 +78,14 @@ turn produced them.
 ### ADR-3 — The sink owns per-session transcript state; the session registry does not
 
 The sink holds `HashMap<SessionId, SessionTranscript { enabled, writer: Option<Writer>, n,
-dropped, degraded, root }>`. `SessionRegistry::create` calls `sink.session_created(id, root,
-config.transcript.enabled)` and removal calls `sink.session_closed(id, reason)`. `session/transcript`
-reads and writes through the sink's API; `SessionRecord` gains no field.
+dropped, degraded, root }>`. The `session/create` handler calls `sink.session_created(id, root,
+config.transcript.enabled, seq)` (in `runtime::transcript_session_created`, not in
+`SessionRegistry::create` — the registry holds none of the three inputs). `session_closed(id,
+SessionEnded)` has **no production call site**: this daemon has no session-removal path, so every
+shipped transcript closes with `daemon_shutdown` via `shutdown()`; the `SessionEnded` reason is
+exercised by the sink's unit tests only and is wired the day a session end exists (recorded in
+`tests/transcript.rs`'s header). `session/transcript` reads and writes through the sink's API;
+`SessionRecord` gains no field.
 
 **Rationale.** The effective toggle is a fact about a file — whether one is open, how many
 records it holds, why it stopped — and the sink is the only writer of that file. Splitting the

@@ -3685,3 +3685,30 @@ fn the_fixture_key_never_reaches_the_transcript_directory() {
         );
     }
 }
+
+/// REQ-611 AC-5 (usage leg): an argument that is neither `on` nor `off` prints
+/// the usage line and sends nothing.
+///
+/// **Mutation (run 2026-09-03):** treating an unknown argument as `Status`
+/// reddened the assertion (a status line printed instead); restored.
+#[test]
+fn transcript_unknown_argument_prints_the_usage_line() {
+    let daemon = TestDaemon::spawn(&daemon_bin());
+    let (mut session, transcript, mut writer) = transcript_session(&daemon);
+    writer
+        .write_all(b"/transcript maybe\r")
+        .expect("type the command");
+    writer.flush().ok();
+    let printed = wait_for(&transcript, "unknown transcript argument `maybe`");
+    let text = snapshot(&transcript);
+    let _ = session.kill();
+    let _ = session.wait();
+    assert!(
+        printed,
+        "the usage line names the argument; transcript:\n{text}"
+    );
+    assert!(
+        !text.contains("recording to") && !text.contains("transcript: on"),
+        "nothing was switched or reported; transcript:\n{text}"
+    );
+}

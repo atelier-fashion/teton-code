@@ -90,3 +90,22 @@ without a manifest.
 `transcript_closed` on `daemon_shutdown` is TASK-363's call; this task only exposes `close`.
 Write with `write_all` then `flush` per line; a crash can leave at most one partial trailing
 line, which BR-14 permits and the format doc (TASK-367) states.
+
+## Outcome
+
+- The writer is a dedicated OS thread (`blocking_recv` + blocking file I/O),
+  not a tokio task (LESSON-518); the channel is the specified bounded tokio
+  mpsc at 4,096 records.
+- `Writer::append(&Record)` builds the `Line` inside so `n` has one minting
+  site; `Writer::open` takes the `Opened` payload, which carries the budget.
+- Drop counts ride on the `Record` message (`drops_before`) and the writer
+  keeps its own channel-ordered `enabled` flag — both fixes caught by tests
+  after out-of-band reads raced.
+- `set_enabled(true)` is refused on a degraded session so `status().enabled`
+  never says `true` while the writer refuses every byte.
+- `prune` prints BR-13's stderr line itself (one home for the rule).
+- `Faults` began as a `cfg(test)`-only injector; TASK-366 later gave it a
+  runtime `fail_after` arm for the `write_fail_after:<n>` seam.
+- The `symlink_metadata` mutation exposed a wrong fixture (a fresh symlink
+  target) and the "degrade once" claim was over-determined; both are recorded
+  in the tests' doc comments.
