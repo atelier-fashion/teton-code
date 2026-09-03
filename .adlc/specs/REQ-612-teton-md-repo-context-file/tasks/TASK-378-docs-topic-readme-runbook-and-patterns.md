@@ -22,7 +22,10 @@ states are the shipped ones.
   and precedence, the cap, truncation, the switches, the reload rule, the boundary rule, and
   the cost shape (`max_turns` 12 local / 40 strong × the block; up to a quarter of the local
   byte budget; the overhead consequence for redact-scanning routes). Fix "25" to name
-  `max_turns`.
+  `max_turns`. State the MEASURED redact consequence from TASK-375's ledger entry, not the
+  spec's prediction: overhead 23 KiB, chunk cap 4, scannable bound up to 184,265, scan calls
+  up to 5. Also update `docs/manual-verification.md:2214`, which still quotes the pre-REQ
+  capability sentence (TASK-375 flagged it).
 - `crates/tetond/src/harness/docs/doctor.md` — the two advisories.
 - `README.md` — `/context [on|off]` in the session-command table; a short "TETON.md" paragraph
   under the session section.

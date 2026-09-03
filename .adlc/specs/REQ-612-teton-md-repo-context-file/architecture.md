@@ -161,7 +161,11 @@ already defines it. `REPO_CONTEXT_READ_CEILING_BYTES = 65_536` bounds the read i
 REQ-585 body cap) so a gigantic file costs 64 KiB, not its size. Truncation cuts at the last
 `\n` at or under the cap after stripping, then appends the marker line.
 
-`REDACT_BODY_OVERHEAD_BYTES` moves 14 → 22 KiB. The chunk arithmetic
+`REDACT_BODY_OVERHEAD_BYTES` moves 14 → **23 KiB** (measured by TASK-375, 2026-09-03 — the
+22 KiB this ADR first named was `14 KiB + 8,192`, the very "add the cap to a number" this
+paragraph forbids; the block costs 8,603 resident bytes, not 8,192, because the frame is 331
+bytes and BR-8's sentence 80, and 22 KiB left the widest prompt 282 bytes short of the floor).
+The chunk arithmetic
 (`REDACT_TOTAL_CAP_CHUNKS`, `REDACT_INPUT_MAX_BYTES`, the scannable bound) is **re-derived where
 it lives and re-stated in its doc ledger**, and the two recorded margins are re-pinned to what the
 sweeps measure — by measurement, never by adding 8,192 to a number (LESSON-593, LESSON-597). The
@@ -228,7 +232,7 @@ drifted from `max_turns` 12/40).
 | Daemon harness | `crates/tetond/src/harness/self_config.md` | the amended capability sentence |
 | Daemon harness | `crates/tetond/src/harness/tools/docs.rs` | headroom sentence |
 | Daemon harness | `crates/tetond/src/harness/tools/web.rs` | web sweep builds the worst-case block |
-| Daemon egress | `crates/tetond/src/egress/redact.rs` | overhead 14→22 KiB, chunk arithmetic re-stated, margins re-pinned, sweep builds the block |
+| Daemon egress | `crates/tetond/src/egress/redact.rs` | overhead 14→23 KiB (measured), `REDACT_TOTAL_CAP_CHUNKS` 3→4, `REDACT_INPUT_MAX_BYTES` 169,683→226,244, scannable bound 141,224→184,265, margins re-pinned 129→742 and 176→789, sweep builds the block |
 | Daemon harness | `crates/tetond/src/harness/budget.rs` | `RouteBudget.repo_context_cap` = min(8 KiB, budget_bytes / 4) |
 | Daemon runtime | `crates/tetond/src/runtime/session.rs` | load at create; load in `set_session_cwd` before publish; `session_context` method impl; switch |
 | Daemon runtime | `crates/tetond/src/runtime/turn.rs` | `assemble`: refresh, stamp `repo_context`, seed `system_sources` |
@@ -244,9 +248,13 @@ drifted from `max_turns` 12/40).
 
 ## Risks and accepted consequences
 
-**Every redact-scanning route loses 8 KiB of context.** `REDACT_BODY_OVERHEAD_BYTES` is a
-production input to the scannable bound (REQ-586 verify (b)). Accepted; TASK-375 states it in the
-ledger and TASK-378 in the docs.
+**The ceiling move changed the redact arithmetic in a direction the spec did not predict.**
+`REDACT_BODY_OVERHEAD_BYTES` is a production input to the scannable bound (REQ-586 verify (b)),
+and the spec assumed the bound would shrink by the block's bytes. Measured (TASK-375): three
+chunks hold twice a body only while the overhead is ≤ 21,353, so the raise pushed
+`REDACT_TOTAL_CAP_CHUNKS` from 3 to 4 and the scannable bound *rose* 141,224 → 184,265 — the
+cost moved to scan calls (`REDACT_MAX_CHUNKS` 4 → 5) rather than to context. The ledger states
+both halves; TASK-378 documents the actual consequence, not the predicted one.
 
 **The local tier spends up to a quarter of its byte budget on the notes.** That is the trade the
 feature makes; BR-2's switch and the cap bound it, and AC-13's dogfood is where the trade is

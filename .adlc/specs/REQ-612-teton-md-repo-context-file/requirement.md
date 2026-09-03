@@ -173,8 +173,10 @@ _Leg B — bounded, and the bound is stated_
   so this REQ **moves `REDACT_BODY_OVERHEAD_BYTES` once**, with the chunk
   arithmetic re-stated where it lives (REQ-586 BR-11) and the consequence
   named in the docs: the overhead is a production input to every
-  redact-scanning route's budget (REQ-586 verify (b)), so the cap's bytes
-  come off that budget too. Truncation, not refusal, because the top of the
+  redact-scanning route's budget (REQ-586 verify (b)). *Measured at
+  implementation (TASK-375): the move is 14 → 23 KiB, the chunk cap rises
+  3 → 4, and the scannable bound rises rather than shrinks — the cost lands
+  on scan calls, and the docs state that, not the predicted shrink.* Truncation, not refusal, because the top of the
   file is the part a repository author puts first; the marker is what makes
   the choice honest (informed by REQ-586 BR-7/BR-11, REQ-585 BR-8, BUG-181,
   LESSON-543, REQ-587 BR-2).
