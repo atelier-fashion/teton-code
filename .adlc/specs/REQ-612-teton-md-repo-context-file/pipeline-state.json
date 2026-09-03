@@ -1,0 +1,28 @@
+{
+  "req": "REQ-612",
+  "branch": "feat/REQ-612-teton-md-repo-context-file",
+  "startedAt": "2026-09-03T18:01:58Z",
+  "completed": false,
+  "currentPhase": 0,
+  "completedPhases": [],
+  "integrationBranch": "main",
+  "phaseHistory": [],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-612",
+      "branch": "feat/REQ-612-teton-md-repo-context-file",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "prCreatedAt": null,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": ["teton-code"],
+  "phase4": { "currentTask": null, "completedTasks": [], "failedTasks": [] },
+  "conflictsResolved": []
+}
