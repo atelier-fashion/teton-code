@@ -126,11 +126,11 @@ use teton_protocol::methods::{
     PermissionRespondResult, ProjectsListParams, ProjectsListResult, PromptBlock, PromptTurnParams,
     ProviderSetupCommitParams, ProviderSetupPlanParams, ProviderSetupPreviewParams,
     ProviderTestParams, RootKind, RpcMethod, SessionAttachParams, SessionAttachResult,
-    SessionClearParams, SessionCreateParams, SessionCreateResult, SessionListParams,
-    SessionListResult, SessionPermissionsParams, SessionSetCwdParams, SessionSummary,
-    SessionTranscriptParams, SkillSkipped, SkillView, SkillsListParams, SkillsListResult,
-    SkillsPreflightParams, SkillsPreflightResult, WebOverrideParams, WebRefreshParams,
-    WebSetupCommitParams, WebSetupPlanParams, WebSetupPreviewParams,
+    SessionClearParams, SessionContextParams, SessionCreateParams, SessionCreateResult,
+    SessionListParams, SessionListResult, SessionPermissionsParams, SessionSetCwdParams,
+    SessionSummary, SessionTranscriptParams, SkillSkipped, SkillView, SkillsListParams,
+    SkillsListResult, SkillsPreflightParams, SkillsPreflightResult, WebOverrideParams,
+    WebRefreshParams, WebSetupCommitParams, WebSetupPlanParams, WebSetupPreviewParams,
 };
 use teton_protocol::{RequestId, SessionId};
 
@@ -2552,6 +2552,14 @@ fn dispatch(
         SessionPermissionsParams::METHOD => {
             Some(handle_session_permissions(daemon, conn, id, params))
         }
+        // REQ-612 ADR-6: `session/context` sits beside `session/permissions`
+        // rather than beside its own twin. `session/transcript` is absent from
+        // this match because it awaits a disk flush; this one awaits nothing —
+        // `off` and `status` touch no syscall, and `on`'s single read is taken
+        // under `block_in_place` where the load is (BUG-184) — so it answers
+        // from the reader loop and its event rides the fence ahead of the
+        // response.
+        SessionContextParams::METHOD => Some(handle_session_context(daemon, conn, id, params)),
         WebRefreshParams::METHOD => Some(handle_web_refresh(daemon, conn, id, params)),
         _ => Some(error_string(
             id,
@@ -3172,6 +3180,56 @@ async fn handle_session_transcript(
     )
 }
 
+/// Switch or read a session's repository notes (`session/context`, REQ-612
+/// ADR-6).
+///
+/// **Modelled on [`handle_session_transcript`] above, including the argument
+/// that makes BR-4 structural.** Tool dispatch holds a `ToolContext`, not a
+/// `DaemonRuntime`, so a model that emits a tool call named `session/context` —
+/// or a `TETON.md` whose text reads `/context on` — reaches the tool registry,
+/// finds no such tool, and is told so. That matters more here than it does for
+/// the transcript, because the content this switch governs is *itself*
+/// repository-authored: "the file cannot turn its own mechanism on" is a fact
+/// about which channel this function hangs off, not a check that could be
+/// forgotten.
+///
+/// Gated on [`ConnState::may_drive`] for **all three** actions, `Status`
+/// included, and that is ADR-6 rather than an over-tight read. On and off are
+/// mutations; and the status answer names the *file*, which the broadcast
+/// `repo_context_state` deliberately does not. Do not relax this to
+/// `may_receive` for the convenience of a read.
+///
+/// The gate sits before the runtime is touched, so an unattached caller cannot
+/// read a session's existence out of which refusal it got (ADR-B).
+///
+/// # Why it is **not** async, where its transcript twin is
+///
+/// The twin awaits the transcript sink's flush. This one awaits nothing: `on`
+/// costs a `stat` and at most one 64 KiB read, `off` and `status` cost no
+/// syscall at all, and the read is taken inside
+/// [`DaemonRuntime::store_session_repo_context`]'s `block_in_place` for
+/// BUG-184's reason. So it answers from the reader loop beside
+/// [`handle_session_permissions`] and `skills/list`, and its event rides the
+/// fence ahead of its response like every other synchronous handler's.
+fn handle_session_context(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    let params: SessionContextParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+    if let Some(refusal) = refuse_unmintable_session_id(&id, &params.session_id) {
+        return refusal;
+    }
+    if !conn.may_drive(&params.session_id) {
+        return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
+    }
+    ok_string(
+        id,
+        &daemon
+            .runtime
+            .session_context(&params, &daemon.sessions, &daemon.events),
+    )
+}
+
 /// Evict a cached document so the next lookup re-fetches (`web/refresh`,
 /// REQ-563 AC-10).
 ///
@@ -3562,7 +3620,15 @@ fn handle_session_create(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
             // display form, and it has to run before the first session-scoped
             // event is published or the sink would be offered an envelope for a
             // session it has not been told about.
-            let root = daemon.runtime.session_root_for(summary.cwd.as_deref()).view;
+            //
+            // REQ-612 keeps the *whole* probe rather than only its view: the
+            // repository-notes load below hangs off the same reading — the path
+            // the file is read under and the `RootKind` that decides whether it
+            // is read at all — and probing a second time would be two readings
+            // of a filesystem that can change between them (ADR-1's rule, at
+            // the seam where two consumers share one probe).
+            let probed = daemon.runtime.session_root_for(summary.cwd.as_deref());
+            let root = probed.view.clone();
 
             // REQ-611 BR-2 / ADR-3: the sink learns the session exists, and
             // whether it records from its first record. Here rather than in
@@ -3582,6 +3648,26 @@ fn handle_session_create(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
                 &summary.session_id,
                 &root.display,
                 daemon.events.current_seq(),
+            );
+
+            // REQ-612 BR-1 / ADR-3: the session's repository notes, read once,
+            // here — the first of the loader's three call sites, and the same
+            // pair of lifecycle sites the skill registry above has, for the same
+            // reason: half of what it derives is a fact about the root. It
+            // publishes `repo_context_state` itself when there is news, which on
+            // a repository with a `TETON.md` is this session's first event and
+            // on a repository without one is no event at all (BR-1's normal
+            // case).
+            //
+            // **After the transcript hand-off**, so the sink has been told the
+            // session exists before it is offered an envelope for it, and
+            // before the response, so a client reading the create result cannot
+            // receive the session's first event after it.
+            daemon.runtime.store_session_repo_context(
+                &daemon.sessions,
+                &summary.session_id,
+                &probed,
+                &daemon.events,
             );
 
             // Broadcast a session-scoped event so attached peers learn of the

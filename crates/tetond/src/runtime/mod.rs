@@ -107,6 +107,7 @@ use teton_core::entities::{
 };
 use teton_core::phase::Phase as CorePhase;
 use teton_core::policy::ProviderHealth;
+use teton_core::session_root::{bounded_field, DISPLAY_MAX_CHARS, NAME_MAX_CHARS};
 use teton_core::{
     apply_config_delta, compose_endpoint, is_absolute_http_url, is_cleartext_to_a_remote_host,
     table_section, ProvenanceId,
@@ -129,13 +130,14 @@ use teton_protocol::events::{
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
     BoundaryOriginConfig, CategoryRouteView, ConfigSnapshot, ConfigUpdate, ContentClass,
-    CostGroupView, CostQueryResult, CostReportView, ExistingProvider, ModelConfirmOutcome,
-    ModelConfirmParams, ModelConfirmResult, ModelListResult, ModelSetResult, ModelStatusResult,
-    PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig, ProviderHealth as WireProviderHealth,
-    ProviderSetupCandidate, ProviderSetupCommitResult, ProviderSetupPlanResult,
-    ProviderSetupPreviewResult, ProviderTestOutcome, ProviderTestResult, SessionClearParams,
-    SessionClearResult, SessionPermissionsParams, SessionPermissionsResult, SessionSetCwdParams,
-    SessionSetCwdResult, SessionTranscriptParams, SessionTranscriptResult, SkillInvocation,
+    ContextAction, CostGroupView, CostQueryResult, CostReportView, ExistingProvider,
+    ModelConfirmOutcome, ModelConfirmParams, ModelConfirmResult, ModelListResult, ModelSetResult,
+    ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig,
+    ProviderHealth as WireProviderHealth, ProviderSetupCandidate, ProviderSetupCommitResult,
+    ProviderSetupPlanResult, ProviderSetupPreviewResult, ProviderTestOutcome, ProviderTestResult,
+    SessionClearParams, SessionClearResult, SessionContextParams, SessionContextResult,
+    SessionPermissionsParams, SessionPermissionsResult, SessionSetCwdParams, SessionSetCwdResult,
+    SessionTranscriptParams, SessionTranscriptResult, SkillInvocation,
     TierBinding as WireTierBinding, TierBindingConfig, TierRouteView, TierSummary,
     TranscriptAction, WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams,
     WebRefreshResult, WebSetupCommitParams, WebSetupCommitResult, WebSetupPlanResult,
@@ -194,6 +196,10 @@ use crate::mcp::{McpRegistry, McpServerConfig};
 use crate::model_consent::{
     list_entries, no_local_engine_reason, probe_view, selection_view, ConsentOutcome,
     ModelConsentGate, NoInstaller, PendingModelDecisions, WeightsInstaller,
+};
+use crate::repo_context::{
+    RealFiles, RepoContext, RepoContextBlock, RepoContextState, RepoFileReader,
+    REPO_CONTEXT_MAX_BYTES,
 };
 use crate::router::{
     to_protocol_category, to_protocol_phase, to_protocol_tier, RemoteProvider, Router, TierOrigin,
@@ -2208,6 +2214,20 @@ pub struct DaemonRuntime {
     /// `None` on [`Self::minimal`] and [`Self::with_consent`], which have no
     /// state directory and run no sessions that record.
     transcript: Option<Arc<crate::transcript::TranscriptSink>>,
+    /// The filesystem the repository-notes loader reads through (REQ-612
+    /// ADR-3).
+    ///
+    /// A seam rather than a direct `std::fs` call, for the reason written where
+    /// the trait is: a *reach* claim — "the switch is off and nothing was
+    /// opened" — cannot be made by a test that hands the code the real
+    /// filesystem and then inspects the answer. It is held here rather than on
+    /// [`crate::server::Daemon`] beside `skills_fs`, because unlike discovery
+    /// this seam is also read on the **turn** path (BR-6's staleness check),
+    /// and the turn path holds a runtime and not a daemon.
+    ///
+    /// Production is [`RealFiles`] on every constructor; a fixture says
+    /// [`Self::with_repo_files`] out loud.
+    repo_files: Arc<dyn RepoFileReader + Send + Sync>,
 }
 
 impl DaemonRuntime {
@@ -2275,6 +2295,7 @@ impl DaemonRuntime {
             // — a runtime with no state directory must not be able to write
             // into the real machine's data directory.
             transcript: None,
+            repo_files: Arc::new(RealFiles),
         }
     }
 
@@ -2341,6 +2362,25 @@ impl DaemonRuntime {
     #[must_use]
     pub fn with_skill_command_timeout(mut self, timeout_ms: u64) -> Self {
         self.skill_command_timeout_ms = timeout_ms;
+        self
+    }
+
+    /// Replace the filesystem the repository-notes loader reads through
+    /// (REQ-612 BR-2, AC-10).
+    ///
+    /// **The observation seam BR-2's claim is written against.** "The switch is
+    /// off and the file was never opened" is a statement about calls that did
+    /// not happen, and no amount of inspecting the *answer* can settle it — a
+    /// loader that read the file and then discarded it answers identically. A
+    /// recording double counts what was asked of the filesystem, so the claim is
+    /// checked against calls rather than against outcomes (the argument
+    /// `crate::skills::discovery::DirLister` makes, at one file's scale).
+    ///
+    /// Production is [`RealFiles`] on every constructor; a fixture has to say
+    /// this out loud, exactly as it does [`Self::with_skill_command_timeout`].
+    #[must_use]
+    pub fn with_repo_files(mut self, files: Arc<dyn RepoFileReader + Send + Sync>) -> Self {
+        self.repo_files = files;
         self
     }
 
@@ -2599,6 +2639,7 @@ impl DaemonRuntime {
                 &teton_protocol::socket_path::projects_path(base_dir),
             )),
             transcript: Some(transcript),
+            repo_files: Arc::new(RealFiles),
         })
     }
 
@@ -3477,6 +3518,112 @@ impl DaemonRuntime {
         sessions.set_skills(session_id, discovered);
     }
 
+    /// Derive `session_id`'s repository notes from the root it stands on, store
+    /// them, and announce a change — **the one derivation** (REQ-612 BR-1,
+    /// ADR-3).
+    ///
+    /// [`Self::store_session_skills`]'s twin above, at the same two lifecycle
+    /// sites for the same reason: half of what it computes is a fact about the
+    /// root, so the root moving re-derives it. The third site is the one the
+    /// skill registry does not have — the turn's `assemble` stage, which
+    /// re-checks the file's `stat` key against the stored state (BR-6) and calls
+    /// [`SessionRegistry::set_repo_context`] directly rather than through here,
+    /// because it holds the route whose cap the block is rendered at.
+    ///
+    /// # Store first, publish after (the `set_session_cwd` discipline)
+    ///
+    /// The write and the announcement are two steps in this order, and the order
+    /// is REQ-585's: a second attached client reacting to `session_root_changed`
+    /// within microseconds must not be able to read the *pre-move* state. Both
+    /// happen inside `set_session_cwd`, before either of that method's events,
+    /// so by the time any client learns the root moved the notes under the new
+    /// root are already the session's.
+    ///
+    /// The publish is also **outside** the registry mutex, which is why it is
+    /// here rather than inside `set_repo_context`: [`EventBus::publish`] fans out
+    /// to every subscriber, and a bus called under the session lock is a lock
+    /// every other session's turn waits behind (LESSON-448).
+    ///
+    /// # Only a change is news
+    ///
+    /// Published when the state actually moved, never on every create. A machine
+    /// with no `TETON.md` stores `Absent` over `Absent` and says nothing — which
+    /// is BR-1's normal case, and a build that announced it would put a line in
+    /// front of every user of every repository that does not use this feature
+    /// (LESSON-513). A `/cd` **out** of a repository with notes publishes
+    /// `absent`, because the block being dropped is news.
+    ///
+    /// # Visibility
+    ///
+    /// `pub` rather than `pub(crate)`, which production alone would satisfy —
+    /// both call sites are in `crate::server`. The acceptance suite links the
+    /// lib from **outside** the crate and drives this exact derivation as its
+    /// stand-in for `session/create`, which is what keeps the fixture from
+    /// drifting into an agreeing re-implementation of the create path
+    /// (LESSON-451). `set_session_cwd` and `run_prompt_turn` beside it are `pub`
+    /// for the same reason, established the same way (LESSON-596: demote and
+    /// build, never grep for the name).
+    pub fn store_session_repo_context(
+        &self,
+        sessions: &SessionRegistry,
+        session_id: &SessionId,
+        probed: &ProbedRoot,
+        events: &EventBus,
+    ) {
+        let enabled = self.repo_context_enabled(sessions, session_id);
+        let boundaries = self
+            .config
+            .lock()
+            .expect("config mutex poisoned")
+            .effective_boundaries();
+        // BUG-184's rule, one seam narrower: this is a `stat` and — at most —
+        // one 64 KiB read of a user-controlled path at the session root, and on
+        // macOS a root under `~/Documents` can raise a TCC dialog that blocks
+        // the syscall for as long as the user takes to answer it. Both call
+        // sites reach this from a connection's synchronous reader loop, so the
+        // wait must not be taken on an async worker. The turn-path refresh does
+        // **not** take this: its quiet answer is one `stat`, and wrapping one
+        // syscall would cost a thread hand-off on every prompt of every session.
+        let loaded = block_in_place_if_multithread(|| {
+            load_repo_context(probed, &boundaries, enabled, self.repo_files.as_ref())
+        });
+        if *sessions.repo_context(session_id) == loaded {
+            return;
+        }
+        let event = repo_context_event(&loaded, REPO_CONTEXT_MAX_BYTES);
+        // A session that vanished between the caller's claim and this write
+        // stores nothing and announces nothing — `set_skills`'s reading of the
+        // same `false`, and the reason the publish is guarded by it rather than
+        // unconditional.
+        if sessions.set_repo_context(session_id, loaded) {
+            // After the store and after the lock — see above.
+            events.publish(Some(session_id.clone()), event);
+        }
+    }
+
+    /// Whether this session's repository notes may be read at all (REQ-612
+    /// BR-2): the session's own `/context` switch, or the durable
+    /// `[context] repo_file` default when it has not been switched.
+    ///
+    /// **One composition, three readers** — the two lifecycle loads, the turn's
+    /// staleness check and `session/context` all ask this function, so a session
+    /// that said `off` cannot have its file read by a path that consulted only
+    /// the config (BR-2's "off means unopened" is a claim about every path, not
+    /// about the one the user typed at).
+    pub(crate) fn repo_context_enabled(
+        &self,
+        sessions: &SessionRegistry,
+        session_id: &SessionId,
+    ) -> bool {
+        sessions.context_switch(session_id).unwrap_or_else(|| {
+            self.config
+                .lock()
+                .expect("config mutex poisoned")
+                .context
+                .repo_file
+        })
+    }
+
     /// The choke point an MCP `tools/call` crosses (ADR-003, REQ-562 ADR-1).
     ///
     /// ADR-003 makes an MCP call remote egress, so ADR-1's "every remote path"
@@ -3988,6 +4135,64 @@ impl DaemonRuntime {
             records: after.records,
             degraded: after.degraded,
         }
+    }
+
+    /// Switch a session's repository notes on or off, or report what they are
+    /// doing (`session/context`, REQ-612 BR-2 / ADR-6).
+    ///
+    /// [`Self::session_transcript`]'s twin above, line for line where the two
+    /// features agree: one method for all three answers, because they are one
+    /// question asked three ways and a set that did not read back would let a
+    /// client's status row drift from what the daemon actually made resident.
+    /// The state it moves is session-scoped and **not persisted** — the durable
+    /// half is [`ConfigUpdate::SetRepoContextEnabled`] through `config/set`, and
+    /// `/context off` writes nothing to `config.toml`.
+    ///
+    /// # `on` re-loads at once; `off` never opens the file
+    ///
+    /// Both go through [`Self::store_session_repo_context`], the same derivation
+    /// `session/create` and `/cd` take, so all three sites read one file under
+    /// one boundary set through one switch. `on` therefore answers with what is
+    /// resident *now* rather than with what the next turn will make resident
+    /// (BR-2), and `off` answers `withheld_off` having made **zero** reader
+    /// calls — the loader returns before it touches the seam at all, which is
+    /// what makes "off means unopened" a property of the code rather than of a
+    /// comment.
+    ///
+    /// `Status` changes nothing and reads the stored state. It is gated exactly
+    /// as the other two are (`may_drive`, in the handler): the answer names the
+    /// file, which the broadcast event deliberately does not.
+    ///
+    /// # The cap this answer reports
+    ///
+    /// [`REPO_CONTEXT_MAX_BYTES`], because between turns there is no route to
+    /// ask — and it is the figure the stored state was classified against, so
+    /// the `truncated` flag here and the state word agree. A floored route
+    /// renders the same file at its own smaller cap and says so through
+    /// `repo_context_state` at the next prompt.
+    pub fn session_context(
+        &self,
+        params: &SessionContextParams,
+        sessions: &SessionRegistry,
+        events: &EventBus,
+    ) -> SessionContextResult {
+        if let Some(enabled) = match params.action {
+            ContextAction::On => Some(true),
+            ContextAction::Off => Some(false),
+            ContextAction::Status => None,
+        } {
+            sessions.set_context_switch(&params.session_id, enabled);
+            // The root, probed now rather than remembered: REQ-583 ADR-1's one
+            // derivation, so a `/context on` after a `/cd` reads the file at the
+            // root the session actually stands on.
+            let cwd = sessions.get(&params.session_id).and_then(|s| s.cwd);
+            let probed = self.session_root_for(cwd.as_deref());
+            self.store_session_repo_context(sessions, &params.session_id, &probed, events);
+        }
+        repo_context_result(
+            &sessions.repo_context(&params.session_id),
+            REPO_CONTEXT_MAX_BYTES,
+        )
     }
 
     pub fn web_override(
@@ -7040,6 +7245,124 @@ fn expansion_provenance(sources: &BTreeSet<ProvenanceId>, unknown: bool) -> Prov
         provenance.mark_unknown();
     }
     provenance
+}
+
+/// [`RepoContext::load`] with the session's boundary set compiled, and the
+/// fail-closed answer when it will not compile (REQ-612 ADR-2).
+///
+/// **One composition, every call site.** The loader takes a
+/// [`BoundaryMatcher`]; every caller here holds a `Vec<PrivacyBoundary>` off the
+/// config, and a second spelling of "compile it, and decide what an
+/// uncompilable set means" is how one of the three sites comes to read a file
+/// the others would withhold.
+///
+/// An uncompilable set reads **nothing** and makes nothing resident, which is
+/// the direction [`context_is_sensitive`] already fails in (`Err(_) => true`).
+/// The state is `Absent` rather than a withheld one because the daemon has not
+/// opened a file and cannot name which of the two candidates is there — and
+/// `Config::validate` refuses an invalid glob at load and at `config/set`, so
+/// this arm is unreachable from a shipped path rather than merely unlikely.
+fn load_repo_context(
+    probed: &ProbedRoot,
+    boundaries: &[PrivacyBoundary],
+    enabled: bool,
+    files: &dyn RepoFileReader,
+) -> RepoContextState {
+    match BoundaryMatcher::new(boundaries) {
+        Ok(matcher) => RepoContext::load(probed, &matcher, enabled, files),
+        Err(_) => RepoContextState::Absent,
+    }
+}
+
+/// [`RepoContext::refresh`] through [`load_repo_context`]'s composition — BR-6's
+/// start-of-turn staleness check, with the same fail-closed answer.
+///
+/// `Some` only when the session's state has to change, so the turn path's quiet
+/// answer stays one `stat` and no allocation.
+fn refresh_repo_context(
+    current: &RepoContextState,
+    probed: &ProbedRoot,
+    boundaries: &[PrivacyBoundary],
+    enabled: bool,
+    files: &dyn RepoFileReader,
+) -> Option<RepoContextState> {
+    match BoundaryMatcher::new(boundaries) {
+        Ok(matcher) => RepoContext::refresh(current, probed, &matcher, enabled, files),
+        Err(_) => (*current != RepoContextState::Absent).then_some(RepoContextState::Absent),
+    }
+}
+
+/// The one shaping of `repo_context_state` from a state and the cap it is
+/// measured at (REQ-612 ADR-6).
+///
+/// `cap` is a parameter for [`RepoContextBlock::render`]'s reason: between turns
+/// there is no route, so the two lifecycle sites measure at
+/// [`REPO_CONTEXT_MAX_BYTES`] — the widest any route can ask for, and the figure
+/// the loader itself classified `Loaded` against — while the turn's `assemble`
+/// stage measures at the route's own effective cap. One function either way, so
+/// the byte pair a client renders cannot be assembled two ways.
+///
+/// The bytes are the **file's**, not the block's: the harness frame around the
+/// notes is this build's own text and is not what a user is weighing against
+/// their budget.
+fn repo_context_event(state: &RepoContextState, cap: usize) -> Event {
+    let block = state.file().map(|file| RepoContextBlock::render(file, cap));
+    Event::RepoContextState(teton_protocol::events::RepoContextState {
+        state: state.kind(),
+        source: state.source(),
+        bytes_on_disk: state.file().map_or(0, |file| file.bytes_on_disk),
+        resident_bytes: block
+            .as_ref()
+            .map_or(0, |block| block.resident_bytes as u64),
+        truncated: block.is_some_and(|block| block.truncated),
+        reason: repo_context_reason(state),
+    })
+}
+
+/// [`repo_context_event`]'s routed twin — the answer `session/context` returns
+/// on the asking connection, which is the one surface that names the file
+/// (REQ-612 BR-2).
+///
+/// Both projections read the same state through the same accessors, so the
+/// broadcast line and the routed answer cannot come to disagree about what is
+/// resident; what differs is exactly the two fields BR-2 splits on — this one
+/// carries the file's name and the cap, and the event carries neither.
+fn repo_context_result(state: &RepoContextState, cap: usize) -> SessionContextResult {
+    let block = state.file().map(|file| RepoContextBlock::render(file, cap));
+    SessionContextResult {
+        state: state.kind(),
+        source: state.source(),
+        // Bounded on the way out like every other file-derived field on the
+        // wire (the `SkillView` rule). The set is two harness-authored literals,
+        // so the bound is a formality here — and applying it anyway is what
+        // keeps the rule structural rather than argued from the current
+        // contents of a `const`.
+        file: state
+            .source()
+            .map(|source| bounded_field(crate::repo_context::file_name(source), NAME_MAX_CHARS)),
+        bytes_on_disk: state.file().map_or(0, |file| file.bytes_on_disk),
+        resident_bytes: block
+            .as_ref()
+            .map_or(0, |block| block.resident_bytes as u64),
+        cap: cap as u64,
+        truncated: block.is_some_and(|block| block.truncated),
+    }
+}
+
+/// The daemon's own words for a state that has words to give.
+///
+/// Only [`RepoContextState::Unreadable`] has any, and its reason set is a closed
+/// list of `&'static str` this build wrote — no path, no OS message and no
+/// repository byte can reach a surface through it. `WithheldBoundary` carries
+/// none: the state word already names the remedy, and the glob that covered the
+/// file is not on the state to quote.
+fn repo_context_reason(state: &RepoContextState) -> Option<String> {
+    match state {
+        RepoContextState::Unreadable { reason, .. } => {
+            Some(bounded_field(reason, DISPLAY_MAX_CHARS))
+        }
+        _ => None,
+    }
 }
 
 /// Whether the assembled context in `ctx` carries content that must pin the

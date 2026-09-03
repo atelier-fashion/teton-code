@@ -1,7 +1,7 @@
 ---
 id: TASK-374
 title: "Runtime wiring: load at create and `/cd`, refresh in `assemble`, the switch, and `session/context`"
-status: draft
+status: complete
 parent: REQ-612
 repo: teton-code
 created: 2026-09-03
@@ -36,20 +36,20 @@ ordering half of AC-2.
 
 ## Acceptance Criteria
 
-- [ ] BR-1 / AC-2: a `session/create` from a project root with `TETON.md` stores a `Loaded`
+- [x] BR-1 / AC-2: a `session/create` from a project root with `TETON.md` stores a `Loaded`
       state and publishes `repo_context_state` once; a `/cd` into another project stores the
       new state **before** `session_root_changed` is published (assert order on the bus:
       `context_cleared`, `session_root_changed`, and the new state visible to a second client
       by the time it reads `session_root_changed`); a `/cd` to a `home` root drops the block.
-- [ ] BR-6 / AC-8: an edit between prompts is resident on the next prompt with one event; a
+- [x] BR-6 / AC-8: an edit between prompts is resident on the next prompt with one event; a
       touch that changes neither `len` nor `mtime` reads nothing; a mid-turn edit is not
       resident until the next prompt (drive a two-iteration tool loop).
-- [ ] BR-2 / AC-10: `Off` drops the block from the next turn and writes nothing to
+- [x] BR-2 / AC-10: `Off` drops the block from the next turn and writes nothing to
       `config.toml`; `On` re-loads at once; `repo_file = false` in config yields `WithheldOff`
       with zero reader calls (the injected reader's counter).
-- [ ] The method refuses an unattached connection with `NOT_ATTACHED`, as `session/transcript`
+- [x] The method refuses an unattached connection with `NOT_ATTACHED`, as `session/transcript`
       does; the model has no tool that reaches it (grep the registry).
-- [ ] OQ-4: a boundary configured mid-session that covers the file yields `WithheldBoundary` at
+- [x] OQ-4: a boundary configured mid-session that covers the file yields `WithheldBoundary` at
       the next refresh with the event.
 
 ## Verification

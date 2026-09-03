@@ -512,7 +512,7 @@ impl DaemonRuntime {
             stream_events,
             system,
         } = self
-            .assemble_harness(tctx, &skills, &probed, &mut route)
+            .assemble_harness(tctx, sessions, &skills, &probed, &mut route)
             .await;
 
         let accepted = self
@@ -917,6 +917,7 @@ impl DaemonRuntime {
     async fn assemble_harness(
         self: &Arc<Self>,
         tctx: TurnContext<'_>,
+        sessions: &SessionRegistry,
         skills: &Arc<SkillRegistry>,
         probed: &ProbedRoot,
         route: &mut crate::router::Route,
@@ -1002,6 +1003,50 @@ impl DaemonRuntime {
                     })
                     .collect()
             };
+        // REQ-612 BR-6 / ADR-3: the repository's notes, re-checked **here** —
+        // the one place per turn that has already re-derived the root, after
+        // `session_root_for` and before the prompt is built. Never mid-turn: the
+        // system prompt is fixed for the turn, so an edit that lands between two
+        // tool iterations is resident at the *next* prompt and not inside this
+        // one.
+        //
+        // The quiet answer costs one `stat` and no allocation (`refresh`
+        // returns `None` when the key and the boundary verdict both still
+        // hold), which is why it is taken inline rather than on a blocking
+        // thread: one syscall does not earn a hand-off, and a turn whose notes
+        // actually changed is already paying for a read.
+        let enabled = self.repo_context_enabled(sessions, session_id);
+        let boundaries = config.effective_boundaries();
+        let current = sessions.repo_context(session_id);
+        // The route's **effective** cap, not the build's ceiling (ADR-5): the
+        // loader stored the file and this stage renders it, so a floored
+        // 16,384-byte route carries 4 KiB of notes and the local tier the full
+        // 8 KiB — one derivation, asked where the route is known.
+        let cap = route.budget.repo_context_cap;
+        let state = match refresh_repo_context(
+            &current,
+            probed,
+            &boundaries,
+            enabled,
+            self.repo_files.as_ref(),
+        ) {
+            Some(fresh) => {
+                // Published on the change and only on the change (BR-6's "one
+                // event"), from outside the registry lock, before the prompt
+                // that carries it is built.
+                let event = repo_context_event(&fresh, cap);
+                if sessions.set_repo_context(session_id, fresh) {
+                    events.publish(Some(session_id.clone()), event);
+                }
+                sessions.repo_context(session_id)
+            }
+            None => current,
+        };
+        // The block, rendered from the state the two lines above settled. The
+        // manager's `system_sources` follows from it through `CarriedTurn::begin`
+        // — read off this same value, so the prompt's bytes and the provenance
+        // of those bytes are seeded from one fact (ADR-2, REQ-585 BR-7).
+        route.harness.repo_context = state.file().map(|file| RepoContextBlock::render(file, cap));
         let system = build_system_prompt(&tools, &route.harness);
         AssembledHarness {
             tools,

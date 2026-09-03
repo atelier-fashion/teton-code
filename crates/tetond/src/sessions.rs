@@ -33,6 +33,7 @@ use teton_protocol::methods::SessionSummary;
 use teton_protocol::{Phase, SessionId, SessionMode, TurnId};
 
 use crate::harness::context::{ContextBlock, RetainedContext};
+use crate::repo_context::RepoContextState;
 use crate::skills::SkillRegistry;
 
 /// One session as the registry holds it: what clients see, plus what only the
@@ -80,6 +81,38 @@ struct SessionRecord {
     /// registry lock (LESSON-448's rule at a smaller scale: a lock held across a
     /// deep copy is a lock every other session waits on).
     skills: Arc<SkillRegistry>,
+    /// The repository's own notes, as this session last read them (REQ-612
+    /// BR-1, ADR-3).
+    ///
+    /// Beside [`Self::skills`] because it is the same kind of fact and moves at
+    /// the same three moments: a **snapshot** derived from the root the session
+    /// stands on, taken at `session/create`, retaken when the root moves, and —
+    /// unlike the skill registry — re-checked at the start of each prompt turn
+    /// against one `stat` (BR-6). Storing it anywhere else would be a second
+    /// thing to move on `/cd`.
+    ///
+    /// [`RepoContextState::Absent`] until the first load, which is the honest
+    /// reading of a record nobody has derived yet: no file is resident, and the
+    /// prompt is byte-identical to a build without this feature.
+    ///
+    /// Behind an [`Arc`] for [`Self::skills`]'s reason at a smaller scale — the
+    /// state carries up to 64 KiB of file text, and a turn reading it under the
+    /// registry lock would hold that lock for the copy.
+    repo_context: Arc<RepoContextState>,
+    /// This session's `/context on|off`, or `None` while it follows the durable
+    /// `[context] repo_file` default (REQ-612 BR-2).
+    ///
+    /// Three values rather than two, and the third is what makes the two
+    /// switches composable: `None` is "nobody has said anything about *this*
+    /// session", so a `config/set` that flips the durable default reaches every
+    /// session that has not overridden it. A `bool` seeded from the config at
+    /// create would freeze each session at the value the config held that
+    /// moment, which is the second store REQ-611 ASSUME-017 keeps this feature
+    /// free of.
+    ///
+    /// Never persisted: `/context off` is a fact about one session and writes
+    /// nothing to `config.toml` (BR-2).
+    context_switch: Option<bool>,
 }
 
 /// One session's conversation: the ordered blocks the harness retained, turn
@@ -512,6 +545,17 @@ impl SessionRegistry {
                 // id being returned here is the first anyone learns of the
                 // session, and reaching it needs that id.
                 skills: Arc::new(SkillRegistry::default()),
+                // Absent until the caller loads one ([`Self::set_repo_context`]),
+                // for the reason above it: the load needs the session's probed
+                // root, its boundary set and the durable switch, and this
+                // registry holds none of the three. Nothing can observe the gap
+                // — the id being returned here is the first anyone learns of the
+                // session.
+                repo_context: Arc::new(RepoContextState::Absent),
+                // No session has said anything about itself yet, so every one of
+                // them follows `[context] repo_file` until someone types
+                // `/context`.
+                context_switch: None,
             });
         Ok(summary)
     }
@@ -708,6 +752,102 @@ impl SessionRegistry {
             .find(|record| &record.summary.session_id == id)
             .map(|record| Arc::clone(&record.skills))
             .unwrap_or_default()
+    }
+
+    /// Replace this session's repository notes (REQ-612 BR-1, ADR-3).
+    ///
+    /// Called from the **three** sites ADR-3 names and nowhere else: at
+    /// `session/create`, inside `session/set_cwd` before the move is announced,
+    /// and from the turn's `assemble` stage when BR-6's staleness check says the
+    /// file moved. `/context on|off` reaches it through the first of those
+    /// spellings, since a switch that changed is a state that changed.
+    ///
+    /// Unconditional, like [`Self::set_skills`] beside it: the file is re-read
+    /// as often as its key moves. `false` only for a session the registry does
+    /// not have.
+    ///
+    /// **The publish is the caller's, and it happens after this returns.** The
+    /// event bus is not to be touched while this mutex is held — the
+    /// `set_session_cwd` discipline, and the reason `store_session_repo_context`
+    /// separates the store from the announcement.
+    pub fn set_repo_context(&self, id: &SessionId, state: RepoContextState) -> bool {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .expect("session registry mutex poisoned");
+        let Some(record) = sessions
+            .iter_mut()
+            .find(|record| &record.summary.session_id == id)
+        else {
+            return false;
+        };
+        record.repo_context = Arc::new(state);
+        true
+    }
+
+    /// This session's repository notes, as the next turn's staleness check
+    /// compares them and as `/context` reports them.
+    ///
+    /// A cloned [`Arc`], so the lock is held for a pointer bump rather than for
+    /// a copy of the file's text (LESSON-448) — the same trade
+    /// [`Self::skills`] makes.
+    ///
+    /// A session the registry does not have answers [`RepoContextState::Absent`],
+    /// for [`Self::skills`]'s reason: a session that does not exist carries no
+    /// notes, and `Absent` is a state every consumer already handles — it is
+    /// what a session at a `home` root has.
+    #[must_use]
+    pub fn repo_context(&self, id: &SessionId) -> Arc<RepoContextState> {
+        self.sessions
+            .lock()
+            .expect("session registry mutex poisoned")
+            .iter()
+            .find(|record| &record.summary.session_id == id)
+            .map_or_else(
+                || Arc::new(RepoContextState::Absent),
+                |record| Arc::clone(&record.repo_context),
+            )
+    }
+
+    /// Set this session's `/context` switch (REQ-612 BR-2).
+    ///
+    /// Session-scoped and never persisted: the durable half is
+    /// `[context] repo_file` through `config/set`, and the two are composed —
+    /// not merged — by the reader, so this write cannot be mistaken for a
+    /// machine-wide one. `false` only for a session the registry does not have.
+    ///
+    /// There is no verb that clears it back to `None`. A session that has been
+    /// switched has an opinion for the rest of its life, which is what makes
+    /// `/context off` survive a `config/set` that turns the default on.
+    pub fn set_context_switch(&self, id: &SessionId, enabled: bool) -> bool {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .expect("session registry mutex poisoned");
+        let Some(record) = sessions
+            .iter_mut()
+            .find(|record| &record.summary.session_id == id)
+        else {
+            return false;
+        };
+        record.context_switch = Some(enabled);
+        true
+    }
+
+    /// This session's `/context` switch, or `None` while it follows the durable
+    /// default.
+    ///
+    /// A session the registry does not have answers `None`, which is the same
+    /// answer as "has not been switched" and is the honest one: nobody has
+    /// switched a session that does not exist.
+    #[must_use]
+    pub fn context_switch(&self, id: &SessionId) -> Option<bool> {
+        self.sessions
+            .lock()
+            .expect("session registry mutex poisoned")
+            .iter()
+            .find(|record| &record.summary.session_id == id)
+            .and_then(|record| record.context_switch)
     }
 
     /// This session's retained conversation, as the next turn replays it
