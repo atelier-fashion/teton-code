@@ -156,9 +156,10 @@ _Leg B — bounded, and the bound is stated_
   is 8 KiB** (product decision 2026-09-03: solid context over cheap context),
   and it is **route-aware**: the effective cap on a route is the smaller of
   8 KiB and a quarter of the route's byte budget (REQ-586's per-route pair),
-  so the local tier carries the full 8 KiB, a floored 16,384-byte route
-  carries 4 KiB, and no route ever spends more than a quarter of its context
-  on the notes. The effective cap is derived where the route is decided, like
+  so the local tier carries the full 8 KiB (its budget is 63,488 bytes since
+  REQ-590, so the notes are about an eighth of it), a floored 16,384-byte
+  route carries 4 KiB, and no route ever spends more than a quarter of its
+  context on the notes. The effective cap is derived where the route is decided, like
   the budget itself, and `/verbose` prints it beside the resident bytes. A file over the cap is
   **truncated at the last line boundary under the cap**, the block ends with
   a harness-authored marker naming the cap and the bytes dropped, the state
@@ -265,7 +266,8 @@ _Leg F — cost, and what the model is told_
   every iteration, so a prompt that runs to its `max_turns` (12 on the local
   profile, 40 on the strong-model profile — `teton_docs context`'s "25" is a
   stale figure this REQ corrects in passing) carries an 8 KiB block 12 to 40
-  times, and on the local tier it is up to a quarter of the byte budget —
+  times, and on the local tier it is about an eighth of the byte budget
+  (a quarter on a floored route) —
   which is why the cap is small and why the file should hold the facts a
   session needs every time (layout, build and test commands, conventions)
   and not the ones it needs once (informed by REQ-586 BR-9, LESSON-543).

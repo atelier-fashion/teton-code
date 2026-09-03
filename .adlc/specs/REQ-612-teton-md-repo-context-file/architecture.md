@@ -149,8 +149,9 @@ so nothing user-controlled reaches the opening line.
 
 ### ADR-5 — The cap is 8,192 bytes, route-aware by a quarter rule, truncation is at a line boundary, and the ceiling moves once by measurement
 
-`REPO_CONTEXT_MAX_BYTES = 8_192` (product decision 2026-09-03; a quarter of the local byte
-budget). The **effective** cap on a route is `min(REPO_CONTEXT_MAX_BYTES, route.budget_bytes / 4)`,
+`REPO_CONTEXT_MAX_BYTES = 8_192` (product decision 2026-09-03; about an eighth of the local byte
+budget, which has been 63,488 since REQ-590 — the "quarter" this ADR first said was the pre-REQ-590
+figure). The **effective** cap on a route is `min(REPO_CONTEXT_MAX_BYTES, route.budget_bytes / 4)`,
 derived in `harness/budget.rs` beside the budget it reads (REQ-586's one-derivation rule) and
 stamped on `RouteBudget` as `repo_context_cap`, so `/verbose`, the truncation marker and the
 loader read one number. The loader stores the stripped file; the `assemble` stage renders the
@@ -256,7 +257,7 @@ chunks hold twice a body only while the overhead is ≤ 21,353, so the raise pus
 cost moved to scan calls (`REDACT_MAX_CHUNKS` 4 → 5) rather than to context. The ledger states
 both halves; TASK-378 documents the actual consequence, not the predicted one.
 
-**The local tier spends up to a quarter of its byte budget on the notes.** That is the trade the
+**The local tier spends about an eighth of its byte budget on the notes, a floored route a quarter.** That is the trade the
 feature makes; BR-2's switch and the cap bound it, and AC-13's dogfood is where the trade is
 checked (ASSUME-1 in the spec). If the local model does not use the notes, the remedy is
 `/context off` per session or `repo_file = false` durably, not a larger cap.
