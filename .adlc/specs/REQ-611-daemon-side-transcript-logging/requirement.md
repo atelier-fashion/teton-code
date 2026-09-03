@@ -1,7 +1,7 @@
 ---
 id: REQ-611
 title: "Daemon-side transcript logging: an opt-in, per-session JSONL record you can switch on and off"
-status: approved
+status: complete
 deployable: true
 created: 2026-09-03
 updated: 2026-09-03
