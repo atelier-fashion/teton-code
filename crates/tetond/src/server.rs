@@ -3147,8 +3147,12 @@ fn handle_permission_respond(daemon: &Daemon, conn: &ConnState, id: Id, params: 
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
     };
     let pending = daemon.runtime.pending();
-    if let Some(owner) = pending.owner_of(&params.request_id) {
-        if !conn.may_drive(&owner) {
+    // Kept for the transcript hand-off below: `resolve_from` consumes the
+    // waiter, so after it there is no longer anything to ask whose session this
+    // answer belonged to.
+    let owner = pending.owner_of(&params.request_id);
+    if let Some(owner) = &owner {
+        if !conn.may_drive(owner) {
             return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
         }
     }
@@ -3161,7 +3165,23 @@ fn handle_permission_respond(daemon: &Daemon, conn: &ConnState, id: Id, params: 
     // standing for the client that was actually asked. Every pre-REQ-585 prompt
     // is unaddressed and is unaffected: its delivery policy is attachment, and
     // the `may_drive` check above is where that is enforced.
-    pending.resolve_from(&params.request_id, params.outcome, conn.id);
+    let resolved = pending.resolve_from(&params.request_id, params.outcome.clone(), conn.id);
+    // REQ-611 BR-4 / BR-10: the answer, to the session's transcript, and only
+    // when it actually settled the request. `resolve_from` answers `false` for
+    // a request id with no waiter — a late or duplicate reply, which this
+    // handler has always acknowledged rather than refused — and for an
+    // addressed waiter this connection was not the addressee of. Recording
+    // either would put an answer in the file that changed nothing, which is
+    // exactly the kind of thing a record must not do.
+    if resolved {
+        if let Some(owner) = &owner {
+            daemon.runtime.transcript_permission_decided(
+                owner,
+                &params.request_id,
+                &params.outcome,
+            );
+        }
+    }
     ok_string(id, &PermissionRespondResult {})
 }
 
@@ -3447,6 +3467,38 @@ fn handle_session_create(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
             // create just minted.
             rebuild_session_skills(daemon, &summary.session_id, summary.cwd.as_deref());
 
+            // REQ-583 BR-6: the root the daemon settled on, probed from the
+            // same path — or the same fallback — every turn will jail to, so
+            // what the CLI's banner and launch notice render is what the tools
+            // will enforce (ADR-1: one derivation, on the side that enforces).
+            //
+            // REQ-611 moved this derivation above the publishes below rather
+            // than leaving it between them: the transcript hand-off wants the
+            // display form, and it has to run before the first session-scoped
+            // event is published or the sink would be offered an envelope for a
+            // session it has not been told about.
+            let root = daemon.runtime.session_root_for(summary.cwd.as_deref()).view;
+
+            // REQ-611 BR-2 / ADR-3: the sink learns the session exists, and
+            // whether it records from its first record. Here rather than in
+            // `SessionRegistry::create` because the registry owns none of this
+            // (ADR-3) and holds none of its three inputs — the config's
+            // `[transcript] enabled`, the root's display form derived one line
+            // above, and the bus's sequence number.
+            //
+            // **Before every publish below.** With `enabled = true` the file is
+            // opened by this call, so `transcript_opened` is the first record in
+            // it (BR-2's "a session created while enabled opens a file before
+            // its first prompt") and the session's own first events — a
+            // structured session's `phase_transition`, the boundary posture —
+            // land in it rather than arriving for a session the sink does not
+            // yet know.
+            daemon.runtime.transcript_session_created(
+                &summary.session_id,
+                &root.display,
+                daemon.events.current_seq(),
+            );
+
             // Broadcast a session-scoped event so attached peers learn of the
             // new session. Entering a structured session's first phase is a
             // phase transition from nothing to that phase.
@@ -3460,12 +3512,6 @@ fn handle_session_create(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
                     }),
                 );
             }
-            // REQ-583 BR-6: the root the daemon settled on, probed from the
-            // same path — or the same fallback — every turn will jail to, so
-            // what the CLI's banner and launch notice render is what the tools
-            // will enforce (ADR-1: one derivation, on the side that enforces).
-            let root = daemon.runtime.session_root_for(summary.cwd.as_deref()).view;
-
             // REQ-597 BR-5 / System Model. Both derived from one reading of the
             // config, and published here — before the response, alongside the
             // phase transition above — so a client reading the create result

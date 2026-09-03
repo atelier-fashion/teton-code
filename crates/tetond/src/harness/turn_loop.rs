@@ -654,16 +654,54 @@ pub struct TurnOutcome {
 /// Publishes `session_update` events for one session (streaming turn surface,
 /// ACP `session/update`). Shares TASK-004's [`EventBus`] with the permission
 /// gate.
+///
+/// # And hands the turn's own content to the transcript sink (REQ-611 BR-4)
+///
+/// Three things a transcript needs never travel on the bus and never will: the
+/// prompt's text, a tool call's input, and a tool's result. `session_update`
+/// carries a call's id, title and status and nothing else, and widening it
+/// would hand every attached client and every declared monitor the content of
+/// every turn — a new disclosure surface, in exchange for a file the daemon can
+/// write in-process (LESSON-513). So they reach the sink from here, the type
+/// that already owns "this is session S's news", by the three `pub` methods
+/// below. They **publish nothing**.
 pub struct SessionEvents {
     bus: Arc<EventBus>,
     session_id: SessionId,
+    /// The daemon's transcript sink, when this emitter belongs to a real
+    /// daemon (REQ-611 ADR-3).
+    ///
+    /// `None` in the harness's own unit fixtures, which is what keeps a test
+    /// of the turn loop from writing a file: [`Self::new`] never takes one, and
+    /// a fixture must go out of its way ([`Self::with_sink`]) to get one.
+    sink: Option<Arc<crate::transcript::TranscriptSink>>,
 }
 
 impl SessionEvents {
     /// Session-scoped event emitter over `bus`.
+    ///
+    /// Records nothing — see [`Self::with_sink`] for the production form.
     #[must_use]
     pub fn new(bus: Arc<EventBus>, session_id: SessionId) -> Self {
-        Self { bus, session_id }
+        Self {
+            bus,
+            session_id,
+            sink: None,
+        }
+    }
+
+    /// The same emitter, handing this session's prompts, tool inputs and tool
+    /// results to `sink` (REQ-611 BR-4).
+    ///
+    /// Takes an `Option` rather than an `Arc` because the runtime's own sink is
+    /// optional — `DaemonRuntime::minimal` has none — and a call site that had
+    /// to unwrap one first would be a call site that could forget to. Every
+    /// production construction passes `self.transcript()` through it; nothing
+    /// else does.
+    #[must_use]
+    pub fn with_sink(mut self, sink: Option<Arc<crate::transcript::TranscriptSink>>) -> Self {
+        self.sink = sink;
+        self
     }
 
     /// The session these events are scoped to.
@@ -681,6 +719,79 @@ impl SessionEvents {
             Some(self.session_id.clone()),
             Event::SessionUpdate(SessionUpdate { update }),
         );
+    }
+
+    /// Hand one record to the transcript sink, if this session has one
+    /// (REQ-611 ADR-2, ADR-8).
+    ///
+    /// The counterpart of [`Self::emit`] and deliberately its opposite number:
+    /// `emit` widens an audience, this widens nothing. It returns `()` and
+    /// cannot fail — a turn must not die because a disk is full, and making
+    /// that a property of the type rather than of each call site remembering to
+    /// ignore an error is the whole of ADR-8.
+    fn record(&self, record: crate::transcript::Record) {
+        if let Some(sink) = self.sink.as_ref() {
+            sink.record(&self.session_id, record);
+        }
+    }
+
+    /// Record the prompt this turn is answering (REQ-611 BR-4, AC-2).
+    ///
+    /// Called at the turn's entry, **after** the claim — the turn id this
+    /// record carries is minted with the claim, and reading session state
+    /// before holding it is what LESSON-539 is about. It is also before the
+    /// route is decided, which is the one ordering AC-2 asserts on this record:
+    /// a reader must be able to see what was asked before what it cost.
+    ///
+    /// Nothing is published. The prompt's text has never been on the bus and
+    /// this does not put it there (BR-4).
+    pub fn prompt_submitted(
+        &self,
+        turn_id: &teton_protocol::TurnId,
+        prompt: &[teton_protocol::methods::PromptBlock],
+        skill: Option<&teton_protocol::methods::SkillInvocation>,
+    ) {
+        self.record(crate::transcript::Record::PromptSubmitted(
+            crate::transcript::PromptSubmitted {
+                turn_id: turn_id.clone(),
+                prompt: prompt.to_vec(),
+                skill: skill.cloned(),
+            },
+        ));
+    }
+
+    /// Record a tool call's input, as the harness parsed it (REQ-611 BR-4).
+    ///
+    /// The `session_update` published beside this carries the call's id, title
+    /// and status; the *arguments* are here and nowhere else, which is why the
+    /// hand-off exists at all.
+    pub fn tool_input(&self, tool_call_id: &str, tool: &str, input: &Value) {
+        self.record(crate::transcript::Record::ToolCallInput(
+            crate::transcript::ToolCallInput {
+                tool_call_id: tool_call_id.to_owned(),
+                tool: tool.to_owned(),
+                input: input.clone(),
+            },
+        ));
+    }
+
+    /// Record what a tool handed back (REQ-611 BR-4, BR-12).
+    ///
+    /// **What the tool returned, not what the model was shown.** Called before
+    /// the digest duty condenses an oversized result and before
+    /// `frame_untrusted_builtin` wraps it: both of those are model-facing
+    /// artifacts of this daemon's prompt construction, and a transcript that
+    /// recorded them would be a record of the conversation with the model
+    /// rather than of what the session did. The full result travels; the
+    /// writer is where `max_record_bytes` cuts it, with a marker (BR-12).
+    pub fn tool_result(&self, tool_call_id: &str, status: ToolCallStatus, output: &str) {
+        self.record(crate::transcript::Record::ToolResult(
+            crate::transcript::ToolResult {
+                tool_call_id: tool_call_id.to_owned(),
+                status,
+                output: output.to_owned(),
+            },
+        ));
     }
 
     /// Publish this turn's prefix-cache outcome (REQ-564).
@@ -1273,6 +1384,19 @@ async fn serve_tool_call(
     };
     let title = describe_call(&call);
     events.tool_started(&call.id, &title);
+    // REQ-611 BR-4: the arguments, to the transcript only. `tool_started` above
+    // published the id, the title and the status — everything a client is
+    // entitled to — and the input reaches the sink in-process rather than being
+    // added to that envelope, which would hand every attached client and every
+    // monitor the content of every call.
+    //
+    // Here, where `name` and `arguments` are in hand and **before** the
+    // permission gate is awaited: a call the user then declines is still a call
+    // the session made, and the file should say what was asked for. No
+    // `tool_result` follows a declined call, because no tool ran — the
+    // `tool_call_update { failed }` envelope and the `permission_decided`
+    // record are what that half of the story is made of.
+    events.tool_input(&call.id, &call.name, &call.arguments);
 
     // Almost every tool is authorized here, by name, before it runs.
     // A tool that answers [`Tool::gates_itself`] holds the gate
@@ -1581,6 +1705,28 @@ async fn run_the_allowed_tool(
     } else {
         content
     };
+    // REQ-611 BR-4: the result, to the transcript only, **here**.
+    //
+    // Every later rebinding of `folded` below composes something for the
+    // *model*: the digest duty condenses an oversized result, the untrusted
+    // frame wraps it in instructions about how to read it, and BUG-147's notice
+    // appends a sentence about calls this turn dropped. A transcript that
+    // recorded any of those would be a record of this daemon's prompt
+    // construction rather than of what the session's tool returned — which is
+    // the thing a user reading their own file back wants to see.
+    //
+    // The whole result travels, however large; `max_record_bytes` cuts it in
+    // the writer, with a marker, so BR-12's rule has one home (architecture's
+    // risk register accepts the in-flight cost).
+    events.tool_result(
+        &call.id,
+        if is_error {
+            ToolCallStatus::Failed
+        } else {
+            ToolCallStatus::Completed
+        },
+        &folded,
+    );
     // Condense an oversized result before it enters context.
     //
     // **REQ-558 BR-2: the category is tagged here.** This is

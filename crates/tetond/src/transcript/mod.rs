@@ -52,7 +52,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use teton_core::config::TranscriptConfig;
-use teton_protocol::events::TranscriptStateReason;
+use teton_protocol::events::{EventEnvelope, TranscriptStateReason};
 use teton_protocol::SessionId;
 use tokio::sync::{mpsc, oneshot};
 
@@ -559,6 +559,33 @@ impl TranscriptSink {
         if self.tx.try_send(message).is_err() {
             self.dropped(session_id, 1);
         }
+    }
+}
+
+/// The sink **is** the bus tap (ADR-1).
+///
+/// One method, one `try_send`, and deliberately nothing else — `observe` runs
+/// under the bus mutex, so every publisher in the daemon waits on whatever this
+/// body does (LESSON-518). The envelope clone is the whole cost, and it is the
+/// cost of recording the wire form verbatim: a record built by re-serializing
+/// the event here would be this daemon's second rendering of it rather than the
+/// bytes a fully attached client saw.
+///
+/// [`TranscriptSink::record`] answers the rest: it drops out on the recording
+/// fast path when nothing is switched on, refuses a session it does not know,
+/// and counts a full channel as a drop that becomes the next record's
+/// `transcript_gap` (BR-5).
+///
+/// The `session_id` check is a second seam for BR-7, and it stays. `publish`
+/// offers only session-scoped envelopes, and the writer refuses one scoped to
+/// another session — three checks for one rule, because the rule is *whose
+/// file this is* and each seam sees a different half of it (LESSON-502).
+impl crate::broadcast::EventTap for TranscriptSink {
+    fn observe(&self, envelope: &EventEnvelope) {
+        let Some(session_id) = envelope.session_id.clone() else {
+            return;
+        };
+        self.record(&session_id, Record::BusEnvelope(envelope.clone()));
     }
 }
 

@@ -1,7 +1,7 @@
 ---
 id: TASK-363
 title: "The bus tap, the turn-path hand-offs, session lifecycle, and shutdown flush"
-status: draft
+status: complete
 parent: REQ-611
 repo: teton-code
 created: 2026-09-03
@@ -46,30 +46,30 @@ excluded), BR-10, BR-11, AC-2, AC-8, AC-18.
 
 ## Acceptance Criteria
 
-- [ ] BR-5 (tap half): a unit test fills a 1-slot sink channel, publishes 100 envelopes, and
+- [x] BR-5 (tap half): a unit test fills a 1-slot sink channel, publishes 100 envelopes, and
       asserts `publish` returned each time and the bus's ordinary subscribers still received all
       100; the sink's dropped counter equals the shortfall.
-- [ ] ADR-1: a subscriber evicted for lag does not affect the tap — after eviction the tap still
+- [x] ADR-1: a subscriber evicted for lag does not affect the tap — after eviction the tap still
       observes every envelope.
-- [ ] BR-7: a daemon-scoped envelope (`session_id = None`) is never offered to the tap; asserted
+- [x] BR-7: a daemon-scoped envelope (`session_id = None`) is never offered to the tap; asserted
       by publishing `model_lifecycle` and checking the tap saw nothing.
-- [ ] BR-4: `grep -n 'publish' crates/tetond/src/harness/turn_loop.rs` after the change shows no
+- [x] BR-4: `grep -n 'publish' crates/tetond/src/harness/turn_loop.rs` after the change shows no
       publish carrying `PromptBlock`, tool arguments, or a tool result — recorded as a structural
       assertion in the transcript integration test (source-scanning check bounded to the function
       bodies that gained hand-offs, per `conventions.md`).
-- [ ] BR-2: a session created while `enabled = true` opens a file before its first prompt; one
+- [x] BR-2: a session created while `enabled = true` opens a file before its first prompt; one
       created while `false` opens nothing (AC-1's filesystem inspection).
-- [ ] AC-2: end-to-end against `MockProvider`, the file contains the record kinds the spec lists
+- [x] AC-2: end-to-end against `MockProvider`, the file contains the record kinds the spec lists
       with the three order relations and contiguous `n`.
-- [ ] BR-10: the `permission_decided` record and the `session_grant_minted` handling carry no
+- [x] BR-10: the `permission_decided` record and the `session_grant_minted` handling carry no
       secret; the existing wire forms are recorded verbatim.
-- [ ] BR-11: no call into `harness/redact.rs` from the transcript module or its hand-offs
+- [x] BR-11: no call into `harness/redact.rs` from the transcript module or its hand-offs
       (structural: `grep -c redact crates/tetond/src/transcript` is 0).
-- [ ] AC-8: two concurrent sessions, one event each, two files, no cross-talk; no daemon-scoped
+- [x] AC-8: two concurrent sessions, one event each, two files, no cross-talk; no daemon-scoped
       event in either file.
-- [ ] AC-18: orderly shutdown of a daemon with an open transcript leaves `transcript_closed {
+- [x] AC-18: orderly shutdown of a daemon with an open transcript leaves `transcript_closed {
       daemon_shutdown }` as the last line; `SIGKILL` leaves at most one partial trailing line.
-- [ ] `cargo test --workspace --no-fail-fast` is green; grep the output for `FAILED`.
+- [x] `cargo test --workspace --no-fail-fast` is green; grep the output for `FAILED`.
 
 ## Verification
 

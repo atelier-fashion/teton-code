@@ -3113,6 +3113,29 @@ const OPTION_ALLOW_ALWAYS: &str = "allow_always";
 const OPTION_REJECT_ONCE: &str = "reject_once";
 const OPTION_REJECT_ALWAYS: &str = "reject_always";
 
+/// Whether answering with `option_id` records a session-lifetime grant
+/// (REQ-611 BR-10's `permission_decided` record).
+///
+/// **Here, beside the ids, and not at the caller.** The transcript's
+/// `remembered` flag is a claim about what [`PermissionGate::settle`] did with
+/// an answer, and the three arms above that call `remember` are the definition
+/// of it. Spelling `ends_with("_always")` at the server would be a second
+/// reading of this rule in a file that cannot see it change.
+///
+/// [`OPTION_ID_ENABLE_PERMANENT`] is in the set because both of its arms record
+/// the session grant unconditionally, before the durable write they are really
+/// about. It is *slightly* over-broad by construction: that id on a prompt that
+/// offered neither a web tier nor a project root falls to the deny arm and
+/// remembers nothing — an id that was not on the prompt is not an answer to it
+/// — and no prompt but those two ever offers it.
+#[must_use]
+pub fn option_remembers_for_session(option_id: &str) -> bool {
+    matches!(
+        option_id,
+        OPTION_ALLOW_ALWAYS | OPTION_REJECT_ALWAYS | OPTION_ID_ENABLE_PERMANENT
+    )
+}
+
 /// Narrow a settlement to the five answers a skill caller can act on.
 ///
 /// One body for every skill door, so they cannot come to disagree about which

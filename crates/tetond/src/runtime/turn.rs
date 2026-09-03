@@ -73,6 +73,33 @@ pub(super) fn effective_transcript_dir(
     transcript.effective_dir(&teton_protocol::socket_path::data_dir())
 }
 
+/// The turn's prompt as the blocks its `prompt_submitted` record carries
+/// (REQ-611).
+///
+/// **One text block holding the flattened prompt, and that is a stated
+/// approximation.** The wire form is a `Vec<PromptBlock>` and `session/prompt`
+/// flattens it (`server::flatten_prompt`) before the turn is spawned: a
+/// resource link becomes `[resource: name (uri)]` in the one string every layer
+/// below reads. `run_prompt_turn` receives that string and never the blocks, so
+/// this is the prompt *the turn actually ran on* rather than a re-derivation of
+/// something the daemon threw away. Threading the original vector down would
+/// widen the turn's entry signature — already at the argument ceiling — to
+/// carry a second spelling of a value the turn does not otherwise have.
+///
+/// An empty prompt yields no blocks rather than one empty block: a skill turn's
+/// `prompt` is `""` by ADR-3 (the invocation travels as a name, and rides on
+/// the record's `skill` field), and a text block holding nothing would tell a
+/// reader the user typed an empty line.
+fn transcript_prompt_blocks(prompt: &str) -> Vec<teton_protocol::methods::PromptBlock> {
+    if prompt.is_empty() {
+        Vec::new()
+    } else {
+        vec![teton_protocol::methods::PromptBlock::Text {
+            text: prompt.to_owned(),
+        }]
+    }
+}
+
 /// What [`DaemonRuntime::claim_the_turn`] establishes before anything else runs.
 ///
 /// A parameter bundle, not a stage object: it holds no behaviour, mints no ids,
@@ -375,6 +402,25 @@ impl DaemonRuntime {
             claim: _claim,
             probed,
         } = self.claim_the_turn(sessions, &session_id, session_cwd)?;
+
+        // REQ-611 BR-4 / AC-2: the prompt, to the transcript, here.
+        //
+        // **After the claim**, because the record carries `turn_id` and the id
+        // is minted with the claim — reading a session's facts before holding
+        // its claim is what LESSON-539 is about. **Before the route**, because
+        // `prompt_submitted` preceding `route_decided` is one of the three
+        // orderings AC-2 asserts, and `resolve_the_route` below publishes that
+        // event. A refused turn — a skill this session does not dispatch, an
+        // expansion that does not fit — still has its prompt in the file, which
+        // is the honest record of what was asked.
+        //
+        // A short-lived emitter rather than the turn's `stream_events`: that one
+        // is assembled with the tools, well below the route, and the ordering
+        // above is the whole point. It is two `Arc` clones on a path that is
+        // about to run a model.
+        SessionEvents::new(Arc::clone(events), session_id.clone())
+            .with_sink(self.transcript())
+            .prompt_submitted(&turn_id, &transcript_prompt_blocks(&prompt), skill.as_ref());
 
         // REQ-585 BR-4/ADR-3: **expand before routing.** A skill turn's `prompt`
         // is empty by ADR-3 — the invocation crosses the wire as a name — and
@@ -914,7 +960,12 @@ impl DaemonRuntime {
         // is the point.
         let tool_ctx = ToolContext::for_root(probed)
             .with_denied_prefix(effective_transcript_dir(&config.transcript));
-        let stream_events = SessionEvents::new(events.clone(), session_id.clone());
+        // REQ-611 BR-4: the turn's streaming surface also carries the sink, so
+        // the tool input and the tool result — neither of which the bus has ever
+        // carried — reach the transcript in-process from the two points in the
+        // loop that hold them.
+        let stream_events =
+            SessionEvents::new(events.clone(), session_id.clone()).with_sink(self.transcript());
 
         // REQ-572 BR-3: the prompt's capability clause reads the same classifier
         // that decides tool exposure — stated here, where both inputs live, so
@@ -3159,7 +3210,17 @@ impl DaemonRuntime {
             Arc::clone(self.projects()),
             home(),
             // BR-11's hand-off record goes to the session that asked.
-            Some(SessionEvents::new(Arc::clone(events), session_id.clone())),
+            //
+            // REQ-611: carries the sink like every other production
+            // `SessionEvents`, so that "an emitter without a sink is a test
+            // fixture" stays a rule with no exceptions. This one only
+            // publishes — the tap records what it publishes — so the sink is
+            // never used here; the alternative is a second shape of emitter
+            // whose difference a reader has to work out.
+            Some(
+                SessionEvents::new(Arc::clone(events), session_id.clone())
+                    .with_sink(self.transcript()),
+            ),
         );
         // REQ-563 BR-1: `register_web_tool` is the one place the "tier is above
         // off" condition is expressed, so a machine that never opted in has no
