@@ -3356,3 +3356,215 @@ fn a_turn_boundary_closes_an_unclosed_fence_at_a_terminal() {
          transcript:\n{seen}"
     );
 }
+
+/// A `teton` session under a pty against `daemon`, ready at the entry prompt.
+/// Returns the child, its transcript, and the pty writer (REQ-611 tests).
+fn transcript_session(
+    daemon: &TestDaemon,
+) -> (
+    Box<dyn portable_pty::Child + Send + Sync>,
+    Transcript,
+    Box<dyn Write + Send>,
+) {
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 40,
+            cols: 160,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+    let mut cmd = CommandBuilder::new(teton_bin());
+    cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
+    cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
+    cmd.env("TETON_REPO_ROOT", &daemon.root);
+    let session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
+    drop(pty.slave);
+    let transcript = spawn_reader(pty.master.try_clone_reader().expect("pty reader"));
+    let writer = pty.master.take_writer().expect("pty writer");
+    assert!(
+        wait_for(&transcript, "ready (freeform)"),
+        "the session never reached the entry prompt; transcript:\n{}",
+        snapshot(&transcript)
+    );
+    (session, transcript, writer)
+}
+
+fn count_lines_containing(text: &str, needle: &str) -> usize {
+    text.lines().filter(|line| line.contains(needle)).count()
+}
+
+/// Wait until `text` holds at least `n` lines containing `needle`, bounded.
+fn wait_for_count(transcript: &Transcript, needle: &str, n: usize) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if count_lines_containing(&snapshot(transcript), needle) >= n {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+/// REQ-611 AC-3 (CLI half): `/transcript on` prints the handler's one line
+/// (naming the file) and the `transcript_state` notice arrives exactly once.
+///
+/// **Mutation (run 2026-09-03):** suppressing the `transcript_state` render
+/// arm in `session_ui` (line composed, never drawn) reddened "the
+/// transcript_state notice must render"; restored.
+#[test]
+fn transcript_on_prints_one_line_and_one_state_notice() {
+    let daemon = TestDaemon::spawn(&daemon_bin());
+    let (mut session, transcript, mut writer) = transcript_session(&daemon);
+
+    writer
+        .write_all(b"/transcript on\r")
+        .expect("type the command");
+    writer.flush().ok();
+    assert!(
+        wait_for(&transcript, "recording to"),
+        "`/transcript on` must name the file it records to; transcript:\n{}",
+        snapshot(&transcript)
+    );
+    let landed = wait_for_count(&transcript, "transcript: on", 2);
+    let text = snapshot(&transcript);
+    let _ = session.kill();
+    let _ = session.wait();
+
+    assert!(
+        landed,
+        "the transcript_state notice must render; transcript:\n{text}"
+    );
+    assert_eq!(
+        count_lines_containing(&text, "recording to"),
+        1,
+        "the handler prints one line; transcript:\n{text}"
+    );
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.trim_end().ends_with("transcript: on"))
+            .count(),
+        1,
+        "the state notice arrives once, not twice; transcript:\n{text}"
+    );
+    assert!(
+        text.contains("/transcripts/") && text.contains(".jsonl"),
+        "the path under the data directory is shown to the asker (BR-15); transcript:\n{text}"
+    );
+}
+
+/// REQ-611 AC-4 (CLI half): `off` stops, `on` again resumes the same file.
+///
+/// **Mutation (run 2026-09-03):** making `off` print the `recording to` form
+/// reddened the `stopped` count; restored.
+#[test]
+fn transcript_off_then_on_prints_the_resume() {
+    let daemon = TestDaemon::spawn(&daemon_bin());
+    let (mut session, transcript, mut writer) = transcript_session(&daemon);
+
+    writer.write_all(b"/transcript on\r").expect("type on");
+    writer.flush().ok();
+    assert!(
+        wait_for(&transcript, "recording to"),
+        "on; transcript:\n{}",
+        snapshot(&transcript)
+    );
+    let first = snapshot(&transcript);
+    let path = first
+        .lines()
+        .find_map(|line| line.split("recording to ").nth(1))
+        .map(|p| p.trim().to_owned())
+        .expect("the first `on` names a path");
+
+    writer.write_all(b"/transcript off\r").expect("type off");
+    writer.flush().ok();
+    assert!(
+        wait_for(&transcript, "stopped"),
+        "off; transcript:\n{}",
+        snapshot(&transcript)
+    );
+
+    writer
+        .write_all(b"/transcript on\r")
+        .expect("type on again");
+    writer.flush().ok();
+    let resumed = wait_for_count(&transcript, "recording to", 2);
+    let text = snapshot(&transcript);
+    let _ = session.kill();
+    let _ = session.wait();
+
+    assert!(resumed, "the second `on` prints again; transcript:\n{text}");
+    let second = text
+        .lines()
+        .filter_map(|line| line.split("recording to ").nth(1))
+        .nth(1)
+        .map(|p| p.trim().to_owned())
+        .expect("the second `on` names a path");
+    assert_eq!(
+        second, path,
+        "the second `on` resumes the SAME file (AC-4); transcript:\n{text}"
+    );
+    assert_eq!(
+        count_lines_containing(&text, "stopped"),
+        1,
+        "one stop; transcript:\n{text}"
+    );
+    assert_eq!(
+        count_lines_containing(&text, "recording to"),
+        2,
+        "two starts; transcript:\n{text}"
+    );
+}
+
+/// REQ-611 AC-5 (CLI half): bare `/transcript` reports the state, the path,
+/// the record count, and — after the daemon refuses a directory that is wider
+/// than owner-only — the degraded reason.
+///
+/// **Mutation (run 2026-09-03):** dropping the `degraded:` suffix from the
+/// render reddened the final assertion; restored.
+#[test]
+fn bare_transcript_prints_status_with_path_and_degraded_reason() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let daemon = TestDaemon::spawn(&daemon_bin());
+    // A pre-existing, group-readable transcript directory: the daemon refuses
+    // it at `on` (BR-9 / AC-11) and the session is degraded from then on.
+    let dir = daemon.root.join("d").join("teton").join("transcripts");
+    std::fs::create_dir_all(&dir).expect("plant the directory");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("widen it");
+
+    let (mut session, transcript, mut writer) = transcript_session(&daemon);
+
+    writer.write_all(b"/transcript\r").expect("type bare");
+    writer.flush().ok();
+    assert!(
+        wait_for(&transcript, "transcript: off"),
+        "bare `/transcript` reports the state; transcript:\n{}",
+        snapshot(&transcript)
+    );
+
+    writer.write_all(b"/transcript on\r").expect("type on");
+    writer.flush().ok();
+    assert!(
+        wait_for(&transcript, "degraded:"),
+        "a refused directory is reported as degraded; transcript:\n{}",
+        snapshot(&transcript)
+    );
+
+    writer.write_all(b"/transcript\r").expect("type bare again");
+    writer.flush().ok();
+    let reported = wait_for_count(&transcript, "degraded:", 2);
+    let text = snapshot(&transcript);
+    let _ = session.kill();
+    let _ = session.wait();
+
+    assert!(
+        reported,
+        "bare `/transcript` reports the degraded reason (AC-5); transcript:\n{text}"
+    );
+    assert!(
+        count_lines_containing(&text, "transcript: off") >= 2,
+        "the state stays off on a degraded session (BR-6); transcript:\n{text}"
+    );
+}

@@ -167,6 +167,13 @@ pub(crate) enum Command {
         /// setting.
         level: Option<String>,
     },
+    /// The durable transcript default (REQ-611): `enable` / `disable` write
+    /// `[transcript] enabled` through `config/set`; `status` prints the
+    /// posture `teton doctor` prints.
+    Transcript {
+        #[command(subcommand)]
+        action: TranscriptCli,
+    },
     /// Diagnose the daemon, socket, model state, and providers.
     Doctor,
     /// Remove Teton Code from this machine: stop the daemon, delete its data
@@ -520,6 +527,7 @@ fn main() -> ExitCode {
         Some(Command::Doctor) => run_doctor(&paths),
         Some(Command::Cost) => run_cost(&paths),
         Some(Command::Effort { level }) => run_effort(&paths, level.as_deref()),
+        Some(Command::Transcript { action }) => run_transcript(&paths, action),
         Some(Command::Model { action }) => match action {
             ModelAction::List => run_model_list(&paths),
             ModelAction::Set { name } => run_model_set(&paths, &name, cli.yes),
@@ -734,6 +742,11 @@ pub(crate) fn run_mirrored_command(
         Command::Effort { .. } => {
             ctx.surface
                 .line(LineKind::Error, &not_a_mirrored_row("effort"));
+            Ok(())
+        }
+        Command::Transcript { .. } => {
+            ctx.surface
+                .line(LineKind::Error, &not_a_mirrored_row("transcript"));
             Ok(())
         }
         Command::Uninstall { .. } => {
@@ -2033,6 +2046,7 @@ pub(crate) fn doctor_report_on(
     match conn.call(ConfigGetParams::default(), ctx)? {
         Ok(cfg) => {
             render_config(&cfg.snapshot.providers, ctx.surface);
+            render_transcript_posture(cfg.snapshot.transcript.as_ref(), ctx.surface);
             advise_on_base_url_endpoints(&cfg.snapshot.providers, ctx.surface);
             advise_on_context_windows(&cfg.snapshot.providers, ctx.surface);
         }
@@ -2151,6 +2165,86 @@ fn run_cost(paths: &DaemonPaths) -> anyhow::Result<()> {
 /// typed. Both render through [`crate::effort_ui::render`] — the same function
 /// `/effort` calls — because two surfaces describing one setting must not be
 /// able to drift (LESSON-456, REQ-555 BR-4).
+/// The `teton transcript` subcommands (REQ-611 BR-2): the durable default's
+/// shell surface. Not a twin of `/transcript`, whose `on`/`off` is a
+/// session-lifetime switch — the two grammars differ on purpose, so a user
+/// cannot mistake one lifetime for the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+pub(crate) enum TranscriptCli {
+    /// Record every session created from now on (`[transcript] enabled = true`).
+    Enable,
+    /// Stop recording new sessions (`[transcript] enabled = false`).
+    Disable,
+    /// Print the durable default, the effective directory and the retention.
+    Status,
+}
+
+/// REQ-611 AC-20: the one `transcript:` line, shared by `teton doctor`,
+/// `/doctor` and `teton transcript status`. An older daemon that reports no
+/// posture says so rather than printing a default it did not read.
+fn render_transcript_posture(
+    posture: Option<&teton_protocol::methods::TranscriptPosture>,
+    surface: &mut dyn Surface,
+) {
+    match posture {
+        Some(p) => surface.line(
+            LineKind::Info,
+            &status::transcript_line(p.enabled, &p.dir, p.retain_days),
+        ),
+        None => surface.line(
+            LineKind::Notice,
+            "transcript: not reported by this daemon build (config/get predates REQ-611).",
+        ),
+    }
+}
+
+fn run_transcript(paths: &DaemonPaths, action: TranscriptCli) -> anyhow::Result<()> {
+    let mut surface = stdout_surface();
+    let mut conn = client::ensure_connected(paths, &mut surface)?;
+    let mut state = SessionState::new();
+    let mut prompter = StdinPrompter::new();
+    let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
+    transcript_on(&mut conn, &mut ctx, action)
+}
+
+/// The body `teton transcript …` runs. `enable`/`disable` go through
+/// `config/set` and inherit its gates unchanged (architecture ADR-5); every
+/// arm then reads the posture back off `config/get`, so the line printed is
+/// what the daemon holds, never what was asked for.
+pub(crate) fn transcript_on(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    action: TranscriptCli,
+) -> anyhow::Result<()> {
+    let enabled = match action {
+        TranscriptCli::Enable => Some(true),
+        TranscriptCli::Disable => Some(false),
+        TranscriptCli::Status => None,
+    };
+    if let Some(enabled) = enabled {
+        if let Err(err) = conn.call(
+            ConfigSetParams {
+                update: ConfigUpdate::SetTranscriptEnabled { enabled },
+            },
+            ctx,
+        )? {
+            ctx.surface.line(
+                LineKind::Error,
+                &format!("could not set the transcript default: {}", err.message),
+            );
+            return Ok(());
+        }
+    }
+    match conn.call(ConfigGetParams::default(), ctx)? {
+        Ok(cfg) => render_transcript_posture(cfg.snapshot.transcript.as_ref(), ctx.surface),
+        Err(err) => ctx.surface.line(
+            LineKind::Error,
+            &format!("could not read the transcript posture: {}", err.message),
+        ),
+    }
+    Ok(())
+}
+
 fn run_effort(paths: &DaemonPaths, level: Option<&str>) -> anyhow::Result<()> {
     let mut surface = stdout_surface();
     let mut conn = client::ensure_connected(paths, &mut surface)?;
@@ -6031,6 +6125,12 @@ mod tests {
         let unreachable: Vec<(Command, &str)> = vec![
             (Command::Cost, "cost"),
             (Command::Effort { level: None }, "effort"),
+            (
+                Command::Transcript {
+                    action: TranscriptCli::Status,
+                },
+                "transcript",
+            ),
             (
                 Command::Model {
                     action: ModelAction::Set {

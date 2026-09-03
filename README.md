@@ -95,6 +95,9 @@ directory is yours alone — `0700`, files `0600` — nothing ships it anywhere,
 and the session's own file tools refuse to read it: a `read`, `edit`, `grep` or
 `glob` under it is denied whether or not it sits inside the session root.
 `docs/transcript-format.md` describes the file.
+The shell surface of the durable switch is `teton transcript enable|disable|status`;
+it is not a twin of `/transcript`, because the two switches have different
+lifetimes.
 
 Everything you would otherwise open a second terminal for is here too. The ten
 commands below that have a `teton …` twin *are* that twin — the same arguments,

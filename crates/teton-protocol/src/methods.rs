@@ -405,6 +405,7 @@ pub const RESERVED_SKILL_NAMES: &[&str] = &[
     "provider",
     "quit",
     "teton",
+    "transcript",
     "verbose",
     "web",
 ];

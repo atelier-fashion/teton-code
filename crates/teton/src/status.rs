@@ -100,6 +100,28 @@ pub fn status_line(level: PermissionLevel, effort: Option<&str>, width: usize) -
     (row.chars().count() <= width).then_some(row)
 }
 
+/// The `transcript:` label, shared by `teton doctor`, `/doctor` and
+/// `teton transcript status` so the three cannot drift (REQ-611 AC-20).
+pub const TRANSCRIPT_LABEL: &str = "transcript";
+
+/// One line stating the machine's transcript posture (REQ-611 AC-20): the
+/// durable default, the effective directory, and the retention policy.
+///
+/// Pure, like [`status_line`]: the caller reads the posture off `config/get`
+/// and hands the three facts in, so the sentence is composed where the facts
+/// are and tested without a daemon. `retain_days == 0` is BR-13's "never
+/// prune", and it is said that way rather than as a number.
+#[must_use]
+pub fn transcript_line(enabled_default: bool, effective_dir: &str, retain_days: u32) -> String {
+    let default = if enabled_default { "on" } else { "off" };
+    let kept = if retain_days == 0 {
+        "kept forever".to_owned()
+    } else {
+        format!("kept {retain_days} days")
+    };
+    format!("{TRANSCRIPT_LABEL}: {default} by default{FIELD_SEPARATOR}{effective_dir}{FIELD_SEPARATOR}{kept}")
+}
+
 /// Reading the **client's** own sources, for the seam assertion below.
 ///
 /// The client twin of `tetond`'s `call_sites::scan`, and a separate copy rather
@@ -526,6 +548,27 @@ mod tests {
         assert!(
             status_line(PermissionLevel::Guarded, Some(effort), chars).is_some(),
             "a row measured in bytes would have been dropped here"
+        );
+    }
+}
+
+#[cfg(test)]
+mod transcript_line_tests {
+    use super::*;
+
+    /// **Mutation (run 2026-09-03):** swapping the `on`/`off` words reddened
+    /// this test on the first assertion; restored.
+    #[test]
+    fn the_transcript_line_states_default_dir_and_retention() {
+        let line = transcript_line(false, "/tmp/t/transcripts", 30);
+        assert_eq!(
+            line,
+            format!("transcript: off by default{FIELD_SEPARATOR}/tmp/t/transcripts{FIELD_SEPARATOR}kept 30 days")
+        );
+        assert!(transcript_line(true, "/x", 7).starts_with("transcript: on by default"));
+        assert!(
+            transcript_line(true, "/x", 0).ends_with("kept forever"),
+            "retain_days = 0 is BR-13's never-prune and is said in words"
         );
     }
 }

@@ -1007,6 +1007,11 @@ fn slash_help_lists_every_command_and_no_turn_is_attempted() {
             "/verbose",
             "Toggle the routing and turn-end notices for this session.",
         ),
+        // REQ-611 AC-5: the session-lifetime transcript switch is findable.
+        (
+            "/transcript",
+            "Record this session to a file, or stop: /transcript [on|off]; bare, show the state.",
+        ),
         (
             "/effort",
             "Show or set the global reasoning effort: /effort [low|medium|high|xhigh|max].",
@@ -3399,6 +3404,47 @@ fn bare_permissions_reads_the_level_on_a_pipe_and_help_lists_it() {
 /// The full-restart leg is the daemon spawn itself: this test's second CLI run
 /// is a new session, and the config file is asserted byte-identical, so a level
 /// that had persisted through either route would fail here.
+/// REQ-611 AC-20: `teton doctor` prints exactly one `transcript:` posture
+/// line, and `teton transcript status` prints the same line. The fixture
+/// config names no `[transcript]` table, so the default is off and the
+/// directory is the isolated `XDG_DATA_HOME`.
+///
+/// **Mutation (run 2026-09-03):** removing the `render_transcript_posture`
+/// call from `doctor_report_on` reddened the `== 1` count; restored.
+#[test]
+fn doctor_prints_one_transcript_posture_line() {
+    let daemon = daemon_bin();
+    let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
+    let teton = teton_bin();
+
+    let doctor = daemon.run_cli(&teton, &["doctor"]);
+    let posture: Vec<&str> = doctor
+        .lines()
+        .filter(|line| line.trim_start().starts_with("transcript:"))
+        .collect();
+    assert_eq!(
+        posture.len(),
+        1,
+        "doctor prints exactly one transcript posture line; output:\n{doctor}"
+    );
+    assert!(
+        posture[0].contains("off by default") && posture[0].contains("kept 30 days"),
+        "the line names the default and the retention; got: {}",
+        posture[0]
+    );
+    assert!(
+        posture[0].contains("transcripts"),
+        "the line names the effective directory; got: {}",
+        posture[0]
+    );
+
+    let status = daemon.run_cli(&teton, &["transcript", "status"]);
+    assert!(
+        status.lines().any(|line| line.trim() == posture[0].trim()),
+        "`teton transcript status` prints the doctor's line verbatim; output:\n{status}"
+    );
+}
+
 #[test]
 fn a_permission_level_does_not_survive_the_session() {
     let daemon = daemon_bin();

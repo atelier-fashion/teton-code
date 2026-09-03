@@ -1,7 +1,7 @@
 ---
 id: TASK-365
 title: "CLI: /transcript, teton transcript enable|disable|status, the state event, and doctor"
-status: draft
+status: complete
 parent: REQ-611
 repo: teton-code
 created: 2026-09-03
@@ -36,18 +36,18 @@ by registering the command only in `COMMANDS`.
 
 ## Acceptance Criteria
 
-- [ ] AC-5 (CLI half): bare `/transcript` prints enabled state, path, record count, and the
+- [x] AC-5 (CLI half): bare `/transcript` prints enabled state, path, record count, and the
       degraded reason when present; `/help` lists `/transcript`.
-- [ ] AC-3 / AC-4 (CLI half): `/transcript on` and `/transcript off` each print one line and the
+- [x] AC-3 / AC-4 (CLI half): `/transcript on` and `/transcript off` each print one line and the
       rendered `transcript_state` notice arrives once, not twice.
-- [ ] AC-20: `teton doctor` and `/doctor` each contain exactly one line beginning `transcript:`
+- [x] AC-20: `teton doctor` and `/doctor` each contain exactly one line beginning `transcript:`
       naming the durable default, the effective directory, and `retain_days`; snapshot test
       updated.
-- [ ] `teton transcript enable` followed by `teton transcript status` shows `enabled` and the
+- [x] `teton transcript enable` followed by `teton transcript status` shows `enabled` and the
       config file on disk carries the key (read back — LESSON-519).
-- [ ] The session command is dispatched only via the `COMMANDS` table; no other call site
+- [x] The session command is dispatched only via the `COMMANDS` table; no other call site
       parses `transcript` (grep in `crates/teton/src`).
-- [ ] `cargo test -p teton --no-fail-fast` is green, including `cli_e2e.rs` and `pty_e2e.rs`
+- [x] `cargo test -p teton --no-fail-fast` is green, including `cli_e2e.rs` and `pty_e2e.rs`
       `/help` assertions.
 
 ## Verification
@@ -69,3 +69,28 @@ facts are (conventions: "compose the sentence where the facts are").
 
 Keep the notice to one line per state change. A second attached client also receives
 `transcript_state`; it renders the same line — that is correct, it is news for that session.
+
+## Outcome
+
+- Implemented in-context by the orchestrator after two backend failures
+  (HTTP 529) killed the dispatched agents before they wrote anything.
+- `/transcript [on|off]` is one `COMMANDS` row (`Args::Optional`, no mirror);
+  `on`/`off` print one handler line naming the file (or `stopped`) and the
+  `transcript_state` notice is drawn once by `session_ui` on every attached
+  client, the issuer included. Bare `/transcript` prints state, path, record
+  count and any degraded reason.
+- `teton transcript enable|disable|status` is deliberately **shell-only**, not
+  a twin: the two switches have different lifetimes, and `cli_rows::SHELL_ONLY`
+  gained the three leaves with their own refusal sentence pointing at
+  `/transcript on|off`. `RESERVED_SKILL_NAMES` gained `transcript` so a skill
+  cannot shadow the command.
+- `status::transcript_line(enabled_default, dir, retain_days)` has no `width`
+  parameter: `doctor` lines are never width-gated, only the entry status row is.
+- The degraded leg of AC-5 is driven by a pre-existing `0o755` transcript
+  directory (BR-9 / AC-11), which the daemon refuses at `on`; the AC-10 write
+  seam belongs to TASK-366.
+- Mutations run and recorded: doctor line removed (cli_e2e red), degraded
+  suffix dropped (unit red), `off` printing the recording form (pty red),
+  notice render suppressed (pty red). All restored; suite green
+  (4159 passed / 0 failed, clippy clean).
+
