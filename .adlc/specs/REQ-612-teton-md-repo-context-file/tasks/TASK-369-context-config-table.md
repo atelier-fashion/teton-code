@@ -1,7 +1,7 @@
 ---
 id: TASK-369
 title: "The [context] table: `repo_file`, default true, rendered only when named"
-status: draft
+status: complete
 parent: REQ-612
 repo: teton-code
 created: 2026-09-03
@@ -29,11 +29,11 @@ Landing it alone pins the default before anything reads it (ADR-6).
 
 ## Acceptance Criteria
 
-- [ ] BR-2: a `Config` parsed from TOML with no `[context]` table has `context.repo_file == true`;
+- [x] BR-2: a `Config` parsed from TOML with no `[context]` table has `context.repo_file == true`;
       `[context]` with `repo_file = false` parses to `false`; an unrelated write preserves both.
-- [ ] LESSON-587 check recorded in the PR: no predicate in the tree branches on the emptiness of
+- [x] LESSON-587 check recorded in the PR: no predicate in the tree branches on the emptiness of
       anything the new table introduces (grep `context.` readers; none exist yet).
-- [ ] `cargo test -p teton-core --no-fail-fast` and the preservation suite are green.
+- [x] `cargo test -p teton-core --no-fail-fast` and the preservation suite are green.
 
 ## Verification
 

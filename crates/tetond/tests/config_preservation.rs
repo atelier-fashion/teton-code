@@ -2215,3 +2215,86 @@ fn a_transcript_table_survives_an_unrelated_write_and_is_never_invented() {
         "a config that never named `[transcript]` does not gain it on an unrelated write:\n{after}"
     );
 }
+
+/// REQ-612 BR-2 / TASK-369 (integration leg): a `config.toml` that names
+/// `[context]` keeps it byte-for-byte across an unrelated `config/set`, and one
+/// that never named it does not gain the table.
+///
+/// The schema half is
+/// `teton_core::config::tests::context_table_defaults_repo_file_to_true`; this
+/// is the same claim made of the daemon's real write path — `apply_config_delta`
+/// over the bytes on disk — because that is where a table a write is not about
+/// would actually be invented.
+///
+/// The `[context]` fixture writes `repo_file = false`, which is the only posture
+/// worth preserving: `true` is the shipped default, so a document holding it is
+/// indistinguishable from one that says nothing. Losing the `false` is the
+/// failure this test exists to catch — it would turn the repository notes back
+/// on behind a user who turned them off.
+///
+/// **Mutation (run 2026-09-03):** making `apply_update`'s `RegisterProvider`
+/// arm also set `config.context.repo_file = false` — a write that *touches* the
+/// table — goes red on the "not invented" leg: `[context]\nrepo_file = false`
+/// appears in the bare document, and the reload reads `false` where it must read
+/// `true`. Restored.
+///
+/// A schema mutation is deliberately **not** the one recorded here, and that was
+/// measured rather than assumed: dropping `skip_serializing_if` from
+/// `Config.context` leaves this test **green** (run 2026-09-03), the same finding
+/// TASK-360 recorded for `[transcript]`. The reason is structural —
+/// `apply_config_delta` diffs the caller's `current` against its candidate, so a
+/// table neither side touched cannot enter the delta whatever `Config`'s serde
+/// attributes say. That mutation has teeth one layer down, where the config is
+/// serialized rather than diffed, and it is run there —
+/// `teton_core::config::tests::context_table_defaults_repo_file_to_true`,
+/// mutation 3.
+#[test]
+fn a_named_context_table_survives_an_unrelated_write_and_an_unnamed_one_is_not_added() {
+    let named = format!(
+        "{}\n# the notes are off on this machine, hand-written\n[context]\nrepo_file = false\n",
+        readme_config()
+    );
+    let daemon = Daemon::start("context-kept", Some(&named));
+    daemon
+        .runtime
+        .apply_config_update(register("cheap"))
+        .expect("the registration lands");
+    let after = daemon.document();
+    for line in [
+        "# the notes are off on this machine, hand-written",
+        "[context]",
+        "repo_file = false",
+    ] {
+        assert!(
+            after.contains(line),
+            "`{line}` survives an unrelated write:\n{after}"
+        );
+    }
+    assert_eq!(
+        after.matches("[context]").count(),
+        1,
+        "exactly one table, never duplicated:\n{after}"
+    );
+    assert!(
+        !daemon.reload().context.repo_file,
+        "the written document must still mean what the user wrote:\n{after}"
+    );
+    daemon.cleanup();
+
+    let bare = readme_config();
+    let daemon = Daemon::start("context-absent", Some(&bare));
+    daemon
+        .runtime
+        .apply_config_update(register("cheap"))
+        .expect("the registration lands");
+    let after = daemon.document();
+    assert!(
+        !after.contains("[context]"),
+        "a config that never named `[context]` does not gain it on an unrelated write:\n{after}"
+    );
+    assert!(
+        daemon.reload().context.repo_file,
+        "the absent table must still read as the shipped default (on):\n{after}"
+    );
+    daemon.cleanup();
+}

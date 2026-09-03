@@ -9709,6 +9709,7 @@ provider_id = "on-device"
     fn an_unconfigured_default_provider_is_none_not_a_synthesized_id() {
         let config = Config {
             transcript: Default::default(),
+            context: Default::default(),
             pinned_local_model: None,
             effort: teton_core::EffortLevel::default(),
             // The whole point: unset.
@@ -10038,6 +10039,7 @@ provider_id = "on-device"
     fn two_provider_spec_config() -> Config {
         Config {
             transcript: Default::default(),
+            context: Default::default(),
             pinned_local_model: None,
             effort: teton_core::EffortLevel::default(),
             default_provider: Some("anthropic".to_owned()),

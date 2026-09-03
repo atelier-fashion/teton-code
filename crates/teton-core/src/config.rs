@@ -1025,6 +1025,78 @@ impl TranscriptConfig {
     }
 }
 
+/// The default `[context] repo_file` — **on** (REQ-612 BR-2).
+///
+/// A free function rather than a bare `#[serde(default)]` on the field, and the
+/// distinction is the whole feature: serde's *field*-level `default` calls
+/// `bool::default()`, which is `false`, and it wins over the container's
+/// `#[serde(default)]`. A `[context]` table written for some other key would
+/// then silently turn the notes off — the "on arriving by omission" failure
+/// [`TranscriptConfig::enabled`] guards against, inverted. This is
+/// [`default_retain_days`]'s pattern for [`default_retain_days`]'s reason: serde's
+/// field default and [`ContextConfig::default`] must be one number by
+/// construction.
+fn default_repo_file() -> bool {
+    true
+}
+
+/// Repository context notes (the `[context]` table, REQ-612).
+///
+/// **On by default** (BR-2), which is the opposite posture from
+/// [`TranscriptConfig`] and deliberately so: a `TETON.md` at the repository root
+/// is a file an author wrote *in order to be read*, and a feature that has to be
+/// switched on before the file it names does anything is a feature nobody
+/// installs. The bound on the trade is a byte cap (BR-3), not an opt-in.
+///
+/// "Off" still means the mechanism does not run (the REQ-611 BR-1 posture):
+/// `repo_file = false` means the daemon never opens the file — no `stat`, no
+/// read, no block, no event — rather than reading it and discarding the result.
+///
+/// # Two switches, and only one of them is here
+///
+/// This table is the **durable default** read when a session is created. The
+/// session-lifetime override (`/context on|off`) is deliberately not a field
+/// here and is never written to disk — the same split
+/// [`TranscriptConfig`] makes for `/transcript on|off`, and `/permissions`
+/// before it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContextConfig {
+    /// Read the repository's notes file at the session root into the system
+    /// prompt.
+    ///
+    /// **Defaults to `true`** (BR-2). Serialized unconditionally within the
+    /// table (no `skip_serializing_if`), like [`PrivacyConfig::redact`] and
+    /// [`TranscriptConfig::enabled`]: a config that names `[context]` at all
+    /// states its posture rather than leaving a reader to infer it from an
+    /// absence — and here the absence would read as the *wrong* posture, since
+    /// the shipped default is on.
+    #[serde(default = "default_repo_file")]
+    pub repo_file: bool,
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            repo_file: default_repo_file(),
+        }
+    }
+}
+
+impl ContextConfig {
+    /// Whether every field still holds its default, used to keep the
+    /// `[context]` table out of a config that never named it — the same
+    /// treatment [`PrivacyConfig::is_unset`] gives `[privacy]`.
+    ///
+    /// Note which way round this reads: an *unset* `[context]` is one with the
+    /// feature **on**, because on is the default. The table reaches a user's
+    /// file only when they turned the notes off.
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Top-level configuration document.
 ///
 /// Field order matters for TOML serialization: the scalar `pinned_local_model`
@@ -1118,6 +1190,15 @@ pub struct Config {
     /// array-of-table fields, for the TOML-ordering reason above.
     #[serde(default, skip_serializing_if = "TranscriptConfig::is_unset")]
     pub transcript: TranscriptConfig,
+    /// Repository context notes (`[context]`, REQ-612): whether the daemon
+    /// reads the repository's notes file at the session root into the system
+    /// prompt. Absent means `repo_file = true` — the notes are on, because a
+    /// file written to be read is no use behind an opt-in (BR-2) — and `false`
+    /// means the file is never opened at all. See [`ContextConfig`]. Declared
+    /// here among the tables, before the array-of-table fields, for the
+    /// TOML-ordering reason above.
+    #[serde(default, skip_serializing_if = "ContextConfig::is_unset")]
+    pub context: ContextConfig,
     /// Registered providers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ModelProvider>,
@@ -3495,6 +3576,10 @@ effort_ladder = []
             // the round trip proves `[transcript]` stays out of a config that
             // never opted in.
             transcript: TranscriptConfig::default(),
+            // REQ-612 BR-2: likewise the shipped default — which here is the
+            // feature *on*, so the round trip proves `[context]` stays out of a
+            // config that never turned the notes off.
+            context: ContextConfig::default(),
             providers: vec![
                 ModelProvider {
                     id: "local".to_owned(),
@@ -4852,6 +4937,104 @@ provider_id = "on-device"
                 .expect("deserialize")
                 .transcript,
             with_dir.transcript
+        );
+    }
+
+    // ---- REQ-612: the `[context]` table (BR-2) -----------------------------
+
+    /// **REQ-612 BR-2 / TASK-369.** The repository notes are **on** by default,
+    /// from every direction a config can arrive, and a written-out table states
+    /// the posture rather than leaving it to be inferred.
+    ///
+    /// The three arrivals are separate cases because they are three different
+    /// serde paths, and a schema that gets one right and another wrong is
+    /// exactly what BR-2 has to rule out. The middle one — the table **named**
+    /// with no `repo_file` key — is the trap: serde's *field*-level
+    /// `#[serde(default)]` resolves to `bool::default()`, which is `false`, and
+    /// it outranks the container's `#[serde(default)]`. Written that way, naming
+    /// `[context]` for any other reason would silently turn the feature off.
+    /// [`default_repo_file`] exists so it cannot.
+    ///
+    /// The last leg is the write posture, and it is the one that keeps the table
+    /// out of a file whose author never mentioned it — the [`PrivacyConfig`]
+    /// rule, and the integration half of it is
+    /// `tetond/tests/config_preservation.rs::a_named_context_table_survives_an_unrelated_write_and_an_unnamed_one_is_not_added`.
+    ///
+    /// **Mutations** (LESSON-441), all three run 2026-09-03 and restored:
+    /// 1. `default_repo_file` returns `false` — the first three legs go red
+    ///    (every default arrival reads as off);
+    /// 2. `#[serde(default = "default_repo_file")]` on `ContextConfig::repo_file`
+    ///    replaced by a bare `#[serde(default)]` — only the named-but-empty-table
+    ///    leg goes red, which is the point of writing that leg down;
+    /// 3. `skip_serializing_if = "ContextConfig::is_unset"` dropped from
+    ///    `Config::context` — only the last leg goes red (an untouched config
+    ///    grows a `[context]` table on write).
+    #[test]
+    fn context_table_defaults_repo_file_to_true() {
+        // No table at all — the stock install, and a config authored before
+        // this REQ existed. Both must read as "on".
+        for (label, document) in [
+            ("empty document", ""),
+            ("an unrelated table", "[privacy]\nredact = true\n"),
+        ] {
+            let cfg = Config::load(document).expect("must load");
+            assert!(
+                cfg.context.repo_file,
+                "{label}: a config that never named [context] opted out"
+            );
+            assert!(cfg.context.is_unset(), "{label}");
+        }
+        assert!(
+            Config::default().context.repo_file,
+            "the in-memory default opted out"
+        );
+
+        // The table named, the key omitted: still on, and indistinguishable
+        // from the absence. This is the leg the field-level default breaks.
+        let named = Config::load("[context]\n").expect("must load");
+        assert!(
+            named.context.repo_file,
+            "naming [context] without writing `repo_file` turned the notes off"
+        );
+        assert_eq!(named.context, ContextConfig::default());
+        assert_eq!(
+            named.context,
+            Config::load("[context]\nrepo_file = true\n")
+                .expect("must load")
+                .context,
+            "writing the default explicitly is not a third state"
+        );
+
+        // Reading the opt-out rather than defaulting it.
+        let off = Config::load("[context]\nrepo_file = false\n").expect("must load");
+        assert!(!off.context.repo_file);
+        assert!(
+            !off.context.is_unset(),
+            "an opted-out table is not the shipped default"
+        );
+        off.validate()
+            .expect("the table is structural only — nothing to refuse");
+
+        // "States its posture": whenever the table is emitted at all,
+        // `repo_file` is in it, so a reader of the file never has to infer the
+        // switch from an absence — which here would read as the wrong answer,
+        // the default being on.
+        let written = off.to_toml().expect("serialize");
+        assert!(written.contains("[context]"), "toml: {written}");
+        assert!(written.contains("repo_file = false"), "toml: {written}");
+        assert_eq!(
+            Config::from_toml(&written).expect("deserialize").context,
+            off.context,
+            "the table must round-trip; toml was:\n{written}"
+        );
+
+        // And BR-2's other half: a config that never named the table does not
+        // grow it on a write, exactly as `[privacy]` does not.
+        let untouched = Config::load("[privacy]\nredact = true\n").expect("must load");
+        let written = untouched.to_toml().expect("serialize");
+        assert!(
+            !written.contains("[context]"),
+            "an unset table was written into the user's config: {written}"
         );
     }
 
