@@ -2366,3 +2366,54 @@ async fn a_parked_web_setup_commit_does_not_stall_the_connection() {
     server_task.abort();
     let _ = std::fs::remove_file(&path);
 }
+
+/// REQ-611 AC-8 / BR-15 via REQ-568 BR-1: `transcript_state` is published
+/// session-scoped, so it reaches the connection attached to the session and
+/// never a bystander that attached to nothing. Published straight onto the
+/// bus here — the delivery seam is the subject, not the sink.
+///
+/// **Mutation (run 2026-09-03):** publishing with `None` for the session
+/// reddened the bystander assertion; restored.
+#[tokio::test]
+async fn a_transcript_state_reaches_the_attached_client_and_never_a_bystander() {
+    let path = temp_socket("txs");
+    let listener = server::bind_listener(&path).unwrap();
+    let daemon = test_daemon();
+    let server_task = tokio::spawn(server::serve(listener, daemon.clone()));
+
+    let mut a = TestClient::connect(&path).await;
+    assert!(a.handshake(1).await.get("result").is_some());
+    let mut observer = TestClient::connect(&path).await;
+    assert!(observer.handshake(1).await.get("result").is_some());
+    let sid_a = create_structured_session(&mut a, 2).await;
+
+    let session: teton_protocol::SessionId =
+        serde_json::from_value(json!(sid_a)).expect("a minted id parses");
+    daemon.events.publish(
+        Some(session),
+        teton_protocol::events::Event::TranscriptState(teton_protocol::events::TranscriptState {
+            enabled: true,
+            reason: teton_protocol::events::TranscriptStateReason::SessionCommand,
+        }),
+    );
+
+    let (_, state) = a.collect_events_until("transcript_state").await;
+    assert_eq!(state["session_id"], json!(sid_a), "{state}");
+    assert_eq!(state["enabled"], json!(true), "{state}");
+    assert!(
+        state.get("path").is_none(),
+        "the state event carries no path (BR-15): {state}"
+    );
+
+    let mut marker_client = TestClient::connect(&path).await;
+    assert!(marker_client.handshake(1).await.get("result").is_some());
+    let (seen, marker) = observer.collect_events_until("daemon_client_attach").await;
+    assert!(
+        !seen.iter().any(|e| e["event"] == "transcript_state"),
+        "a bystander attached to nothing must not receive `transcript_state`: {seen:?}"
+    );
+    assert!(marker.get("session_id").is_none());
+
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}

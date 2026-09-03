@@ -103,11 +103,13 @@ pub enum Refused {
 
 /// Write-failure injection for this module's own tests (BR-6, ADR-8).
 ///
-/// **Not a runtime seam.** Outside `cfg(test)` the struct is empty and
-/// [`Faults::take`] is a constant `false`, so the shipped daemon carries no
-/// field, no atomic and no branch it could ever take — unlike
-/// `runtime::engine`'s `test_seams_enabled`, which is a *runtime* switch and
-/// deliberately not the shape used here.
+/// **Two arms, one call site.** Under `cfg(test)` a unit test arms an exact
+/// number of failures with [`Faults::arm`]. In any build, the
+/// `TETON_TRANSCRIPT_SEAM=write_fail_after:<n>` seam (REQ-611 AC-10) may arm
+/// "the `n+1`th append fails" through [`Faults::failing_after`] — but only
+/// where `runtime::engine::test_seams_enabled` says seams are honoured, so a
+/// shipped daemon that reaches this code carries `fail_after: None` and the
+/// branch is never taken. A seam can only *deny* a write, never record one.
 ///
 /// A count rather than a flag: BR-6 requires the sink to *attempt* one
 /// `transcript_closed { write_failure }` after the failure that degraded it, so
@@ -117,12 +119,41 @@ pub enum Refused {
 pub(crate) struct Faults {
     #[cfg(test)]
     remaining: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The `write_fail_after:<n>` seam: appends seen so far, and the count
+    /// after which every further append fails. `None` outside a seam.
+    fail_after: Option<std::sync::Arc<(std::sync::atomic::AtomicU64, u64)>>,
 }
 
 impl Faults {
+    /// Arm the runtime seam: the first `n` appends succeed, every later one fails.
+    #[must_use]
+    pub(crate) fn failing_after(n: u64) -> Self {
+        Self {
+            #[cfg(test)]
+            remaining: Default::default(),
+            fail_after: Some(std::sync::Arc::new((
+                std::sync::atomic::AtomicU64::new(0),
+                n,
+            ))),
+        }
+    }
+
+    /// Whether this append fails: the runtime seam first, then a unit test's
+    /// armed count.
+    fn take(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if let Some(armed) = &self.fail_after {
+            let seen = armed.0.fetch_add(1, Ordering::Relaxed) + 1;
+            if seen > armed.1 {
+                return true;
+            }
+        }
+        self.take_armed()
+    }
+
     /// Consume one armed failure, if any remain.
     #[cfg(test)]
-    fn take(&self) -> bool {
+    fn take_armed(&self) -> bool {
         use std::sync::atomic::Ordering;
         self.remaining
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
@@ -131,9 +162,9 @@ impl Faults {
             .is_ok()
     }
 
-    /// No failure is ever injected in a shipped build.
+    /// No unit-test failure is ever injected in a shipped build.
     #[cfg(not(test))]
-    fn take(&self) -> bool {
+    fn take_armed(&self) -> bool {
         false
     }
 

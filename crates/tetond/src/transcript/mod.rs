@@ -72,6 +72,45 @@ use writer::Faults;
 /// home. A byte-budgeted channel is the follow-up if that is ever measured.
 pub const CHANNEL_CAPACITY: usize = 4_096;
 
+/// What `TETON_TRANSCRIPT_SEAM` may ask for (REQ-611 AC-9 / AC-10), parsed by
+/// [`parse_seam`]. Both fields default to "no seam"; a seam can only shrink
+/// the channel or arm a write failure — never enable a transcript.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Seam {
+    /// `channel_full`: the sink's channel holds this many records (1), so a
+    /// turn of ordinary length overflows it and the file must carry a
+    /// `transcript_gap` rather than lose a record silently (BR-5).
+    pub capacity: Option<usize>,
+    /// `write_fail_after:<n>`: the writer's (n+1)th append fails with an I/O
+    /// error, exercising BR-6 mid-session.
+    pub write_fail_after: Option<u64>,
+}
+
+/// The seam in force, from the master switch and the raw variable.
+///
+/// Pure, so the release posture is a table test rather than a process: with
+/// `honoured == false` — which is what `test_seams_enabled()` answers on a
+/// release build (it panics first if `TETON_TEST_SEAMS=1` is set there) —
+/// every value yields the default, and an unrecognised value yields the
+/// default too rather than a guess.
+#[must_use]
+pub fn parse_seam(honoured: bool, raw: Option<&str>) -> Seam {
+    if !honoured {
+        return Seam::default();
+    }
+    match raw.map(str::trim) {
+        Some("channel_full") => Seam {
+            capacity: Some(1),
+            write_fail_after: None,
+        },
+        Some(value) if value.starts_with("write_fail_after:") => Seam {
+            capacity: None,
+            write_fail_after: value["write_fail_after:".len()..].trim().parse().ok(),
+        },
+        _ => Seam::default(),
+    }
+}
+
 /// What the sink needs to know to write files (ADR-4).
 ///
 /// Built from the `[transcript]` table plus the resolved data directory, which
@@ -316,18 +355,36 @@ impl TranscriptSink {
     /// Start a sink whose degradations reach `hooks` (ADR-8).
     #[must_use]
     pub fn spawn_with(config: SinkConfig, hooks: SinkHooks) -> Self {
-        Self::spawn_inner(config, hooks, Faults::default())
+        Self::spawn_inner(config, hooks, Faults::default(), CHANNEL_CAPACITY)
+    }
+
+    /// [`spawn_with`](Self::spawn_with) under a test seam (REQ-611 AC-9 /
+    /// AC-10). A seam can only shrink the channel or arm a write failure —
+    /// it can never turn a transcript on — and [`parse_seam`] yields the
+    /// default for every value when the seams are not honoured, so a release
+    /// build reaches exactly [`Self::spawn_with`]'s behaviour.
+    #[must_use]
+    pub fn spawn_with_seam(config: SinkConfig, hooks: SinkHooks, seam: Seam) -> Self {
+        let faults = seam
+            .write_fail_after
+            .map_or_else(Faults::default, Faults::failing_after);
+        Self::spawn_inner(
+            config,
+            hooks,
+            faults,
+            seam.capacity.unwrap_or(CHANNEL_CAPACITY),
+        )
     }
 
     /// Start a sink whose writers share `faults`, so a test can arm a write
     /// failure before the file exists.
     #[cfg(test)]
     fn spawn_faulty(config: SinkConfig, hooks: SinkHooks, faults: Faults) -> Self {
-        Self::spawn_inner(config, hooks, faults)
+        Self::spawn_inner(config, hooks, faults, CHANNEL_CAPACITY)
     }
 
-    fn spawn_inner(config: SinkConfig, hooks: SinkHooks, faults: Faults) -> Self {
-        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+    fn spawn_inner(config: SinkConfig, hooks: SinkHooks, faults: Faults, capacity: usize) -> Self {
+        let (tx, rx) = mpsc::channel(capacity.max(1));
         let shared = Arc::new(Shared::default());
         let sink = Self {
             tx,
@@ -1526,5 +1583,47 @@ mod tests {
 
         sink.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod seam_tests {
+    use super::*;
+
+    /// **Mutation (run 2026-09-03):** dropping the `!honoured` early return
+    /// reddened the first two assertions; restored. The release build's
+    /// refusal itself lives in `engine::test_seams_enabled`, which panics on
+    /// `TETON_TEST_SEAMS=1` before this parser is ever consulted.
+    #[test]
+    fn a_release_posture_yields_no_seam_whatever_the_variable_says() {
+        assert_eq!(parse_seam(false, Some("channel_full")), Seam::default());
+        assert_eq!(
+            parse_seam(false, Some("write_fail_after:3")),
+            Seam::default()
+        );
+        assert_eq!(parse_seam(true, None), Seam::default());
+        assert_eq!(parse_seam(true, Some("nonsense")), Seam::default());
+    }
+
+    #[test]
+    fn honoured_seams_parse_to_exactly_what_they_name() {
+        assert_eq!(
+            parse_seam(true, Some("channel_full")),
+            Seam {
+                capacity: Some(1),
+                write_fail_after: None
+            }
+        );
+        assert_eq!(
+            parse_seam(true, Some("write_fail_after:2")),
+            Seam {
+                capacity: None,
+                write_fail_after: Some(2)
+            }
+        );
+        assert_eq!(
+            parse_seam(true, Some("write_fail_after:x")),
+            Seam::default()
+        );
     }
 }

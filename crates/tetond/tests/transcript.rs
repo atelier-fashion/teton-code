@@ -1780,3 +1780,684 @@ fn a_durable_change_applies_to_later_sessions_only() {
         "BR-2: the session created afterwards starts from the new default: {recording}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// TASK-366 — the acceptance suite: AC-1, AC-9, BR-11, AC-12, AC-21.
+// ---------------------------------------------------------------------------
+
+/// A config with **no** `[transcript]` table at all — the stock install AC-1
+/// is about, as opposed to `write_config(.., false)`, which names the table.
+fn write_stock_config(workspace: &Workspace, provider: &MockProvider, duties: &MockProvider) {
+    let mut config = String::new();
+    config.push_str(&remote_provider_block(
+        "mock",
+        &provider.openai_endpoint(),
+        "deepseek-chat",
+    ));
+    config.push_str(&remote_provider_block(
+        "duties",
+        &duties.openai_endpoint(),
+        "deepseek-chat",
+    ));
+    config.push_str(&every_tier_bound_to("mock"));
+    config.push_str(&category_block("title", "duties"));
+    workspace.write_config(&config);
+}
+
+/// Like [`write_config_in`], plus a verbatim `extra` table appended (AC-21's
+/// `[privacy]` opt-out).
+fn write_config_with_extra(
+    workspace: &Workspace,
+    provider: &MockProvider,
+    duties: &MockProvider,
+    dir: &Path,
+    extra: &str,
+) -> PathBuf {
+    let mut config = String::new();
+    config.push_str(&remote_provider_block(
+        "mock",
+        &provider.openai_endpoint(),
+        "deepseek-chat",
+    ));
+    config.push_str(&remote_provider_block(
+        "duties",
+        &duties.openai_endpoint(),
+        "deepseek-chat",
+    ));
+    config.push_str(&every_tier_bound_to("mock"));
+    config.push_str(&category_block("title", "duties"));
+    config.push_str(&transcript_block(dir, true));
+    config.push_str(extra);
+    workspace.write_config(&config);
+    dir.to_path_buf()
+}
+
+/// Every directory named `transcripts` under `root`, recursively (AC-1 lists
+/// the filesystem rather than trusting a flag; listing order is irrelevant).
+fn transcripts_dirs_under(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                if path.file_name().and_then(|n| n.to_str()) == Some("transcripts") {
+                    found.push(path.clone());
+                }
+                stack.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// The sink's own record kinds, written by the writer rather than enqueued
+/// from the turn: excluded from AC-9's accounting.
+fn is_control_record(kind: &str) -> bool {
+    matches!(
+        kind,
+        "transcript_opened" | "transcript_closed" | "transcript_gap" | "transcript_resumed"
+    )
+}
+
+/// REQ-611 AC-1 / BR-1: a stock config — no `[transcript]` table — runs a
+/// full session (prompt, tool call, reply, exit) and leaves no `transcripts`
+/// directory anywhere under the workspace, its data dirs included. The sink
+/// *object* exists in the daemon (TASK-363 constructs it unconditionally so
+/// `/transcript on` has something to switch), which is why this test asserts
+/// the filesystem and not a flag.
+///
+/// **Mutation (run 2026-09-03):** running the same session under
+/// `write_config(.., true)` instead of the stock config reddened the "no
+/// transcripts directory" assertion (a directory appeared), so the assertion
+/// is not vacuous; restored.
+#[test]
+fn a_stock_config_writes_nothing_and_constructs_no_sink() {
+    let provider = MockProvider::start(
+        vec![MockResponse::ok(openai_turn(
+            "Let me read the README.",
+            Some(("c1", "read", r#"{"path":"README.md"}"#)),
+            120,
+            20,
+        ))],
+        MockResponse::ok(openai_turn("The README describes the demo.", None, 140, 30)),
+    );
+    let duties = duty_provider();
+    let workspace = Workspace::new("transcript-ac1");
+    write_stock_config(&workspace, &provider, &duties);
+    let mut daemon = spawn(&workspace, probe().real_lifetime());
+    let mut client = daemon.connect();
+    let session = client.create_session("freeform", None);
+    let response = client.prompt(&session, "Summarize the README for me.");
+    assert!(
+        response.get("result").is_some(),
+        "the turn must complete: {response}"
+    );
+    client.drain_events(Duration::from_millis(300));
+    drop(client);
+    let status = daemon
+        .wait_for_exit(WINDOW)
+        .expect("the daemon exits on its own when its last client leaves");
+    assert!(status.success(), "log:\n{}", daemon.log());
+
+    let found = transcripts_dirs_under(&workspace.root);
+    assert!(
+        found.is_empty(),
+        "a stock config must create no transcripts directory anywhere: {found:?}"
+    );
+    assert!(
+        client_events_are_clean(&daemon),
+        "no transcript_state is published when nothing was ever switched"
+    );
+}
+
+/// The daemon log carries no `transcript` line for a stock session — the
+/// sink prints only when it prunes or degrades, and a stock session does
+/// neither.
+fn client_events_are_clean(daemon: &Daemon) -> bool {
+    !daemon.log().contains("transcript_state")
+}
+
+/// REQ-611 AC-9 / BR-5: with the sink's channel forced to one slot, six
+/// tool-using turns complete within the ordinary window, and the file
+/// accounts for every record the turn produced — written, or counted in a
+/// `transcript_gap` — with `n` contiguous.
+///
+/// `published` is what the attached client itself received for this session
+/// (every session-scoped envelope the tap saw) plus the sink-local records the
+/// turns hand in: one `prompt_submitted`, one `tool_call_input` and one
+/// `tool_result` per tool turn, and one `permission_decided` per
+/// `permission_request` the client answered. The file is the subject, so
+/// nothing in `published` is read from it.
+///
+/// **Mutation (run 2026-09-03):** making the writer's `note_dropped` a no-op
+/// (no gap ever written) reddened the `dropped >= 1` assertion; restored.
+#[test]
+fn a_full_sink_channel_delays_nothing_and_writes_one_gap() {
+    const TURNS: usize = 6;
+    let mut scripted = Vec::new();
+    for _ in 0..TURNS {
+        scripted.push(MockResponse::ok(openai_turn(
+            "Let me read the README.",
+            Some(("c1", "read", r#"{"path":"README.md"}"#)),
+            120,
+            20,
+        )));
+        scripted.push(MockResponse::ok(openai_turn(
+            "The README describes the demo.",
+            None,
+            140,
+            30,
+        )));
+    }
+    let provider = MockProvider::start(
+        scripted,
+        MockResponse::ok(openai_turn("Done.", None, 140, 30)),
+    );
+    let duties = duty_provider();
+    let workspace = Workspace::new("transcript-ac9");
+    let dir = write_config(&workspace, &provider, &duties, true);
+    let mut daemon = spawn(
+        &workspace,
+        probe()
+            .real_lifetime()
+            .env("TETON_TRANSCRIPT_SEAM", "channel_full"),
+    );
+    let mut client = daemon.connect();
+    let session = client.create_session("freeform", None);
+
+    for i in 0..TURNS {
+        let started = Instant::now();
+        let response = client.prompt(&session, &format!("Summarize the README ({i})."));
+        assert!(
+            response.get("result").is_some(),
+            "turn {i} must complete: {response}"
+        );
+        assert!(
+            started.elapsed() < WINDOW,
+            "a full sink channel must not delay the turn (BR-5): turn {i} took {:?}",
+            started.elapsed()
+        );
+    }
+    client.drain_events(Duration::from_millis(500));
+    let envelopes = client
+        .events()
+        .iter()
+        .filter(|e| e.get("session_id").and_then(Value::as_str) == Some(session.as_str()))
+        .count();
+    let permission_requests = client
+        .events()
+        .iter()
+        .filter(|e| {
+            e.get("session_id").and_then(Value::as_str) == Some(session.as_str())
+                && e["event"] == "permission_request"
+        })
+        .count();
+    let local_attempted = TURNS * 3 + permission_requests;
+
+    let path = await_file(&dir, &session);
+    drop(client);
+    let status = daemon
+        .wait_for_exit(WINDOW)
+        .expect("the daemon exits on its own when its last client leaves");
+    assert!(status.success(), "log:\n{}", daemon.log());
+
+    let (records, partial) = read_transcript(&path);
+    assert_eq!(partial, None, "an orderly exit leaves no partial line");
+    assert_well_formed(&records, &session);
+    let dropped: u64 = records
+        .iter()
+        .filter(|r| r["kind"] == "transcript_gap")
+        .map(|r| r["dropped"].as_u64().expect("a gap names its count"))
+        .sum();
+    let written = records
+        .iter()
+        .filter(|r| !is_control_record(r["kind"].as_str().unwrap_or("")))
+        .count();
+    assert!(
+        dropped >= 1,
+        "a one-slot channel under six turns must drop something, or the seam is inert: {:?}",
+        kinds_of(&records)
+    );
+    assert_eq!(
+        written as u64 + dropped,
+        (envelopes + local_attempted) as u64,
+        "every record is written or counted (AC-9): written {written}, dropped {dropped}, \
+         envelopes {envelopes}, local {local_attempted}; kinds {:?}",
+        kinds_of(&records)
+    );
+}
+
+/// REQ-611 BR-11: the transcript neither installs nor consults the redactor
+/// — the module-level proof is `the_transcript_module_never_calls_the_redactor`
+/// — and the `transcript_opened` record states the egress posture in force,
+/// so a reader knows the file was written unredacted while egress was (or
+/// was not) scanning.
+///
+/// **Mutation (run 2026-09-03):** hard-coding `redact: true` into the opened
+/// record reddened the posture assertion; restored.
+#[test]
+fn the_redactor_is_not_installed_by_the_transcript_and_the_opened_record_states_posture() {
+    let provider = MockProvider::always(openai_turn("Done.", None, 120, 20));
+    let duties = duty_provider();
+    let workspace = Workspace::new("transcript-br11");
+    let dir = write_config(&workspace, &provider, &duties, true);
+    let mut daemon = spawn(&workspace, probe().real_lifetime());
+    let mut client = daemon.connect();
+    let session = client.create_session("freeform", None);
+    client.prompt(&session, "Say something.");
+    let path = await_file(&dir, &session);
+    drop(client);
+    daemon.wait_for_exit(WINDOW).expect("orderly exit");
+
+    let (records, _) = read_transcript(&path);
+    let opened = &records[first_index(&records, "transcript_opened").expect("opened")];
+    assert_eq!(
+        opened["redact"],
+        json!(false),
+        "the fixture never opted into `[privacy] redact`, and the record says so: {opened}"
+    );
+    let log = daemon.log();
+    assert!(
+        !log.contains("redact scan") && !log.contains("redaction gate"),
+        "no scanner was installed for a transcript-only session: {log}"
+    );
+}
+
+/// A transcript directory planted by a test must already be owner-only, or the
+/// daemon refuses it at open (BR-9 / AC-11) and the test is about a refusal it
+/// did not mean to stage.
+fn plant_owner_only_dir(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).expect("plant the dir");
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .expect("make the planted dir owner-only");
+}
+
+const DECOY_MARKER: &str = "TRANSCRIPT-DECOY-MARKER-77c1";
+const KEY_MARKER: &str = "ID-RSA-FIXTURE-MARKER-3b9e";
+const TRANSCRIPT_REASON: &str = "is a session transcript; tools do not read transcripts";
+
+/// The four file tools aimed at a decoy inside `dir`, each as one scripted
+/// turn: `read` and `edit` by path (the jail seam), `grep` and `glob` over the
+/// root (the walker seam). Returns the scripted replies in order.
+fn tool_turns_against(decoy: &Path) -> Vec<MockResponse> {
+    let path = decoy.display().to_string();
+    let mut turns = Vec::new();
+    for (id, tool, args) in [
+        ("r1", "read", json!({ "path": path }).to_string()),
+        (
+            "e1",
+            "edit",
+            // Not the marker: tool-call arguments travel back to the provider
+            // as the assistant's own message, so the marker may live only in
+            // the file — otherwise the egress assertion below cannot tell a
+            // leak from an echo.
+            json!({ "path": path, "old_string": "decoy", "new_string": "x" }).to_string(),
+        ),
+        // The pattern is not the marker: grep's own "no matches for `…`" line
+        // echoes the pattern into the conversation, and from there into every
+        // later provider request — an echo the egress assertion must not
+        // mistake for a leak.
+        ("g1", "grep", json!({ "pattern": "decoy" }).to_string()),
+        ("l1", "glob", json!({ "glob": "**/*.jsonl" }).to_string()),
+    ] {
+        turns.push(MockResponse::ok(openai_turn(
+            "Let me look.",
+            Some((id, tool, &args)),
+            120,
+            20,
+        )));
+        turns.push(MockResponse::ok(openai_turn("Looked.", None, 140, 30)));
+    }
+    turns
+}
+
+/// The `tool_result` records of a session's file, in order, as text.
+fn tool_results(records: &[Value]) -> Vec<String> {
+    records
+        .iter()
+        .filter(|r| r["kind"] == "tool_result")
+        .map(|r| {
+            r.get("output")
+                .or_else(|| r.get("text"))
+                .or_else(|| r.get("result"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Assert the four refusals on a session whose transcript dir holds `decoy`.
+fn assert_four_tools_refuse(records: &[Value], where_: &str) {
+    let results = tool_results(records);
+    assert!(
+        results.len() >= 4,
+        "{where_}: four tool turns leave four results: {results:?}"
+    );
+    assert!(
+        results[0].contains(TRANSCRIPT_REASON),
+        "{where_}: `read` of a transcript is refused with the transcript reason: {}",
+        results[0]
+    );
+    assert!(
+        results[1].contains(TRANSCRIPT_REASON),
+        "{where_}: `edit` of a transcript is refused with the transcript reason: {}",
+        results[1]
+    );
+    // A match line carries `{path}:{line}: …`; the pattern itself is echoed
+    // by the "no matches for" harness line, so it is the *path* that must be
+    // absent, never the pattern.
+    assert!(
+        !results[2].contains("decoy.jsonl") && !results[2].contains("transcripts/"),
+        "{where_}: `grep` never lists a transcript (walker seam): {}",
+        results[2]
+    );
+    assert!(
+        !results[3].contains("decoy.jsonl"),
+        "{where_}: `glob` never lists a transcript (walker seam): {}",
+        results[3]
+    );
+}
+
+/// REQ-611 AC-12 / BR-8: every file tool refuses the session's transcript
+/// directory — inside the root and outside it — and the one named exception,
+/// `shell`, may print the file but what it printed is held at egress: the
+/// next remote-routed request is blocked with none of the decoy's bytes in
+/// any captured provider request, the shipped default boundaries in force.
+///
+/// **Mutations (run 2026-09-03, LESSON-502 — one per seam):** removing the
+/// denied-prefix check from `ToolContext::resolve` reddened the `read`/`edit`
+/// legs and left `grep`/`glob` green; removing it from `WalkPolicy` reddened
+/// `grep`/`glob` and left `read`/`edit` green. Both restored.
+#[test]
+fn every_file_tool_refuses_the_transcript_and_shell_output_is_held_at_egress() {
+    // (a) inside the session root
+    {
+        let workspace = Workspace::new("transcript-ac12-in");
+        // The session root is the workspace's `repo/`, so "inside" means under it.
+        let dir = workspace.root.join("repo").join("transcripts");
+        plant_owner_only_dir(&dir);
+        let decoy = dir.join("decoy.jsonl");
+        std::fs::write(
+            &decoy,
+            format!("{{\"kind\":\"decoy\",\"m\":\"{DECOY_MARKER}\"}}\n"),
+        )
+        .expect("plant the decoy");
+        let mut scripted = tool_turns_against(&decoy);
+        let shell_args = json!({ "command": format!("cat {}", decoy.display()) }).to_string();
+        scripted.push(MockResponse::ok(openai_turn(
+            "Let me cat it.",
+            Some(("s1", "shell", &shell_args)),
+            120,
+            20,
+        )));
+        let provider = MockProvider::start(
+            scripted,
+            MockResponse::ok(openai_turn("Done.", None, 140, 30)),
+        );
+        let duties = duty_provider();
+        write_config_in(&workspace, &provider, &duties, true, &dir);
+        let mut daemon = spawn(&workspace, probe().real_lifetime());
+        let mut client = daemon.connect();
+        let session = client.create_session("freeform", None);
+        for i in 0..4 {
+            let r = client.prompt(&session, &format!("Look at the transcript ({i})."));
+            assert!(r.get("result").is_some(), "tool turn {i}: {r}");
+        }
+        let shell_turn = client.prompt(&session, "Print the transcript with a shell.");
+        assert!(
+            shell_turn.get("result").is_some(),
+            "shell turn: {shell_turn}"
+        );
+        let remote_turn = client.prompt(&session, "Now summarize what you printed.");
+        assert!(
+            remote_turn.get("result").is_some(),
+            "remote turn: {remote_turn}"
+        );
+        client.drain_events(Duration::from_millis(500));
+        assert!(
+            !client.events_named("privacy_block").is_empty(),
+            "the shell-read transcript is held at egress (unknown provenance, fail-closed): {:?}",
+            client
+                .events()
+                .iter()
+                .map(|e| e["event"].clone())
+                .collect::<Vec<_>>()
+        );
+        let events_seen: Vec<Value> = client.events().to_vec();
+        let path = await_file(&dir, &session);
+        drop(client);
+        daemon.wait_for_exit(WINDOW).expect("orderly exit");
+        let (records, _) = read_transcript(&path);
+        assert_four_tools_refuse(&records, "inside the root");
+        let results = tool_results(&records);
+        assert!(
+            results.iter().any(|r| r.contains(DECOY_MARKER)),
+            "`shell` is the named exception and did print the file: {results:?}"
+        );
+        let requests = provider.requests();
+        let leaking: Vec<usize> = requests
+            .iter()
+            .enumerate()
+            .filter(|(_, body)| {
+                body.windows(DECOY_MARKER.len())
+                    .any(|w| w == DECOY_MARKER.as_bytes())
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            leaking.is_empty(),
+            "no captured provider request may carry the transcript's bytes (AC-12); \
+             requests {} of {} carry it: {leaking:?}; events {:?}; leaking body: {}\nlog:\n{}",
+            leaking.len(),
+            requests.len(),
+            events_seen
+                .iter()
+                .map(|e| e["event"].to_string())
+                .collect::<Vec<_>>(),
+            String::from_utf8_lossy(&requests[leaking[0]])
+                .chars()
+                .take(600)
+                .collect::<String>(),
+            daemon.log()
+        );
+    }
+    // (b) outside the session root
+    {
+        let workspace = Workspace::new("transcript-ac12-out");
+        let outside = std::env::temp_dir().join(format!(
+            "teton-transcript-ac12-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        plant_owner_only_dir(&outside);
+        let decoy = outside.join("decoy.jsonl");
+        std::fs::write(
+            &decoy,
+            format!("{{\"kind\":\"decoy\",\"m\":\"{DECOY_MARKER}\"}}\n"),
+        )
+        .expect("plant the decoy");
+        let provider = MockProvider::start(
+            tool_turns_against(&decoy),
+            MockResponse::ok(openai_turn("Done.", None, 140, 30)),
+        );
+        let duties = duty_provider();
+        write_config_in(&workspace, &provider, &duties, true, &outside);
+        let mut daemon = spawn(&workspace, probe().real_lifetime());
+        let mut client = daemon.connect();
+        let session = client.create_session("freeform", None);
+        for i in 0..4 {
+            let r = client.prompt(&session, &format!("Look at the transcript ({i})."));
+            assert!(r.get("result").is_some(), "tool turn {i}: {r}");
+        }
+        client.drain_events(Duration::from_millis(300));
+        let path = await_file(&outside, &session);
+        drop(client);
+        daemon.wait_for_exit(WINDOW).expect("orderly exit");
+        let (records, _) = read_transcript(&path);
+        let results = tool_results(&records);
+        assert!(results.len() >= 4, "four results: {results:?}");
+        for (i, name) in ["read", "edit"].iter().enumerate() {
+            assert!(
+                results[i].contains("outside the session root")
+                    || results[i].contains(TRANSCRIPT_REASON),
+                "outside the root, `{name}` is refused (the jail's own reason is acceptable): {}",
+                results[i]
+            );
+        }
+        assert!(
+            !results[2].contains("decoy.jsonl") && !results[3].contains("decoy.jsonl"),
+            "the walkers never reach outside the root: {results:?}"
+        );
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+}
+
+/// REQ-611 AC-21: with `[privacy] disable_default_boundaries = true` the four
+/// refusals are unchanged — the denial reads no boundary state — while an
+/// in-root `.ssh/id_rsa` read, which the shipped defaults would block, now
+/// reaches the provider: both legs on one fixture.
+///
+/// **Mutation (run 2026-09-03):** making the denied prefix conditional on a
+/// non-empty boundary set reddened the four refusals here while AC-12 stayed
+/// green; restored.
+#[test]
+fn the_transcript_refusal_survives_disable_default_boundaries_while_id_rsa_does_not() {
+    let workspace = Workspace::new("transcript-ac21");
+    let dir = workspace.root.join("repo").join("transcripts");
+    plant_owner_only_dir(&dir);
+    let decoy = dir.join("decoy.jsonl");
+    std::fs::write(
+        &decoy,
+        format!("{{\"kind\":\"decoy\",\"m\":\"{DECOY_MARKER}\"}}\n"),
+    )
+    .expect("plant the decoy");
+    let ssh = workspace.root.join("repo").join(".ssh");
+    std::fs::create_dir_all(&ssh).expect("plant .ssh");
+    std::fs::write(
+        ssh.join("id_rsa"),
+        format!("-----BEGIN {KEY_MARKER}-----\n"),
+    )
+    .expect("plant the key fixture");
+
+    let mut scripted = tool_turns_against(&decoy);
+    scripted.push(MockResponse::ok(openai_turn(
+        "Let me read the key.",
+        Some(("k1", "read", r#"{"path":".ssh/id_rsa"}"#)),
+        120,
+        20,
+    )));
+    let provider = MockProvider::start(
+        scripted,
+        MockResponse::ok(openai_turn("Done.", None, 140, 30)),
+    );
+    let duties = duty_provider();
+    write_config_with_extra(
+        &workspace,
+        &provider,
+        &duties,
+        &dir,
+        "[privacy]\ndisable_default_boundaries = true\n\n",
+    );
+    let mut daemon = spawn(&workspace, probe().real_lifetime());
+    let mut client = daemon.connect();
+    let session = client.create_session("freeform", None);
+    for i in 0..4 {
+        let r = client.prompt(&session, &format!("Look at the transcript ({i})."));
+        assert!(r.get("result").is_some(), "tool turn {i}: {r}");
+    }
+    let key_turn = client.prompt(&session, "Read the key.");
+    assert!(key_turn.get("result").is_some(), "key turn: {key_turn}");
+    client.drain_events(Duration::from_millis(500));
+    assert!(
+        client.events_named("privacy_block").is_empty(),
+        "with every boundary removed nothing is blocked (REQ-597 BR-5's consequence)"
+    );
+    let path = await_file(&dir, &session);
+    drop(client);
+    daemon.wait_for_exit(WINDOW).expect("orderly exit");
+
+    let (records, _) = read_transcript(&path);
+    assert_four_tools_refuse(&records, "defaults disabled");
+    assert!(
+        provider.requests().iter().any(|body| body
+            .windows(KEY_MARKER.len())
+            .any(|w| w == KEY_MARKER.as_bytes())),
+        "the `id_rsa` read is no longer held at egress once the defaults are off"
+    );
+}
+
+/// REQ-611 AC-10 (seam leg) / BR-6: `TETON_TRANSCRIPT_SEAM=write_fail_after:2`
+/// makes the writer's third append fail mid-session. The turn that was in
+/// flight still completes, exactly one `transcript_state { write_failure }`
+/// reaches the attached client, `status` reports the degraded reason, and no
+/// later record lands.
+///
+/// **Mutation (run 2026-09-03):** neutralising `Faults::take`'s runtime arm
+/// (never consulting `fail_after`) left the session healthy and reddened the
+/// degraded-status assertion; restored.
+#[test]
+fn the_write_fail_after_seam_degrades_the_session_once_and_spares_the_turn() {
+    let provider = MockProvider::always(openai_turn("Done.", None, 120, 20));
+    let duties = duty_provider();
+    let workspace = Workspace::new("transcript-seam-wf");
+    let dir = write_config(&workspace, &provider, &duties, true);
+    let mut daemon = spawn(
+        &workspace,
+        probe()
+            .real_lifetime()
+            .env("TETON_TRANSCRIPT_SEAM", "write_fail_after:2"),
+    );
+    let mut client = daemon.connect();
+    let session = client.create_session("freeform", None);
+    let first = client.prompt(&session, "Say something.");
+    assert!(
+        first.get("result").is_some(),
+        "the in-flight turn completes: {first}"
+    );
+    let second = client.prompt(&session, "Say something else.");
+    assert!(
+        second.get("result").is_some(),
+        "a later turn is spared too: {second}"
+    );
+    client.drain_events(Duration::from_millis(500));
+
+    let failures: Vec<(bool, String)> = state_events(&client)
+        .into_iter()
+        .filter(|(_, reason)| reason == "write_failure")
+        .collect();
+    assert_eq!(
+        failures.len(),
+        1,
+        "exactly one write-failure announcement (BR-6): {:?}",
+        state_events(&client)
+    );
+    let status = transcript_result(&mut client, &session, "status");
+    assert_eq!(status["enabled"], json!(false), "{status}");
+    assert!(
+        status["degraded"].as_str().is_some(),
+        "status names the degraded reason: {status}"
+    );
+
+    let path = await_file(&dir, &session);
+    drop(client);
+    daemon.wait_for_exit(WINDOW).expect("orderly exit");
+    let (records, _) = read_transcript(&path);
+    assert!(
+        records.len() <= 3,
+        "two appends landed before the third failed, then nothing: {:?}",
+        kinds_of(&records)
+    );
+    assert_well_formed(&records, &session);
+}

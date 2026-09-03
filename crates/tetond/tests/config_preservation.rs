@@ -2161,3 +2161,57 @@ fn an_existing_config_gains_the_builtin_set_without_rewriting_its_own_rows() {
 
     daemon.cleanup();
 }
+
+/// REQ-611 AC-19 (integration leg): a `config.toml` that names `[transcript]`
+/// keeps it byte-for-byte across an unrelated `config/set`, and one that
+/// never named it does not gain the table.
+///
+/// **Mutation (run 2026-09-03):** dropping `skip_serializing_if` from
+/// `Config.transcript` left this test **green** — `apply_config_delta` diffs
+/// the caller's pre-mutation `Config` against its candidate, so an untouched
+/// table can never enter the delta whatever the schema says (the same finding
+/// TASK-360 recorded). The mutation with teeth is a write that *touches* the
+/// table: making `apply_update`'s `RegisterProvider` arm also set
+/// `config.transcript.enabled = true` reddened the "not invented" leg
+/// (`[transcript]` appeared in the bare document); restored.
+#[test]
+fn a_transcript_table_survives_an_unrelated_write_and_is_never_invented() {
+    let named = format!(
+        "{}\n# my transcript posture, hand-written\n[transcript]\nenabled = true\nretain_days = 7\n",
+        readme_config()
+    );
+    let daemon = Daemon::start("transcript-kept", Some(&named));
+    daemon
+        .runtime
+        .apply_config_update(register("cheap"))
+        .expect("the registration lands");
+    let after = daemon.document();
+    for line in [
+        "# my transcript posture, hand-written",
+        "[transcript]",
+        "enabled = true",
+        "retain_days = 7",
+    ] {
+        assert!(
+            after.contains(line),
+            "`{line}` survives an unrelated write:\n{after}"
+        );
+    }
+    assert_eq!(
+        after.matches("[transcript]").count(),
+        1,
+        "exactly one table, never duplicated:\n{after}"
+    );
+
+    let bare = readme_config();
+    let daemon = Daemon::start("transcript-absent", Some(&bare));
+    daemon
+        .runtime
+        .apply_config_update(register("cheap"))
+        .expect("the registration lands");
+    let after = daemon.document();
+    assert!(
+        !after.contains("[transcript]"),
+        "a config that never named `[transcript]` does not gain it on an unrelated write:\n{after}"
+    );
+}

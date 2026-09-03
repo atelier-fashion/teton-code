@@ -3568,3 +3568,120 @@ fn bare_transcript_prints_status_with_path_and_degraded_reason() {
         "the state stays off on a degraded session (BR-6); transcript:\n{text}"
     );
 }
+
+/// REQ-611 AC-14: with the transcript on, the REQ-572 key step (typed
+/// echo-off, declined at the confirm) leaves no trace of the planted key in
+/// any `*.jsonl` under the transcript directory — while the transcript itself
+/// is non-empty, so the sweep is over a real file and not an absence.
+///
+/// **Mutation (run 2026-09-03):** planting `PLANTED_KEY` into a throwaway
+/// `decoy.jsonl` in the directory before the sweep reddened the "never
+/// reaches" assertion, proving the sweep fires; restored.
+#[test]
+fn the_fixture_key_never_reaches_the_transcript_directory() {
+    let daemon_path = daemon_bin();
+    // Every tier bound to the scripted local tier, so the session is servable
+    // and — the part this test needs — the daemon reports a local model, which
+    // is what makes the `search` tier (the only branch that asks for a key)
+    // offerable at all.
+    let tiers: String = ["reflex", "scan", "build", "think"]
+        .iter()
+        .map(|t| format!("[[tiers]]\ntier = \"{t}\"\nprovider_id = \"local\"\n\n"))
+        .collect();
+    let config = format!("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n{tiers}");
+    let daemon = TestDaemon::spawn_with(&daemon_path, &config, &["a scripted reply."]);
+    let config_path = daemon.root.join("config.toml");
+    let (mut session, transcript, mut writer) = {
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: 40,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new(teton_bin());
+        cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+        cmd.env("XDG_DATA_HOME", daemon.root.join("d"));
+        cmd.env("TETON_CONFIG", &config_path);
+        cmd.env("TETON_REPO_ROOT", &daemon.root);
+        let session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
+        drop(pty.slave);
+        let transcript = spawn_reader(pty.master.try_clone_reader().expect("pty reader"));
+        let writer = pty.master.take_writer().expect("pty writer");
+        assert!(
+            wait_for(&transcript, "ready (freeform)"),
+            "the session never reached the entry prompt; transcript:\n{}",
+            snapshot(&transcript)
+        );
+        (session, transcript, writer)
+    };
+
+    let step = |writer: &mut Box<dyn Write + Send>, text: &str, until: &str| {
+        writer
+            .write_all(text.as_bytes())
+            .expect("type into the pty");
+        writer.flush().ok();
+        assert!(
+            wait_for(&transcript, until),
+            "the walk never reached {until:?}; transcript:\n{}",
+            snapshot(&transcript)
+        );
+    };
+
+    step(&mut writer, "/transcript on\r", "recording to");
+    step(&mut writer, "/web setup\r", "tier [1-3");
+    step(&mut writer, "3\r", "search endpoint");
+    step(
+        &mut writer,
+        "https://api.search.brave.com/res/v1/web/search\r",
+        "does this backend need an API key?",
+    );
+    step(
+        &mut writer,
+        &format!("{ECHO_WITNESS}\r"),
+        "auth header template",
+    );
+    step(&mut writer, "\r", "API key (not shown");
+    step(
+        &mut writer,
+        &format!("{PLANTED_KEY}\r"),
+        "write this to your config?",
+    );
+    writer.write_all(b"n\r").expect("decline the confirm");
+    writer.flush().ok();
+    assert!(
+        wait_for(&transcript, "no key was stored"),
+        "the decline must land; transcript:\n{}",
+        snapshot(&transcript)
+    );
+    step(&mut writer, "/transcript off\r", "stopped");
+    let _ = session.kill();
+    let _ = session.wait();
+
+    let dir = daemon.root.join("d").join("teton").join("transcripts");
+    let files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("the transcript directory exists after `/transcript on`: {e}"))
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+        .collect();
+    assert!(
+        !files.is_empty(),
+        "the session wrote a transcript under {}",
+        dir.display()
+    );
+    for file in &files {
+        let text = std::fs::read_to_string(file).expect("the transcript is readable");
+        assert!(
+            text.contains("transcript_opened"),
+            "the sweep runs over a real transcript: {}",
+            file.display()
+        );
+        assert!(
+            !text.contains(PLANTED_KEY) && !text.contains("PLANTED-DO-NOT-ECHO"),
+            "the planted key never reaches the transcript (AC-14): {}",
+            file.display()
+        );
+    }
+}

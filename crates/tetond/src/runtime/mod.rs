@@ -2540,7 +2540,14 @@ impl DaemonRuntime {
         // `transcript::TranscriptSink::spawn`, which runs `prune` before it
         // takes a single message and prints BR-13's stderr line itself. Calling
         // it a second time here would double a rule that already has one home.
-        let transcript = TranscriptSink::spawn_with(
+        // REQ-611 AC-9 / AC-10: the transcript test seam, honoured only where
+        // every other seam is (`test_seams_enabled`), and able only to shrink
+        // the channel or arm a write failure — never to record.
+        let seam = crate::transcript::parse_seam(
+            engine::test_seams_enabled(),
+            std::env::var("TETON_TRANSCRIPT_SEAM").ok().as_deref(),
+        );
+        let transcript = TranscriptSink::spawn_with_seam(
             SinkConfig::new(
                 &config.transcript,
                 &teton_protocol::socket_path::data_dir(),
@@ -2548,6 +2555,7 @@ impl DaemonRuntime {
                 env!("CARGO_PKG_VERSION").to_owned(),
             ),
             transcript_degradation_hook(events),
+            seam,
         );
         let transcript = Arc::new(transcript);
         // ADR-1: the sink observes every session-scoped envelope from here on.
