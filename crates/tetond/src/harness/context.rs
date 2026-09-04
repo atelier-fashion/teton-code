@@ -1829,7 +1829,7 @@ impl ContextManager {
         // blocks did get smaller. `droppable()` also carries the older half of
         // the rule: the most recent block is the step in progress, the same
         // block `truncate_to_budget` refuses to drop.
-        let compaction = match read_compaction(&answer, offer.droppable()) {
+        let compaction = match read_compaction(&answer, offer.droppable(), offer.protected()) {
             Ok(compaction) => compaction,
             Err(error) => return CompactionOutcome::degraded(error),
         };
@@ -4175,7 +4175,7 @@ mod tests {
         // out of range for the prompt that was actually rendered.
         let answer = forget_first(150);
         assert!(
-            read_compaction(&answer, ctx.blocks().len() - 1).is_ok(),
+            read_compaction(&answer, ctx.blocks().len() - 1, &BTreeSet::new()).is_ok(),
             "non-vacuity: this answer is exactly what the pre-fix apply step \
              accepted — the range is the whole difference"
         );
@@ -4747,7 +4747,10 @@ mod tests {
             "K=".to_owned() + &"1".repeat(1_000),
         );
         ctx.push_tool_result("read", Some(fixture_id("src/lib.rs")), "x".repeat(1_000));
-        ctx.push_user("y".repeat(1_000));
+        // A model turn as the third droppable block rather than a prompt:
+        // REQ-618 anchors the newest two prompt blocks, and this test is about
+        // what a summary *inherits*, not about what may be forgotten.
+        ctx.push_model("y".repeat(1_000));
         ctx.push_user("and now?");
         assert!(ctx.under_compaction_pressure());
 
@@ -4789,8 +4792,17 @@ mod tests {
     #[tokio::test]
     async fn a_compaction_inherits_the_provenance_of_everything_it_was_shown() {
         let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(TEST_BUDGET_BYTES);
-        ctx.push_user("x".repeat(1_500));
-        ctx.push_user("y".repeat(1_500));
+        // Two droppable blocks, and one of them a *file-supplied* prompt: the
+        // fourth seam ADR-9 named is that a user block can carry file
+        // provenance, and REQ-618 leaves it droppable once it is no longer one
+        // of the newest two asks — which is what the trailing prompt below
+        // makes true of it.
+        ctx.push_user_from(
+            "x".repeat(1_500),
+            [fixture_id("skills/heavy/SKILL.md")].into_iter().collect(),
+            false,
+        );
+        ctx.push_model("y".repeat(1_500));
         // Retained, and NOT in the forget set — but the duty is shown it, so its
         // paragraph may describe it.
         ctx.push_tool_result("read", Some(fixture_id("secrets/prod.env")), "K=hunter2");
@@ -4804,7 +4816,13 @@ mod tests {
         match &ctx.blocks()[0].provenance {
             Provenance::Tool { provenance, .. } => assert_eq!(
                 provenance,
-                &ToolProvenance::paths([fixture_id("secrets/prod.env")]),
+                // Both: the retained boundary read the duty was *shown*, and
+                // the file-supplied prompt it forgot — ADR-9's fourth seam,
+                // which contributes a user block's own sources.
+                &ToolProvenance::paths([
+                    fixture_id("secrets/prod.env"),
+                    fixture_id("skills/heavy/SKILL.md"),
+                ]),
                 "the summary was written from a prompt containing the boundary \
                  file and came out with clean provenance"
             ),
@@ -4877,7 +4895,8 @@ mod tests {
         let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(TEST_BUDGET_BYTES);
         ctx.push_tool_result_prov("shell", ToolProvenance::Unknown, "x".repeat(1_000));
         ctx.push_tool_result("read", Some(fixture_id("src/lib.rs")), "y".repeat(1_000));
-        ctx.push_user("z".repeat(1_000));
+        // A model turn, for the reason recorded on the sibling test above.
+        ctx.push_model("z".repeat(1_000));
         ctx.push_user("and now?");
 
         let (route, _) = stub(StubAnswer::Says(forget_first(3)));
