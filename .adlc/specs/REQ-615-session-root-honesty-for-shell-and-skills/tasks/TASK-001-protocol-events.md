@@ -1,7 +1,7 @@
 ---
 id: TASK-001
 title: "Three new protocol events for the root gates"
-status: draft
+status: complete
 parent: REQ-615
 created: 2026-09-04
 updated: 2026-09-04
