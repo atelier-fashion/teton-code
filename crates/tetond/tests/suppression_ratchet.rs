@@ -246,3 +246,79 @@ fn the_typed_outcomes_still_return_none_from_failure_class() {
          the assertions above would pass no matter what"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REQ-618 BR-3 — only the context manager assigns an anchor
+// ---------------------------------------------------------------------------
+
+/// **BR-3 / TASK-001.** An anchor is harness-assigned, and "the harness" is one
+/// file: `harness/context.rs`. Everywhere else states `Anchor::None` and lets
+/// `ContextManager::restate_anchors` decide the rest.
+///
+/// # Why a region check and not a count
+///
+/// A count of `anchor:` initializers would stay identical if a site *moved*
+/// from `None` to `UserAsk` (LESSON-568 — relocating a call keeps a count the
+/// same). What has to hold is a property of every site outside the manager, so
+/// the check reads every site and asserts the value.
+///
+/// # Why this is the enforcement and not the doc comment
+///
+/// `Anchor`'s own doc says block text is never an input to the assignment.
+/// That is true of `restate_anchors` today and would stay true of it after a
+/// future push path started writing `anchor: Anchor::UserAsk` from a field the
+/// model can influence. This check is what makes the promise survive that
+/// author.
+///
+/// # Inversion
+///
+/// Changing any one of the workspace's `anchor: Anchor::None` initializers to
+/// `Anchor::UserAsk` fails this test naming that file and line; deleting the
+/// `Anchor` field entirely fails the vacuity floor below instead of passing
+/// silently.
+#[test]
+fn only_the_context_manager_assigns_an_anchor() {
+    let root = workspace_root();
+    let owner = root.join("crates/tetond/src/harness/context.rs");
+    let mut sites = 0usize;
+    let mut offenders = Vec::new();
+    for path in rust_sources(&root) {
+        if path == owner {
+            continue;
+        }
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // Cut at the first column-0 `#[cfg(test)]`? No — deliberately not.
+        // Test helpers build `ContextBlock`s too, and a test that hand-anchored
+        // a block would be asserting against a state production cannot reach.
+        for (n, line) in src.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with("anchor:") {
+                continue;
+            }
+            sites += 1;
+            if !trimmed.contains("Anchor::None") {
+                offenders.push(format!(
+                    "{}:{}: {}",
+                    path.strip_prefix(&root).unwrap_or(&path).display(),
+                    n + 1,
+                    trimmed
+                ));
+            }
+        }
+    }
+    // The vacuity floor. Without it, renaming the field turns this test into a
+    // loop over nothing that exits green — the shape LESSON-598 is about.
+    assert!(
+        sites >= 8,
+        "expected the workspace to hold anchor initializers outside the manager; found {sites}. \
+         Either the field was renamed or this check has stopped covering its subject."
+    );
+    assert!(
+        offenders.is_empty(),
+        "an anchor is assigned by ContextManager::restate_anchors and nowhere else (REQ-618 BR-3); \
+         these sites name something other than Anchor::None:\n{}",
+        offenders.join("\n")
+    );
+}

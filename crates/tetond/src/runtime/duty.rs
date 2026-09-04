@@ -2650,6 +2650,7 @@ mod dispatch {
                     crate::harness::compact::compact_prompt(
                         &[crate::harness::context::ContextBlock {
                             role: crate::harness::context::BlockRole::User,
+                            anchor: crate::harness::context::Anchor::None,
                             text: "do the thing".to_owned(),
                             provenance: crate::harness::context::Provenance::user(),
                         }],

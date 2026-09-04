@@ -1362,6 +1362,7 @@ mod tests {
     fn a_tool_block_is_introduced_by_its_tool() {
         let block = ContextBlock {
             role: BlockRole::Tool,
+            anchor: super::super::context::Anchor::None,
             text: "body".to_owned(),
             provenance: Provenance::Tool {
                 tool: "grep".to_owned(),

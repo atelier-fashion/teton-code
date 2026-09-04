@@ -1866,6 +1866,7 @@ mod tests {
     fn user_block(text: &str) -> ContextBlock {
         ContextBlock {
             role: BlockRole::User,
+            anchor: crate::harness::context::Anchor::None,
             text: text.to_owned(),
             provenance: Provenance::user(),
         }
@@ -1874,6 +1875,7 @@ mod tests {
     fn model_block(text: &str) -> ContextBlock {
         ContextBlock {
             role: BlockRole::Assistant,
+            anchor: crate::harness::context::Anchor::None,
             text: text.to_owned(),
             provenance: Provenance::Model,
         }
@@ -1882,6 +1884,7 @@ mod tests {
     fn tool_block(tool: &str, path: &str, text: &str) -> ContextBlock {
         ContextBlock {
             role: BlockRole::Tool,
+            anchor: crate::harness::context::Anchor::None,
             text: text.to_owned(),
             provenance: Provenance::Tool {
                 tool: tool.to_owned(),

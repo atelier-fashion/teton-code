@@ -3,11 +3,12 @@
   "branch": "feat/REQ-618-compaction-that-keeps-the-ask",
   "startedAt": "2026-09-04T19:35:10.833694Z",
   "completed": false,
-  "currentPhase": 3,
+  "currentPhase": 4,
   "completedPhases": [
     0,
     1,
-    2
+    2,
+    3
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -25,6 +26,11 @@
       "phase": 2,
       "name": "Architect & Tasks",
       "completedAt": "2026-09-04T19:42:52.534053Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-09-04T19:43:31.291759Z"
     }
   ],
   "repos": {
@@ -52,6 +58,7 @@
   },
   "conflictsResolved": [],
   "notes": [
-    "Phase 1: APPROVED. One spec defect fixed in place \u2014 AC-1 expanded a 25 KB body against a 21,162-token budget whose room_fraction ceiling is ~15.9 KB, so BR-4 would have refused the very turn AC-1 is about; AC-1 now states the expansion is admitted through BR-4's `proceed once` offer. Five warnings carried into architecture: (W-1) provenance_class values rooted/boundary are REQ-614 vocabulary while External Dependencies says None, and ContextManager holds no boundary matcher; (W-2) BR-6's 'turns <a>-<b>' names a fact ContextBlock does not carry; (W-3) AC-8's session transcript is not a repo artifact; (W-4) BR-2's second-expansion refusal is not what BR-4 governs; (W-5/info) AC-4's byte identity needs its three terms defined so the test is not vacuous."
+    "Phase 1: APPROVED. One spec defect fixed in place \u2014 AC-1 expanded a 25 KB body against a 21,162-token budget whose room_fraction ceiling is ~15.9 KB, so BR-4 would have refused the very turn AC-1 is about; AC-1 now states the expansion is admitted through BR-4's `proceed once` offer. Five warnings carried into architecture: (W-1) provenance_class values rooted/boundary are REQ-614 vocabulary while External Dependencies says None, and ContextManager holds no boundary matcher; (W-2) BR-6's 'turns <a>-<b>' names a fact ContextBlock does not carry; (W-3) AC-8's session transcript is not a repo artifact; (W-4) BR-2's second-expansion refusal is not what BR-4 governs; (W-5/info) AC-4's byte identity needs its three terms defined so the test is not vacuous.",
+    "Phase 3: APPROVED. 8/8 BRs and 9/9 ACs cited by task Verification blocks; DAG acyclic in 5 tiers; all three refusal rules (BR-1, BR-2, BR-4) carry benign_path. Firestore/REST/layering checks n/a for a Rust daemon on JSON-RPC (ADR-002); the analogous invariants (engine/surface split, single egress choke point) are respected. budget.rs and turn_loop.rs are also touched by the concurrent REQ-616/617 \u2014 textual rebase expected, no design conflict."
   ]
 }
