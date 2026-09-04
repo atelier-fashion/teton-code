@@ -99,6 +99,7 @@ pub mod draft;
 pub mod duty;
 pub mod permissions;
 pub mod redact;
+pub(crate) mod root_gate;
 pub(crate) mod render;
 pub(crate) mod reply;
 pub mod shell_duty;

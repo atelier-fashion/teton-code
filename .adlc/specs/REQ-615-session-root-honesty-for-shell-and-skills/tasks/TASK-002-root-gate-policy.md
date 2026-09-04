@@ -1,7 +1,7 @@
 ---
 id: TASK-002
 title: "harness/root_gate.rs — the two pure root decisions"
-status: draft
+status: complete
 parent: REQ-615
 created: 2026-09-04
 updated: 2026-09-04

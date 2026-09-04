@@ -686,7 +686,7 @@ fn is_env_assignment(word: &str) -> bool {
 ///   (`GIT_SSH_COMMAND='ssh -v' git push`) is not skipped, because this splits
 ///   on whitespace and cannot tell where the quoted value ends. See
 ///   [`is_env_assignment`].
-fn command_position_programs(command: &str) -> Vec<&str> {
+pub(crate) fn command_position_programs(command: &str) -> Vec<&str> {
     command
         .split(['|', ';', '&', '(', '\n'])
         .filter_map(|segment| {
