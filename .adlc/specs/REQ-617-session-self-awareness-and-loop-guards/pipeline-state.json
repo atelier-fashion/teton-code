@@ -83,5 +83,26 @@
     "failedTasks": []
   },
   "conflictsResolved": [],
-  "notes": []
+  "notes": [
+    "Phases 0-6 complete. PR #291 is OPEN and review-ready with a full body.",
+    "Workspace suite was green at 4,336 passed / 0 failed and clippy clean on 295c082, the branch tip, before origin/main moved.",
+    "CI has NOT run on the tip: GitHub does not compute checks for a PR whose merge commit is unresolvable, and the PR reads CONFLICTING/DIRTY since REQ-615 merged. CI was green on 5f3d4e5, two commits earlier.",
+    "Halted at Phase 7 per BUG-207: the trial merge returns rc=1 and adlc_conflict_append_only names two modified-line offenders, so the bounded keep-both path does not apply. Nothing was resolved and nothing was pushed; the merge was aborted and the worktree is clean at 295c082.",
+    "conflictsResolved is deliberately empty: a conflict occurred and was NOT resolved, which blockers records and conflictsResolved must not."
+  ],
+  "blockers": [
+    {
+      "blockedBy": "manual",
+      "resolvedBlocker": "REQ-615",
+      "conflictFiles": [
+        "crates/tetond/src/egress/redact.rs",
+        "crates/tetond/tests/skill_over_budget_offer.rs",
+        "crates/teton-protocol/src/events.rs"
+      ],
+      "unblockCondition": "REQ-615 merged to main while REQ-617 was in Phase 5-6. Rebase onto origin/main and resolve. Two of the three conflicts are NOT append-point collisions (partials/conflict-bound.sh returns rc=1, naming redact.rs and skill_over_budget_offer.rs), so BUG-207's bounded keep-both path does not apply and the runner halted rather than resolving. (1) redact.rs is the real decision: REQ-615 spent 278 bytes of the prompt margin (733 -> 455) and REQ-617 spent 540 (733 -> 193). Together that is 818 against 733, with a 48-byte floor -- the combined prompt does NOT fit inside REDACT_BODY_OVERHEAD_BYTES (23 KiB) and needs about 133 bytes of relief. That arithmetic is DERIVED, not measured; the constant's own doc says re-measure rather than reason, so whoever resolves must take the figure the failing assertion reports. Two options: shorten one of the two prompt additions (REQ-617's command roster is the more compressible -- the 29 names could drop to families), or raise REDACT_BODY_OVERHEAD_BYTES to 24 KiB and re-derive REDACT_TOTAL_CAP_CHUNKS, REDACT_INPUT_MAX_BYTES, REDACT_SCANNABLE_CONTEXT_BYTES and REDACT_MAX_CHUNKS, adding a ledger line. The RECORDED_MARGIN_GAP_BYTES const-assert REQ-617 added will refuse a resolution that moves one margin and not the other. (2) skill_over_budget_offer.rs is downstream of (1): REQ-617 moved the Window/FitsWindow cell's declared window 30,000 -> 31,000 because its own prompt growth flipped the verdict. The band is ~1,000 tokens wide, so the combined growth will need it moved again -- re-tune empirically after (1) is settled, and see that fixture's own comment for the durable fix. (3) events.rs IS append-only (both REQs added event variants) and keep-both resolves it.",
+      "holdState": "needs-manual-rebase",
+      "rebaseAttempts": 0,
+      "detectedAt": "2026-09-04T21:22:26.680363Z"
+    }
+  ]
 }
