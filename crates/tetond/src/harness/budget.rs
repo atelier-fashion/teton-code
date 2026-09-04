@@ -23,8 +23,9 @@
 //!       usable   = window_eff − reservation   (saturating; may be 0)
 //!       tokens   = max(usable × 2 / 3, MIN_BUDGET_TOKENS)
 //!       bytes    = max(usable × 2,     MIN_BUDGET_BYTES)
-//!     if redact_scan and bytes > REDACT_SCANNABLE_CONTEXT_BYTES:
-//!         bytes = REDACT_SCANNABLE_CONTEXT_BYTES; bound = RedactScan
+//!     scannable = redact_scannable_context_bytes(local_window)
+//!     if redact_scan and bytes > scannable:
+//!         bytes = scannable; bound = RedactScan
 //!         (applies LAST; the word component stays window-derived — BR-4)
 //!   digest thresholds = today's fraction of the pair, capped by the
 //!                       absolute ceiling
@@ -139,7 +140,7 @@ use teton_providers::capability::NATIVE_MAX_ITERATIONS;
 use super::context::{ContextManager, Fit, APPROX_BYTES_PER_TOKEN};
 use super::duty::DUTY_REQUEST_BYTES_PER_TOKEN;
 use super::permissions::{OverBudgetOptionLabels, OverBudgetRemedyLabels};
-use crate::egress::redact::REDACT_SCANNABLE_CONTEXT_BYTES;
+use crate::egress::redact::redact_scannable_context_bytes;
 use crate::repo_context::REPO_CONTEXT_MAX_BYTES;
 use crate::runtime::LOCAL_ENGINE_N_CTX_DEFAULT;
 use crate::skills::SkillSource;
@@ -522,12 +523,20 @@ pub struct BudgetInputs<'a> {
     /// (REQ-616 BR-1). The same `0 = not stated` convention [`Self::window`]
     /// already uses, one field up.
     ///
-    /// Read **only** by [`derive`]'s local arm, and deliberately not folded
-    /// into [`Self::window`]: that field is the *provider's* declaration, and
-    /// two guards depend on the local arm ignoring it whatever it holds — see
-    /// [`BudgetInputs::local`]. An engine's allocation is a different kind of
-    /// fact from a provider's promise, and giving it its own field is what
-    /// keeps both guards meaning what they say.
+    /// **Populated on every route, not just the local one**, because two
+    /// different consumers read it. [`derive`]'s local arm uses it as *this
+    /// route's* window; the redact clamp uses it as the basis of the scannable
+    /// bound on a **remote** route, since the redact duty runs on the local
+    /// engine whatever the turn is routed to (BR-7). A remote route whose
+    /// `local_window` was left at zero would be clamped to the scan bound of a
+    /// window the engine is not serving.
+    ///
+    /// Deliberately not folded into [`Self::window`]: that field is the
+    /// *provider's* declaration, and two guards depend on the local arm
+    /// ignoring it whatever it holds — see [`BudgetInputs::local`]. An engine's
+    /// allocation is a different kind of fact from a provider's promise, and
+    /// giving it its own field is what keeps both guards meaning what they
+    /// say.
     pub local_window: u32,
 }
 
@@ -846,8 +855,16 @@ pub fn derive(inputs: BudgetInputs<'_>) -> RouteBudget {
     // (BR-4): the scan is byte-denominated, so only bytes clamp — the word
     // component stays window-derived and the byte guard binds.
     let (mut window_label, provider_id) = labelled_provider(inputs.provider_id);
-    if inputs.redact_scan && pair.bytes > REDACT_SCANNABLE_CONTEXT_BYTES {
-        pair.bytes = REDACT_SCANNABLE_CONTEXT_BYTES;
+    // BR-7: the scan bound follows the **local engine's** window, because the
+    // redact duty runs there whatever this route is bound to. `0` is the
+    // no-engine default, exactly as on the local arm.
+    let scannable = redact_scannable_context_bytes(if inputs.local_window == 0 {
+        LOCAL_ENGINE_N_CTX_DEFAULT
+    } else {
+        inputs.local_window
+    });
+    if inputs.redact_scan && pair.bytes > scannable {
+        pair.bytes = scannable;
         bound = BudgetBound::RedactScan;
         // The clamp renames the **window**, not the provider: this route is
         // still `kimi`'s, and `capabilities.max_context` for `kimi` is still
@@ -3101,7 +3118,135 @@ mod tests {
     /// table below hand-computes its expectations under 1,024, so a change to
     /// [`LOCAL_GENERATION_RESERVATION`] must redden those rows rather than
     /// travel through them unnoticed.
+    use crate::egress::redact::REDACT_SCANNABLE_CONTEXT_BYTES;
+
     const RESERVATION: u32 = 1_024;
+
+    /// BR-7 / AC-10: the scan bound follows the **local engine's** window, and
+    /// it does so on a *remote* route — which is the case that matters, because
+    /// the redact duty runs on the local engine whatever the turn is bound to.
+    ///
+    /// Mutation: make the clamp read `REDACT_SCANNABLE_CONTEXT_BYTES` (the
+    /// constant) instead of the function, and the 262,144 case fails with the
+    /// 32,768 bound.
+    #[test]
+    fn scan_bound_follows_the_local_window_on_a_remote_route() {
+        use crate::egress::redact::redact_scannable_context_bytes;
+
+        // No engine: the bound is the constant, exactly as before REQ-616.
+        let at_default = derive(remote(1_000_000, 0, true));
+        assert_eq!(at_default.bound, BudgetBound::RedactScan);
+        assert_eq!(at_default.budget_bytes, REDACT_SCANNABLE_CONTEXT_BYTES);
+        assert_eq!(at_default.budget_bytes, 184_265);
+
+        // A loaded 262,144-token engine: the scan can read eight times as much,
+        // so the clamp lands eight times higher.
+        let mut wide = remote(1_000_000, 0, true);
+        wide.local_window = 262_144;
+        let at_262k = derive(wide);
+        assert_eq!(at_262k.bound, BudgetBound::RedactScan);
+        assert_eq!(
+            at_262k.budget_bytes,
+            redact_scannable_context_bytes(262_144)
+        );
+        assert!(
+            at_262k.budget_bytes > at_default.budget_bytes * 7,
+            "the scan bound must follow the window, not sit at the constant"
+        );
+
+        // The word half is untouched by the clamp at either window — the clamp
+        // is byte-denominated and stayed that way (BR-4).
+        assert_eq!(at_default.budget_tokens, at_262k.budget_tokens);
+    }
+
+    /// The benign path for the clamp: a route whose byte half already fits
+    /// inside the scan is **not** renamed to `redact_scan`, at either window.
+    ///
+    /// A detector validated only where it fires ships broken (LESSON-440), and
+    /// here the failure mode is loud — every route would report a bound that is
+    /// not the one binding it.
+    #[test]
+    fn a_route_inside_the_scan_bound_keeps_its_own_bound() {
+        // A 64,000-token window derives 126,000-odd bytes, comfortably inside
+        // the 184,265 bound — the premise is asserted, not assumed, so that a
+        // change to either figure fails here rather than making the test
+        // vacuous by accident.
+        let narrow = derive(remote(64_000, 0, true));
+        assert!(
+            narrow.budget_bytes <= REDACT_SCANNABLE_CONTEXT_BYTES,
+            "premise: {} must be inside the {REDACT_SCANNABLE_CONTEXT_BYTES}-byte bound",
+            narrow.budget_bytes
+        );
+        assert_eq!(
+            narrow.bound,
+            BudgetBound::Window,
+            "a route inside the scan bound keeps its own bound"
+        );
+
+        // And the contrast, so the pair reads as a decision rather than a
+        // coincidence: 128,000 derives 253,952 bytes and *is* clamped.
+        let wide = derive(remote(128_000, 0, true));
+        assert!(wide.budget_bytes < 253_952);
+        assert_eq!(wide.bound, BudgetBound::RedactScan);
+
+        // Benign path with the scan **off**: neither is clamped, whatever the
+        // byte half. A clamp that fired without the opt-in would hold every
+        // route to a bound nobody asked for.
+        assert_eq!(derive(remote(128_000, 0, false)).bound, BudgetBound::Window);
+        assert_eq!(derive(remote(128_000, 0, false)).budget_bytes, 253_952);
+    }
+
+    /// The default-window value of every window-derived cap is byte-identical
+    /// to the constant it replaced — the ADR-616-2 claim, asserted rather than
+    /// asserted-by-construction.
+    ///
+    /// Each constant is now `f(LOCAL_ENGINE_N_CTX_DEFAULT)`, so this could not
+    /// fail by construction; what it pins is the **literals**, which is what a
+    /// reader of `redact_egress.rs` is relying on.
+    #[test]
+    fn window_derived_caps_at_the_default_are_todays_literals() {
+        use crate::egress::redact::{
+            redact_chunk_max_bytes, redact_scannable_context_bytes, REDACT_CHUNK_MAX_BYTES,
+        };
+        assert_eq!(
+            redact_scannable_context_bytes(LOCAL_ENGINE_N_CTX_DEFAULT),
+            184_265
+        );
+        assert_eq!(REDACT_SCANNABLE_CONTEXT_BYTES, 184_265);
+        assert_eq!(
+            redact_chunk_max_bytes(LOCAL_ENGINE_N_CTX_DEFAULT),
+            REDACT_CHUNK_MAX_BYTES
+        );
+        assert_eq!(
+            crate::harness::compact::compact_prompt_budget_bytes(LOCAL_ENGINE_N_CTX_DEFAULT),
+            crate::harness::compact::COMPACT_PROMPT_BUDGET_BYTES
+        );
+        assert_eq!(
+            crate::harness::compact::compact_output_max_bytes(LOCAL_ENGINE_N_CTX_DEFAULT),
+            crate::harness::compact::COMPACT_OUTPUT_MAX_BYTES
+        );
+    }
+
+    /// Every window-derived cap is monotone in the window: a larger engine
+    /// never buys a smaller cap.
+    ///
+    /// Cheap, and it catches the class of arithmetic slip a `const fn`
+    /// conversion invites — an inverted subtraction or a misplaced divisor
+    /// reads fine and is caught here.
+    #[test]
+    fn window_derived_caps_are_monotone_in_the_window() {
+        use crate::egress::redact::{redact_chunk_max_bytes, redact_scannable_context_bytes};
+        let windows = [32_768u32, 65_536, 131_072, 262_144];
+        for pair in windows.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            assert!(redact_scannable_context_bytes(b) > redact_scannable_context_bytes(a));
+            assert!(redact_chunk_max_bytes(b) > redact_chunk_max_bytes(a));
+            assert!(
+                crate::harness::compact::compact_prompt_budget_bytes(b)
+                    > crate::harness::compact::compact_prompt_budget_bytes(a)
+            );
+        }
+    }
 
     /// REQ-616 BR-1: the local arm derives from the window the **engine**
     /// loaded with, and `0` means no engine is loaded so the default applies.

@@ -1,7 +1,7 @@
 ---
 id: TASK-393
 title: "Derive the redact scan and compact prompt caps from the window"
-status: draft
+status: complete
 parent: REQ-616
 created: 2026-09-04
 updated: 2026-09-04

@@ -656,9 +656,10 @@ impl Router {
                     is_local: false,
                     redact_scan: self.redact_scan,
                     provider_id: Some(id),
-                    // A remote route: `is_local` is false, so the local arm is
-                    // not taken and this field is not read.
-                    local_window: 0,
+                    // Populated on a **remote** route too: the redact clamp
+                    // reads it, because the redact duty runs on the local
+                    // engine whatever this turn is bound to (REQ-616 BR-7).
+                    local_window: self.local_window,
                 }
             }
             // The local tier and the unresolvable route: no declared window, no

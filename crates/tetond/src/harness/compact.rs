@@ -175,9 +175,13 @@ use crate::runtime::LOCAL_ENGINE_N_CTX_DEFAULT;
 /// the whole window must land where the budget lands, not stop the build here
 /// while the budget quietly derives 0. Following the neighbour's arithmetic is
 /// the whole point of following the neighbour.
-pub const COMPACT_OUTPUT_MAX_BYTES: usize =
-    LOCAL_ENGINE_N_CTX_DEFAULT.saturating_sub(LOCAL_GENERATION_RESERVATION) as usize
-        * DUTY_REQUEST_BYTES_PER_TOKEN;
+pub const COMPACT_OUTPUT_MAX_BYTES: usize = compact_output_max_bytes(LOCAL_ENGINE_N_CTX_DEFAULT);
+
+/// [`COMPACT_OUTPUT_MAX_BYTES`] at an arbitrary engine window (REQ-616 BR-8).
+#[must_use]
+pub const fn compact_output_max_bytes(n_ctx: u32) -> usize {
+    n_ctx.saturating_sub(LOCAL_GENERATION_RESERVATION) as usize * DUTY_REQUEST_BYTES_PER_TOKEN
+}
 
 /// The `compact` duty on the shared seam: its category and its output ceiling.
 ///
@@ -212,10 +216,17 @@ pub const COMPACT_DUTY: DutyKind = DutyKind::new(Category::Compact, COMPACT_OUTP
 /// A remote `compact` binding has a larger window than this and is simply
 /// offered less than it could take, which costs a partial offer — and a partial
 /// offer still compacts, because the answer is block numbers.
-pub const COMPACT_PROMPT_BUDGET_BYTES: usize = (LOCAL_ENGINE_N_CTX_DEFAULT as usize
-    - COMPACT_DUTY.max_tokens() as usize)
-    * DUTY_REQUEST_BYTES_PER_TOKEN
-    - CHATML_DUTY_ENVELOPE_BYTES;
+pub const COMPACT_PROMPT_BUDGET_BYTES: usize =
+    compact_prompt_budget_bytes(LOCAL_ENGINE_N_CTX_DEFAULT);
+
+/// [`COMPACT_PROMPT_BUDGET_BYTES`] at an arbitrary engine window (REQ-616
+/// BR-8). The `compact` duty runs on the local engine, so this follows the
+/// local window exactly as the redact chain does.
+#[must_use]
+pub const fn compact_prompt_budget_bytes(n_ctx: u32) -> usize {
+    (n_ctx as usize - COMPACT_DUTY.max_tokens() as usize) * DUTY_REQUEST_BYTES_PER_TOKEN
+        - CHATML_DUTY_ENVELOPE_BYTES
+}
 
 /// The compact duty's output contract, verbatim: the last sentence of the
 /// instruction, before the numbered blocks it embeds.
