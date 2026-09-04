@@ -1694,6 +1694,14 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
         // historical, kept because renaming it would touch every comment that
         // cites it while changing nothing about what it does.
         //
+        // `session/context` (REQ-613 BR-8) is the newest member and is back to
+        // the branch's own name: `/context init` raises a permission prompt and
+        // then spends a model call, so it waits on a person and then on a
+        // provider. Its other three actions wait on nothing at all — and that is
+        // not a reason to keep it on the reader loop, because which action a
+        // frame carries is only known after it is parsed, and a method that can
+        // park is a method that must not park there.
+        //
         // Membership in this list decides where the work *runs*. It does not
         // decide what teardown does with it: `provider/test` ends up on
         // `prompt_tasks` (drained) rather than `attach_tasks` (aborted), for the
@@ -1710,6 +1718,7 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
                 || m == ConfigSetParams::METHOD
                 || m == ProviderTestParams::METHOD
                 || m == SessionTranscriptParams::METHOD
+                || m == SessionContextParams::METHOD
         );
         if blocks_on_a_human {
             let daemon = Arc::clone(&daemon);
@@ -1799,10 +1808,12 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
                     handle_provider_test(&daemon, &conn, id, params).await
                 } else if method == SessionTranscriptParams::METHOD {
                     handle_session_transcript(&daemon, &conn, id, params).await
+                } else if method == SessionContextParams::METHOD {
+                    handle_session_context(&daemon, &conn, id, params).await
                 } else {
                     // Unreachable: the `blocks_on_a_human` `matches!` guard admits
-                    // exactly the nine methods branched above. Made explicit rather
-                    // than a catch-all so a future tenth member that updates the
+                    // exactly the ten methods branched above. Made explicit rather
+                    // than a catch-all so a future eleventh member that updates the
                     // guard but forgets a branch fails loudly here instead of being
                     // silently misrouted into the last handler.
                     unreachable!("blocks_on_a_human admitted an unrouted method: {method}")
@@ -2552,14 +2563,11 @@ fn dispatch(
         SessionPermissionsParams::METHOD => {
             Some(handle_session_permissions(daemon, conn, id, params))
         }
-        // REQ-612 ADR-6: `session/context` sits beside `session/permissions`
-        // rather than beside its own twin. `session/transcript` is absent from
-        // this match because it awaits a disk flush; this one awaits nothing —
-        // `off` and `status` touch no syscall, and `on`'s single read is taken
-        // under `block_in_place` where the load is (BUG-184) — so it answers
-        // from the reader loop and its event rides the fence ahead of the
-        // response.
-        SessionContextParams::METHOD => Some(handle_session_context(daemon, conn, id, params)),
+        // `session/context` is deliberately absent, alongside `session/attach`
+        // and `session/transcript`: REQ-613 gave it a fourth action that raises
+        // a permission prompt and spends a model call, so it runs on
+        // `handle_client`'s `blocks_on_a_human` task. See
+        // [`handle_session_context`].
         WebRefreshParams::METHOD => Some(handle_web_refresh(daemon, conn, id, params)),
         _ => Some(error_string(
             id,
@@ -3202,16 +3210,35 @@ async fn handle_session_transcript(
 /// The gate sits before the runtime is touched, so an unattached caller cannot
 /// read a session's existence out of which refusal it got (ADR-B).
 ///
-/// # Why it is **not** async, where its transcript twin is
+/// # Why it awaits, where REQ-612 answered from the reader loop
 ///
-/// The twin awaits the transcript sink's flush. This one awaits nothing: `on`
-/// costs a `stat` and at most one 64 KiB read, `off` and `status` cost no
-/// syscall at all, and the read is taken inside
+/// Three of its four actions await nothing: `on` costs a `stat` and at most one
+/// 64 KiB read, taken inside
 /// [`DaemonRuntime::store_session_repo_context`]'s `block_in_place` for
-/// BUG-184's reason. So it answers from the reader loop beside
-/// [`handle_session_permissions`] and `skills/list`, and its event rides the
-/// fence ahead of its response like every other synchronous handler's.
-fn handle_session_context(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+/// BUG-184's reason, and `off` and `status` cost no syscall at all. The fourth
+/// is REQ-613's `init`, which raises a **permission prompt** and then spends a
+/// model call — a wait on a person followed by a wait on a provider, either of
+/// which parks the connection's reader loop and with it every other RPC on that
+/// connection (LESSON-518).
+///
+/// Which action a frame carries is only known after it is parsed, so the method
+/// moves to `handle_client`'s `blocks_on_a_human` task as a whole rather than
+/// branching there — a method that *can* park must not be dispatched where
+/// parking is fatal.
+///
+/// # The connection is the addressee of the offer
+///
+/// `conn.id` is read here, where it exists, and travels into the gate as the
+/// one connection that may answer the generation prompt (REQ-587 ADR-3's rule,
+/// which every addressed consent follows). A `session/context` arriving with no
+/// connection to name cannot be asked anything, and the gate says so in its own
+/// word rather than in a second one.
+async fn handle_session_context(
+    daemon: &Daemon,
+    conn: &ConnState,
+    id: Id,
+    params: Value,
+) -> String {
     let params: SessionContextParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
@@ -3236,7 +3263,14 @@ fn handle_session_context(daemon: &Daemon, conn: &ConnState, id: Id, params: Val
         id,
         &daemon
             .runtime
-            .session_context(&params, &daemon.sessions, &daemon.events, route_cap),
+            .session_context(
+                &params,
+                &daemon.sessions,
+                &daemon.events,
+                route_cap,
+                Some(conn.id),
+            )
+            .await,
     )
 }
 

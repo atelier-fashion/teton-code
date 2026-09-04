@@ -37,13 +37,25 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures::{stream, StreamExt};
 
+use serde_json::{json, Value};
+
 use teton_core::boundary::BoundaryMatcher;
 use teton_core::config::Config;
 use teton_core::effort::{EffortLevel, ResolvedEffort};
 use teton_core::entities::{BoundaryMode, PrivacyBoundary};
-use teton_protocol::events::{Event, GenerationOutcome as Stage, RepoContextGeneration};
-use teton_protocol::methods::{RepoContextStateKind, RootKind, SessionRoot};
-use teton_protocol::{Category, SessionId, Tier};
+use teton_protocol::events::{
+    Event, GenerationOutcome as Stage, PermissionRequest, PermissionSubject, RepoContextGeneration,
+};
+use teton_protocol::methods::{
+    ConfigUpdate, ContextAction, PermissionOutcome, ProviderConfig, RepoContextGenerateMode,
+    RepoContextOrigin, RepoContextStateKind, RootKind, SessionContextParams, SessionContextResult,
+    SessionPermissionsParams, SessionRoot, SessionSetCwdParams, TierBindingConfig,
+};
+use teton_protocol::permissions::PermissionLevel;
+use teton_protocol::{
+    Category, Phase as ProtoPhase, ProviderId, ProviderKind as ProtoProviderKind, SessionId,
+    SessionMode, Tier, Tier as ProtoTier,
+};
 use teton_providers::transport::{
     ByteStream, HttpMethod, Transport, TransportError, TransportRequest, TransportResponse,
 };
@@ -55,6 +67,8 @@ use teton_providers::{
 use tetond::broadcast::{EventBus, Subscription};
 use tetond::cost::{CostLedger, NoopCostSink, PriceTable};
 use tetond::egress::{Egress, NoopSink, Provenance};
+use tetond::grants::{ConnectionId, GrantRegistry};
+use tetond::harness::permissions::{AddressedPermissionDelivery, PendingPermissions};
 use tetond::harness::tools::walk::WalkBudget;
 use tetond::harness::{Duty, DutyRoute, SessionEvents, DRAFT_DUTY};
 use tetond::repo_context::evidence::EvidenceBudget;
@@ -62,7 +76,9 @@ use tetond::repo_context::generate::{
     self, ConsentGiven, GenerationContext, GenerationOutcome, Reason, Stage as FailStage,
 };
 use tetond::repo_context::{RealFiles, RepoContextBlock, RepoContextState, REPO_CONTEXT_MAX_BYTES};
+use tetond::runtime::{ClientPresence, DaemonRuntime};
 use tetond::session_root::ProbedRoot;
+use tetond::sessions::{GenerationState, SessionRegistry};
 
 /// A marker that exists only inside `Cargo.toml`, so its appearance in a prompt
 /// the duty was handed is a leak and its absence is the exclusion holding
@@ -169,14 +185,17 @@ fn set_dir_mode(dir: &Path, mode: u32) {
 /// accidentally differs in a tenth thing.
 struct Run<'a> {
     boundaries: &'a [PrivacyBoundary],
-    route: &'a dyn Fn() -> DutyRoute,
+    /// `Send + Sync` because production holds this closure across the gate's
+    /// `await` on a spawned task (`GenerationContext::route`); every fixture
+    /// below is already both.
+    route: &'a (dyn Fn() -> DutyRoute + Send + Sync),
     budget: EvidenceBudget,
     walk: WalkBudget,
     force: bool,
 }
 
 impl<'a> Run<'a> {
-    fn new(route: &'a dyn Fn() -> DutyRoute) -> Self {
+    fn new(route: &'a (dyn Fn() -> DutyRoute + Send + Sync)) -> Self {
         Self {
             boundaries: &[],
             route,
@@ -1050,4 +1069,966 @@ async fn force_replaces_and_without_it_an_existing_file_is_refused_untouched() {
         .filter(|path| path.to_string_lossy().ends_with(".tmp"))
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+// ===========================================================================
+// TASK-386 — the offer in front of the pipeline, from inside a real turn
+// ===========================================================================
+//
+// Everything above drives `generate::run` with consent already in hand. What
+// follows drives the **daemon**: `DaemonRuntime::run_prompt_turn` and
+// `session_context`, over a real socket to a mock vendor, with a real
+// `PermissionGate` answered by a scripted client.
+//
+// That is the only instrument that can settle BR-1 and BR-2. "The offer is
+// raised once per session per root, on the first prompt turn" is a claim about
+// *when* the daemon asks, and a test that called `offer_and_run` directly would
+// pass with the hook deleted from `assemble_harness` — which is the whole of
+// what this task wired.
+
+/// A planted project root: a marker so it probes as `project`, and the evidence
+/// classes a draft is written from.
+struct Project {
+    root: PathBuf,
+}
+
+impl Project {
+    fn new(tag: &str) -> Self {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let root = PathBuf::from("/tmp").join(format!(
+            "tg{tag}{:x}{:x}",
+            std::process::id() & 0xffff,
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"planted\"\n").unwrap();
+        std::fs::write(root.join("README.md"), "# Planted\n\nA fixture.\n").unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        Self { root }
+    }
+
+    fn notes(&self) -> PathBuf {
+        self.root.join("TETON.md")
+    }
+
+    fn notes_exist(&self) -> bool {
+        std::fs::symlink_metadata(self.notes()).is_ok()
+    }
+
+    fn write(&self, rel: &str, contents: &str) {
+        std::fs::write(self.root.join(rel), contents).unwrap();
+    }
+}
+
+impl Drop for Project {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// A single-threaded mock OpenAI-compatible vendor on a real socket.
+///
+/// Real rather than a `Transport` double, for `repo_context.rs`'s reason: the
+/// claim is about the bytes a **turn** put on the wire, and the system prompt is
+/// assembled several layers above any seam a double could stand in for. A copy
+/// of the shape three other integration binaries carry, because integration test
+/// binaries share nothing.
+struct Vendor {
+    endpoint: String,
+    bodies: Arc<Mutex<Vec<String>>>,
+    script: Arc<Mutex<std::collections::VecDeque<String>>>,
+}
+
+impl Vendor {
+    fn start() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a mock vendor");
+        let addr = listener.local_addr().expect("mock vendor address");
+        let bodies: Arc<Mutex<Vec<String>>> = Arc::default();
+        let script: Arc<Mutex<std::collections::VecDeque<String>>> = Arc::default();
+        let captured = Arc::clone(&bodies);
+        let scripted = Arc::clone(&script);
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                // Read by the request's own framing, never by a heuristic: a
+                // short read is legal at any point in a stream (LESSON-540).
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 65_536];
+                let mut want: Option<usize> = None;
+                while let Ok(read) = stream.read(&mut buf) {
+                    if read == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..read]);
+                    if want.is_none() {
+                        if let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+                            let len = head
+                                .lines()
+                                .find_map(|line| line.strip_prefix("content-length:"))
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            want = Some(end + 4 + len);
+                        }
+                    }
+                    if want.is_some_and(|total| raw.len() >= total) {
+                        break;
+                    }
+                }
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&raw).into_owned());
+                let body = scripted
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| openai_turn(GOOD_DRAFT, None));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        Self {
+            endpoint: format!("http://{addr}/v1/chat/completions"),
+            bodies,
+            script,
+        }
+    }
+
+    /// Queue one reply. The queue is consumed in order, so a fixture that
+    /// expects a draft queues the draft first: the offer runs inside `assemble`,
+    /// ahead of the turn's own call.
+    fn will_answer(&self, content: &str, tool: Option<(&str, &str, &str)>) {
+        self.script
+            .lock()
+            .unwrap()
+            .push_back(openai_turn(content, tool));
+    }
+
+    /// Every request body the vendor was handed, parsed out of the raw HTTP.
+    fn requests(&self) -> Vec<Value> {
+        self.bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|raw| {
+                let (_, body) = raw.split_once("\r\n\r\n")?;
+                serde_json::from_str(body).ok()
+            })
+            .collect()
+    }
+
+    /// The system prompt of every captured request, in order — parsed as a
+    /// *value*, because the claims below are about the bytes the daemon
+    /// assembled and `\n` on the wire is two characters.
+    fn systems(&self) -> Vec<String> {
+        self.requests()
+            .iter()
+            .filter_map(|request| {
+                request["messages"]
+                    .as_array()?
+                    .iter()
+                    .find(|message| message["role"] == json!("system"))
+                    .map(|message| message["content"].as_str().unwrap_or_default().to_owned())
+            })
+            .collect()
+    }
+
+    /// How many requests carried a **draft** prompt — the duty's own instruction
+    /// is unmistakable and belongs to no other call.
+    fn draft_calls(&self) -> usize {
+        self.requests()
+            .iter()
+            .filter(|request| {
+                serde_json::to_string(request).is_ok_and(|body| {
+                    body.contains("You are writing the repository notes for a project")
+                })
+            })
+            .count()
+    }
+}
+
+/// One OpenAI-compatible streaming turn: a content delta, an optional tool call,
+/// then usage and `[DONE]`.
+fn openai_turn(content: &str, tool: Option<(&str, &str, &str)>) -> String {
+    let mut s = String::new();
+    let chunk = json!({ "choices": [{ "delta": { "content": content } }] });
+    s.push_str(&format!("data: {chunk}\n\n"));
+    if let Some((id, name, args)) = tool {
+        let chunk = json!({
+            "choices": [{
+                "delta": { "tool_calls": [{
+                    "index": 0,
+                    "id": id,
+                    "function": { "name": name, "arguments": args }
+                }]}
+            }]
+        });
+        s.push_str(&format!("data: {chunk}\n\n"));
+        let finish = json!({ "choices": [{ "delta": {}, "finish_reason": "tool_calls" }] });
+        s.push_str(&format!("data: {finish}\n\n"));
+    } else {
+        let finish = json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }] });
+        s.push_str(&format!("data: {finish}\n\n"));
+    }
+    let usage = json!({ "usage": { "prompt_tokens": 5, "completion_tokens": 2 } });
+    s.push_str(&format!("data: {usage}\n\n"));
+    s.push_str("data: [DONE]\n\n");
+    s
+}
+
+/// A client that answers every addressed permission prompt from a script and
+/// records what it was shown.
+///
+/// The recording is half the instrument: BR-2's claim is that the human sees
+/// *which* question is on screen, so `--force`'s `replace: true` has to be
+/// readable off the subject rather than inferred from the outcome.
+struct Answerer {
+    pending: Arc<PendingPermissions>,
+    script: Mutex<std::collections::VecDeque<String>>,
+    seen: Mutex<Vec<PermissionSubject>>,
+}
+
+impl Answerer {
+    fn new(pending: Arc<PendingPermissions>, script: &[&str]) -> Arc<Self> {
+        Arc::new(Self {
+            pending,
+            script: Mutex::new(script.iter().map(|s| (*s).to_owned()).collect()),
+            seen: Mutex::default(),
+        })
+    }
+
+    /// Every subject this client was shown, in order.
+    fn seen(&self) -> Vec<PermissionSubject> {
+        self.seen.lock().unwrap().clone()
+    }
+
+    /// Just the generation offers.
+    fn offers(&self) -> Vec<PermissionSubject> {
+        self.seen()
+            .into_iter()
+            .filter(|subject| matches!(subject, PermissionSubject::RepoContextGeneration { .. }))
+            .collect()
+    }
+}
+
+impl AddressedPermissionDelivery for Answerer {
+    fn deliver(
+        &self,
+        connection: ConnectionId,
+        _session_id: &SessionId,
+        request: PermissionRequest,
+    ) -> bool {
+        if let Some(subject) = request.subject.clone() {
+            self.seen.lock().unwrap().push(subject);
+        }
+        // An exhausted script dismisses rather than hangs: these tests count
+        // prompts, and a prompt nobody answers is a wedged process rather than a
+        // failed assertion.
+        let outcome = match self.script.lock().unwrap().pop_front() {
+            Some(option_id) => PermissionOutcome::Selected { option_id },
+            None => PermissionOutcome::Cancelled,
+        };
+        self.pending
+            .resolve_from(&request.request_id, outcome, connection)
+    }
+}
+
+/// A daemon runtime with one mock provider, a session registry, and a client
+/// that answers its prompts.
+struct Wired {
+    runtime: Arc<DaemonRuntime>,
+    events: Arc<EventBus>,
+    sessions: SessionRegistry,
+    vendor: Vendor,
+    connection: ConnectionId,
+    answerer: Arc<Answerer>,
+}
+
+impl Wired {
+    /// A runtime whose `scan`, `build` and `think` tiers all point at one mock
+    /// vendor, answering permission prompts from `script`.
+    ///
+    /// `reflex` is deliberately left unbound: `route`, `redact` and `title` all
+    /// hang off it and this machine has no local tier, so those duties resolve
+    /// to nothing and cannot race the turn for a scripted reply
+    /// (`repo_context.rs`'s fixture, for its reason).
+    fn new(script: &[&str]) -> Self {
+        let vendor = Vendor::start();
+        let runtime = Arc::new(DaemonRuntime::minimal().with_default_boundaries_disabled());
+        runtime
+            .apply_config_update(ConfigUpdate::RegisterProvider(ProviderConfig {
+                id: ProviderId::from("mock"),
+                kind: ProtoProviderKind::OpenaiCompatible,
+                endpoint: Some(vendor.endpoint.clone()),
+                model: Some("mock-1".to_owned()),
+                auth_ref: None,
+                max_context: Some(128_000),
+                context_budget_cap: None,
+                allow_cleartext: None,
+                floored_budget: None,
+            }))
+            .expect("registering a provider");
+        for tier in [ProtoTier::Scan, ProtoTier::Build, ProtoTier::Think] {
+            runtime
+                .apply_config_update(ConfigUpdate::SetTierBinding(TierBindingConfig {
+                    tier,
+                    provider_id: ProviderId::from("mock"),
+                    fallback_id: None,
+                }))
+                .expect("binding a tier");
+        }
+        let answerer = Answerer::new(Arc::clone(runtime.pending()), script);
+        runtime.install_addressed_delivery(
+            Arc::clone(&answerer) as Arc<dyn AddressedPermissionDelivery>
+        );
+        Self {
+            runtime,
+            events: Arc::new(EventBus::new()),
+            sessions: SessionRegistry::new(),
+            vendor,
+            connection: GrantRegistry::new().next_connection_id(),
+            answerer,
+        }
+    }
+
+    /// A session rooted at `cwd`, with its notes and its generation state
+    /// derived exactly as `session/create` derives them — the daemon's own
+    /// function, so a fixture cannot drift into an agreeing re-implementation of
+    /// the create path (LESSON-451).
+    fn session_at(&self, cwd: &Path) -> SessionId {
+        let id = self
+            .sessions
+            .create(
+                SessionMode::Structured,
+                Some(ProtoPhase::Implement),
+                Some(cwd.to_path_buf()),
+            )
+            .expect("a structured session takes a phase")
+            .session_id;
+        let probed = self.runtime.session_root_for(Some(cwd));
+        self.runtime
+            .store_session_repo_context(&self.sessions, &id, &probed, &self.events);
+        id
+    }
+
+    /// Move a session's root, through the daemon's own `/cd`.
+    fn cd(&self, id: &SessionId, to: &Path) {
+        self.runtime
+            .set_session_cwd(
+                &SessionSetCwdParams {
+                    session_id: id.clone(),
+                    cwd: to.to_path_buf(),
+                    name_hint: None,
+                },
+                &self.sessions,
+                &self.events,
+                &tetond::skills::RealFs,
+            )
+            .expect("the fixture always moves to a real directory");
+    }
+
+    fn set_level(&self, id: &SessionId, level: PermissionLevel) {
+        self.runtime.session_permissions(
+            &SessionPermissionsParams {
+                session_id: id.clone(),
+                level: Some(level),
+            },
+            &self.events,
+        );
+    }
+
+    async fn turn(&self, id: &SessionId, prompt: &str) {
+        let cwd = self
+            .sessions
+            .get(id)
+            .and_then(|s| s.cwd)
+            .expect("the fixture always roots its sessions");
+        let outcome = self
+            .runtime
+            .run_prompt_turn(
+                &self.events,
+                &self.sessions,
+                id.clone(),
+                SessionMode::Structured,
+                Some(ProtoPhase::Implement),
+                Some(cwd),
+                prompt.to_owned(),
+                None,
+                Some(self.connection),
+                ClientPresence::unwatched(),
+            )
+            .await;
+        assert!(outcome.is_ok(), "the turn failed: {outcome:?}");
+    }
+
+    async fn context(&self, id: &SessionId, action: ContextAction) -> SessionContextResult {
+        self.runtime
+            .session_context(
+                &SessionContextParams {
+                    session_id: id.clone(),
+                    action,
+                },
+                &self.sessions,
+                &self.events,
+                None,
+                Some(self.connection),
+            )
+            .await
+    }
+
+    fn generation_state(&self, id: &SessionId) -> GenerationState {
+        self.sessions.generation(id)
+    }
+}
+
+/// Every `repo_context_generation` stage a subscription heard, in order.
+///
+/// Its own drain rather than [`stages`]: that one asserts the fixture's fixed
+/// session id, and these sessions are minted by the registry.
+fn offer_stages(sub: &mut Subscription) -> Vec<RepoContextGeneration> {
+    let mut out = Vec::new();
+    while let Some(envelope) = sub.try_recv() {
+        assert!(
+            envelope.session_id.is_some(),
+            "every stage is attributed to the session that ran it: {:?}",
+            envelope.event
+        );
+        if let Event::RepoContextGeneration(news) = envelope.event {
+            out.push(news);
+        }
+    }
+    out
+}
+
+/// The stage words, in order.
+fn words(sub: &mut Subscription) -> Vec<Stage> {
+    names(&offer_stages(sub))
+}
+
+// ---------------------------------------------------------------------------
+// BR-1 / AC-1 — once per session per root, on the first prompt
+// ---------------------------------------------------------------------------
+
+/// **BR-1, AC-1.** The first prompt in a project with no notes raises **exactly
+/// one** offer; accepting writes the file, loads it, and the *same turn's*
+/// request carries the block; declining writes nothing and a second prompt
+/// raises no second offer; a `/cd` into another notes-less project raises it
+/// again; and an `AGENTS.md` or an empty `TETON.md` suppresses it with no prompt
+/// at all.
+///
+/// # Why the whole rule is one test
+///
+/// Every clause here is a claim about the *same* counter — how many times the
+/// daemon asked — and each is only meaningful beside the others. "Declining
+/// raises no second offer" is equally consistent with a build that never asks,
+/// and "a `/cd` asks again" is equally consistent with one that asks on every
+/// turn. The accepted leg at the top is the non-vacuity for both (LESSON-479).
+///
+/// # The block assertion is on the bytes, not on the state
+///
+/// AC-1 says the turn that raised the offer proceeds *with the block resident*.
+/// A stored `Loaded` state does not say that: the prompt is built after the
+/// offer runs, so the claim is about the request the vendor was handed, and the
+/// assertion is that its system prompt **ends with** the block REQ-612's own
+/// renderer produces for the file on disk.
+///
+/// **Mutations** (LESSON-441), all four run 2026-09-04 and restored, recorded as
+/// **observed**:
+/// 1. `assemble_harness` keeps the pre-offer state instead of reading the stored
+///    one back — the file is written and the turn's system prompt does not end
+///    with the block (`the same turn's request body must end with the block`);
+/// 2. dropping `claim_generation`'s `Pending` check — `left: 2, right: 1` on
+///    the declined session's second prompt;
+/// 3. arming on `RepoContextState::Absent` alone, without
+///    `generate::notes_present` — `left: Pending, right: Suppressed` for the
+///    empty `TETON.md` a user left there to stop exactly this;
+/// 4. dropping the root comparison from `SessionRegistry::arm_generation` —
+///    `left: Declined, right: Pending` after the `/cd`, so a session that
+///    declined once would never be offered notes in any later repository.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_offer_is_raised_once_per_session_per_root_on_the_first_prompt_and_never_after_a_decline(
+) {
+    // --- accepted: written, loaded, and resident in the same turn -----------
+    {
+        let project = Project::new("accept");
+        let wired = Wired::new(&["allow_once"]);
+        let mut sub = wired.events.subscribe(256);
+        wired.vendor.will_answer(GOOD_DRAFT, None);
+        wired.vendor.will_answer("Understood.", None);
+
+        let session = wired.session_at(&project.root);
+        assert_eq!(wired.generation_state(&session), GenerationState::Pending);
+        wired.turn(&session, "what is this repository?").await;
+
+        assert_eq!(
+            wired.answerer.offers().len(),
+            1,
+            "exactly one offer, on the first prompt: {:?}",
+            wired.answerer.seen()
+        );
+        let PermissionSubject::RepoContextGeneration { path, replace, .. } =
+            &wired.answerer.offers()[0]
+        else {
+            unreachable!("filtered above");
+        };
+        assert_eq!(path, "TETON.md", "the prompt names the path it will write");
+        assert!(!replace, "nothing was there to replace");
+
+        assert!(project.notes_exist(), "an accepted offer writes the file");
+        let on_disk = std::fs::read_to_string(project.notes()).unwrap();
+        assert!(on_disk.starts_with("> Generated by Teton on "), "{on_disk}");
+        assert_eq!(wired.generation_state(&session), GenerationState::Generated);
+
+        // …and the turn that raised it carried the block. The expected bytes
+        // are REQ-612's own render of the stored state, so this cannot pass
+        // against a block assembled some other way.
+        let state = wired.sessions.repo_context(&session);
+        let RepoContextState::Loaded(file) = &*state else {
+            panic!("the written file must be resident: {:?}", state.kind());
+        };
+        let block = RepoContextBlock::render(file, REPO_CONTEXT_MAX_BYTES);
+        let systems = wired.vendor.systems();
+        let turn_system = systems.last().expect("the turn reached the vendor");
+        assert!(
+            turn_system.trim_end().ends_with(block.text.trim_end()),
+            "the same turn's request body must end with the block: {turn_system}"
+        );
+        assert_eq!(wired.vendor.draft_calls(), 1, "one draft is one model call");
+
+        let heard = words(&mut sub);
+        assert_eq!(
+            heard,
+            vec![
+                Stage::Offered,
+                Stage::Walking,
+                Stage::Drafted,
+                Stage::Written
+            ],
+            "one event per stage, offer first"
+        );
+    }
+
+    // --- declined: nothing written, and never asked twice -------------------
+    {
+        let project = Project::new("decline");
+        let wired = Wired::new(&["reject_once"]);
+        let mut sub = wired.events.subscribe(256);
+        wired.vendor.will_answer("First.", None);
+        wired.vendor.will_answer("Second.", None);
+
+        let session = wired.session_at(&project.root);
+        wired.turn(&session, "first prompt").await;
+        assert!(!project.notes_exist(), "a declined offer writes nothing");
+        assert_eq!(wired.generation_state(&session), GenerationState::Declined);
+        assert_eq!(wired.vendor.draft_calls(), 0, "nothing was drafted");
+
+        wired.turn(&session, "second prompt").await;
+        assert_eq!(
+            wired.answerer.offers().len(),
+            1,
+            "a declined offer is not raised again in this session"
+        );
+        assert!(!project.notes_exist());
+        assert_eq!(
+            words(&mut sub),
+            vec![Stage::Offered, Stage::Declined],
+            "one offer, one decline, and nothing on the second prompt"
+        );
+
+        // --- …and a `/cd` into another absent project asks again ------------
+        let second = Project::new("cd-target");
+        wired.cd(&session, &second.root);
+        assert_eq!(
+            wired.generation_state(&session),
+            GenerationState::Pending,
+            "a different root is a different question (BR-1)"
+        );
+        wired.vendor.will_answer(GOOD_DRAFT, None);
+        wired.vendor.will_answer("Third.", None);
+        wired.turn(&session, "third prompt").await;
+        assert_eq!(
+            wired.answerer.offers().len(),
+            2,
+            "the new root raised its own offer"
+        );
+        // The script is exhausted, so the second offer was dismissed rather than
+        // accepted — which is the point: it was *asked*.
+        assert!(!second.notes_exist(), "a dismissed offer writes nothing");
+    }
+
+    // --- an `AGENTS.md`, and an empty `TETON.md`: no offer at all -----------
+    for (tag, name, contents) in [
+        (
+            "agents",
+            "AGENTS.md",
+            "# Agents\n\nSomeone described this.\n",
+        ),
+        ("empty", "TETON.md", "   \n"),
+    ] {
+        let project = Project::new(tag);
+        project.write(name, contents);
+        let wired = Wired::new(&["allow_once"]);
+        let mut sub = wired.events.subscribe(256);
+        wired.vendor.will_answer("Nothing to do.", None);
+
+        let session = wired.session_at(&project.root);
+        assert_eq!(
+            wired.generation_state(&session),
+            GenerationState::Suppressed,
+            "{name} suppresses the offer before any turn runs"
+        );
+        wired.turn(&session, "a prompt").await;
+        assert!(
+            wired.answerer.offers().is_empty(),
+            "{name} must raise no offer: {:?}",
+            wired.answerer.seen()
+        );
+        assert_eq!(wired.vendor.draft_calls(), 0);
+        assert!(
+            words(&mut sub).is_empty(),
+            "a suppressed-by-file root publishes no stage at all"
+        );
+    }
+}
+
+/// **The offer never runs mid-turn.** A two-iteration tool loop sees one offer,
+/// one draft call, and one system prompt.
+///
+/// The rule REQ-612's own refresh obeys, one act further on: the system prompt
+/// is fixed for the turn, so a second iteration must not be able to raise a
+/// second offer — and the claim needs a turn that genuinely iterates, which is
+/// why the first scripted reply calls a tool.
+///
+/// **What this pins, and what it cannot mutate.** The hook is outside the loop
+/// *by position*, so there is no one-line change that moves it inside — which is
+/// exactly why the guard is here: the next edit that reaches for the loop fails
+/// both counts below. The claim's own mechanism is mutated where it can be, in
+/// `SessionRegistry::claim_generation`
+/// (`a_generation_offer_is_claimed_once_and_re_armed_only_by_a_new_root`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_two_iteration_tool_loop_sees_no_second_offer() {
+    let project = Project::new("loop");
+    let wired = Wired::new(&["allow_once", "allow_once"]);
+    wired.vendor.will_answer(GOOD_DRAFT, None);
+    wired.vendor.will_answer(
+        "Looking.",
+        Some((
+            "call-1",
+            "read",
+            &json!({ "path": "README.md" }).to_string(),
+        )),
+    );
+    wired.vendor.will_answer("Read it.", None);
+
+    let session = wired.session_at(&project.root);
+    wired.turn(&session, "read the readme").await;
+
+    assert_eq!(
+        wired.answerer.offers().len(),
+        1,
+        "one turn is one offer, however many iterations it takes: {:?}",
+        wired.answerer.seen()
+    );
+    assert_eq!(wired.vendor.draft_calls(), 1);
+    // Three requests: the draft, then the turn's two iterations. The draft
+    // carries no system message — a duty prompt is one user block — so the
+    // *systems* below are exactly the loop's, which is what makes the equality
+    // beneath them a statement about the turn rather than about the count.
+    assert_eq!(
+        wired.vendor.requests().len(),
+        3,
+        "the loop really did iterate"
+    );
+    let systems = wired.vendor.systems();
+    assert_eq!(systems.len(), 2, "two iterations, two system prompts");
+    assert_eq!(
+        systems[1], systems[0],
+        "the system prompt is fixed for the turn, offer included"
+    );
+    assert!(
+        systems[0].contains("<repo-notes file=\"TETON.md\">"),
+        "and it carried the block the offer produced: {}",
+        systems[0]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BR-2 / BR-10 / AC-2 / AC-11 — the level table and the config's two postures
+// ---------------------------------------------------------------------------
+
+/// **BR-2, BR-10, AC-2, AC-11.** `plan` suppresses with one event and **no gate
+/// call**; `full` writes with no prompt; `generate = always` writes with no
+/// prompt at a level that would ask, and the event says the config answered;
+/// `generate = never` suppresses, and `/context init` still writes.
+///
+/// Four postures, one test, because what they claim is one thing: *who* settled
+/// the question. A build that asked in every case and a build that never asked
+/// each satisfy half of this table, and only the four together pin the table
+/// itself.
+///
+/// **Mutations** (LESSON-441), all three run 2026-09-04 and restored, recorded
+/// as **observed** — and the first is why they are recorded that way:
+/// 1. deleting the `plan` short-circuit gives `left: [Offered, DeniedLevel],
+///    right: [DeniedLevel]`. The prediction was "a prompt is drawn"; what
+///    actually happens is that the gate's own level table refuses without
+///    drawing one, so the damage is an `offered` line a client renders for a
+///    question that was never put to anybody. That is the event stream this
+///    assertion is on, and it is why the assertion is on the *stages* rather
+///    than only on the prompt count;
+/// 2. reading `generate = always` as `ask` — the `always` leg's
+///    "`always` answers the question the prompt would ask" fails with the
+///    prompt it was shown;
+/// 3. letting `generate = never` reach `/context init` — `left:
+///    Some(Suppressed), right: Some(Written)`, and AC-11's explicit door is
+///    gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_suppresses_without_a_prompt_full_and_always_write_without_one_and_never_suppresses() {
+    // --- `plan`: no prompt, one `denied_level`, no file ---------------------
+    {
+        let project = Project::new("plan");
+        let wired = Wired::new(&["allow_once"]);
+        let mut sub = wired.events.subscribe(256);
+        wired.vendor.will_answer("Planning.", None);
+
+        let session = wired.session_at(&project.root);
+        wired.set_level(&session, PermissionLevel::Plan);
+        wired.turn(&session, "a prompt").await;
+
+        assert!(
+            wired.answerer.seen().is_empty(),
+            "`plan` draws no prompt for an act it will refuse: {:?}",
+            wired.answerer.seen()
+        );
+        assert!(!project.notes_exist(), "`plan` never writes");
+        assert_eq!(wired.vendor.draft_calls(), 0);
+        let heard = offer_stages(&mut sub);
+        assert_eq!(
+            names(&heard),
+            vec![Stage::DeniedLevel],
+            "one event, and it names the level rather than a suppression"
+        );
+        assert!(
+            heard[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| !reason.trim().is_empty()),
+            "the level's own sentence rides the event: {heard:?}"
+        );
+        assert_eq!(
+            wired.generation_state(&session),
+            GenerationState::Suppressed
+        );
+    }
+
+    // --- `full`: written, no prompt -----------------------------------------
+    {
+        let project = Project::new("full");
+        let wired = Wired::new(&["allow_once"]);
+        wired.vendor.will_answer(GOOD_DRAFT, None);
+        wired.vendor.will_answer("Done.", None);
+
+        let session = wired.session_at(&project.root);
+        wired.set_level(&session, PermissionLevel::Full);
+        wired.turn(&session, "a prompt").await;
+
+        assert!(
+            wired.answerer.seen().is_empty(),
+            "`full` runs every mutation unprompted: {:?}",
+            wired.answerer.seen()
+        );
+        assert!(project.notes_exist(), "`full` writes");
+        assert_eq!(wired.vendor.draft_calls(), 1);
+    }
+
+    // --- `generate = always` at `guarded`: written, no prompt, and said so ---
+    {
+        let project = Project::new("always");
+        let wired = Wired::new(&["allow_once"]);
+        let mut sub = wired.events.subscribe(256);
+        wired
+            .runtime
+            .apply_config_update(ConfigUpdate::SetRepoContextGenerate {
+                mode: RepoContextGenerateMode::Always,
+            })
+            .expect("the durable posture is a config update");
+        wired.vendor.will_answer(GOOD_DRAFT, None);
+        wired.vendor.will_answer("Done.", None);
+
+        let session = wired.session_at(&project.root);
+        assert_eq!(
+            wired
+                .runtime
+                .session_permissions(
+                    &SessionPermissionsParams {
+                        session_id: session.clone(),
+                        level: None,
+                    },
+                    &wired.events,
+                )
+                .level,
+            PermissionLevel::Guarded,
+            "the leg is only meaningful at a level that would otherwise ask"
+        );
+        wired.turn(&session, "a prompt").await;
+
+        assert!(
+            wired.answerer.seen().is_empty(),
+            "`always` answers the question the prompt would ask: {:?}",
+            wired.answerer.seen()
+        );
+        assert!(project.notes_exist(), "`always` writes");
+        let heard = offer_stages(&mut sub);
+        assert_eq!(names(&heard)[0], Stage::Offered);
+        assert!(
+            heard[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("always")),
+            "a user who was never asked is owed the setting's name: {heard:?}"
+        );
+    }
+
+    // --- `generate = never`: no offer, and `/context init` still writes ------
+    {
+        let project = Project::new("never");
+        let wired = Wired::new(&["allow_once"]);
+        let mut sub = wired.events.subscribe(256);
+        wired
+            .runtime
+            .apply_config_update(ConfigUpdate::SetRepoContextGenerate {
+                mode: RepoContextGenerateMode::Never,
+            })
+            .expect("the durable posture is a config update");
+        wired.vendor.will_answer("Nothing to do.", None);
+
+        let session = wired.session_at(&project.root);
+        wired.turn(&session, "a prompt").await;
+        assert!(
+            wired.answerer.seen().is_empty(),
+            "`never` raises no offer: {:?}",
+            wired.answerer.seen()
+        );
+        assert!(!project.notes_exist());
+        assert_eq!(
+            names(&offer_stages(&mut sub)),
+            vec![Stage::Suppressed],
+            "the suppression is stated, not silent"
+        );
+
+        // AC-11: the user's explicit act outranks the setting.
+        wired.vendor.will_answer(GOOD_DRAFT, None);
+        let answer = wired
+            .context(&session, ContextAction::Init { force: false })
+            .await;
+        assert_eq!(
+            answer.generation,
+            Some(Stage::Written),
+            "`/context init` writes even when `generate = never` (BR-8)"
+        );
+        assert!(project.notes_exist(), "the explicit door wrote the file");
+        assert_eq!(answer.state, RepoContextStateKind::Loaded);
+        assert_eq!(answer.origin, Some(RepoContextOrigin::Generated));
+        assert_eq!(wired.answerer.offers().len(), 1, "and it asked, once");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BR-8 — the explicit door, and what `--force` asks
+// ---------------------------------------------------------------------------
+
+/// **BR-8.** `/context init` with a file already there refuses without touching
+/// it, naming its size and the flag; with `--force` it asks a **different**
+/// question — the subject says the file will be replaced — and, accepted,
+/// replaces it.
+///
+/// The pair is the test. A refusal alone is equally consistent with a door that
+/// never writes, and a replacement alone with one that never refuses; the two
+/// legs run over the same file, differing in one flag.
+///
+/// **Mutations**, both run 2026-09-04 and restored: dropping the present-file
+/// check in `offer_and_run` makes the first leg reach the gate and spend a model
+/// call before the write refuses, failing "no model call, no prompt: the file is
+/// answer enough"; passing `false` for `force` into
+/// `authorize_repo_context_generation` makes the second leg's subject say
+/// `replace: false`, which is the first leg's question wearing the second's
+/// consequences.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn init_refuses_an_existing_file_without_force_and_asks_the_replace_question_with_it() {
+    let project = Project::new("init");
+    let authored = "# Hand written\n\nThe notes a user wrote themselves.\n";
+    project.write("TETON.md", authored);
+    let wired = Wired::new(&["allow_once"]);
+    let mut sub = wired.events.subscribe(256);
+
+    let session = wired.session_at(&project.root);
+    assert_eq!(
+        wired.generation_state(&session),
+        GenerationState::Suppressed,
+        "a repository with notes is not offered any"
+    );
+
+    // --- without `--force`: refused, untouched, and nobody was asked ---------
+    let refused = wired
+        .context(&session, ContextAction::Init { force: false })
+        .await;
+    assert_eq!(refused.generation, Some(Stage::Failed));
+    assert_eq!(
+        std::fs::read_to_string(project.notes()).unwrap(),
+        authored,
+        "a refused `init` changes nothing"
+    );
+    assert_eq!(
+        refused.bytes_on_disk,
+        Some(authored.len() as u64),
+        "the answer names the size of the file it would not clobber (BR-8)"
+    );
+    assert!(
+        wired.answerer.seen().is_empty(),
+        "no model call, no prompt: the file is answer enough"
+    );
+    assert_eq!(wired.vendor.draft_calls(), 0);
+    let heard = offer_stages(&mut sub);
+    assert_eq!(names(&heard), vec![Stage::Failed]);
+    let reason = heard[0].reason.as_deref().unwrap_or_default();
+    assert!(
+        reason.contains(&authored.len().to_string()) && reason.contains("--force"),
+        "the news names the size and the flag: {reason}"
+    );
+
+    // --- with `--force`: a different question, and a replacement ------------
+    wired.vendor.will_answer(GOOD_DRAFT, None);
+    let replaced = wired
+        .context(&session, ContextAction::Init { force: true })
+        .await;
+    assert_eq!(replaced.generation, Some(Stage::Replaced));
+    let offers = wired.answerer.offers();
+    assert_eq!(offers.len(), 1, "`--force` asks");
+    let PermissionSubject::RepoContextGeneration { replace, path, .. } = &offers[0] else {
+        unreachable!("filtered above");
+    };
+    assert!(
+        *replace,
+        "the human must see that this one overwrites: {:?}",
+        offers[0]
+    );
+    assert_eq!(path, "TETON.md");
+
+    let on_disk = std::fs::read_to_string(project.notes()).unwrap();
+    assert!(on_disk.starts_with("> Generated by Teton on "), "{on_disk}");
+    assert!(on_disk.contains("## Purpose"), "{on_disk}");
+    assert_eq!(replaced.state, RepoContextStateKind::Loaded);
+    assert_eq!(replaced.origin, Some(RepoContextOrigin::Generated));
+    assert_eq!(
+        wired.generation_state(&session),
+        GenerationState::Generated,
+        "the explicit door settles the session's question too"
+    );
 }

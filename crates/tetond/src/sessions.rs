@@ -132,6 +132,76 @@ struct SessionRecord {
     /// Never persisted: `/context off` is a fact about one session and writes
     /// nothing to `config.toml` (BR-2).
     context_switch: Option<bool>,
+    /// Where this session stands on writing the notes file it does **not**
+    /// have (REQ-613 BR-1, ADR-1).
+    ///
+    /// Beside [`Self::repo_context`] because it is derived from it and moves at
+    /// the same two lifecycle moments, and on the record rather than on the
+    /// daemon because "has *this session* prompted yet" is a session fact: the
+    /// runtime's `turn_counter` is daemon-wide and mints ids, so it cannot
+    /// answer it (REQ-613 architecture, finding 1).
+    generation: GenerationState,
+    /// The root [`Self::generation`] was last decided **at**, or `None` before
+    /// anything decided it.
+    ///
+    /// BR-1's cadence is once per session *per root*, and the two halves need
+    /// different treatment: a decision made at this root is never re-armed —
+    /// a decline is a decline for the rest of the session — while a `/cd` into
+    /// a different project is a new question and must re-arm even after one.
+    /// Comparing the root is what tells those apart, and it is the only thing
+    /// that can: every site that re-derives the notes calls one function
+    /// ([`SessionRegistry::arm_generation`]), and `/context on` reaches it too.
+    generation_root: Option<PathBuf>,
+}
+
+/// Where a session stands on writing the repository notes it does not have
+/// (REQ-613 BR-1, architecture ADR-1).
+///
+/// Six states, and every one of them is terminal but the first two: `Pending`
+/// is a question waiting for the turn that will ask it, `Offered` is that turn
+/// holding the claim, and the other four are the four ways the question is
+/// over. Nothing here is written anywhere — a declined offer is session-scoped
+/// by construction, because Teton never remembers a permission answer across
+/// sessions, and the durable ways to stop the offer are `[context] generate =
+/// never` and an existing (even empty) file.
+///
+/// Deliberately **not** [`teton_protocol::events::GenerationOutcome`], which is
+/// the ten-word vocabulary the wire carries for the *stages* of one run. This
+/// is what the record holds between runs, and folding the two would put nine
+/// values on a record where six are reachable and would make `walking` a state
+/// a session can be left in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationState {
+    /// The root's notes are absent, nothing has suppressed the offer, and the
+    /// next prompt turn is the one that raises it (BR-1).
+    Pending,
+    /// A turn has **claimed** the offer and is running it. The claim is what
+    /// makes the hook fire on one turn rather than on every turn of a session
+    /// whose answer never arrived ([`SessionRegistry::claim_generation`]).
+    Offered,
+    /// A human said no. Not raised again for this root in this session.
+    Declined,
+    /// A file was written and loaded (BR-7).
+    Generated,
+    /// A stage failed, no file was left behind, and the offer is not re-raised
+    /// this session (BR-9).
+    Failed,
+    /// Nothing was asked and nothing ran: a file (or an `AGENTS.md`, or an
+    /// empty one) is already there, the notes are switched off, the root is not
+    /// a project, `[context] generate = never`, or the level forbids the write.
+    Suppressed,
+}
+
+impl GenerationState {
+    /// Whether this state is one a fresh derivation may replace.
+    ///
+    /// The two that are not: a human's answer and a run's outcome. Both mean
+    /// *this root's* question is settled for this session (BR-1), and a
+    /// re-derivation at the same root — `/context off` then `/context on`, say
+    /// — must not turn a decline back into a prompt.
+    const fn rearmable(self) -> bool {
+        matches!(self, Self::Pending | Self::Suppressed)
+    }
 }
 
 /// One session's conversation: the ordered blocks the harness retained, turn
@@ -583,6 +653,15 @@ impl SessionRegistry {
                 // them follows `[context] repo_file` until someone types
                 // `/context`.
                 context_switch: None,
+                // `Suppressed` until the caller derives the notes
+                // ([`Self::arm_generation`]), for `repo_context`'s reason above
+                // it: the derivation needs the probed root, and this registry
+                // does not have one. The fail-**closed** value, deliberately —
+                // a session whose notes were never derived offers nothing, so a
+                // create path that forgot to derive them writes no file rather
+                // than writing one into a directory nobody probed.
+                generation: GenerationState::Suppressed,
+                generation_root: None,
             });
         Ok(summary)
     }
@@ -940,6 +1019,122 @@ impl SessionRegistry {
         record.repo_context = Arc::new(state);
         record.repo_context_published = triple;
         true
+    }
+
+    /// Settle this session's generation state for the root it now stands on
+    /// (REQ-613 BR-1, ADR-1).
+    ///
+    /// Called from the **one** derivation both lifecycle sites funnel through
+    /// (`DaemonRuntime::store_session_repo_context`), so `session/create`,
+    /// `/cd` and `/context on|off` cannot come to disagree about when the offer
+    /// is armed.
+    ///
+    /// # Two rules, and the root is what tells them apart
+    ///
+    /// A **different** root is a different question: BR-1 says a `/cd` into
+    /// another project raises the offer again, even for a session that declined
+    /// at the last one, so the state is replaced whatever it held.
+    ///
+    /// The **same** root is the same question, and only a state nobody has
+    /// answered may move ([`GenerationState::rearmable`]). Without that, a
+    /// `/context off` followed by `/context on` — two calls that re-derive the
+    /// notes and land back on `Absent` — would turn a decline the user gave
+    /// five minutes ago back into a prompt, and BR-1's "not raised again for
+    /// that root in that session" would hold only for sessions that never
+    /// touched the switch.
+    ///
+    /// `false` for a session the registry does not have: there is no record to
+    /// arm and nobody to ask.
+    pub fn arm_generation(&self, id: &SessionId, root: &Path, state: GenerationState) -> bool {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .expect("session registry mutex poisoned");
+        let Some(record) = sessions
+            .iter_mut()
+            .find(|record| &record.summary.session_id == id)
+        else {
+            return false;
+        };
+        let same_root = record.generation_root.as_deref() == Some(root);
+        if !same_root || record.generation.rearmable() {
+            record.generation = state;
+            record.generation_root = Some(root.to_path_buf());
+        }
+        true
+    }
+
+    /// Claim the right to raise this session's generation offer, moving
+    /// [`GenerationState::Pending`] to [`GenerationState::Offered`] (BR-1).
+    ///
+    /// `true` for the **one** turn that takes the claim; every other turn — and
+    /// every later iteration of the same turn's tool loop — reads a state that
+    /// is no longer `Pending` and raises nothing. Read and write under one
+    /// lock, for [`Self::claim_title`]'s reason: two concurrent turns of one
+    /// session must not both decide they are the one asking.
+    ///
+    /// The claim is taken **before** the offer, not after it succeeds. A guard
+    /// keyed on "has this session generated yet" would re-raise the offer on
+    /// every prompt of a session whose answer never came — the per-turn model
+    /// call `claim_title` exists to prevent, with a permission prompt in front
+    /// of it.
+    ///
+    /// The caller **must** store a terminal state when the run finishes
+    /// ([`Self::set_generation`]); a claim that is never settled leaves the
+    /// session at `Offered`, which raises nothing again and is the fail-closed
+    /// end of that mistake.
+    pub fn claim_generation(&self, id: &SessionId) -> bool {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .expect("session registry mutex poisoned");
+        let Some(record) = sessions
+            .iter_mut()
+            .find(|record| &record.summary.session_id == id)
+        else {
+            return false;
+        };
+        if record.generation != GenerationState::Pending {
+            return false;
+        }
+        record.generation = GenerationState::Offered;
+        true
+    }
+
+    /// Record what a generation run ended as (REQ-613 BR-1, BR-9).
+    ///
+    /// Unconditional, unlike [`Self::arm_generation`]: this is the answer to the
+    /// question that method armed, and the caller has just finished asking it.
+    /// `false` only for a session the registry does not have.
+    pub fn set_generation(&self, id: &SessionId, state: GenerationState) -> bool {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .expect("session registry mutex poisoned");
+        let Some(record) = sessions
+            .iter_mut()
+            .find(|record| &record.summary.session_id == id)
+        else {
+            return false;
+        };
+        record.generation = state;
+        true
+    }
+
+    /// Where this session stands on the offer.
+    ///
+    /// A session the registry does not have answers
+    /// [`GenerationState::Suppressed`], which is the fail-closed reading and the
+    /// same one the constructor seeds: a session that does not exist is not
+    /// owed a prompt and has no working tree to write into.
+    #[must_use]
+    pub fn generation(&self, id: &SessionId) -> GenerationState {
+        self.sessions
+            .lock()
+            .expect("session registry mutex poisoned")
+            .iter()
+            .find(|record| &record.summary.session_id == id)
+            .map_or(GenerationState::Suppressed, |record| record.generation)
     }
 
     /// Set this session's `/context` switch (REQ-612 BR-2).
@@ -2020,5 +2215,76 @@ mod tests {
         // The pairing under contention is not asserted here — see the doc
         // above for why a race over this window cannot be made to fail on
         // demand, and where the atomicity is pinned instead.
+    }
+
+    /// **REQ-613 BR-1: once per session per root, and the root is what makes it
+    /// "per root".**
+    ///
+    /// Three claims, and the middle one is the whole reason the record carries a
+    /// root beside the state:
+    ///
+    /// 1. an armed offer is **claimed once** — the second turn of a session, and
+    ///    the second iteration of one turn's tool loop, both read a state that
+    ///    is no longer `Pending`;
+    /// 2. a decision at **this** root survives a re-derivation of it, which is
+    ///    what `/context off` then `/context on` is: two calls that land back on
+    ///    `Absent` and would otherwise re-ask a question the user answered;
+    /// 3. a **different** root re-arms whatever the last one held, because a
+    ///    `/cd` into another project is another project's question.
+    ///
+    /// **Mutations** (LESSON-441), both run 2026-09-03 and restored: dropping
+    /// the `rearmable` guard from `arm_generation` re-arms the decline in leg 2;
+    /// dropping the `same_root` comparison leaves leg 3 at `Declined`, so a
+    /// session that declined once would never be offered notes in any later
+    /// repository.
+    #[test]
+    fn a_generation_offer_is_claimed_once_and_re_armed_only_by_a_new_root() {
+        let reg = SessionRegistry::new();
+        let id = reg
+            .create(SessionMode::Freeform, None, None)
+            .expect("a freeform session needs no phase")
+            .session_id;
+        let alpha = Path::new("/tmp/alpha");
+        let beta = Path::new("/tmp/beta");
+
+        // Fail closed until something derives the notes.
+        assert_eq!(reg.generation(&id), GenerationState::Suppressed);
+        assert!(!reg.claim_generation(&id), "nothing to claim");
+
+        // (1) Armed, then claimed exactly once.
+        assert!(reg.arm_generation(&id, alpha, GenerationState::Pending));
+        assert!(reg.claim_generation(&id));
+        assert_eq!(reg.generation(&id), GenerationState::Offered);
+        assert!(
+            !reg.claim_generation(&id),
+            "a second turn — or a second tool-loop iteration — must not raise \
+             the offer again"
+        );
+
+        // (2) The human answered; re-deriving the same root changes nothing.
+        assert!(reg.set_generation(&id, GenerationState::Declined));
+        assert!(reg.arm_generation(&id, alpha, GenerationState::Pending));
+        assert_eq!(
+            reg.generation(&id),
+            GenerationState::Declined,
+            "`/context on` at the root the user declined at must not re-ask"
+        );
+        assert!(!reg.claim_generation(&id));
+
+        // (3) …and a different project is a different question.
+        assert!(reg.arm_generation(&id, beta, GenerationState::Pending));
+        assert_eq!(reg.generation(&id), GenerationState::Pending);
+        assert!(reg.claim_generation(&id));
+
+        // A suppressed root re-derives freely: nobody was asked anything.
+        assert!(reg.set_generation(&id, GenerationState::Suppressed));
+        assert!(reg.arm_generation(&id, beta, GenerationState::Pending));
+        assert_eq!(reg.generation(&id), GenerationState::Pending);
+
+        let ghost = SessionId::from("no-such-session");
+        assert!(!reg.arm_generation(&ghost, alpha, GenerationState::Pending));
+        assert!(!reg.set_generation(&ghost, GenerationState::Generated));
+        assert!(!reg.claim_generation(&ghost));
+        assert_eq!(reg.generation(&ghost), GenerationState::Suppressed);
     }
 }

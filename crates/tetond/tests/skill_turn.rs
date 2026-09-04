@@ -211,6 +211,15 @@ impl Tree {
         // A project marker, so the root probes as `project` rather than `plain`
         // and the project half of discovery is reached at all.
         std::fs::write(root.join("Cargo.toml"), "[package]\n").unwrap();
+        // …and an **empty** `TETON.md`, which is REQ-613 BR-1's documented way
+        // to say this repository does not want generated notes. Without it the
+        // first typed prompt of every session here raises the generation offer:
+        // a permission prompt addressed to the one connection these fixtures
+        // drive, which none of them answers, so the turn waits for a frame only
+        // the test could send. Empty rather than written: it stops the offer and
+        // still loads as `Absent`, so the system prompt is byte-identical to the
+        // one these tests were written against.
+        std::fs::write(root.join("TETON.md"), "").unwrap();
         Self { root }
     }
 

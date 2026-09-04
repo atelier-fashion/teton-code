@@ -2117,18 +2117,26 @@ impl NotesSession {
     }
 
     /// This session's `/context` answer, through the daemon's own method.
-    fn status(&self) -> teton_protocol::methods::SessionContextResult {
-        self.runtime.session_context(
-            &SessionContextParams {
-                session_id: self.session_id.clone(),
-                action: ContextAction::Status,
-            },
-            &self.sessions,
-            &self.events,
-            // No stamped route: this fixture asserts on egress rather than on
-            // the cap, and a session no turn has routed reports the ceiling.
-            None,
-        )
+    ///
+    /// `async` since REQ-613 gave the method a fourth action that runs the
+    /// generation pipeline; `status` runs none of it and awaits nothing.
+    async fn status(&self) -> teton_protocol::methods::SessionContextResult {
+        self.runtime
+            .session_context(
+                &SessionContextParams {
+                    session_id: self.session_id.clone(),
+                    action: ContextAction::Status,
+                },
+                &self.sessions,
+                &self.events,
+                // No stamped route: this fixture asserts on egress rather than
+                // on the cap, and a session no turn has routed reports the
+                // ceiling.
+                None,
+                // No connection: nothing on this path raises a prompt.
+                None,
+            )
+            .await
     }
 }
 
@@ -2341,7 +2349,7 @@ async fn a_boundary_covered_notes_file_never_leaves_and_an_uncovered_one_is_in_t
         covered.announced[0].resident_bytes, 0,
         "a withheld file is resident in no bytes at all"
     );
-    let status = covered.status();
+    let status = covered.status().await;
     assert_eq!(status.state, RepoContextStateKind::WithheldBoundary);
     assert_eq!(status.file.as_deref(), Some("TETON.md"));
     assert_eq!(status.resident_bytes, 0);

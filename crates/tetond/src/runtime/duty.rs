@@ -186,19 +186,39 @@ impl DaemonRuntime {
     /// egress choke point by the provenance of the files it came from — so a
     /// covered file cannot reach the call even on an untainted session.
     ///
-    /// Visibility: `pub` rather than `pub(super)`, unlike its five siblings,
-    /// because its call site is not in [`crate::runtime`] at all — the
-    /// generation pipeline lives in [`crate::repo_context`] (REQ-613 ADR-6),
-    /// which is the only module that knows the evidence was gathered and the
-    /// offer accepted.
-    pub fn draft_route(&self, dctx: DutyContext<'_>) -> DutyRoute {
+    /// # Two answers from one resolution
+    ///
+    /// The pipeline needs the route *and* the tier — the tier is what the
+    /// generated file's header names and what the event carries (BR-5) — and
+    /// resolving twice would ask the router a second question whose answer can
+    /// differ if a policy row or a provider's health moved in between. It is
+    /// also the only shape that keeps the category named where AC-10 allows one
+    /// to be named: in a [`Router::resolve`](crate::router::Router::resolve)
+    /// call, in this module.
+    ///
+    /// Visibility: `pub(super)`, like its five siblings. The pipeline that
+    /// spends this route lives in [`crate::repo_context`] (REQ-613 ADR-6), but
+    /// it never resolves one: it takes a resolver closure, and the closure is
+    /// built by `DaemonRuntime::generate_repo_context` — inside this tree,
+    /// which is what keeps the seam that reads provider health where the router
+    /// is (LESSON-596: established by demoting and building, not by grepping
+    /// for the name).
+    pub(super) fn draft_route(&self, dctx: DutyContext<'_>) -> DraftPlan {
         let (router, session_id) = (dctx.core.router, dctx.core.session_id);
         let route = if self.session_taint.is_tainted(session_id) {
             router.resolve_local_pin(taint_pin_reason("the `draft` duty"))
         } else {
             router.resolve(Category::Draft)
         };
-        self.resolve_duty(DRAFT_DUTY, &route, dctx)
+        // The taint pin consults no resolution — it is a privacy guarantee
+        // overriding every binding — so it has no tier of its own to report. The
+        // tier a resolution *would* have carried is the category's compile-time
+        // one, which `routing.rs`'s AC-14 case pins as `think`.
+        let tier = route.resolution.as_ref().map_or(Tier::Think, |r| r.tier);
+        DraftPlan {
+            route: self.resolve_duty(DRAFT_DUTY, &route, dctx),
+            tier: to_protocol_tier(tier),
+        }
     }
 
     /// Name this session after `prompt`, at most once for its whole life
