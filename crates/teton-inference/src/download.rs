@@ -312,6 +312,7 @@ mod tests {
             size_bytes: data.len() as u64,
             ram_floor_bytes: 0,
             band: TierBand::Small,
+            n_ctx_train: Some(32_768),
         }
     }
 

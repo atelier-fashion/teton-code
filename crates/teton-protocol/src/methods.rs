@@ -2215,6 +2215,31 @@ pub enum ConfigUpdate {
     /// A new `ConfigUpdate` variant, not a new RPC — `config/set` already
     /// carries every configuration mutation.
     SetEffort(EffortLevel),
+    /// Set the local engine's context allocation (`[inference]`, REQ-616 BR-2).
+    ///
+    /// **A struct variant**, for [`Self::SetTranscriptEnabled`]'s reason: three
+    /// independent optional keys have no sensible newtype, and naming them on
+    /// the wire keeps a caller from having to remember an order.
+    ///
+    /// The keys are *overrides*, and `None` means "leave the probe's decision
+    /// alone" rather than "clear it" — clearing is not expressible here on
+    /// purpose, because the probe's decision is not a stored value to clear.
+    ///
+    /// `n_ctx` above the model's trained window is refused by `config/set`
+    /// naming the trained figure: no RoPE or YaRN scaling is applied, so a
+    /// larger window is not something the daemon can deliver by trying harder.
+    SetInference {
+        /// An explicit window in tokens, at or below the model's trained window.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        n_ctx: Option<u32>,
+        /// `f16` or `q8_0`; validated against
+        /// `teton_inference::window::KvCacheType::parse`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kv_cache_type: Option<String>,
+        /// Permit a load whose resident estimate exceeds admissible RAM.
+        #[serde(default)]
+        allow_over_memory: bool,
+    },
     /// Turn daemon-side transcript recording on or off for **every future
     /// session** (REQ-611 BR-15, architecture ADR-5) — the `[transcript]
     /// enabled` key in `config.toml`.

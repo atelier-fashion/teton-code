@@ -1869,6 +1869,7 @@ mod tests {
             size_bytes,
             ram_floor_bytes,
             band,
+            n_ctx_train: Some(32_768),
         }
     }
 

@@ -85,6 +85,27 @@ impl KvCacheType {
             Self::Q8_0 => "q8_0",
         }
     }
+
+    /// Parse a user-authored spelling — `[inference] kv_cache_type`.
+    ///
+    /// This is the **one** authority on the spellings. `teton-core`'s config
+    /// carries the key as a `String` rather than mirroring this enum, because
+    /// `teton-inference` is a deliberate leaf (serde/toml/thiserror only, no
+    /// edge to `teton-core` or `teton-protocol`) and a mirrored enum in another
+    /// crate is a second home that drifts. The same shape as
+    /// `LocalModelConfig::pinned`, which carries a catalog model *name* rather
+    /// than a catalog type, and is validated where it is used.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "f16" => Some(Self::F16),
+            "q8_0" => Some(Self::Q8_0),
+            _ => None,
+        }
+    }
+
+    /// Every spelling this type accepts, for a refusal message that lists them.
+    pub const ALL: [Self; 2] = [Self::F16, Self::Q8_0];
 }
 
 /// The share of physical RAM the daemon may plan to occupy: **75 %**.
@@ -654,6 +675,26 @@ mod tests {
         assert!(q8 <= adm, "48 GiB must admit q8_0 at the trained window");
         assert!(f16 > adm, "48 GiB must refuse f16 at the trained window");
         assert!((62..88).contains(&ADMISSIBLE_RAM_PERCENT));
+    }
+
+    /// `as_str` and `parse` are inverses, and `ALL` enumerates every variant —
+    /// so a third KV type cannot be added without this failing.
+    ///
+    /// Mutation: drop a variant from `ALL`, or change one spelling on one side.
+    #[test]
+    fn kv_spellings_round_trip_and_all_is_exhaustive() {
+        for kv in KvCacheType::ALL {
+            assert_eq!(KvCacheType::parse(kv.as_str()), Some(kv));
+        }
+        assert_eq!(KvCacheType::parse("bf16"), None);
+        assert_eq!(KvCacheType::parse(""), None);
+        // Exhaustiveness: a new variant makes this match fail to compile, and
+        // the count assertion fails if it is not added to ALL.
+        let counted = [KvCacheType::F16, KvCacheType::Q8_0]
+            .iter()
+            .filter(|k| KvCacheType::ALL.contains(k))
+            .count();
+        assert_eq!(counted, KvCacheType::ALL.len());
     }
 
     /// The window grid is a floor, never a round-up: a rounded-up window would

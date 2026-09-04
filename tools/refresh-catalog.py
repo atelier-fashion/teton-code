@@ -212,6 +212,13 @@ class Mismatch(Exception):
 # for the user's own work (BR-8/BR-9: never degrade the machine), not the raw
 # weight size. It is carried over from REQ-544 and is not API-derived.
 #
+# `n_ctx_train` is the model's trained context window as its publisher states it
+# (REQ-616). Declared here rather than derived, for the same reason
+# `ram_floor_bytes` is: it is a property of the model that has to be readable
+# before anyone downloads the weights, so that `[inference] n_ctx` can be
+# refused against it at `config/set`. The authoritative figure is the GGUF's own
+# `n_ctx_train`, which the loader cross-checks against this declaration.
+#
 # The quantization is q4_k_m throughout — the documented REQ-544 assumption.
 # Model picks stay provisional pending REQ-544 OQ-3's dogfooding benchmark;
 # what this file makes real is the data *pipeline*, not the final picks.
@@ -223,6 +230,7 @@ PICKS = [
         "file": "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
         "band": "small",
         "ram_floor_bytes": 3 * 1024**3,
+        "n_ctx_train": 32 * 1024,
         "note": "Qwen's own GGUF release (official, public, ungated).",
     },
     {
@@ -231,6 +239,7 @@ PICKS = [
         "file": "qwen2.5-coder-3b-instruct-q4_k_m.gguf",
         "band": "small",
         "ram_floor_bytes": 5 * 1024**3,
+        "n_ctx_train": 32 * 1024,
         "note": (
             "Qwen's own GGUF release (official, public, ungated). NOTE: the 3B "
             "weights carry the Qwen Research licence, unlike the Apache-2.0 "
@@ -243,6 +252,7 @@ PICKS = [
         "file": "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
         "band": "mid",
         "ram_floor_bytes": 9 * 1024**3,
+        "n_ctx_train": 32 * 1024,
         "note": (
             "Qwen's own GGUF release (official, public, ungated). The repo also "
             "ships a two-part split of this quant; the single-file artifact is "
@@ -255,6 +265,7 @@ PICKS = [
         "file": "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
         "band": "large",
         "ram_floor_bytes": 20 * 1024**3,
+        "n_ctx_train": 256 * 1024,
         "note": (
             "NOT an official Qwen repo: Qwen publishes no GGUF for "
             "Qwen3-Coder-30B-A3B-Instruct (huggingface.co/Qwen/"
@@ -504,6 +515,7 @@ def render(rows: list) -> str:
         out.append(f"size_bytes = {grouped(row['size_bytes'])}")
         out.append(f"ram_floor_bytes = {grouped(row['ram_floor_bytes'])}")
         out.append(f'band = "{row["band"]}"')
+        out.append(f"n_ctx_train = {grouped(row['n_ctx_train'])}")
         out.append("")
     return "\n".join(out).rstrip("\n") + "\n"
 
@@ -545,6 +557,13 @@ def validate_pick(pick: dict) -> None:
     them keeps an ill-advised edit — a path separator, a stray quote, URL
     structure — from ever reaching the rendered catalog (M-9).
     """
+    n_ctx_train = pick.get("n_ctx_train")
+    if not isinstance(n_ctx_train, int) or n_ctx_train <= 0:
+        raise Mismatch(
+            f"catalog pick {pick['name']!r} has n_ctx_train {n_ctx_train!r}; it must "
+            f"be a positive integer (it is rendered as a TOML number and read as a "
+            f"context window)."
+        )
     if not SAFE_NAME_RE.match(pick["name"]):
         raise Mismatch(
             f"catalog pick name {pick['name']!r} is not a plain id "
@@ -599,6 +618,7 @@ def derive_rows(update_target, existing: str) -> list:
                 "size_bytes": size_bytes,
                 "ram_floor_bytes": pick["ram_floor_bytes"],
                 "band": pick["band"],
+                "n_ctx_train": pick["n_ctx_train"],
                 "note": pick["note"],
             }
         )

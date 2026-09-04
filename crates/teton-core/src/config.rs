@@ -83,6 +83,62 @@ impl LocalModelConfig {
     }
 }
 
+/// How the local engine allocates its context (the `[inference]` table, REQ-616).
+///
+/// Every field is an *override* of a decision the daemon would otherwise make
+/// from the model's trained window and the machine's admissible RAM. Absent
+/// means "let the probe decide", which is the shipped posture.
+///
+/// # The two waivers are separate, and neither implies the other (BR-4)
+///
+/// | key | waives | does not waive |
+/// |---|---|---|
+/// | [`n_ctx`](Self::n_ctx) | the quarter-window refusal | the memory check |
+/// | [`allow_over_memory`](Self::allow_over_memory) | the memory check | nothing else |
+///
+/// Collapsing them would let a user who asked for a *smaller* window silently
+/// get an overcommitted load — the opposite of what they asked for. The
+/// arithmetic lives in `teton_inference::window::fit_window`; this table is only
+/// the user's half of it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct InferenceConfig {
+    /// An explicit context window, in tokens.
+    ///
+    /// Accepted only at or below the model's trained window: no RoPE or YaRN
+    /// scaling is applied, so a larger value is refused at `config/set` naming
+    /// the trained figure (BR-2). A *smaller* value is honoured — that is what
+    /// this key is mostly for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_ctx: Option<u32>,
+    /// The KV cache element type: `f16` or `q8_0`.
+    ///
+    /// Carried as a `String` rather than a mirrored enum. `teton-inference` is a
+    /// deliberate leaf — serde/toml/thiserror only, with no edge to this crate
+    /// or to `teton-protocol` — so `KvCacheType` cannot be shared, and a second
+    /// copy of it here would be a second home for the spellings that drifts.
+    /// `teton_inference::window::KvCacheType::parse` is the one authority, and
+    /// this key is validated against it at `config/set`. The same shape as
+    /// [`LocalModelConfig::pinned`], which carries a catalog model *name*.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_cache_type: Option<String>,
+    /// Load even when the resident estimate exceeds the admissible share of RAM.
+    ///
+    /// **Defaults to `false`**, and serialized unconditionally so a written-out
+    /// config states the posture rather than leaving a reader to infer it — the
+    /// same reasoning as [`LocalModelConfig::auto_accept`].
+    #[serde(default)]
+    pub allow_over_memory: bool,
+}
+
+impl InferenceConfig {
+    /// Whether every field still holds its default, used to keep the
+    /// `[inference]` table out of a config that never set one.
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Privacy behaviour the user opts into (the `[privacy]` table).
 ///
 /// # Why this is not a `[[categories]]` row (REQ-562 BR-10)
@@ -1233,6 +1289,13 @@ pub struct Config {
     /// switch is here rather than in [`Config::categories`].
     #[serde(default, skip_serializing_if = "PrivacyConfig::is_unset")]
     pub privacy: PrivacyConfig,
+    /// Local-engine context allocation (`[inference]`, REQ-616): an explicit
+    /// window, a KV cache type, or permission to overcommit. Absent means the
+    /// probe decides from the model's trained window and the machine's
+    /// admissible RAM. Declared here among the tables, before the
+    /// array-of-table fields, for the TOML-ordering reason above.
+    #[serde(default, skip_serializing_if = "InferenceConfig::is_unset")]
+    pub inference: InferenceConfig,
     /// Opt-in spend behaviour (`[cost]`): today, REQ-588's per-prompt ceiling.
     /// Absent means no ceiling — see [`CostConfig`].
     #[serde(default, skip_serializing_if = "CostConfig::is_unset")]
@@ -3629,6 +3692,14 @@ effort_ladder = []
     fn sample_config() -> Config {
         Config {
             pinned_local_model: None,
+            // REQ-616: non-default on purpose, for the same reason `effort` is
+            // — a round-trip that silently dropped the `[inference]` table
+            // would otherwise coincide with the default and pass.
+            inference: InferenceConfig {
+                n_ctx: Some(65_536),
+                kv_cache_type: Some("q8_0".to_owned()),
+                allow_over_memory: true,
+            },
             // REQ-559: the sample carries a non-default level on purpose, so a
             // serialization round-trip that silently dropped the key would fail
             // rather than coincide with the default.

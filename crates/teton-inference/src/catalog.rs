@@ -325,6 +325,29 @@ pub struct ModelEntry {
     pub ram_floor_bytes: u64,
     /// The hardware band this model serves.
     pub band: TierBand,
+    /// The model's trained context window, as the publisher declares it
+    /// (REQ-616 BR-1/BR-2). `None` when the catalog does not state one.
+    ///
+    /// # Why declared, and why `Option`
+    ///
+    /// The authoritative figure is `n_ctx_train` in the GGUF metadata, which is
+    /// only readable once the weights are on disk and the `llama` feature is
+    /// compiled in. But `[inference] n_ctx` has to be refusable at `config/set`
+    /// — before any of that — so the ceiling needs a home that a default build
+    /// can read. The catalog is that home: it already carries `size_bytes` and
+    /// `ram_floor_bytes` as declared facts about a model nobody has downloaded
+    /// yet, and this is the same kind of fact.
+    ///
+    /// `Option` rather than a defaulted literal, on the REQ-557 ADR-D rule that
+    /// an absent identifier stays `None` rather than becoming a plausible
+    /// value. A catalog predating this field reads `None`, and a refusal that
+    /// cannot cite a figure says so instead of inventing one (LESSON-456).
+    ///
+    /// The loader cross-checks the declaration against the GGUF's own
+    /// `n_ctx_train` and reports a disagreement rather than trusting either
+    /// silently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_ctx_train: Option<u32>,
 }
 
 impl ModelEntry {
@@ -573,6 +596,7 @@ mod tests {
             size_bytes: 1_000,
             ram_floor_bytes: 2_000,
             band: TierBand::Small,
+            n_ctx_train: Some(32_768),
         }
     }
 

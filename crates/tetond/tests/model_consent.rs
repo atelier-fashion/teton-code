@@ -94,6 +94,7 @@ fn entry(
         size_bytes: body.len() as u64,
         ram_floor_bytes,
         band,
+        n_ctx_train: Some(32_768),
     }
 }
 

@@ -67,6 +67,7 @@ fn entry(body: &[u8]) -> ModelEntry {
         size_bytes: body.len() as u64,
         ram_floor_bytes: 8 * 1024 * 1024 * 1024,
         band: TierBand::Small,
+        n_ctx_train: Some(32_768),
     }
 }
 

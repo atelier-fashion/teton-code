@@ -3185,6 +3185,7 @@ impl DaemonRuntime {
                 | ConfigUpdate::SetCategoryBinding(_)
                 | ConfigUpdate::SetPrivacyBoundary(_)
                 | ConfigUpdate::SetEffort(_)
+                | ConfigUpdate::SetInference { .. }
                 | ConfigUpdate::SetTranscriptEnabled { .. }
                 | ConfigUpdate::SetRepoContextEnabled { .. }
                 // REQ-613 TASK-380: names no provider, so it restates no

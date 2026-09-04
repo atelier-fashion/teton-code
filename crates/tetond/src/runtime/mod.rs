@@ -3459,6 +3459,26 @@ impl DaemonRuntime {
         self.apply_config_update_guarded(update, |_| Ok(()))
     }
 
+    /// This machine's selected model's trained window, when it is knowable.
+    ///
+    /// Read from the **catalog** — a declared fact — rather than from the GGUF,
+    /// so `config/set` can enforce the BR-2 ceiling in a default build that
+    /// never compiles llama.cpp and on a machine whose weights are not yet
+    /// downloaded. `None` where no model is selected, where the entry is not in
+    /// the catalog, or where the catalog predates `n_ctx_train`; the load path
+    /// re-checks against the GGUF's own figure, which is authoritative.
+    fn trained_window_of_selected_model(&self) -> Option<u32> {
+        let selection = self.consent.current_selection();
+        let name = selection
+            .as_ref()
+            .and_then(|s| s.model_name.clone())
+            .or_else(|| self.probe.as_ref().and_then(|p| p.model.clone()))?;
+        self.consent
+            .catalog()
+            .get(&name)
+            .and_then(|entry| entry.n_ctx_train)
+    }
+
     /// [`Self::apply_config_update`], with a precondition evaluated **under the
     /// config lock this write takes** (REQ-589 review pass).
     ///
@@ -3503,6 +3523,23 @@ impl DaemonRuntime {
                     ),
                 ));
             }
+        }
+        // REQ-616 BR-2 / AC-6: an `[inference] n_ctx` above the model's trained
+        // window is refused here, naming the trained figure. The ceiling is read
+        // from the catalog entry for the selected model — a *declared* fact, so
+        // this works in a default build that has never compiled llama.cpp and on
+        // a machine where the weights are not yet downloaded.
+        if let ConfigUpdate::SetInference {
+            n_ctx,
+            kv_cache_type,
+            ..
+        } = &update
+        {
+            refuse_unusable_inference(
+                *n_ctx,
+                kv_cache_type.as_deref(),
+                self.trained_window_of_selected_model(),
+            )?;
         }
         let mut config = self.config.lock().expect("config mutex poisoned");
         // The caller's precondition, against the config this write is about to
@@ -8045,6 +8082,9 @@ fn reject_unusable_binding(config: &Config, update: &ConfigUpdate) -> Result<(),
         ConfigUpdate::RegisterProvider(_)
         | ConfigUpdate::SetPrivacyBoundary(_)
         | ConfigUpdate::SetEffort(_)
+        // REQ-616: names no provider — the local engine has no provider
+        // binding to reject. `SetEffort`'s row, one variant over.
+        | ConfigUpdate::SetInference { .. }
         | ConfigUpdate::SetTranscriptEnabled { .. }
         | ConfigUpdate::SetRepoContextEnabled { .. }
         // REQ-613 TASK-380: names no provider, so there is no binding to
@@ -8073,6 +8113,65 @@ fn reject_unusable_binding(config: &Config, update: &ConfigUpdate) -> Result<(),
     Ok(())
 }
 
+/// Refuse an `[inference]` update the daemon could not honour (REQ-616 BR-2).
+///
+/// Pure over its three inputs so the rule is testable without a daemon, a
+/// socket, or a downloaded model — the shape this codebase uses for decisions
+/// whose mechanism is awkward to reach (`session_start_boundary_events`,
+/// `teton_inference::probe::decide`).
+///
+/// # Why `trained_window` is an `Option`, and what happens when it is `None`
+///
+/// The ceiling is a property of the model, and a machine may have no model
+/// selected yet, or a catalog entry that predates `n_ctx_train`. Rather than
+/// substituting a plausible literal — which would either refuse a legal window
+/// or admit an illegal one, both silently — the refusal says the ceiling is
+/// unknown and names what would make it known (REQ-557 ADR-D; LESSON-456: the
+/// daemon knew, the message must say — here it genuinely does not know, and
+/// says *that*).
+///
+/// A `None` ceiling **accepts** the value rather than refusing it: the load path
+/// re-checks against the GGUF's own `n_ctx_train`, which is authoritative, so
+/// refusing here would block a legal configuration on the daemon's ignorance.
+/// The user is told the check was deferred.
+fn refuse_unusable_inference(
+    n_ctx: Option<u32>,
+    kv_cache_type: Option<&str>,
+    trained_window: Option<u32>,
+) -> Result<(), RpcError> {
+    if let Some(spelling) = kv_cache_type {
+        if teton_inference::window::KvCacheType::parse(spelling).is_none() {
+            let valid = teton_inference::window::KvCacheType::ALL
+                .iter()
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>()
+                .join("` or `");
+            return Err(RpcError::new(
+                error_code::CONFIG_REJECTED,
+                format!(
+                    "`[inference] kv_cache_type` must be `{valid}`, not `{spelling}`. \
+                     Nothing was changed."
+                ),
+            ));
+        }
+    }
+    let (Some(requested), Some(trained)) = (n_ctx, trained_window) else {
+        return Ok(());
+    };
+    if requested > trained {
+        return Err(RpcError::new(
+            error_code::CONFIG_REJECTED,
+            format!(
+                "`[inference] n_ctx = {requested}` exceeds this model's trained window \
+                 (n_ctx_train = {trained}). The engine applies no RoPE or YaRN scaling, so a \
+                 larger window is not available at any quality. Set it to {trained} or below. \
+                 Nothing was changed."
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Apply a single [`ConfigUpdate`] to `config` in place (replace-or-insert).
 fn apply_update(config: &mut Config, update: ConfigUpdate) {
     match update {
@@ -8080,6 +8179,24 @@ fn apply_update(config: &mut Config, update: ConfigUpdate) {
         // starts here. The session override (ADR-I) is applied by the caller
         // that owns a session; this is the durable floor.
         ConfigUpdate::SetEffort(level) => config.effort = level,
+        // REQ-616 BR-2: the durable `[inference]` overrides, through the same
+        // write path as the switches below. `None` leaves a key alone rather
+        // than clearing it — see `ConfigUpdate::SetInference`. Validation
+        // (the trained-window ceiling, the KV spelling) has already run in
+        // `refuse_unusable_inference`; this arm only writes.
+        ConfigUpdate::SetInference {
+            n_ctx,
+            kv_cache_type,
+            allow_over_memory,
+        } => {
+            if n_ctx.is_some() {
+                config.inference.n_ctx = n_ctx;
+            }
+            if kv_cache_type.is_some() {
+                config.inference.kv_cache_type = kv_cache_type;
+            }
+            config.inference.allow_over_memory = allow_over_memory;
+        }
         // REQ-611 BR-2 / ADR-5: the durable transcript default. Written to the
         // persisted config so sessions created afterwards start from it; a
         // running session's effective state is the sink's and is untouched.
@@ -8391,6 +8508,117 @@ fn env_flag(key: &str) -> bool {
 // declaration near the top truncates every one of them at that line: it took
 // this file's visible production half from ~10,000 lines to ~100 and turned
 // eight derived checks green-on-nothing at once (REQ-599 step 2).
+#[cfg(test)]
+mod inference_config_tests {
+    use super::*;
+
+    const TRAINED: u32 = 262_144;
+
+    /// AC-6: a window above the trained one is refused, and the message names
+    /// the trained figure so the user knows what to set instead.
+    ///
+    /// Mutation: drop the `requested > trained` comparison and this goes red;
+    /// remove `{trained}` from the message and the `contains` assertion does.
+    #[test]
+    fn set_n_ctx_300000_names_trained_window() {
+        let err = refuse_unusable_inference(Some(300_000), None, Some(TRAINED))
+            .expect_err("300,000 exceeds the trained window and must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("262144"),
+            "the trained figure must be named: {msg}"
+        );
+        assert!(
+            msg.contains("300000"),
+            "the rejected value must be named: {msg}"
+        );
+        assert!(
+            msg.contains("Nothing was changed"),
+            "a refusal must say nothing was applied: {msg}"
+        );
+    }
+
+    /// The benign path, in three shapes: at the ceiling, below it, and with no
+    /// window named at all. A detector validated only against the adversarial
+    /// input ships broken and passes its own suite (LESSON-440).
+    #[test]
+    fn set_n_ctx_at_or_below_trained_is_accepted() {
+        assert!(refuse_unusable_inference(Some(TRAINED), None, Some(TRAINED)).is_ok());
+        assert!(refuse_unusable_inference(Some(65_536), None, Some(TRAINED)).is_ok());
+        assert!(refuse_unusable_inference(None, None, Some(TRAINED)).is_ok());
+    }
+
+    /// An unknown ceiling defers rather than guessing, in **both** directions:
+    /// it does not refuse a legal window on the daemon's ignorance, and it does
+    /// not invent a figure to compare against (REQ-557 ADR-D).
+    #[test]
+    fn an_unknown_trained_window_defers_to_the_load_path() {
+        assert!(refuse_unusable_inference(Some(300_000), None, None).is_ok());
+        assert!(refuse_unusable_inference(Some(1_024), None, None).is_ok());
+    }
+
+    /// The KV spelling is validated against the one authority, and the refusal
+    /// lists the values that would work.
+    #[test]
+    fn kv_cache_type_spelling_is_validated_and_lists_the_alternatives() {
+        let err = refuse_unusable_inference(None, Some("bf16"), Some(TRAINED))
+            .expect_err("bf16 is not a supported KV cache type");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("f16"),
+            "the message lists the valid values: {msg}"
+        );
+        assert!(
+            msg.contains("q8_0"),
+            "the message lists the valid values: {msg}"
+        );
+
+        // Benign path: both supported spellings pass.
+        for spelling in ["f16", "q8_0"] {
+            assert!(
+                refuse_unusable_inference(None, Some(spelling), Some(TRAINED)).is_ok(),
+                "{spelling} must be accepted"
+            );
+        }
+    }
+
+    /// The apply arm writes what was sent and leaves unrelated tables alone.
+    /// `None` means "leave this key" rather than "clear it".
+    #[test]
+    fn apply_writes_the_keys_sent_and_leaves_the_rest() {
+        let mut config = Config::default();
+        config.inference.n_ctx = Some(65_536);
+        apply_update(
+            &mut config,
+            ConfigUpdate::SetInference {
+                n_ctx: None,
+                kv_cache_type: Some("q8_0".to_owned()),
+                allow_over_memory: true,
+            },
+        );
+        assert_eq!(
+            config.inference.n_ctx,
+            Some(65_536),
+            "a None n_ctx leaves the existing key alone rather than clearing it"
+        );
+        assert_eq!(config.inference.kv_cache_type.as_deref(), Some("q8_0"));
+        assert!(config.inference.allow_over_memory);
+    }
+
+    /// The table stays out of a config that never set one, so an untouched
+    /// `config.toml` does not grow an `[inference]` section.
+    #[test]
+    fn an_unset_table_is_not_serialized() {
+        let config = Config::default();
+        assert!(config.inference.is_unset());
+        let rendered = toml::to_string(&config).expect("config serializes");
+        assert!(
+            !rendered.contains("[inference]"),
+            "an unset table must not be written: {rendered}"
+        );
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod testsupport;
 
@@ -10685,6 +10913,7 @@ provider_id = "on-device"
         let config = Config {
             transcript: Default::default(),
             context: Default::default(),
+            inference: Default::default(),
             pinned_local_model: None,
             effort: teton_core::EffortLevel::default(),
             // The whole point: unset.
@@ -11015,6 +11244,7 @@ provider_id = "on-device"
         Config {
             transcript: Default::default(),
             context: Default::default(),
+            inference: Default::default(),
             pinned_local_model: None,
             effort: teton_core::EffortLevel::default(),
             default_provider: Some("anthropic".to_owned()),

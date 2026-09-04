@@ -1,7 +1,7 @@
 ---
 id: TASK-391
 title: "The [inference] config table and its config/set refusal"
-status: draft
+status: complete
 parent: REQ-616
 created: 2026-09-04
 updated: 2026-09-04
