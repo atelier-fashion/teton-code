@@ -457,6 +457,44 @@ pub(crate) const REDACT_ESCAPING_DIVISOR: usize = 10;
 /// whole-KiB move with a scannable-bound consequence, and it belongs to a REQ
 /// that means to make it rather than to one that needed two sentences.
 ///
+/// **REQ-617 spends 540 of the margin and moves nothing here.** The constant
+/// stays at 23 KiB and every figure derived from it — the chunk count, the input
+/// cap, the scannable bound, the max chunks — is untouched. That is the whole
+/// point of recording it: the roster fit, so the ceiling did not have to move,
+/// and the next REQ inherits the same arithmetic rather than a re-derivation.
+///
+/// Where the 540 went (`RECORDED_PROMPT_MARGIN_BYTES` 733 → 193):
+///
+/// ```text
+///   the `teton_docs` topic index, twice          23   `commands` and `transcript`
+///                                                     cost 22 in the tool's input
+///                                                     schema (`One of: …`) and 1
+///                                                     net in the description,
+///                                                     whose frame paid the rest
+///   the guide's command roster                  517   29 names grouped by family,
+///                                                     BR-1's closing sentence, and
+///                                                     BR-3's session-state ending,
+///                                                     folded INTO the existing
+///                                                     capability line rather than
+///                                                     added as a second one
+///   = what the prompt actually pays             540
+/// ```
+///
+/// **The fold is the load-bearing part and it was not optional.** The roster
+/// first went in as its own line and
+/// `the_system_prompt_states_what_the_session_can_run_and_from_where` went red:
+/// exactly one line of the guide may name `/help`, because two lines about what
+/// the session can run is BUG-181's shape. Folding it into the capability
+/// sentence — and deleting the clause it supersedes, *"the session's commands are
+/// exactly those `/help` lists"*, which an enumerated roster says better —
+/// recovered 100 bytes over the two-line spelling. A guard that forced a smaller
+/// diff than the one first written; worth saying, because the reflex on a red
+/// count assertion is to raise the count.
+///
+/// 193 leaves 145 of usable room above the 48-byte floor, the tightest this has
+/// been since REQ-612's raise. REQ-615 spends from the same margin in the same
+/// sprint and should expect to shorten something or make the ceiling case.
+///
 /// `pub(crate)` because the *other* prompt shape has to clear it too and cannot
 /// be built from here: with `[web] tier` above `off` the system prompt carries
 /// the web tool's docs instead of REQ-563's BR-6 opt-in clause, and building
@@ -525,7 +563,7 @@ pub(crate) const MIN_PROMPT_HEADROOM_BYTES: usize = 48;
 /// last time. Add a ledger line to [`REDACT_BODY_OVERHEAD_BYTES`] saying which
 /// REQ spent the bytes, then move this number in the same diff.
 #[cfg(test)]
-pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 455;
+pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 193;
 
 /// The same pin for the **web-enabled** prompt shape measured by
 /// `harness::tools::web::tests::the_web_tool_docs_clear_the_outbound_body_overhead`.
@@ -537,7 +575,31 @@ pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 455;
 /// holds the budget vocabulary, so the two shapes cannot come to disagree about
 /// which constant they are measuring against.
 #[cfg(test)]
-pub(crate) const RECORDED_WEB_PROMPT_MARGIN_BYTES: usize = 502;
+pub(crate) const RECORDED_WEB_PROMPT_MARGIN_BYTES: usize = 240;
+
+/// The gap between the two recorded margins, pinned (REQ-617).
+///
+/// The two prompt shapes differ by exactly one clause — REQ-563 BR-6's web opt-in
+/// sentence versus the web tool's docs — and nothing any other REQ does should
+/// change the *distance* between them. It has been 47 bytes since REQ-612, and
+/// stating that as an equation rather than as a coincidence turns a whole class
+/// of mistake into a compile-time failure: an edit that lands on one prompt shape
+/// and not the other moves one margin and not the gap.
+///
+/// It is `const` and asserted below rather than checked in a test body, so the
+/// two numbers cannot be updated independently — which is precisely what would
+/// happen if a future REQ re-measured one, found it green, and moved on.
+#[cfg(test)]
+pub(crate) const RECORDED_MARGIN_GAP_BYTES: usize = 47;
+
+#[cfg(test)]
+const _: () = assert!(
+    RECORDED_WEB_PROMPT_MARGIN_BYTES - RECORDED_PROMPT_MARGIN_BYTES == RECORDED_MARGIN_GAP_BYTES,
+    "the two recorded prompt margins are no longer 47 bytes apart. They differ by \
+     one clause and nothing else, so a change that moves the gap has landed on one \
+     prompt shape and not the other — re-measure BOTH sweeps before moving either \
+     number."
+);
 
 /// How many per-chunk windows the total cap is worth — the multiple that turns
 /// [`REDACT_CHUNK_MAX_BYTES`] into [`REDACT_INPUT_MAX_BYTES`].

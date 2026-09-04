@@ -1,7 +1,7 @@
 ---
 id: TASK-003
 title: "The self-config guide carries the command names, and the prompt margin is re-measured last"
-status: draft
+status: complete
 parent: REQ-617
 created: 2026-09-04
 updated: 2026-09-04
