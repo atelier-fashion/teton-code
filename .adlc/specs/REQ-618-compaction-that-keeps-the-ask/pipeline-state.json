@@ -3,7 +3,7 @@
   "branch": "feat/REQ-618-compaction-that-keeps-the-ask",
   "startedAt": "2026-09-04T19:35:10.833694Z",
   "completed": false,
-  "currentPhase": 7,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
@@ -11,7 +11,8 @@
     3,
     4,
     5,
-    6
+    6,
+    7
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -49,6 +50,11 @@
       "phase": 6,
       "name": "Create PR",
       "completedAt": "2026-09-04T22:06:35.959401Z"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-09-04T22:18:35.805528Z"
     }
   ],
   "repos": {
