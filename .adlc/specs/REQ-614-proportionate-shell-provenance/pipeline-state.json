@@ -3,12 +3,13 @@
   "branch": "feat/REQ-614-proportionate-shell-provenance",
   "startedAt": "2026-09-04T00:00:00Z",
   "completed": false,
-  "currentPhase": 4,
+  "currentPhase": 5,
   "completedPhases": [
     0,
     1,
     2,
-    3
+    3,
+    4
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -34,6 +35,12 @@
       "name": "Validate Architecture & Tasks",
       "completedAt": "2026-09-04T19:45:12.068846Z",
       "result": "APPROVED; fixed TASK-397 dep count (4->3), added boundary-mode and project-root fixture notes. Obligation coverage 10/10 BR, 12/12 AC; benign paths present for all 4 detection-shaped BRs. Vacuous-run gate deferred to the real cargo test run in Phase 4/5."
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-09-04T21:31:48.763275Z",
+      "result": "8/8 tasks complete; 4,346 workspace tests pass; clippy clean under -D warnings"
     }
   ],
   "repos": {
@@ -54,7 +61,7 @@
     "teton-code"
   ],
   "phase4": {
-    "currentTask": "TASK-397",
+    "currentTask": null,
     "completedTasks": [
       "TASK-390",
       "TASK-391",
@@ -62,7 +69,8 @@
       "TASK-393",
       "TASK-394",
       "TASK-395",
-      "TASK-396"
+      "TASK-396",
+      "TASK-397"
     ],
     "failedTasks": []
   },

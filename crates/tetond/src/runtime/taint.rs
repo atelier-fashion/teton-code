@@ -2418,3 +2418,243 @@ mod shell_override_rpc {
         );
     }
 }
+
+/// REQ-614 TASK-397 — the routing and event claims the wire tests cannot make.
+///
+/// These need the runtime's route decision, its taint map and its lift set;
+/// `provenance_egress.rs` drives the harness loop directly and has none of them.
+#[cfg(test)]
+mod shell_pin_lifecycle {
+    use super::*;
+    use teton_protocol::methods::ShellOverrideParams;
+
+    /// **AC-8.** An `unknown` block carried into a later turn of a **lifted**
+    /// session is still refused at egress, and the turn is rerouted local
+    /// **without re-pinning** the session.
+    ///
+    /// This is the case that makes the lift honest rather than a leak: what
+    /// `/shell allow` changes is that *later* turns are routed by category
+    /// again, not that the blocks already in context become sendable (BR-6).
+    /// The context is re-inspected every turn (REQ-567), so the carried block
+    /// keeps refusing on its own merits.
+    ///
+    /// "Without re-pinning" is the subtle half. `context_taint_cause` runs at
+    /// the carried turn's commit and marks again — but `mark` keeps the first
+    /// cause, so the session's recorded cause and its lift both survive, and
+    /// the route stays unpinned.
+    #[test]
+    fn a_carried_unknown_block_in_a_lifted_session_is_still_refused() {
+        use crate::egress::{inspect, Provenance};
+        use teton_core::boundary::BoundaryMatcher;
+        use teton_protocol::events::PrivacyAction;
+
+        let runtime = DaemonRuntime::minimal();
+        let events = Arc::new(EventBus::new());
+        let session = SessionId::from("lifted-carry");
+        runtime
+            .session_taint
+            .mark(&session, TaintCause::UnknownShell);
+        assert!(
+            runtime
+                .shell_override(
+                    &ShellOverrideParams {
+                        session_id: session.clone()
+                    },
+                    &events
+                )
+                .lifted_now
+        );
+        assert!(!runtime.route_pin().pins(&session), "routing resumed");
+
+        // The carried block. Egress inspects provenance, not the pin, so the
+        // lift has no bearing on it.
+        let bounds = vec![teton_core::entities::PrivacyBoundary::builtin("**/.env")];
+        let matcher = BoundaryMatcher::new(&bounds).expect("compiles");
+        let verdict = inspect(
+            &Provenance::unknown(),
+            &matcher,
+            PrivacyAction::ReroutedToLocal,
+        );
+        let crate::egress::Inspection::Blocked(violation) = verdict else {
+            panic!("BR-6: a carried unknown block must still be refused after a lift");
+        };
+        assert_eq!(
+            violation.path, "<unknown-provenance>",
+            "AC-8: and the block names the sentinel"
+        );
+
+        // No re-pin: the cause is unchanged and the lift still holds, so the
+        // *next* turn is still routed by category.
+        runtime
+            .session_taint
+            .mark(&session, TaintCause::UnknownShell);
+        assert_eq!(
+            runtime.session_taint.cause(&session),
+            Some(TaintCause::UnknownShell)
+        );
+        assert!(
+            !runtime.route_pin().pins(&session),
+            "AC-8: the turn is rerouted local without re-pinning the session"
+        );
+    }
+
+    /// **AC-11.** The transcript for a pinned session carries one
+    /// `session_pinned` **before** the first pinned `route_decided`, and one
+    /// `session_pin_lifted` after `/shell allow`.
+    ///
+    /// Ordering, not presence. A `session_pinned` published after the routes it
+    /// explains would reach the user's scrollback below the slow turns it is
+    /// the reason for — which is the same failure as not publishing it, one
+    /// step subtler.
+    #[test]
+    fn pinned_session_records_the_two_events_in_order() {
+        let runtime = DaemonRuntime::minimal();
+        let events = Arc::new(EventBus::new());
+        let mut sub = events.subscribe(64);
+        let session = SessionId::from("ordered");
+
+        // The pin, through the sink that publishes it — not by calling `mark`
+        // directly, which would prove nothing about the publish.
+        let sink = TaintingPrivacySink::for_turn_path(
+            Arc::clone(&events),
+            Arc::clone(&runtime.session_taint),
+        )
+        .with_local_budget(Some(21_162));
+        crate::egress::PrivacyEventSink::privacy_block(
+            &sink,
+            Some(session.clone()),
+            teton_protocol::events::PrivacyBlock {
+                path: crate::egress::provenance::UNKNOWN_PROVENANCE_PATH.to_owned(),
+                provider_id: teton_protocol::ProviderId::from("kimi-k3"),
+                action: teton_protocol::events::PrivacyAction::ReroutedToLocal,
+                cause: BlockCause::Boundary,
+            },
+        );
+
+        let lifted = runtime.shell_override(
+            &ShellOverrideParams {
+                session_id: session.clone(),
+            },
+            &events,
+        );
+        assert!(lifted.lifted_now, "the fixture's pin must be liftable");
+
+        let mut names = Vec::new();
+        while let Some(env) = sub.try_recv() {
+            names.push(env.event.name().to_owned());
+        }
+        let pinned_at = names.iter().position(|n| n == "session_pinned");
+        let lifted_at = names.iter().position(|n| n == "session_pin_lifted");
+        assert!(
+            pinned_at.is_some(),
+            "AC-11: a pinned session records `session_pinned`: {names:?}"
+        );
+        assert!(
+            lifted_at.is_some(),
+            "AC-11: and `session_pin_lifted` after the lift: {names:?}"
+        );
+        assert!(
+            pinned_at < lifted_at,
+            "AC-11: the pin is recorded before the lift: {names:?}"
+        );
+        // And the pin's payload is the liftable one, since the block named the
+        // unknown sentinel rather than a file.
+        assert_eq!(
+            runtime.session_taint.cause(&session),
+            Some(TaintCause::UnknownShell),
+            "the sentinel path is what makes this pin liftable (cause_of)"
+        );
+    }
+
+    /// **AC-12 — the 2026-09-04 cost shape cannot recur.**
+    ///
+    /// The REQ's headline claim, and the one the description says was
+    /// *inferred* from `cost.db` rather than observed: one to four `kimi-k3`
+    /// rows, then dozens of `qwen3-coder-30b-a3b` rows, in session after
+    /// session.
+    ///
+    /// The four commands AC-12 scripts — `pwd`, `ls -la`, `git status`,
+    /// `git log -3` — are the ones a model runs while orienting itself, and
+    /// every one of them used to pin the session on the first call. Here they
+    /// leave it unpinned, so every turn is routed by category. A fifth prompt
+    /// running `cargo test` pins it (BR-1(e): a build tool can read anything),
+    /// and `/shell allow` restores routing for a sixth.
+    ///
+    /// **Written against the classifier rather than a live six-prompt daemon**,
+    /// because what decides the shape is the verdict: the routing consequence
+    /// of a verdict is `RoutePin`'s, and `every_pinned_route_site_reads_the_
+    /// composed_predicate` already pins that all seven sites read it. A daemon
+    /// fixture here would re-test those two facts through six process spawns.
+    ///
+    /// **Mutation**: stub `classify` back to a constant `Unknown` — the
+    /// pre-REQ-614 behaviour — and the first loop fails on `pwd`, which is
+    /// exactly the 2026-09-04 shape reappearing.
+    #[test]
+    fn the_2026_09_04_cost_shape_cannot_recur() {
+        use crate::harness::tools::shell_provenance::{classify, VerdictKind};
+        use teton_core::config::DEFAULT_BOUNDARIES;
+        use teton_core::entities::PrivacyBoundary;
+        use teton_protocol::methods::RootKind;
+
+        let root = std::env::temp_dir().join(format!("teton-ac12-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).expect("fixture root");
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("a file");
+        let bounds: Vec<PrivacyBoundary> = DEFAULT_BOUNDARIES
+            .iter()
+            .map(|g| PrivacyBoundary::builtin(*g))
+            .collect();
+
+        let runtime = DaemonRuntime::minimal();
+        let events = Arc::new(EventBus::new());
+        let session = SessionId::from("ac12");
+
+        // Prompts 1-4: the orienting commands. Every one is provably rooted, so
+        // nothing pins and every agent turn routes by category — the remote
+        // provider the user configured.
+        for command in ["pwd", "ls -la", "git status", "git log -3"] {
+            let verdict = classify(&root, RootKind::Project, &bounds, Vec::new(), command);
+            assert_eq!(
+                verdict.kind,
+                VerdictKind::Rooted,
+                "AC-12: `{command}` must not pin the session ({})",
+                verdict.reason
+            );
+            assert!(
+                !runtime.route_pin().pins(&session),
+                "AC-12: the session is still routed by category after `{command}`"
+            );
+        }
+
+        // Prompt 5: `cargo test`. A build tool can read anything, so BR-1(e)
+        // makes it unknown — and unknown pins, liftably.
+        let build = classify(&root, RootKind::Project, &bounds, Vec::new(), "cargo test");
+        assert_eq!(build.kind, VerdictKind::Unknown, "{}", build.reason);
+        runtime
+            .session_taint
+            .mark(&session, TaintCause::UnknownShell);
+        assert!(
+            runtime.route_pin().pins(&session),
+            "AC-12: the fifth prompt pins the session"
+        );
+
+        // Prompt 6: the lift, then routing by category again.
+        let lifted = runtime.shell_override(
+            &ShellOverrideParams {
+                session_id: session.clone(),
+            },
+            &events,
+        );
+        assert!(lifted.lifted_now);
+        assert_eq!(
+            runtime.ledger.all_shell_overrides().expect("read").len(),
+            1,
+            "AC-12: one ledger row for the one lift"
+        );
+        assert!(
+            !runtime.route_pin().pins(&session),
+            "AC-12: the sixth prompt's rows go to the remote provider again"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+}

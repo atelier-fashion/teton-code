@@ -1,7 +1,7 @@
 ---
 id: TASK-397
 title: "End-to-end — egress capture for the three verdicts and the cost.db shape that cannot recur"
-status: draft
+status: complete
 parent: REQ-614
 created: 2026-09-04
 updated: 2026-09-04
