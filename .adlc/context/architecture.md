@@ -450,7 +450,9 @@
   keys the user never wrote, while a report whose whole job is distinguishing
   two origins must state both. **The consequence to carry forward**: switching
   a default on activates every path that was gated on "does any boundary
-  exist?" — `context_is_sensitive` short-circuits on an empty list, so REQ-585's
+  exist?" — `context_taint_cause` (REQ-597's `context_is_sensitive`, which
+  REQ-614 replaced with a cause-returning derivation) short-circuits on an
+  empty list, so REQ-585's
   *unpinnable* provenance (a skill's command output, a skill file outside the
   root) went from failing closed only for users who had configured boundaries
   to failing closed for everyone. The reach of a default is not its list; it is

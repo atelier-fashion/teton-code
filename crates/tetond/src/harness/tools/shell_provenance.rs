@@ -1072,6 +1072,58 @@ mod tests {
         std::fs::remove_dir_all(&clean).ok();
     }
 
+    /// A symlink to a boundary file is a boundary touch, and a symlink out of
+    /// the root is not rooted.
+    ///
+    /// LESSON-550's recurrence class: REQ-585 closed a symlink escape at the
+    /// leaf and REQ-587 found it again one level up. The property that makes
+    /// this safe here is that `resolve_token` goes through
+    /// `canonical_through_existing_ancestor` — the same resolution
+    /// `ToolContext::resolve` uses — so containment and the glob match are both
+    /// decided on the **resolved** path, never on the spelling. Asserted rather
+    /// than assumed, because "it canonicalizes" is exactly the kind of claim
+    /// that stays true right up until a refactor takes the call out.
+    #[test]
+    fn a_symlink_is_resolved_before_the_glob_and_the_root_check() {
+        #[cfg(unix)]
+        {
+            let root = project_root("symlink");
+            std::fs::write(root.join(".env"), "K=v\n").unwrap();
+            let outside = std::env::temp_dir().join("teton-symlink-outside-614");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("notes.txt"), "x").unwrap();
+
+            // A link INSIDE the root pointing at a boundary file inside it.
+            let to_env = root.join("innocent.txt");
+            std::os::unix::fs::symlink(root.join(".env"), &to_env).unwrap();
+            let v = verdict(&root, "cat innocent.txt");
+            assert_eq!(
+                v.kind,
+                VerdictKind::BoundaryTouch,
+                "a symlink to `.env` must resolve to `.env` before the glob runs ({})",
+                v.reason
+            );
+
+            // A link INSIDE the root pointing OUT of it.
+            let escape = root.join("escape.txt");
+            std::os::unix::fs::symlink(outside.join("notes.txt"), &escape).unwrap();
+            let out = verdict(&root, "cat escape.txt");
+            assert_eq!(
+                out.kind,
+                VerdictKind::Unknown,
+                "a symlink out of the root is not rooted ({})",
+                out.reason
+            );
+            assert_eq!(
+                out.reason,
+                "a path argument resolves outside the session root"
+            );
+
+            std::fs::remove_dir_all(&root).ok();
+            std::fs::remove_dir_all(&outside).ok();
+        }
+    }
+
     /// AC-9's other half: the opaque set is one pinned table. A verb removed
     /// from it must be caught here rather than silently becoming `Unknown` by
     /// the fallthrough — which would pass every other test in this module.

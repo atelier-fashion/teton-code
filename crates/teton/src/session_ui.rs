@@ -5372,11 +5372,16 @@ mod tests {
                     phase,
                     provider_id: ProviderId::from("local"),
                     model: Some("qwen2.5-coder-7b".to_owned()),
-                    // The daemon's own `taint_pin_reason` sentence, verbatim. It
-                    // names no specific cause since REQ-562 — the pin has three
-                    // sources and only one of them is boundary content — and
-                    // this renderer keys on the absent category/tier rather than
-                    // on the wording, which is what the assertions below check.
+                    // The daemon's own pin sentence, verbatim. Since REQ-614 it
+                    // is `taint_pin_reason_for` and it **does** name the cause
+                    // (and, for a liftable pin, the remedy) — but this renderer
+                    // keys on the absent category/tier rather than on the
+                    // wording, which is what the assertions below check and why
+                    // the wording change did not reach here. The literal below
+                    // is deliberately the pre-REQ-614 spelling: it is a fixture
+                    // for "some pinned-route reason", not a copy of the daemon's
+                    // current sentence, and pinning it to the live wording would
+                    // make this a second place that has to be kept in step.
                     reason: "an earlier privacy decision in this session; this turn is \
                              pinned to the local tier (BR-1 backstop)"
                         .to_owned(),
