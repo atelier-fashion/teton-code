@@ -3,14 +3,16 @@
   "branch": "feat/REQ-613-generate-teton-md-when-absent",
   "startedAt": "2026-09-03T23:34:45Z",
   "completed": false,
-  "currentPhase": 6,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
     2,
     3,
     4,
-    5
+    5,
+    6,
+    7
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -49,6 +51,19 @@
       "name": "Verify (6-agent review + fix pass + 3-agent confirm)",
       "completedAt": "2026-09-04T12:52:48Z",
       "verdict": "PASS \u2014 pre-pass failed (no candidates); quality/architecture reached no-findings then stalled, security relaunched scoped, reflector run in-context. Fix pass 50fd9b0: 1 critical (durable switch after the walk), 4 major correctness (force load-back data loss, per-process scratch name, init without a claim, present-file reported as failed), 3 major security (dead symlink guard on evidence, raw evidence in the prompt, scratch unlink of a foreign temp), 8 minor. Confirmation loop: all resolved; follow-up commit adds the exhaustion leg, a serial lock between two tests and a stale doc. Recorded not fixed: listing names bypass provenance (REQ-583 OQ-7), always skips the gate (BR-2), absolute paths on daemon stderr, route resolved ahead of the SwitchedOff short-circuit (health read only). No user-facing questions."
+    },
+    {
+      "phase": 6,
+      "name": "Create Pull Request",
+      "completedAt": "2026-09-04T12:53:09Z",
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/283",
+      "notes": "draft opened at Step 0, body filled and marked ready after Phase 5"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-09-04T12:55:43Z",
+      "notes": "PR body filled, marked ready; six of eight checks green on 3e5916d with the two fmt\u00b7clippy\u00b7test matrices running; the merge in Phase 8 waits on all eight green on the final tip; trial-merge against origin/main clean, 0 commits behind"
     }
   ],
   "repos": {
