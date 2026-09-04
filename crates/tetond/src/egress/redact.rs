@@ -457,13 +457,13 @@ pub(crate) const REDACT_ESCAPING_DIVISOR: usize = 10;
 /// whole-KiB move with a scannable-bound consequence, and it belongs to a REQ
 /// that means to make it rather than to one that needed two sentences.
 ///
-/// **REQ-617 spends 540 of the margin and moves nothing here.** The constant
-/// stays at 23 KiB and every figure derived from it — the chunk count, the input
-/// cap, the scannable bound, the max chunks — is untouched. That is the whole
-/// point of recording it: the roster fit, so the ceiling did not have to move,
-/// and the next REQ inherits the same arithmetic rather than a re-derivation.
+/// **REQ-617 spends 343 bytes of margin and does NOT move this constant
+/// either.** The ceiling stays at 23 KiB and every figure derived from it — the
+/// chunk count, the input cap, the scannable bound, the max chunks — is
+/// untouched, so the next REQ inherits this arithmetic rather than a
+/// re-derivation.
 ///
-/// Where the 540 went (`RECORDED_PROMPT_MARGIN_BYTES` 733 → 193):
+/// Where the 343 went (`RECORDED_PROMPT_MARGIN_BYTES` 455 → 112):
 ///
 /// ```text
 ///   the `teton_docs` topic index, twice          23   `commands` and `transcript`
@@ -471,13 +471,13 @@ pub(crate) const REDACT_ESCAPING_DIVISOR: usize = 10;
 ///                                                     schema (`One of: …`) and 1
 ///                                                     net in the description,
 ///                                                     whose frame paid the rest
-///   the guide's command roster                  517   29 names grouped by family,
-///                                                     BR-1's closing sentence, and
-///                                                     BR-3's session-state ending,
-///                                                     folded INTO the existing
-///                                                     capability line rather than
-///                                                     added as a second one
-///   = what the prompt actually pays             540
+///   the guide's command roster                   320   17 command families, BR-1's
+///                                                     closing sentence and BR-3's
+///                                                     session-state ending, folded
+///                                                     INTO the existing capability
+///                                                     line rather than added as a
+///                                                     second one
+///   = what the prompt actually pays              343
 /// ```
 ///
 /// **The fold is the load-bearing part and it was not optional.** The roster
@@ -491,9 +491,24 @@ pub(crate) const REDACT_ESCAPING_DIVISOR: usize = 10;
 /// diff than the one first written; worth saying, because the reflex on a red
 /// count assertion is to raise the count.
 ///
-/// 193 leaves 145 of usable room above the 48-byte floor, the tightest this has
-/// been since REQ-612's raise. REQ-615 spends from the same margin in the same
-/// sprint and should expect to shorten something or make the ceiling case.
+/// **The roster was cut a second time, and by 197 bytes, because REQ-615 landed
+/// first.** Written against the 733 this REQ started from, the roster spent 540
+/// and left 193. REQ-615 then merged, taking 278 of the same margin, and 733 −
+/// 278 − 540 = −85: the two additions together did not fit, and the rebase's
+/// `spent < REDACT_BODY_OVERHEAD_BYTES` assertion said so before the floor ever
+/// got a chance to. The relief was taken out of *this* REQ's own sentence rather
+/// than out of the ceiling — the 29 names collapsed to 17 families with
+/// `teton_docs commands` carrying the sub-commands and effects, and BR-3's
+/// ending lost the parenthetical that re-listed five switches the roster three
+/// clauses earlier already names. `/help`, `/cd`, `/transcript` and `/context`
+/// stay spelled out: they are the commands the originating transcript's defect
+/// was about.
+///
+/// 112 leaves 64 of usable room above the 48-byte floor, the tightest this pin
+/// has ever recorded — tighter than the 81 it was introduced at. The next REQ to
+/// add a sentence here will not fit it, and should expect to make the ceiling
+/// case rather than to shorten a third prompt: two REQs in one sprint have now
+/// paid for the ceiling's stability with their own words.
 ///
 /// `pub(crate)` because the *other* prompt shape has to clear it too and cannot
 /// be built from here: with `[web] tier` above `off` the system prompt carries
@@ -548,14 +563,16 @@ pub(crate) const MIN_PROMPT_HEADROOM_BYTES: usize = 48;
 /// edit that cost 20 of them was a fifth of what was left and had to announce
 /// itself.
 ///
-/// REQ-615 leaves **455**, and therefore 407 of usable room. REQ-612's raise had
-/// left **733** and therefore 685, which was
-/// the loosest this has been since the pin was written — an artefact of the
-/// overhead moving in whole KiB while the prompt moves in sentences, not a
-/// decision to relax. The pin earns its keep at any margin for the *other*
-/// reason: it is what says the resident prompt moved. Drift is what went
-/// unnoticed for six REQs (BUG-193), and drift is invisible at 733 exactly as
-/// it was at 129.
+/// REQ-617 leaves **112**, and therefore 64 of usable room — less than the 81
+/// this pin was introduced at, and the tightest it has recorded. REQ-615 had
+/// left 455 (407 usable) and REQ-612's raise 733 (685), the loosest this has
+/// been since the pin was written — an artefact of the overhead moving in whole
+/// KiB while the prompt moves in sentences, not a decision to relax. The pin
+/// earns its keep at any margin for the *other* reason: it is what says the
+/// resident prompt moved. Drift is what went unnoticed for six REQs (BUG-193),
+/// and drift is invisible at 733 exactly as it was at 129 — and at 112 the pin
+/// is doing the floor's job a sentence early, which is the posture a REQ that
+/// wants room should read as "make the ceiling case".
 ///
 /// # Updating it
 ///
@@ -563,7 +580,7 @@ pub(crate) const MIN_PROMPT_HEADROOM_BYTES: usize = 48;
 /// last time. Add a ledger line to [`REDACT_BODY_OVERHEAD_BYTES`] saying which
 /// REQ spent the bytes, then move this number in the same diff.
 #[cfg(test)]
-pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 193;
+pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 112;
 
 /// The same pin for the **web-enabled** prompt shape measured by
 /// `harness::tools::web::tests::the_web_tool_docs_clear_the_outbound_body_overhead`.
@@ -575,7 +592,7 @@ pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 193;
 /// holds the budget vocabulary, so the two shapes cannot come to disagree about
 /// which constant they are measuring against.
 #[cfg(test)]
-pub(crate) const RECORDED_WEB_PROMPT_MARGIN_BYTES: usize = 240;
+pub(crate) const RECORDED_WEB_PROMPT_MARGIN_BYTES: usize = 159;
 
 /// The gap between the two recorded margins, pinned (REQ-617).
 ///

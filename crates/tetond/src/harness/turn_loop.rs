@@ -39,22 +39,10 @@ use serde_json::Value;
 
 use teton_inference::{ChatFormat, Engine, EngineError, GenParams};
 use teton_protocol::events::{
-    CapabilityDeadEnd,
-    CompactedBlock,
-    CompactedBlockKind,
-    ContextCompacted,
-    ContextPressure,
-    ContextPressureKind,
-    Event,
-    PrefixCache,
-    ProvenanceClass as WireProvenanceClass,
-    SessionUpdate,
-    SessionUpdatePayload,
-    ShellDutySkipped,
-    ToolCallRepeated,
-    ToolCallStatus,
-    TurnRefusedAnchorsExceedBudget,
-    COMPACTED_BLOCKS_LISTED,
+    CapabilityDeadEnd, CompactedBlock, CompactedBlockKind, ContextCompacted, ContextPressure,
+    ContextPressureKind, Event, PrefixCache, ProvenanceClass as WireProvenanceClass, SessionUpdate,
+    SessionUpdatePayload, ShellDutySkipped, ToolCallRepeated, ToolCallStatus,
+    TurnRefusedAnchorsExceedBudget, COMPACTED_BLOCKS_LISTED,
 };
 use teton_protocol::methods::{SessionRoot, StopReason};
 use teton_protocol::{ProviderId, SessionId};

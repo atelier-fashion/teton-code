@@ -1795,62 +1795,59 @@ fn route_for(bound: BudgetBound, verdict: WindowVerdict) -> (Fixture, Option<Moc
             (fx, Some(provider))
         }
         (BudgetBound::Window, WindowVerdict::FitsWindow) => {
-            // 31,000 declared. The body is over budget in **bytes only**, and
-            // half the measured bytes still sit under the raw window — the band
-            // this cell lives in is
-            // `(window − reservation) × 2 < measured ≤ window × 2`.
+            // 32,000 declared. The body is over budget in **bytes only**, and
+            // half the measured bytes still sit under the raw window — the lower
+            // edge of the band this cell lives in is `measured ≤ window × 2`.
             //
             // It was 20,000 declared with a 31,000-byte body until REQ-612
             // raised `MIN_BUDGET_BYTES` to 50,000: that floored the 20,000-token
             // route to (12,650, 50,000), and a body inside the old band was no
             // longer over budget at all, so the cell stopped producing an offer.
-            // 30,000 is the narrowest round window that is **not** floored.
+            // 30,000 was then the narrowest round window that is **not** floored.
             //
             // The body was 51,700 bytes until REQ-615, which added 278 bytes to
             // the resident system prompt (176 for the `shell` tool's cwd
             // sentence, 102 because BR-3's dictation made the worst-case
             // environment-block row the home one). That pushed `measured` from
             // 59,779 to 60,057 — 57 bytes past `window × 2` — and the cell
-            // reported `ExceedsWindow`.
+            // reported `ExceedsWindow`. REQ-615 re-centred the *body* on 50,600
+            // rather than nudging the window.
             //
-            // **Re-centred rather than nudged.** The framing overhead between
-            // the body and `measured` is 8,357 bytes, so the band admits a body
-            // in (49,595, 51,643]; 50,600 sits near its middle with ~1 KiB of
-            // clearance on each side, where 51,700 had 221 bytes above it. Two
-            // REQs in a row have moved this cell by growing the prompt, and the
-            // next one should not have to.
+            // **REQ-617 is the third REQ in a row to move this cell, and it
+            // moved the window instead of the body, 30,000 → 32,000.**
+            // `measured` is the whole prompt, not just the body, so *any* growth
+            // in the resident system prompt pushes `claimed_provider_tokens` —
+            // `max(words × 3/2, bytes / 2)` — toward the window. This REQ spends
+            // 343 bytes on the command roster (see
+            // `egress::redact::REDACT_BODY_OVERHEAD_BYTES`), and at 30,000 that
+            // left roughly 400 bytes between `measured` and `window × 2`.
             //
-            // 30,000 was then the narrowest round window that is **not** floored.
+            // **The band was re-probed rather than reasoned about, and it is far
+            // wider than this comment used to claim.** Sweeping the declared
+            // window with everything else held fixed: 29,600 fails
+            // (`ExceedsWindow`), 29,800 through 100,000 pass, and 150,000 fails
+            // the other way — by then the derived budget has grown past the body
+            // and there is no over-budget offer left to make. The old note here
+            // said the band was one thousand tokens wide; REQ-616's window work
+            // and REQ-586's derived budget have widened it, and the figure was
+            // never re-measured. 32,000 sits ~2,200 tokens above the lower edge
+            // — room for another ~4 KB of prompt growth — with the upper edge
+            // three times further away than the whole span this cell has ever
+            // moved through.
             //
-            // **REQ-617 moved it again, 30,000 → 31,000, and this is the second
-            // re-tune for the same underlying cause.** `measured` is the whole
-            // prompt, not just the body, so *any* growth in the resident system
-            // prompt pushes `claimed_provider_tokens` — `max(words × 3/2,
-            // bytes / 2)` — toward the window. REQ-617 spent 540 bytes on the
-            // command roster, which is 270 tokens on the bytes arm, and that was
-            // enough to flip the verdict to `ExceedsWindow`.
-            //
-            // **The band is one thousand tokens wide, measured.** 31,000 passes;
-            // 32,000 fails, because by then the derived budget has grown past
-            // the body and there is no over-budget offer to make at all. Shrinking
-            // the body does not help — it moves the lower edge of the band down
-            // with it. So the only free variable is the window.
-            //
-            // **This will break again on the next prompt edit** (REQ-615 is
-            // spending from the same margin as this REQ). The durable fix is to
-            // size the fixture *relative to* the budget `derive` produces for the
-            // route rather than as two absolute constants, which would let it
-            // track prompt growth on its own; that is a change to this file's
-            // whole `Spec` shape and is deliberately not made here. Recorded so
-            // the third person to hit it does not have to re-derive any of the
-            // above.
+            // The durable fix is still to size the fixture *relative to* the
+            // budget `derive` produces for the route rather than as two absolute
+            // constants, which would let it track prompt growth on its own; that
+            // is a change to this file's whole `Spec` shape and is deliberately
+            // not made here. Recorded so the fourth person to hit it does not
+            // have to re-derive any of the above.
             let provider = vendor();
             let fx = Fixture::new(Spec::new(
                 "v6wfit",
                 remote_route(
                     &provider.openai_endpoint(),
                     UNRECOGNIZED_MODEL,
-                    Some(31_000),
+                    Some(32_000),
                     None,
                 ),
                 sized_body(10_000, 50_600),
