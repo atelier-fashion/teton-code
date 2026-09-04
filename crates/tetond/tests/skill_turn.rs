@@ -3665,6 +3665,10 @@ async fn an_expansion_past_the_digest_threshold_is_folded_whole_where_an_ordinar
             is_local: false,
             redact_scan: false,
             provider_id: Some("mock"),
+            // REQ-616: the engine's own allocation, which a remote route
+            // ignores. Zero is the no-engine case and is what a remote row
+            // carries.
+            local_window: 0,
         });
         assert!(
             BODY_BYTES > budget.digest_threshold_bytes,
