@@ -360,6 +360,7 @@ pub fn render_list(list: &ModelListResult, surface: &mut dyn Surface) {
     render_catalog_rows(
         &list.models,
         selected_name(list.selection.as_ref()),
+        served_window(list.selection.as_ref()),
         surface,
     );
     render_selection(list.selection.as_ref(), surface);
@@ -492,9 +493,62 @@ fn install_words(install: Option<&InstallStateView>, selected: &str) -> &'static
 /// The numbered catalog rows, marking the current selection and each entry's
 /// fit. The fits are the daemon's (`model/list` computes them against the probe)
 /// so every client renders the same verdict rather than re-deriving it.
+/// The window and KV type the engine is actually serving, when a load has
+/// recorded them (REQ-616 BR-10).
+///
+/// Read off the recorded selection rather than re-derived: the probe's inputs
+/// can change between a load and this listing, so re-running it would report
+/// what the daemon *would* choose rather than what it is serving.
+#[must_use]
+fn served_window(selection: Option<&ModelSelectionView>) -> Option<(u32, &str)> {
+    let selection = selection?;
+    Some((selection.served_n_ctx?, selection.kv_cache_type.as_deref()?))
+}
+
+/// A count with thousands separators, shared with every other surface that
+/// prints a window so they cannot disagree about the grouping.
+fn thousands(n: u64) -> String {
+    teton_protocol::events::thousands(n)
+}
+
+/// BR-10's clause: what a model was trained for, and what this machine will
+/// actually serve it at.
+///
+/// The two are only the same number on a machine that can hold the trained
+/// window, and on any other machine printing one of them alone invites the
+/// wrong conclusion — either "my model is small" (trained only) or "this model
+/// has a 65k window" (served only). So both appear, and the served figure only
+/// where it is *known*: it is a record of a load that happened, not a
+/// prediction, and the daemon has one only for the model it actually loaded.
+///
+/// Pure over its three inputs so the sentence can be table-tested without a
+/// daemon or a surface.
+#[must_use]
+fn window_clause(
+    n_ctx_train: Option<u32>,
+    served: Option<(u32, &str)>,
+    is_selected: bool,
+) -> String {
+    let Some(trained) = n_ctx_train else {
+        // The catalog states no trained window. Saying nothing is right: a
+        // clause reading "trained —" is noise, and inventing a figure would be
+        // worse (REQ-557 ADR-D).
+        return String::new();
+    };
+    match served.filter(|_| is_selected) {
+        Some((n_ctx, kv)) => format!(
+            " — trained {} · served {} (KV {kv})",
+            thousands(u64::from(trained)),
+            thousands(u64::from(n_ctx)),
+        ),
+        None => format!(" — trained {}", thousands(u64::from(trained))),
+    }
+}
+
 fn render_catalog_rows(
     models: &[ModelListEntry],
     selected: Option<&str>,
+    served: Option<(u32, &str)>,
     surface: &mut dyn Surface,
 ) {
     if models.is_empty() {
@@ -502,11 +556,8 @@ fn render_catalog_rows(
         return;
     }
     for (index, model) in models.iter().enumerate() {
-        let marker = if selected == Some(model.entry.name.as_str()) {
-            "*"
-        } else {
-            " "
-        };
+        let selected_here = selected == Some(model.entry.name.as_str());
+        let marker = if selected_here { "*" } else { " " };
         let mut notes = Vec::new();
         if !model.fits_ram {
             notes.push("above this machine's RAM");
@@ -522,12 +573,13 @@ fn render_catalog_rows(
         surface.line(
             LineKind::Info,
             &format!(
-                "{marker} {}. {} [{}] — {} download, needs {} RAM — {fit}",
+                "{marker} {}. {} [{}] — {} download, needs {} RAM — {fit}{}",
                 index + 1,
                 model.entry.name,
                 firstrun::tier_label(model.entry.band),
                 firstrun::format_bytes(model.entry.size_bytes),
                 firstrun::format_bytes(model.entry.ram_floor_bytes),
+                window_clause(model.entry.n_ctx_train, served, selected_here),
             ),
         );
     }
@@ -553,6 +605,19 @@ fn render_selection(selection: Option<&ModelSelectionView>, surface: &mut dyn Su
         },
     };
     surface.line(LineKind::Info, &text);
+    // REQ-616 BR-10: what the engine is actually serving, on its own line so it
+    // is legible beside the decision rather than crammed into it. Absent until a
+    // load records one — a status line that guessed would be reporting a
+    // prediction as a fact.
+    if let Some((n_ctx, kv)) = served_window(selection) {
+        surface.line(
+            LineKind::Info,
+            &format!(
+                "context:   {} tokens (KV {kv})",
+                thousands(u64::from(n_ctx))
+            ),
+        );
+    }
 }
 
 /// The selected model's name, when one is selected.
@@ -609,6 +674,7 @@ pub(crate) mod testing {
             band,
             size_bytes,
             ram_floor_bytes,
+            n_ctx_train: Some(32_768),
             provenance: CatalogProvenance {
                 repo: format!("Qwen/{name}-GGUF"),
                 host: "huggingface.co".to_owned(),
@@ -1083,6 +1149,8 @@ mod tests {
         list.selection = Some(ModelSelectionView {
             model_name: Some("qwen2.5-coder-7b".to_owned()),
             source: SelectionSource::UserOverride,
+            kv_cache_type: None,
+            served_n_ctx: None,
             declined_local: false,
             decided_at_ms: 1_700_000_000_000,
         });
@@ -1118,6 +1186,8 @@ mod tests {
         list.selection = Some(ModelSelectionView {
             model_name: None,
             source: SelectionSource::UserOverride,
+            kv_cache_type: None,
+            served_n_ctx: None,
             declined_local: true,
             decided_at_ms: 1,
         });
@@ -1134,6 +1204,8 @@ mod tests {
                 source: SelectionSource::Probe,
                 declined_local: false,
                 decided_at_ms: 1,
+                kv_cache_type: None,
+                served_n_ctx: None,
             }),
             install: Some(InstallStateView {
                 model_name: "qwen2.5-coder-7b".to_owned(),
@@ -1218,6 +1290,8 @@ mod tests {
             source,
             declined_local: false,
             decided_at_ms: 1,
+            kv_cache_type: None,
+            served_n_ctx: None,
         }
     }
 
@@ -1310,6 +1384,8 @@ mod tests {
             Some(ModelSelectionView {
                 model_name: None,
                 source: SelectionSource::UserOverride,
+                kv_cache_type: None,
+                served_n_ctx: None,
                 declined_local: true,
                 decided_at_ms: 1,
             }),
@@ -1339,6 +1415,8 @@ mod tests {
                 source: SelectionSource::ConfigPin,
                 declined_local: false,
                 decided_at_ms: 1,
+                kv_cache_type: None,
+                served_n_ctx: None,
             }),
             None,
         );
@@ -1427,5 +1505,84 @@ mod tests {
                 "answers: {answers:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod window_clause_tests {
+    use super::*;
+    use teton_protocol::events::SelectionSource;
+
+    /// BR-10: the listing states both windows for the selected model, and only
+    /// the trained one for the rest.
+    ///
+    /// The distinction is the point. `served` is a record of a load that
+    /// happened, and only one model has been loaded — printing it against every
+    /// row would claim the daemon had loaded them all.
+    #[test]
+    fn list_states_trained_and_served_windows() {
+        let selected = window_clause(Some(262_144), Some((262_144, "q8_0")), true);
+        assert_eq!(selected, " — trained 262,144 · served 262,144 (KV q8_0)");
+
+        // Same machine, a different catalog row: trained only.
+        let other = window_clause(Some(32_768), Some((262_144, "q8_0")), false);
+        assert_eq!(other, " — trained 32,768");
+    }
+
+    /// A machine that cannot hold the trained window says so by showing two
+    /// different numbers — which is the case the clause exists for.
+    #[test]
+    fn a_fitted_window_shows_both_figures_differing() {
+        let clause = window_clause(Some(262_144), Some((65_536, "q8_0")), true);
+        assert!(clause.contains("trained 262,144"));
+        assert!(clause.contains("served 65,536"));
+        assert_ne!(
+            clause,
+            window_clause(Some(262_144), Some((262_144, "q8_0")), true),
+            "a fitted window must not render identically to a full one"
+        );
+    }
+
+    /// No load recorded yet, and no trained window declared: neither invents a
+    /// figure (REQ-557 ADR-D).
+    #[test]
+    fn absent_facts_are_absent_rather_than_guessed() {
+        assert_eq!(
+            window_clause(Some(262_144), None, true),
+            " — trained 262,144"
+        );
+        assert_eq!(window_clause(None, Some((262_144, "q8_0")), true), "");
+        assert_eq!(window_clause(None, None, false), "");
+    }
+
+    /// `served_window` needs *both* halves: a record carrying a window but no KV
+    /// type (or the reverse) is incomplete and reports nothing rather than half
+    /// a sentence.
+    #[test]
+    fn served_window_needs_both_halves() {
+        let base = ModelSelectionView {
+            model_name: Some("m".to_owned()),
+            source: SelectionSource::UserOverride,
+            declined_local: false,
+            decided_at_ms: 1,
+            kv_cache_type: None,
+            served_n_ctx: None,
+        };
+        assert_eq!(served_window(Some(&base)), None);
+
+        let mut window_only = base.clone();
+        window_only.served_n_ctx = Some(262_144);
+        assert_eq!(served_window(Some(&window_only)), None);
+
+        let mut kv_only = base.clone();
+        kv_only.kv_cache_type = Some("q8_0".to_owned());
+        assert_eq!(served_window(Some(&kv_only)), None);
+
+        let mut both = base;
+        both.served_n_ctx = Some(262_144);
+        both.kv_cache_type = Some("q8_0".to_owned());
+        assert_eq!(served_window(Some(&both)), Some((262_144, "q8_0")));
+
+        assert_eq!(served_window(None), None);
     }
 }

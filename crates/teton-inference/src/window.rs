@@ -133,9 +133,16 @@ impl KvCacheType {
 pub const ADMISSIBLE_RAM_PERCENT: u64 = 75;
 
 /// The bytes of `physical` RAM the daemon may plan to occupy.
+///
+/// Multiplies **before** dividing. The other order (`physical / 100 * percent`)
+/// silently discards up to 99 × percent bytes — on a 48 GiB machine it lands 39
+/// bytes below `36 GiB`, which is harmless in itself but makes every figure
+/// derived from it un-checkable against a round number. Overflow is not
+/// reachable: `u64::MAX / 100` is ~184 petabytes of RAM.
 #[must_use]
 pub const fn admissible_bytes(physical_bytes: u64) -> u64 {
     physical_bytes / 100 * ADMISSIBLE_RAM_PERCENT
+        + physical_bytes % 100 * ADMISSIBLE_RAM_PERCENT / 100
 }
 
 /// A stated allowance for llama.cpp's compute buffers: **1 GiB**.
@@ -666,6 +673,21 @@ mod tests {
     /// assertion is written as the band rather than as the number so that
     /// moving the constant out of range fails here rather than in a distant
     /// table.
+    /// The fraction is exact on a round machine: 75 % of 48 GiB is 36 GiB, to
+    /// the byte.
+    ///
+    /// Mutation: revert to `physical / 100 * percent` and this fails by 39
+    /// bytes — the slip that made every derived figure un-checkable against a
+    /// round number.
+    #[test]
+    fn admissible_bytes_is_exact_on_round_machines() {
+        assert_eq!(admissible_bytes(48 * GIB), 36 * GIB);
+        assert_eq!(admissible_bytes(96 * GIB), 72 * GIB);
+        assert_eq!(admissible_bytes(32 * GIB), 24 * GIB);
+        assert_eq!(admissible_bytes(16 * GIB), 12 * GIB);
+        assert_eq!(admissible_bytes(0), 0);
+    }
+
     #[test]
     fn admissible_fraction_is_inside_the_band_ac5_implies() {
         let physical = 48 * GIB;

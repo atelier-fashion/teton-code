@@ -106,6 +106,40 @@ impl SelectionStore {
         write_atomically(path, &text)
     }
 
+    /// Record what the engine was actually loaded with (REQ-616 AC-11).
+    ///
+    /// Updates the two window fields on the decision already in force, leaving
+    /// every other field alone: this is not a new decision, it is the outcome of
+    /// acting on the existing one. A no-op when nothing is recorded yet, because
+    /// there is no decision for a load to be the outcome *of* — and inventing a
+    /// `ModelSelection` here would fabricate a consent nobody gave.
+    ///
+    /// # Errors
+    /// Returns a [`SelectionStoreError`] if the record could not be encoded or
+    /// written. As with [`Self::record`], the in-memory view is updated either
+    /// way so a read-only state directory still reports what is being served.
+    pub fn record_window(
+        &self,
+        kv_cache_type: &str,
+        served_n_ctx: u32,
+    ) -> Result<(), SelectionStoreError> {
+        let updated = {
+            let mut cached = self.cached.lock().expect("selection store mutex poisoned");
+            let Some(selection) = cached.as_mut() else {
+                return Ok(());
+            };
+            selection.kv_cache_type = Some(kv_cache_type.to_owned());
+            selection.served_n_ctx = Some(served_n_ctx);
+            selection.clone()
+        };
+
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let text = toml::to_string(&updated).map_err(|_| SelectionStoreError::Encode)?;
+        write_atomically(path, &text)
+    }
+
     /// Forget the recorded decision (the daemon re-proposes on the next start).
     ///
     /// Used by `model/set`-style flows that deliberately re-open the question;
@@ -254,5 +288,84 @@ mod tests {
         let text = std::fs::read_to_string(dir.join(SELECTION_FILE)).unwrap();
         assert!(!text.contains('/'), "record leaked a path: {text}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod window_record_tests {
+    use super::*;
+    use teton_core::entities::SelectionSource;
+
+    /// AC-11: the window facts round-trip through `model-selection.toml`, and a
+    /// file written before REQ-616 still parses with them absent.
+    ///
+    /// The backward-compatibility half is the one that matters: this file is
+    /// persisted state written by earlier releases, so a required field would
+    /// make every existing install unreadable.
+    ///
+    /// Mutation: drop `#[serde(default)]` from either new field and the
+    /// old-file case fails to parse.
+    #[test]
+    fn kv_cache_type_round_trips_and_old_files_read_none() {
+        let dir =
+            std::env::temp_dir().join(format!("teton-req616-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let store = SelectionStore::open(&dir);
+
+        store
+            .record(&ModelSelection::accepted(
+                "qwen3-coder-30b-a3b",
+                SelectionSource::UserOverride,
+                now_ms(),
+            ))
+            .expect("record the decision");
+        // Before any load, nothing is served.
+        assert_eq!(store.current().unwrap().kv_cache_type, None);
+        assert_eq!(store.current().unwrap().served_n_ctx, None);
+
+        store.record_window("q8_0", 262_144).expect("record window");
+        let after = store.current().expect("still recorded");
+        assert_eq!(after.kv_cache_type.as_deref(), Some("q8_0"));
+        assert_eq!(after.served_n_ctx, Some(262_144));
+        // The decision itself is untouched — this is the outcome of acting on
+        // it, not a new decision.
+        assert_eq!(after.model_name.as_deref(), Some("qwen3-coder-30b-a3b"));
+        assert!(!after.declined_local);
+
+        // It survives a reopen, which is what "recorded" has to mean.
+        let reopened = SelectionStore::open(&dir);
+        assert_eq!(
+            reopened.current().unwrap().served_n_ctx,
+            Some(262_144),
+            "the window must survive a daemon restart"
+        );
+
+        // A file written before REQ-616 has neither key and still parses.
+        let old = "model_name = \"qwen3-coder-30b-a3b\"\n\
+                   source = \"user_override\"\n\
+                   declined_local = false\n\
+                   decided_at_ms = 1\n";
+        std::fs::write(dir.join(SELECTION_FILE), old).expect("write an old-format file");
+        let legacy = SelectionStore::open(&dir);
+        let read = legacy.current().expect("an old file must still parse");
+        assert_eq!(read.model_name.as_deref(), Some("qwen3-coder-30b-a3b"));
+        assert_eq!(read.kv_cache_type, None);
+        assert_eq!(read.served_n_ctx, None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `record_window` on an empty store writes nothing: a load is the outcome
+    /// of a decision, and with no decision there is nothing for it to be the
+    /// outcome of. Fabricating a `ModelSelection` here would invent a consent.
+    #[test]
+    fn recording_a_window_with_no_decision_is_a_no_op() {
+        let store = SelectionStore::in_memory();
+        assert!(store.current().is_none());
+        store.record_window("f16", 32_768).expect("no-op succeeds");
+        assert!(
+            store.current().is_none(),
+            "a window must not conjure a selection nobody consented to"
+        );
     }
 }

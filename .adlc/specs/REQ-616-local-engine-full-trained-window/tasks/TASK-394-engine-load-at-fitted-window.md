@@ -1,7 +1,7 @@
 ---
 id: TASK-394
 title: "Load the engine at the fitted window and KV type; emit the two window events"
-status: draft
+status: complete
 parent: REQ-616
 created: 2026-09-04
 updated: 2026-09-04

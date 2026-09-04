@@ -2627,8 +2627,16 @@ impl DaemonRuntime {
         // The gated `TETON_FAKE_ENGINE_LOADER` seam takes precedence when
         // honoured, so the acceptance suite drives the same gate → stage →
         // commit → slot path without a GGUF parser in the build.
-        let engine_loader = fake_engine_loader(&engine, scripted_engine)
-            .or_else(|| build_engine_loader(&engine, &profile, base_dir, scripted_engine));
+        let engine_loader = fake_engine_loader(&engine, scripted_engine).or_else(|| {
+            build_engine_loader(
+                &engine,
+                &profile,
+                base_dir,
+                scripted_engine,
+                catalog.clone(),
+                config.inference.clone(),
+            )
+        });
         let weights_loader_present = engine_loader.is_some();
 
         // --- first-run consent (REQ-547) ---

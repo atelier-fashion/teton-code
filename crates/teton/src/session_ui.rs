@@ -639,6 +639,42 @@ pub fn render_event(
             firstrun::render_lifecycle(model_id, stage, surface);
             EventOutcome::Rendered
         }
+        // REQ-616 BR-3/BR-4. The refusal is **not** verbose-gated: the local
+        // tier failed to come up and the user has to know, with the remedies.
+        // The decision is, because on a machine that fits it is diagnostic
+        // detail — the same split `route_decided` uses.
+        Event::LocalWindowDecided(d) => {
+            if state.verbose {
+                surface.line(
+                    LineKind::Info,
+                    &format!(
+                        "local engine: {} tokens of context (trained {}), KV {} — {}",
+                        thousands(u64::from(d.n_ctx)),
+                        thousands(u64::from(d.n_ctx_train)),
+                        d.kv_cache_type,
+                        d.reason.replace('_', " "),
+                    ),
+                );
+            }
+            EventOutcome::Rendered
+        }
+        Event::LocalWindowRefused(r) => {
+            surface.line(
+                LineKind::Notice,
+                &format!(
+                    "the local engine could not be loaded: {} tokens of context needs about \
+                     {:.1} GiB more than this machine allows. {}",
+                    thousands(u64::from(r.wanted_n_ctx)),
+                    r.shortfall_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    if r.remedies.is_empty() {
+                        String::new()
+                    } else {
+                        format!("Remedies: {}.", r.remedies.join("; "))
+                    }
+                ),
+            );
+            EventOutcome::Rendered
+        }
         Event::PhaseTransition(pt) => {
             surface.line(LineKind::Notice, &format_phase(pt));
             EventOutcome::Rendered

@@ -1360,6 +1360,14 @@ pub struct ModelSelectionView {
     pub declined_local: bool,
     /// When the decision was recorded, in Unix epoch milliseconds.
     pub decided_at_ms: u64,
+    /// The KV cache element type the engine was loaded at (REQ-616 BR-10).
+    /// `None` until a load records one.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub kv_cache_type: Option<String>,
+    /// The context window the engine was loaded with, in engine tokens
+    /// (REQ-616 BR-10). `None` until a load records one.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub served_n_ctx: Option<u32>,
 }
 
 /// Install state of a model's weights (spec entity `InstallState.status`).
@@ -4526,6 +4534,7 @@ mod tests {
             band: TierBand::Mid,
             size_bytes: 4_700_000_000,
             ram_floor_bytes: 12_884_901_888,
+            n_ctx_train: Some(32_768),
             provenance: crate::events::CatalogProvenance {
                 repo: "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF".to_owned(),
                 host: "huggingface.co".to_owned(),
@@ -4547,6 +4556,7 @@ mod tests {
                 band: TierBand::Small,
                 size_bytes: 2_104_932_800,
                 ram_floor_bytes: 8_589_934_592,
+                n_ctx_train: Some(32_768),
                 provenance: crate::events::CatalogProvenance {
                     repo: "Qwen/Qwen2.5-Coder-3B-Instruct-GGUF".to_owned(),
                     host: "huggingface.co".to_owned(),
@@ -4563,6 +4573,8 @@ mod tests {
             source: SelectionSource::Probe,
             declined_local: false,
             decided_at_ms: 1_771_200_000_000,
+            kv_cache_type: None,
+            served_n_ctx: None,
         }
     }
 
@@ -4673,6 +4685,7 @@ mod tests {
                         band: TierBand::Large,
                         size_bytes: 18_000_000_000,
                         ram_floor_bytes: 51_539_607_552,
+                        n_ctx_train: Some(32_768),
                         provenance: crate::events::CatalogProvenance {
                             repo: "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF".to_owned(),
                             host: "huggingface.co".to_owned(),
@@ -4709,6 +4722,8 @@ mod tests {
                 source: SelectionSource::UserOverride,
                 declined_local: false,
                 decided_at_ms: 1_771_200_000_001,
+                kv_cache_type: None,
+                served_n_ctx: None,
             },
         });
     }
@@ -4738,6 +4753,8 @@ mod tests {
                 source: SelectionSource::UserOverride,
                 declined_local: true,
                 decided_at_ms: 1_771_200_000_002,
+                kv_cache_type: None,
+                served_n_ctx: None,
             }),
             install: None,
             pending_proposal: None,

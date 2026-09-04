@@ -132,6 +132,7 @@ impl LocalEngineLoader for InstantLoader {
                 tokens_per_sec: 120.0,
             },
             duty: DutyOutcome::Pass,
+            window: None,
         })
     }
 }
@@ -167,6 +168,7 @@ impl LocalEngineLoader for RecordingSlowLoader {
                 tokens_per_sec: 120.0,
             },
             duty: DutyOutcome::Pass,
+            window: None,
         })
     }
 
@@ -187,6 +189,7 @@ impl LocalEngineLoader for SlowLoader {
         Ok(EngineLoadReport {
             duty: teton_inference::DutySpec::default().evaluate(&benchmark),
             benchmark,
+            window: None,
         })
     }
 }

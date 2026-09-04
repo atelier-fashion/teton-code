@@ -1,7 +1,7 @@
 ---
 id: TASK-395
 title: "Record kv_cache_type in model-selection.toml and state both windows in the catalog"
-status: draft
+status: complete
 parent: REQ-616
 created: 2026-09-04
 updated: 2026-09-04
