@@ -71,7 +71,7 @@ use tetond::grants::{ConnectionId, GrantRegistry};
 use tetond::harness::permissions::{AddressedPermissionDelivery, PendingPermissions};
 use tetond::harness::tools::walk::WalkBudget;
 use tetond::harness::{Duty, DutyRoute, SessionEvents, DRAFT_DUTY};
-use tetond::repo_context::evidence::EvidenceBudget;
+use tetond::repo_context::evidence::{self, EvidenceBudget, WalkStop};
 use tetond::repo_context::generate::{
     self, ConsentGiven, GenerationContext, GenerationOutcome, Reason, Stage as FailStage,
 };
@@ -1069,6 +1069,358 @@ async fn force_replaces_and_without_it_an_existing_file_is_refused_untouched() {
         .filter(|path| path.to_string_lossy().ends_with(".tmp"))
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+// ===========================================================================
+// BR-6 / AC-8 — the cap, and the file that appears after consent
+// ===========================================================================
+
+/// A duty that plants a `TETON.md` at the root and *then* answers well.
+///
+/// The one instrument that can produce AC-8's race. `perform` runs strictly
+/// after consent (the caller holds the witness), strictly after the walk, and
+/// strictly before the write — which is exactly the window in which a checkout,
+/// another session, or the user's own editor can put a file where this run is
+/// about to put one. Nothing outside the seam can plant a file in that window
+/// without a second thread and a sleep.
+struct RacesTheWrite {
+    notes: PathBuf,
+    contents: &'static str,
+}
+
+#[async_trait]
+impl Duty for RacesTheWrite {
+    fn category(&self) -> Category {
+        DRAFT_DUTY.category()
+    }
+
+    fn ceiling_bytes(&self) -> usize {
+        DRAFT_DUTY.ceiling_bytes()
+    }
+
+    async fn perform(&self, _prompt: &str, _provenance: &Provenance) -> Result<String, String> {
+        std::fs::write(&self.notes, self.contents).expect("the racing writer plants its file");
+        Ok(GOOD_DRAFT.to_owned())
+    }
+}
+
+/// An answer of exactly `REPO_CONTEXT_MAX_BYTES + 2,000` bytes: the five
+/// sections, then one-byte lines to the target length.
+///
+/// **The padding is one byte wide on purpose.** The bounding cut keeps whole
+/// lines, so a wider line would land the file at "the last line boundary at or
+/// under the cap" — a number that depends on the header this build happens to
+/// compose, and computing it here would be letting the subject state its own
+/// expectation (LESSON-569). With every padding byte a newline there is a line
+/// boundary at every offset, so the file lands on the cap **exactly**, whatever
+/// the header's length turns out to be, and the assertion can be the flat
+/// constant REQ-612 published.
+fn answer_of_cap_plus_2000() -> String {
+    let mut answer = GOOD_DRAFT.to_owned();
+    let target = REPO_CONTEXT_MAX_BYTES + 2_000;
+    assert!(
+        answer.len() < target,
+        "the fixture prefix is already too long"
+    );
+    while answer.len() < target {
+        answer.push('\n');
+    }
+    assert_eq!(answer.len(), target);
+    answer
+}
+
+/// **BR-6, AC-8.** An answer of the cap plus 2,000 bytes is written at
+/// **exactly** REQ-612's cap — the header counted inside it — and the loader
+/// reports `Loaded` rather than `Truncated`; and a `TETON.md` that appears
+/// between consent and the write stops the write with
+/// `Failed { AlreadyExists }`, one line, and the racing file untouched.
+///
+/// # Why the two halves are one test
+///
+/// They are the same claim about the same act, taken from its two ends. The
+/// cap half says what the write puts on disk when it happens; the race half
+/// says when it does not happen at all. Split apart, each is satisfiable by a
+/// build the other rejects — a pipeline that never writes passes the race half,
+/// and one that clobbers passes the cap half — and the cap half is what makes
+/// the race half non-vacuous, because it writes a real file over the same
+/// fixture shape a few lines earlier (LESSON-485).
+///
+/// # The race is decided at the write, not by a pre-check
+///
+/// Nothing here plants the file before `run` is called: `RacesTheWrite` plants
+/// it from *inside* the duty, which is the window BR-6 is about. A build that
+/// answered the no-clobber question by `stat`ing the root before the walk would
+/// pass `force_replaces_and_without_it_an_existing_file_is_refused_untouched`
+/// and clobber here.
+///
+/// **Mutations** (LESSON-441), both run 2026-09-03 and restored, recorded as
+/// **observed** — and the first is why they are recorded that way:
+/// 1. `bound_answer` charging the cap without the header
+///    (`DRAFT_OUTPUT_MAX_BYTES.saturating_sub(0)`). The prediction was "the
+///    file is header + cap and the length assertion fails"; what actually
+///    happens is `Failed { stage: Load, reason: NotLoaded(Truncated) }` — the
+///    over-cap file is written, REQ-612's loader answers `Truncated`, and `run`
+///    unlinks it. So the assertion that fires is the outcome one, *an over-long
+///    answer is bounded, not refused*, and the visible damage is a repository
+///    that ends a generation with no notes at all. That the failure lands there
+///    rather than on the byte count is the reason the outcome is asserted
+///    before the length;
+/// 2. `run` calling `write::replace` unconditionally in place of
+///    `write::write_new` — the race leg gives `expected a failure at Write, got
+///    Written(..)`, and the file that won the race is gone.
+/// Mutation run 2026-09-03 (orchestrator, after two agent stalls): `if force` → `if true` at
+/// `generate.rs:432` (the replace path taken unconditionally) — the race leg fails at the
+/// `Failed { AlreadyExists }` assertion because the file created between consent and write is
+/// replaced. Restored byte-identically.
+#[tokio::test]
+async fn a_file_created_between_consent_and_write_stops_the_write_and_a_long_answer_lands_at_the_cap(
+) {
+    // --- the cap: an answer 2,000 bytes over it lands exactly on it ---------
+    {
+        let fx = Fixture::new("at-the-cap");
+        let seen: Seen = Arc::default();
+        let handle = Arc::clone(&seen);
+        let answer = answer_of_cap_plus_2000();
+        let route = move || recording_route(&handle, Ok(answer.clone()));
+
+        let outcome = generate(&fx, Run::new(&route)).await;
+        let GenerationOutcome::Written(made) = &outcome else {
+            panic!("an over-long answer is bounded, not refused: {outcome:?}");
+        };
+        assert_eq!(seen.lock().unwrap().len(), 1, "one draft is one model call");
+
+        let on_disk = std::fs::read_to_string(fx.notes()).expect("the file is there");
+        assert_eq!(
+            on_disk.len(),
+            REPO_CONTEXT_MAX_BYTES,
+            "the written file lands exactly on REQ-612's cap, header included (AC-8)"
+        );
+        assert_eq!(made.bytes, REPO_CONTEXT_MAX_BYTES, "and it reports that");
+        let first = on_disk.lines().next().expect("a non-empty file");
+        assert!(
+            first.starts_with("> Generated by Teton on ") && first.contains("(think tier)"),
+            "the header is still the first line of a file cut to the cap: {first}"
+        );
+        assert!(
+            made.draft_bytes < REPO_CONTEXT_MAX_BYTES,
+            "the header is charged inside the cap, so the draft's share is smaller: {}",
+            made.draft_bytes
+        );
+
+        // --- and the loader takes it whole ---------------------------------
+        let RepoContextState::Loaded(file) = &made.state else {
+            panic!(
+                "a file bounded to the cap must load whole, not {:?} (AC-8)",
+                made.state.kind()
+            );
+        };
+        assert_eq!(file.text.len(), REPO_CONTEXT_MAX_BYTES);
+        let block = RepoContextBlock::render(file, REPO_CONTEXT_MAX_BYTES);
+        assert!(
+            !block.truncated,
+            "`loaded`, not `truncated`: a generated file is bounded before it is written"
+        );
+        assert!(block.text.contains(first), "the header is resident too");
+    }
+
+    // --- the race: a file that appears after consent stops the write --------
+    {
+        let fx = Fixture::new("race");
+        let mut sub = fx.subscribe();
+        let racer = "# Won the race\n\nWritten by someone else while Teton was drafting.\n";
+        let notes = fx.notes();
+        let route = move || DutyRoute::Serves {
+            provider_id: "fake-think".to_owned(),
+            duty: Arc::new(RacesTheWrite {
+                notes: notes.clone(),
+                contents: racer,
+            }),
+            announce: None,
+        };
+
+        assert!(!fx.notes_exist(), "the race starts with an empty root");
+        let outcome = generate(&fx, Run::new(&route)).await;
+        assert_failed(&outcome, FailStage::Write, &Reason::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(fx.notes()).unwrap(),
+            racer,
+            "the file that won the race is not clobbered (BR-6)"
+        );
+
+        // --- one line, and nothing else ------------------------------------
+        let events = published(&mut sub);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::ProviderDegraded(_))),
+            "losing a race is not the provider's fault (BR-9)"
+        );
+        let heard: Vec<RepoContextGeneration> = events
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::RepoContextGeneration(news) => Some(news),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            names(&heard),
+            vec![Stage::Walking, Stage::Drafted, Stage::Failed],
+            "the run got as far as the draft and stopped at the write"
+        );
+        let failed = heard.last().expect("a run publishes its last stage");
+        assert_eq!(
+            failed.reason.as_deref(),
+            Some("a TETON.md is already there"),
+            "one line, and it names the fact rather than an errno"
+        );
+        assert_eq!(
+            heard
+                .iter()
+                .filter(|stage| stage.outcome == Stage::Failed)
+                .count(),
+            1,
+            "one line, not two: {heard:?}"
+        );
+    }
+}
+
+// ===========================================================================
+// BR-3 / AC-4 — the real walker, over a real deep tree
+// ===========================================================================
+
+/// Plant a six-level tree under `dir` and answer how many entries it adds.
+///
+/// Six levels because that is the depth at which a listing stops being a
+/// formality: `crates/tetond/src/harness/tools/walk.rs` is five, and a
+/// `src/main/java/com/example/app` layout is six. A walker that quietly bounded
+/// its depth would still list every fixture in this file correctly.
+fn plant_six_levels(dir: &Path) -> usize {
+    let leaf = dir.join("d1/d2/d3/d4/d5/d6");
+    std::fs::create_dir_all(&leaf).unwrap();
+    // Two extensions in one directory, so the per-directory profile has
+    // something to order; the rest are one file per level, so the count is
+    // arithmetic rather than a guess.
+    std::fs::write(dir.join("d1/a.rs"), "pub fn a() {}\n").unwrap();
+    std::fs::write(dir.join("d1/a.md"), "# a\n").unwrap();
+    std::fs::write(dir.join("d1/d2/b.rs"), "pub fn b() {}\n").unwrap();
+    std::fs::write(dir.join("d1/d2/d3/c.py"), "def c(): pass\n").unwrap();
+    std::fs::write(dir.join("d1/d2/d3/d4/d.py"), "def d(): pass\n").unwrap();
+    std::fs::write(dir.join("d1/d2/d3/d4/d5/e.md"), "# e\n").unwrap();
+    std::fs::write(leaf.join("leaf.rs"), "pub fn leaf() {}\n").unwrap();
+    // Six directories and seven files.
+    13
+}
+
+/// **BR-3, AC-4.** The production walker, over a real six-level tree in a real
+/// temporary directory, lists it **to its leaves** with the per-directory
+/// extension profile — and the same gatherer under an injected [`WalkBudget`]
+/// stops, says so in the evidence it hands the model, and says so again in the
+/// header of the file that gets written.
+///
+/// # Why a real directory and the real walker
+///
+/// Every other walk claim in this REQ is made against a planted listing or the
+/// three-file fixture at the top of this file, and neither can fail the way a
+/// real walk can: depth is where a recursive walker breaks, and a fixture whose
+/// deepest path is `src/main.rs` cannot tell a walker that descends from one
+/// that lists two levels and stops. So this one plants six levels on the real
+/// filesystem and asserts the **leaf's own line**, profile included.
+///
+/// # The stop is injected, not provoked
+///
+/// AC-4's budget-stop half is reached through
+/// [`evidence::gather_with_walk_budget`] rather than by planting 100,001 files:
+/// the seam exists for exactly this, and a test that planted the real budget's
+/// worth of entries would trade ten seconds of CI for the same assertion. The
+/// pipeline leg beneath it re-runs the whole of `run` under the same budget,
+/// because "the stop is stated" is a claim about the **file's header** and the
+/// gatherer cannot make it.
+///
+/// **Mutations** (LESSON-441), both run 2026-09-03 and restored, recorded as
+/// **observed**:
+/// 1. `gather_with_walk_budget` building its jail with `WalkBudget::default()`
+///    instead of the budget it was handed — the injected-budget leg fails with
+///    `left: None, right: Some(Entries(5))`, and AC-4's stop becomes untestable
+///    without a hundred thousand files;
+/// 2. `tree_section` rendering at `Some(2)` instead of the assembly's own depth
+///    — the sixth level's line disappears (the body prints `.`, `d1/` and
+///    `src/` and stops), which is the difference between a listing and a
+///    summary.
+/// Mutation run 2026-09-03 (orchestrator): `stop_phrase(evidence.stop).as_deref()` → `None` at
+/// `generate.rs:412` (the walk stop not written into the header) — fails at the header assertion.
+/// Restored byte-identically.
+#[tokio::test]
+async fn the_real_walker_lists_a_deep_tempdir_and_stops_at_an_injected_budget() {
+    let fx = Fixture::new("deep");
+    let planted = plant_six_levels(&fx.dir);
+    // The fixture's own three files and its `src/` directory.
+    let entries = planted + 4;
+    let open: [PrivacyBoundary; 0] = [];
+    let matcher = BoundaryMatcher::new(&open).expect("an empty set compiles");
+    let roomy = EvidenceBudget::new(64 * 1024);
+
+    // --- listed to its leaves ----------------------------------------------
+    let whole = evidence::gather(&fx.root, &RealFiles, &matcher, roomy);
+    assert_eq!(whole.stop, None, "the default budget walks this tree whole");
+    assert_eq!(whole.cut, None, "and 64 KiB is room for its listing");
+    assert_eq!(
+        whole.entries, entries,
+        "every planted entry was handed over: {}",
+        whole.body
+    );
+    assert!(
+        whole.body.contains("d1/d2/d3/d4/d5/d6/ — 1 file (.rs 1)"),
+        "the sixth level is listed with its own profile: {}",
+        whole.body
+    );
+    assert!(
+        whole.body.contains("d1/ — 2 files (.md 1, .rs 1)"),
+        "a directory's line counts its files by extension: {}",
+        whole.body
+    );
+
+    // --- and the same gatherer stops on an injected budget ------------------
+    let budget = WalkBudget {
+        max_entries: 5,
+        ..WalkBudget::default()
+    };
+    let stopped = evidence::gather_with_walk_budget(&fx.root, &RealFiles, &matcher, roomy, budget);
+    assert_eq!(
+        stopped.stop,
+        Some(WalkStop::Entries(5)),
+        "the injected budget is the one the walk obeys (AC-4)"
+    );
+    assert_eq!(stopped.entries, 5, "and it stopped at it, not past it");
+    assert!(
+        stopped.body.contains("the listing is partial"),
+        "the model is told what it is looking at: {}",
+        stopped.body
+    );
+
+    // --- the stop reaches the file's header --------------------------------
+    let (_seen, route) = answers_well();
+    let outcome = generate(
+        &fx,
+        Run {
+            walk: budget,
+            ..Run::new(&route)
+        },
+    )
+    .await;
+    assert!(
+        matches!(outcome, GenerationOutcome::Written(_)),
+        "a partial listing is still a listing (BR-9): {outcome:?}"
+    );
+    let on_disk = std::fs::read_to_string(fx.notes()).unwrap();
+    let header = on_disk.lines().next().expect("a non-empty file").to_owned();
+    assert!(
+        header.contains("walk stopped at 5 entries"),
+        "the budget stop is written into the header, never swallowed (BR-3): {header}"
+    );
+    assert!(
+        !header.contains("cut at depth"),
+        "and nothing else was omitted, so the header claims nothing else: {header}"
+    );
 }
 
 // ===========================================================================

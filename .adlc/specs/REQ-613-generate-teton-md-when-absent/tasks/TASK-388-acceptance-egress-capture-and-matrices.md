@@ -22,7 +22,10 @@ doors.
   with a marker in its bytes; a generation run on a remote-routed `draft`; no request body carries
   the marker; `excluded == 1`; a mutation that skips exclusion fails.
 - `crates/tetond/tests/routing.rs` — AC-14 on the real resolver with three policy fixtures.
-- `crates/tetond/tests/cost_attribution.rs` — AC-7's row through `/cost`'s query.
+- `crates/tetond/tests/cost_attribution.rs` — AC-7's row: DELIVERED INSTEAD by TASK-385's
+  `repo_context_generation.rs::one_cost_row_names_the_draft_category_and_the_serving_provider`,
+  which asserts exactly one `draft`-category ledger row naming the serving provider (no second
+  test written; the obligation row below points at the existing artifact).
 - `crates/tetond/tests/repo_context_generation.rs` — AC-8 (cap + 2,000 written at the cap; a
   file created between consent and write → no write), AC-4's real-walker leg on a tempdir.
 
@@ -30,7 +33,7 @@ doors.
 
 - [ ] AC-6 both legs green, mutation recorded in the doc comment (the marker lives only in the
       file's bytes — LESSON-624).
-- [ ] AC-14 three fixtures green; AC-7 through the ledger query; AC-8 both halves.
+- [ ] AC-14 three fixtures green; AC-7 through TASK-385's ledger assertion; AC-8 both halves (done: cap + race, mutations recorded).
 - [ ] `cargo test --workspace --no-fail-fast` green, output grepped for `FAILED`.
 
 ## Verification
