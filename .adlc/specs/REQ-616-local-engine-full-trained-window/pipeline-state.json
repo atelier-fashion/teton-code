@@ -3,9 +3,24 @@
   "branch": "feat/REQ-616-local-engine-full-trained-window",
   "startedAt": "2026-09-04T19:34:00Z",
   "completed": false,
-  "currentPhase": 0,
-  "completedPhases": [],
-  "phaseHistory": [],
+  "currentPhase": 2,
+  "completedPhases": [
+    0,
+    1
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree + Preflight",
+      "completedAt": "2026-09-04T19:34:14Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-09-04T19:41:22Z",
+      "note": "3 blockers fixed (AC-3/AC-4/AC-5 arithmetic), BR-4/BR-5 clarified, OQ-1/OQ-2 resolved; approved on loop 2"
+    }
+  ],
   "integrationBranch": "main",
   "repos": {
     "teton-code": {
@@ -14,14 +29,17 @@
       "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-616",
       "branch": "feat/REQ-616-local-engine-full-trained-window",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/290",
+      "prNumber": 290,
       "merged": false,
       "snapshotBranch": null,
-      "snapshotPR": null
+      "snapshotPR": null,
+      "prCreatedAt": "2026-09-04T19:34:14Z"
     }
   },
-  "mergeOrder": ["teton-code"],
+  "mergeOrder": [
+    "teton-code"
+  ],
   "phase4": {
     "currentTask": null,
     "completedTasks": [],
