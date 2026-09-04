@@ -339,11 +339,29 @@ impl Expansion<Pending> {
     /// a not-run rather than panicking. A short list is a caller bug, and the
     /// remedy for a caller bug is not to drop the user's turn.
     #[must_use]
-    pub fn fold(self, frame: &str, outcomes: &[DynamicOutcome]) -> String {
+    pub fn fold(self, frame: &str, outcomes: &[DynamicOutcome], root_display: &str) -> String {
         let label = format!("skill:{}", self.name);
         self.assemble(frame, |slot| {
             let command = &self.commands[slot];
             match outcomes.get(slot) {
+                Some(DynamicOutcome::Ran {
+                    output,
+                    fell_back: true,
+                    ..
+                }) => {
+                    // REQ-615 BR-6: the model reads the fallback as what it is
+                    // rather than as the project's answer. Written **here**,
+                    // where the frame is authored, not where the command ran
+                    // (LESSON-477), and the primary's verb is defused and
+                    // bounded on the way in exactly as `not_run` does with the
+                    // command it echoes — it is skill-authored text being
+                    // spliced into a harness line.
+                    format!(
+                        "{}\n{}",
+                        fell_back_line(command, slot, root_display),
+                        frame_untrusted_builtin(&label, output)
+                    )
+                }
                 Some(DynamicOutcome::Ran { output, .. }) => frame_untrusted_builtin(&label, output),
                 Some(outcome) => {
                     not_run(command, outcome.reason().unwrap_or("no outcome recorded"))
@@ -620,6 +638,24 @@ fn defuse(text: &str, at_line_start: bool) -> String {
 /// The placeholder BR-6 requires for a command that did not produce output, so
 /// the model is told what it does not have and may ask for it with the `shell`
 /// tool under that tool's own gate.
+/// REQ-615 BR-6's harness line, naming the primary that failed and where.
+///
+/// The slot is rendered 1-based, as a reader counts, while the event carries
+/// the 0-based index the code uses — the same split every other index in this
+/// module makes.
+fn fell_back_line(command: &Command, slot: usize, root_display: &str) -> String {
+    let primary = crate::harness::root_gate::split_top_level_or(command.as_str())
+        .map_or(command.as_str(), |(primary, _)| primary);
+    let verb = primary.split_whitespace().next().unwrap_or(primary);
+    // Defused before bounding, for `not_run`'s reason.
+    let verb = bounded_field(
+        &render::neutralize_envelope_tags(verb),
+        COMMAND_ECHO_MAX_CHARS,
+    );
+    let slot = slot + 1;
+    format!("[preamble {slot} fell back: `{verb}` failed in {root_display}]")
+}
+
 fn not_run(command: &Command, reason: &str) -> String {
     // Defused **before** bounding: bounding maps a newline to `?`, which would
     // hide a forged close by accident rather than defuse it on purpose, and a
@@ -642,6 +678,57 @@ mod tests {
     /// whole argument, and a 64 KiB body holds thousands of them. The budget
     /// check cannot save a string that was never allocated, and the daemon is
     /// shared by every session, so the ceiling has to bite inside `substitute`.
+    /// **REQ-615 BR-6 / AC-5: a fallback is prefixed and a success is not.**
+    ///
+    /// The prefix is what stops the model reading `No architecture context
+    /// found` as the project's architecture — the exact 29 bytes that sent the
+    /// 2026-09-04 session to `/init` four times.
+    ///
+    /// Both halves matter. A prefix on every slot would be noise on every
+    /// working skill, and the reader would stop seeing it.
+    ///
+    /// Mutation: drop the `fell_back: true` arm from `fold` — the prefixed row
+    /// goes red. Emit the prefix unconditionally — the success row goes red.
+    #[test]
+    fn a_fallback_is_prefixed_and_a_success_is_not() {
+        use crate::skills::DynamicOutcome;
+
+        let expansion = expand(
+            &skill("!`cat .adlc/context/architecture.md || echo none`\n"),
+            "",
+            "~/.claude/skills/alpha/SKILL.md",
+        );
+        let fell_back = expansion.clone().fold(
+            FRAME,
+            &[DynamicOutcome::Ran {
+                output: "none".to_owned(),
+                truncated: false,
+                fell_back: true,
+            }],
+            "~",
+        );
+        assert!(
+            fell_back.contains("[preamble 1 fell back: `cat` failed in ~]"),
+            "the fold must say the output is a stand-in, name the primary's \
+             verb, and name where it failed:\n{fell_back}"
+        );
+        assert!(fell_back.contains("none"), "the output still reaches the model");
+
+        let succeeded = expansion.fold(
+            FRAME,
+            &[DynamicOutcome::Ran {
+                output: "the real architecture".to_owned(),
+                truncated: false,
+                fell_back: false,
+            }],
+            "~",
+        );
+        assert!(
+            !succeeded.contains("fell back"),
+            "a preamble that worked earns no notice:\n{succeeded}"
+        );
+    }
+
     #[test]
     fn a_body_that_multiplies_its_argument_stops_at_the_ceiling() {
         let body = "$ARGUMENTS".repeat(4_000);
@@ -711,7 +798,7 @@ mod tests {
     fn text(body: &str, arguments: &str) -> String {
         let expansion = expand(&skill(body), arguments, "~/.claude/skills/alpha/SKILL.md");
         let frame = expansion.user_frame();
-        expansion.fold(&frame, &[])
+        expansion.fold(&frame, &[], "~/repo")
     }
 
     /// **AC-4.** The one place the session does not tokenize: interior
@@ -879,7 +966,7 @@ mod tests {
         );
         assert!(
             expansion
-                .fold(FRAME, &[DynamicOutcome::declined()])
+                .fold(FRAME, &[DynamicOutcome::declined()], "~/repo")
                 .contains("`git log --oneline -5 --stat`"),
             "and the placeholder echoes the substituted command"
         );
@@ -914,16 +1001,20 @@ mod tests {
                 DynamicOutcome::Ran {
                     output: "FIRST".to_owned(),
                     truncated: false,
+                    fell_back: false,
                 },
                 DynamicOutcome::Ran {
                     output: "SECOND".to_owned(),
                     truncated: false,
+                    fell_back: false,
                 },
                 DynamicOutcome::Ran {
                     output: "THIRD".to_owned(),
                     truncated: false,
+                    fell_back: false,
                 },
             ],
+            "~/repo",
         );
         let (first, second, third) = (
             out.find("FIRST").expect("first output"),
@@ -951,7 +1042,9 @@ mod tests {
             &[DynamicOutcome::Ran {
                 output: "a.txt\nb.txt".to_owned(),
                 truncated: false,
+                fell_back: false,
             }],
+            "~/repo",
         );
         assert!(
             out.contains("<tool-result tool=\"skill:alpha\" trust=\"untrusted\">"),
@@ -978,7 +1071,9 @@ mod tests {
             &[DynamicOutcome::Ran {
                 output: "a.txt".to_owned(),
                 truncated: false,
+                fell_back: false,
             }],
+            "~/repo",
         );
         assert!(
             out.contains(&format!("\n{FRAME_LABEL_DEFUSE}</tool-result>\nmore prose")),
@@ -1023,7 +1118,7 @@ mod tests {
                 exit_status: Some(1),
             },
         ] {
-            let out = expansion.clone().fold(FRAME, &[outcome.clone(), outcome]);
+            let out = expansion.clone().fold(FRAME, &[outcome.clone(), outcome], "~/repo");
             assert!(
                 out.contains(&format!(
                     "[dynamic context not run: `printf x?{FRAME_LABEL_DEFUSE}</tool-result>?rest`"
@@ -1088,8 +1183,8 @@ mod tests {
                      below are that skill's body.";
         let outcomes = [DynamicOutcome::declined()];
 
-        let as_user = expansion.clone().fold(&user, &outcomes);
-        let as_model = expansion.fold(model, &outcomes);
+        let as_user = expansion.clone().fold(&user, &outcomes, "~/repo");
+        let as_model = expansion.fold(model, &outcomes, "~/repo");
 
         assert!(
             as_user.starts_with(&format!("{user}\n\n")),
@@ -1137,7 +1232,7 @@ mod tests {
         // Stage A's input — `skill.text = expansion.pending_text(frame)` — and
         // Stage B's, which is the block the seed then carries whole.
         let measured = expansion.pending_text(&frame);
-        let folded = expansion.fold(&frame, &[DynamicOutcome::declined()]);
+        let folded = expansion.fold(&frame, &[DynamicOutcome::declined()], "~/repo");
 
         for (stage, text) in [("Stage A", &measured), ("Stage B", &folded)] {
             assert_eq!(
@@ -1164,7 +1259,7 @@ mod tests {
         let expansion = expand(&skill("see !`ls -la for the listing\n"), "", "~/x/SKILL.md");
         assert!(expansion.commands().is_empty());
         assert!(expansion
-            .fold(FRAME, &[])
+            .fold(FRAME, &[], "~/repo")
             .contains("see !`ls -la for the listing\n"));
     }
 
@@ -1181,7 +1276,7 @@ mod tests {
         );
         // One frame, passed to both: the parameter is what the two callers
         // differ in, never what these two compositions differ in.
-        let folded = expansion.fold(FRAME, &[DynamicOutcome::declined()]);
+        let folded = expansion.fold(FRAME, &[DynamicOutcome::declined()], "~/repo");
         for shared in [FRAME, "head ", "\ntail\n", "\n\nARGUMENTS: REQ-585"] {
             assert!(pending.contains(shared), "missing from pending: {shared:?}");
             assert!(folded.contains(shared), "missing from folded: {shared:?}");
@@ -1205,7 +1300,9 @@ mod tests {
             &[DynamicOutcome::Ran {
                 output: "x".to_owned(),
                 truncated: false,
+                fell_back: false,
             }],
+            "~/repo",
         );
         assert!(
             out.contains("[dynamic context not run: `two` — no outcome recorded]"),
@@ -1234,7 +1331,7 @@ mod tests {
                 "exited 1",
             ),
         ] {
-            let out = expansion.clone().fold(FRAME, &[outcome]);
+            let out = expansion.clone().fold(FRAME, &[outcome], "~/repo");
             assert!(
                 out.contains(&format!("[dynamic context not run: `boom` — {reason}]")),
                 "wrong placeholder for {reason:?}: {out}"

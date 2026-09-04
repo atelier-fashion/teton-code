@@ -1061,7 +1061,7 @@ fn ran_expansion(repo: &std::path::Path, name: &str, arguments: &str) -> (String
     // The user path's frame, which is the one `accept_invocation` supplies
     // (REQ-587 ADR-6) — the daemon's own line, not a paraphrase of it.
     let frame = expansion.user_frame();
-    (expansion.fold(&frame, &outcomes), ran)
+    (expansion.fold(&frame, &outcomes, "~/repo"), ran)
 }
 
 /// A repo holding the two fixture skills beside the boundary file.

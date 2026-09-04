@@ -1363,6 +1363,7 @@ impl DaemonRuntime {
                 tctx.core.session_id,
                 tctx.gate,
                 &probed.path,
+                &probed.view.display,
                 tctx.invoker,
                 skill,
             )
@@ -2616,12 +2617,55 @@ impl DaemonRuntime {
     /// [`crate::skills::run_all`] is `run_bounded`'s second caller, not
     /// `ShellTool::run`'s — so `Tool::refine`, which fires the `shell` duty and
     /// *is* a model call, is not on this path (ADR-14).
+/// REQ-615 BR-6: publish one `skill_preamble_fallback` per preamble whose
+/// primary exited non-zero.
+///
+/// Free and silent in the common case — an expansion whose commands all
+/// succeeded (or that has none) iterates a short slice and publishes nothing.
+///
+/// The record carries **no output**: the bytes reach the model on the
+/// expansion, framed, and the bus fans out to every attached client and every
+/// declared monitor (REQ-611 BR-4).
+fn publish_preamble_fallbacks(
+    events: &Arc<EventBus>,
+    session_id: &SessionId,
+    skill: &str,
+    outcomes: &[crate::skills::DynamicOutcome],
+    root_display: &str,
+) {
+    for (index, outcome) in outcomes.iter().enumerate() {
+        if matches!(
+            outcome,
+            crate::skills::DynamicOutcome::Ran {
+                fell_back: true,
+                ..
+            }
+        ) {
+            events.publish(
+                Some(session_id.clone()),
+                teton_protocol::events::Event::SkillPreambleFallback(
+                    teton_protocol::events::SkillPreambleFallback {
+                        skill: skill.to_owned(),
+                        command_index: index,
+                        root_display: root_display.to_owned(),
+                    },
+                ),
+            );
+        }
+    }
+}
+
     async fn settle_dynamic_context(
         self: &Arc<Self>,
         events: &Arc<EventBus>,
         session_id: &SessionId,
         gate: &PermissionGate,
         root: &Path,
+        // REQ-615 BR-6: the fold's fallback line names the root the primary
+        // failed in. The probe's display, from the same `ProbedRoot` the jail
+        // and the environment block are built from, so the three spell it one
+        // way (REQ-583 ADR-2).
+        root_display: &str,
         invoker: Option<ConnectionId>,
         skill: &mut SkillTurn,
     ) {
@@ -2704,7 +2748,18 @@ impl DaemonRuntime {
         // is what entitles Stage B's sentence to say the body itself already
         // fit.
         let frame = expansion.user_frame();
-        skill.text = expansion.fold(&frame, &outcomes);
+        skill.text = expansion.fold(&frame, &outcomes, root_display);
+        // REQ-615 BR-6: one notice per preamble whose primary failed. Published
+        // here, where the outcomes are, rather than inside the fold — the fold
+        // is pure and composes text, and a publisher inside it would make a
+        // renderer a second source of session news.
+        Self::publish_preamble_fallbacks(
+            events,
+            session_id,
+            &skill.name,
+            &outcomes,
+            root_display,
+        );
 
         // BR-7: anything that came from a command carries what `shell` output
         // carries — nothing that can be pinned. On a boundary-configured machine

@@ -1915,7 +1915,32 @@ impl SkillTool {
             Some(reason) => vec![door_outcome(reason); commands.len()],
         };
 
-        let text = frame.close(&expansion.fold(&opening, &outcomes));
+        // REQ-615 BR-6: the model-invoked path publishes the same notice the
+        // typed path does. Two call sites because the two paths reach the fold
+        // from different orchestrations; one payload, so a client cannot tell
+        // which door a fallback came through — it is a fact about the preamble,
+        // not about who asked.
+        for (index, outcome) in outcomes.iter().enumerate() {
+            if matches!(
+                outcome,
+                crate::skills::DynamicOutcome::Ran {
+                    fell_back: true,
+                    ..
+                }
+            ) {
+                self.gate.events().publish(
+                    Some(self.gate.session_id().clone()),
+                    Event::SkillPreambleFallback(
+                        teton_protocol::events::SkillPreambleFallback {
+                            skill: skill.name.clone(),
+                            command_index: index,
+                            root_display: ctx.root_display().to_owned(),
+                        },
+                    ),
+                );
+            }
+        }
+        let text = frame.close(&expansion.fold(&opening, &outcomes, ctx.root_display()));
 
         // ADR-8: set **explicitly**, because the default is the wrong posture.
         // `ToolOutcome::ok` defaults to `Sources(∅)`, which `teton_docs` chose

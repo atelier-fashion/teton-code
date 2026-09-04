@@ -1,7 +1,7 @@
 ---
 id: TASK-007
 title: "A preamble fallback is reported, not silently folded"
-status: draft
+status: complete
 parent: REQ-615
 created: 2026-09-04
 updated: 2026-09-04
