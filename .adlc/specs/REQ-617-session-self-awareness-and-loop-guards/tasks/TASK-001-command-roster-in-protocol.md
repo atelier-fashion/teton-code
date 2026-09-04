@@ -1,7 +1,7 @@
 ---
 id: TASK-001
 title: "The session command roster as a derived table in teton-protocol, with a both-directions drift guard in the CLI"
-status: draft
+status: complete
 parent: REQ-617
 created: 2026-09-04
 updated: 2026-09-04
