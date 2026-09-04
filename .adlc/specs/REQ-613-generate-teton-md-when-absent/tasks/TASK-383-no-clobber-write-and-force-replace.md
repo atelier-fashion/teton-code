@@ -1,7 +1,7 @@
 ---
 id: TASK-383
 title: "The write: create-new with `O_NOFOLLOW`, the header line, cleanup on failure, and `--force` by rename"
-status: draft
+status: complete
 parent: REQ-613
 repo: teton-code
 created: 2026-09-03
@@ -27,13 +27,13 @@ writer's `O_NOFOLLOW` discipline.
 
 ## Acceptance Criteria
 
-- [ ] BR-6: writing where a file exists returns `AlreadyExists` and changes nothing (bytes and
+- [x] BR-6: writing where a file exists returns `AlreadyExists` and changes nothing (bytes and
       mtime); a symlink at the path is refused; a write that fails after create (injected
       short write via a read-only directory or a full-disk seam) leaves no file.
-- [ ] `replace` leaves either the old or the new bytes, never a truncated file, when interrupted
+- [x] `replace` leaves either the old or the new bytes, never a truncated file, when interrupted
       between temp write and rename (simulate by asserting the temp path is used and the rename
       is the last operation).
-- [ ] The header golden names the tier, date, and a cut or stop when present; ≤ 200 bytes.
+- [x] The header golden names the tier, date, and a cut or stop when present; ≤ 200 bytes.
 
 ## Verification
 

@@ -19,7 +19,9 @@ use std::io::IsTerminal;
 use std::path::Path;
 
 use teton_core::session_root::{bounded_field, display_for, kind_phrase, DISPLAY_MAX_CHARS};
-use teton_protocol::methods::{RootKind, SessionRoot};
+use teton_protocol::methods::{
+    RepoContextGenerateMode, RepoContextStateKind, RootKind, SessionRoot,
+};
 
 use crate::render::{LineKind, Surface};
 
@@ -190,10 +192,167 @@ pub fn root_notice_with_projects(root: &SessionRoot, known: &[String]) -> Option
     ))
 }
 
+/// The launch clause announcing that Teton will offer to write this
+/// repository's notes on the first prompt (REQ-613 BR-1) — `None` where no
+/// offer is coming.
+///
+/// BR-1's own sentence, and its whole purpose is that the permission prompt on
+/// the first prompt turn is not a surprise. It is drawn under the banner beside
+/// [`root_notice`] and is TTY-gated by the caller for the same reason that one
+/// is: a piped session's bytes must not move (ADR-5), and a pipe cannot answer
+/// the prompt this clause is about anyway.
+///
+/// # The three facts, and where each is honestly known
+///
+/// * **A project root.** [`root_notice`]'s complement — this returns `None` for
+///   every root that one speaks about. The daemon reads a `home` root's notes as
+///   `absent` exactly as it reads an empty repository's, and "Teton wrote a
+///   TETON.md in my home directory" is the one outcome this feature must never
+///   produce, so the kind is asked first.
+/// * **The notes are absent.** Read off the create-time state, where `None`
+///   means the daemon published nothing — and on this event silence *is* an
+///   `absent`: the session record seeds its published state with `absent`
+///   precisely so that a project with no notes stores `Absent` over `Absent` at
+///   create and says nothing. Reading the silence any other way would leave the
+///   clause undrawn in the one case it exists for.
+/// * **Generation is not suppressed.** `[context] generate = never` is the
+///   durable way to stop the offer, and a machine that has set it is not owed a
+///   sentence promising one. A posture the daemon did not report (`None` — an
+///   older daemon, or a `config/get` that failed) draws the clause, on
+///   `permission_level`'s rule: a fact nobody stated is not a `never`.
+///
+/// # What it cannot see, and why that is the right line anyway
+///
+/// An **empty** `TETON.md` also stops the offer (BR-1: it is the documented way
+/// to say "not here"), and the wire cannot tell it from no file at all —
+/// `RepoContextState::Absent` folds the two deliberately, because no surface has
+/// a different remedy for them. So `touch TETON.md` earns this clause and then
+/// no prompt. The alternative is worse: a client that suppressed the clause
+/// wherever it was unsure would go quiet in the ordinary case, which is the
+/// surprise BR-1 is about.
+#[must_use]
+pub fn generation_notice(
+    root: Option<&SessionRoot>,
+    notes: Option<RepoContextStateKind>,
+    generate: Option<RepoContextGenerateMode>,
+) -> Option<String> {
+    if root?.kind != RootKind::Project {
+        return None;
+    }
+    if !matches!(notes, None | Some(RepoContextStateKind::Absent)) {
+        return None;
+    }
+    if generate == Some(RepoContextGenerateMode::Never) {
+        return None;
+    }
+    Some(
+        "no TETON.md here — Teton will offer to write one on your first prompt (`/context init` \
+         writes one now; `teton context generate never` stops the offer)"
+            .to_owned(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::render::RecordingSurface;
+
+    fn project_root(kind: RootKind) -> SessionRoot {
+        SessionRoot {
+            display: "~/dev/teton".to_owned(),
+            kind,
+            project_name: Some("teton".to_owned()),
+            vcs_branch: None,
+        }
+    }
+
+    /// **REQ-613 BR-1.** The launch clause is drawn for the one session BR-1 is
+    /// about — a project root with no notes and no durable stop — and for no
+    /// other. Its whole purpose is that the permission prompt on the first
+    /// prompt turn is not a surprise, so it also names both doors out.
+    ///
+    /// The three gates are asserted separately because each is a different way
+    /// of being wrong: a non-project root would promise a `TETON.md` in the
+    /// user's home directory, a root that already has notes would promise an
+    /// offer that is never raised, and `generate = never` would promise one the
+    /// config has already refused.
+    ///
+    /// **Mutation (run 2026-09-03):** dropping the `RootKind::Project` gate
+    /// reddened the home row — the clause then announced a write into `~`, which
+    /// is the one outcome this feature must never produce. Dropping the `never`
+    /// gate reddened the last row. Restored both.
+    #[test]
+    fn the_launch_clause_is_drawn_only_where_an_offer_is_actually_coming() {
+        let project = project_root(RootKind::Project);
+        let clause = generation_notice(Some(&project), None, Some(RepoContextGenerateMode::Ask))
+            .expect("a project with no notes earns the clause");
+        assert!(
+            clause.contains("no TETON.md here")
+                && clause.contains("offer to write one on your first prompt"),
+            "BR-1's own sentence: {clause}"
+        );
+        assert!(
+            clause.contains("/context init") && clause.contains("teton context generate never"),
+            "both doors, so the prompt is a choice rather than an ambush: {clause}"
+        );
+
+        // Silence on `repo_context_state` *is* an `absent` (the daemon seeds its
+        // published state with `absent` for exactly this), and an explicit
+        // `absent` reads the same.
+        assert!(generation_notice(
+            Some(&project),
+            Some(RepoContextStateKind::Absent),
+            Some(RepoContextGenerateMode::Ask)
+        )
+        .is_some());
+        // A posture nobody reported is not a `never` — the `permission_level`
+        // rule, and the reason an older daemon still gets the clause.
+        assert!(generation_notice(Some(&project), None, None).is_some());
+        assert!(
+            generation_notice(Some(&project), None, Some(RepoContextGenerateMode::Always))
+                .is_some()
+        );
+
+        // The three silences.
+        for kind in [RootKind::Home, RootKind::Plain, RootKind::FilesystemRoot] {
+            assert_eq!(
+                generation_notice(
+                    Some(&project_root(kind)),
+                    None,
+                    Some(RepoContextGenerateMode::Ask)
+                ),
+                None,
+                "{kind:?} is what `root_notice` speaks about; this one must not"
+            );
+        }
+        for state in [
+            RepoContextStateKind::Loaded,
+            RepoContextStateKind::Truncated,
+            RepoContextStateKind::WithheldBoundary,
+            RepoContextStateKind::WithheldOff,
+            RepoContextStateKind::Unreadable,
+        ] {
+            assert_eq!(
+                generation_notice(
+                    Some(&project),
+                    Some(state),
+                    Some(RepoContextGenerateMode::Ask)
+                ),
+                None,
+                "{state:?} is not a repository with no notes"
+            );
+        }
+        assert_eq!(
+            generation_notice(Some(&project), None, Some(RepoContextGenerateMode::Never)),
+            None,
+            "a machine that said `never` is not owed a promise of an offer"
+        );
+        assert_eq!(
+            generation_notice(None, None, Some(RepoContextGenerateMode::Ask)),
+            None,
+            "a daemon that named no root has said nothing to announce"
+        );
+    }
 
     /// **REQ-584 BR-10 / AC-11.** The notice names a few known projects.
     #[test]

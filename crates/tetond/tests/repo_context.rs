@@ -573,7 +573,11 @@ impl Harness {
 
     /// One `/context` call, through the daemon's own method — with the cap
     /// read off the stamped route exactly as `handle_session_context` reads it.
-    fn context(
+    ///
+    /// `async` since REQ-613 gave the method a fourth action that runs the
+    /// generation pipeline behind a permission gate; the three REQ-612 actions
+    /// await nothing.
+    async fn context(
         &self,
         id: &SessionId,
         action: ContextAction,
@@ -582,7 +586,7 @@ impl Harness {
             .routes
             .stamped(id)
             .map(|budget| budget.repo_context_cap);
-        self.context_at(id, action, route_cap)
+        self.context_at(id, action, route_cap).await
     }
 
     /// The same call with the route's cap **supplied**, for a cap no route can
@@ -593,21 +597,25 @@ impl Harness {
     /// `server` and the method must answer without it. Passing a narrower one
     /// is asking that method the question a narrower route would have asked it
     /// — the same argument [`Self::context`] computes.
-    fn context_at(
+    async fn context_at(
         &self,
         id: &SessionId,
         action: ContextAction,
         route_cap: Option<usize>,
     ) -> teton_protocol::methods::SessionContextResult {
-        self.runtime.session_context(
-            &SessionContextParams {
-                session_id: id.clone(),
-                action,
-            },
-            &self.sessions,
-            &self.events,
-            route_cap,
-        )
+        self.runtime
+            .session_context(
+                &SessionContextParams {
+                    session_id: id.clone(),
+                    action,
+                },
+                &self.sessions,
+                &self.events,
+                route_cap,
+                Some(self.connection),
+            )
+            .await
+            .expect("no turn holds these fixtures' sessions, so no action is refused")
     }
 
     /// Run one turn and require it to complete.
@@ -1002,7 +1010,7 @@ async fn the_session_switch_and_the_durable_switch_withhold_without_opening_the_
 
     // --- the session switch, off ------------------------------------------
     h.files.drain();
-    let off = h.context(&lit, ContextAction::Off);
+    let off = h.context(&lit, ContextAction::Off).await;
     assert_eq!(off.state, RepoContextStateKind::WithheldOff);
     assert_eq!(off.resident_bytes, 0);
     assert_eq!(
@@ -1032,7 +1040,7 @@ async fn the_session_switch_and_the_durable_switch_withhold_without_opening_the_
     );
 
     // --- the session switch, on: at once ----------------------------------
-    let on = h.context(&lit, ContextAction::On);
+    let on = h.context(&lit, ContextAction::On).await;
     assert_eq!(
         on.state,
         RepoContextStateKind::Loaded,
@@ -2156,7 +2164,7 @@ async fn a_floored_route_carries_the_whole_file_and_a_narrower_cap_is_answered_a
         &first[first.len().saturating_sub(400)..]
     );
     h.await_route_stamp(&session, 8_192).await;
-    let status = h.context(&session, ContextAction::Status);
+    let status = h.context(&session, ContextAction::Status).await;
     assert_eq!(
         (status.cap, status.truncated, status.resident_bytes),
         (8_192, false, 6_000),
@@ -2170,7 +2178,9 @@ async fn a_floored_route_carries_the_whole_file_and_a_narrower_cap_is_answered_a
     // carried the marker — two surfaces, two answers, one file. The cap is a
     // *parameter* of the daemon's own method, so this is that method answering,
     // not a re-derivation of it.
-    let narrow = h.context_at(&session, ContextAction::Status, Some(4_096));
+    let narrow = h
+        .context_at(&session, ContextAction::Status, Some(4_096))
+        .await;
     assert_eq!(
         (narrow.cap, narrow.truncated, narrow.resident_bytes),
         (4_096, true, 4_096),
@@ -2244,7 +2254,7 @@ async fn a_floored_route_carries_the_whole_file_and_a_narrower_cap_is_answered_a
         !fourth.contains("truncated:"),
         "the block is still cut after the file shrank"
     );
-    let status = h.context(&session, ContextAction::Status);
+    let status = h.context(&session, ContextAction::Status).await;
     assert_eq!(
         (status.cap, status.truncated, status.resident_bytes),
         (8_192, false, 6_000),
@@ -2310,7 +2320,7 @@ async fn a_withheld_file_reports_the_size_the_stat_saw_on_both_surfaces() {
         h.files.drain()
     );
 
-    let status = h.context(&session, ContextAction::Status);
+    let status = h.context(&session, ContextAction::Status).await;
     assert_eq!(status.state, RepoContextStateKind::WithheldBoundary);
     assert_eq!(
         (status.bytes_on_disk, status.resident_bytes),
@@ -2350,7 +2360,7 @@ async fn a_withheld_file_reports_the_size_the_stat_saw_on_both_surfaces() {
         vec![(RepoContextStateKind::Unreadable, None)],
         "a symlinked entry was given a size: {announced:?}"
     );
-    let status = h.context(&linked_session, ContextAction::Status);
+    let status = h.context(&linked_session, ContextAction::Status).await;
     assert_eq!(
         (status.state, status.bytes_on_disk, status.file.as_deref()),
         (RepoContextStateKind::Unreadable, None, Some("TETON.md")),

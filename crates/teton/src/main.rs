@@ -32,8 +32,9 @@ use teton_protocol::methods::{
     BoundaryOriginConfig, CategoryBindingConfig, ConfigGetParams, ConfigSetParams, ConfigSetResult,
     ConfigSnapshot, ConfigUpdate, ContentClass, CostQueryParams, CostQueryResult, CostReportView,
     ModelListParams, ModelListResult, ModelSetParams, ModelStatusParams, ModelStatusResult,
-    PrivacyBoundaryConfig, PromptTurnParams, ProviderConfig, SessionCreateParams,
-    SessionPermissionsParams, SkillInvocation, SkillsPreflightParams, TierBindingConfig,
+    PrivacyBoundaryConfig, PromptTurnParams, ProviderConfig, RepoContextGenerateMode,
+    SessionCreateParams, SessionPermissionsParams, SkillInvocation, SkillsPreflightParams,
+    TierBindingConfig,
 };
 use teton_protocol::SessionId;
 use teton_protocol::{
@@ -535,7 +536,9 @@ fn main() -> ExitCode {
         Some(Command::Cost) => run_cost(&paths),
         Some(Command::Effort { level }) => run_effort(&paths, level.as_deref()),
         Some(Command::Transcript { action }) => run_transcript(&paths, action),
-        Some(Command::Context { action }) => run_context(&paths, action),
+        Some(Command::Context { action }) => {
+            run_context(&paths, action, session_root.as_deref(), cli.cwd.as_deref())
+        }
         Some(Command::Model { action }) => match action {
             ModelAction::List => run_model_list(&paths),
             ModelAction::Set { name } => run_model_set(&paths, &name, cli.yes),
@@ -985,6 +988,11 @@ fn read_config_view(conn: &mut Connection, ctx: &mut UiContext<'_>) {
             .iter()
             .map(|provider| provider.id.0.clone())
             .collect();
+        // REQ-613 BR-1: the durable offer posture, for the launch clause below.
+        // Off the same snapshot as the three above it, which is why this read
+        // moved up to sit before the clause that quotes it rather than earning a
+        // second `config/get` of its own.
+        ctx.state.generate_posture = cfg.snapshot.repo_context.and_then(|p| p.generate);
     }
 }
 
@@ -1248,6 +1256,19 @@ fn run_session(
             if let Some(notice) = ctx.state.root.as_ref().and_then(banner::root_notice) {
                 ctx.surface.line(LineKind::Notice, &notice);
             }
+            // REQ-613 BR-1: and the clause that says an offer is coming, under
+            // the same gate and immediately after the notice it is the
+            // complement of — `root_notice` speaks for every root this one is
+            // silent about, and the reverse. The posture it quotes is read
+            // first, off the one `config/get` this startup makes.
+            read_config_view(&mut conn, &mut ctx);
+            if let Some(clause) = banner::generation_notice(
+                ctx.state.root.as_ref(),
+                ctx.state.repo_context_state,
+                ctx.state.generate_posture,
+            ) {
+                ctx.surface.line(LineKind::Notice, &clause);
+            }
         }
         ctx.surface.line(
             LineKind::Info,
@@ -1275,7 +1296,6 @@ fn run_session(
         // rather than showing a guess.
         if interactive {
             read_permission_level(&mut conn, &mut ctx, &session_id);
-            read_config_view(&mut conn, &mut ctx);
         }
         // REQ-585 ADR-2: the registry this session's `/name` lines dispatch
         // from, asked for once the session exists and again after every
@@ -2056,11 +2076,27 @@ pub(crate) fn doctor_report_on(
     attach: &DoctorAttach,
 ) -> anyhow::Result<()> {
     doctor_preamble(paths, attach, ctx.surface);
+    // REQ-613 BR-10: the durable offer posture, kept past the match because one
+    // of its two advisories is about a *session's* root and is drawn below,
+    // where a session is in scope. Read once here rather than asked for twice —
+    // the `read_config_view` rule.
+    let mut generate = None;
     match conn.call(ConfigGetParams::default(), ctx)? {
         Ok(cfg) => {
             render_config(&cfg.snapshot.providers, ctx.surface);
             render_transcript_posture(cfg.snapshot.transcript.as_ref(), ctx.surface);
             render_repo_context_posture(cfg.snapshot.repo_context.as_ref(), ctx.surface);
+            generate = cfg.snapshot.repo_context.and_then(|p| p.generate);
+            // Beside the posture line and *not* in the session-scoped pass
+            // below, because it needs no session: `always` is a standing
+            // permission on this machine, and `teton doctor` from a shell — which
+            // owns no session — must still name it.
+            if generate == Some(RepoContextGenerateMode::Always) {
+                ctx.surface.line(
+                    LineKind::Notice,
+                    &status::repo_notes_generate_always_advisory(),
+                );
+            }
             advise_on_base_url_endpoints(&cfg.snapshot.providers, ctx.surface);
             advise_on_context_windows(&cfg.snapshot.providers, ctx.surface);
         }
@@ -2074,7 +2110,7 @@ pub(crate) fn doctor_report_on(
         ),
     }
     report_skill_preflight(conn, ctx)?;
-    advise_on_repo_context(conn, ctx)?;
+    advise_on_repo_context(conn, ctx, generate)?;
     doctor_trailer(ctx.surface);
     Ok(())
 }
@@ -2110,7 +2146,11 @@ pub(crate) fn doctor_report_on(
 ///
 /// Propagates a transport error from the call, as the calls above it do; a
 /// daemon that answers is reported on the surface and returns `Ok`.
-fn advise_on_repo_context(conn: &mut Connection, ctx: &mut UiContext<'_>) -> anyhow::Result<()> {
+fn advise_on_repo_context(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    generate: Option<RepoContextGenerateMode>,
+) -> anyhow::Result<()> {
     use teton_protocol::methods::{ContextAction, RepoContextStateKind, SessionContextParams};
 
     let Some(session_id) = ctx.session_id.clone() else {
@@ -2167,6 +2207,20 @@ fn advise_on_repo_context(conn: &mut Connection, ctx: &mut UiContext<'_>) -> any
                          file rather than a symlink",
                     ),
                 ),
+                // REQ-613 BR-10: a root with no notes is healthy — unless the
+                // machine has also said it will never offer to write any, in
+                // which case the pair is worth one line. Not a fault, and it
+                // does not move the exit status: `/context init` still writes,
+                // and naming the door that is left is the whole content of the
+                // advisory `doctor.md` documents.
+                RepoContextStateKind::Absent
+                    if generate == Some(RepoContextGenerateMode::Never) =>
+                {
+                    ctx.surface.line(
+                        LineKind::Notice,
+                        &status::repo_notes_generate_never_advisory(),
+                    );
+                }
                 // A session carrying its notes whole, a session whose switch is
                 // off, and a root with no file are three healthy states. Doctor
                 // stays quiet about all three: the posture line above already
@@ -2383,6 +2437,58 @@ pub(crate) enum ContextCli {
     Disable,
     /// Print the durable default and the resident cap.
     Status,
+    /// Write this repository's `TETON.md` now (REQ-613 BR-8): walk the tree,
+    /// spend one model call, write the file. Asks first.
+    ///
+    /// The **only** `teton context` verb that opens a session, and the reason is
+    /// [`ProviderAction::Test`]'s: it is not a read. The write, the walk and the
+    /// model call are the daemon's, driven through a one-shot session at this
+    /// shell's directory — one grammar, two spellings, and the same bytes out of
+    /// both doors (architecture ADR-7).
+    Init {
+        /// Replace an existing `TETON.md` instead of leaving it alone.
+        ///
+        /// Without it a file that is already there stops the run with one line
+        /// naming its size and this flag (BR-6's no-clobber rule reaching the
+        /// explicit door). With it the prompt asks a different question — the
+        /// daemon puts `replace` on the permission subject so the human sees
+        /// which one is on screen.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Set the durable offer posture: `ask` (the default), `always`, or `never`
+    /// (`[context] generate`, REQ-613 BR-10).
+    Generate {
+        /// One of `ask`, `always`, `never`.
+        mode: CliGenerateMode,
+    },
+}
+
+/// CLI mirror of [`RepoContextGenerateMode`] (REQ-613 BR-10).
+///
+/// A third spelling of one closed set, beside `teton-core`'s config enum and
+/// `teton-protocol`'s wire enum, for [`CliTier`]'s reason: clap owns the
+/// grammar a user types, and the mapping below is the one place the typed word
+/// becomes the wire value — an exhaustive `match`, so a fourth posture is a
+/// compile error here rather than a spelling the CLI silently cannot send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum CliGenerateMode {
+    /// Offer on the first prompt of a session in a project with no notes.
+    Ask,
+    /// Write without asking, at every level but `plan` — the unattended opt-in.
+    Always,
+    /// Never offer; `teton context init` still writes.
+    Never,
+}
+
+impl From<CliGenerateMode> for RepoContextGenerateMode {
+    fn from(mode: CliGenerateMode) -> Self {
+        match mode {
+            CliGenerateMode::Ask => RepoContextGenerateMode::Ask,
+            CliGenerateMode::Always => RepoContextGenerateMode::Always,
+            CliGenerateMode::Never => RepoContextGenerateMode::Never,
+        }
+    }
 }
 
 /// REQ-612 AC-11: the one `repo notes:` line, shared by `teton doctor`,
@@ -2397,7 +2503,7 @@ fn render_repo_context_posture(
     match posture {
         Some(p) => surface.line(
             LineKind::Info,
-            &status::repo_notes_line(p.enabled, p.max_bytes),
+            &status::repo_notes_line(p.enabled, p.max_bytes, p.generate),
         ),
         None => surface.line(
             LineKind::Notice,
@@ -2406,13 +2512,124 @@ fn render_repo_context_posture(
     }
 }
 
-fn run_context(paths: &DaemonPaths, action: ContextCli) -> anyhow::Result<()> {
+/// `teton context …` (REQ-612 BR-2, REQ-613 BR-8/BR-10).
+///
+/// Four of the five verbs are passive reads and writes of configuration and run
+/// under [`passive_ctx`]. `init` is the fifth and goes elsewhere entirely: it
+/// opens a session and answers a permission prompt, which a passive context is
+/// defined not to do.
+///
+/// # Errors
+///
+/// A `--cwd` that names no directory, on the `init` path only, and a transport
+/// error from any of them.
+fn run_context(
+    paths: &DaemonPaths,
+    action: ContextCli,
+    session_root: Option<&Path>,
+    cwd_flag: Option<&str>,
+) -> anyhow::Result<()> {
+    if let ContextCli::Init { force } = action {
+        return run_context_init(paths, force, session_root, cwd_flag);
+    }
     let mut surface = stdout_surface();
     let mut conn = client::ensure_connected(paths, &mut surface)?;
     let mut state = SessionState::new();
     let mut prompter = StdinPrompter::new();
     let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
     context_on(&mut conn, &mut ctx, action)
+}
+
+/// `teton context init [--force]`: a one-shot session at the shell's directory,
+/// one `session/context` call, and out (REQ-613 BR-8, architecture ADR-7).
+///
+/// # Why a session, and not a daemon-wide method
+///
+/// The write needs three things a session already has and a daemon-wide "write
+/// here" method would have to invent: a probed root (so the file lands inside
+/// the jail and the permission key encodes the directory the human was deciding
+/// about), an addressee for the offer, and a level to judge it at. So this
+/// creates a session exactly as `teton` itself does — the same
+/// [`resolve_session_root_path`] resolution, the same `session/create`, the same
+/// refusal for a `--cwd` that names nothing — sends the one call, prints what
+/// the daemon says, and lets the session end with the process, as
+/// [`run_provider_test`]'s does.
+///
+/// # The gate is answered here, on this process's own terminal
+///
+/// `answer_permissions: true`, which is the one thing that separates this from
+/// every other `teton …` subcommand's [`passive_ctx`]: the offer this call
+/// raises is *this* invocation's to answer, and nobody else is looking at it.
+/// `typed_input` is read at the edge like the session path reads it, so on a
+/// pipe the client refuses the offer **without reading a line** and the daemon
+/// records `refused_unattended` — the session's own behaviour, inherited rather
+/// than re-implemented (BR-2).
+///
+/// # Errors
+///
+/// A `--cwd` that names no directory (refused before anything connects, in the
+/// shape every refused argument takes) or a transport error. A daemon that
+/// *answers* — including a refused `session/create` — is reported on the surface
+/// and returns `Ok`.
+fn run_context_init(
+    paths: &DaemonPaths,
+    force: bool,
+    session_root: Option<&Path>,
+    cwd_flag: Option<&str>,
+) -> anyhow::Result<()> {
+    if let Some(refusal) = cwd_flag_refusal(cwd_flag, session_root) {
+        anyhow::bail!(refusal);
+    }
+    let mut surface = stdout_surface();
+    let mut conn = client::ensure_connected(paths, &mut surface)?;
+    let mut state = SessionState::new();
+    let mut prompter = StdinPrompter::new();
+    let mut ctx = UiContext {
+        surface: &mut surface,
+        state: &mut state,
+        prompter: &mut prompter,
+        // The one departure from `passive_ctx`, and the whole point of this
+        // subcommand: the offer belongs to this invocation.
+        answer_permissions: true,
+        // A model proposal does not. Nothing here downloads a model, and a
+        // first-run proposal raised by somebody else's session must not be
+        // answered by a command that was asked to write a file.
+        answer_model_proposals: false,
+        auto_accept_model: false,
+        typed_input: std::io::IsTerminal::is_terminal(&std::io::stdin()),
+        session_id: None,
+        // No slash command runs here, so nothing classifies as a skill —
+        // `passive_ctx`'s reading of the same fact.
+        skills: slash::SkillSnapshot::empty(),
+    };
+
+    let created = conn.call(
+        SessionCreateParams {
+            mode: SessionMode::Freeform,
+            phase: None,
+            // BUG-147 / REQ-583 BR-6: the daemon runs under launchd with cwd
+            // `/`, so the root this writes into has to be sent.
+            cwd: session_root.map(Path::to_path_buf),
+        },
+        &mut ctx,
+    )?;
+    let session_id = match created {
+        Ok(res) => res.session_id,
+        Err(err) => {
+            ctx.surface.line(
+                LineKind::Error,
+                &format!("{SESSION_START_REFUSAL_PREFIX}{}", err.message),
+            );
+            return Ok(());
+        }
+    };
+    ctx.session_id = Some(session_id.clone());
+    ctx.state.session_id = Some(session_id.clone());
+
+    // The same body `/context init` runs, so the two doors cannot send
+    // different params or render through a different function (REQ-582's
+    // one-grammar rule).
+    slash::context_init_on(&mut conn, &mut ctx, session_id, force)
 }
 
 /// The body `teton context …` runs. `enable`/`disable` go through `config/set`
@@ -2430,18 +2647,24 @@ pub(crate) fn context_on(
     ctx: &mut UiContext<'_>,
     action: ContextCli,
 ) -> anyhow::Result<()> {
-    let enabled = match action {
-        ContextCli::Enable => Some(true),
-        ContextCli::Disable => Some(false),
+    let update = match action {
+        ContextCli::Enable => Some(ConfigUpdate::SetRepoContextEnabled { enabled: true }),
+        ContextCli::Disable => Some(ConfigUpdate::SetRepoContextEnabled { enabled: false }),
         ContextCli::Status => None,
+        // REQ-613 BR-10 / ADR-7: the second durable key of the `[context]`
+        // table, through the **same** `config/set` the switch goes through, so
+        // it inherits that method's gates whole rather than needing a method and
+        // a gate of its own.
+        ContextCli::Generate { mode } => {
+            Some(ConfigUpdate::SetRepoContextGenerate { mode: mode.into() })
+        }
+        // `init` never reaches here: `run_context` sends it to its own session
+        // path above, and the session form is `/context init`. Named rather than
+        // wildcarded so a sixth verb has to be decided about.
+        ContextCli::Init { .. } => None,
     };
-    if let Some(enabled) = enabled {
-        if let Err(err) = conn.call(
-            ConfigSetParams {
-                update: ConfigUpdate::SetRepoContextEnabled { enabled },
-            },
-            ctx,
-        )? {
+    if let Some(update) = update {
+        if let Err(err) = conn.call(ConfigSetParams { update }, ctx)? {
             ctx.surface.line(
                 LineKind::Error,
                 &format!(
@@ -5395,6 +5618,11 @@ mod tests {
                     BindingSource::Override,
                     true,
                 ),
+                // REQ-613: the twelfth, sharing `think` with the three above.
+                // Present here because `policy show` is the surface a user
+                // checks before writing `policy set-category draft local`, and a
+                // row the table never rendered is a knob they cannot find.
+                row(Category::Draft, Tier::Think, "anthropic", Inherit, true),
             ],
             judgment_default: Some(Category::Edit),
             privacy: Vec::new(),
@@ -5464,6 +5692,9 @@ mod tests {
         for reached in [
             "route", "digest", "edit", "design", "debug", "review", "triage", "shell", "title",
             "compact",
+            // REQ-613 TASK-381: the twelfth, reached the moment its duty
+            // landed.
+            "draft",
         ] {
             let line = category_row(&rendered, reached);
             assert!(
@@ -5471,6 +5702,26 @@ mod tests {
                 "{reached} is reached and must not be marked: {line}"
             );
         }
+
+        // REQ-613 AC-14, on the surface a user reads before writing
+        // `policy set-category draft local`: the twelfth category has a row, and
+        // the row names the tier it follows and the provider that tier resolved
+        // to. `category_row` above already panics on a missing row; this is the
+        // half that says the row is *informative* rather than merely present.
+        let draft = category_row(&rendered, "draft");
+        assert!(
+            draft.contains("think"),
+            "the draft row names its tier: {draft}"
+        );
+        assert!(
+            draft.contains("→ anthropic"),
+            "the draft row names the provider its tier resolved to: {draft}"
+        );
+        assert!(
+            draft.contains("via its tier"),
+            "the draft row says the binding came from `think`, not from a row of \
+             its own: {draft}"
+        );
 
         // BR-6 / AC-11: the "where did this binding come from" column is the
         // resolver's `source`, and nothing else.
@@ -5515,7 +5766,7 @@ mod tests {
         assert!(rendered.contains("inherits default_provider"), "{rendered}");
     }
 
-    /// AC-16 / BR-11: every one of the eleven rows names the content class it
+    /// AC-16 / BR-11: every one of the twelve rows names the content class it
     /// transmits, and `triage` and `compact` name **different** ones despite
     /// sharing the `scan` tier.
     ///
@@ -5535,10 +5786,11 @@ mod tests {
         render_policy(&snapshot, &mut surface);
         let rendered = surface.lines_of(LineKind::Info).join("\n");
 
+        // REQ-613 TASK-381: twelve since `draft` joined them.
         assert_eq!(
             snapshot.routing.len(),
-            11,
-            "AC-16 is about all eleven categories, so the fixture must carry all eleven"
+            12,
+            "AC-16 is about every category, so the fixture must carry them all"
         );
         for row in &snapshot.routing {
             let name = row.category.as_str();

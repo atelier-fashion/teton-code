@@ -112,7 +112,10 @@
 //! watching. No wiring: `HarnessConfig`, the session record and the runtime are
 //! TASK-373/374's, and nothing in this module knows they exist.
 
+pub mod evidence;
+pub mod generate;
 pub mod render;
+pub mod write;
 
 use std::fs::OpenOptions;
 use std::io::Read;

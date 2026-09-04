@@ -27,7 +27,7 @@
 //! `/permissions` prints it and works on a pipe (BR-10), which is what makes
 //! dropping the row an acceptable degradation rather than a loss.
 
-use teton_protocol::methods::EffortView;
+use teton_protocol::methods::{EffortView, RepoContextGenerateMode};
 use teton_protocol::permissions::PermissionLevel;
 
 /// The label the permission field carries.
@@ -142,15 +142,81 @@ pub const REPO_NOTES_LABEL: &str = "repo notes";
 /// to answer that. The cap is dropped from the off arm for the same reason — a
 /// ceiling on bytes that are never read would be describing nothing.
 #[must_use]
-pub fn repo_notes_line(enabled_default: bool, max_bytes: u64) -> String {
-    if enabled_default {
+pub fn repo_notes_line(
+    enabled_default: bool,
+    max_bytes: u64,
+    generate: Option<RepoContextGenerateMode>,
+) -> String {
+    let head = if enabled_default {
         format!(
             "{REPO_NOTES_LABEL}: on (default){FIELD_SEPARATOR}TETON.md or AGENTS.md at the \
              session root{FIELD_SEPARATOR}up to {max_bytes} bytes resident"
         )
     } else {
         format!("{REPO_NOTES_LABEL}: off (default){FIELD_SEPARATOR}the file is never opened")
+    };
+    match generate {
+        Some(mode) => format!("{head}{FIELD_SEPARATOR}generate = {}", generate_word(mode)),
+        None => head,
     }
+}
+
+/// The `[context] generate` posture as `config.toml` spells it (REQ-613 BR-10).
+///
+/// The **config** spelling and not a prose one, for the reason the web override
+/// row records tier names the config's way: this clause is read by someone who
+/// is about to go and change the key, and a line that said "asks first" would
+/// send them looking for a value that does not exist.
+#[must_use]
+fn generate_word(mode: RepoContextGenerateMode) -> &'static str {
+    match mode {
+        RepoContextGenerateMode::Ask => "ask",
+        RepoContextGenerateMode::Always => "always",
+        RepoContextGenerateMode::Never => "never",
+    }
+}
+
+/// The advisory `[context] generate = always` earns on `doctor` (REQ-613 BR-10,
+/// AC-4; `doctor.md`'s "two more advisories").
+///
+/// **A posture advisory, not a file one.** The two beside it describe a file at
+/// a session's root; this one describes a standing permission on the machine —
+/// an unattended session writes `TETON.md` into whichever project it lands in,
+/// without asking, at every level but `plan`. That is the same class of durable
+/// opt-in as `[skills] trusted_project_roots`, and doctor names it wherever it
+/// is set, on REQ-578's posture: one line, a remedy in it, and no change to the
+/// exit status. It is not a fault — it is a thing the user meant once and may
+/// not mean now.
+///
+/// It takes no session and no argument, which is why it renders beside the
+/// posture line off `config/get` rather than inside
+/// [`crate::main`]'s session-scoped advisory pass: `teton doctor` from a shell
+/// owns no session and must still say this.
+#[must_use]
+pub fn repo_notes_generate_always_advisory() -> String {
+    format!(
+        "advisory: {REPO_NOTES_LABEL}: `[context] generate = always` is a standing permission to \
+         write into a working tree — an unattended session on this machine writes TETON.md into \
+         whichever project it was launched in, without asking, at every level but `plan`. \
+         `teton context generate ask` puts the prompt back."
+    )
+}
+
+/// The advisory `[context] generate = never` earns at a root with **no** notes
+/// (REQ-613 BR-10, AC-4; `doctor.md`'s second posture advisory).
+///
+/// The opposite report from [`repo_notes_generate_always_advisory`], and gated
+/// on the session's own state for the reason that one is not: "no offer will be
+/// raised here" is only worth saying where there is something to offer, and a
+/// root whose notes are already resident has nothing. Neither advisory moves the
+/// exit status.
+#[must_use]
+pub fn repo_notes_generate_never_advisory() -> String {
+    format!(
+        "advisory: {REPO_NOTES_LABEL}: this root has no notes and `[context] generate = never`, \
+         so no offer will be raised here — `/context init` is the only door left, and it still \
+         writes."
+    )
 }
 
 /// The advisory a **truncated** notes file earns on `doctor` (REQ-612 BR-7,
@@ -656,7 +722,7 @@ mod repo_notes_line_tests {
     /// reads describes nothing; restored.
     #[test]
     fn the_repo_notes_line_states_the_default_the_files_and_the_cap() {
-        let on = repo_notes_line(true, 8_192);
+        let on = repo_notes_line(true, 8_192, None);
         assert!(
             on.starts_with("repo notes: on (default)"),
             "the default comes first; got: {on}"
@@ -670,7 +736,7 @@ mod repo_notes_line_tests {
             "BR-7 asks the cost be stated; got: {on}"
         );
 
-        let off = repo_notes_line(false, 8_192);
+        let off = repo_notes_line(false, 8_192, None);
         assert!(off.starts_with("repo notes: off (default)"), "got: {off}");
         assert!(
             off.contains("never opened"),
@@ -679,6 +745,71 @@ mod repo_notes_line_tests {
         assert!(
             !off.contains("up to"),
             "a cap on bytes that are never read describes nothing; got: {off}"
+        );
+    }
+
+    /// **REQ-613 BR-10 / AC-4.** The posture line gains the `[context] generate`
+    /// clause, spelled the way `config.toml` spells it — and a daemon that
+    /// reports no posture prints the REQ-612 line byte for byte rather than the
+    /// shipped default dressed up as a fact the daemon stated.
+    ///
+    /// **Mutation (run 2026-09-03):** rendering `None` as `generate = ask`
+    /// reddened the last assertion; wording the clause as "asks first" reddened
+    /// the `generate = never` one. Restored both.
+    #[test]
+    fn the_repo_notes_line_names_the_generate_posture_when_the_daemon_reports_one() {
+        for (mode, word) in [
+            (RepoContextGenerateMode::Ask, "generate = ask"),
+            (RepoContextGenerateMode::Always, "generate = always"),
+            (RepoContextGenerateMode::Never, "generate = never"),
+        ] {
+            let line = repo_notes_line(true, 8_192, Some(mode));
+            assert!(
+                line.contains(word),
+                "the clause spells the key as config.toml does; got: {line}"
+            );
+        }
+        // The off arm carries it too: `repo_file` and `generate` are two
+        // different questions, and a machine that reads no file can still be one
+        // that writes one.
+        assert!(
+            repo_notes_line(false, 8_192, Some(RepoContextGenerateMode::Always))
+                .contains("generate = always"),
+            "the posture is not conditional on the read switch"
+        );
+        assert_eq!(
+            repo_notes_line(true, 8_192, None),
+            repo_notes_line(true, 8_192, None),
+            "sanity"
+        );
+        assert!(
+            !repo_notes_line(true, 8_192, None).contains("generate"),
+            "a daemon that reports no posture must not have one printed for it"
+        );
+    }
+
+    /// **REQ-613 BR-10 / AC-4.** The two posture advisories say what
+    /// `doctor.md` documents: `always` is a standing permission to write into a
+    /// working tree, `never` at a bare root leaves `/context init` as the only
+    /// door. Both carry a remedy and neither claims a fault.
+    #[test]
+    fn each_generate_advisory_names_the_posture_and_a_remedy() {
+        let always = repo_notes_generate_always_advisory();
+        assert!(always.starts_with("advisory: repo notes: "), "{always}");
+        assert!(
+            always.contains("generate = always") && always.contains("without asking"),
+            "the advisory has to say what the posture actually does; got: {always}"
+        );
+        assert!(
+            always.contains("teton context generate ask"),
+            "an advisory with no remedy is a dead end; got: {always}"
+        );
+
+        let never = repo_notes_generate_never_advisory();
+        assert!(never.starts_with("advisory: repo notes: "), "{never}");
+        assert!(
+            never.contains("generate = never") && never.contains("/context init"),
+            "the `never` report is about the door that is left; got: {never}"
         );
     }
 

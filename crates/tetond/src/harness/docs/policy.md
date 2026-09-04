@@ -14,8 +14,8 @@ You cannot run these commands. Print them; the user runs them.
   dominate. Carries `digest`, `compact` and `triage`.
 - `build` — the agentic loop of read, edit, run, verify. Tool-call fidelity
   dominates. Carries `edit` and `shell`.
-- `think` — design, debug, critique. Reasoning depth dominates. Carries
-  `design`, `debug` and `review`.
+- `think` — design, debug, critique, and the once-per-repository draft.
+  Reasoning depth dominates. Carries `design`, `debug`, `review` and `draft`.
 
 An unbound `build` or `think` tier falls back to the configured default
 provider. `reflex` and `scan` do not: work that was already local stays local
@@ -35,8 +35,8 @@ away from the model that wrote the code.
 `--fallback` names the provider used when the primary errors or times out. It
 is a second binding, not a retry count.
 
-The nine bindable categories are `title`, `digest`, `compact`, `triage`,
-`edit`, `shell`, `design`, `debug` and `review`. `route` and `redact` cannot be
+The ten bindable categories are `title`, `digest`, `compact`, `triage`,
+`edit`, `shell`, `design`, `debug`, `review` and `draft`. `route` and `redact` cannot be
 bound at all, and this is structural rather than a check: `route` classifies
 intent, and a router that called a remote model to decide would have spent what
 it was saving; `redact` scans content before egress, so binding it elsewhere

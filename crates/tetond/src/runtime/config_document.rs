@@ -1467,4 +1467,164 @@ permission_allow = [\"fetch_user_url\"]
              the key the user has to fix"
         );
     }
+
+    /// **`[context] generate` is rendered into the table when the write is
+    /// about it, and invented nowhere else** (REQ-613 TASK-379, BR-10).
+    ///
+    /// The finding this test records is that **no rendering code was needed**.
+    /// The task expected a `generate` arm here; the seam already had one,
+    /// assembled from two rules REQ-612 and REQ-574 put in place:
+    ///
+    /// 1. `Config::context` carries `skip_serializing_if =
+    ///    "ContextConfig::is_unset"`, so a config whose whole `[context]` table
+    ///    is at its default canonicalizes to no table at all; and
+    /// 2. [`apply_config_delta`] diffs the caller's `current` against its
+    ///    `candidate`, so a key **neither side moved** is not in the delta and
+    ///    the document is not touched at it.
+    ///
+    /// Between them, a `generate` a write is not about can neither appear in a
+    /// table the user never named nor be re-stated in one they did. A test
+    /// rather than a claim, because that is a property of two attributes in
+    /// another crate and a diff in a third, and nothing local would fail if
+    /// either moved.
+    ///
+    /// The legs run in the order they are hardest to satisfy accidentally: the
+    /// absence first, then the creation, then the in-place edit — which is also
+    /// what makes each mutation below attributable to one leg rather than dying
+    /// at whichever assertion happens to run first.
+    ///
+    /// The last leg is the one an implementer would get wrong by hand: the key
+    /// lands *inside* the existing table with the user's comment and
+    /// `repo_file` intact, rather than as a duplicate `[context]` header
+    /// appended at the end.
+    ///
+    /// **Mutations** (all four run 2026-09-03, restored):
+    /// 1. `#[serde(skip)]` on `ContextConfig::generate` — the *creation* leg
+    ///    goes red (`the durable posture never reached the document`), which is
+    ///    the leg that proves the key is wired into the canonical serialization
+    ///    the delta reads;
+    /// 2. `skip_serializing_if` dropped from `Config::context` **and**
+    ///    `render_config_document` re-serialized (`candidate.to_toml()`) instead
+    ///    of edited — the *absence* leg goes red, an unrelated `effort` write
+    ///    growing a `[context]` table stating two defaults. That is the
+    ///    pre-REQ-574 writer, and it takes both halves because either one alone
+    ///    is not enough (see 3 and 4);
+    /// 3. `skip_serializing_if` dropped from `Config::context` **alone** —
+    ///    **green**, measured rather than assumed, and the same finding REQ-612
+    ///    recorded for the table itself: the delta diffs two configs that agree
+    ///    at `[context]`, so no serde attribute can put it in the delta. Its
+    ///    teeth are one layer down, in
+    ///    `teton_core::config::tests::context_generate_defaults_to_ask_and_names_its_three_values`
+    ///    mutation 3;
+    /// 4. the delta base forced to the document's own parse instead of `current`
+    ///    — **green here**, because this fixture's memory and document agree, so
+    ///    the two bases are the same value. That mutation needs *drift* to bite,
+    ///    and it is run where the drift is:
+    ///    `tetond/tests/config_preservation.rs::a_hand_written_generate_survives_a_write_the_daemon_has_no_memory_of_it_for`.
+    #[test]
+    fn the_generate_key_reaches_the_table_a_write_is_about_and_is_invented_in_no_other() {
+        use teton_core::config::GenerateMode;
+
+        // A hand-written config that has never heard of `[context]`.
+        let dir = scratch_dir("persist-context-generate");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, HAND_WRITTEN_CONFIG).expect("seed the config");
+        let current = Config::load(HAND_WRITTEN_CONFIG).expect("the fixture loads");
+
+        // A write about something else does not mention `generate` at all, and
+        // does not invent the table to hold it. First, so a writer that
+        // re-serializes rather than edits is caught here rather than at the
+        // surviving-comments assertion below.
+        let mut unrelated = current.clone();
+        unrelated.effort = teton_core::effort::EffortLevel::High;
+        let edited = super::render_config_document(
+            Some(&path),
+            &current,
+            &unrelated,
+            super::DeltaBase::InMemory,
+        )
+        .expect("the write derives");
+        assert!(
+            !edited.text.contains("[context]") && !edited.text.contains("generate"),
+            "an unrelated write grew a `[context]` table:\n{}",
+            edited.text
+        );
+
+        // The write that *is* about it: the table is created, the mode is
+        // spelled in snake_case, and the notes above survive.
+        let mut candidate = current.clone();
+        candidate.context.generate = GenerateMode::Never;
+        let edited = super::render_config_document(
+            Some(&path),
+            &current,
+            &candidate,
+            super::DeltaBase::InMemory,
+        )
+        .expect("the write derives");
+        assert!(
+            !edited.unchanged,
+            "the write changed nothing:\n{}",
+            edited.text
+        );
+        assert!(
+            edited.text.contains("[context]") && edited.text.contains("generate = \"never\""),
+            "the durable posture never reached the document:\n{}",
+            edited.text
+        );
+        assert!(
+            edited.text.contains("# my teton config, written by hand")
+                && edited
+                    .text
+                    .contains("# search is on because I set up a backend below"),
+            "the user's notes were lost:\n{}",
+            edited.text
+        );
+        assert_eq!(
+            Config::load(&edited.text)
+                .expect("the edited document loads")
+                .context
+                .generate,
+            GenerateMode::Never,
+            "read back through the production loader, not matched as a string:\n{}",
+            edited.text
+        );
+
+        // And in a table the user *did* name, the key is edited in place —
+        // one header, the comment and the neighbouring switch untouched.
+        const NAMED: &str = "# the notes are off here, on purpose\n\
+                             [context]\n\
+                             repo_file = false\n";
+        let named_path = dir.join("named.toml");
+        std::fs::write(&named_path, NAMED).expect("seed the named config");
+        let current = Config::load(NAMED).expect("the fixture loads");
+        let mut candidate = current.clone();
+        candidate.context.generate = GenerateMode::Always;
+        let edited = super::render_config_document(
+            Some(&named_path),
+            &current,
+            &candidate,
+            super::DeltaBase::InMemory,
+        )
+        .expect("the write derives");
+        assert_eq!(
+            edited.text.matches("[context]").count(),
+            1,
+            "the write appended a second table instead of editing the one there:\n{}",
+            edited.text
+        );
+        assert!(
+            edited.text.contains("# the notes are off here, on purpose")
+                && edited.text.contains("repo_file = false")
+                && edited.text.contains("generate = \"always\""),
+            "the edit did not land beside what the user wrote:\n{}",
+            edited.text
+        );
+        let reloaded = Config::load(&edited.text).expect("the edited document loads");
+        assert_eq!(reloaded.context.generate, GenerateMode::Always);
+        assert!(
+            !reloaded.context.repo_file,
+            "the write about one switch moved the other:\n{}",
+            edited.text
+        );
+    }
 }

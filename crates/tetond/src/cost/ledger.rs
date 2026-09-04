@@ -1198,6 +1198,8 @@ fn category_from_wire(s: &str) -> Option<Category> {
         "design" => Category::Design,
         "debug" => Category::Debug,
         "review" => Category::Review,
+        // REQ-613 TASK-381: Draft arm.
+        "draft" => Category::Draft,
         _ => return None,
     })
 }

@@ -1,7 +1,7 @@
 ---
 id: TASK-381
 title: "`Category::Draft` bound to `think`, the `DRAFT_DUTY`, and the draft prompt with bounding"
-status: draft
+status: complete
 parent: REQ-613
 repo: teton-code
 created: 2026-09-03
@@ -31,12 +31,12 @@ REQ-612's renderer does, at the cap less the header). No call site yet beyond th
 
 ## Acceptance Criteria
 
-- [ ] `Category::Draft.tier() == Tier::Think`; `/policy set-category draft local` parses and
+- [x] `Category::Draft.tier() == Tier::Think`; `/policy set-category draft local` parses and
       binds; `policy show` renders the row; every category test counts 12.
-- [ ] `build_prompt` names the five sections in order and the byte budget; a golden.
-- [ ] `bound_answer` of cap + 2,000 bytes with a 120-byte header is exactly the cap, cut at a
+- [x] `build_prompt` names the five sections in order and the byte budget; a golden.
+- [x] `bound_answer` of cap + 2,000 bytes with a 120-byte header is exactly the cap, cut at a
       line boundary, header first.
-- [ ] `cargo test -p teton-core -p tetond --lib --no-fail-fast` green.
+- [x] `cargo test -p teton-core -p tetond --lib --no-fail-fast` green.
 
 ## Verification
 

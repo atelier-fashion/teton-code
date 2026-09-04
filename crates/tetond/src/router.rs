@@ -118,6 +118,8 @@ pub fn to_protocol_category(category: CoreCategory) -> ProtoCategory {
         CoreCategory::Design => ProtoCategory::Design,
         CoreCategory::Debug => ProtoCategory::Debug,
         CoreCategory::Review => ProtoCategory::Review,
+        // REQ-613 TASK-381: Draft arm.
+        CoreCategory::Draft => ProtoCategory::Draft,
     }
 }
 

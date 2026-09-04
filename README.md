@@ -68,6 +68,7 @@ prompts:
 | `/permissions [level]` | Show, or change, what this session may run without asking |
 | `/transcript [on\|off]` | Record this session to a file, or stop; bare, print the state and the file's path |
 | `/context [on\|off]` | Use this repository's `TETON.md` notes in the prompt, or stop; bare, print the state, the file and its resident bytes |
+| `/context init [--force]` | Write this repository's `TETON.md` now — walk the tree, spend one model call, create the file (asks first; `--force` replaces an existing one) |
 | `/web setup` | Set up web lookup: pick a tier, name a backend, confirm before anything is written |
 | `/web allow` | Lift this session's web taint restriction (grants no new tier) |
 | `/web refresh <url>` | Drop a URL's cached copy so the next lookup re-fetches |
@@ -113,6 +114,23 @@ again, with two lifetimes: `[context] repo_file = false` in `config.toml` turns
 it off durably — the file is never opened — and `/context on` / `/context off`
 switch the session you are in without writing anything. `teton context
 enable|disable|status` is the durable switch's shell surface.
+
+**And when there is no such file, Teton offers to write one.** The first prompt
+of a session in a project with no `TETON.md` and no `AGENTS.md` raises one
+permission prompt: may Teton walk this tree, spend one model call, and write the
+file. Accept and it is written and loaded on that same turn, opening with a line
+saying Teton generated it, on what date, and that you should edit it freely —
+it is your file from then on. Decline and nothing happens, for that session only;
+Teton never remembers a permission answer across sessions. `/context init
+[--force]` and `teton context init [--force]` write one on demand. The durable
+setting is `[context] generate = ask|always|never`, spelled from a shell as
+`teton context generate <mode>`: `ask` is the default and the only value that
+ever draws a prompt; `never` stops the offer while leaving `init` working; and
+`always` is the automation opt-in — an unattended session (piped stdin, no
+terminal) cannot answer a prompt, so under `ask` it writes nothing at all, and
+under `always` it writes `TETON.md` into whichever project it was launched in,
+without asking, at every permission level except `plan`. A `plan` session never
+writes, and an empty `TETON.md` is the other way to say "not here".
 
 Everything you would otherwise open a second terminal for is here too. The ten
 commands below that have a `teton …` twin *are* that twin — the same arguments,

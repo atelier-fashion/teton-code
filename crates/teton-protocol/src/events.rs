@@ -58,6 +58,16 @@
 //! for the reason `transcript_state` carries no path: which file the notes came
 //! out of is [`crate::methods::SessionContextResult`]'s routed answer to the
 //! connection that asked.
+//! REQ-613 adds `repo_context_generation` (BR-2, architecture ADR-6), the
+//! **one** event the whole generation pipeline puts on the bus: an offer raised,
+//! how it was settled, and — once it was accepted — each stage of the walk,
+//! draft and write. One event and not ten, for the reason `repo_context_state`
+//! is one and not two: a client renders one line either way, and one event is
+//! one `name()` arm, one spec-table row and one thing to subscribe to. The ten
+//! stage names survive as the values of [`GenerationOutcome`]. It carries the
+//! root's **display** and no other path, for `repo_context_state`'s reason —
+//! which file was written is [`crate::methods::SessionContextResult`]'s routed
+//! answer.
 //!
 //! This list is an index, not decoration: a new variant of [`Event`] that is not
 //! named here makes the paragraph above wrong.
@@ -66,8 +76,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::effort::ResolvedEffort;
 use crate::methods::{
-    ProviderHealth, ProviderTestOutcome, RepoContextSource, RepoContextStateKind, RootKind,
-    SessionRoot, SkillSource, TierBinding,
+    ProviderHealth, ProviderTestOutcome, RepoContextOrigin, RepoContextSource,
+    RepoContextStateKind, RootKind, SessionRoot, SkillSource, TierBinding,
 };
 use crate::{
     Category, ClientKind, Phase, ProtocolVersion, ProviderId, ProviderKind, RequestId, SessionId,
@@ -240,6 +250,10 @@ pub enum Event {
     /// A session's repository notes were loaded, or exist and were not made
     /// resident (REQ-612 BR-1/BR-2).
     RepoContextState(RepoContextState),
+    /// An offer to write the repository's missing notes file was raised, or one
+    /// stage of the generation that followed it finished (REQ-613 BR-2,
+    /// architecture ADR-6).
+    RepoContextGeneration(RepoContextGeneration),
 }
 
 impl Event {
@@ -288,6 +302,7 @@ impl Event {
             Event::BoundaryDefaultsApplied(_) => "boundary_defaults_applied",
             Event::TranscriptState(_) => "transcript_state",
             Event::RepoContextState(_) => "repo_context_state",
+            Event::RepoContextGeneration(_) => "repo_context_generation",
         }
     }
 }
@@ -1607,6 +1622,68 @@ pub enum PermissionSubject {
         /// the daemon like every other identifier that reaches a prompt.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider_id: Option<ProviderId>,
+    },
+    /// May Teton **write** the repository's missing notes file — walking the
+    /// tree for evidence and spending one model call to draft it (REQ-613 BR-2,
+    /// architecture ADR-2)?
+    ///
+    /// Asked once per session per root, under
+    /// [`crate::methods::repo_context_generate_key`] — never a tool's name and
+    /// never a skill key, for [`Self::ProjectSkillTrust`]'s reason (LESSON-495:
+    /// the key encodes the question, and the root it was asked about). The
+    /// level table is the gate's own: `guarded` and `edits` ask, `plan` never
+    /// reaches here at all, `full` allows.
+    ///
+    /// # A new variant is not additive the way a new field is
+    ///
+    /// [`Self::ProjectSkillTrust`]'s note applies verbatim, and here the
+    /// consequence is the mildest of the four: a REQ-612-vintage client lands on
+    /// [`Self::Unrecognized`], answers
+    /// [`crate::methods::RefusalReason::UnrecognizedSubject`] without asking
+    /// anyone, and the session proceeds **cold** — no file is written, the turn
+    /// runs without repository notes, and the client prints its refusal line.
+    /// That is the spec's own answer for an unrecognizing client (System Model,
+    /// Events table): stated, not hidden, and never a write nobody approved.
+    /// Pinned by `an_older_client_reads_the_generation_subject_as_unrecognized`.
+    RepoContextGeneration {
+        /// The session root the offer is scoped to, **home-relative** — never an
+        /// absolute path carrying a username into a transcript.
+        ///
+        /// # Bounded, unlike [`Self::ProjectSkillTrust::root`], and that is safe
+        /// here
+        ///
+        /// REQ-591 BR-11 left that field unbounded because it *is* the grant
+        /// key's source: truncating it would collapse two repositories onto one
+        /// key, which is the collision the per-root scope exists to prevent.
+        /// This field is not a key source. The key is minted separately by
+        /// [`crate::methods::repo_context_generate_key`] from the **durable**
+        /// root (ADR-2), so bounding the display costs nothing a comparison
+        /// depends on — and a directory name is repository-authored text, which
+        /// this crate's standing rule says to bound (`session_root::bounded_field`,
+        /// the [`crate::methods::SkillView`] rule).
+        ///
+        /// Bounded is not defused: the client still writes it through
+        /// `render::Surface::line`, as it does every other file-derived string.
+        root: String,
+        /// The root-relative path Teton would write, as the prompt must name it
+        /// (BR-2: "the prompt names what it will do").
+        ///
+        /// This build's own constant (`TETON.md`) rather than anything the
+        /// repository chose, and it rides as a field instead of being assumed by
+        /// the client for the reason [`crate::methods::RepoContextSource`] rides
+        /// on the state: the human is answering about a named file, and a client
+        /// that hard-coded the name would print the wrong one the day this build
+        /// writes somewhere else.
+        path: String,
+        /// Whether an existing file at [`Self::RepoContextGeneration::path`]
+        /// would be **replaced** (BR-8's `--force`).
+        ///
+        /// On the subject rather than left to the caller because `--force` asks
+        /// a materially different question — "write a file that is not there"
+        /// and "overwrite the one that is" — and the human has to see which one
+        /// is on screen. The ordinary offer is `false`; only the explicit
+        /// `/context init --force` sets it.
+        replace: bool,
     },
     /// A subject this build does not know. Never constructed by a daemon —
     /// serde produces it when the `kind` is one this build has never heard of,
@@ -3970,6 +4047,23 @@ pub struct RepoContextState {
     /// unopened").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<RepoContextSource>,
+    /// Who wrote the file that was read — the author, or Teton (REQ-613 System
+    /// Model, `RepoContextState (REQ-612, extended)`).
+    ///
+    /// **Additive, and absent means "not known" rather than "authored".** A
+    /// daemon predating REQ-613 emits no key, and a monitor built before it
+    /// reads `None`; flattening that absence to
+    /// [`RepoContextOrigin::Authored`] would state a fact about
+    /// authorship that no daemon ever asserted. Absent also covers every state
+    /// with no file to attribute — `absent`, `withheld_off` — for the reason
+    /// [`Self::source`] is absent there.
+    ///
+    /// The loader learns nothing else from it (spec: "the loader learns nothing
+    /// else from the origin"); it exists so `/context` and this line can say
+    /// which of the two a file is, and so a generated file is never passed off
+    /// as something a human wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<RepoContextOrigin>,
     /// The file's size on disk in bytes — **absent when the daemon does not
     /// know one**.
     ///
@@ -4016,6 +4110,156 @@ pub struct RepoContextState {
     /// Absent for every state that has nothing to explain, so `unreadable` with
     /// no reason is "we could not say why" and `unreadable` with one is a
     /// remedy the user can act on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// repo_context_generation (REQ-613)
+// ---------------------------------------------------------------------------
+
+/// What the generation pipeline did, in one word (REQ-613 System Model,
+/// architecture ADR-6).
+///
+/// Carried by **both** halves of the feature — [`RepoContextGeneration::outcome`]'s
+/// broadcast news and [`crate::methods::SessionContextResult::generation`]'s
+/// routed answer — for the reason [`crate::methods::RepoContextStateKind`] is
+/// carried by both: one enum spells the answer once, so `/context init` and the
+/// event line cannot come to disagree about what a declined offer is called.
+///
+/// The ten values are ADR-6's nine stages plus [`Self::Replaced`], which BR-8's
+/// `--force` needs to tell from [`Self::Written`]: "Teton wrote the notes you
+/// did not have" and "Teton replaced the notes you did have" are different
+/// facts about the same directory.
+///
+/// A **closed** enum with no catch-all and no `Default`, for
+/// [`TranscriptStateReason`]'s reason and with more riding on it: five of these
+/// values name a *different* reason nothing was written — the human said no, no
+/// human could be asked, the level forbids it, the config forbids it, a stage
+/// failed — and each sends the user to a different remedy. A client that guessed
+/// would tell someone their config suppressed a write that a human declined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationOutcome {
+    /// The offer was put to the human and is awaiting an answer (BR-1). The
+    /// first event of any accepted run, and the only one that is not terminal.
+    Offered,
+    /// The human said no. **Session-scoped and never written anywhere** — Teton
+    /// does not remember a permission answer across sessions, so the durable
+    /// ways to stop the offer stay `generate = never` and an existing (even
+    /// empty) file (BR-1).
+    Declined,
+    /// Nobody could be asked: the surface takes no typed input, so the client
+    /// refused **without reading a line** (BR-2). Distinct from
+    /// [`Self::Declined`] because no human was involved, and the next stdin line
+    /// is still the user's next prompt.
+    RefusedUnattended,
+    /// The session's permission level forbids the write, so no prompt was drawn
+    /// at all (`plan`, BR-2). Decided *before* the gate, on LESSON-524's rule
+    /// inverted: do not ask what you will deny.
+    DeniedLevel,
+    /// The config said not to offer — `[context] generate = never` — or the
+    /// state was one BR-1 stops on (an `AGENTS.md`, an empty file). No walk, no
+    /// call, no prompt. `/context init` is unaffected: it is the user's explicit
+    /// act (BR-8).
+    Suppressed,
+    /// Consent is in hand and the evidence walk is running (BR-3). Published so
+    /// a walk that stops on its budget is visible as a stage rather than as a
+    /// pause.
+    Walking,
+    /// The model answered and the draft was bounded (BR-4).
+    /// [`RepoContextGeneration::draft_bytes`] is the size after bounding.
+    Drafted,
+    /// The file was created where none existed (BR-6's no-clobber write).
+    Written,
+    /// An existing file was replaced, which only `--force` can reach (BR-8).
+    Replaced,
+    /// A stage failed and **no file was left behind** (BR-6: a partial write is
+    /// removed). The turn proceeds cold;
+    /// [`RepoContextGeneration::reason`] carries the daemon's own words, and the
+    /// surface names `/context init` as the remedy.
+    Failed,
+}
+
+/// One stage of an offer to write the repository's missing notes file, or of the
+/// generation that followed it (REQ-613 BR-2, architecture ADR-6).
+///
+/// **One event for the whole pipeline**, whose [`Self::outcome`] carries which
+/// stage this is — the fold [`RepoContextState`] made one REQ earlier, for the
+/// same three reasons: a client renders one line per stage, one event is one
+/// `name()` arm and one spec-table row, and a monitor subscribes once.
+///
+/// **There is no file path here, and that is the same split**
+/// [`RepoContextState`] and [`TranscriptState`] make. [`Self::root`] is the
+/// root's *display*, which the offer already showed the human; which file was
+/// written is answered on the asking connection as
+/// [`crate::methods::SessionContextResult`]'s routed reply. A monitor learns a
+/// repository got notes and does not learn where the user's working tree is.
+///
+/// The session is named by [`EventEnvelope::session_id`], not by a field here:
+/// [`Event`] is internally tagged and flattened, so a `session_id` on this
+/// struct would emit the key twice and fail to deserialize — the same shape
+/// [`ContextCleared`], [`SessionTitled`], [`PrefixCache`], [`TranscriptState`]
+/// and [`RepoContextState`] document. The spec's Events table names the session
+/// in this event's payload; the envelope is where it lives.
+///
+/// Every measurement is an [`Option`] for [`RepoContextState::bytes_on_disk`]'s
+/// reason, and it matters more here than there: this event is published at every
+/// stage, so most of them are emitted *before* the figure exists. A `0` would be
+/// a measurement — "the walk found nothing", "the model returned nothing" — and
+/// an offer that has not walked yet has measured nothing at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoContextGeneration {
+    /// Which stage this is, and — for the five terminal ones — why nothing was
+    /// written.
+    pub outcome: GenerationOutcome,
+    /// The session root, **home-relative** and bounded by the daemon
+    /// (`session_root::bounded_field`), exactly as
+    /// [`PermissionSubject::RepoContextGeneration::root`] carries it to the
+    /// prompt. The same spelling on the question and on the news, so a user
+    /// reading both cannot be looking at two names for one directory.
+    ///
+    /// Repository-authored text: the client defuses it at render.
+    pub root: String,
+    /// How many filesystem entries the evidence walk visited (BR-3).
+    ///
+    /// Absent before the walk has run, and absent on every stage that never
+    /// reaches one. Present *including* on a budget stop, which is what makes
+    /// the stop legible beside [`Self::reason`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entries: Option<u64>,
+    /// How many evidence files a privacy boundary covered and the gatherer
+    /// therefore dropped **before** the call (BR-3, spec's `provenance` row).
+    ///
+    /// Absent before the walk; `0` once it has run is a measurement — nothing
+    /// was excluded — and the distinction is the point of the [`Option`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excluded: Option<u32>,
+    /// The size of the bounded draft in bytes, once there is one (BR-4).
+    ///
+    /// The model's answer after stripping and bounding, not the bytes finally on
+    /// disk: the header line BR-6 prepends is this build's own text and is
+    /// counted where the file is written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_bytes: Option<u64>,
+    /// Which tier served the drafting call, once one has been chosen (BR-5).
+    ///
+    /// Carried so the one named cost row `/cost` shows can be tied to the event
+    /// that caused it without joining on a timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<Tier>,
+    /// Why, in the daemon's own words, when the outcome has words to give.
+    ///
+    /// Composed at the surface from typed facts (LESSON-557) — never a provider
+    /// response body, and never an `io::Error` passed through raw. **Bounded and
+    /// neutralised by the daemon before it reaches the wire**
+    /// (`session_root::bounded_field`, the [`crate::methods::SkillView`] rule),
+    /// because a failure reason is repository-adjacent content: it can carry a
+    /// path the repository chose.
+    ///
+    /// Absent for every outcome with nothing to explain, so a
+    /// [`GenerationOutcome::Failed`] with no reason is "we could not say why"
+    /// and one with a reason is something the user can act on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -4367,12 +4611,31 @@ mod tests {
                 Event::RepoContextState(RepoContextState {
                     state: RepoContextStateKind::Loaded,
                     source: Some(RepoContextSource::TetonMd),
+                    origin: Some(RepoContextOrigin::Authored),
                     bytes_on_disk: Some(3_120),
                     resident_bytes: 3_120,
                     truncated: false,
                     reason: None,
                 }),
                 "repo_context_state",
+            ),
+            (
+                // REQ-613 ADR-6: the one event for the whole pipeline, whose
+                // `outcome` carries which of the ten stages this is. The row
+                // here is the terminal one that spends money and writes a file,
+                // so every optional figure is populated — a fixture built on
+                // `offered` would name the event without exercising a single
+                // measurement.
+                Event::RepoContextGeneration(RepoContextGeneration {
+                    outcome: GenerationOutcome::Written,
+                    root: "~/dev/teton".to_owned(),
+                    entries: Some(4_812),
+                    excluded: Some(2),
+                    draft_bytes: Some(2_400),
+                    tier: Some(Tier::Build),
+                    reason: None,
+                }),
+                "repo_context_generation",
             ),
         ];
 
@@ -4675,6 +4938,8 @@ mod tests {
         let loaded = RepoContextState {
             state: RepoContextStateKind::Loaded,
             source: Some(RepoContextSource::TetonMd),
+            // REQ-613: a file a human wrote, which is every file predating it.
+            origin: Some(RepoContextOrigin::Authored),
             bytes_on_disk: Some(3_120),
             resident_bytes: 3_120,
             truncated: false,
@@ -4710,6 +4975,9 @@ mod tests {
             // alphabetically rather than in declaration order.
             vec![
                 "bytes_on_disk",
+                // REQ-613: *who* wrote it, which is not *which file* it is —
+                // a closed two-value enum this build wrote, and no path.
+                "origin",
                 "resident_bytes",
                 "source",
                 "state",
@@ -4763,6 +5031,8 @@ mod tests {
             let event = RepoContextState {
                 state,
                 source,
+                // A state that named no source has nobody to attribute either.
+                origin: source.map(|_| RepoContextOrigin::Authored),
                 bytes_on_disk: on_disk,
                 resident_bytes: resident,
                 truncated: state == RepoContextStateKind::Truncated,
@@ -4796,6 +5066,9 @@ mod tests {
         let unreadable = RepoContextState {
             state: RepoContextStateKind::Unreadable,
             source: Some(RepoContextSource::TetonMd),
+            // Unreadable: there are bytes on disk and the daemon could not read
+            // them, so it cannot say who wrote them either.
+            origin: None,
             bytes_on_disk: None,
             resident_bytes: 0,
             truncated: false,
@@ -4876,6 +5149,348 @@ mod tests {
         ))
         .unwrap();
         assert!(serde_json::from_str::<EnvelopeAsShippedBeforeReq612>(&known).is_ok());
+    }
+
+    /// **REQ-613 AC-2, and the property `permission_request_subject_is_additive_in_both_directions`
+    /// cannot state.** A new *variant* is not additive the way a new field is: a
+    /// client that predates
+    /// [`PermissionSubject::RepoContextGeneration`] must land on
+    /// [`PermissionSubject::Unrecognized`], and that arm is a **refusal** — not
+    /// an ignore.
+    ///
+    /// The AC asks for the fail-closed *arm*, not merely for deserialization,
+    /// so both halves are asserted: the subject reads as `Unrecognized` (rather
+    /// than taking the whole [`PermissionRequest`] down with it, which on a pipe
+    /// costs the user's next stdin line — LESSON-537), **and** the request it
+    /// arrives on is still fully readable, which is what leaves the client able
+    /// to answer [`crate::methods::RefusalReason::UnrecognizedSubject`] naming
+    /// the request. On such a client the offer is refused and the session
+    /// proceeds cold, which is the spec's own answer: no file is written, and
+    /// nothing is silently guessed at.
+    ///
+    /// **Shown to fail.** Three mutations, each restored after observing.
+    ///
+    /// - Deleting `#[serde(other)]` from the modelled older reader's
+    ///   `Unrecognized` arm — **red here**, on the `expect`: the unknown kind
+    ///   becomes a whole-request parse error, the client sees no request at all,
+    ///   and on a pipe that difference costs the user's next stdin line. That is
+    ///   the failure the arm exists to prevent, and it is mutated on the
+    ///   *modelled* reader because that is the one this test's claim is about —
+    ///   deleting it from the shipped enum instead reds three neighbouring tests
+    ///   and leaves this one green, which is why the model is here.
+    /// - `#[serde(rename = "project_skill_trust")]` on the new variant — red
+    ///   here, and the dangerous regression it stands for: a subject whose kind
+    ///   collides with one an older client already knows is not refused, it is
+    ///   **answered as the other question**.
+    /// - Modelling the older reader as this build's own [`PermissionSubject`] —
+    ///   red, and observed rather than imagined: the first draft of this test
+    ///   did exactly that and reported
+    ///   `left: Some(RepoContextGeneration { .. })`, because a build that knows
+    ///   the kind cannot demonstrate anything about one that does not.
+    #[test]
+    fn an_older_client_reads_the_generation_subject_as_unrecognized() {
+        // What a REQ-613 daemon puts on the wire, minted from the shipped type
+        // rather than hand-written, so the fixture cannot drift from the
+        // variant it is about.
+        let subject = PermissionSubject::RepoContextGeneration {
+            root: "~/dev/teton".to_owned(),
+            path: "TETON.md".to_owned(),
+            replace: false,
+        };
+        let wire = serde_json::to_string(&subject).expect("serializes");
+        assert!(
+            wire.contains(r#""kind":"repo_context_generation""#)
+                && wire.contains(r#""path":"TETON.md""#)
+                && wire.contains(r#""replace":false"#),
+            "the fixture must carry the kind and the fields the prompt names: {wire}"
+        );
+        // This build reads its own subject back whole — the non-vacuity leg, so
+        // the refusal below is about the *reader* and not about the fixture.
+        assert_eq!(
+            serde_json::from_str::<PermissionSubject>(&wire).unwrap(),
+            subject
+        );
+
+        // A reader that genuinely predates the variant: the REQ-589-vintage
+        // subject enum with the same `#[serde(other)]` arm, inside the request
+        // it arrives on. Modelling it rather than reusing this build's type is
+        // the whole test — this build *knows* the kind, so reading it back here
+        // would assert nothing about an older client.
+        #[derive(Debug, Deserialize, PartialEq)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum SubjectAsShippedBeforeReq613 {
+            SkillDynamicContext {
+                skill: String,
+                source: SkillSource,
+                commands: Vec<String>,
+            },
+            ProjectSkillTrust {
+                root: String,
+                skills: Vec<ProjectSkillTrustEntry>,
+                more: u32,
+            },
+            #[serde(other)]
+            Unrecognized,
+        }
+        #[derive(Debug, Deserialize)]
+        struct RequestAsShippedBeforeReq613 {
+            request_id: RequestId,
+            tool_name: String,
+            #[serde(default)]
+            subject: Option<SubjectAsShippedBeforeReq613>,
+        }
+
+        let older = format!(
+            r#"{{"request_id":"r1","tool_name":"repo_context:generate:~/dev/teton",
+                 "options":[],"subject":{wire}}}"#
+        );
+        let request: RequestAsShippedBeforeReq613 =
+            serde_json::from_str(&older).expect("an unknown kind must not fail the whole request");
+        assert_eq!(
+            request.subject,
+            Some(SubjectAsShippedBeforeReq613::Unrecognized),
+            "the unknown case has to be a value the client can branch on, or \
+             there is nothing to refuse"
+        );
+        // The rest of the request survives, which is what lets that client name
+        // what it refused on its refusal line rather than dropping the frame.
+        assert_eq!(request.request_id, RequestId::from("r1"));
+        assert_eq!(request.tool_name, "repo_context:generate:~/dev/teton");
+
+        // Non-vacuity from the other side: that same reader still reads a
+        // subject it shipped with, so the `Unrecognized` above is reached by the
+        // tag being unknown and not by a catch-all swallowing everything.
+        let known = serde_json::to_string(&PermissionSubject::SkillDynamicContext {
+            skill: "status".to_owned(),
+            source: SkillSource::User,
+            commands: vec!["pwd".to_owned()],
+            invoked_by: InvokedBy::User,
+        })
+        .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<SubjectAsShippedBeforeReq613>(&known).unwrap(),
+            SubjectAsShippedBeforeReq613::SkillDynamicContext { .. }
+        ));
+
+        // `--force` asks a different question, and the human has to see which
+        // one is on screen (BR-8), so the flag is on the wire rather than
+        // implied by the caller.
+        let replacing = serde_json::to_value(PermissionSubject::RepoContextGeneration {
+            root: "~/dev/teton".to_owned(),
+            path: "TETON.md".to_owned(),
+            replace: true,
+        })
+        .unwrap();
+        assert_eq!(replacing["replace"], true, "{replacing}");
+    }
+
+    /// **REQ-613's additivity, both directions, for the two things the wire
+    /// gained**: the new `repo_context_generation` event's optional
+    /// measurements, and [`RepoContextState::origin`] on REQ-612's event.
+    ///
+    /// The two are one test because they are one claim — a REQ-612-vintage
+    /// monitor keeps working — asserted at the two places it can break: an event
+    /// tag it has never heard of, and a field it has never heard of.
+    ///
+    /// **Shown to fail.** Three mutations, each restored after observing.
+    ///
+    /// - Dropping `skip_serializing_if` from [`RepoContextState::origin`] — red
+    ///   on the "emits no key" leg: a daemon with nothing to say starts writing
+    ///   `null` where an older daemon wrote nothing.
+    /// - Dropping it from [`RepoContextGeneration::entries`] — red on the
+    ///   `offered` leg, where a stage that has not walked yet would report a key
+    ///   for a measurement it never took.
+    /// - Renaming the `name()` arm to `repo_context_generated` — red here
+    ///   **and** in `event_names_match_the_spec_events_table`, the pairing that
+    ///   keeps ADR-6's "one event, one name, one row" checkable. Worth spelling
+    ///   out: it reds here only because this test asserts `name()` *beside* the
+    ///   serialized tag. The two are independent spellings — the tag comes from
+    ///   `rename_all`, the arm is hand-written — and a test that checked only
+    ///   the wire tag would stay green through that rename.
+    #[test]
+    fn repo_context_generation_is_additive_in_both_directions() {
+        // The first stage: an offer put to a human, before anything has been
+        // walked, drafted or spent. Every measurement absent — and absent as a
+        // *missing key*, not as a `0` that would read as a measurement.
+        let offered = RepoContextGeneration {
+            outcome: GenerationOutcome::Offered,
+            root: "~/dev/teton".to_owned(),
+            entries: None,
+            excluded: None,
+            draft_bytes: None,
+            tier: None,
+            reason: None,
+        };
+        round_trip(&offered);
+        let wire = envelope_wire(Event::RepoContextGeneration(offered.clone()));
+        assert_eq!(wire["event"], "repo_context_generation", "{wire}");
+        // The serialized tag and `name()` are two independent spellings of one
+        // name — the tag comes from `rename_all`, the arm is hand-written — so
+        // both are asserted. Renaming only the arm is green on the line above.
+        assert_eq!(
+            Event::RepoContextGeneration(offered.clone()).name(),
+            "repo_context_generation"
+        );
+        assert_eq!(wire["outcome"], "offered", "{wire}");
+        assert_eq!(wire["root"], "~/dev/teton", "{wire}");
+        for absent in ["entries", "excluded", "draft_bytes", "tier", "reason"] {
+            assert!(
+                wire.get(absent).is_none(),
+                "a stage that measured nothing reported `{absent}`: {wire}"
+            );
+        }
+        // The session rides on the envelope, never on the payload — the shape
+        // `RepoContextState` and `TranscriptState` document, and `envelope_wire`
+        // round-trips, so re-adding a `session_id` field here fails on the
+        // duplicate key rather than reaching a client.
+        assert_eq!(wire["session_id"], "s1", "{wire}");
+
+        // Every outcome, under the System Model's spelling, and no two alike.
+        let spellings: Vec<String> = [
+            (GenerationOutcome::Offered, "offered"),
+            (GenerationOutcome::Declined, "declined"),
+            (GenerationOutcome::RefusedUnattended, "refused_unattended"),
+            (GenerationOutcome::DeniedLevel, "denied_level"),
+            (GenerationOutcome::Suppressed, "suppressed"),
+            (GenerationOutcome::Walking, "walking"),
+            (GenerationOutcome::Drafted, "drafted"),
+            (GenerationOutcome::Written, "written"),
+            (GenerationOutcome::Replaced, "replaced"),
+            (GenerationOutcome::Failed, "failed"),
+        ]
+        .into_iter()
+        .map(|(outcome, spelling)| {
+            round_trip(&outcome);
+            assert_eq!(
+                serde_json::to_value(outcome).expect("serializes"),
+                spelling,
+                "the wire spelling of {outcome:?} moved"
+            );
+            spelling.to_owned()
+        })
+        .collect();
+        let unique: std::collections::HashSet<&String> = spellings.iter().collect();
+        assert_eq!(unique.len(), spellings.len(), "{spellings:?}");
+        // Closed, for the reason the five refusal outcomes give: each names a
+        // different remedy, so an outcome this build cannot read must be an
+        // error rather than a guess at one of the ten.
+        assert!(
+            serde_json::from_str::<GenerationOutcome>(r#""probably_written""#).is_err(),
+            "an outcome this build cannot read must not deserialize to one it renders"
+        );
+
+        // A failure, with the bounded reason and the figures the stages before
+        // it did measure — `0` excluded is a measurement, and the difference
+        // from the absent key above is the whole point of the `Option`.
+        let failed = RepoContextGeneration {
+            outcome: GenerationOutcome::Failed,
+            root: "~/dev/teton".to_owned(),
+            entries: Some(4_812),
+            excluded: Some(0),
+            draft_bytes: None,
+            tier: Some(Tier::Build),
+            reason: Some("the draft route returned no answer".to_owned()),
+        };
+        round_trip(&failed);
+        let wire = envelope_wire(Event::RepoContextGeneration(failed));
+        assert_eq!(wire["excluded"], 0, "{wire}");
+        assert_eq!(wire["tier"], "build", "{wire}");
+        assert_eq!(
+            wire["reason"], "the draft route returned no answer",
+            "{wire}"
+        );
+        assert!(wire.get("draft_bytes").is_none(), "{wire}");
+
+        // Direction one — a frame from a daemon that populates only what it
+        // must still parses, with every optional `None`.
+        let minimal: RepoContextGeneration =
+            serde_json::from_str(r#"{"outcome":"declined","root":"~/dev/teton"}"#)
+                .expect("a frame carrying only the required keys must parse");
+        assert_eq!(minimal.outcome, GenerationOutcome::Declined);
+        assert_eq!(minimal.entries, None);
+        assert_eq!(minimal.draft_bytes, None);
+        assert_eq!(minimal.tier, None);
+
+        // `RepoContextState.origin`, the same two legs on REQ-612's event: a
+        // frame predating the field reads `None` rather than `authored`, and a
+        // payload that never populated it emits no key at all.
+        let older: RepoContextState = serde_json::from_str(
+            r#"{"state":"loaded","source":"teton_md","resident_bytes":9,"truncated":false}"#,
+        )
+        .expect("an event from a daemon predating the field must still parse");
+        assert_eq!(
+            older.origin, None,
+            "absent means `not known`, never a claim that a human wrote it"
+        );
+        let wire = serde_json::to_value(&older).unwrap();
+        assert!(wire.get("origin").is_none(), "{wire}");
+        // Non-vacuity: a daemon that *does* populate it writes the key.
+        let generated = RepoContextState {
+            origin: Some(RepoContextOrigin::Generated),
+            ..older.clone()
+        };
+        round_trip(&generated);
+        assert_eq!(
+            serde_json::to_value(&generated).unwrap()["origin"],
+            "generated"
+        );
+
+        // Direction two — a reader built before REQ-613. It is modelled the way
+        // the shipped `Event` is in the one respect that decides the outcome:
+        // internally tagged on `event` and closed, so the new tag is an error
+        // the CLI turns into a skipped notification, while the *field* added to
+        // a tag it already knows is simply ignored.
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "event", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum EventAsShippedBeforeReq613 {
+            RepoContextState(StateAsShippedBeforeReq613),
+            TranscriptState(TranscriptState),
+        }
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        struct StateAsShippedBeforeReq613 {
+            state: RepoContextStateKind,
+            resident_bytes: u64,
+            truncated: bool,
+        }
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        struct EnvelopeAsShippedBeforeReq613 {
+            seq: u64,
+            #[serde(flatten)]
+            event: EventAsShippedBeforeReq613,
+        }
+
+        let frame = serde_json::to_string(&EventEnvelope::new(
+            7,
+            Some(SessionId::from("s1")),
+            Event::RepoContextGeneration(offered),
+        ))
+        .unwrap();
+        assert!(
+            serde_json::from_str::<EnvelopeAsShippedBeforeReq613>(&frame).is_err(),
+            "the older reader must drop the frame — which is how the CLI's \
+             `from_value(params).ok()?` ignores an unknown event: {frame}"
+        );
+        // And the *field* on an event it does know is ignored rather than
+        // fatal, which is the half that keeps a REQ-612 monitor working.
+        let with_origin = serde_json::to_string(&EventEnvelope::new(
+            8,
+            Some(SessionId::from("s1")),
+            Event::RepoContextState(generated),
+        ))
+        .unwrap();
+        assert!(
+            with_origin.contains(r#""origin":"generated""#),
+            "the fixture must actually carry the new key: {with_origin}"
+        );
+        assert!(
+            serde_json::from_str::<EnvelopeAsShippedBeforeReq613>(&with_origin).is_ok(),
+            "a new field on a known event must not cost the older reader the \
+             whole frame: {with_origin}"
+        );
     }
 
     /// **REQ-586 BR-7's wire half.** A clamp reaches a client as a flat
@@ -5423,6 +6038,14 @@ mod tests {
             // has never heard of.
             PermissionSubject::SkillOverBudget { .. } => {
                 panic!("a dynamic-context subject must not read as the over-budget offer")
+            }
+            // REQ-613's variant, matched for the same reason as the two above
+            // it — and it is the fourth landing of ADR-2's forcing function: a
+            // subject that reddens every exhaustive match is what keeps a client
+            // from silently skipping a consent it has never heard of, and this
+            // one authorizes a file write.
+            PermissionSubject::RepoContextGeneration { .. } => {
+                panic!("a dynamic-context subject must not read as the generation offer")
             }
             PermissionSubject::Unrecognized => panic!("a known kind must not read as unrecognized"),
         }

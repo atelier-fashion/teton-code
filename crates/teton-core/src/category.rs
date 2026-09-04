@@ -196,7 +196,7 @@ impl fmt::Display for CategoryOrigin {
     }
 }
 
-/// The eleven routing categories — the runtime dispatch key in **both** session
+/// The twelve routing categories — the runtime dispatch key in **both** session
 /// modes (BR-1).
 ///
 /// Deliberately carries **no** `FromStr` and **no** `Deserialize`. Config binds
@@ -233,11 +233,23 @@ pub enum Category {
     /// Adversarial critique — some users deliberately pick a different vendor
     /// here than the one that wrote the code.
     Review,
+    /// Writing a repository's `TETON.md` from evidence gathered off its tree
+    /// (REQ-613 BR-4, ADR-4).
+    ///
+    /// Harness-known, like every other duty's category — nothing a user types
+    /// names it — and bound to [`Tier::Think`] by default because the file is
+    /// drafted **once per repository** and then read at the start of every
+    /// session afterwards. That is the one place in the harness where the
+    /// expensive model is the cheap choice, which is why it did not join
+    /// `digest`: `digest`'s local default is right for digests and wrong here
+    /// (REQ-613 OQ-2). The default is a compile-time property like every other
+    /// tier binding; a user who wants it local writes the policy row.
+    Draft,
 }
 
 impl Category {
     /// Every category. AC-2 iterates this; nothing may resolve outside it.
-    pub const ALL: [Category; 11] = [
+    pub const ALL: [Category; 12] = [
         Category::Route,
         Category::Redact,
         Category::Title,
@@ -249,6 +261,7 @@ impl Category {
         Category::Design,
         Category::Debug,
         Category::Review,
+        Category::Draft,
     ];
 
     /// The lowercase wire/display name of this category.
@@ -266,6 +279,7 @@ impl Category {
             Category::Design => "design",
             Category::Debug => "debug",
             Category::Review => "review",
+            Category::Draft => "draft",
         }
     }
 
@@ -278,7 +292,7 @@ impl Category {
             Category::Route | Category::Redact | Category::Title => Tier::Reflex,
             Category::Digest | Category::Compact | Category::Triage => Tier::Scan,
             Category::Edit | Category::Shell => Tier::Build,
-            Category::Design | Category::Debug | Category::Review => Tier::Think,
+            Category::Design | Category::Debug | Category::Review | Category::Draft => Tier::Think,
         }
     }
 
@@ -293,7 +307,12 @@ impl Category {
             | Category::Digest
             | Category::Compact
             | Category::Triage
-            | Category::Shell => CategoryOrigin::HarnessKnown,
+            | Category::Shell
+            // REQ-613 BR-4: the draft is issued by the generation pipeline, not
+            // asked for in prose. Nothing a user types can name it — which is
+            // what keeps `Draft` out of `JudgmentCategory` and out of the
+            // classifier's answer space.
+            | Category::Draft => CategoryOrigin::HarnessKnown,
             Category::Edit | Category::Design | Category::Debug | Category::Review => {
                 CategoryOrigin::IntentClassified
             }
@@ -336,6 +355,7 @@ impl Category {
             Category::Design => Some(ConfigurableCategory::Design),
             Category::Debug => Some(ConfigurableCategory::Debug),
             Category::Review => Some(ConfigurableCategory::Review),
+            Category::Draft => Some(ConfigurableCategory::Draft),
         }
     }
 }
@@ -350,7 +370,7 @@ impl fmt::Display for Category {
 // ConfigurableCategory
 // ---------------------------------------------------------------------------
 
-/// The nine categories a configuration file may bind to a provider.
+/// The ten categories a configuration file may bind to a provider.
 ///
 /// `redact` and `route` are **absent by design** (BR-4, BR-5, ADR-B):
 /// resolution has no branch for either and cannot be made to have one, because
@@ -380,12 +400,14 @@ pub enum ConfigurableCategory {
     Debug,
     /// See [`Category::Review`].
     Review,
+    /// See [`Category::Draft`].
+    Draft,
 }
 
 impl ConfigurableCategory {
-    /// Every configurable category — nine, one per [`Category`] except the two
+    /// Every configurable category — ten, one per [`Category`] except the two
     /// pinned-local ones (`redact`, `route`).
-    pub const ALL: [ConfigurableCategory; 9] = [
+    pub const ALL: [ConfigurableCategory; 10] = [
         ConfigurableCategory::Title,
         ConfigurableCategory::Digest,
         ConfigurableCategory::Compact,
@@ -395,6 +417,7 @@ impl ConfigurableCategory {
         ConfigurableCategory::Design,
         ConfigurableCategory::Debug,
         ConfigurableCategory::Review,
+        ConfigurableCategory::Draft,
     ];
 
     /// The lowercase wire/display name — identical to the [`Category`] it maps
@@ -412,7 +435,7 @@ impl fmt::Display for ConfigurableCategory {
 }
 
 impl Category {
-    /// Total conversion from the configurable nine (ADR-B).
+    /// Total conversion from the configurable ten (ADR-B).
     ///
     /// A `const fn` twin of [`From<ConfigurableCategory> for Category`] so
     /// [`ConfigurableCategory::as_str`] can stay `const`.
@@ -428,6 +451,7 @@ impl Category {
             ConfigurableCategory::Design => Category::Design,
             ConfigurableCategory::Debug => Category::Debug,
             ConfigurableCategory::Review => Category::Review,
+            ConfigurableCategory::Draft => Category::Draft,
         }
     }
 }
@@ -1412,7 +1436,7 @@ mod tests {
     }
 
     /// The provider a category resolves to in `tiers_bound_to(p)` — `p` for the
-    /// nine configurable ones, the local tier for the two pinned ones.
+    /// ten configurable ones, the local tier for the two pinned ones.
     fn expected_provider(category: Category, bound: &str) -> &str {
         if category.configurable().is_some() {
             bound
@@ -1425,8 +1449,8 @@ mod tests {
 
     #[test]
     fn every_enum_lists_each_variant_exactly_once() {
-        assert_eq!(Category::ALL.len(), 11);
-        assert_eq!(ConfigurableCategory::ALL.len(), 9);
+        assert_eq!(Category::ALL.len(), 12);
+        assert_eq!(ConfigurableCategory::ALL.len(), 10);
         assert_eq!(JudgmentCategory::ALL.len(), 4);
         assert_eq!(Tier::ALL.len(), 4);
 
@@ -1471,7 +1495,7 @@ mod tests {
 
     #[test]
     fn origin_split_matches_the_requirement_table() {
-        // Seven harness-known, four intent-classified — the requirement's table
+        // Eight harness-known, four intent-classified — the requirement's table
         // spelled out, so a variant added on the wrong side fails here.
         let harness_known = [
             Category::Route,
@@ -1481,6 +1505,8 @@ mod tests {
             Category::Compact,
             Category::Triage,
             Category::Shell,
+            // REQ-613 BR-4: the eighth. Its call site names it; no prompt can.
+            Category::Draft,
         ];
         let intent_classified = [
             Category::Edit,
@@ -1502,13 +1528,13 @@ mod tests {
                 "{category} must be intent-classified"
             );
         }
-        assert_eq!(harness_known.len() + intent_classified.len(), 11);
+        assert_eq!(harness_known.len() + intent_classified.len(), 12);
         assert_eq!(
             Category::ALL
                 .iter()
                 .filter(|c| c.origin() == CategoryOrigin::HarnessKnown)
                 .count(),
-            7
+            8
         );
         assert_eq!(CategoryOrigin::HarnessKnown.as_str(), "harness_known");
         assert_eq!(
@@ -1531,9 +1557,91 @@ mod tests {
             (Category::Design, Tier::Think),
             (Category::Debug, Tier::Think),
             (Category::Review, Tier::Think),
+            (Category::Draft, Tier::Think),
         ] {
             assert_eq!(category.tier(), tier, "{category}");
         }
+    }
+
+    /// **REQ-613 BR-4 / ADR-4**: `draft` is the twelfth category, harness-known,
+    /// bound to `think` by default, and settable by a policy row.
+    ///
+    /// # What "reached" means here, and where the other half lives
+    ///
+    /// This crate has no call sites — it is the pure vocabulary — so the half
+    /// of "reached" it can assert is the half it owns: `draft` is **declared**
+    /// in [`Category::ALL`], it has a configurable counterpart so
+    /// `/policy set-category draft <tier>` can name it, and nothing that parses
+    /// prompt text can. The other half — that a model call in the daemon really
+    /// dispatches on it — is derived by reading the daemon's own source in
+    /// `tetond::call_sites`, whose `the_unreached_marker_matches_the_daemons_actual_call_sites`
+    /// turns red if `has_call_site(Draft)` and the daemon's routing calls
+    /// disagree. Stated rather than silently split, because a test named
+    /// "reached" that asserted only "declared" would be the weaker claim wearing
+    /// the stronger name.
+    ///
+    /// # Mutations
+    ///
+    /// Moving `Draft` into `tier()`'s `Scan` arm fails the tier assertion (and
+    /// `tiers_match_the_requirement_table`); returning `None` from
+    /// `configurable()` for it fails the policy-row half **and**
+    /// `every_pinned_category_names_its_own_pin`, which would then demand a pin
+    /// sentence for a category that is not pinned; dropping it from `ALL` fails
+    /// the declaration assertion and `every_enum_lists_each_variant_exactly_once`.
+    #[test]
+    fn draft_is_declared_reached_and_bound_to_think() {
+        // Declared, and spelled one way for config, CLI and the wire.
+        assert!(Category::ALL.contains(&Category::Draft));
+        assert_eq!(Category::Draft.as_str(), "draft");
+        assert_eq!(Category::Draft.to_string(), "draft");
+
+        // Bound to `think` at compile time, beside `design`/`debug`/`review`:
+        // the draft is written once per repository and read at the start of
+        // every session afterwards (REQ-613 OQ-2).
+        assert_eq!(Category::Draft.tier(), Tier::Think);
+        assert_eq!(Category::Draft.origin(), CategoryOrigin::HarnessKnown);
+
+        // Harness-known means the classifier's answer space cannot name it, so
+        // no prompt can route itself here.
+        assert!("draft".parse::<JudgmentCategory>().is_err());
+
+        // A policy row *can*: `teton policy set-category draft local`.
+        assert_eq!(
+            Category::Draft.configurable(),
+            Some(ConfigurableCategory::Draft)
+        );
+        assert_eq!(
+            "draft".parse::<ConfigurableCategory>(),
+            Ok(ConfigurableCategory::Draft)
+        );
+        assert_eq!(Category::from(ConfigurableCategory::Draft), Category::Draft);
+
+        // Default: it follows whatever `think` names, through the one resolver
+        // and the ordinary tier row — no branch of its own.
+        let table = tiers_bound_to("frontier");
+        let inherited = resolve(Category::Draft, &table, healthy, all_usable);
+        assert_eq!(inherited.tier, Tier::Think);
+        assert_eq!(inherited.provider_id.as_deref(), Some("frontier"));
+        assert_eq!(inherited.source, BindingSource::TierInheritance);
+        assert_eq!(inherited.outcome, RouteOutcome::Primary);
+
+        // Overridden: the user's own row wins, and `design` — which shares the
+        // tier — is untouched, so the override really is per category.
+        let pinned_local = table.with_override(CategoryOverride {
+            name: ConfigurableCategory::Draft,
+            provider_id: LOCAL.to_owned(),
+            fallback_id: None,
+        });
+        let overridden = resolve(Category::Draft, &pinned_local, healthy, all_usable);
+        assert_eq!(overridden.provider_id.as_deref(), Some(LOCAL));
+        assert_eq!(overridden.source, BindingSource::Override);
+        assert_eq!(
+            resolve(Category::Design, &pinned_local, healthy, all_usable)
+                .provider_id
+                .as_deref(),
+            Some("frontier"),
+            "binding `draft` moved a category that only shares its tier"
+        );
     }
 
     #[test]
@@ -1693,7 +1801,7 @@ mod tests {
 
     #[test]
     fn every_category_resolves_through_override_tier_and_declared_error() {
-        // AC-2 / BR-12: all eleven categories × (per-category override / tier
+        // AC-2 / BR-12: all twelve categories × (per-category override / tier
         // inheritance / unresolvable), asserting provider, tier, outcome and a
         // non-empty reason for each.
         for category in Category::ALL {
@@ -1853,7 +1961,7 @@ mod tests {
                 r.reason
             );
             assert!(r.provider_id.is_none(), "{category}");
-            // The unset binding is named too: the tier for the nine
+            // The unset binding is named too: the tier for the ten
             // configurable ones, the local tier for the two pinned ones.
             if matches!(category, Category::Redact | Category::Route) {
                 assert!(
@@ -1936,7 +2044,7 @@ mod tests {
 
     #[test]
     fn redact_ignores_every_representable_override() {
-        // Nothing a config can say moves `redact`: bind all nine categories and
+        // Nothing a config can say moves `redact`: bind all ten categories and
         // all four tiers to a remote provider and it still resolves local.
         let mut table = tiers_bound_to("frontier-remote");
         for name in ConfigurableCategory::ALL {

@@ -30,8 +30,10 @@ use async_trait::async_trait;
 use futures::StreamExt;
 
 use teton_core::category::{
-    category_for_phase, Category, CategoryTable, JudgmentCategory, Tier, TierBinding,
+    category_for_phase, BindingSource, Category, CategoryOverride, CategoryTable,
+    ConfigurableCategory, JudgmentCategory, Tier, TierBinding,
 };
+use teton_core::effort::{EffortLevel, ResolvedEffort};
 use teton_core::entities::{BoundaryMode, PrivacyBoundary};
 use teton_core::phase::Phase as CorePhase;
 use teton_core::policy::ProviderHealth;
@@ -46,7 +48,10 @@ use teton_protocol::{Phase as ProtoPhase, ProviderId, SessionId};
 use teton_providers::transport::{
     ByteStream, HttpMethod, Transport, TransportError, TransportRequest, TransportResponse,
 };
-use teton_providers::{CapabilityProfile, FailureClass};
+use teton_providers::{
+    CapabilityProfile, FailureClass, Provider, ProviderError, StopReason, TokenUsage,
+    TurnCompletion, TurnEvent, TurnRequest, TurnStream,
+};
 
 use tetond::broadcast::{EventBus, Subscription};
 use tetond::classify::{self, ClassificationSignal};
@@ -54,6 +59,8 @@ use tetond::cost::{CostLedger, NoopCostSink, PriceTable};
 use tetond::egress::{Egress, EgressError, NoopSink, Provenance};
 use tetond::harness::budget::{derive, BudgetInputs};
 use tetond::harness::turn_loop::HarnessConfig;
+use tetond::harness::{DutyRoute, DRAFT_DUTY};
+use tetond::repo_context::render::generated_header;
 use tetond::router::{to_protocol_phase, Route, Router};
 
 /// Mint the identity of a fixture file (REQ-571 ADR-A).
@@ -815,5 +822,414 @@ async fn routed_remote_call_produces_cost_record_and_passes_boundary_inspection(
     assert!(
         events.iter().any(|e| e.event_name() == "route_decided"),
         "the routed call emitted route_decided"
+    );
+}
+
+// --------------------------------------------------------------------------
+// 7. `draft` follows `think` by default and a policy row moves it (REQ-613
+//    BR-4, AC-14)
+// --------------------------------------------------------------------------
+
+/// `teton policy set-category draft local`, as a table: `think` bound to a
+/// healthy **remote** provider, and a `[[categories]]` row moving `draft` off
+/// it — the second of AC-14's three fixtures.
+///
+/// A helper rather than a construction per test, so the case that asserts where
+/// this fixture *resolves* and the case that asserts where it is *served* are
+/// two questions about one fixture. Two hand-built tables would let the serving
+/// case pass over a policy the resolution case never saw, which is the whole
+/// failure mode AC-14 is written against.
+fn draft_override_router() -> Router {
+    Router::new(
+        CategoryTable::new()
+            .with_local_provider("local")
+            .with_tier(tier(Tier::Think, "anthropic", None))
+            .with_override(CategoryOverride {
+                name: ConfigurableCategory::Draft,
+                provider_id: "local".to_owned(),
+                fallback_id: None,
+            }),
+        Some("anthropic".to_owned()),
+    )
+    .with_provider(
+        "anthropic",
+        ProviderKind::Anthropic,
+        "claude-opus-4",
+        native(),
+        ProviderHealth::Healthy,
+    )
+    .with_provider(
+        "local",
+        ProviderKind::Local,
+        "qwen",
+        native(),
+        ProviderHealth::Healthy,
+    )
+}
+
+/// A machine with **no remote provider at all** — `think` itself is bound to
+/// the local tier and there is no declared default behind it. AC-14's third
+/// fixture, shared for [`draft_override_router`]'s reason.
+fn offline_draft_router() -> Router {
+    Router::new(
+        CategoryTable::new()
+            .with_local_provider("local")
+            .with_tier(tier(Tier::Think, "local", None)),
+        None,
+    )
+    .with_provider(
+        "local",
+        ProviderKind::Local,
+        "qwen",
+        native(),
+        ProviderHealth::Healthy,
+    )
+}
+
+/// **AC-14.** The repository-notes draft is a routed model call like any other:
+/// it inherits whatever `think` names, a `[[categories]] name = "draft"` row
+/// overrides that, and a machine with no remote provider drafts on the local
+/// tier — with the resolver naming the tier in every case, because the header
+/// ADR-5 writes into the generated file says which tier wrote it.
+///
+/// Driven through the router rather than through a `DaemonRuntime` for the
+/// reason every test in this file is: what AC-14 claims is a *routing* fact, and
+/// the router is where the decision is made. The daemon-side half — that the
+/// draft duty asks this question at all — is the derived call-site marker in
+/// `tetond::call_sites`.
+///
+/// # Mutations
+///
+/// Binding `Category::Draft` to `Tier::Scan` in `teton_core` sends the first
+/// case to the `scan` provider and fails it; dropping `Draft` from
+/// `ConfigurableCategory` makes the override unrepresentable and fails to
+/// compile; making the resolver ignore per-category overrides for it leaves the
+/// second case on `anthropic`.
+#[tokio::test]
+async fn draft_routes_to_the_think_binding_by_default_and_to_local_when_set() {
+    // 1. The default. `think` is bound to a frontier provider, and `draft`
+    //    inherits it because a file written once and read on every later turn is
+    //    the one place the expensive model is the cheap choice (REQ-613 OQ-2).
+    let router = structured_router();
+    let route = router.resolve(Category::Draft);
+    assert_eq!(
+        route.provider_id.as_ref().expect("draft resolves").0,
+        "anthropic",
+        "draft must follow the `think` binding: {}",
+        route.reason
+    );
+    assert_eq!(route.model.as_deref(), Some("claude-opus-4"));
+    let resolution = router.resolution_for(Category::Draft);
+    assert_eq!(resolution.tier, Tier::Think);
+    assert_eq!(resolution.source, BindingSource::TierInheritance);
+    assert!(
+        route.reason.contains("draft"),
+        "the reason names the category: {}",
+        route.reason
+    );
+    // And it is not `design`'s decision borrowed: the two share a tier, and a
+    // row below moves one without the other.
+    assert_eq!(
+        router.resolve(Category::Design).provider_id,
+        route.provider_id
+    );
+
+    // 2. `teton policy set-category draft local` — a `[[categories]]` row like
+    //    any other, and the resolver says the override is what fired.
+    let local_draft = draft_override_router();
+    let route = local_draft.resolve(Category::Draft);
+    assert_eq!(
+        route.provider_id.as_ref().expect("draft resolves").0,
+        "local",
+        "the policy row must move the draft: {}",
+        route.reason
+    );
+    let resolution = local_draft.resolution_for(Category::Draft);
+    assert_eq!(resolution.source, BindingSource::Override);
+    assert_eq!(
+        resolution.tier,
+        Tier::Think,
+        "the tier is a compile-time property; the row moves the provider, not the tier"
+    );
+    // The row is per category: `design` still goes where `think` says.
+    assert_eq!(
+        local_draft
+            .resolve(Category::Design)
+            .provider_id
+            .expect("design resolves")
+            .0,
+        "anthropic"
+    );
+
+    // 3. No remote provider at all. The draft is served locally and the tier is
+    //    still `think`, which is what ADR-5's header line reports.
+    let offline = offline_draft_router();
+    let route = offline.resolve(Category::Draft);
+    assert_eq!(
+        route.provider_id.as_ref().expect("draft resolves").0,
+        "local",
+        "with nothing remote the draft is written on the local tier: {}",
+        route.reason
+    );
+    assert_eq!(offline.resolution_for(Category::Draft).tier, Tier::Think);
+}
+
+// --------------------------------------------------------------------------
+// 8. ...and each of those three fixtures is *served* where it was sent
+//    (REQ-613 BR-4, AC-14's second half)
+// --------------------------------------------------------------------------
+
+/// The session the drafting calls below are attributed to.
+const DRAFT_SESSION: &str = "sess-draft-routing";
+
+/// What the stand-in remote model answers a drafting call with.
+const REMOTE_DRAFT: &str = "## Purpose\nA sample crate.\n";
+
+/// A provider that really puts its request on the transport it was handed and
+/// **drains the response**.
+///
+/// Both halves are load-bearing. The send is what makes the call a call; the
+/// drain is what makes it a *billed* one, because the choke point meters a
+/// request when its body is consumed — a provider that dropped the response
+/// would leave the ledger empty and the row assertions below passing over a
+/// call nobody made.
+struct DraftingProvider;
+
+#[async_trait]
+impl Provider for DraftingProvider {
+    fn id(&self) -> &str {
+        "anthropic"
+    }
+
+    fn capabilities(&self) -> CapabilityProfile {
+        CapabilityProfile::default()
+    }
+
+    async fn stream_turn(
+        &self,
+        request: TurnRequest,
+        transport: &dyn Transport,
+    ) -> Result<TurnStream, ProviderError> {
+        let body = serde_json::to_vec(&request).map_err(|e| ProviderError::Build(e.to_string()))?;
+        let response = transport
+            .execute(TransportRequest {
+                method: HttpMethod::Post,
+                url: "https://api.anthropic.com/v1/messages".to_owned(),
+                headers: Vec::new(),
+                body,
+            })
+            .await
+            .map_err(|_| ProviderError::Transport)?;
+        drain(response.body).await;
+        Ok(Box::pin(futures::stream::iter(vec![
+            Ok(TurnEvent::TextDelta(REMOTE_DRAFT.to_owned())),
+            Ok(TurnEvent::Completed(TurnCompletion {
+                usage: TokenUsage::default(),
+                stop_reason: StopReason::EndTurn,
+            })),
+        ])))
+    }
+}
+
+/// The local tier serving a draft, answering `says`.
+fn local_engine(model: &str, says: &str) -> Arc<Mutex<dyn Engine>> {
+    Arc::new(Mutex::new(MockEngine::with_response(model, says)))
+}
+
+/// **AC-14's second half, on all three fixtures.** The case above settles where
+/// the resolver *sends* a draft; this one settles that the route it named is the
+/// route that **serves** one — the remote fixture on its provider, with a cost
+/// row naming that provider and the draft category, and both local fixtures on
+/// the local engine, with the tier the header line will carry.
+///
+/// A sibling rather than more assertions on the case above, because the two ask
+/// different questions of different machinery: that one is about
+/// `Router::resolve` and nothing else, this one spends its answer through the
+/// duty seam. They share their fixtures ([`draft_override_router`],
+/// [`offline_draft_router`]) so they cannot drift into being about two different
+/// policies.
+///
+/// # Why the tier travels in a header line
+///
+/// ADR-5's generated file opens with the tier that wrote it, so "the tier names
+/// it" is checked by composing that line from the resolution rather than by
+/// reading the resolution twice — `generated_header` is imported, never
+/// re-typed, so a change to the sentence cannot leave this assertion agreeing
+/// with a header nobody ships (LESSON-456's rule, one layer up).
+///
+/// # Mutations
+///
+/// All three run 2026-09-03 and restored byte-identically.
+///
+/// 1. **Production.** Dropping `.with_category(..)` from `RemoteDuty`'s cost
+///    attribution (`harness::duty`) leaves the row's `category` `None`, and the
+///    remote leg fails on the assertion that `/cost` can name the draft.
+/// 2. **The `served locally` claim is about which engine answered.** Serving
+///    the override fixture with `DutyRoute::remote` in place of
+///    `DutyRoute::local` answers with [`REMOTE_DRAFT`] instead of the engine's
+///    line, and leg 2 fails — so "local" here is a fact about the answer, not a
+///    restatement of the resolution the case above already made.
+/// 3. **The ledger really is the instrument.** Dropping the `drain` in
+///    [`DraftingProvider`] leaves the ledger empty (`one draft is one billed
+///    call: []`), which is what a row assertion over an unmetered call would
+///    have silently accepted had the assertion been on the row's contents
+///    alone rather than on the count first.
+#[tokio::test]
+async fn each_draft_fixture_is_served_where_the_resolver_sent_it_and_the_row_and_header_name_it() {
+    // --- 1. the default: `think` is remote, so the draft is drafted there ---
+    let router = structured_router();
+    let route = router.resolve(Category::Draft);
+    let provider_id = route
+        .provider_id
+        .as_ref()
+        .expect("the default fixture resolves the draft")
+        .0
+        .clone();
+    let model = route
+        .model
+        .clone()
+        .expect("a resolved binding names the model it will bill");
+    assert_eq!(provider_id, "anthropic", "{}", route.reason);
+
+    let (ledger, egress) = egress_with_ledger(
+        ScriptedTransport::with_script(&[(4_100, 900)]),
+        // No boundaries: what this case is about is *where* the draft went. The
+        // covered-evidence half of BR-4 is `egress_capture.rs`'s, on the real
+        // pipeline, where there is evidence to cover.
+        Vec::new(),
+    );
+    // The provider and the model are the resolver's answers, not literals: a
+    // duty built from a hardcoded provider would be served by whatever this test
+    // typed rather than by whatever the policy named.
+    let served = DutyRoute::remote(
+        DRAFT_DUTY,
+        provider_id.clone(),
+        Box::new(DraftingProvider),
+        egress,
+        model.clone(),
+        DRAFT_SESSION,
+        ResolvedEffort::effort(EffortLevel::High),
+    );
+    assert_eq!(served.provider(), Some(provider_id.as_str()));
+    let answer = served
+        .perform("draft the notes", &Provenance::empty())
+        .await
+        .expect("the remote draft answers");
+    assert_eq!(
+        answer.trim(),
+        REMOTE_DRAFT.trim(),
+        "the answer must come from the provider the resolver named"
+    );
+
+    let rows = ledger.all_records().expect("read the ledger");
+    assert_eq!(rows.len(), 1, "one draft is one billed call: {rows:?}");
+    assert_eq!(
+        rows[0].provider_id, "anthropic",
+        "the row names the provider"
+    );
+    assert_eq!(rows[0].model, "claude-opus-4");
+    assert_eq!(
+        rows[0].category,
+        Some(teton_protocol::Category::Draft),
+        "the row names the draft category, which is what lets `/cost` show it"
+    );
+    assert_eq!(rows[0].phase, None, "a duty has no lifecycle position");
+    assert_eq!(
+        (rows[0].input_tokens, rows[0].output_tokens),
+        (4_100, 900),
+        "the counts tie the row to this call rather than to any call"
+    );
+    assert_eq!(rows[0].session_id, DRAFT_SESSION);
+    // And the tier the file's first line will name is the resolution's own.
+    assert!(
+        generated_header(
+            router.resolution_for(Category::Draft).tier.as_str(),
+            "2026-09-03",
+            None,
+            None,
+        )
+        .contains("(think tier)"),
+        "the header names the tier that served the draft"
+    );
+
+    // --- 2. `set-category draft local`: served by the local engine ----------
+    //
+    // The fixture has a healthy *remote* provider bound to `think`; the row is
+    // the only reason this draft stays on the machine.
+    let local_draft = draft_override_router();
+    let route = local_draft.resolve(Category::Draft);
+    let provider_id = route
+        .provider_id
+        .as_ref()
+        .expect("the override fixture resolves the draft")
+        .0
+        .clone();
+    assert_eq!(provider_id, "local", "{}", route.reason);
+    let served = DutyRoute::local(
+        DRAFT_DUTY,
+        provider_id.clone(),
+        local_engine("qwen", "drafted on the machine that asked"),
+    );
+    assert_eq!(served.provider(), Some("local"));
+    let answer = served
+        .perform("draft the notes", &Provenance::empty())
+        .await
+        .expect("the local draft answers");
+    assert_eq!(
+        answer.trim(),
+        "drafted on the machine that asked",
+        "the override must be served by the local engine, not by the remote \
+         provider the same table still binds to `think`"
+    );
+    assert_eq!(
+        ledger.all_records().expect("read the ledger").len(),
+        1,
+        "a locally served draft reaches no transport, so it bills nothing — the \
+         only row in the ledger is still the remote leg's"
+    );
+    assert_eq!(
+        local_draft.resolution_for(Category::Draft).tier,
+        Tier::Think,
+        "the row moved the provider, not the tier — and the tier is what the \
+         header reports"
+    );
+
+    // --- 3. no remote provider at all: served locally, header still says ----
+    let offline = offline_draft_router();
+    let route = offline.resolve(Category::Draft);
+    let provider_id = route
+        .provider_id
+        .as_ref()
+        .expect("an offline machine still resolves a draft")
+        .0
+        .clone();
+    assert_eq!(provider_id, "local", "{}", route.reason);
+    let served = DutyRoute::local(
+        DRAFT_DUTY,
+        provider_id,
+        // A different answer from leg 2's, so this leg cannot pass on that
+        // leg's engine.
+        local_engine("qwen", "drafted with nothing remote to reach"),
+    );
+    let answer = served
+        .perform("draft the notes", &Provenance::empty())
+        .await
+        .expect("the offline draft answers");
+    assert_eq!(answer.trim(), "drafted with nothing remote to reach");
+    let header = generated_header(
+        offline.resolution_for(Category::Draft).tier.as_str(),
+        "2026-09-03",
+        None,
+        None,
+    );
+    assert!(
+        header.contains("(think tier)"),
+        "a machine with no remote provider still drafts on the `think` tier, and \
+         the header says so: {header}"
+    );
+    assert_eq!(
+        ledger.all_records().expect("read the ledger").len(),
+        1,
+        "nothing in this test billed a second call"
     );
 }

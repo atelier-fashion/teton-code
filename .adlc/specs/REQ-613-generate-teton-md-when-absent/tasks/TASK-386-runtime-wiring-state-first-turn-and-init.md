@@ -1,11 +1,11 @@
 ---
 id: TASK-386
 title: "Runtime wiring: `GenerationState` on the record, the first-turn hook, short-circuits, and `Init`"
-status: draft
+status: complete
 parent: REQ-613
 repo: teton-code
 created: 2026-09-03
-updated: 2026-09-03
+updated: 2026-09-04
 dependencies: [TASK-379, TASK-384, TASK-385]
 ---
 
@@ -30,17 +30,17 @@ BR-8's daemon half, BR-10's daemon half.
 
 ## Acceptance Criteria
 
-- [ ] BR-1 / AC-1: first prompt with `absent` raises exactly one offer; accepted → written,
+- [x] BR-1 / AC-1: first prompt with `absent` raises exactly one offer; accepted → written,
       loaded, and the same turn's request body ends with the block; declined → nothing, and a
       second prompt raises no offer; `/cd` to another absent project raises again; an
       `AGENTS.md` or empty `TETON.md` → `Suppressed`, no offer.
-- [ ] BR-2 / AC-2: `plan` → `Suppressed { DeniedLevel }` with one event and no gate call; `full`
+- [x] BR-2 / AC-2: `plan` → `Suppressed { DeniedLevel }` with one event and no gate call; `full`
       → written with no prompt; `generate = always` at `guarded` → written with no prompt and the
       event says `always`; `generate = never` → `Suppressed`, and `Init` still runs.
-- [ ] BR-8: `Init { force: false }` with a file present → `Failed { AlreadyExists }` naming the
+- [x] BR-8: `Init { force: false }` with a file present → `Failed { AlreadyExists }` naming the
       size and `--force`; `Init { force: true }` at `guarded` raises the `replace` question.
-- [ ] The offer never runs mid-turn: a two-iteration tool loop sees no second offer.
-- [ ] `cargo test -p tetond --no-fail-fast` green; every Verification row below resolves to a
+- [x] The offer never runs mid-turn: a two-iteration tool loop sees no second offer.
+- [x] `cargo test -p tetond --no-fail-fast` green; every Verification row below resolves to a
       real, executed case.
 
 ## Verification
@@ -58,3 +58,33 @@ BR-8's daemon half, BR-10's daemon half.
 
 The state is written under the sessions lock and the gate is awaited outside it (the
 `set_session_cwd` discipline). The hook runs on the claiming turn only.
+
+### As built (2026-09-04)
+
+- `store_session_repo_context` and `session_context` live in `runtime/mod.rs`, not
+  `runtime/session.rs`; both were edited where they are.
+- `session/context` moved to `handle_client`'s `blocks_on_a_human` task: `Init` raises a
+  permission prompt and then spends a model call, so the method may no longer answer from the
+  connection's reader loop. `DaemonRuntime::session_context` is `async` and takes the asking
+  connection as the offer's addressee.
+- `RepoContextState::Absent` cannot decide the arming on its own — an empty `TETON.md` loads as
+  `Absent` by REQ-612's rule and BR-1 counts it as *present* — so the arming stats the two
+  candidate names through the injected reader (`generate::notes_present`), and only when the
+  notes switch is on.
+- The record carries the root the state was decided at beside the state, so BR-1's "per root"
+  is structural: a re-derivation at the same root never re-arms a decision, and a `/cd` always
+  does.
+- A **skill** turn does not raise the offer (`skill_turn.is_none()`), on
+  `spawn_title_session`'s reason: REQ-589 BR-8's refusal says nothing was sent and no provider
+  saw the turn, and a draft call spent in `assemble` would make that false. The state stays
+  `Pending` for the next typed prompt.
+- `draft_route` narrowed to `pub(super)` (not `pub(crate)`: that spelling trips
+  `runtime_visibility`'s crate-wide ratchet instead of its `pub` one) and now answers a
+  `DraftPlan` — the route and the tier from **one** resolution, since the header line and the
+  event both need the tier.
+- The offline `ScriptedFileEngine` recognizes the draft contract on its own 2,048-byte window:
+  the draft instruction is the longest in the harness and states its contract ~1,300 bytes in,
+  past `DUTY_CONTRACT_PREFIX_BYTES`.
+- Fixture fallout, fixed at the source: the shared e2e demo repo and `skill_turn`'s tree now
+  plant an **empty** `TETON.md` (BR-1's own documented opt-out), because every scripted fixture
+  in a project root would otherwise draw a prompt nobody answers or spend a scripted reply.

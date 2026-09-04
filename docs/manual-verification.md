@@ -3708,3 +3708,153 @@ ASSUME-1 verdict: notes used / notes ignored / inconclusive
 Anything that hung, aborted, or crashed             :
 Notes / findings                                    :
 ```
+
+---
+
+# Manual verification runbook — REQ-613 AC-13 (the file Teton writes, dogfooded)
+
+**Status: OUTSTANDING — nothing below has been executed.** REQ-613 spends one
+frontier model call per repository and then writes its answer into the user's
+working tree, where REQ-612 makes it resident on every turn of every session
+afterwards. It does that on the strength of ASSUME-1: that a frontier-tier model
+given the whole tree, the manifests, the README and the entry-point headers
+produces a description **a new contributor would not object to**. AC-13 is the
+only check that assumption gets. No test can make it — CI can prove the file is
+bounded, headed, no-clobber and loaded, and none of that is a judgement about
+whether the prose is any good. Leave AC-13 unticked in
+`.adlc/specs/REQ-613-generate-teton-md-when-absent/requirement.md` until the
+sign-off block below is filled in.
+
+> A file that comes out thin is a **finding, not a failed run**. The levers the
+> architecture already names are OQ-5's cap and ADR-4's tier: `/policy
+> set-category draft <tier>` moves the model, and the evidence tables in
+> `crates/tetond/src/repo_context/evidence.rs` are where a missing input would
+> be added. Record what was thin and file it; do not re-roll the same repository
+> until it reads better — a second draft of the same tree measures the sampler,
+> not the feature.
+
+## What this proves that CI does not
+
+| Claim | Proven by CI? | Why not |
+|---|---|---|
+| One prompt, one write, no clobber, header first | **yes** | `crates/tetond/tests/repo_context_generation.rs` and the writer's unit tests |
+| The draft is bounded to the cap less the header, and loads as `loaded` | **yes** | the write/load acceptance legs |
+| Covered evidence never reaches the call | **yes** | the egress-capture leg |
+| The evidence tables and the walk bounds hold | **yes** | the gatherer's unit tests |
+| The **prose** is one a new contributor would accept | **no** | that is a judgement about answers, not about bytes |
+| A frontier model needs nothing this evidence set leaves out | **no** | only a real repository's real draft can say |
+
+## Prerequisites
+
+- A **fresh clone** of this repository, at a path this machine has never run a
+  session in: `git clone <this repo> ~/tmp/teton-ac13 && cd ~/tmp/teton-ac13`.
+  A fresh clone is the subject — a working tree with your own `TETON.md`,
+  `AGENTS.md`, or an editor's leftovers in it measures a different repository.
+- **No `TETON.md` and no `AGENTS.md` at the clone's root.** Check both by name;
+  either one suppresses the offer, and a run that never saw a prompt has
+  measured nothing.
+- `teton doctor` reporting `repo notes: on (default)` and `[context] generate`
+  at its default `ask`. If this machine has `generate = never` set, the offer
+  will not be raised; if it has `always`, the file is written with no prompt and
+  the consent half of the leg is not exercised.
+- A policy whose `think` tier resolves to a **remote frontier provider**
+  (`/policy show`). A local-tier draft is a legitimate configuration and a
+  different measurement; if that is what you ran, say so in the sign-off — the
+  header line records the tier either way.
+- The session at `guarded` (`/permissions` to confirm) and `/verbose` on.
+
+## The prompt
+
+Exactly this, as the **first** prompt of the session in the fresh clone:
+
+    what is this repository?
+
+Nothing before it — no `/help`, no `/cd`, no warm-up. The offer rides the first
+prompt turn, so anything typed ahead of it spends the turn the offer was going
+to ride. The *answer* to this prompt is not what AC-13 measures; the **file** is.
+Reading the answer is still worth a line in the sign-off, because a good answer
+on that same turn is the evidence that the file was written and made resident
+before the turn's own model call.
+
+## Procedure
+
+1. Fresh session in the clone. The banner should carry the announcement clause —
+   `no TETON.md here — Teton will offer to write one on your first prompt`.
+   Record whether it did; a prompt that arrives unannounced is a finding on its
+   own (BR-1).
+2. Send the prompt, once. Exactly one permission prompt should be drawn, naming
+   the root, the path `TETON.md`, and that it is a **write** (not a replace).
+3. Accept it **once** (not "for this session" — the offer runs once per session
+   per root anyway, and `once` is the answer whose scope this leg is about).
+4. Watch the event lines: `walking`, `drafted`, `written`. With `/verbose` on,
+   record the drafting line's tier, entries walked and input tokens.
+5. `/context` — expect state `loaded`, file `TETON.md`, `origin: generated`, and
+   **not** `truncated`. A `truncated` here is a defect, not a finding: the draft
+   is bounded to the cap less the header before it is written.
+6. Confirm the turn was answered. The prompt raised the offer and should still
+   have produced a reply.
+7. **Now read the file** — `cat TETON.md`, whole, once, as a new contributor
+   would. Score it against the rubric below before reading any source.
+8. `git status` — the only change in the tree should be the one new untracked
+   `TETON.md`. Record `wc -c TETON.md` and check the first line is the header.
+9. `/cost` — one row under the `draft` category, and the tier it names should be
+   the tier the header names.
+
+## The reading rubric
+
+**The bar is "a new contributor would not object".** Not "is it accurate in
+every clause", not a score out of ten — would a person joining this repository
+tomorrow read this file and find nothing in it to argue with, and something in
+it to use. Three facts are named outright because they are what this repository
+is, and a draft that misses them has missed the tree it was given:
+
+| # | The file names… | Found? |
+|---|---|---|
+| 1 | **the crates** — `teton` (CLI), `tetond` (daemon), `teton-core`, `teton-protocol`, `teton-providers`, `teton-inference` | |
+| 2 | **the daemon/CLI split** — that `tetond` holds the harness, runtime and providers and `teton` is a client speaking JSON-RPC over a socket | |
+| 3 | **the test command** — `cargo test --workspace`, or the per-crate form a contributor would actually run | |
+
+Record each as found / partly / absent, **and record the verdict separately**:
+the three facts are the floor, not the bar. A file that names all three and
+reads like a manifest still fails "a new contributor would not object", and a
+file that misses one but is otherwise right is a finding about the evidence set
+rather than about the model. The result is **recorded, not scored** — there is
+no pass mark here, only a written answer and the objections a reader had.
+
+## Sign-off
+
+```
+REQ-613 AC-13 sign-off
+----------------------
+RESULT                                              : OUTSTANDING
+Verified by                                         :
+Date / build / commit                               :
+Clone path (fresh, never sessioned)                 :
+No TETON.md and no AGENTS.md at the root            : yes / no  <-- must be "yes"
+Permission level / `[context] generate`             :          / ask
+`think` resolved to (provider, model)               :
+Local-tier draft instead?                           : yes / no  (if yes, say why)
+
+Banner carried the announcement clause              : yes / no
+Exactly one permission prompt was drawn             : yes / no  <-- must be "yes"
+The prompt named the root, `TETON.md`, and a write  : yes / no
+Answer given                                        : once / session / declined
+Event lines seen (walking/drafted/written)          :
+`/verbose` drafting line, verbatim                  :
+`/context` state / origin / resident bytes          :          / generated /
+The turn's own prompt was still answered            : yes / no
+`git status` showed only the new TETON.md           : yes / no
+TETON.md size, in bytes                             :
+First line was the generated header, verbatim       :
+`/cost` row: category / tier                        : draft    /
+
+(rubric) 1. names the crates                        : found / partly / absent
+(rubric) 2. names the daemon/CLI split              : found / partly / absent
+(rubric) 3. names the test command                  : found / partly / absent
+
+VERDICT — "a new contributor would not object"      : agree / object
+What a new contributor would object to              :
+What was missing that the evidence set could supply :
+Anything that hung, aborted, panicked, or crashed   :
+Notes / findings                                    :
+```

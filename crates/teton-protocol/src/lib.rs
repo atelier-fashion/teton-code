@@ -280,6 +280,9 @@ pub enum Category {
     Debug,
     /// Adversarial critique.
     Review,
+    /// Writing a repository's `TETON.md` from evidence off its own tree
+    /// (REQ-613 BR-4). Harness-known, bound to `think` by default.
+    Draft,
 }
 
 impl Category {
@@ -298,6 +301,7 @@ impl Category {
             Category::Design => "design",
             Category::Debug => "debug",
             Category::Review => "review",
+            Category::Draft => "draft",
         }
     }
 }
@@ -308,7 +312,7 @@ impl fmt::Display for Category {
     }
 }
 
-/// The nine categories a client may **bind** to a provider (REQ-558 ADR-B).
+/// The ten categories a client may **bind** to a provider (REQ-558 ADR-B).
 ///
 /// Mirrors `teton_core::category::ConfigurableCategory` variant-for-variant, and
 /// mirrors its *absences* too: `route` and `redact` have no variant here either,
@@ -317,7 +321,7 @@ impl fmt::Display for Category {
 /// argument ADR-B makes about the config file, applied to the protocol, because
 /// a check is something a fourth code path can forget (BUG-155).
 ///
-/// [`Category`] is the *reporting* type and keeps all eleven variants: a pinned
+/// [`Category`] is the *reporting* type and keeps all twelve variants: a pinned
 /// category still routes a call, and an event has to be able to say so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -340,11 +344,14 @@ pub enum ConfigurableCategory {
     Debug,
     /// Adversarial critique.
     Review,
+    /// Writing a repository's `TETON.md` (REQ-613 BR-4) — bindable, so
+    /// `teton policy set-category draft local` can move it off `think`.
+    Draft,
 }
 
 impl ConfigurableCategory {
     /// Every bindable category, in the order `teton policy show` prints them.
-    pub const ALL: [ConfigurableCategory; 9] = [
+    pub const ALL: [ConfigurableCategory; 10] = [
         ConfigurableCategory::Title,
         ConfigurableCategory::Digest,
         ConfigurableCategory::Compact,
@@ -354,6 +361,7 @@ impl ConfigurableCategory {
         ConfigurableCategory::Design,
         ConfigurableCategory::Debug,
         ConfigurableCategory::Review,
+        ConfigurableCategory::Draft,
     ];
 
     /// The lowercase wire/display name — identical to the [`Category`] it names.
@@ -375,6 +383,7 @@ impl ConfigurableCategory {
             ConfigurableCategory::Design => Category::Design,
             ConfigurableCategory::Debug => Category::Debug,
             ConfigurableCategory::Review => Category::Review,
+            ConfigurableCategory::Draft => Category::Draft,
         }
     }
 }
@@ -678,6 +687,8 @@ mod tests {
             Category::Design,
             Category::Debug,
             Category::Review,
+            // REQ-613 TASK-381: Draft arm.
+            Category::Draft,
         ];
         for category in categories {
             let json = serde_json::to_string(&category).unwrap();
@@ -689,9 +700,9 @@ mod tests {
                 "{category} must round-trip"
             );
         }
-        // All eleven, including the two pinned-local ones: the event reports
+        // All twelve, including the two pinned-local ones: the event reports
         // what happened, and a pinned category still routes a call.
-        assert_eq!(categories.len(), 11);
+        assert_eq!(categories.len(), 12);
 
         for tier in [Tier::Reflex, Tier::Scan, Tier::Build, Tier::Think] {
             let json = serde_json::to_string(&tier).unwrap();
@@ -702,11 +713,17 @@ mod tests {
     }
 
     /// ADR-B on the wire: a binding for a pinned category is unrepresentable,
-    /// and the nine that *are* representable share their spelling with the
+    /// and the ten that *are* representable share their spelling with the
     /// reporting enum, so one name serves config, CLI, and the wire.
+    ///
+    /// The name says nine and the count is now ten (REQ-613 added `draft`). It
+    /// keeps the old name deliberately: REQ-562 TASK-067's verification table
+    /// names this test as its artifact, and a rename would break a shipped
+    /// REQ's traceability to buy an adjective. What the test asserts — that the
+    /// pinned two are absent — never depended on the arity.
     #[test]
     fn a_binding_can_name_nine_categories_and_only_nine() {
-        assert_eq!(ConfigurableCategory::ALL.len(), 9);
+        assert_eq!(ConfigurableCategory::ALL.len(), 10);
         for c in ConfigurableCategory::ALL {
             let json = serde_json::to_string(&c).unwrap();
             assert_eq!(json, format!("\"{}\"", c.as_str()));

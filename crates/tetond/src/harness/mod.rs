@@ -65,6 +65,16 @@
 //!   [`crate::egress`], which is the one place every outbound byte crosses. The
 //!   verdict types, the deterministic pattern pass it composes with, and the
 //!   forward/block decision live in [`crate::egress::redact`].
+//! - [`draft`] — what is `draft`-specific about the repository-notes duty
+//!   (REQ-613): its [`draft::DRAFT_DUTY`] descriptor, its output contract, the
+//!   prompt builder with the five fixed sections OQ-3 settled, and
+//!   [`draft::bound_answer`], which spends REQ-612's cap on the header first and
+//!   cuts the rest with REQ-612's own cutter. Like [`title`] and [`compact`] it
+//!   is **not** tool-owned, and like [`redact`] its call site is outside the
+//!   harness: the generation pipeline in [`crate::repo_context`], which is the
+//!   only thing that knows the evidence was gathered and the offer accepted. It
+//!   is the one duty bound to `think` — the file is written once per repository
+//!   and read at the start of every session after that.
 //! - [`completion`] — the [`completion::CompletionSource`] the loop drives: a
 //!   local-[`Engine`](teton_inference::Engine) impl and a remote-[`Provider`](teton_providers::Provider)
 //!   impl that streams through the egress choke point (BR-1/BR-2). This is what
@@ -85,6 +95,7 @@ pub mod compact;
 pub mod completion;
 pub mod context;
 pub mod digest;
+pub mod draft;
 pub mod duty;
 pub mod permissions;
 pub mod redact;
@@ -107,6 +118,7 @@ pub use context::{
     ProvenanceHook, RecordingProvenanceHook, ToolProvenance,
 };
 pub use digest::DIGEST_DUTY;
+pub use draft::DRAFT_DUTY;
 pub use duty::{Duty, DutyKind, DutyRoute};
 pub use permissions::{
     is_web_permission_key, table_for, CommitmentAttestation, PendingPermissions, PermissionConfig,

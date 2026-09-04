@@ -93,6 +93,16 @@ const KNOWN_UNRELATED_HOMES: &[(u32, &str, usize, &str)] = &[
     ),
     (
         4_096,
+        "repo_context/generate.rs",
+        1,
+        "`DRAFT_PROMPT_BYTES` (REQ-613 ADR-3) — what the drafting instruction \
+         costs before a byte of evidence is added, subtracted from the draft \
+         route's window to size the evidence body. A reservation inside a \
+         window, never a window: it is read against no model and nothing \
+         declares it",
+    ),
+    (
+        4_096,
         "harness/duty.rs",
         1,
         "`DUTY_MAX_TOKENS_REQUEST` — how many tokens a duty call may generate",

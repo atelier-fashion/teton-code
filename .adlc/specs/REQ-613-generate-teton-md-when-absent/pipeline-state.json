@@ -1,0 +1,119 @@
+{
+  "req": "REQ-613",
+  "branch": "feat/REQ-613-generate-teton-md-when-absent",
+  "startedAt": "2026-09-03T23:34:45Z",
+  "completed": false,
+  "currentPhase": 8,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "integrationBranch": "main",
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Resolve Repos + Worktree + Preflight + Draft PR",
+      "completedAt": "2026-09-03T23:34:50Z",
+      "notes": "single-repo; worktree /Users/brettluelling/GitHub/teton-code/.worktrees/REQ-613 from origin/main af3a1a4+; draft PR #283"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Requirement Spec",
+      "completedAt": "2026-09-03T23:35:28Z",
+      "verdict": "APPROVED (validated 2026-09-03 earlier this session, AC-14 ordinal fixed; re-checked at gate)"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Break Into Tasks",
+      "completedAt": "2026-09-03T23:35:28Z",
+      "notes": "architecture.md (8 ADRs) and TASK-379..389 produced by /architect earlier this session, landed in #280; single repo, mergeOrder [teton-code]"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-09-03T23:35:28Z",
+      "verdict": "VALIDATED \u2014 11 tasks, DAG acyclic, max 3 deps, 23/24 obligations mapped (AC-13 dogfood unmapped by design), benign paths present"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-09-04T08:30:22Z",
+      "notes": "tiers: [379,380,381,382,383] -> [384,385] -> [386,389] -> [387] -> [388]; all 11 complete; policy.md draft row by orchestrator; workspace 4,290 passed / 0 failed, clippy + fmt clean"
+    },
+    {
+      "phase": 5,
+      "name": "Verify (6-agent review + fix pass + 3-agent confirm)",
+      "completedAt": "2026-09-04T12:52:48Z",
+      "verdict": "PASS \u2014 pre-pass failed (no candidates); quality/architecture reached no-findings then stalled, security relaunched scoped, reflector run in-context. Fix pass 50fd9b0: 1 critical (durable switch after the walk), 4 major correctness (force load-back data loss, per-process scratch name, init without a claim, present-file reported as failed), 3 major security (dead symlink guard on evidence, raw evidence in the prompt, scratch unlink of a foreign temp), 8 minor. Confirmation loop: all resolved; follow-up commit adds the exhaustion leg, a serial lock between two tests and a stale doc. Recorded not fixed: listing names bypass provenance (REQ-583 OQ-7), always skips the gate (BR-2), absolute paths on daemon stderr, route resolved ahead of the SwitchedOff short-circuit (health read only). No user-facing questions."
+    },
+    {
+      "phase": 6,
+      "name": "Create Pull Request",
+      "completedAt": "2026-09-04T12:53:09Z",
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/283",
+      "notes": "draft opened at Step 0, body filled and marked ready after Phase 5"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-09-04T12:55:43Z",
+      "notes": "PR body filled, marked ready; six of eight checks green on 3e5916d with the two fmt\u00b7clippy\u00b7test matrices running; the merge in Phase 8 waits on all eight green on the final tip; trial-merge against origin/main clean, 0 commits behind"
+    }
+  ],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-613",
+      "branch": "feat/REQ-613-generate-teton-md-when-absent",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/283",
+      "prNumber": 283,
+      "prCreatedAt": "2026-09-03T23:34:48Z",
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-380",
+      "TASK-383",
+      "TASK-382",
+      "TASK-379",
+      "TASK-381",
+      "TASK-384",
+      "TASK-385",
+      "TASK-389",
+      "TASK-386",
+      "TASK-387",
+      "TASK-388"
+    ],
+    "failedTasks": [],
+    "tier": 4,
+    "notes": [
+      "TASK-380 7b3db53: RepoContextGenerateMode lives in teton-protocol (core must not depend back); SetRepoContextGenerate must stay a struct variant (newtype serializes the value as a key name); no session_id on the flattened event; minimal CLI/daemon arms added, TASK-386/387 replace",
+      "TASK-383 7413d9b: O_EXCL wins over O_NOFOLLOW (EEXIST before ELOOP) so the symlink sentence is chosen by a post-refusal lstat; replace never returns AlreadyExists; fill calls sync_all; mode 0644 left to umask",
+      "TASK-382: gather_with_walk_budget(..) beside gather (walk bound has one owner); boundary match before stat; lazy reads by priority class; Evidence.body/provenance/excluded/entries/stop/cut",
+      "TASK-381 293ff93: draft_route is pub (narrow to pub(crate) once generate.rs calls it); DRAFT_OUTPUT_CONTRACT has no ScriptedFileEngine recognition arm yet (add before any scripted test issues the duty); ContentClass::for_category(Draft) reuses FileContent (inexact, safe direction); teton_protocol::Category::Draft added by 381",
+      "TASK-379 4169c09: config_document needed no production change (skip_serializing_if + delta rule); refuse/accept pair uses the load gate (attestation inherited); Verification row labelled AC-11 is really BR-10's write test \u2014 AC-11 proper is TASK-386's",
+      "TASK-384 33eac36: GenerationConsent {Allowed{scope},Declined,RefusedUnattended,Denied}; repo_context_generation_key(TrustRoot)->Option; second denial-note method so the absolute key never renders; replace rendering deferred to TASK-387",
+      "TASK-385: GenerationContext gained walk: WalkBudget; daemon GenerationOutcome{stage,reason} maps to the wire word via wire(); runtime_visibility red at HEAD (draft_route pub, 18 vs 17) \u2014 TASK-386 narrows it",
+      "TASK-389: docs written ahead of TASK-386/387 to spec+ADR wording; reconcile in 387: doctor.md advisories (always/never posture), README /context init row (cli_rows fails only on that row until 387), context.md's 'once per session per root' / first-prompt / AlreadyExists sentence against 386",
+      "TASK-386 57d5853: session/context is async and dispatches from the blocks_on_a_human task; draft_route pub(super) returning DraftPlan{route,tier}; the offer skips skill turns; scripted fixtures plant an empty TETON.md; origin known only in the producing run",
+      "TASK-387 fadebff: /context init is its own COMMANDS row (longest-match routing); RepoContextPosture.generate added additively; the launch clause cannot distinguish an empty TETON.md from none (wire folds both into Absent)",
+      "TASK-388 394ca6e+8bba2f2 (two agent stalls; finished by the orchestrator + one agent): AC-7 carried by TASK-385's ledger test; egress mutation shows the choke point refuses the send when exclusion is skipped"
+    ]
+  },
+  "conflictsResolved": []
+}

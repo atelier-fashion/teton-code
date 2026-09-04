@@ -31,20 +31,38 @@
 //! byte-identical `provenance_id` — the second half being what pins BR-2, since
 //! a block against a divergent id is a block that happened to fire.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use futures::StreamExt as _;
 
+use teton_core::boundary::BoundaryMatcher;
+use teton_core::effort::{EffortLevel, ResolvedEffort};
 use teton_core::entities::{BoundaryMode, PrivacyBoundary};
 use teton_core::ProvenanceId;
-use teton_protocol::events::{Event, PrivacyAction, PrivacyBlock, ProvenanceRejected};
-use teton_protocol::{ProviderId, SessionId};
+use teton_protocol::events::{
+    Event, GenerationOutcome as GenerationStage, PrivacyAction, PrivacyBlock, ProvenanceRejected,
+    RepoContextGeneration,
+};
+use teton_protocol::methods::{RootKind, SessionRoot};
+use teton_protocol::{ProviderId, SessionId, Tier};
 use teton_providers::transport::{
     ByteStream, HttpMethod, Transport, TransportError, TransportRequest, TransportResponse,
 };
+use teton_providers::{
+    CapabilityProfile, Provider, ProviderError, StopReason, TokenUsage, TurnCompletion, TurnEvent,
+    TurnRequest, TurnStream,
+};
 
+use tetond::broadcast::{EventBus, Subscription};
 use tetond::egress::provenance::{assembled_provenance, ContextBlock};
 use tetond::egress::{Egress, EgressContext, EgressError, PrivacyEventSink, Provenance};
+use tetond::harness::tools::walk::WalkBudget;
+use tetond::harness::{Duty, DutyRoute, SessionEvents, DRAFT_DUTY};
+use tetond::repo_context::generate::{self, ConsentGiven, GenerationContext, GenerationOutcome};
+use tetond::repo_context::RealFiles;
+use tetond::session_root::ProbedRoot;
 
 /// Mint the identity of a fixture file (REQ-571 ADR-A).
 ///
@@ -1694,6 +1712,430 @@ async fn every_spelling_of_a_builtin_covered_path_is_blocked_under_one_identity(
     assert!(
         capture.captured().is_empty(),
         "no spelling may reach the wire"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ---------------------------------------------------------------------------
+// REQ-613 AC-6 / BR-4 — the draft call, and the manifest that never reaches it
+//
+// Generation is the first thing in the harness that puts *whole repository
+// files* into one model call, so BR-4's claim — a covered file's bytes never
+// reach the draft provider — is exactly the shape this file exists for: it is
+// settled by capturing the outbound body, never by reading the exclusion in
+// `evidence.rs` (the AC-5 stance at the top of this file).
+//
+// What is real: the production gatherer walking a real tree, the production
+// pipeline (`repo_context::generate::run`), the real duty seam, the real
+// `Egress`. The stand-ins are the transport — which is the point of the harness
+// — and the model behind it.
+//
+// **Why the choke point cannot be the oracle here.** Every other boundary claim
+// in this file ends in a `privacy_block`: content is assembled, handed to
+// egress, and refused. The draft's covered file is dropped *before* the prompt
+// exists, so it never acquires a provenance and the choke point is never asked
+// about it — a `privacy_block` on this path would mean the exclusion had failed
+// and the backstop had caught it. That is why the assertions below are paired
+// with positive controls: the uncovered evidence really is on the wire, and the
+// provenance handed to the call really names it. Without them "no marker" is
+// what a pipeline that sent nothing at all would also report (LESSON-479).
+// ---------------------------------------------------------------------------
+
+/// A marker that exists **only** inside the planted `Cargo.toml`'s bytes.
+///
+/// Not in a file name, not in the scripted answer, not in any string this test
+/// puts into a prompt: tool arguments, file names and prompts are echoed into
+/// the conversation and reach a provider legitimately, so a marker placed in one
+/// of them turns a correct daemon into a failing egress assertion (LESSON-624).
+/// Obviously synthetic rather than credential-shaped, for [`SENTINEL_SSH`]'s
+/// reason (LESSON-497).
+const SENTINEL_MANIFEST: &str = "SENTINEL-REQ613-COVERED-MANIFEST-NOT-A-REAL-KEY";
+
+/// The session the drafting run is attributed to.
+const DRAFT_SESSION: &str = "sess-req613-draft";
+
+/// What the stand-in model answers with: five sections, none of them carrying a
+/// byte of the fixture's evidence, so nothing in the written file can be
+/// mistaken for something that came back off the wire.
+const DRAFT_ANSWER: &str = "## Purpose\nA sample crate.\n\n## Layout\n`src/` holds the \
+                            binary.\n\n## Build & test\n`cargo test`.\n\n## Conventions\nNone \
+                            stated.\n\n## Where to look\n`src/main.rs`.\n";
+
+/// A project root with one member of each evidence class: a manifest a boundary
+/// will cover, a README it will not, and an entry point it will not.
+///
+/// Canonicalized, because the jail resolves the paths it mints identities from
+/// and `/var` is a symlink on macOS — an uncanonical root produces identities no
+/// repo-relative glob matches, which is a fixture that cannot fail.
+fn drafted_project(tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "teton-req613-{tag}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let root = std::fs::canonicalize(&root).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        format!("[package]\nname = \"sample\"\n# {SENTINEL_MANIFEST}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("README.md"),
+        "# Sample\n\nA planted repository.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/main.rs"),
+        "fn main() { println!(\"hi\"); }\n",
+    )
+    .unwrap();
+    root
+}
+
+/// A provider that really puts its request on the transport it was handed — the
+/// provenance-scoped one [`Egress::scoped`] built — and drains the response
+/// before answering.
+///
+/// The send is what makes the capture non-empty, and the capture is the whole
+/// instrument: a provider that answered without reaching the transport would
+/// satisfy every "no marker on the wire" assertion below while leaking freely in
+/// production.
+struct DraftingProvider;
+
+#[async_trait]
+impl Provider for DraftingProvider {
+    fn id(&self) -> &str {
+        "anthropic"
+    }
+
+    fn capabilities(&self) -> CapabilityProfile {
+        CapabilityProfile::default()
+    }
+
+    async fn stream_turn(
+        &self,
+        request: TurnRequest,
+        transport: &dyn Transport,
+    ) -> Result<TurnStream, ProviderError> {
+        // The whole request, serialized as a real adapter would: the prompt —
+        // and therefore every evidence byte the pipeline chose to send — is in
+        // the body the capture records.
+        let body = serde_json::to_vec(&request).map_err(|e| ProviderError::Build(e.to_string()))?;
+        let response = transport
+            .execute(TransportRequest {
+                method: HttpMethod::Post,
+                url: "https://api.anthropic.com/v1/messages".to_owned(),
+                headers: Vec::new(),
+                body,
+            })
+            .await
+            .map_err(|err| match err {
+                TransportError::PrivacyBlocked(detail) => ProviderError::PrivacyBlocked(detail),
+                _ => ProviderError::Transport,
+            })?;
+        let mut body = response.body;
+        while let Some(chunk) = body.next().await {
+            chunk.map_err(|_| ProviderError::Transport)?;
+        }
+        Ok(Box::pin(futures::stream::iter(vec![
+            Ok(TurnEvent::TextDelta(DRAFT_ANSWER.to_owned())),
+            Ok(TurnEvent::Completed(TurnCompletion {
+                usage: TokenUsage::default(),
+                stop_reason: StopReason::EndTurn,
+            })),
+        ])))
+    }
+}
+
+/// The provenance each draft call was scoped by, in call order.
+type Scoped = Arc<Mutex<Vec<Provenance>>>;
+
+/// A duty that records the provenance it is asked to send under, then performs
+/// the real one.
+///
+/// It wraps rather than replaces the [`RemoteDuty`] the seam built, so the call
+/// still goes through `Egress::scoped` with exactly the provenance recorded
+/// here — the alternative, a fake duty that recorded and returned, would make
+/// the wire assertions vacuous.
+///
+/// [`RemoteDuty`]: tetond::harness::DutyRoute::remote
+struct Watching {
+    inner: Arc<dyn Duty>,
+    scoped: Scoped,
+}
+
+#[async_trait]
+impl Duty for Watching {
+    fn category(&self) -> teton_protocol::Category {
+        self.inner.category()
+    }
+
+    fn ceiling_bytes(&self) -> usize {
+        self.inner.ceiling_bytes()
+    }
+
+    async fn perform(&self, prompt: &str, provenance: &Provenance) -> Result<String, String> {
+        self.scoped
+            .lock()
+            .expect("recorder poisoned")
+            .push(provenance.clone());
+        self.inner.perform(prompt, provenance).await
+    }
+}
+
+/// The same route, with [`Watching`] between the seam and the duty it resolved.
+fn watching(route: DutyRoute, scoped: &Scoped) -> DutyRoute {
+    match route {
+        DutyRoute::Serves {
+            provider_id,
+            duty,
+            announce,
+        } => DutyRoute::Serves {
+            provider_id,
+            duty: Arc::new(Watching {
+                inner: duty,
+                scoped: Arc::clone(scoped),
+            }),
+            announce,
+        },
+        unresolved => unresolved,
+    }
+}
+
+/// Every event published so far, in order. `try_recv` rather than a timed
+/// `recv`: publishing is synchronous, so a caller that knows the run has
+/// finished drains deterministically (LESSON-450).
+fn drain_events(sub: &mut Subscription) -> Vec<Event> {
+    let mut out = Vec::new();
+    while let Some(envelope) = sub.try_recv() {
+        out.push(envelope.event);
+    }
+    out
+}
+
+/// **REQ-613 AC-6 / BR-4, both legs.** A `local-only` glob covers `Cargo.toml`,
+/// whose bytes carry a marker that exists nowhere else; a generation run drafts
+/// on a genuinely **remote** route; and no request body the transport was handed
+/// carries the marker, while the `drafted` event reports `excluded == 1` and the
+/// call's provenance names every evidence file that was *not* covered.
+///
+/// The three claims are one criterion and are asserted together, because each
+/// alone is satisfiable by a broken pipeline: a marker-free wire is what a run
+/// that sent nothing produces, `excluded == 1` is what a counter incremented in
+/// the wrong place produces, and a well-formed provenance is what a gatherer
+/// that read the covered file and then forgot to name it produces. What holds
+/// them together is that the *uncovered* evidence really is on the wire, under
+/// its own identities, on the same call.
+///
+/// The covered file's **name** is expected on the wire and asserted to be there:
+/// a listing name is metadata, not content (REQ-583 OQ-7), and a run that
+/// scrubbed the name would be hiding the repository's shape from the model for
+/// no privacy gain.
+///
+/// **Mutations** (LESSON-441), both run 2026-09-03 and restored byte-identically.
+///
+/// 1. **The exclusion, skipped.** Replacing the boundary test in
+///    `repo_context::evidence`'s `add_class` —
+///    `if matcher.match_path(resolved.provenance.as_str()).is_some() {` — with
+///    `if false {` reads the covered manifest into the prompt like any other
+///    table member. The test goes red, and *where* it goes red is worth
+///    recording: the run comes back
+///    `Failed { stage: Draft, reason: Duty("egress refused: content is under a
+///    local-only privacy boundary") }`. The manifest's identity is now in the
+///    call's provenance, so the choke point refuses the send — no `drafted`
+///    event, no file, and nothing on the wire. BR-4's exclusion is what makes
+///    generation *work* over a repository with a covered manifest; the choke
+///    point is what makes its absence safe rather than silent.
+/// 2. **The instrument, proven live.** Because of (1), the wire leg above
+///    cannot be reddened by a production mutation alone — so it was reddened by
+///    mutating this fixture: with the exclusion still skipped, building the
+///    draft route's `Egress` over `Vec::new()` instead of the session's
+///    boundaries removes the backstop, and the assertion fires with
+///    `request indices [0] of 1 carry the marker; the run published, in order,
+///    ["repo_context_generation", "repo_context_generation",
+///    "repo_context_generation"]` — the capture really would see the marker,
+///    and the failure message really does name the requests carrying it beside
+///    the ordered event names (conventions, LESSON-624).
+#[tokio::test]
+async fn a_boundary_covered_manifest_never_reaches_the_draft_provider_and_is_counted_excluded() {
+    let root = drafted_project("covered-manifest");
+    let probed = ProbedRoot {
+        path: root.clone(),
+        view: SessionRoot {
+            display: "~/sample".to_owned(),
+            kind: RootKind::Project,
+            project_name: Some("sample".to_owned()),
+            vcs_branch: None,
+        },
+    };
+    let boundaries = vec![PrivacyBoundary::user("Cargo.toml", BoundaryMode::LocalOnly)];
+    let matcher = BoundaryMatcher::new(&boundaries).expect("the fixture glob compiles");
+
+    let capture = CaptureTransport::default();
+    let sink = Arc::new(CapturingSink::default());
+    let scoped: Scoped = Arc::default();
+
+    // A resolver closure, as production hands one: nothing is routed until the
+    // evidence is in hand. The `Egress` it builds holds the *same* boundary set
+    // the gatherer excluded by, which is what makes the choke point a genuine
+    // backstop rather than a differently-configured one.
+    let route = {
+        let capture = capture.clone();
+        let sink = Arc::clone(&sink);
+        let boundaries = boundaries.clone();
+        let scoped = Arc::clone(&scoped);
+        move || {
+            let egress = Egress::new(capture.clone(), boundaries.clone(), Arc::clone(&sink) as _);
+            watching(
+                DutyRoute::remote(
+                    DRAFT_DUTY,
+                    "anthropic",
+                    Box::new(DraftingProvider),
+                    egress,
+                    "claude-opus-5",
+                    DRAFT_SESSION,
+                    ResolvedEffort::effort(EffortLevel::High),
+                ),
+                &scoped,
+            )
+        }
+    };
+
+    let bus = Arc::new(EventBus::new());
+    let mut sub = bus.subscribe(256);
+    let events = SessionEvents::new(Arc::clone(&bus), SessionId::from(DRAFT_SESSION));
+    let config = teton_core::Config::default();
+
+    let outcome = generate::run(
+        GenerationContext {
+            root: &probed,
+            reader: &RealFiles,
+            boundaries: &matcher,
+            // Roomy: the fixture's evidence is a few hundred bytes, so a cut is
+            // something a test asks for rather than stumbles into. Spelled as
+            // the route's *window* and put through the production derivation,
+            // which is what reserves the answer and the drafting instruction
+            // out of it.
+            budget: generate::evidence_budget_for(64 * 1024),
+            walk: WalkBudget::default(),
+            route: &route,
+            events: &events,
+            tier: Tier::Think,
+            config: &config,
+        },
+        // The witness carries the directory the answer was about, and this
+        // fixture's root is the one it was planted at.
+        ConsentGiven::granted(&root),
+        false,
+    )
+    .await;
+
+    // Non-vacuity, first and loudest: the run really drafted and really wrote.
+    assert!(
+        matches!(outcome, GenerationOutcome::Written(_)),
+        "the drafting run must succeed, or every assertion below is about a \
+         pipeline that did nothing: {outcome:?}"
+    );
+
+    let published = drain_events(&mut sub);
+    let ordered: Vec<&str> = published.iter().map(Event::name).collect();
+    let captured = capture.captured();
+
+    // --- the bytes on the wire (AC-6, the leg this file exists for) --------
+    let leaking: Vec<usize> = captured
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| contains_bytes(&request.body, SENTINEL_MANIFEST))
+        .map(|(index, _)| index)
+        .collect();
+    assert!(
+        leaking.is_empty(),
+        "the covered manifest's bytes reached the draft provider: request \
+         indices {leaking:?} of {} carry the marker; the run published, in \
+         order, {ordered:?}",
+        captured.len()
+    );
+
+    // ...and the wire was not empty, which is what makes the absence a fact
+    // about the exclusion rather than about a call nobody made.
+    assert_eq!(
+        captured.len(),
+        1,
+        "one draft is one request on the wire: {ordered:?}"
+    );
+    let body = String::from_utf8_lossy(&captured[0].body).into_owned();
+    for public in ["A planted repository.", "fn main()"] {
+        assert!(
+            body.contains(public),
+            "the uncovered evidence must really travel, or `no marker` is a \
+             claim about an empty prompt: {public:?} is missing"
+        );
+    }
+    assert!(
+        body.contains(".toml 1"),
+        "the covered file still counts in its directory's language profile — a \
+         listing is metadata (REQ-583 OQ-7) and only the bytes are withheld: \
+         {body}"
+    );
+
+    // --- what the surface was told ----------------------------------------
+    let stages: Vec<RepoContextGeneration> = published
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::RepoContextGeneration(news) => Some(news),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        stages.iter().map(|stage| stage.outcome).collect::<Vec<_>>(),
+        vec![
+            GenerationStage::Walking,
+            GenerationStage::Drafted,
+            GenerationStage::Written
+        ],
+        "one event per stage, in the order the stages happen"
+    );
+    let drafted = &stages[1];
+    assert_eq!(
+        drafted.excluded,
+        Some(1),
+        "the covered manifest must be counted excluded — a file silently not \
+         read looks exactly like a file that was not there (AC-6)"
+    );
+    assert_eq!(drafted.tier, Some(Tier::Think));
+
+    // --- what the call was scoped by --------------------------------------
+    let calls = scoped.lock().expect("recorder poisoned").clone();
+    assert_eq!(calls.len(), 1, "one draft is one duty call");
+    let provenance = &calls[0];
+    assert!(
+        !provenance.is_unknown(),
+        "the draft's provenance is never Unknown (BR-4): an unknown one is \
+         fail-closed at the choke point and says nothing about what was sent"
+    );
+    let mut sources: Vec<&str> = provenance.sources().collect();
+    sources.sort_unstable();
+    assert_eq!(
+        sources,
+        vec!["README.md", "src/main.rs"],
+        "the call is scoped by exactly the evidence files whose bytes it carries \
+         — the covered manifest is not among them, and neither is anything the \
+         gatherer failed to name"
+    );
+
+    // --- and the backstop was never needed --------------------------------
+    assert!(
+        sink.events().is_empty(),
+        "a privacy_block here would mean the exclusion had failed and the choke \
+         point had caught it — BR-4 says the covered file never reaches a prompt \
+         at all"
+    );
+    assert!(
+        root.join("TETON.md").is_file(),
+        "the run that proved all of the above is the run that wrote the notes"
     );
     std::fs::remove_dir_all(&root).ok();
 }

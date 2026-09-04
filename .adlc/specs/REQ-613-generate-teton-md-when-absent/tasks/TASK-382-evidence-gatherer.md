@@ -1,7 +1,7 @@
 ---
 id: TASK-382
 title: "The evidence gatherer: one walk, two closed tables, a rendered tree, exclusion, and the priority cut"
-status: draft
+status: complete
 parent: REQ-613
 repo: teton-code
 created: 2026-09-03
@@ -26,17 +26,17 @@ recorded. Covers BR-3 and the exclusion half of BR-4.
 
 ## Acceptance Criteria
 
-- [ ] BR-3: a planted six-level tree renders to its leaves with counts; a tree over a small
+- [x] BR-3: a planted six-level tree renders to its leaves with counts; a tree over a small
       injected `WalkBudget` stops with `stop` set; the skip set and symlink rule hold; the
       reader records zero calls before `gather` is called.
-- [ ] Both tables are exercised by name; present members contribute whole text to 16 KiB or
+- [x] Both tables are exercised by name; present members contribute whole text to 16 KiB or
       4 KiB; absent members cost one `stat`; nothing outside the tables is read (the reader's
       path log is the assertion).
-- [ ] BR-4: a covered `Cargo.toml` is absent from `body` and `provenance`, `excluded == 1`;
+- [x] BR-4: a covered `Cargo.toml` is absent from `body` and `provenance`, `excluded == 1`;
       listing names of a covered directory still appear in the tree.
-- [ ] The priority cut drops entry points before README before manifests before the tree, and
+- [x] The priority cut drops entry points before README before manifests before the tree, and
       the tree is cut by depth with `cut.depth` recorded; the body never exceeds `max_bytes`.
-- [ ] Rendering is order-independent: two listings of the same entries in different orders
+- [x] Rendering is order-independent: two listings of the same entries in different orders
       render identically (LESSON-540).
 
 ## Verification

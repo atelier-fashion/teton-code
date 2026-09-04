@@ -1,10 +1,10 @@
 ---
 id: REQ-613
 title: "Teton writes TETON.md when a project has none — a consented, bounded, provenance-carrying draft the session then loads"
-status: approved
+status: complete
 deployable: true
 created: 2026-09-03
-updated: 2026-09-03
+updated: 2026-09-04
 component: "daemon/harness"
 domain: "harness"
 stack: ["rust", "daemon", "cli", "json-rpc", "llm-providers"]

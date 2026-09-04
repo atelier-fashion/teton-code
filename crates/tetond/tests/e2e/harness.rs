@@ -1385,8 +1385,26 @@ impl Drop for Client {
 // ---------------------------------------------------------------------------
 
 /// Write the fixture demo repo into `repo`.
+///
+/// # The empty `TETON.md` is deliberate (REQ-613 BR-1)
+///
+/// Since REQ-613 the daemon offers to *write* a repository's notes on the first
+/// prompt of a session whose project root has none — and at `full`, or with
+/// `[context] generate = always`, it writes them with no prompt at all. Every
+/// fixture below drives scripted turns against a scripted vendor, so an
+/// unannounced extra model call would consume a scripted reply, add a cost row
+/// and leave a generated file in the tree: each of those breaks a test whose
+/// subject is something else entirely.
+///
+/// An **empty** file is BR-1's own documented way to stop the offer: it counts
+/// as present for the offer and loads as `Absent` for the prompt, so the system
+/// prompt these fixtures assert on is byte-identical to one from a repository
+/// with no notes at all. Planting it here rather than turning the feature off in
+/// sixty config files keeps the opt-out in one place, where a fixture that
+/// *wants* the offer (`repo_context_generation.rs`) is the one that removes it.
 pub fn write_demo_repo(repo: &Path) {
     let files: &[(&str, &str)] = &[
+        ("TETON.md", ""),
         ("README.md", include_str!("fixtures/demo_repo/README.md")),
         ("Cargo.toml", include_str!("fixtures/demo_repo/Cargo.toml")),
         ("src/lib.rs", include_str!("fixtures/demo_repo/src/lib.rs")),

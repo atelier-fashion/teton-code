@@ -182,7 +182,12 @@ const CONTROL_TOKEN_SPELLINGS: [(&str, &str); 4] = [
 ///    `<think>`), which the shape rule cannot see.
 ///
 /// Both are insertion-only, so no rewrite can mint a neighbouring spelling.
-fn neutralize_control_tokens(text: &str) -> std::borrow::Cow<'_, str> {
+///
+/// `pub(crate)` since REQ-613: the evidence gatherer authors a prompt frame of
+/// its own out of repository text that no render pass will see — the draft duty
+/// parses that text back, so it is neutralized where it is assembled (ADR-009
+/// rule 2), and the tokenizer's alphabet is one of the three it needs.
+pub(crate) fn neutralize_control_tokens(text: &str) -> std::borrow::Cow<'_, str> {
     // Fast path: every spelling opens with `<`, so text without one is clean.
     if !text.contains('<') {
         return std::borrow::Cow::Borrowed(text);

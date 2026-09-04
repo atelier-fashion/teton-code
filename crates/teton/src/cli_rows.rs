@@ -164,6 +164,15 @@ pub(crate) const SHELL_ONLY: &[&str] = &[
     "context enable",
     "context disable",
     "context status",
+    // REQ-613: the durable offer posture, shell-only for the reason its three
+    // neighbours are — it writes `config.toml`, and REQ-611 BR-2's split says a
+    // line typed inside a session must not move a machine-wide key.
+    //
+    // `context init` is deliberately **not** here: it writes a file in this
+    // repository rather than a key on this machine, and it is a row of the
+    // session table (`/context init`), so a typed `teton context init` runs that
+    // row instead of earning a refusal.
+    "context generate",
 ];
 
 /// What [`write_gate`] decides.
@@ -717,6 +726,20 @@ pub(crate) fn refusal_for_path(path: &[&str]) -> String {
             "`teton {spelling}` is shell-only: it sets the machine's durable transcript default, \
              so nothing was run — run `teton {spelling}` from a shell; this session's own \
              switch is `/transcript on` and `/transcript off`."
+        );
+    }
+    // REQ-613: the offer posture, and its own sentence rather than the notes
+    // switch's below it. `generate` decides whether a *missing* file gets
+    // written; `/context on|off` decides whether a file that exists is read.
+    // Pointing a user at the switch would answer a question they did not ask,
+    // so this names the session form that actually corresponds — `/context
+    // init`, which writes one now without touching any durable key.
+    if spelling == "context generate" {
+        return format!(
+            "`teton {spelling}` is shell-only: it sets the machine's durable `[context] \
+             generate` posture — whether Teton offers to write a missing TETON.md — so \
+             nothing was run. Run it from a shell; to write one for this repository now, \
+             `/context init`."
         );
     }
     // REQ-612: the same split one feature over. The durable half decides what
@@ -1498,6 +1521,9 @@ mod tests {
                 state: teton_protocol::methods::RepoContextStateKind::Truncated,
                 source: Some(teton_protocol::methods::RepoContextSource::TetonMd),
                 file: Some("TETON.md".to_owned()),
+                // REQ-613 TASK-380: additive fields; TASK-387 owns rendering them.
+                origin: None,
+                generation: None,
                 bytes_on_disk: Some(9_412),
                 resident_bytes: 8_192,
                 cap: 8_192,
@@ -2242,6 +2268,21 @@ mod readme_tests {
              It is TASK-378's to add — do not add it from the CLI task; if that commit \
              has not landed yet, this failure is the coordination working. Found: \
              {documented:?}"
+        );
+
+        // REQ-613 AC-12's client half, and the reason it is named outright
+        // beside `/context` rather than left to the sweep above: the sweep is a
+        // conditional over whatever the README happens to list, so a README that
+        // simply dropped the row would pass it. This row is the one a user finds
+        // the on-demand write through, and it is the one whose `COMMANDS`
+        // spelling has to be two words — `builtin_spellings` yields row *names*,
+        // so a `/context init` documented in the README and served only by the
+        // `context` row's argument parser would be an `unknown command` to
+        // anyone who typed it with a `--force`.
+        assert!(
+            documented.iter().any(|row| row == "context init"),
+            "the README's session-command table names no `/context init` row (REQ-613 \
+             AC-12/BR-8). Found: {documented:?}"
         );
 
         // The guide half. A session-only row has no `teton …` form at all, so

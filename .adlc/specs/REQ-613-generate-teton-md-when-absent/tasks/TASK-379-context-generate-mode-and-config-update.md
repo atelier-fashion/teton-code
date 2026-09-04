@@ -1,7 +1,7 @@
 ---
 id: TASK-379
 title: "`[context] generate = ask|always|never` and its durable `ConfigUpdate`"
-status: draft
+status: complete
 parent: REQ-613
 repo: teton-code
 created: 2026-09-03
@@ -30,18 +30,36 @@ writes through `config/set`. Requires REQ-612 TASK-369 merged (the table exists)
 
 ## Acceptance Criteria
 
-- [ ] A config with no `[context]` table parses to `generate == Ask`; `generate = "never"` parses;
+- [x] A config with no `[context]` table parses to `generate == Ask`; `generate = "never"` parses;
       an unknown value is a structural error naming the three values.
-- [ ] `SetRepoContextGenerate` writes the key and re-parses to the same value; a refused write
-      (unattested commitment seam) leaves the bytes identical — the LESSON-519/520 pair.
-- [ ] `cargo test -p teton-core -p teton-protocol --no-fail-fast` green.
+- [x] `SetRepoContextGenerate` writes the key and re-parses to the same value; a refused write
+      leaves the bytes identical — the LESSON-519/520 pair.
+- [x] `cargo test -p teton-core --no-fail-fast` and
+      `cargo test -p tetond --test config_preservation --no-fail-fast` green.
+- [x] LESSON-587 audit recorded on `ContextConfig::is_unset`: it is the only predicate in the
+      tree that branches on a `[context]` field holding its default, and adding a field to a
+      whole-struct equality can only move configs from "unset" to "set" — no dormant rule is
+      switched on. No `is_empty`-style predicate was added.
+
+## Delivery notes
+
+**Scope split.** `ConfigUpdate::SetRepoContextGenerate`, the `RepoContextGenerateMode` wire twin
+and the daemon's persistence/`config/get` arms were delivered by TASK-380 (commit `7b3db53`);
+this task delivers the `teton-core` schema, the rendering finding, and the three tests.
+
+**No rendering code was needed in `config_document.rs`.** REQ-612's
+`skip_serializing_if = "ContextConfig::is_unset"` on `Config::context` plus REQ-574's
+`diff(current, candidate)` delta rule already give "rendered inside `[context]` only when the
+write is about it, and never invented in a table the user did not name". Recorded as a test
+rather than a claim, since it is a property of attributes in another crate and a diff in a third.
 
 ## Verification
 
 | rule | kind | artifact | benign_path |
 |------|------|----------|-------------|
 | BR-10 | test-case | `crates/teton-core/src/config.rs::context_generate_defaults_to_ask_and_names_its_three_values` | yes |
-| AC-11 | test-case | `crates/tetond/tests/config_preservation.rs::set_repo_context_generate_writes_the_key_and_a_refused_write_leaves_the_bytes_identical` | yes |
+| BR-10 | test-case | `crates/tetond/tests/config_preservation.rs::set_repo_context_generate_writes_the_key_and_a_refused_write_leaves_the_bytes_identical` | yes |
+| AC-11 | test-case | `crates/tetond/tests/repo_context_generation.rs::plan_suppresses_without_a_prompt_full_and_always_write_without_one_and_never_suppresses` | yes |
 
 ## Technical Notes
 

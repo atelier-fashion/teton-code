@@ -512,6 +512,24 @@ pub(super) fn snapshot_from_config(
         repo_context: Some(teton_protocol::methods::RepoContextPosture {
             enabled: config.context.repo_file,
             max_bytes: crate::repo_context::REPO_CONTEXT_MAX_BYTES as u64,
+            // REQ-613 BR-10: the other half of the `[context]` table, read from
+            // the config's own key beside `repo_file` for the reason above it.
+            // Mapped by an exhaustive `match` and not a `From`, which is the
+            // same discipline `apply_update` takes at the other end of the same
+            // pair of enums: a fourth posture added to either crate is a compile
+            // error at both boundaries rather than a value quietly
+            // reinterpreted at one of them.
+            generate: Some(match config.context.generate {
+                teton_core::config::GenerateMode::Ask => {
+                    teton_protocol::methods::RepoContextGenerateMode::Ask
+                }
+                teton_core::config::GenerateMode::Always => {
+                    teton_protocol::methods::RepoContextGenerateMode::Always
+                }
+                teton_core::config::GenerateMode::Never => {
+                    teton_protocol::methods::RepoContextGenerateMode::Never
+                }
+            }),
         }),
     }
 }
@@ -760,6 +778,10 @@ mod tests {
         let flipped = Config {
             context: teton_core::config::ContextConfig {
                 repo_file: !absent.context.repo_file,
+                // The one key this projection is about; every other field of
+                // the table (REQ-613's `generate`) keeps its default, so a
+                // later one cannot break this fixture.
+                ..teton_core::config::ContextConfig::default()
             },
             ..Config::default()
         };
@@ -788,7 +810,7 @@ mod tests {
 
     /// ADR-A + AC-12, on the projection a client actually reads.
     ///
-    /// The snapshot carries one row per category — all eleven — with the ones
+    /// The snapshot carries one row per category — all twelve — with the ones
     /// that no model call reaches marked, and the BR-9 judgment default beside
     /// them. Both are things `teton policy show` renders and nothing else
     /// computes.
@@ -804,14 +826,16 @@ mod tests {
             a_transcript_dir(),
         );
 
-        assert_eq!(snap.routing.len(), 11, "every category gets a row");
+        // REQ-613 TASK-381: twelve since `draft` joined them.
+        assert_eq!(snap.routing.len(), 12, "every category gets a row");
         let unreached: Vec<&str> = snap
             .routing
             .iter()
             .filter(|r| !r.reached)
             .map(|r| r.category.as_str())
             .collect();
-        // Empty since REQ-562 TASK-070 wired `redact`, the last of the eleven.
+        // Empty since REQ-562 TASK-070 wired `redact`, and still empty after
+        // REQ-613 added `draft` with its duty in the same change.
         // Stated as the census rather than dropped: the loop below is the
         // invariant (every row agrees with `has_call_site`), and this line is
         // what makes a *change* to the set show up as a diff a reviewer reads.

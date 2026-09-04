@@ -532,7 +532,22 @@ impl DaemonRuntime {
             system,
             repo_context,
         } = self
-            .assemble_harness(tctx, sessions, &skills, &probed, &mut route)
+            .assemble_harness(
+                tctx,
+                sessions,
+                &skills,
+                &probed,
+                &mut route,
+                // REQ-613 BR-1: a **typed** prompt is what raises the offer, on
+                // `spawn_title_session`'s reason below and with more riding on
+                // it. A skill turn can still be refused by Stage A's budget
+                // question, and REQ-589 BR-8's refusal says *"Nothing was sent
+                // and no provider saw this turn"* — a draft call spent here
+                // would make that sentence true of the turn and false of the
+                // machine, over an offer nobody typed a prompt to reach. The
+                // state stays `Pending`, so the next typed prompt raises it.
+                skill_turn.is_none(),
+            )
             .await;
 
         let accepted = self
@@ -943,6 +958,7 @@ impl DaemonRuntime {
         skills: &Arc<SkillRegistry>,
         probed: &ProbedRoot,
         route: &mut crate::router::Route,
+        may_offer_generation: bool,
     ) -> AssembledHarness {
         // `events`, `session_id` and `config` come off the context rather than
         // being passed again beside it — three parameters that were already in
@@ -1103,6 +1119,55 @@ impl DaemonRuntime {
         if sessions.claim_repo_context_publish(session_id, triple, state_moved) {
             events.publish(Some(session_id.clone()), event);
         }
+        // REQ-613 BR-1 / ADR-1: **the offer, on the claiming turn only.** After
+        // the refresh above, so the state it reads is this turn's own reading of
+        // the root rather than one taken before a `/cd`; before the prompt is
+        // built below, so a file this turn writes is resident in the very
+        // request that offered it (BR-7, AC-1).
+        //
+        // Here rather than inside the tool loop, and that is the same rule the
+        // refresh obeys one paragraph up: the system prompt is fixed for the
+        // turn, so a second iteration must not be able to raise a second offer.
+        // The claim is what makes it structural — `claim_generation` moves
+        // `Pending` to `Offered` under the registry lock, and every later
+        // reader, in this turn or the next, sees a state that is no longer
+        // pending.
+        //
+        // The claim is taken **outside** the await and the gate is awaited
+        // outside every lock (the `set_session_cwd` discipline): the registry
+        // mutex is a lock every other session's turn can wait behind, and what
+        // this awaits is a person.
+        let state = if may_offer_generation && sessions.claim_generation(session_id) {
+            let outcome = self
+                .generate_repo_context(
+                    tctx.core,
+                    sessions,
+                    probed,
+                    &stream_events,
+                    GenerationDoor {
+                        gate: tctx.gate,
+                        invoker: tctx.invoker,
+                        cap,
+                        // The offer, not the command: `[context] generate =
+                        // never` stops this door, and nothing here replaces a
+                        // file that is there.
+                        explicit: false,
+                        force: false,
+                    },
+                )
+                .await;
+            sessions.set_generation(session_id, Self::generation_state_for(&outcome));
+            // Read back rather than kept: `generate_repo_context` stored the
+            // loaded state under the registry's own lock, and a session that
+            // vanished under this turn answers `Absent` — the same reading the
+            // refresh above takes of the same registry.
+            match outcome.generated() {
+                Some(_) => sessions.repo_context(session_id),
+                None => state,
+            }
+        } else {
+            state
+        };
         // The prompt is built in two pieces so a mid-turn reroute can rebuild
         // the second one at a different cap (REQ-612 BR-3, `CarriedTurn::rebudget`):
         // everything above the notes is a function of the tools and the route's
@@ -2197,7 +2262,7 @@ impl DaemonRuntime {
     /// the whole point of the hold is that the tier's availability changed
     /// underneath the first reading. Both readings are this one function so
     /// they cannot disagree about anything but the tier.
-    fn turn_router(&self, config: &Config, session_id: &SessionId) -> Router {
+    pub(super) fn turn_router(&self, config: &Config, session_id: &SessionId) -> Router {
         // REQ-544 M-5: seed the router from the daemon-wide health map so a
         // provider marked Unavailable on an earlier turn stays Unavailable here —
         // UNLESS its half-open cooldown has elapsed, in which case it is offered as
@@ -3121,7 +3186,10 @@ impl DaemonRuntime {
                 | ConfigUpdate::SetPrivacyBoundary(_)
                 | ConfigUpdate::SetEffort(_)
                 | ConfigUpdate::SetTranscriptEnabled { .. }
-                | ConfigUpdate::SetRepoContextEnabled { .. } => None,
+                | ConfigUpdate::SetRepoContextEnabled { .. }
+                // REQ-613 TASK-380: names no provider, so it restates no
+                // registration.
+                | ConfigUpdate::SetRepoContextGenerate { .. } => None,
             };
             self.apply_config_update_guarded(update, |config| {
                 if let Some(restates) = &restates {

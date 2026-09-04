@@ -99,7 +99,9 @@ use teton_core::category::{
     category_for_phase, BindingSource as CoreBindingSource, Category, CategoryOverride,
     CategoryResolution, CategoryTable, ConfigurableCategory, Tier, TierBinding,
 };
-use teton_core::config::{Config, LocalModelConfig, RoutingMigration, WebConfig, WebTier};
+use teton_core::config::{
+    Config, GenerateMode, LocalModelConfig, RoutingMigration, WebConfig, WebTier,
+};
 use teton_core::config_doc::document_is_effectively_empty;
 use teton_core::entities::{
     BoundaryMode, BoundaryOrigin, ModelProvider, PrivacyBoundary, ProviderCapabilities,
@@ -135,13 +137,14 @@ use teton_protocol::methods::{
     ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig,
     ProviderHealth as WireProviderHealth, ProviderSetupCandidate, ProviderSetupCommitResult,
     ProviderSetupPlanResult, ProviderSetupPreviewResult, ProviderTestOutcome, ProviderTestResult,
-    RepoContextStateKind, SessionClearParams, SessionClearResult, SessionContextParams,
-    SessionContextResult, SessionPermissionsParams, SessionPermissionsResult, SessionSetCwdParams,
-    SessionSetCwdResult, SessionTranscriptParams, SessionTranscriptResult, SkillInvocation,
-    TierBinding as WireTierBinding, TierBindingConfig, TierRouteView, TierSummary,
-    TranscriptAction, WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams,
-    WebRefreshResult, WebSetupCommitParams, WebSetupCommitResult, WebSetupPlanResult,
-    WebSetupPreviewParams, WebSetupPreviewResult, WebTableSummary, WebTotalsView,
+    RepoContextGenerateMode, RepoContextOrigin, RepoContextStateKind, SessionClearParams,
+    SessionClearResult, SessionContextParams, SessionContextResult, SessionPermissionsParams,
+    SessionPermissionsResult, SessionSetCwdParams, SessionSetCwdResult, SessionTranscriptParams,
+    SessionTranscriptResult, SkillInvocation, TierBinding as WireTierBinding, TierBindingConfig,
+    TierRouteView, TierSummary, TranscriptAction, WebOverrideParams, WebOverrideResult,
+    WebRefreshOutcome, WebRefreshParams, WebRefreshResult, WebSetupCommitParams,
+    WebSetupCommitResult, WebSetupPlanResult, WebSetupPreviewParams, WebSetupPreviewResult,
+    WebTableSummary, WebTotalsView,
 };
 use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::{
@@ -197,6 +200,7 @@ use crate::model_consent::{
     list_entries, no_local_engine_reason, probe_view, selection_view, ConsentOutcome,
     ModelConsentGate, NoInstaller, PendingModelDecisions, WeightsInstaller,
 };
+use crate::repo_context::generate::{self, OfferOutcome};
 use crate::repo_context::{
     RealFiles, RefreshVerdict, RepoContext, RepoContextBlock, RepoContextState, RepoFileReader,
     REPO_CONTEXT_MAX_BYTES,
@@ -207,7 +211,7 @@ use crate::router::{
 };
 use crate::selection_store::SelectionStore;
 use crate::session_root::{home, ProbedRoot};
-use crate::sessions::{validate_session_cwd, SessionRegistry, TurnClaimError};
+use crate::sessions::{validate_session_cwd, GenerationState, SessionRegistry, TurnClaimError};
 use crate::skills::dynamic::{closed_door, door_outcome, outcome_view};
 use crate::skills::{DynamicOutcome, Expansion, Pending, SkillRegistry, SkillSource};
 // REQ-611: the sink is constructed here (`from_env`), and the two hand-offs the
@@ -379,6 +383,39 @@ const SCRIPTED_COMPACTION: &str =
 /// legible-but-unparseable marker would fail every scripted scan closed.
 const SCRIPTED_REDACTION: &str = "NONE";
 
+/// The stand-in engine's answer to a `draft` duty: the five sections REQ-613's
+/// prompt asks for, saying they are scripted (REQ-613 TASK-386).
+///
+/// A **well-formed** file rather than a marker line, because this answer is
+/// written to disk and read back by REQ-612's loader on the same run: an answer
+/// that stripped to nothing would make every scripted `/context init` a
+/// `Failed { EmptyDraft }`, which is the one outcome a fixture cannot tell from
+/// a broken pipeline. The section headings match
+/// [`DRAFT_SECTIONS`](crate::harness::draft) so a fixture can assert the shape
+/// it would get from a real model.
+const SCRIPTED_DRAFT: &str = "## Purpose\nA scripted repository, drafted by the offline \
+                              stand-in engine.\n\n## Layout\nAs listed in the evidence \
+                              above.\n\n## Build & test\nAs the manifests above state.\n\n\
+                              ## Conventions\nNone stated.\n\n## Where to look\nThe entry \
+                              points listed above.\n";
+
+/// How far into a **draft** prompt its contract may start and still be the
+/// harness's own instruction (REQ-613 TASK-386).
+///
+/// [`DUTY_CONTRACT_PREFIX_BYTES`]'s reasoning with this duty's own numbers. The
+/// window there is sized for instructions "a few hundred bytes" long; the draft
+/// instruction is the longest in the harness by a wide margin — five section
+/// names with their purposes, the byte budget, and the audience — and states its
+/// contract about 1,300 bytes in, so it does not fit and the arm would never
+/// fire.
+///
+/// Widening the shared constant instead would loosen the anchor for the six
+/// duties it is correctly sized for, which is the wrong trade: the anchor exists
+/// so that *material* quoting a contract cannot be mistaken for an instruction
+/// stating one, and every byte it grows is a byte of some other duty's material
+/// that comes inside the window.
+pub(crate) const DRAFT_CONTRACT_PREFIX_BYTES: usize = 2_048;
+
 /// A local [`Engine`] that replays a fixed script of replies, one per turn.
 ///
 /// This is the CI/offline stand-in for a real llama.cpp engine: the daemon ships
@@ -406,8 +443,18 @@ const SCRIPTED_REDACTION: &str = "NONE";
 /// [`crate::harness::shell_duty::SHELL_OUTPUT_CONTRACT`],
 /// [`crate::harness::title::TITLE_OUTPUT_CONTRACT`],
 /// [`crate::harness::compact::COMPACT_OUTPUT_CONTRACT`],
-/// [`crate::harness::redact::REDACTION_OUTPUT_CONTRACT`]) and answered
+/// [`crate::harness::redact::REDACTION_OUTPUT_CONTRACT`],
+/// [`crate::harness::draft::DRAFT_OUTPUT_CONTRACT`]) and answered
 /// off-script, consuming nothing.
+///
+/// REQ-613 added the last of those. `draft` fires at most once per repository —
+/// on the first prompt of a session whose root has no notes, and on
+/// `/context init` — so a missing arm would not desynchronize a suite the way a
+/// missing `title` arm would; it would do something worse on the fixtures it
+/// reaches, because the answer is **written to the repository as a file** and
+/// read back by REQ-612's loader. A scripted turn's reply landing in a
+/// `TETON.md` is a fixture whose next prompt carries the block it was never
+/// given.
 ///
 /// `title` is the one that would have bitten hardest among the five: it fires on
 /// the first turn of **every** session rather than on some particular tool
@@ -487,9 +534,17 @@ pub(crate) const DUTY_CONTRACT_PREFIX_BYTES: usize = 1_024;
 /// is the failure mode [`ScriptedFileEngine`]'s own docs describe having shipped
 /// twice, arriving by a different route (REQ-561 verify).
 fn instructs(prompt: &str, contract: &str) -> bool {
-    prompt
-        .find(contract)
-        .is_some_and(|at| at < DUTY_CONTRACT_PREFIX_BYTES)
+    instructs_within(prompt, contract, DUTY_CONTRACT_PREFIX_BYTES)
+}
+
+/// [`instructs`] against a window this duty's own instruction earns.
+///
+/// One anchor with a stated width rather than two rules: the draft's
+/// instruction is long enough that the shared window cannot hold it
+/// ([`DRAFT_CONTRACT_PREFIX_BYTES`]), and the alternative — widening the shared
+/// one — would loosen the anchor for every duty that does fit.
+fn instructs_within(prompt: &str, contract: &str, window: usize) -> bool {
+    prompt.find(contract).is_some_and(|at| at < window)
 }
 
 /// Whether `prompt` ends with `contract` — the classifier's shape, and only the
@@ -518,7 +573,7 @@ impl Engine for ScriptedFileEngine {
         // A duty, not a turn: answered off-script so the block sequence keeps
         // meaning what the fixture author wrote (see the type's docs).
         //
-        // The five harness duties are recognized by their contract appearing in
+        // The harness duties are recognized by their contract appearing in
         // the prompt's **instruction prefix** and the classifier by its contract
         // *terminating* the prompt — never by a bare `contains` over the whole
         // rendered text. See `instructs` and `concludes`.
@@ -548,6 +603,20 @@ impl Engine for ScriptedFileEngine {
             SCRIPTED_TITLE.to_owned()
         } else if instructs(prompt, crate::harness::compact::COMPACT_OUTPUT_CONTRACT) {
             SCRIPTED_COMPACTION.to_owned()
+        } else if instructs_within(
+            prompt,
+            crate::harness::draft::DRAFT_OUTPUT_CONTRACT,
+            DRAFT_CONTRACT_PREFIX_BYTES,
+        ) {
+            // REQ-613: the seventh duty, and the first whose answer is written
+            // to a file. Recognized on its own window because its instruction is
+            // the longest in the harness — see `DRAFT_CONTRACT_PREFIX_BYTES`.
+            // Last among the prefix-anchored arms, so a *draft* prompt whose
+            // evidence happens to quote a shorter duty's contract is still
+            // answered as the duty it is: the draft's own material starts past
+            // 1,300 bytes, and every arm above reads a narrower window than
+            // this one.
+            SCRIPTED_DRAFT.to_owned()
         } else if concludes(prompt, crate::classify::CLASSIFIER_OUTPUT_CONTRACT) {
             scripted_classification().to_owned()
         } else {
@@ -585,6 +654,42 @@ impl Engine for ScriptedFileEngine {
         let prompt_tokens = u32::try_from(prompt.split_whitespace().count()).unwrap_or(u32::MAX);
         Ok(Completion::cold(text, prompt_tokens, completion_tokens))
     }
+}
+
+/// Which door an offer came through, and what it may do (REQ-613 ADR-6).
+///
+/// Named rather than passed loose, because `suppression_ratchet.rs` treats a new
+/// `too_many_arguments` allow as a new unnamed parameter cluster and asks for
+/// the name instead — and these five *are* a cluster: they are the whole of what
+/// the first-turn hook and `/context init` differ in, plus the two things only a
+/// caller can hold (a session's gate, and the connection that may answer it).
+pub(crate) struct GenerationDoor<'a> {
+    /// The session's gate — the same one every other consent this session gives
+    /// goes through.
+    pub(crate) gate: &'a PermissionGate,
+    /// The connection that may answer, when there is one.
+    pub(crate) invoker: Option<ConnectionId>,
+    /// The cap the resulting block is measured at: the turn's route cap on one
+    /// door, the stamped route's on the other.
+    pub(crate) cap: usize,
+    /// Whether the user asked for this by name (`/context init`), which is the
+    /// one thing that outranks `[context] generate = never` (BR-8).
+    pub(crate) explicit: bool,
+    /// Whether an existing file may be replaced (`--force`).
+    pub(crate) force: bool,
+}
+
+/// The `draft` category's route and the tier it resolved through (REQ-613
+/// BR-5).
+///
+/// Declared here rather than in [`duty`] so the module map's line budget for
+/// that slice stays where REQ-599 put it; it is `duty.rs`'s type in every other
+/// sense, and `draft_route` is the only thing that builds one.
+pub(crate) struct DraftPlan {
+    /// Where the duty runs.
+    pub(crate) route: DutyRoute,
+    /// The tier the resolution named — the header line's word, and the event's.
+    pub(crate) tier: ProtoTier,
 }
 
 /// Providers that refused the reasoning-effort field, per session (REQ-559
@@ -3594,6 +3699,18 @@ impl DaemonRuntime {
         let loaded = block_in_place_if_multithread(|| {
             load_repo_context(probed, &boundaries, enabled, self.repo_files.as_ref())
         });
+        // REQ-613 BR-1 / ADR-1: the offer is armed **here**, in the one
+        // derivation both lifecycle sites funnel through, and before the
+        // unchanged-state return below — because the normal case is exactly the
+        // one that must arm: a project with no notes stores `Absent` over
+        // `Absent` and says nothing, and that is the session BR-1 is about.
+        //
+        // Inside the same `block_in_place` as the load, for BUG-184's reason:
+        // deciding it costs up to two more `stat`s of a user-controlled path,
+        // and both call sites run on a connection's reader loop.
+        let armed =
+            block_in_place_if_multithread(|| self.generation_arming(probed, &loaded, enabled));
+        sessions.arm_generation(session_id, &probed.path, armed);
         if *sessions.repo_context(session_id) == loaded {
             return;
         }
@@ -3615,6 +3732,216 @@ impl DaemonRuntime {
         if sessions.store_and_claim_repo_context(session_id, loaded, triple) {
             // After the store and after the lock — see above.
             events.publish(Some(session_id.clone()), event);
+        }
+    }
+
+    /// What the offer's state should be for the notes just derived (REQ-613
+    /// BR-1).
+    ///
+    /// `Pending` for the one case BR-1 names — a **project** root whose notes
+    /// this session may read and which holds neither of REQ-612's two candidate
+    /// names — and `Suppressed` for every other reading, which is four
+    /// different facts with one consequence:
+    ///
+    /// - a file is there: a `TETON.md`, an `AGENTS.md` (ASSUME-3: someone has
+    ///   already described this repository), or an **empty** one, which BR-1
+    ///   counts as present because it is the documented way to stop the offer;
+    /// - the notes are switched off, so nothing was opened and nothing may be:
+    ///   `off` means unopened, and writing a file the session would not read
+    ///   would be the switch working in one direction only;
+    /// - a boundary covers the file, or it could not be read — both mean bytes
+    ///   are there, and a write would clobber them;
+    /// - the root is not a project. REQ-612's loader answers `Absent` for a
+    ///   `home` root as much as for an empty repository, and "Teton wrote a
+    ///   `TETON.md` in my home directory" is the one outcome this feature must
+    ///   never produce.
+    ///
+    /// The state alone cannot decide it, which is why this exists at all: an
+    /// empty file and no file are both [`RepoContextState::Absent`], so the
+    /// present-file half is a `stat` through the injected reader
+    /// ([`generate::notes_present`]) — taken only when the switch is on, so
+    /// "off means unopened" stays true of this path too.
+    fn generation_arming(
+        &self,
+        probed: &ProbedRoot,
+        loaded: &RepoContextState,
+        enabled: bool,
+    ) -> GenerationState {
+        let absent = *loaded == RepoContextState::Absent;
+        let a_project = probed.view.kind == teton_protocol::methods::RootKind::Project;
+        if enabled
+            && absent
+            && a_project
+            && generate::notes_present(probed, self.repo_files.as_ref()).is_none()
+        {
+            GenerationState::Pending
+        } else {
+            GenerationState::Suppressed
+        }
+    }
+
+    /// Offer to write this repository's missing notes, and write them if the
+    /// answer allows it — **the one path both doors take** (REQ-613 ADR-1,
+    /// ADR-6).
+    ///
+    /// The turn's `assemble` stage reaches it with a claimed `Pending` state and
+    /// `explicit: false`; `session/context`'s `Init` reaches it with the user's
+    /// own request and `explicit: true`. Everything between — the config
+    /// short-circuits, the gate, the walk, the call, the write, the loader — is
+    /// [`generate::offer_and_run`]'s, so the two doors cannot come to differ in
+    /// anything but the two flags they pass (AC-8).
+    ///
+    /// What lives *here* rather than there is the wiring only the daemon has:
+    /// the file-reader seam, the compiled boundary set, the draft route and the
+    /// window it is measured against, and — after a successful run — storing the
+    /// state the loader produced and announcing it.
+    ///
+    /// # One resolution of the draft route, read twice
+    ///
+    /// [`Self::draft_route`] is the seam that decides where the draft runs (a
+    /// tainted session's local pin included), and the evidence budget has to be
+    /// measured against *that* provider's window. So the route is resolved once,
+    /// its provider is handed to [`Router::budget_for`] — the one derivation
+    /// (REQ-586 AC-12) — and the same route object is handed to the pipeline
+    /// through its resolver closure. Resolving twice would build a second
+    /// transport for one call and, worse, could answer differently if health
+    /// moved in between.
+    ///
+    /// The caller stores the terminal [`GenerationState`]: this returns what
+    /// happened and writes nothing to the record, because the two doors settle
+    /// different states from the same outcome — a claimed offer and an explicit
+    /// `init` are the same act with different bookkeeping.
+    pub(crate) async fn generate_repo_context(
+        self: &Arc<Self>,
+        core: TurnCore<'_>,
+        sessions: &SessionRegistry,
+        probed: &ProbedRoot,
+        stream: &SessionEvents,
+        door: GenerationDoor<'_>,
+    ) -> OfferOutcome {
+        let GenerationDoor {
+            gate,
+            invoker,
+            cap,
+            explicit,
+            force,
+        } = door;
+        let config = core.config;
+        let boundaries = config.effective_boundaries();
+        let Ok(matcher) = BoundaryMatcher::new(&boundaries) else {
+            // `load_repo_context`'s direction, one act further on: a set that
+            // will not compile judges nothing, so nothing is read, nothing is
+            // sent and nothing is written. `Config::validate` refuses an invalid
+            // glob at load and at `config/set`, so this is unreachable from a
+            // shipped path rather than merely unlikely. Announced all the same:
+            // every other suppression puts one line on the bus, and an `init`
+            // that answers `suppressed` with no reason is a refusal nobody can
+            // act on.
+            return generate::announce_unconfigured(stream, probed);
+        };
+        // One read of the engine slot for this act, exactly as a turn takes one
+        // for its attempt — and no spend accumulator: the draft is metered as
+        // its own named cost row (BR-5) and, on the `init` door, does not belong
+        // to any prompt's total (`spawn_title_session`'s reason).
+        let local_engine = self.engine.get_with_format();
+        let dctx = core.duties(local_engine.as_ref(), None);
+        let plan = self.draft_route(dctx);
+        let budget = generate::evidence_budget_for(
+            core.router.budget_for(plan.route.provider()).budget_bytes,
+        );
+        let tier = plan.tier;
+        // Handed over rather than re-resolved. The pipeline takes a resolver so
+        // that a run which fails at the walk has routed nothing; this hands it
+        // the one route already resolved for its own window, and re-resolves
+        // only if it were ever called twice — which it is not.
+        // A `Mutex` rather than a `Cell`: this closure is borrowed across the
+        // gate's `await`, and a future holding a non-`Send` cell cannot be
+        // spawned — which is the reader loop's own requirement arriving as a
+        // compile error.
+        let handed = Mutex::new(Some(plan.route));
+        let route = || {
+            handed
+                .lock()
+                .expect("draft route mutex poisoned")
+                .take()
+                .unwrap_or_else(|| self.draft_route(dctx).route)
+        };
+        let outcome = generate::offer_and_run(generate::Offer {
+            ctx: generate::GenerationContext {
+                root: probed,
+                reader: self.repo_files.as_ref(),
+                boundaries: &matcher,
+                budget,
+                // REQ-583's own numbers. The walk was asked for, so the tool
+                // walk's budget is the right one (BR-3), and it is a parameter
+                // only so a test can plant a stop without a hundred thousand
+                // files.
+                walk: crate::harness::tools::walk::WalkBudget::default(),
+                route: &route,
+                events: stream,
+                // The tier the one resolution above named — never a second
+                // reading, and never a constant: a `/policy set-category draft`
+                // row moves the provider and the resolver is what says which
+                // tier it was reached through.
+                tier,
+                config,
+            },
+            gate,
+            addressee: invoker,
+            mode: config.context.generate,
+            explicit,
+            force,
+        })
+        .await;
+
+        // BR-7: the file the loader already read back becomes this session's
+        // notes, the same turn, announced like any other move. Stored **after**
+        // the pipeline and outside every lock (the `set_session_cwd`
+        // discipline), and the news carries the one origin nothing else can
+        // know: this build wrote the file a moment ago.
+        //
+        // …unless **this session** has said `/context off`. Writing and carrying
+        // are two acts with two switches (REQ-612 BR-2): `/context init` in a
+        // switched-off session is the user asking for a file, not for a block,
+        // and storing one here would put the notes in the next turn's prompt on
+        // the strength of a command that never mentioned them. The durable
+        // `[context] repo_file` is a different question and is the one the
+        // pipeline's own load-back obeys — a machine that says the file may not
+        // be opened refuses the write outright, which is where that refusal
+        // belongs.
+        let carried =
+            repo_context_enabled_from(sessions, core.session_id, config.context.repo_file);
+        if let Some(made) = outcome.generated().filter(|_| carried) {
+            let state = made.state.clone();
+            let figures = repo_context_figures(&state, cap);
+            let triple = figures.triple();
+            let mut news = figures.into_news(&state);
+            news.origin = Some(RepoContextOrigin::Generated);
+            if sessions.store_and_claim_repo_context(core.session_id, state, triple) {
+                core.events
+                    .publish(Some(core.session_id.clone()), Event::RepoContextState(news));
+            }
+        }
+        outcome
+    }
+
+    /// What a finished offer leaves on the session record (BR-1, BR-9).
+    ///
+    /// One mapping, so the two doors cannot come to disagree about which
+    /// outcomes stop the offer being raised again. Every one of them does: a
+    /// decline is a decline for the session, a failure is not retried on the
+    /// next prompt (BR-9), and "nobody could be asked" is not a question that
+    /// gets a better answer one turn later — an unattended session would
+    /// publish the same refusal on every prompt it ever ran.
+    fn generation_state_for(outcome: &OfferOutcome) -> GenerationState {
+        match outcome {
+            OfferOutcome::Suppressed(_) => GenerationState::Suppressed,
+            OfferOutcome::Declined => GenerationState::Declined,
+            OfferOutcome::RefusedUnattended => GenerationState::Failed,
+            OfferOutcome::Ran(generate::GenerationOutcome::Failed { .. }) => {
+                GenerationState::Failed
+            }
+            OfferOutcome::Ran(_) => GenerationState::Generated,
         }
     }
 
@@ -4206,17 +4533,25 @@ impl DaemonRuntime {
     /// `None` — and only then — falls back to [`REPO_CONTEXT_MAX_BYTES`]: before
     /// any turn there is no route, and the ceiling is both the widest a route
     /// can ask for and the figure the stored state was classified against.
-    pub fn session_context(
-        &self,
+    pub async fn session_context(
+        self: &Arc<Self>,
         params: &SessionContextParams,
         sessions: &SessionRegistry,
-        events: &EventBus,
+        events: &Arc<EventBus>,
         route_cap: Option<usize>,
-    ) -> SessionContextResult {
+        invoker: Option<ConnectionId>,
+    ) -> Result<SessionContextResult, RpcError> {
+        let cap = route_cap.unwrap_or(REPO_CONTEXT_MAX_BYTES);
         if let Some(enabled) = match params.action {
             ContextAction::On => Some(true),
             ContextAction::Off => Some(false),
             ContextAction::Status => None,
+            // `init` flips no switch: it writes a file, and whether this session
+            // *carries* one is a different question with its own two verbs. A
+            // session that is `off` and asks for `init` gets the write and no
+            // block, which is the honest composition of two settings rather
+            // than one of them silently turning the other on.
+            ContextAction::Init { .. } => None,
         } {
             sessions.set_context_switch(&params.session_id, enabled);
             // The root, probed now rather than remembered: REQ-583 ADR-1's one
@@ -4226,10 +4561,118 @@ impl DaemonRuntime {
             let probed = self.session_root_for(cwd.as_deref());
             self.store_session_repo_context(sessions, &params.session_id, &probed, events);
         }
-        repo_context_result(
-            &sessions.repo_context(&params.session_id),
-            route_cap.unwrap_or(REPO_CONTEXT_MAX_BYTES),
-        )
+        // REQ-613 BR-8: the explicit door. The same pipeline the first prompt
+        // would have raised, with the two flags that make it explicit — so the
+        // bytes, the gate, the walk and the header are the offer's, and what
+        // differs is that `[context] generate = never` does not stop it and
+        // `--force` may replace what is there.
+        //
+        // **Under the turn claim**, the same one `set_session_cwd` and every
+        // prompt turn take. `session/context` runs on its own spawned task
+        // (`handle_client`'s `blocks_on_a_human`), so without it two `init`
+        // frames — one connection pipelining, or two attached clients — would
+        // walk twice, bill two model calls and race at the write; and a `/cd`
+        // could land while the offer waits on a human, re-arming the record at
+        // a root the answer was never about. The claim refuses both with
+        // `SESSION_BUSY` naming what holds the session, and it is released when
+        // the pipeline returns, whatever it returned. `status`, `on` and `off`
+        // take no claim: they run no pipeline and move no root.
+        let generation = match params.action {
+            ContextAction::Init { force } => {
+                let _claim = sessions
+                    .try_begin_turn(
+                        &params.session_id,
+                        &teton_protocol::TurnId::from(format!(
+                            "init-{}",
+                            self.turn_counter.fetch_add(1, Ordering::SeqCst)
+                        )),
+                    )
+                    .map_err(|err| refused_claim_error(&err))?;
+                Some(
+                    self.init_repo_context(params, sessions, events, invoker, cap, force)
+                        .await,
+                )
+            }
+            _ => None,
+        };
+        let mut result = repo_context_result(&sessions.repo_context(&params.session_id), cap);
+        result.origin = generation
+            .filter(|outcome| {
+                matches!(
+                    outcome,
+                    teton_protocol::events::GenerationOutcome::Written
+                        | teton_protocol::events::GenerationOutcome::Replaced
+                )
+            })
+            // The one surface that can answer it without guessing: this call
+            // wrote the file a moment ago. Every other reading leaves it absent,
+            // which the field defines as *not known* rather than `authored` —
+            // nothing on disk records who wrote a file, and a `/context` a turn
+            // later must not claim it does.
+            .map(|_| RepoContextOrigin::Generated);
+        result.generation = generation;
+        Ok(result)
+    }
+
+    /// Run `/context init` and answer with what the pipeline did (BR-8).
+    ///
+    /// Split from [`Self::session_context`] because it needs four things the
+    /// other three actions do not — a probed root, a config snapshot, a router
+    /// and this session's gate — and folding them into the switch path would
+    /// make `off` build a router it never uses.
+    ///
+    /// # It resolves a route, unlike every other `session/*` read
+    ///
+    /// REQ-589 ADR-11 keeps a *diagnostic* away from route resolution, because
+    /// resolving consults provider health and can wake the local tier, and a
+    /// status call must not change the session it describes. This is not a
+    /// diagnostic: the user asked for a model call, and the route is what serves
+    /// it. `status` still reads the stamped route and resolves nothing.
+    async fn init_repo_context(
+        self: &Arc<Self>,
+        params: &SessionContextParams,
+        sessions: &SessionRegistry,
+        events: &Arc<EventBus>,
+        invoker: Option<ConnectionId>,
+        cap: usize,
+        force: bool,
+    ) -> teton_protocol::events::GenerationOutcome {
+        let cwd = sessions.get(&params.session_id).and_then(|s| s.cwd);
+        let probed = self.session_root_for(cwd.as_deref());
+        let config = self.config.lock().expect("config mutex poisoned").clone();
+        let router = self.turn_router(&config, &params.session_id);
+        let gate = self.permission_gate_for(&params.session_id, events, &config);
+        // The session's own emitter, sink included: an `init` on a recording
+        // session belongs in the record like the turn that would have offered
+        // it (REQ-611 BR-4).
+        let stream = SessionEvents::new(events.clone(), params.session_id.clone())
+            .with_sink(self.transcript());
+        let outcome = self
+            .generate_repo_context(
+                TurnCore {
+                    events,
+                    session_id: &params.session_id,
+                    config: &config,
+                    router: &router,
+                },
+                sessions,
+                &probed,
+                &stream,
+                GenerationDoor {
+                    gate: &gate,
+                    invoker,
+                    cap,
+                    explicit: true,
+                    force,
+                },
+            )
+            .await;
+        // The record moves for the explicit door too. A user who was just asked
+        // at this root and answered has settled BR-1's question for the session,
+        // and a first prompt that raised the offer again would be asking a
+        // question they answered a second ago.
+        sessions.set_generation(&params.session_id, Self::generation_state_for(&outcome));
+        outcome.wire()
     }
 
     pub fn web_override(
@@ -7456,6 +7899,10 @@ impl RepoContextFigures {
         teton_protocol::events::RepoContextState {
             state: self.state,
             source: state.source(),
+            // REQ-613 TASK-380: additive field, `None` until TASK-386 wires the
+            // origin through. Absent means *not known*, which is the honest
+            // reading while nothing here can tell the two apart.
+            origin: None,
             bytes_on_disk: self.bytes_on_disk,
             resident_bytes: self.resident_bytes,
             truncated: self.truncated,
@@ -7517,6 +7964,12 @@ fn repo_context_result(state: &RepoContextState, cap: usize) -> SessionContextRe
         file: state
             .source()
             .map(|source| bounded_field(crate::repo_context::file_name(source), NAME_MAX_CHARS)),
+        // REQ-613 TASK-380: additive fields. `origin` is `None` until TASK-386
+        // wires it through; `generation` stays `None` on this path by design —
+        // it reports what the *calling* action's pipeline did, and none of
+        // `on`/`off`/`status` runs one.
+        origin: None,
+        generation: None,
         bytes_on_disk: figures.bytes_on_disk,
         resident_bytes: figures.resident_bytes,
         cap: cap as u64,
@@ -7593,7 +8046,10 @@ fn reject_unusable_binding(config: &Config, update: &ConfigUpdate) -> Result<(),
         | ConfigUpdate::SetPrivacyBoundary(_)
         | ConfigUpdate::SetEffort(_)
         | ConfigUpdate::SetTranscriptEnabled { .. }
-        | ConfigUpdate::SetRepoContextEnabled { .. } => {
+        | ConfigUpdate::SetRepoContextEnabled { .. }
+        // REQ-613 TASK-380: names no provider, so there is no binding to
+        // reject — `SetEffort`'s row, one variant over.
+        | ConfigUpdate::SetRepoContextGenerate { .. } => {
             return Ok(());
         }
     };
@@ -7633,6 +8089,19 @@ fn apply_update(config: &mut Config, update: ConfigUpdate) {
         // behaviour that reads it; this arm exists so the variant TASK-370
         // added compiles at every exhaustive match.
         ConfigUpdate::SetRepoContextEnabled { enabled } => config.context.repo_file = enabled,
+        // REQ-613 BR-10 / ADR-7: the durable `[context] generate` posture,
+        // through the same write path as the two switches above it. This is the
+        // one place the wire enum and the config enum are mapped onto each
+        // other — an exhaustive `match` rather than a `From`, so a fourth
+        // posture added to either is a compile error here rather than a value
+        // silently reinterpreted at the boundary.
+        ConfigUpdate::SetRepoContextGenerate { mode } => {
+            config.context.generate = match mode {
+                RepoContextGenerateMode::Ask => GenerateMode::Ask,
+                RepoContextGenerateMode::Always => GenerateMode::Always,
+                RepoContextGenerateMode::Never => GenerateMode::Never,
+            };
+        }
         ConfigUpdate::RegisterProvider(pc) => {
             let id = pc.id.0;
             // BUG-155: re-registering an existing id keeps the capability
@@ -7869,6 +8338,8 @@ fn to_core_configurable_category(category: ProtoConfigurableCategory) -> Configu
         ProtoConfigurableCategory::Design => ConfigurableCategory::Design,
         ProtoConfigurableCategory::Debug => ConfigurableCategory::Debug,
         ProtoConfigurableCategory::Review => ConfigurableCategory::Review,
+        // REQ-613 TASK-381: Draft arm.
+        ProtoConfigurableCategory::Draft => ConfigurableCategory::Draft,
     }
 }
 
@@ -18725,6 +19196,68 @@ provider_id = \"deepseek\"
                 "the accepted move must actually land, or the refusal above \
                  proved nothing"
             );
+        }
+
+        /// **REQ-613 — `/context init` takes the same claim `/cd` does.**
+        ///
+        /// `session/context` runs on its own spawned task, so nothing but a
+        /// claim stops a second `init` (or a `/cd`) from interleaving with a
+        /// pipeline that is waiting on a human: two walks, two billed model
+        /// calls, a write race, and a record re-armed at a root the answer was
+        /// never about. The mechanism is `try_begin_turn`, so the test is the
+        /// same refuse/accept pair invariant 3 uses: refused while a claim is
+        /// held, naming the holder; accepted the moment it drops; and `status`
+        /// — which runs no pipeline — answered either way (the benign path).
+        ///
+        /// **Mutation, run and observed** (reverted): deleting the
+        /// `try_begin_turn` in `session_context`'s `Init` arm fails here at the
+        /// refuse half — "a claimed session refuses `init`" — with the call
+        /// having answered `Ok`.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_held_claim_refuses_context_init_and_not_status() {
+            let root = repo_with_notes("inv3-init-claim");
+            let (runtime, _seen) = carry_runtime(&[Scripted::Say("Noted.")]);
+            let events = Arc::new(EventBus::new());
+            let (sessions, session_id) = one_session_at(&root);
+            let context = |action: ContextAction| {
+                let runtime = Arc::clone(&runtime);
+                let events = Arc::clone(&events);
+                let sessions = &sessions;
+                let session_id = session_id.clone();
+                async move {
+                    runtime
+                        .session_context(
+                            &SessionContextParams { session_id, action },
+                            sessions,
+                            &events,
+                            None,
+                            None,
+                        )
+                        .await
+                }
+            };
+
+            let claim = sessions
+                .try_begin_turn(&session_id, &teton_protocol::TurnId::from("probe-1"))
+                .expect("the session is idle, so the claim is taken");
+
+            let refused = context(ContextAction::Init { force: false })
+                .await
+                .expect_err("a claimed session refuses `init`");
+            assert_eq!(refused.code, error_code::SESSION_BUSY);
+            assert!(
+                refused.message.contains("probe-1"),
+                "the refusal must name the turn that holds the session: {}",
+                refused.message
+            );
+            context(ContextAction::Status)
+                .await
+                .expect("`status` runs no pipeline and is answered under a claim");
+
+            drop(claim);
+            context(ContextAction::Init { force: false })
+                .await
+                .expect("with no turn in flight the identical `init` is accepted");
         }
 
         /// **REQ-604 — the two ordering fixtures REQ-599 AC-6 named and never

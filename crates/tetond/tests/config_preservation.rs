@@ -68,6 +68,18 @@
 //! | AC-13 / LESSON-520 (the paired refusal) | [`a_refused_remedy_write_leaves_the_document_byte_identical`] |
 //! | ADR-7 / BR-7c (the figure on disk is the figure the offer named, with its date) | [`the_window_written_to_disk_is_the_one_the_offer_named_with_its_date`] |
 //!
+//! ## REQ-613: the second key in the `[context]` table
+//!
+//! `[context] generate` is a durable posture written through the same
+//! `config/set` body (ADR-7), so it becomes a **seventh** caller of this
+//! writer — and the one whose value a user is most likely to have hand-written,
+//! since the two reasons to set it are "never write files here" and "always".
+//!
+//! | AC | Test |
+//! |----|------|
+//! | BR-5 / BR-10 (the key survives a write the daemon has no memory of it for) | [`a_hand_written_generate_survives_a_write_the_daemon_has_no_memory_of_it_for`] |
+//! | AC-11 / LESSON-519+520 (the durable write, and its paired refusal) | [`set_repo_context_generate_writes_the_key_and_a_refused_write_leaves_the_bytes_identical`] |
+//!
 //! ### Covered elsewhere, deliberately not repeated here
 //!
 //! * **AC-5 through `persist_web_tier`**, and the seam's own missing-file and
@@ -96,13 +108,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use teton_core::category::Tier;
-use teton_core::config::{Config, WebTier};
+use teton_core::config::{Config, GenerateMode, WebTier};
 use teton_core::entities::BoundaryOrigin;
 use teton_protocol::events::{BudgetBound, WebTier as WireWebTier};
 use teton_protocol::jsonrpc::error_code;
 use teton_protocol::methods::{
-    BoundaryOriginConfig, ConfigUpdate, PrivacyBoundaryConfig, ProviderConfig, TierBindingConfig,
-    WebSetupCommitParams, WebSetupPreviewParams,
+    BoundaryOriginConfig, ConfigUpdate, PrivacyBoundaryConfig, ProviderConfig,
+    RepoContextGenerateMode, TierBindingConfig, WebSetupCommitParams, WebSetupPreviewParams,
 };
 use teton_protocol::PrivacyMode;
 use teton_protocol::{ProviderId, ProviderKind, SessionId, Tier as WireTier};
@@ -2295,6 +2307,231 @@ fn a_named_context_table_survives_an_unrelated_write_and_an_unnamed_one_is_not_a
     assert!(
         daemon.reload().context.repo_file,
         "the absent table must still read as the shipped default (on):\n{after}"
+    );
+    daemon.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// REQ-613 — `[context] generate`, the durable generation posture
+// ---------------------------------------------------------------------------
+
+/// **REQ-613 BR-10 / TASK-379 — a `generate` the daemon has never seen survives
+/// a write that is not about it, and the document still means what the user
+/// wrote.**
+///
+/// This is BR-5's drift case aimed at the new key, and the drift is the whole
+/// design of the fixture: the daemon **starts** on a config with no `[context]`
+/// table, so its memory holds `generate = ask`, and the key is hand-written into
+/// the file afterwards — the mid-session edit the daemon stays blind to until
+/// restart. A registration then goes through. If the write's delta were taken
+/// against the *document* rather than against the daemon's own `current`, the
+/// stale `ask` would be written back over a `never` the user set minutes
+/// earlier, silently re-arming an offer they turned off.
+///
+/// The claim is stated as a line delta rather than as a spot check for the
+/// surviving string, so a normalized key order or a dropped comment shows up as
+/// an unexpected move: nothing at all is deleted, and nothing the write inserts
+/// mentions this table. The insertion is left unenumerated on purpose — the
+/// provider entry a registration appends is
+/// [`registering_a_provider_leaves_the_web_table_and_its_comments_alone`]'s
+/// claim, and transcribing it here would make this test fail for that writer's
+/// reasons.
+///
+/// **Mutation (run 2026-09-03, restored):** in
+/// `runtime::config_document::render_config_document`, take the delta base from
+/// the document (`Config::from_toml(&document)`) instead of the caller's
+/// `current`. Red here on `the write deleted lines it is not about` — memory's
+/// canonical form does not name `[context]`, so the delta reads the
+/// hand-written table as a removal and takes it, the user's comment with it.
+/// (Four of this suite's existing drift witnesses go red with it, which is the
+/// point of ADR-1 rather than a side effect of this test.) Restored.
+#[test]
+fn a_hand_written_generate_survives_a_write_the_daemon_has_no_memory_of_it_for() {
+    let daemon = Daemon::start("context-generate-drift", Some(&readme_config()));
+    assert_eq!(
+        daemon.reload().context.generate,
+        GenerateMode::Ask,
+        "the fixture must start with no posture of its own, or the drift is not drift"
+    );
+
+    // The hand edit the daemon does not see: `never` set mid-session, in a
+    // table its in-memory config has never held.
+    let drifted = format!(
+        "{}\n# I do not want Teton writing files in this repository\n[context]\n\
+         generate = \"never\"\n",
+        readme_config()
+    );
+    daemon.hand_edit(&drifted);
+
+    daemon
+        .runtime
+        .apply_config_update(register("cheap"))
+        .expect("the registration lands on a document the daemon has not re-read");
+
+    // Measured against the **drifted** document, and stated as "nothing was
+    // deleted and nothing about this table was written": an exact line delta
+    // here would be a transcription of the provider entry the registration
+    // exists to append, which is the other writer's claim and not this one's.
+    let after = daemon.document();
+    let (removed, added) = line_diff(&drifted, &after);
+    assert!(
+        removed.is_empty(),
+        "the write deleted lines it is not about:\n--- before ---\n{drifted}\n--- after \
+         ---\n{after}"
+    );
+    assert!(
+        !added
+            .iter()
+            // The header and the key, not the substring: a provider's
+            // `max_context` is an insertion this write *is* about.
+            .any(|line| line.trim() == "[context]" || line.trim_start().starts_with("generate")),
+        "a key this write is not about was rewritten (BR-5): {added:?}\n{after}"
+    );
+    assert_eq!(
+        after.matches("[context]").count(),
+        1,
+        "exactly one table, never duplicated:\n{after}"
+    );
+
+    // And the production loader agrees the setting is still in force — the
+    // claim is about meaning, not about a string that survived (AC-8).
+    let reloaded = daemon.reload();
+    assert_eq!(
+        reloaded.context.generate,
+        GenerateMode::Never,
+        "an unrelated write put the daemon's stale `ask` back over the user's \
+         `never`:\n{after}"
+    );
+    assert!(
+        reloaded.context.repo_file,
+        "and the neighbouring switch keeps its own default:\n{after}"
+    );
+    daemon.cleanup();
+}
+
+/// **REQ-613 AC-11 / LESSON-519+520 — the durable posture reaches disk on a
+/// write that is allowed to land, and a refused one leaves the bytes
+/// untouched.**
+///
+/// Both legs on the same fixture and the **same payload**, because each is what
+/// makes the other mean anything: the accepting leg proves
+/// `SetRepoContextGenerate` is a payload that would persist, which is what stops
+/// the refusing leg's byte-identical assertion from being satisfied by a write
+/// that could never have happened (LESSON-520). The payload is `never` on a
+/// fixture that names no `[context]` table at all, so an applied write
+/// necessarily adds bytes and a refused one necessarily leaves the file alone —
+/// a payload merely restating the shipped `ask` would leave the file identical
+/// either way and prove nothing.
+///
+/// The evidence is the **bytes and a re-parse**, never the error code
+/// (LESSON-519): the document is read back and handed to the production
+/// `Config::load`, so what is asserted is that the daemon's own loader agrees a
+/// durable posture is now in force.
+///
+/// # Which refusal this is, and where the other one is witnessed
+///
+/// The refusal here is the **document** gate REQ-574 put in front of every
+/// writer: the file has drifted into a state that would not load, so the write
+/// is refused rather than allowed to overwrite the user's edit (BR-4/AC-10).
+/// That is the refusal this suite's harness can reach — an in-process
+/// `DaemonRuntime`, which sits *below* `config/set`'s presence and attestation
+/// gates in `server.rs`. The attestation half is inherited rather than
+/// re-implemented: `SetRepoContextGenerate` is a `ConfigUpdate` variant and not
+/// a new RPC, so `refuse_daemon_wide` and `refuse_unattested_commitment` run
+/// before it is deserialized, for every variant — the argument REQ-611 ADR-5
+/// made, that `config_set_attestation::set_transcript_enabled_writes_on_accept_
+/// and_nothing_on_refuse` pins for the family, and that REQ-612's
+/// `SetRepoContextEnabled` already ships on.
+///
+/// **Mutation (run 2026-09-03, restored):** delete the `Config::load(&text)`
+/// gate from `runtime::config_document::render_config_document` — the one line
+/// that refuses bytes that would not load. The refusing leg then applies the
+/// update and fails on both the `expect_err` and, with the guard removed, on the
+/// byte-identical assertion. The accepting leg stays green, which is the right
+/// split: it is the payload being shown persistable, and a deleted gate does not
+/// stop a legitimate write. Restored.
+#[test]
+fn set_repo_context_generate_writes_the_key_and_a_refused_write_leaves_the_bytes_identical() {
+    // --- accepted: the key lands, and only the key -------------------------
+    let daemon = Daemon::start("context-generate-applied", Some(&readme_config()));
+    let before = daemon.document();
+    assert!(
+        !before.contains("[context]"),
+        "the fixture must start with no [context] table, or 'the write added \
+         the key' is unfalsifiable:\n{before}"
+    );
+
+    daemon
+        .runtime
+        .apply_config_update(ConfigUpdate::SetRepoContextGenerate {
+            mode: RepoContextGenerateMode::Never,
+        })
+        .expect("the durable posture is a config update");
+
+    let after = daemon.document();
+    assert_ne!(
+        after, before,
+        "the applied write changed nothing, so the refused leg below would prove nothing"
+    );
+    assert_eq!(
+        after.matches("[context]").count(),
+        1,
+        "exactly one table, never duplicated:\n{after}"
+    );
+    // The table is created whole, stating both of its switches — the posture
+    // `ContextConfig` documents — and nothing else in the document moves.
+    assert_only_these_lines_changed(
+        &before,
+        &after,
+        &[],
+        &["", "[context]", "repo_file = true", "generate = \"never\""],
+    );
+    let reloaded = daemon.reload();
+    assert_eq!(
+        reloaded.context.generate,
+        GenerateMode::Never,
+        "read back and RE-PARSED, not matched as a string:\n{after}"
+    );
+    assert!(
+        reloaded.context.repo_file,
+        "the write about one switch must not move the other:\n{after}"
+    );
+    daemon.cleanup();
+
+    // --- refused: the same payload, and not one byte moves -----------------
+    let daemon = Daemon::start("context-generate-refused", Some(&readme_config()));
+    // Parses cleanly, fails `Config::validate` at a key this write never
+    // touches: the candidate is clean and only the bytes that would land are
+    // not.
+    let drifted = format!("default_provider = \"ghost\"\n{}", readme_config());
+    daemon.hand_edit(&drifted);
+
+    let refused = daemon
+        .runtime
+        .apply_config_update(ConfigUpdate::SetRepoContextGenerate {
+            mode: RepoContextGenerateMode::Never,
+        })
+        .expect_err("a write that would leave an unbootable document must be refused");
+    assert_eq!(refused.code, error_code::CONFIG_REJECTED, "{refused:?}");
+    assert!(
+        refused.message.contains("would not load")
+            && refused
+                .message
+                .contains("default_provider names provider 'ghost'"),
+        "the refusal must carry the validator's own sentence, which names the \
+         key the user has to fix: {}",
+        refused.message
+    );
+
+    assert_eq!(
+        daemon.document(),
+        drifted,
+        "a refused SetRepoContextGenerate must leave config.toml byte-identical"
+    );
+    assert!(
+        !daemon.document().contains("[context]"),
+        "the refused posture was written anyway:\n{}",
+        daemon.document()
     );
     daemon.cleanup();
 }
