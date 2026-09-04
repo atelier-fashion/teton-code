@@ -3,11 +3,12 @@
   "branch": "feat/REQ-616-local-engine-full-trained-window",
   "startedAt": "2026-09-04T19:34:00Z",
   "completed": false,
-  "currentPhase": 3,
+  "currentPhase": 4,
   "completedPhases": [
     0,
     1,
-    2
+    2,
+    3
   ],
   "phaseHistory": [
     {
@@ -26,6 +27,12 @@
       "name": "Architect & Tasks",
       "completedAt": "2026-09-04T19:47:35Z",
       "note": "7 ADRs; 9 tasks TASK-390..398; footprint published to PR #290"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-09-04T19:48:23Z",
+      "note": "approved first loop; coverage+DAG verified mechanically"
     }
   ],
   "integrationBranch": "main",
