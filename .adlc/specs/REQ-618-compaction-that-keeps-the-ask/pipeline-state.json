@@ -2,7 +2,7 @@
   "req": "REQ-618",
   "branch": "feat/REQ-618-compaction-that-keeps-the-ask",
   "startedAt": "2026-09-04T19:35:10.833694Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -55,6 +56,11 @@
       "phase": 7,
       "name": "PR Cleanup & CI",
       "completedAt": "2026-09-04T22:18:35.805528Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup and Merge",
+      "completedAt": "2026-09-04T22:25:01.438990Z"
     }
   ],
   "repos": {
@@ -66,7 +72,7 @@
       "touched": true,
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/292",
       "prNumber": 292,
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null,
       "prCreatedAt": "2026-09-04T19:35:10.833694Z"
@@ -95,6 +101,7 @@
     "Phase 3: APPROVED. 8/8 BRs and 9/9 ACs cited by task Verification blocks; DAG acyclic in 5 tiers; all three refusal rules (BR-1, BR-2, BR-4) carry benign_path. Firestore/REST/layering checks n/a for a Rust daemon on JSON-RPC (ADR-002); the analogous invariants (engine/surface split, single egress choke point) are respected. budget.rs and turn_loop.rs are also touched by the concurrent REQ-616/617 \u2014 textual rebase expected, no design conflict.",
     "Phase 4 resequencing: TASK-005 (protocol events) and BR-1's refusal from TASK-006 were landed with TASK-002. Removing the in-place clamp from an anchored block without the refusal in the same commit would have shipped a daemon that silently sends over budget \u2014 worse than either end state. TASK-006's remaining items (context_compacted publish, SkillBody anchor at the model-expansion admit) still to come.",
     "TASK-007 finding, carried to Phase 5 and the PR: ROOM_FRACTION_PERCENT = 25 (the spec's proposed starting value) measurably bites on this repo's real corpus today. The largest shipped skill body is 51 KB, not the 25 KB the spec's assumption states, and the local window is 32,768 tokens, not REQ-616's 262,144 \u2014 so /proceed is offered rather than expanded on the local tier. Three shipped behaviours move: REQ-590 AC-12's field-report turn becomes a question (a supersession REQ-618's Description explicitly wants), REQ-587's dynamic-output Stage-B refusal becomes unreachable (body + the 8,000-char output cap cannot exceed a budget a 25% body fits in), and REQ-587 BR-7's digest bypass is pre-empted on every route below ~350k tokens because digest_threshold_bytes is a larger fraction of the same budget. The last two are collateral the spec did not name. Pinned by harness::budget::tests::the_room_ceiling_and_the_digest_threshold_are_pinned_against_each_other.",
-    "Phase 5 (inline, per LESSON-629 \u2014 a 4,600-line diff is run in-context rather than dispatched): four findings, all fixed. (1) anchors_fit cloned up to three blocks \u2014 one of which can be a 25 KB body \u2014 on every loop iteration; the estimators gained iterator spellings and the anchor readers allocate nothing. (2) LESSON-565: the room check is byte-only where every other budget check is a conjunction; the crossover is now computed and written down (the two ceilings coincide at the derived 3 B/word density and separate only for denser or sparser content, in that order). (3) ContextCompacted.dropped_blocks was unbounded while the spec assumed the record fits max_record_bytes; capped at 128 rows with an omitted count, so the assumption holds by construction. (4) anchor_shape and anchor_bytes are two different measures of 'anchor bytes' \u2014 documented, and their agreement where it should hold is pinned by a test. Reflector, correctness, quality, architecture, test-coverage and security checklists all run; no Critical or unfixed Major remains."
+    "Phase 5 (inline, per LESSON-629 \u2014 a 4,600-line diff is run in-context rather than dispatched): four findings, all fixed. (1) anchors_fit cloned up to three blocks \u2014 one of which can be a 25 KB body \u2014 on every loop iteration; the estimators gained iterator spellings and the anchor readers allocate nothing. (2) LESSON-565: the room check is byte-only where every other budget check is a conjunction; the crossover is now computed and written down (the two ceilings coincide at the derived 3 B/word density and separate only for denser or sparser content, in that order). (3) ContextCompacted.dropped_blocks was unbounded while the spec assumed the record fits max_record_bytes; capped at 128 rows with an omitted count, so the assumption holds by construction. (4) anchor_shape and anchor_bytes are two different measures of 'anchor bytes' \u2014 documented, and their agreement where it should hold is pinned by a test. Reflector, correctness, quality, architecture, test-coverage and security checklists all run; no Critical or unfixed Major remains.",
+    "Phase 8: PR #292 squash-merged to main at 2026-09-04T22:23:43Z as 8280202. Trial-merge gate rc=0 against the tip immediately before the merge. Rebased mid-pipeline onto REQ-615 and REQ-616, which landed while this was in flight \u2014 the rebase was clean and changed ASSUME-039's answer: with the engine at 262,144 the room ceiling is 130,560 B and /proceed at 51,037 B is 9.8% of it, so BR-4 does not bite on any machine with a local tier. The `gh pr merge --delete-branch` post-merge cleanup failed as expected because the worktree owned the branch; the remote branch was deleted by the adapter and the local one after `git worktree remove --force`. The remote PR reading MERGED is the canonical signal."
   ]
 }

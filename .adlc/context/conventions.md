@@ -67,6 +67,15 @@ teton-code/
   one place the compiler, clippy and the whole suite are structurally incapable
   of noticing. On any refactor claiming "bodies are byte-identical", diff the
   prose too: `git diff origin/main..HEAD | grep '^[-+].*//'`.
+- **Run the inversion on every test in the batch and count the reds** (REQ-618,
+  LESSON-640). The count is the finding. REQ-618's acceptance suite was four
+  tests written the same way, all passing; reverting the guard reddened three.
+  The fourth built a 52 KB conversation against a 63 KB budget — under budget, so
+  the gate ran and dropped nothing, and "the ask survived" was a statement about
+  a turn that had never been pressured. It would have passed with no anchor rule
+  at all. A fixture sized by arithmetic must **assert the arithmetic**: one
+  `assert!(report.dropped_blocks > 0)` before the interesting assertion is the
+  difference between a test and a decoration.
 - **Show the test can fail before trusting that it passed.** Break the thing the
   test guards and confirm it goes red; record the mutation in the test's doc
   comment. REQ-592 shipped seven green assertions that could not have failed —
