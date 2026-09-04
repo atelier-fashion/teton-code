@@ -113,6 +113,19 @@ CREATE TRIGGER IF NOT EXISTS web_overrides_no_update
 CREATE TRIGGER IF NOT EXISTS web_overrides_no_delete
     BEFORE DELETE ON web_overrides
     BEGIN SELECT RAISE(ABORT, 'cost ledger is append-only'); END;
+
+CREATE TABLE IF NOT EXISTS shell_overrides (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    recorded_at_ms INTEGER NOT NULL,
+    session_id     TEXT    NOT NULL,
+    cause_lifted   TEXT    NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS shell_overrides_no_update
+    BEFORE UPDATE ON shell_overrides
+    BEGIN SELECT RAISE(ABORT, 'cost ledger is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS shell_overrides_no_delete
+    BEFORE DELETE ON shell_overrides
+    BEGIN SELECT RAISE(ABORT, 'cost ledger is append-only'); END;
 ";
 
 /// Columns [`SCHEMA`] creates on a fresh ledger but an older build's file does
@@ -327,6 +340,26 @@ pub struct WebLookupRow {
     /// is one this ledger has learned to keep, and adding the column now means
     /// no migration then (D-7).
     pub usd_micros: Option<i64>,
+}
+
+/// One row of the `shell_overrides` table (REQ-614 BR-5).
+///
+/// The twin of [`WebOverrideRow`], for the twin decision: a user telling the
+/// daemon that a `shell` command of unproven reach touched nothing protected.
+/// It is the single most consequential thing a user can do to this session's
+/// privacy posture, and an append-only row is what makes "when did this session
+/// stop being pinned, and what was lifted" a question no later write can revise.
+///
+/// Content-free by the same rule: a session id and a cause *name* out of the
+/// `TaintCause` vocabulary. There is no column that could hold a command, a
+/// path, or file content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellOverrideRow {
+    /// The session whose pin was lifted.
+    pub session_id: String,
+    /// The cause that was lifted — always `unknown_shell` today, recorded
+    /// rather than assumed so a later liftable cause does not silently join it.
+    pub cause_lifted: String,
 }
 
 /// One row of the `web_overrides` table — the other half of BR-13's account
@@ -604,6 +637,38 @@ impl CostLedger {
             ],
         )?;
         Ok(())
+    }
+
+    /// Append one `shell_overrides` row (REQ-614 BR-5).
+    ///
+    /// Storage only, exactly like [`CostLedger::record_web_override`]: the
+    /// `session_pin_lifted` event is published by the RPC handler, which is the
+    /// layer that knows whether the lift was a transition at all.
+    ///
+    /// # Errors
+    /// [`LedgerError`] if the insert fails or the mutex is poisoned.
+    pub fn record_shell_override(&self, row: &ShellOverrideRow) -> Result<(), LedgerError> {
+        let guard = self.conn.lock().map_err(|_| LedgerError::Poisoned)?;
+        guard.execute(
+            "INSERT INTO shell_overrides (recorded_at_ms, session_id, cause_lifted)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![now_ms(), row.session_id, row.cause_lifted],
+        )?;
+        Ok(())
+    }
+
+    /// Every recorded shell override, in insertion order.
+    ///
+    /// # Errors
+    /// [`LedgerError`] if the query fails or the mutex is poisoned.
+    pub fn all_shell_overrides(&self) -> Result<Vec<(String, String)>, LedgerError> {
+        let guard = self.conn.lock().map_err(|_| LedgerError::Poisoned)?;
+        let mut stmt =
+            guard.prepare("SELECT session_id, cause_lifted FROM shell_overrides ORDER BY id")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Every recorded web override, in insertion order.
@@ -1803,6 +1868,76 @@ CREATE TRIGGER cost_records_no_delete
             guard.execute("DELETE FROM web_overrides", []).is_err(),
             "DELETE must be rejected by the append-only trigger"
         );
+    }
+
+    /// REQ-614 BR-5. The twin table, held to the twin rules: one row per lift,
+    /// append-only, and no column that could carry a command or a path.
+    ///
+    /// The UPDATE/DELETE legs are asserted rather than assumed — a trigger
+    /// nobody tries to violate is a trigger nobody knows works.
+    #[test]
+    fn a_shell_override_row_is_append_only() {
+        let (ledger, _sink) = ledger();
+        ledger
+            .record_shell_override(&ShellOverrideRow {
+                session_id: "sess-shell".to_owned(),
+                cause_lifted: "unknown_shell".to_owned(),
+            })
+            .expect("record");
+        assert_eq!(
+            ledger.all_shell_overrides().expect("read"),
+            vec![("sess-shell".to_owned(), "unknown_shell".to_owned())]
+        );
+
+        // Benign path: a second lift for a *different* session appends rather
+        // than replacing, so the table is a log and not a latch.
+        ledger
+            .record_shell_override(&ShellOverrideRow {
+                session_id: "sess-other".to_owned(),
+                cause_lifted: "unknown_shell".to_owned(),
+            })
+            .expect("record");
+        assert_eq!(ledger.all_shell_overrides().expect("read").len(), 2);
+
+        let guard = ledger.conn.lock().unwrap();
+        assert!(
+            guard
+                .execute("UPDATE shell_overrides SET session_id = 'x'", [])
+                .is_err(),
+            "UPDATE must be rejected by the append-only trigger"
+        );
+        assert!(
+            guard.execute("DELETE FROM shell_overrides", []).is_err(),
+            "DELETE must be rejected by the append-only trigger"
+        );
+    }
+
+    /// A ledger file written before REQ-614 gains the table on the next open —
+    /// `CREATE TABLE IF NOT EXISTS` runs in `SCHEMA` on every open, so a new
+    /// *table* needs no migration entry (a new *column* would).
+    #[test]
+    fn a_ledger_written_before_shell_overrides_gains_the_table_on_open() {
+        let path = scratch_db("pre-shell-overrides");
+        let _ = std::fs::remove_file(&path);
+        {
+            let old = Connection::open(&path).expect("create pre-REQ-614 ledger");
+            old.execute_batch(PRE_REQ_SCHEMA).expect("pre-REQ schema");
+        }
+        let ledger = CostLedger::open(
+            &path,
+            PriceTable::bundled(),
+            Arc::new(CapturingSink::default()),
+        )
+        .expect("open an older ledger");
+        assert!(ledger.all_shell_overrides().expect("read").is_empty());
+        ledger
+            .record_shell_override(&ShellOverrideRow {
+                session_id: "s".to_owned(),
+                cause_lifted: "unknown_shell".to_owned(),
+            })
+            .expect("append after the table arrives");
+        assert_eq!(ledger.all_shell_overrides().expect("read").len(), 1);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The override table holds no column that could carry an utterance either

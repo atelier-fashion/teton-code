@@ -1,7 +1,7 @@
 ---
 id: TASK-394
 title: "The shell_overrides ledger table — one append-only row per lift"
-status: draft
+status: complete
 parent: REQ-614
 created: 2026-09-04
 updated: 2026-09-04
