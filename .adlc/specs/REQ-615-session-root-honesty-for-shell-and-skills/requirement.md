@@ -1,7 +1,7 @@
 ---
 id: REQ-615
 title: "Session-root honesty for the shell tool and skill preambles — `cd` never persists and the tool says so, a home-directory root refuses writes and project skills, and a typed `cd` is offered as `/cd`"
-status: approved
+status: complete
 deployable: true
 created: 2026-09-04
 updated: 2026-09-04
