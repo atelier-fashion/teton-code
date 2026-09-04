@@ -434,22 +434,29 @@ fn classify_segment(
 
     let mut saw_boundary = false;
     let mut saw_directory = false;
-    // A content-reading verb whose arguments do not all name **existing regular
-    // files** has unproven reach, and must be scanned against the root.
+    // Whether any token named an **existing regular file**.
     //
-    // This is not a refinement — it closes a leak. `grep -r foo` names one
-    // token, `foo`, which is a *pattern* and not a path; the first draft
-    // resolved it to a nonexistent file under the root, found `paths` non-empty
-    // and therefore skipped the BR-1(d) root scan, and returned `Rooted`. GNU
-    // grep's `-r` with no path searches `.` recursively, so a repository
-    // holding a `.env` would have had its contents read and sent with a clean
+    // This is what closes the `grep -r foo` leak. That command names one token,
+    // `foo`, which is a *pattern* and not a path; the first draft resolved it
+    // to a nonexistent file under the root, found `paths` non-empty and
+    // therefore skipped BR-1(d)'s root scan, and returned `Rooted`. GNU grep's
+    // `-r` with no path searches `.` recursively, so a repository holding a
+    // `.env` would have had its contents read and sent under a clean
     // provenance.
     //
     // Telling a pattern from a path needs a per-verb option table, which is the
-    // kind of second parser ADR-614-1 refuses. The fail-closed reading needs no
-    // such table: if a token is not an existing regular file, the verb may
-    // reach further than the tokens name, so scan.
-    let mut unproven_reach = false;
+    // second parser ADR-614-1 refuses. This needs no table: **a content verb
+    // given at least one existing file was given explicit files**, so the reach
+    // is those files; given none, the reach is whatever the verb defaults to —
+    // the root — and the subtree decides.
+    //
+    // `head -n 5 src/main.rs` is why the rule is "at least one" rather than
+    // "all": `5` is a flag's argument and resolves to nothing, and a rule
+    // demanding every token resolve would make every flag-carrying read
+    // unknown. Measured on a 192,000-file repository, that cost `grep` 123ms
+    // and an unknown verdict where OQ-3 expected an explicit-file read to stay
+    // rooted.
+    let mut named_an_existing_file = false;
 
     for token in &paths {
         let resolved = resolve_token(root, token);
@@ -499,13 +506,13 @@ fn classify_segment(
                         );
                     }
                 } else if abs.is_file() {
+                    named_an_existing_file = true;
                     sources.insert(id);
-                } else {
-                    // Neither a file nor a directory: a pattern, a flag's
-                    // argument, or a path that does not exist. The verb's reach
-                    // is not what this token says.
-                    unproven_reach = true;
                 }
+                // Neither a file nor a directory: a pattern, a flag's argument,
+                // or a path that does not exist. It contributes no provenance
+                // and no evidence about the verb's reach — deliberately not an
+                // `else` branch, because there is nothing to record.
             }
             Resolved::RootItself(abs) => {
                 saw_directory = true;
@@ -545,11 +552,11 @@ fn classify_segment(
 
     // BR-1(d): a content-reading verb given no path at all reads whatever is
     // under the root.
-    // BR-1(d): a content-reading verb reads the root when it names no path, and
-    // may read it when its tokens do not name existing files (see
-    // `unproven_reach` above). Either way the root's subtree decides.
+    // BR-1(d): a content-reading verb reads the root when it names no path at
+    // all, and may read it when none of its tokens named an existing file (see
+    // `named_an_existing_file` above). Either way the root's subtree decides.
     if reads_content
-        && (paths.is_empty() || unproven_reach)
+        && (paths.is_empty() || !named_an_existing_file)
         && !saw_directory
         && !subtree_is_boundary_free(root, denied_prefixes, matcher, budget)
     {
@@ -1034,12 +1041,9 @@ mod tests {
         let root = project_root("pattern");
         std::fs::write(root.join(".env"), "K=v\n").unwrap();
 
-        for command in [
-            "grep -r foo",
-            "grep -R foo",
-            "grep foo",
-            "head -n 5 src/main.rs",
-        ] {
+        // None of these names an existing file, so none of them bounds the
+        // verb's reach — the root does, and the root holds a `.env`.
+        for command in ["grep -r foo", "grep -R foo", "grep foo", "cat"] {
             let v = verdict(&root, command);
             assert_eq!(
                 v.kind,
@@ -1065,8 +1069,28 @@ mod tests {
                 v.reason
             );
         }
-        // And an explicit read of a real file needs no scan at all.
+        // And an explicit read of a real file needs no scan at all — even in a
+        // repository that DOES hold a boundary file, which is OQ-3's stated
+        // balance and what the "at least one existing file" rule buys. Measured
+        // on a 192,000-file repository, `grep foo <file>` went from 123ms and
+        // `Unknown` under an all-tokens-must-resolve rule to 0.5ms and `Rooted`
+        // under this one.
         assert_eq!(verdict(&clean, "cat src/main.rs").kind, VerdictKind::Rooted);
+        assert_eq!(
+            verdict(&root, "cat src/main.rs").kind,
+            VerdictKind::Rooted,
+            "an explicit file read is bounded by the file, even beside a `.env`"
+        );
+        assert_eq!(
+            verdict(&root, "grep foo src/main.rs").kind,
+            VerdictKind::Rooted,
+            "a pattern plus an explicit file is bounded by the file"
+        );
+        assert_eq!(
+            verdict(&root, "head -n 5 src/main.rs").kind,
+            VerdictKind::Rooted,
+            "a flag's argument resolves to nothing and must not force a root scan"
+        );
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&clean).ok();
