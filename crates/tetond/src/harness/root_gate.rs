@@ -142,17 +142,40 @@ fn names_a_write_verb(command: &str) -> bool {
     })
 }
 
-/// Trigger (b): a `>`, `>>` or `>|` at top level — outside single quotes,
-/// double quotes and a backslash escape.
+/// Trigger (b): a `>`, `>>` or `>|` at top level whose target is a **file** —
+/// outside single quotes, double quotes and a backslash escape.
 ///
-/// `2>&1` is a redirection of a file **descriptor**, not a write to a path, and
-/// it is by far the most common `>` in a read-only command (`cmd 2>/dev/null`
-/// is the counter-example and *is* a write, to `/dev/null`, which is harmless
-/// but not worth a special case). The quote awareness is what keeps
-/// `echo "2 > 1"` allowed.
+/// # Two spellings are redirections and are not writes
+///
+/// Both were false positives in the first implementation of this gate, and both
+/// are common enough that refusing them would have made a home-rooted session
+/// unusable for reading — which is the state a user is in *before* they run
+/// `/cd`, so it is the state that matters most:
+///
+/// * **`2>&1`, `>&2`, `1>&2`** — a redirection of a file *descriptor*. Nothing
+///   is created; the target is a number, not a path.
+/// * **`2>/dev/null`, `>/dev/null`** — a write to the null device. It is a
+///   write in the strictest reading and creates nothing anywhere, and
+///   `cmd 2>/dev/null` is the single most common redirection in a read-only
+///   command. `.adlc`-reading skill preambles are written this way.
+///
+/// Everything else with a top-level `>` is treated as a write, including a
+/// target this scanner cannot resolve — fail closed, as the REQ's assumption
+/// requires. The quote awareness is what keeps `echo "2 > 1"` allowed.
 #[must_use]
 pub(crate) fn has_top_level_redirection(command: &str) -> bool {
-    top_level_positions(command, '>').next().is_some()
+    top_level_positions(command, '>').any(|at| {
+        // Step past the operator itself: `>`, `>>` or `>|`.
+        let after = command[at..]
+            .trim_start_matches('>')
+            .trim_start_matches('|');
+        // `>&2` and `2>&1`: the target is a descriptor.
+        if after.starts_with('&') {
+            return false;
+        }
+        // `> /dev/null` and `>/dev/null`.
+        !matches!(after.split_whitespace().next(), Some("/dev/null"))
+    })
 }
 
 /// Byte offsets of every top-level occurrence of `needle` in `command`.
@@ -357,6 +380,14 @@ mod tests {
                 "a redirection, whose first verb is echo",
             ),
             ("cat a >> b", "an appending redirection"),
+            (
+                "cat a > /dev/nullx",
+                "a path that merely starts like the device",
+            ),
+            (
+                "cat a > out 2>/dev/null",
+                "one real redirection among exempt ones",
+            ),
             ("/bin/touch x", "a path-qualified verb"),
         ];
         for (command, why) in refused {
@@ -379,6 +410,23 @@ mod tests {
                 "a write verb as an argument, not in command position",
             ),
             ("echo 'mkdir x'", "a write verb inside a string"),
+            // The two redirections that are not writes. Both were false
+            // positives in this gate's first implementation, and both are
+            // ordinary in a session that is only reading — which is the state a
+            // user is in *before* they run `/cd`, so it is the state that
+            // matters most.
+            ("cat missing 2>/dev/null", "stderr to the null device"),
+            (
+                "cat missing 2> /dev/null",
+                "with a space, as a shell allows",
+            ),
+            ("ls -la > /dev/null", "stdout to the null device"),
+            ("make 2>&1", "a file-descriptor duplication, not a path"),
+            ("cmd >&2", "the same, the other way round"),
+            (
+                "cat .adlc/context/architecture.md 2>/dev/null || echo none",
+                "the shipped ADLC preamble shape",
+            ),
         ];
         for (command, why) in allowed {
             assert_eq!(

@@ -558,11 +558,25 @@ fn run_one(root: &Path, command: &Command, timeout_ms: u64) -> DynamicOutcome {
     if let Some((primary, fallback)) =
         crate::harness::root_gate::split_top_level_or(command.as_str())
     {
+        // **The two steps share one command's deadline.** Splitting turned one
+        // `run_bounded` into two, and handing each the full `timeout_ms` would
+        // let a single `!cmd` slot take twice the per-command budget — the
+        // arithmetic BUG-185 bounded, quietly reopened by a change that is not
+        // about timeouts at all. What the caller allotted is what the slot
+        // gets, however many shells the daemon runs inside it.
+        let started = Instant::now();
         let first = run_step(root, primary, timeout_ms, false);
         if !matches!(first, DynamicOutcome::Failed { .. }) {
             return first;
         }
-        return run_step(root, fallback, timeout_ms, true);
+        let spent = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let Some(left) = timeout_ms.checked_sub(spent) else {
+            // The primary consumed the whole allowance. Reporting the *timeout*
+            // is honest: the slot's deadline passed, and it is the same word a
+            // one-shell run would have used.
+            return DynamicOutcome::TimedOut;
+        };
+        return run_step(root, fallback, left, true);
     }
     run_step(root, command.as_str(), timeout_ms, false)
 }
@@ -882,6 +896,63 @@ mod tests {
             }
             other => panic!("expected a ran primary, got {other:?}"),
         }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **REQ-615 BR-6: the two steps of a split command share one deadline.**
+    ///
+    /// Splitting turned one `run_bounded` into two, and the obvious
+    /// implementation hands each the full `timeout_ms` — which lets one `!cmd`
+    /// slot take twice the per-command budget. That is the arithmetic BUG-185
+    /// bounded, reopened by a change that is not about timeouts at all.
+    ///
+    /// # The assertion is on the outcome, not on the clock
+    ///
+    /// A wall-clock bound alone did not catch the mutation. A primary that eats
+    /// the *whole* allowance is answered by the `checked_sub` guard before the
+    /// remaining time is ever used, so `left` and `timeout_ms` are
+    /// indistinguishable in that shape — the test passed against both. The
+    /// fixture below instead leaves a **partial** remainder and gives the
+    /// fallback a task that fits the full allowance but not the remainder, so
+    /// the two spellings produce different `DynamicOutcome`s rather than
+    /// different durations. 200 ms of slack either side of a 400 ms task.
+    ///
+    /// Mutation: pass `timeout_ms` to the fallback instead of `left` — the
+    /// fallback then has 600 ms for a 400 ms sleep, returns `Ran("late")`, and
+    /// this goes red.
+    #[test]
+    fn the_two_steps_of_a_split_command_share_one_deadline() {
+        let root = temp_root("deadline");
+
+        // Primary burns 400 ms of a 600 ms allowance and fails; the fallback
+        // needs 400 ms and may have only ~200.
+        let outcomes = run_all(
+            &root,
+            &[Command::new("sleep 0.4; false || sleep 0.4 && echo late")],
+            600,
+        );
+        assert!(
+            !matches!(&outcomes[0], DynamicOutcome::Ran { output, .. } if output == "late"),
+            "the fallback ran to completion, so it was given a fresh allowance \
+             rather than what the primary left: {:?}",
+            outcomes[0]
+        );
+
+        // And the whole-allowance shape still ends at the deadline rather than
+        // starting a second shell.
+        let started = Instant::now();
+        let whole = run_all(&root, &[Command::new("sleep 5 || echo fallback")], 400);
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(whole[0], DynamicOutcome::TimedOut),
+            "{:?}",
+            whole[0]
+        );
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "one slot must not outlive its own deadline by running two shells: \
+             {elapsed:?}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

@@ -2447,6 +2447,103 @@ mod tests {
         }
     }
 
+    /// **REQ-615 BR-5 / BR-6 / AC-5: the two new records reach the bus.**
+    ///
+    /// The producers were unguarded until this existed. Every other REQ-615 test
+    /// reads the *tool result* — the sentence the model gets — and a publish
+    /// that never fired would have left all of them green: a fact that crosses a
+    /// seam is tested on both sides and once across, and four such producers
+    /// shipped unnoticed in one REQ before (LESSON-544).
+    ///
+    /// Both legs run in one test because they share the fixture cost and each is
+    /// one assertion: a refused skill publishes `skill_refused_needs_project`
+    /// and no fallback, and a skill whose preamble falls back publishes
+    /// `skill_preamble_fallback` and no refusal.
+    ///
+    /// Mutation: delete either `publish` — that leg's `expect` on the received
+    /// envelope goes red.
+    #[tokio::test]
+    async fn the_root_gate_records_reach_the_bus() {
+        let fx = Fixture::new();
+        fx.user("needsit", "requires: project\n", "Body.\n");
+        fx.user(
+            "fallsback",
+            "",
+            "!`cat missing.txt 2>/dev/null || echo none`\nBody.\n",
+        );
+        let registry = fx.registry();
+
+        let bus = Arc::new(EventBus::new());
+        let gate = Arc::new(PermissionGate::new(
+            SessionId::from("req615-events"),
+            PermissionConfig::with_default(PermissionPolicy::Allow),
+            Arc::clone(&bus),
+            Arc::new(PendingPermissions::new()),
+        ));
+        let grants = crate::grants::GrantRegistry::default();
+        let tool = SkillTool::new(
+            registry,
+            gate,
+            Some(grants.next_connection_id()),
+            Handle::current(),
+            5_000,
+        );
+
+        // BR-5, at a home root.
+        let mut sub = bus.subscribe(32);
+        let home = fx
+            .ctx()
+            .with_root_kind(RootKind::Home)
+            .with_known_projects(vec!["teton-code".to_owned()]);
+        let _ = tool.invoke(&home, &call(Some("needsit"), "")).await;
+        let refused = drain_for(&mut sub, |event| match event {
+            Event::SkillRefusedNeedsProject(r) => Some(r.clone()),
+            _ => None,
+        })
+        .await
+        .expect("BR-5 publishes a record");
+        assert_eq!(refused.skill, "needsit");
+        assert_eq!(refused.root_kind, RootKind::Home);
+        assert_eq!(refused.known_projects, vec!["teton-code".to_owned()]);
+
+        // BR-6, at a plain root, where the skill is allowed to expand.
+        let mut sub = bus.subscribe(32);
+        let plain = fx.ctx().with_root_kind(RootKind::Plain);
+        let _ = tool.invoke(&plain, &call(Some("fallsback"), "")).await;
+        let fell_back = drain_for(&mut sub, |event| match event {
+            Event::SkillPreambleFallback(f) => Some(f.clone()),
+            _ => None,
+        })
+        .await
+        .expect("BR-6 publishes a record when the primary fails");
+        assert_eq!(fell_back.skill, "fallsback");
+        assert_eq!(fell_back.command_index, 0, "the only slot, 0-based");
+    }
+
+    /// Read events until `pick` answers, or the bus goes quiet.
+    ///
+    /// A drain rather than a single `recv`: the paths under test publish other
+    /// records too (`skill_invoked`), and a test that asserted on the *first*
+    /// envelope would be asserting publication order, which is not the rule
+    /// being checked here.
+    async fn drain_for<T>(
+        sub: &mut crate::broadcast::Subscription,
+        pick: impl Fn(&Event) -> Option<T>,
+    ) -> Option<T> {
+        loop {
+            let envelope =
+                tokio::time::timeout(std::time::Duration::from_millis(500), sub.recv()).await;
+            match envelope {
+                Ok(Some(envelope)) => {
+                    if let Some(found) = pick(&envelope.event) {
+                        return Some(found);
+                    }
+                }
+                _ => return None,
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // BR-2 — the roster (pure, BR-12)
     // -----------------------------------------------------------------------

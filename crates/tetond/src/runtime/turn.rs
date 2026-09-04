@@ -2654,7 +2654,6 @@ impl DaemonRuntime {
     /// [`crate::skills::run_all`] is `run_bounded`'s second caller, not
     /// `ShellTool::run`'s — so `Tool::refine`, which fires the `shell` duty and
     /// *is* a model call, is not on this path (ADR-14).
-
     async fn settle_dynamic_context(
         self: &Arc<Self>,
         events: &Arc<EventBus>,
