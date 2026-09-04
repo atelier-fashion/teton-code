@@ -3,10 +3,11 @@
   "branch": "feat/REQ-614-proportionate-shell-provenance",
   "startedAt": "2026-09-04T00:00:00Z",
   "completed": false,
-  "currentPhase": 2,
+  "currentPhase": 3,
   "completedPhases": [
     0,
-    1
+    1,
+    2
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -20,6 +21,12 @@
       "name": "Validate Spec",
       "completedAt": "2026-09-04T19:37:10.718425Z",
       "result": "approved with 4 in-place fixes (BR-1(d) truncated-scan verdict, BR-5 typed-only precedent, session_pinned.budget_tokens, AC-4 named command)"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Tasks",
+      "completedAt": "2026-09-04T19:43:51.206718Z",
+      "result": "7 ADRs, 8 tasks (TASK-390..397), OQ-1/2/3 resolved, footprint published to PR #288"
     }
   ],
   "repos": {
