@@ -1,7 +1,7 @@
 ---
 id: TASK-398
 title: "The crossover test, the reference-workload replay, and the recall-trial record"
-status: draft
+status: complete
 parent: REQ-616
 created: 2026-09-04
 updated: 2026-09-04
