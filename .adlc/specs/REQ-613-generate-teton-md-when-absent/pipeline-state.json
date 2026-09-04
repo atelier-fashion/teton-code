@@ -2,7 +2,7 @@
   "req": "REQ-613",
   "branch": "feat/REQ-613-generate-teton-md-when-absent",
   "startedAt": "2026-09-03T23:34:45Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -64,6 +65,13 @@
       "name": "PR Cleanup & CI",
       "completedAt": "2026-09-04T12:55:43Z",
       "notes": "PR body filled, marked ready; six of eight checks green on 3e5916d with the two fmt\u00b7clippy\u00b7test matrices running; the merge in Phase 8 waits on all eight green on the final tip; trial-merge against origin/main clean, 0 commits behind"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup",
+      "completedAt": "2026-09-04T13:00:33Z",
+      "mergeCommit": "681c12d",
+      "notes": "PR #283 squash-merged (branch_deleted=1); worktree and local branch removed; LESSON-629..631 and ASSUME-038 written"
     }
   ],
   "repos": {
@@ -76,7 +84,7 @@
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/283",
       "prNumber": 283,
       "prCreatedAt": "2026-09-03T23:34:48Z",
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }
