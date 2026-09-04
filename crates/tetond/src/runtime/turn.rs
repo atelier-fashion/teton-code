@@ -997,8 +997,34 @@ impl DaemonRuntime {
         // writes next, and last week's file is still on disk after
         // `/transcript off`. Nothing here reads `transcript.enabled`, and that
         // is the point.
+        // REQ-584 BR-7's ranked, bounded names, derived **once** here and read
+        // by two consumers: the prompt's known-projects clause (below) and
+        // REQ-615's refusals, which name the same projects to the same model in
+        // the same turn. Two readings of one snapshot would be one answer only
+        // by accident (ADR-5, the shape the root probe itself established).
+        //
+        // **Reads the stored snapshot only — it never scans** (BR-3): this runs
+        // on every turn, and a turn that did not ask for projects must not pay
+        // for a directory walk, let alone raise the macOS Documents dialog.
+        let known_projects: Vec<String> =
+            if probed.view.kind == teton_protocol::methods::RootKind::Project {
+                Vec::new()
+            } else {
+                self.projects
+                    .snapshot()
+                    .rank(None)
+                    .iter()
+                    .map(|p| {
+                        teton_core::session_root::bounded_field(
+                            &p.name,
+                            teton_core::session_root::NAME_MAX_CHARS,
+                        )
+                    })
+                    .collect()
+            };
         let tool_ctx = ToolContext::for_root(probed)
-            .with_denied_prefix(effective_transcript_dir(&config.transcript));
+            .with_denied_prefix(effective_transcript_dir(&config.transcript))
+            .with_known_projects(known_projects.clone());
         // REQ-611 BR-4: the turn's streaming surface also carries the sink, so
         // the tool input and the tool result — neither of which the bus has ever
         // carried — reach the transcript in-process from the two points in the
@@ -1025,22 +1051,7 @@ impl DaemonRuntime {
         // **Reads the stored snapshot only — it never scans** (BR-3): this runs
         // on every turn, and a turn that did not ask for projects must not pay
         // for a directory walk, let alone raise the macOS Documents dialog.
-        route.harness.known_projects =
-            if probed.view.kind == teton_protocol::methods::RootKind::Project {
-                Vec::new()
-            } else {
-                self.projects
-                    .snapshot()
-                    .rank(None)
-                    .iter()
-                    .map(|p| {
-                        teton_core::session_root::bounded_field(
-                            &p.name,
-                            teton_core::session_root::NAME_MAX_CHARS,
-                        )
-                    })
-                    .collect()
-            };
+        route.harness.known_projects = known_projects;
         // REQ-612 BR-6 / ADR-3: the repository's notes, re-checked **here** —
         // the one place per turn that has already re-derived the root, after
         // `session_root_for` and before the prompt is built. Never mid-turn: the
@@ -1351,7 +1362,7 @@ impl DaemonRuntime {
                 tctx.core.events,
                 tctx.core.session_id,
                 tctx.gate,
-                &probed.path,
+                probed,
                 tctx.invoker,
                 skill,
             )
@@ -2564,6 +2575,44 @@ impl DaemonRuntime {
         })
     }
 
+    /// REQ-615 BR-6: publish one `skill_preamble_fallback` per preamble whose
+    /// primary exited non-zero.
+    ///
+    /// Free and silent in the common case — an expansion whose commands all
+    /// succeeded (or that has none) iterates a short slice and publishes nothing.
+    ///
+    /// The record carries **no output**: the bytes reach the model on the
+    /// expansion, framed, and the bus fans out to every attached client and every
+    /// declared monitor (REQ-611 BR-4).
+    fn publish_preamble_fallbacks(
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+        skill: &str,
+        outcomes: &[crate::skills::DynamicOutcome],
+        root_display: &str,
+    ) {
+        for (index, outcome) in outcomes.iter().enumerate() {
+            if matches!(
+                outcome,
+                crate::skills::DynamicOutcome::Ran {
+                    fell_back: true,
+                    ..
+                }
+            ) {
+                events.publish(
+                    Some(session_id.clone()),
+                    teton_protocol::events::Event::SkillPreambleFallback(
+                        teton_protocol::events::SkillPreambleFallback {
+                            skill: skill.to_owned(),
+                            command_index: index,
+                            root_display: root_display.to_owned(),
+                        },
+                    ),
+                );
+            }
+        }
+    }
+
     /// Ask once, run in document order, fold the outcomes back into the
     /// expansion, and publish the invocation's record (REQ-585 BR-6, BR-12;
     /// ADR-7, ADR-14, ADR-15).
@@ -2610,7 +2659,14 @@ impl DaemonRuntime {
         events: &Arc<EventBus>,
         session_id: &SessionId,
         gate: &PermissionGate,
-        root: &Path,
+        // The turn's one probe, taken whole rather than as a path and a display
+        // side by side (REQ-615). Two consumers here — the jail the commands run
+        // in (`probed.path`) and the root BR-6's fallback line names
+        // (`probed.view.display`) — and passing the probe rather than its parts
+        // is what keeps them one reading, as well as what keeps this signature
+        // inside the argument bound the suppression ratchet enforces: a path and
+        // its display are an unnamed cluster, and `ProbedRoot` is its name.
+        probed: &ProbedRoot,
         invoker: Option<ConnectionId>,
         skill: &mut SkillTurn,
     ) {
@@ -2661,7 +2717,7 @@ impl DaemonRuntime {
             // (REQ-596: an allowlist, not a scrub), PATH floor, process group
             // and deadline (ADR-14).
             None if !commands.is_empty() => {
-                let root = root.to_path_buf();
+                let root = probed.path.clone();
                 let to_run = commands.clone();
                 let timeout_ms = self.skill_command_timeout_ms;
                 // On the blocking pool: `run_bounded` waits on a child process
@@ -2693,7 +2749,18 @@ impl DaemonRuntime {
         // is what entitles Stage B's sentence to say the body itself already
         // fit.
         let frame = expansion.user_frame();
-        skill.text = expansion.fold(&frame, &outcomes);
+        skill.text = expansion.fold(&frame, &outcomes, &probed.view.display);
+        // REQ-615 BR-6: one notice per preamble whose primary failed. Published
+        // here, where the outcomes are, rather than inside the fold — the fold
+        // is pure and composes text, and a publisher inside it would make a
+        // renderer a second source of session news.
+        Self::publish_preamble_fallbacks(
+            events,
+            session_id,
+            &skill.name,
+            &outcomes,
+            &probed.view.display,
+        );
 
         // BR-7: anything that came from a command carries what `shell` output
         // carries — nothing that can be pinned. On a boundary-configured machine
@@ -3379,7 +3446,13 @@ impl DaemonRuntime {
             gate,
             invoker,
         } = tctx;
-        let mut tools = ToolRegistry::with_builtins();
+        // REQ-615 BR-4: the two write-capable built-ins report a refused write
+        // to the session that made it. Same emitter shape the projects tool
+        // takes below, carrying the sink so "an emitter without a sink is a
+        // test fixture" stays a rule with no exceptions (REQ-611).
+        let mut tools = ToolRegistry::with_builtins_reporting(Some(
+            SessionEvents::new(Arc::clone(events), session_id.clone()).with_sink(self.transcript()),
+        ));
         if !self.mcp_servers.is_empty() {
             if let Ok(transport) = HttpTransport::new() {
                 let egress =

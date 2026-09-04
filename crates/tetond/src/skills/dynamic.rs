@@ -182,6 +182,19 @@ pub enum DynamicOutcome {
     Ran {
         /// The captured stdout.
         output: String,
+        /// Whether this output came from a `||` **fallback** branch because
+        /// the primary exited non-zero (REQ-615 BR-6).
+        ///
+        /// Observable only because [`run_one`] splits the command at its first
+        /// top-level `||` and runs the primary itself: handing
+        /// `cat X || echo none` to one shell returns exit 0 and the fallback's
+        /// stdout, byte-identical to a primary that succeeded.
+        ///
+        /// No `Default`, deliberately — every construction site states it, so
+        /// "the fold knows whether this is the project's answer or a stand-in
+        /// for it" is a compile-time property rather than a field someone
+        /// forgets (architecture.md: a required field with no `Default`).
+        fell_back: bool,
         /// Whether the `shell` tool's ceiling threw information away, so the
         /// model is reading a **prefix**.
         ///
@@ -352,6 +365,7 @@ impl DynamicOutcome {
             self,
             Self::Ran {
                 truncated: true,
+                fell_back: false,
                 ..
             }
         )
@@ -532,7 +546,47 @@ pub(crate) fn run_all_within(
 
 /// One command's trip through [`run_bounded`], typed for the fold.
 fn run_one(root: &Path, command: &Command, timeout_ms: u64) -> DynamicOutcome {
-    match run_bounded(root, command.as_str(), timeout_ms) {
+    // REQ-615 BR-6. A command with a top-level `||` is run in two steps — the
+    // primary, then the fallback only if the primary failed — because that is
+    // the *only* way the daemon can tell which branch produced the output. One
+    // shell returns exit 0 either way.
+    //
+    // `a || b || c` splits into primary `a` and remainder `b || c`: only the
+    // first branch's exit is observed, and the remainder goes to the shell
+    // whole, so a chain's semantics stay the shell's. A command with no
+    // top-level `||` skips all of this and runs exactly as it did before.
+    if let Some((primary, fallback)) =
+        crate::harness::root_gate::split_top_level_or(command.as_str())
+    {
+        // **The two steps share one command's deadline.** Splitting turned one
+        // `run_bounded` into two, and handing each the full `timeout_ms` would
+        // let a single `!cmd` slot take twice the per-command budget — the
+        // arithmetic BUG-185 bounded, quietly reopened by a change that is not
+        // about timeouts at all. What the caller allotted is what the slot
+        // gets, however many shells the daemon runs inside it.
+        let started = Instant::now();
+        let first = run_step(root, primary, timeout_ms, false);
+        if !matches!(first, DynamicOutcome::Failed { .. }) {
+            return first;
+        }
+        let spent = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let Some(left) = timeout_ms.checked_sub(spent) else {
+            // The primary consumed the whole allowance. Reporting the *timeout*
+            // is honest: the slot's deadline passed, and it is the same word a
+            // one-shell run would have used.
+            return DynamicOutcome::TimedOut;
+        };
+        return run_step(root, fallback, left, true);
+    }
+    run_step(root, command.as_str(), timeout_ms, false)
+}
+
+/// One command string's trip through [`run_bounded`], typed for the fold.
+///
+/// `fell_back` is the caller's fact, not this function's: it says which side of
+/// a `||` this string came from, and only [`run_one`] knows that.
+fn run_step(root: &Path, command: &str, timeout_ms: u64, fell_back: bool) -> DynamicOutcome {
+    match run_bounded(root, command, timeout_ms) {
         BoundedRun::Completed { status, stdout, .. } if status.success() => {
             // stdout only. BR-6 says stdout enters the expansion; a command
             // whose diagnostics matter can redirect them itself (`2>&1`), and
@@ -540,7 +594,11 @@ fn run_one(root: &Path, command: &Command, timeout_ms: u64) -> DynamicOutcome {
             // author asked for a file listing in.
             let text = String::from_utf8_lossy(&stdout).trim_end().to_owned();
             let (output, _raw_chars, truncated) = cap_output(text);
-            DynamicOutcome::Ran { output, truncated }
+            DynamicOutcome::Ran {
+                output,
+                truncated,
+                fell_back,
+            }
         }
         BoundedRun::Completed { status, .. } => DynamicOutcome::Failed {
             status: describe_status(status),
@@ -709,6 +767,7 @@ mod tests {
             DynamicOutcome::Ran {
                 output: "one\ntwo".to_owned(),
                 truncated: false,
+                fell_back: false,
             },
             "the commands did not run in document order: {outcomes:?}"
         );
@@ -780,7 +839,8 @@ mod tests {
             outcomes[0],
             DynamicOutcome::Ran {
                 output: "fine".to_owned(),
-                truncated: false
+                truncated: false,
+                fell_back: false
             },
             "a budget with room runs the command: {outcomes:?}"
         );
@@ -790,6 +850,149 @@ mod tests {
 
     /// The I/O edge: in order, one outcome per command, each arm typed —
     /// and a failing command does not stop the ones after it (BR-6, AC-10).
+    /// **REQ-615 BR-6: the primary of a `cmd || fallback` is run and observed,
+    /// and a succeeding primary reports no fallback.**
+    ///
+    /// This is the whole reason the daemon splits at all. Handed to one shell,
+    /// `cat missing || echo none` exits 0 with `none` on stdout — byte-identical
+    /// to a primary that succeeded and printed `none`. Only running the primary
+    /// separately makes the two distinguishable.
+    ///
+    /// Mutation: delete the split in `run_one` and call `run_step` with the
+    /// whole string — `fell_back` is `false` on the first row and it goes red.
+    #[test]
+    fn the_primary_of_a_fallback_command_is_run_and_observed() {
+        let root = temp_root("fallback");
+        std::fs::write(root.join("present.txt"), "real answer\n").unwrap();
+
+        let outcomes = run_all(
+            &root,
+            &[
+                Command::new("cat missing.txt 2>/dev/null || echo none"),
+                Command::new("cat present.txt || echo none"),
+            ],
+            5_000,
+        );
+
+        match &outcomes[0] {
+            DynamicOutcome::Ran {
+                output, fell_back, ..
+            } => {
+                assert_eq!(output, "none");
+                assert!(
+                    *fell_back,
+                    "the primary failed, so this output is a stand-in and must \
+                     say so — the model must not read it as the project's answer"
+                );
+            }
+            other => panic!("expected a ran fallback, got {other:?}"),
+        }
+        match &outcomes[1] {
+            DynamicOutcome::Ran {
+                output, fell_back, ..
+            } => {
+                assert_eq!(output, "real answer");
+                assert!(!fell_back, "the primary succeeded; nothing fell back");
+            }
+            other => panic!("expected a ran primary, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **REQ-615 BR-6: the two steps of a split command share one deadline.**
+    ///
+    /// Splitting turned one `run_bounded` into two, and the obvious
+    /// implementation hands each the full `timeout_ms` — which lets one `!cmd`
+    /// slot take twice the per-command budget. That is the arithmetic BUG-185
+    /// bounded, reopened by a change that is not about timeouts at all.
+    ///
+    /// # The assertion is on the outcome, not on the clock
+    ///
+    /// A wall-clock bound alone did not catch the mutation. A primary that eats
+    /// the *whole* allowance is answered by the `checked_sub` guard before the
+    /// remaining time is ever used, so `left` and `timeout_ms` are
+    /// indistinguishable in that shape — the test passed against both. The
+    /// fixture below instead leaves a **partial** remainder and gives the
+    /// fallback a task that fits the full allowance but not the remainder, so
+    /// the two spellings produce different `DynamicOutcome`s rather than
+    /// different durations. 200 ms of slack either side of a 400 ms task.
+    ///
+    /// Mutation: pass `timeout_ms` to the fallback instead of `left` — the
+    /// fallback then has 600 ms for a 400 ms sleep, returns `Ran("late")`, and
+    /// this goes red.
+    #[test]
+    fn the_two_steps_of_a_split_command_share_one_deadline() {
+        let root = temp_root("deadline");
+
+        // Primary burns 400 ms of a 600 ms allowance and fails; the fallback
+        // needs 400 ms and may have only ~200.
+        let outcomes = run_all(
+            &root,
+            &[Command::new("sleep 0.4; false || sleep 0.4 && echo late")],
+            600,
+        );
+        assert!(
+            !matches!(&outcomes[0], DynamicOutcome::Ran { output, .. } if output == "late"),
+            "the fallback ran to completion, so it was given a fresh allowance \
+             rather than what the primary left: {:?}",
+            outcomes[0]
+        );
+
+        // And the whole-allowance shape still ends at the deadline rather than
+        // starting a second shell.
+        let started = Instant::now();
+        let whole = run_all(&root, &[Command::new("sleep 5 || echo fallback")], 400);
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(whole[0], DynamicOutcome::TimedOut),
+            "{:?}",
+            whole[0]
+        );
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "one slot must not outlive its own deadline by running two shells: \
+             {elapsed:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **REQ-615 BR-6: a quoted or absent `||` changes nothing.**
+    ///
+    /// The benign path, and it guards every skill preamble that was working
+    /// before this REQ. A separator found inside quotes would split a command
+    /// the shell treats as one, and running half of it is worse than not
+    /// splitting at all.
+    ///
+    /// Mutation: make `split_top_level_or` quote-blind — the quoted row goes
+    /// red with truncated output.
+    #[test]
+    fn a_quoted_or_absent_separator_changes_nothing() {
+        let root = temp_root("nosplit");
+
+        let outcomes = run_all(
+            &root,
+            &[
+                Command::new("echo 'a || b'"),
+                Command::new("echo plain"),
+                Command::new("echo one | tr a-z A-Z"),
+            ],
+            5_000,
+        );
+
+        for (index, expected) in [(0usize, "a || b"), (1, "plain"), (2, "ONE")] {
+            match &outcomes[index] {
+                DynamicOutcome::Ran {
+                    output, fell_back, ..
+                } => {
+                    assert_eq!(output, expected, "slot {index}");
+                    assert!(!fell_back, "slot {index} did not fall back");
+                }
+                other => panic!("slot {index}: {other:?}"),
+            }
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn run_all_runs_in_document_order_and_types_every_outcome() {
         let root = temp_root("order");
@@ -809,6 +1012,7 @@ mod tests {
             DynamicOutcome::Ran {
                 output: "first".to_owned(),
                 truncated: false,
+                fell_back: false,
             }
         );
         assert_eq!(
@@ -824,6 +1028,7 @@ mod tests {
             DynamicOutcome::Ran {
                 output: String::new(),
                 truncated: false,
+                fell_back: false,
             },
             "stderr is not inlined; the command still succeeded"
         );
@@ -832,6 +1037,7 @@ mod tests {
             DynamicOutcome::Ran {
                 output: "last".to_owned(),
                 truncated: false,
+                fell_back: false,
             },
             "a failure never stops the commands after it"
         );
@@ -855,6 +1061,7 @@ mod tests {
             DynamicOutcome::Ran {
                 output: "after".to_owned(),
                 truncated: false,
+                fell_back: false,
             }
         );
         assert!(
@@ -923,6 +1130,7 @@ mod tests {
             DynamicOutcome::Ran {
                 output: "x".to_owned(),
                 truncated: false,
+                fell_back: false,
             }
             .reason(),
             None,
@@ -931,6 +1139,7 @@ mod tests {
         assert!(DynamicOutcome::Ran {
             output: String::new(),
             truncated: false,
+            fell_back: false,
         }
         .did_run());
         assert!(!DynamicOutcome::declined().did_run());

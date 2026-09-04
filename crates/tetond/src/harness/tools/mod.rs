@@ -175,6 +175,13 @@ pub struct ToolContext {
     /// [`denied_prefix_forms`] derives for it, so the list is longer than the
     /// set of directories it came from.
     denied_prefixes: Vec<PathBuf>,
+    /// The projects this machine knows about, ranked and already bounded by the
+    /// caller (REQ-615 ADR-5).
+    ///
+    /// Empty on every context that was not given one, which is the honest value
+    /// for a context nobody handed projects to — and what keeps every existing
+    /// `for_root` call site compiling unchanged.
+    known_projects: Vec<String>,
 }
 
 impl ToolContext {
@@ -195,6 +202,7 @@ impl ToolContext {
             kind: RootKind::Plain,
             walk: walk::WalkPolicy::default(),
             denied_prefixes: Vec::new(),
+            known_projects: Vec::new(),
         }
     }
 
@@ -213,6 +221,7 @@ impl ToolContext {
             kind: probed.view.kind,
             walk: walk::WalkPolicy::default(),
             denied_prefixes: Vec::new(),
+            known_projects: Vec::new(),
         }
     }
 
@@ -258,6 +267,24 @@ impl ToolContext {
         self.denied_prefixes.extend(denied_prefix_forms(dir));
         self.walk = self.walk.with_denied_prefix(dir);
         self
+    }
+
+    /// The same context carrying the machine's ranked, bounded project names
+    /// (REQ-615 ADR-5).
+    ///
+    /// Fed from the **same expression** that feeds the prompt's known-projects
+    /// clause, so the environment block and a REQ-615 refusal name one list —
+    /// the one-reading-two-consumers shape the root probe itself established.
+    #[must_use]
+    pub fn with_known_projects(mut self, names: Vec<String>) -> Self {
+        self.known_projects = names;
+        self
+    }
+
+    /// The project names a REQ-615 refusal may list.
+    #[must_use]
+    pub fn known_projects(&self) -> &[String] {
+        &self.known_projects
     }
 
     /// The walk policy every walker under this context reads (ADR-3, BR-11).
@@ -1076,12 +1103,26 @@ impl ToolRegistry {
     /// `teton_docs`'s is not, so it registers where no config can reach it.
     #[must_use]
     pub fn with_builtins() -> Self {
+        Self::with_builtins_reporting(None)
+    }
+
+    /// The built-ins, with the two write-capable tools reporting REQ-615 BR-4
+    /// refusals to `events`.
+    ///
+    /// A sibling of [`Self::with_builtins`] rather than a parameter on it,
+    /// because every test that builds a registry has no session to report to
+    /// and `None` is the honest value there. Production calls this one; the
+    /// bodies are one, so the two rosters cannot come to differ.
+    #[must_use]
+    pub fn with_builtins_reporting(
+        events: Option<crate::harness::turn_loop::SessionEvents>,
+    ) -> Self {
         let mut reg = Self::new();
         reg.register(Arc::new(ReadTool));
-        reg.register(Arc::new(EditTool));
+        reg.register(Arc::new(EditTool::with_events(events.clone())));
         reg.register(Arc::new(GrepTool));
         reg.register(Arc::new(GlobTool));
-        reg.register(Arc::new(ShellTool::default()));
+        reg.register(Arc::new(ShellTool::default().with_events(events)));
         reg.register_cap_exempt(Arc::new(DocsTool));
         reg
     }
@@ -1425,7 +1466,7 @@ mod tests {
         assert!(read.is_error, "{}", read.content);
         assert_outside_root_shape(&read.content, "../outside.txt", &display);
 
-        let edit = EditTool.run(
+        let edit = EditTool::default().run(
             &ctx,
             &json!({ "path": "/etc/hosts", "old_string": "a", "new_string": "b" }),
         );
@@ -1618,7 +1659,7 @@ mod tests {
         assert!(benign.content.contains(NEEDLE), "{}", benign.content);
 
         // edit — the same jail, so the same sentence; the sibling still edits.
-        let refused = EditTool.run(
+        let refused = EditTool::default().run(
             &ctx,
             &json!({ "path": RAW, "old_string": NEEDLE, "new_string": "x" }),
         );
@@ -1634,7 +1675,7 @@ mod tests {
                 .contains(NEEDLE),
             "edit rewrote the transcript"
         );
-        let benign = EditTool.run(
+        let benign = EditTool::default().run(
             &ctx,
             &json!({ "path": "notes.jsonl", "old_string": "lives here", "new_string": "still lives here" }),
         );
@@ -1753,7 +1794,7 @@ mod tests {
                 .with_denied_prefix(cfg.transcript.effective_dir(Path::new("/nowhere")));
             let answers = vec![
                 ReadTool.run(&ctx, &json!({ "path": RAW })).content,
-                EditTool
+                EditTool::default()
                     .run(
                         &ctx,
                         &json!({ "path": RAW, "old_string": NEEDLE, "new_string": "x" }),

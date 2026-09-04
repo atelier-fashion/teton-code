@@ -682,7 +682,7 @@ async fn edit_blocks_every_boundary_spelling_under_one_identity() {
 
     // Positive control: an edit of a public file still goes remote, carrying the
     // file's content.
-    let public = EditTool.run(
+    let public = EditTool::default().run(
         &ctx,
         &serde_json::json!({
             "path": "src/main.rs",
@@ -702,7 +702,7 @@ async fn edit_blocks_every_boundary_spelling_under_one_identity() {
     for spelling in br3_spellings(&root) {
         // Restore the boundary file so each spelling performs a real edit.
         std::fs::write(root.join(CANONICAL_ID), SECRET_ENV).unwrap();
-        let out = EditTool.run(
+        let out = EditTool::default().run(
             &ctx,
             &serde_json::json!({
                 "path": spelling,
