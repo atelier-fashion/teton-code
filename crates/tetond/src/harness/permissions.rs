@@ -133,6 +133,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
 use teton_core::config::WebTier;
+use teton_core::session_root::{bounded_field, DISPLAY_MAX_CHARS};
 use teton_protocol::events::{
     BudgetBound, Event, InvokedBy, PermissionOption, PermissionOptionKind, PermissionRequest,
     PermissionSubject, ProjectSkillTrustEntry, WebConsentDecided, WebConsentScope, WindowVerdict,
@@ -141,8 +142,9 @@ use teton_protocol::events::{
     OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
 };
 use teton_protocol::methods::{
-    expires_on_session_root_change, is_project_acknowledgment_key, project_skill_trust_key,
-    PermissionOutcome, RefusalReason,
+    expires_on_session_root_change, is_project_acknowledgment_key, is_repo_context_generate_key,
+    project_skill_trust_key, repo_context_generate_key, PermissionOutcome, RefusalReason,
+    RepoContextSource,
 };
 use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::{RequestId, SessionId};
@@ -226,6 +228,103 @@ impl SkillConsent {
     pub const fn is_allowed(self) -> bool {
         matches!(self, Self::Allowed)
     }
+}
+
+/// The resolved answer to the offer to write the repository's missing notes
+/// file (REQ-613 BR-2, architecture ADR-2) — and **why**, because four of the
+/// five sentences the pipeline can print differ only in the why.
+///
+/// A separate type from [`SkillConsent`] for that type's own reason: the extra
+/// facts exist for exactly one caller, and every arm here maps onto a
+/// [`teton_protocol::events::GenerationOutcome`] the client renders as its own
+/// line. That mapping is what fixes the arm count — the wire vocabulary is
+/// closed, so a fifth answer here would be an outcome no client could name.
+///
+/// | This | The event's outcome | What the user is told |
+/// |---|---|---|
+/// | [`Self::Allowed`] | `offered` → `walking` → … | the run proceeds |
+/// | [`Self::Declined`] | `declined` | a human said no |
+/// | [`Self::RefusedUnattended`] | `refused_unattended` | nobody could be asked |
+/// | [`Self::Denied`] | `denied_level` | the level forbids it |
+///
+/// There is no `Suppressed` arm, and its absence is the decision ADR-2 records:
+/// `[context] generate = never`, an `AGENTS.md`, an empty file and `plan` are
+/// all settled **before** the gate is reached, where the config is. A gate that
+/// could answer `Suppressed` would be a second place that knows the config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationConsent {
+    /// The walk, the model call and the write may go ahead.
+    Allowed {
+        /// How far the permission reaches — see [`GenerationScope`].
+        scope: GenerationScope,
+    },
+    /// A **human** decided against it: rejected once, rejected for the session,
+    /// or the prompt was dismissed. Session-scoped and written nowhere; Teton
+    /// never remembers a permission answer across sessions (BR-1).
+    Declined,
+    /// **Nobody was asked**, so nobody declined anything.
+    ///
+    /// Four causes, one fact and one remedy, which is why they share an arm
+    /// where [`SkillConsent`] splits them across two. The wire vocabulary is the
+    /// authority: `GenerationOutcome` has one word for all of it
+    /// (`refused_unattended`), because what the user must be told is the same
+    /// sentence in every case — *the next stdin line is still your next prompt,
+    /// and the session proceeded cold.*
+    ///
+    /// - the client refused **without reading a line** (`NoTerminal`, BR-2's
+    ///   piped-stdin rule);
+    /// - the client does not recognize the subject (`UnrecognizedSubject`) — a
+    ///   REQ-612-vintage `teton` on a REQ-613 daemon;
+    /// - the question could not be put at all: no addressed-delivery route, a
+    ///   connection that would not take the frame, or one that went away;
+    /// - the daemon reached this door under a key it must not remember an answer
+    ///   against. That last one is the daemon's own defect rather than the
+    ///   client's, and — exactly as [`SkillConsent::Unanswerable`] records — the
+    ///   stderr line at the refusing door is its diagnostic.
+    RefusedUnattended,
+    /// The **level** settled it and no prompt was drawn (`plan`). The sentence
+    /// is [`PermissionGate::repo_context_generation_denial_note`]'s, so the
+    /// daemon's and the client's account of one refusal cannot drift
+    /// (LESSON-456).
+    ///
+    /// Reachable, and deliberately so, even though ADR-2 has the caller decide
+    /// `plan` *before* the gate (LESSON-524 inverted: do not draw a prompt for
+    /// an act the level will refuse). The short-circuit is the caller's; this
+    /// arm is the gate's own answer for a caller that did not take it, and
+    /// `the_generation_offer_asks_at_guarded_and_edits_denies_at_plan_and_allows_at_full_without_a_prompt`
+    /// asserts it rather than assuming nobody arrives here.
+    Denied,
+}
+
+impl GenerationConsent {
+    /// Whether the generation may run. The one question the pipeline asks; the
+    /// other arms exist for the line the *other* answer earns.
+    #[must_use]
+    pub const fn is_allowed(self) -> bool {
+        matches!(self, Self::Allowed { .. })
+    }
+}
+
+/// How far an allowed generation offer reaches (REQ-613 BR-2).
+///
+/// Derived from what the gate actually *did* rather than from the option id it
+/// was handed — LESSON-495's prescription, that the label be a function of the
+/// effect. [`GenerationScope::Session`] means, and only means, that
+/// `repo_context:generate:<root>` now holds
+/// [`RememberedGrant::AllowAlways`]; a caller reading it knows the next offer at
+/// this root in this session will not reach a human, and a `/cd` is what takes
+/// that back ([`expires_on_session_root_change`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationScope {
+    /// The **level's** table allowed it and nobody was asked — `full`, whose
+    /// promise is exactly that.
+    Level,
+    /// A human allowed this one offer. Nothing is remembered, so `/context init`
+    /// later in the same session asks again.
+    Once,
+    /// A human allowed it for the rest of this session, remembered under the
+    /// root's key — and dropped the moment the session root moves.
+    Session,
 }
 
 /// A remembered, session-scoped answer for a tool.
@@ -836,6 +935,30 @@ pub struct TrustRoot<'a> {
     /// `None` for a root that will not canonicalise, which matches nothing and
     /// offers nothing — fail-closed in both directions.
     pub durable: Option<&'a str>,
+}
+
+/// The key REQ-613's generation offer is asked and remembered under, or `None`
+/// for a root that has no durable name (BR-2, ADR-2).
+///
+/// **The one mint, and it takes the pair rather than a string.** A caller
+/// holding a [`TrustRoot`] has both spellings in hand, and picking the wrong one
+/// is the whole failure LESSON-495 records: the *display* is home-relative,
+/// session-scoped and produced by a function that is not injective, so two
+/// repositories can share it — and a key two repositories share is one
+/// repository's consent authorizing a write into another. Taking the pair means
+/// no call site can name one root and key another.
+///
+/// **`None` is a decision the caller acts on, not an error it recovers from.**
+/// REQ-591 BR-6's rule, applied one question over: a root the filesystem will
+/// not resolve has no name that means anything later, so there is no key, no
+/// prompt, and the offer is `Suppressed` with a reason. Fail-closed — and it is
+/// an `Option` rather than a fallback spelling precisely so a caller cannot
+/// silently proceed under a name that names nothing.
+/// [`PermissionGate::authorize_repo_context_generation`] refuses the same case
+/// at its own door, so the rule holds even for a caller that ignores this.
+#[must_use]
+pub fn repo_context_generation_key(root: TrustRoot<'_>) -> Option<String> {
+    root.durable.map(repo_context_generate_key)
 }
 
 /// Where a durable project-trust answer is written down (REQ-589 D-13).
@@ -2570,6 +2693,237 @@ impl PermissionGate {
         )
     }
 
+    /// Decide whether Teton may write the repository's missing notes file —
+    /// walk the tree for evidence, spend one model call, and create `TETON.md`
+    /// (REQ-613 BR-2, architecture ADR-2).
+    ///
+    /// The **fourth** entry point, shaped like
+    /// [`Self::authorize_project_skill_trust`] and for its reason: REQ-587 BR-4
+    /// and REQ-591 BR-1 established that a repository-touching act with no human
+    /// typing a name gets its own key and its own door rather than widening
+    /// [`Self::authorize`]. Widening it would have put this question under a
+    /// *tool's* name, where a remembered answer about a tool call would settle a
+    /// write to the user's working tree.
+    ///
+    /// ## The key is the durable root's, and the prompt shows the other spelling
+    ///
+    /// `key` must be [`repo_context_generation_key`] of `root` — the canonical
+    /// resolution, so two spellings of one directory share one answer and two
+    /// directories never do (LESSON-495). The subject shows
+    /// [`TrustRoot::display`], the home-relative name, so no username reaches a
+    /// transcript. The two are minted from different halves of one pair
+    /// precisely so neither can be mistaken for the other, and the door refuses
+    /// rather than guessing when they disagree (below).
+    ///
+    /// Taken as a parameter and *checked* here rather than derived, on
+    /// [`Self::authorize_skill`]'s rule: the caller's key and the gate's key are
+    /// then provably one string rather than two spellings that happen to agree,
+    /// and the caller is the one that has to hold a root with a durable name to
+    /// get a key at all.
+    ///
+    /// ## The level table is the level's own default, and that is the design
+    ///
+    /// `repo_context:generate:<root>` is per-repository, so REQ-560 ADR-A's
+    /// refusal to enumerate open sets leaves it unlisted at every level — and
+    /// unlisted is exactly right here, unlike the acknowledgment REQ-591 D-3 had
+    /// to give a row: `guarded` and `edits` ask, `plan` denies, `full` allows,
+    /// which is ADR-2's table verbatim. So there is no
+    /// [`Question::level_key`] arm to add, and adding one would be the way to
+    /// break it.
+    ///
+    /// ADR-2 has the caller decide `plan` *before* reaching here (LESSON-524
+    /// inverted — do not draw a prompt for an act the level will refuse), and
+    /// this door still answers [`GenerationConsent::Denied`] for a caller that
+    /// did not: a short-circuit and a gate that disagreed would be two answers
+    /// to one question.
+    ///
+    /// ## `replace` is on the subject because it is a different question
+    ///
+    /// "Write a file that is not there" and "overwrite the one that is" are not
+    /// the same offer, and the human has to see which one is on screen (BR-8).
+    /// It rides the subject rather than a description string for
+    /// [`Self::authorize_skill`]'s reason: the client renders the sentence, the
+    /// daemon states the facts.
+    ///
+    /// ## Nothing here is durable, at any answer
+    ///
+    /// The option set is the standard four — once, for this session, no once, no
+    /// for this session — and there is no fifth. Teton never remembers a
+    /// permission answer across sessions; BR-1's durable ways to stop the offer
+    /// are `[context] generate = never` and an existing (even empty) file, and
+    /// both are read before the gate. A session answer expires with the root
+    /// ([`Self::drop_project_skill_grants`]).
+    pub async fn authorize_repo_context_generation(
+        &self,
+        key: &str,
+        root: TrustRoot<'_>,
+        replace: bool,
+        addressee: ConnectionId,
+    ) -> GenerationConsent {
+        // The misroute this door drops. A skill's key, an acknowledgment's key
+        // or a tool's name here would remember "Teton may write this
+        // repository's notes" under somebody else's question, and — read the
+        // other way — would let an answer given about a skill authorize a write
+        // into the user's working tree.
+        //
+        // A hard return rather than an assertion, for the reason the two skill
+        // doors give: an assertion is absent from the shipped binary, and this
+        // door accepts **any** string without it.
+        if !is_repo_context_generate_key(key) {
+            eprintln!(
+                "tetond: refusing a repository-notes generation offer asked under \
+                 `{key}`, which is not a generation key — BR-2's question asks \
+                 under `repo_context:generate:<root>`, never under a skill's key, \
+                 an acknowledgment's key or a tool's name (ADR-2)"
+            );
+            return GenerationConsent::RefusedUnattended;
+        }
+        // …and it must be *this* root's key. Stronger than
+        // [`Self::authorize_project_skill_trust`]'s `debug_assert_eq!`, and the
+        // extra strength is not a matter of taste: this mint is an `Option`, so
+        // a release build has to have an answer for a root that will not
+        // canonicalise. `None` matches no key, which lands here — REQ-591 BR-6's
+        // fail-closed rule reached through the comparison rather than through a
+        // second condition that could drift from it.
+        if repo_context_generation_key(root).as_deref() != Some(key) {
+            eprintln!(
+                "tetond: refusing a repository-notes generation offer asked under \
+                 `{key}`, which is not the key this session root mints — a human \
+                 would answer about one repository and the grant would be kept \
+                 for another (LESSON-495). A root with no canonical name mints \
+                 no key and the offer is suppressed (REQ-591 BR-6)"
+            );
+            return GenerationConsent::RefusedUnattended;
+        }
+
+        let addressed = Addressed {
+            connection: addressee,
+            subject: PermissionSubject::RepoContextGeneration {
+                // Bounded here, where the subject is minted, because the wire
+                // field says it is (`PermissionSubject::RepoContextGeneration`'s
+                // own note): a directory name is repository-authored text. Safe
+                // to bound *only* because this string is not the key's source —
+                // truncating the acknowledgment's root would collapse two
+                // repositories onto one key, which is why REQ-591 BR-11 leaves
+                // that one alone. Idempotent, so a caller handing over an
+                // already-bounded display loses nothing.
+                root: bounded_field(root.display, DISPLAY_MAX_CHARS),
+                // This build's own name for the file, through the one `match`
+                // the loader reads it by — never a literal here, which would be
+                // a second spelling that renders the wrong name the day the
+                // write moves.
+                path: crate::repo_context::file_name(RepoContextSource::TetonMd).to_owned(),
+                replace,
+            },
+        };
+
+        // No `description`, for the skill doors' reason: the subject carries the
+        // root, the path and the question, and a sentence restating them would
+        // be a second spelling of one fact (LESSON-456).
+        //
+        // `LevelAllow::Settles`, unlike the shadowing acknowledgment: `full`
+        // means "do not ask me", and this write is bounded, headed, announced
+        // and reversible with one `rm`. `Question::Standard(None)` is the
+        // standard four options and no fifth — see the doc above.
+        let settled = self
+            .settle(
+                key,
+                None,
+                Question::Standard(None),
+                Some(addressed),
+                LevelAllow::Settles,
+            )
+            .await;
+        self.generation_consent_for(key, settled)
+    }
+
+    /// Narrow a settlement to the four answers the generation pipeline can act
+    /// on, and say how far an allow reaches.
+    ///
+    /// The scope is read back out of the **grant map** rather than out of the
+    /// option id, which is LESSON-495's prescription applied to a label:
+    /// [`GenerationScope::Session`] is true exactly when a later offer at this
+    /// root will be auto-answered, because it is the same lookup that will
+    /// auto-answer it. An id-derived scope would be a second reading of the rule
+    /// and would be wrong the first time [`Self::interpret`] changed which ids
+    /// record a grant.
+    fn generation_consent_for(&self, key: &str, settled: Settled) -> GenerationConsent {
+        match settled {
+            // `full`: the level's own promise, and nobody was asked.
+            Settled::ByLevel(PermissionDecision::Allowed) => GenerationConsent::Allowed {
+                scope: GenerationScope::Level,
+            },
+            // A remembered answer replayed. It is a session grant by
+            // construction — nothing else is remembered — so the scope is not in
+            // doubt.
+            Settled::ByGrant(PermissionDecision::Allowed) => GenerationConsent::Allowed {
+                scope: GenerationScope::Session,
+            },
+            // A human, just now. Which of the two allowing options they chose is
+            // whatever `interpret` recorded, so that is what is read.
+            //
+            // The over-budget arm is unreachable from this door (that
+            // settlement is minted only for `Question::OverBudget`, and this
+            // question is `Standard`) and is folded in rather than left to an
+            // `unreachable!`: a panic in the permission path is a worse answer
+            // to a daemon defect than the fail-closed one two arms down.
+            Settled::ByHuman(PermissionDecision::Allowed)
+            | Settled::ByHumanOverBudget {
+                decision: PermissionDecision::Allowed,
+                ..
+            } => GenerationConsent::Allowed {
+                scope: match self.remembered(key) {
+                    Some(RememberedGrant::AllowAlways) => GenerationScope::Session,
+                    Some(RememberedGrant::RejectAlways) | None => GenerationScope::Once,
+                },
+            },
+            Settled::ByLevel(PermissionDecision::Denied) => GenerationConsent::Denied,
+            // A human decided against it, now or earlier in this session. Both
+            // are declines: the grant a `reject_always` left behind is that same
+            // human's answer, replayed.
+            Settled::ByGrant(PermissionDecision::Denied)
+            | Settled::ByHuman(PermissionDecision::Denied)
+            | Settled::ByHumanOverBudget {
+                decision: PermissionDecision::Denied,
+                ..
+            } => GenerationConsent::Declined,
+            // Nobody was asked — see [`GenerationConsent::RefusedUnattended`]
+            // for why the wire vocabulary gives all of these one word.
+            Settled::Refused(_) | Settled::Unanswerable => GenerationConsent::RefusedUnattended,
+        }
+    }
+
+    /// The sentence a generation offer refused **by the level** carries, or
+    /// `None` when the level would not refuse it (REQ-613 BR-2, AC-2).
+    ///
+    /// [`Self::denial_note`] with the two halves separated, and the separation
+    /// is the whole point of a second method. That one renders the string it
+    /// looked the policy up by, which is right for a tool name and wrong here:
+    /// the lookup key is `repo_context:generate:/Users/<you>/dev/repo`, and
+    /// putting it in a sentence would carry an absolute path — a username —
+    /// into a transcript, from the one door whose subject is deliberately
+    /// home-relative so that cannot happen.
+    ///
+    /// So the **decision** is made by the real key, exactly as the gate will
+    /// make it, and the **sentence** names the act. `key` is not optional and is
+    /// not defaulted: a caller without one has a root that will not canonicalise
+    /// and an offer that is `Suppressed` rather than denied, which is a
+    /// different word for a different reason.
+    ///
+    /// Derived from the same [`PermissionLevel`] the client renders, through the
+    /// same `denial_sentence`, so the daemon's and the client's account of one
+    /// refusal cannot drift (LESSON-456).
+    #[must_use]
+    pub fn repo_context_generation_denial_note(&self, key: &str) -> Option<String> {
+        let policy = self
+            .policy
+            .lock()
+            .expect("permission policy mutex poisoned");
+        let level = policy.level()?;
+        (policy.table().policy_for(key) == PermissionPolicy::Deny)
+            .then(|| level.denial_sentence(&generation_denial_subject()))
+    }
+
     /// Forget every remembered grant a session root move invalidates (REQ-585
     /// ADR-6, REQ-587 ASSUME-017), answering how many were dropped.
     ///
@@ -2580,13 +2934,19 @@ impl PermissionGate {
     /// source in the key narrows the collision to project-vs-project; dropping
     /// these closes it.
     ///
-    /// **Two families since REQ-587**, and the reason they are swept together is
-    /// the reason the predicate is a function: a project skill's
-    /// dynamic-context grant *and* the project-skill acknowledgment
-    /// ([`project_skill_trust_key`]) both mean "this root", and an
+    /// **Three families since REQ-613**, and the reason they are swept together
+    /// is the reason the predicate is a function: a project skill's
+    /// dynamic-context grant, the project-skill acknowledgment
+    /// ([`project_skill_trust_key`]) and the repository-notes generation offer
+    /// ([`repo_context_generation_key`]) all mean "this root", and an
     /// acknowledgment that outlived the root would let the model run a *second*
     /// repository's skills as instructions on an answer the user gave about a
-    /// first. [`expires_on_session_root_change`] is the one invalidation rule,
+    /// first. The third one is what makes this doc's "no new code at either
+    /// store" claim testable rather than rhetorical: REQ-613 added a root-scoped
+    /// consent and changed neither sweep — only the predicate — and
+    /// `a_generation_grant_is_keyed_by_root_and_expires_in_both_stores_on_cd`
+    /// is what says so on this side.
+    /// [`expires_on_session_root_change`] is the one invalidation rule,
     /// spelled above both crates because the client's `SessionGrants` memoizes
     /// the same keys and consults its copy *before* drawing any prompt — two
     /// stores that disagreed about which keys expire would auto-answer the new
@@ -3133,6 +3493,21 @@ pub fn option_remembers_for_session(option_id: &str) -> bool {
     matches!(
         option_id,
         OPTION_ALLOW_ALWAYS | OPTION_REJECT_ALWAYS | OPTION_ID_ENABLE_PERMANENT
+    )
+}
+
+/// How a level's refusal of REQ-613's generation offer names the act it
+/// refused — the *display* half of
+/// [`PermissionGate::repo_context_generation_denial_note`].
+///
+/// Composed from the same `match` the loader reads the file name by, so the
+/// sentence and the file cannot come to disagree; and carrying **no root**,
+/// because the key that decides the refusal is absolute and this string is read
+/// by a person and written to a transcript.
+fn generation_denial_subject() -> String {
+    format!(
+        "writing {}",
+        crate::repo_context::file_name(RepoContextSource::TetonMd)
     )
 }
 
@@ -6886,6 +7261,404 @@ mod tests {
             "one answer, one key: a `p` about a repository must not answer \
              whether any skill's commands may run"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-613 ADR-2 — the generation offer's key, and where it expires
+    // -----------------------------------------------------------------------
+
+    /// **BR-2 / ASSUME-017: one answer, one repository — and a `/cd` takes it
+    /// back in both stores.**
+    ///
+    /// Three claims, and each is a way the same consent could go wide:
+    ///
+    /// 1. **The key is the durable root's.** Two spellings of one directory
+    ///    mint one key; two directories never do (LESSON-495). Asserted on keys
+    ///    this test never writes down — the derivation is driven end to end
+    ///    from real directories through
+    ///    `durable_trust_root_name_by_resolving` and
+    ///    [`repo_context_generation_key`], because a test that hands the minter
+    ///    its own key exercises the consumer and leaves the derivation
+    ///    unguarded (LESSON-552). That is not hypothetical for this key: the
+    ///    display spelling is *right there* on the same `TrustRoot`, it is
+    ///    home-relative and not injective, and keying on it would be invisible
+    ///    to any test that spelled a key literally.
+    /// 2. **A grant answers its own root and no other.** `AllowAlways` under
+    ///    root A settles A's second offer with no prompt, and root B's offer
+    ///    still reaches a human. The pair is the test (LESSON-479): without the
+    ///    B leg, "it stopped asking" is equally consistent with a gate that
+    ///    remembers nothing about roots at all.
+    /// 3. **A root move expires it — in the daemon *and* in the CLI's memo.**
+    ///    [`PermissionGate::drop_project_skill_grants`] is the daemon half and
+    ///    is driven here. The client half is one hop across a crate boundary
+    ///    this test cannot reach, so what is asserted here is the thing both
+    ///    stores read — [`expires_on_session_root_change`] — and
+    ///    `session_ui::tests::a_root_move_forgets_the_repository_notes_generation_grant`
+    ///    drives the client's `SessionGrants` against the same predicate. Two
+    ///    stores that disagreed about which keys expire would auto-answer the
+    ///    new root's question with the old root's answer, with no human shown
+    ///    anything (ASSUME-017), and neither test alone can see that.
+    ///
+    /// The final leg is the falsification for (3): after the drop, root A is
+    /// asked *again*. Without it, "the grant is gone" is equally consistent
+    /// with a gate that has stopped consulting grants.
+    ///
+    /// **Mutations, both run.** Key on `root.display` instead of `root.durable`
+    /// and leg 1's non-vacuity assertion fails naming the key it got
+    /// (`repo_context:generate:~/dev/alpha`) — that assertion, not the
+    /// A-vs-B one, is what catches this, because the two fixtures have distinct
+    /// *display* spellings too and would still not collide. Narrow the sweep in
+    /// [`PermissionGate::drop_project_skill_grants`] back to the two pre-REQ-613
+    /// families — the shape a build that added the key and forgot the predicate
+    /// would have — and leg 3 fails with `left: 0, right: 2`. The same narrowing
+    /// applied to [`expires_on_session_root_change`] itself reddens this test
+    /// *and* the client's, which is the ASSUME-017 pair.
+    #[tokio::test]
+    async fn a_generation_grant_is_keyed_by_root_and_expires_in_both_stores_on_cd() {
+        use crate::harness::tools::skill::durable_trust_root_name_by_resolving;
+
+        let base = std::env::temp_dir().join(format!(
+            "teton-generation-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let repo_a = base.join("alpha");
+        let repo_b = base.join("beta");
+        std::fs::create_dir_all(&repo_a).expect("the fixture tree");
+        std::fs::create_dir_all(&repo_b).expect("the fixture tree");
+
+        let mint = |path: &std::path::Path, display: &str| {
+            let durable = durable_trust_root_name_by_resolving(path)
+                .unwrap_or_else(|| panic!("{} did not canonicalise", path.display()));
+            repo_context_generation_key(TrustRoot {
+                display,
+                durable: Some(&durable),
+            })
+            .expect("a root with a canonical name mints a key")
+        };
+
+        // (1) One directory, two spellings, one key — and `alpha/.` is a
+        // spelling a shell hands over routinely.
+        let key_a = mint(&repo_a, "~/dev/alpha");
+        let key_a_again = mint(&repo_a.join("."), "~/dev/alpha");
+        let key_b = mint(&repo_b, "~/dev/beta");
+        assert_eq!(
+            key_a, key_a_again,
+            "two spellings of one directory must share one answer, or a user is \
+             asked twice about the same repository"
+        );
+        assert_ne!(
+            key_a, key_b,
+            "two directories must never share a key: consent to write notes in \
+             one repository would authorize a write into the other (LESSON-495)"
+        );
+        assert!(
+            key_a.contains("alpha") && !key_a.contains("~"),
+            "non-vacuity: the key is minted from the *durable* root, not the \
+             home-relative display the prompt shows — `{key_a}`"
+        );
+
+        // A root whose canonical name does not exist mints nothing, and the
+        // caller reads that as `Suppressed` rather than proceeding under a name
+        // that names nothing (REQ-591 BR-6, fail closed).
+        assert_eq!(
+            repo_context_generation_key(TrustRoot {
+                display: "~/dev/alpha",
+                durable: None,
+            }),
+            None,
+            "a root that will not canonicalise has no key, so there is no \
+             prompt and no grant to remember"
+        );
+
+        let (gate, route, _bus, _pending, conn) = wired(
+            |bus, pending| {
+                PermissionGate::with_level(
+                    SessionId::from("s1"),
+                    PermissionLevel::Guarded,
+                    Vec::new(),
+                    bus,
+                    pending,
+                )
+            },
+            RouteBehaviour::Answers(OPTION_ALLOW_ALWAYS),
+        );
+        let offer = |key: &str, display: &'static str, durable: String| {
+            let key = key.to_owned();
+            let gate = &gate;
+            async move {
+                gate.authorize_repo_context_generation(
+                    &key,
+                    TrustRoot {
+                        display,
+                        durable: Some(&durable),
+                    },
+                    false,
+                    conn,
+                )
+                .await
+            }
+        };
+        let durable_a = durable_trust_root_name_by_resolving(&repo_a).expect("canonical alpha");
+        let durable_b = durable_trust_root_name_by_resolving(&repo_b).expect("canonical beta");
+
+        assert_eq!(
+            offer(&key_a, "~/dev/alpha", durable_a.clone()).await,
+            GenerationConsent::Allowed {
+                scope: GenerationScope::Session
+            },
+            "a human answered `allow_always`, so the scope names what the grant \
+             map now holds rather than what the option was called"
+        );
+        assert_eq!(route.delivered().len(), 1, "the first offer asked a human");
+
+        // (2) The grant answers its own root…
+        assert_eq!(
+            offer(&key_a, "~/dev/alpha", durable_a.clone()).await,
+            GenerationConsent::Allowed {
+                scope: GenerationScope::Session
+            }
+        );
+        assert_eq!(
+            route.delivered().len(),
+            1,
+            "once per session per root: the second offer at alpha was answered \
+             by the grant, not by a human"
+        );
+
+        // …and no other. This is the leg that makes the one above mean
+        // something.
+        assert_eq!(
+            offer(&key_b, "~/dev/beta", durable_b.clone()).await,
+            GenerationConsent::Allowed {
+                scope: GenerationScope::Session
+            }
+        );
+        assert_eq!(
+            route.delivered().len(),
+            2,
+            "alpha's answer is not beta's: a grant keyed on anything coarser \
+             than the root would have written beta's notes with nobody asked"
+        );
+
+        // (3) `/cd`. The daemon drops both keys…
+        assert!(
+            expires_on_session_root_change(&key_a) && expires_on_session_root_change(&key_b),
+            "the generation key is one of the families a root move invalidates \
+             — this is the predicate the CLI's `SessionGrants` reads too \
+             (ASSUME-017), and the client half is pinned in `session_ui`"
+        );
+        assert_eq!(
+            gate.drop_project_skill_grants(),
+            2,
+            "both roots' answers are about roots this session has left"
+        );
+        assert_eq!(
+            gate.grant_keys(),
+            Vec::<String>::new(),
+            "nothing root-scoped survives the move"
+        );
+
+        // (4) …and the drop costs a question, which is the whole point of it.
+        assert_eq!(
+            offer(&key_a, "~/dev/alpha", durable_a).await,
+            GenerationConsent::Allowed {
+                scope: GenerationScope::Session
+            }
+        );
+        assert_eq!(
+            route.delivered().len(),
+            3,
+            "after a `/cd` the offer is put to a human again; a grant that \
+             outlived its root would have answered it silently"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **BR-2: the door refuses a key that is not this root's — in a release
+    /// build too — and a root with no canonical name is one of those.**
+    ///
+    /// The sibling of `each_skill_door_refuses_the_others_key_in_every_build_profile`,
+    /// and it exists for the reason that one does: an assertion is absent from
+    /// the shipped binary, and this door accepts any `&str`. Three misroutes,
+    /// each of which would remember an answer under a question nobody was asked.
+    ///
+    /// The `durable: None` leg is the fail-closed one REQ-591 BR-6 asks for and
+    /// the reason this check is a hard return rather than the acknowledgment
+    /// door's `debug_assert_eq!`: the mint is an `Option`, so a release build
+    /// has to have an answer for a root that will not canonicalise.
+    ///
+    /// **Mutation:** turn either guard into a `debug_assert!` and this goes red
+    /// under `--release`; drop the exact-root check and the third leg goes red
+    /// in every profile.
+    #[tokio::test]
+    async fn the_generation_door_refuses_any_key_but_this_roots() {
+        for (key, durable, what) in [
+            (
+                skill_permission_key_for(SkillSource::Project, "deploy"),
+                Some(DURABLE),
+                "a skill's own key",
+            ),
+            (
+                project_skill_trust_key(InvokedBy::User, DISPLAY),
+                Some(DURABLE),
+                "the acknowledgment's key",
+            ),
+            (
+                repo_context_generate_key("/Users/fixture/dev/somewhere-else"),
+                Some(DURABLE),
+                "another repository's generation key",
+            ),
+            (
+                repo_context_generate_key(DURABLE),
+                None,
+                "a root that will not canonicalise",
+            ),
+        ] {
+            let (gate, route, _bus, _pending, conn) = wired(
+                |bus, pending| {
+                    PermissionGate::new(
+                        SessionId::from("s1"),
+                        PermissionConfig::with_default(PermissionPolicy::Ask),
+                        bus,
+                        pending,
+                    )
+                },
+                RouteBehaviour::Answers(OPTION_ALLOW_ALWAYS),
+            );
+            assert_eq!(
+                gate.authorize_repo_context_generation(
+                    &key,
+                    TrustRoot {
+                        display: DISPLAY,
+                        durable,
+                    },
+                    false,
+                    conn,
+                )
+                .await,
+                GenerationConsent::RefusedUnattended,
+                "{what}: the door must refuse rather than remember an answer \
+                 under a question nobody asked"
+            );
+            assert!(
+                route.delivered().is_empty(),
+                "{what}: nothing was put in front of anyone"
+            );
+            assert_eq!(
+                gate.grant_keys(),
+                Vec::<String>::new(),
+                "{what}: and nothing was remembered"
+            );
+        }
+    }
+
+    /// **BR-2: an offer nobody could be asked about is `RefusedUnattended`, and
+    /// the gate draws nothing further.**
+    ///
+    /// The four ways no human answers, and they must not be told apart by the
+    /// caller because the wire has one word for them
+    /// (`GenerationOutcome::RefusedUnattended`) and the user has one sentence:
+    /// *nobody was asked, your next stdin line is still your next prompt, and
+    /// the session proceeded cold.* What must never happen is the other
+    /// sentence — [`GenerationConsent::Declined`] says a human decided, and on
+    /// a pipe nobody did.
+    ///
+    /// `NoTerminal` is BR-2's piped-stdin rule and `UnrecognizedSubject` is the
+    /// REQ-612-vintage client meeting a REQ-613 daemon; the other two are the
+    /// question never reaching anyone at all. The last of those,
+    /// [`RouteBehaviour::GoesAway`], is the one an implementation could get
+    /// wrong by waiting: it is a client that took the frame and then
+    /// disconnected, and the gate has to answer rather than park.
+    ///
+    /// **"Draws nothing further"** is three assertions, because there are three
+    /// ways a refusal could grow into something: one delivery attempt and no
+    /// retry, an untouched bus (a refused *addressed* prompt must not fall back
+    /// to the broadcast every attached client sees — ADR-7's whole point), and
+    /// an empty grant map, so the next offer at this root asks rather than
+    /// inheriting a refusal nobody gave.
+    ///
+    /// **Mutation:** map `Settled::Refused(_)` to `Declined` and every leg fails
+    /// naming the reason; fall back to `self.events.publish` when the route
+    /// refuses the frame and the bus assertion fails.
+    #[tokio::test]
+    async fn a_client_refusal_of_the_generation_offer_is_unattended_and_draws_nothing_further() {
+        for (behaviour, delivered, what) in [
+            (
+                RouteBehaviour::RefusesWithoutAsking(RefusalReason::NoTerminal),
+                1,
+                "a piped session, where the client refuses without reading a line",
+            ),
+            (
+                RouteBehaviour::RefusesWithoutAsking(RefusalReason::UnrecognizedSubject),
+                1,
+                "a client too old to know what this question is",
+            ),
+            (
+                RouteBehaviour::RefusesTheFrame,
+                1,
+                "a connection that would not take the frame",
+            ),
+            (
+                RouteBehaviour::GoesAway,
+                1,
+                "a client that took the frame and disconnected",
+            ),
+        ] {
+            let (gate, route, bus, _pending, conn) = wired(
+                |bus, pending| {
+                    PermissionGate::new(
+                        SessionId::from("s1"),
+                        PermissionConfig::with_default(PermissionPolicy::Ask),
+                        bus,
+                        pending,
+                    )
+                },
+                behaviour,
+            );
+            let mut sub = bus.subscribe(16);
+            let key = repo_context_generate_key(DURABLE);
+
+            assert_eq!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    gate.authorize_repo_context_generation(
+                        &key,
+                        TrustRoot {
+                            display: DISPLAY,
+                            durable: Some(DURABLE),
+                        },
+                        false,
+                        conn,
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| panic!(
+                    "{what}: the offer parked on an answer that was never coming"
+                )),
+                GenerationConsent::RefusedUnattended,
+                "{what}: nobody decided anything, and the line the user reads \
+                 must not say they declined"
+            );
+            assert_eq!(
+                route.delivered().len(),
+                delivered,
+                "{what}: one attempt, and no retry after a refusal"
+            );
+            assert!(
+                sub.try_recv().is_none(),
+                "{what}: a refused addressed prompt must not fall back to the \
+                 bus, where every attached connection would see it"
+            );
+            assert_eq!(
+                gate.grant_keys(),
+                Vec::<String>::new(),
+                "{what}: a refusal nobody gave is not an answer to remember"
+            );
+        }
     }
 
     fn over_budget_gate(

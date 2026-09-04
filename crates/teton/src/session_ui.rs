@@ -10807,6 +10807,86 @@ mod skill_tests {
         );
     }
 
+    /// **REQ-613 ADR-2 / ASSUME-017: the offer to write a repository's notes is
+    /// the third family a `/cd` forgets here — and this store needed no new code
+    /// to do it.**
+    ///
+    /// That is the claim worth a test rather than a comment. REQ-613 added a
+    /// root-scoped consent (`repo_context:generate:<root>`) and touched neither
+    /// sweep: the daemon's `PermissionGate::drop_project_skill_grants` and this
+    /// [`SessionGrants::forget_root_scoped_grants`] both read
+    /// [`teton_protocol::methods::expires_on_session_root_change`], so naming
+    /// the family in that one predicate expired it at both stores at once. A
+    /// build that had added the key and left the predicate alone would keep the
+    /// grant *here* while the daemon dropped it there — and this memo is
+    /// consulted **before** any prompt is drawn, so the daemon's re-ask after
+    /// the move would be auto-answered from the previous repository's approval:
+    /// one `auto-allow` line, and Teton writes a file into a repository nobody
+    /// was asked about.
+    ///
+    /// The daemon half is
+    /// `permissions::tests::a_generation_grant_is_keyed_by_root_and_expires_in_both_stores_on_cd`,
+    /// which drives the real gate and the real minter. Neither test alone can
+    /// see the disagreement ASSUME-017 is about; the pair is the assertion.
+    ///
+    /// **Mutation.** Dropping `is_repo_context_generate_key` from
+    /// `expires_on_session_root_change` reddens this test on its first
+    /// assertion — that call *is* the predicate under mutation — and the
+    /// daemon-side test with it; the sweep-narrowing half of that was run for
+    /// real on the daemon side (`drop_project_skill_grants` retaining only the
+    /// two pre-REQ-613 families: `left: 0, right: 2`). The falsification run
+    /// here put a user-skill key in the generation key's slot, and this test
+    /// fails naming it — so the assertion discriminates between the families
+    /// rather than passing for any string.
+    #[test]
+    fn a_root_move_forgets_the_repository_notes_generation_grant() {
+        use teton_protocol::methods::{expires_on_session_root_change, repo_context_generate_key};
+
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.session_id = Some(SessionId::from("s1"));
+
+        // The key is minted, never spelled: a change to its shape moves this
+        // assertion with it, and a mutation that changes what the daemon writes
+        // changes what this compares.
+        let allowed = repo_context_generate_key("/Users/fixture/dev/before");
+        let refused = repo_context_generate_key("/Users/fixture/dev/vendored");
+        state.grants.allow_always(&allowed);
+        // Both halves, because both are answers about a root this session is
+        // leaving — and dropping a refusal costs at most one question, which is
+        // the direction to be wrong in.
+        state.grants.reject_always(&refused);
+        state.grants.allow_always("shell");
+
+        for key in [&allowed, &refused] {
+            assert!(
+                expires_on_session_root_change(key),
+                "`{key}` is one of the families a `/cd` invalidates — this store \
+                 and the daemon's gate read that one predicate, and a family \
+                 named in neither would be a grant that outlived its root",
+            );
+        }
+
+        render_event(&root_moved("s1"), &mut surface, &mut state);
+
+        assert!(
+            !state.grants.is_allow_always(&allowed),
+            "a `y` to writing `~/dev/before`'s notes answered nothing about the \
+             repository this session just moved to",
+        );
+        assert!(
+            !state.grants.is_reject_always(&refused),
+            "and neither did the `n`",
+        );
+        // Falsification: without this, "the grants are gone" is equally
+        // consistent with a store that forgot everything.
+        assert!(
+            state.grants.is_allow_always("shell"),
+            "`shell` is not root-scoped, and a sweep that took it would re-ask a \
+             question whose answer is still true"
+        );
+    }
+
     /// Another session's `/cd` re-derives nothing here — the bus is daemon-wide,
     /// and this client's registry is about this client's root. Under the same
     /// condition the root cache itself is written under, so the two cannot come

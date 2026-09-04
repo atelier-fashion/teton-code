@@ -1,7 +1,7 @@
 ---
 id: TASK-384
 title: "`authorize_repo_context_generation`: the fourth gate entry point, its key, and expiry in both stores"
-status: draft
+status: complete
 parent: REQ-613
 repo: teton-code
 created: 2026-09-03
@@ -29,14 +29,14 @@ gate **and** the CLI's `SessionGrants` through the shared predicate (ASSUME-017)
 
 ## Acceptance Criteria
 
-- [ ] BR-2: at `guarded` and `edits` a prompt is published with the subject naming root, path
+- [x] BR-2: at `guarded` and `edits` a prompt is published with the subject naming root, path
       and `replace`; `plan` returns `Denied` with no prompt (and no event — the short-circuit is
       the caller's, but the gate's own `plan` arm is asserted too); `full` returns `Allowed` with
       no prompt and `pending_count() == 0` (LESSON-524's test shape, with the timeout guard).
-- [ ] `AllowAlways` under `repo_context:generate:<root A>` does not answer root B; a `/cd`
+- [x] `AllowAlways` under `repo_context:generate:<root A>` does not answer root B; a `/cd`
       drops the key in the daemon **and** the CLI memo (drive both, ASSUME-017).
-- [ ] A `Refused(NoTerminal)` answer yields `RefusedUnattended` and draws nothing further.
-- [ ] `replace: true` renders a different sentence than `replace: false` (the human sees which
+- [x] A `Refused(NoTerminal)` answer yields `RefusedUnattended` and draws nothing further.
+- [x] `replace: true` renders a different sentence than `replace: false` (the human sees which
       question is on screen).
 
 ## Verification

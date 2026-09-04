@@ -75,6 +75,32 @@
 //! | make either door's key-family guard a `debug_assert!` again | [`each_skill_door_refuses_the_others_key_in_every_build_profile`] |
 //! | report every consent as the user's | [`the_consent_reports_the_caller_that_invoked_the_skill`] |
 //!
+//! ## REQ-613 — the fourth door, on the same instrument
+//!
+//! TASK-384 adds the offer to write a repository's missing `TETON.md`. It is
+//! not a skill question, but it is the *same* question this file exists to ask:
+//! an answer to one repository must not answer another, and a level's posture
+//! must be the level's rather than a prompt's. The two claims it adds are the
+//! callability split (LESSON-524) and the one the destructive form needs — that
+//! `--force` reaches the human as a different question.
+//!
+//! | AC | Test |
+//! |----|------|
+//! | BR-2 / AC-2 (level table, no prompt where none is owed) | [`the_generation_offer_asks_at_guarded_and_edits_denies_at_plan_and_allows_at_full_without_a_prompt`] |
+//! | BR-2 / BR-8 (`--force` is a different question) | [`the_generation_subject_says_whether_an_existing_file_would_be_replaced`] |
+//!
+//! | Mutation | Test that fails |
+//! |----------|-----------------|
+//! | let the offer ask at `full` (`LevelAllow::DoesNotSettle`) | [`the_generation_offer_asks_at_guarded_and_edits_denies_at_plan_and_allows_at_full_without_a_prompt`] |
+//! | fold `plan`'s refusal into a human's decline | [`the_generation_offer_asks_at_guarded_and_edits_denies_at_plan_and_allows_at_full_without_a_prompt`] |
+//! | render the denial note from the absolute key it looked up | [`the_generation_offer_asks_at_guarded_and_edits_denies_at_plan_and_allows_at_full_without_a_prompt`] |
+//! | drop `replace` on the way to the subject | [`the_generation_subject_says_whether_an_existing_file_would_be_replaced`] |
+//!
+//! The key's own claims — one directory mints one key, two never share one, and
+//! a `/cd` expires it in both stores — are in
+//! `permissions::tests::a_generation_grant_is_keyed_by_root_and_expires_in_both_stores_on_cd`,
+//! which can reach the daemon-internal minter this file cannot.
+//!
 //! ## What this file cannot prove (TASK-215)
 //!
 //! It **invents** a [`ConnectionId`] and hands it to the gate, so every test
@@ -109,7 +135,8 @@ use teton_protocol::SessionId;
 use tetond::broadcast::{EventBus, Subscription};
 use tetond::grants::{ConnectionId, GrantRegistry};
 use tetond::harness::permissions::{
-    skill_grant_key, AddressedPermissionDelivery, ArgumentInterpolation, PendingPermissions,
+    repo_context_generation_key, skill_grant_key, AddressedPermissionDelivery,
+    ArgumentInterpolation, GenerationConsent, GenerationScope, PendingPermissions,
     PermissionDecision, PermissionGate, SkillConsent, TrustRoot,
 };
 use tetond::skills::{permission_key_for, SkillSource};
@@ -2268,6 +2295,306 @@ async fn each_skill_door_refuses_the_others_key_in_every_build_profile() {
         )
         .await,
         SkillConsent::Allowed
+    );
+    answerer.stop();
+}
+
+// ---------------------------------------------------------------------------
+// REQ-613 — the fourth door: may Teton write this repository's missing notes?
+// ---------------------------------------------------------------------------
+//
+// The same instrument, a fourth question. What is being asserted is the split
+// LESSON-524 names: a capability that is *present* at every level is not
+// thereby *usable* at every level, and the two claims have different failure
+// modes. Here the two are inverted relative to REQ-577's — `plan` must refuse,
+// and `full` must not ask — so both directions are driven off
+// `PermissionLevel::ALL` with an exhaustive `match`, which makes a fifth level
+// a compile error rather than a leg nobody wrote.
+
+/// The generation offer's two spellings of one root, as the door takes them.
+///
+/// Two different literals, for the acknowledgment fixtures' reason (REQ-591
+/// D-9): the prompt shows the home-relative name and the key is minted from the
+/// canonical one, and a fixture that used one string for both could not tell
+/// which of them a subject or a key was carrying.
+///
+/// Literals here, and the derivation driven end to end **elsewhere**: an
+/// integration test cannot reach `durable_trust_root_name_by_resolving`, which
+/// is `#[cfg(test)]` inside the daemon. `permissions::tests::
+/// a_generation_grant_is_keyed_by_root_and_expires_in_both_stores_on_cd`
+/// expands real directories through the real minter, which is the leg
+/// LESSON-552 asks for; this file's claims are about the level table and the
+/// prompt, and neither depends on what the canonical name *is*.
+const GENERATION_DURABLE: &str = "/Users/fixture/dev/notes-repo";
+const GENERATION_DISPLAY: &str = "~/dev/notes-repo";
+
+/// Put REQ-613's offer to `gate`, under the key this root mints.
+///
+/// The key comes from [`repo_context_generation_key`] and is never spelled
+/// here, for [`invoke`]'s reason — a mutation that keys the offer on anything
+/// else changes what these tests compare.
+///
+/// **Bounded by [`PROMPT_WAIT`]**, for this file's standing reason and
+/// LESSON-524's. A level regression shows up as a *count* here, because
+/// [`Answerer`] answers whatever it is handed — but the two ways this offer
+/// never returns at all are a prompt published to the bus instead of routed
+/// (ADR-7's defect, which no one in this test is listening for) and a door that
+/// registers a waiter and delivers nothing. Both are hangs without the bound,
+/// and a hang reads as infrastructure trouble and gets retried while a failure
+/// gets read.
+async fn offer(gate: &PermissionGate, replace: bool, from: ConnectionId) -> GenerationConsent {
+    let root = TrustRoot {
+        display: GENERATION_DISPLAY,
+        durable: Some(GENERATION_DURABLE),
+    };
+    let key = repo_context_generation_key(root).expect("a root with a canonical name mints a key");
+    tokio::time::timeout(
+        PROMPT_WAIT,
+        gate.authorize_repo_context_generation(&key, root, replace, from),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the offer to write `{GENERATION_DISPLAY}`'s notes was never answered \
+             within {PROMPT_WAIT:?} — either the level made it `ask` where BR-2 \
+             says it decides silently, or the prompt was not delivered to the \
+             connection that asked (ADR-7)"
+        )
+    })
+}
+
+/// **BR-2 / AC-2: `guarded` and `edits` ask, `plan` denies with no prompt, and
+/// `full` allows without one.**
+///
+/// ADR-2's level table, driven at the gate rather than read off `table_for`.
+/// The key is unlisted at every level — REQ-560 ADR-A refuses to enumerate open
+/// sets, and `repo_context:generate:<root>` is per-repository — so what is
+/// pinned here is that the *default* each level carries is the right posture
+/// for this act, and that nothing acquired a row of its own.
+///
+/// The two silent legs assert three things rather than one, because "allowed"
+/// and "allowed without being asked" are different claims and only the second
+/// is the level's: the answer, `pending_count() == 0` (no waiter was ever
+/// registered), and an untouched bus. The `plan` leg adds the denial note, which
+/// is the sentence AC-2's one line is built from — and asserts it carries the
+/// **level** and not the absolute root the key is minted from, since that string
+/// would put a username in a transcript.
+///
+/// `full` is the leg with the sharpest failure mode and the reason the timeout
+/// in [`offer`] exists: at `full` this call must return without anyone being
+/// asked, and the way that regresses is a parked prompt, not a wrong answer.
+///
+/// **Three mutations, all run.** Settle with `LevelAllow::DoesNotSettle` — the
+/// shape of a door that stopped letting `full` answer — and the `full` leg
+/// fails `Allowed { Once } != Allowed { Level }`, naming the level. Narrow
+/// `plan`'s settlement to `Declined` and the `plan` leg fails on the answer,
+/// because "a human said no" and "the level refused" send the user to different
+/// remedies. Render the denial note from the string it looked the policy up by
+/// — [`PermissionGate::denial_note`]'s own behaviour, and the reason this door
+/// has a second method — and the `plan` leg fails printing
+/// ``does not allow `repo_context:generate:/Users/fixture/dev/notes-repo` ``,
+/// which is the username the home-relative subject exists to keep out of a
+/// transcript.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_generation_offer_asks_at_guarded_and_edits_denies_at_plan_and_allows_at_full_without_a_prompt(
+) {
+    for level in PermissionLevel::ALL {
+        // Exhaustive, so a fifth level is a compile error here rather than a
+        // posture nobody decided (REQ-560 AC-17's rule, in the form Rust
+        // enforces).
+        let want = match level {
+            PermissionLevel::Guarded | PermissionLevel::Edits => GenerationConsent::Allowed {
+                scope: GenerationScope::Once,
+            },
+            PermissionLevel::Plan => GenerationConsent::Denied,
+            PermissionLevel::Full => GenerationConsent::Allowed {
+                scope: GenerationScope::Level,
+            },
+        };
+        let asked = matches!(
+            want,
+            GenerationConsent::Allowed {
+                scope: GenerationScope::Once
+            }
+        );
+
+        let conns = connections(1);
+        let Session {
+            gate,
+            pending,
+            mut bus_watch,
+            routed,
+        } = session_at(*level, "generation-levels", &conns);
+        let answerer = Answerer::spawn(
+            routed,
+            Arc::clone(&pending),
+            // One scripted answer only: a level that asked twice, or a `plan`
+            // that asked at all, runs the script out and is dismissed rather
+            // than quietly answered.
+            vec![selected("allow_once")],
+        );
+
+        assert_eq!(offer(&gate, false, conns[0]).await, want, "at {level}");
+        assert_eq!(
+            answerer.count(),
+            usize::from(asked),
+            "at {level}: whether a human is asked about writing the repository's \
+             notes is the level's answer"
+        );
+        assert_eq!(
+            pending.pending_count(),
+            0,
+            "at {level}: a decision the level made must register no waiter, and \
+             an answered prompt must leave none behind"
+        );
+        assert_nothing_was_broadcast(
+            &mut bus_watch,
+            "the generation offer is addressed to the connection whose session \
+             it is about, never published to every attached client",
+        );
+
+        let key = repo_context_generation_key(TrustRoot {
+            display: GENERATION_DISPLAY,
+            durable: Some(GENERATION_DURABLE),
+        })
+        .expect("a root with a canonical name mints a key");
+        match level {
+            PermissionLevel::Plan => {
+                let note = gate
+                    .repo_context_generation_denial_note(&key)
+                    .expect("`plan` refused it, so the level has a sentence for it");
+                assert!(
+                    note.contains(level.name()),
+                    "the sentence must name the level that refused, so the user \
+                     is told the remedy rather than that they declined: {note}"
+                );
+                assert!(
+                    !note.contains(GENERATION_DURABLE),
+                    "the note is decided by the absolute key and rendered \
+                     without it — a refusal must not carry a username into a \
+                     transcript: {note}"
+                );
+            }
+            PermissionLevel::Guarded | PermissionLevel::Edits | PermissionLevel::Full => {
+                assert_eq!(
+                    gate.repo_context_generation_denial_note(&key),
+                    None,
+                    "at {level} the level did not refuse, so there is no \
+                     level-refusal sentence to give — a note here would tell a \
+                     user nobody was asked when a human had just answered"
+                );
+            }
+        }
+
+        // Falsification for the two silent legs (LESSON-479): where a prompt
+        // *was* drawn, it carried the offer's own subject and the standard four
+        // options, so "nothing was asked" above is a level's doing rather than a
+        // door that has stopped asking anything.
+        if asked {
+            let request = &answerer.prompts()[0].request;
+            assert_eq!(
+                request.subject,
+                Some(PermissionSubject::RepoContextGeneration {
+                    root: GENERATION_DISPLAY.to_owned(),
+                    path: "TETON.md".to_owned(),
+                    replace: false,
+                }),
+                "at {level}: the human is answering about a named file in a \
+                 named repository, in the spelling that carries no username"
+            );
+            let ids: Vec<&str> = request
+                .options
+                .iter()
+                .map(|option| option.option_id.as_str())
+                .collect();
+            assert_eq!(
+                ids,
+                vec!["allow_once", "allow_always", "reject_once", "reject_always"],
+                "at {level}: once and for-this-session, and no durable fifth — \
+                 Teton never remembers a permission answer across sessions"
+            );
+            assert!(!ids.contains(&OPTION_ID_ENABLE_PERMANENT));
+        }
+        answerer.stop();
+    }
+}
+
+/// **BR-2 / BR-8: `--force` asks a different question, and the human sees which
+/// one is on screen.**
+///
+/// "Write the notes you do not have" and "replace the notes you do" are
+/// different offers with different consequences — the second destroys a file
+/// somebody may have written by hand — so the flag rides the *subject*, where
+/// the client builds its sentence from, rather than being known only to the
+/// caller. Asserted as the two subjects differing in exactly that field: a
+/// build that dropped `replace` on the floor would put one sentence on screen
+/// for both questions, and no client-side test could tell, because the daemon
+/// would never have said which was asked.
+///
+/// The `replace: false` half is the falsification: without it, "the subject
+/// says `replace: true`" is equally consistent with a door that hard-codes it.
+///
+/// **Mutation, run:** hard-code `replace: false` into the subject and the
+/// comparison fails printing both subjects side by side — two prompts that
+/// differ in nothing, which is exactly what the user would have seen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_generation_subject_says_whether_an_existing_file_would_be_replaced() {
+    let conns = connections(1);
+    let Session {
+        gate,
+        pending,
+        bus_watch: _bus_watch,
+        routed,
+    } = session_at(PermissionLevel::Guarded, "generation-replace", &conns);
+    let answerer = Answerer::spawn(
+        routed,
+        Arc::clone(&pending),
+        vec![selected("allow_once"), selected("allow_once")],
+    );
+
+    for replace in [true, false] {
+        assert_eq!(
+            offer(&gate, replace, conns[0]).await,
+            GenerationConsent::Allowed {
+                scope: GenerationScope::Once
+            },
+            "an `allow_once` answer buys this offer and nothing later"
+        );
+    }
+
+    let subjects: Vec<Option<PermissionSubject>> = answerer
+        .prompts()
+        .into_iter()
+        .map(|routed| routed.request.subject)
+        .collect();
+    assert_eq!(
+        subjects,
+        vec![
+            Some(PermissionSubject::RepoContextGeneration {
+                root: GENERATION_DISPLAY.to_owned(),
+                path: "TETON.md".to_owned(),
+                replace: true,
+            }),
+            Some(PermissionSubject::RepoContextGeneration {
+                root: GENERATION_DISPLAY.to_owned(),
+                path: "TETON.md".to_owned(),
+                replace: false,
+            }),
+        ],
+        "the two offers are the same root and the same file and differ in the \
+         one field the human is being asked about"
+    );
+    assert_ne!(
+        subjects[0], subjects[1],
+        "non-vacuity: two questions the client cannot tell apart are one \
+         question, and the destructive one would be the surprise"
+    );
+    assert_eq!(
+        answerer.count(),
+        2,
+        "an `allow_once` remembered nothing, so the second offer was put to a \
+         human too — which is also why the `replace` legs cannot be settled by \
+         each other's grant"
     );
     answerer.stop();
 }
