@@ -3,10 +3,11 @@
   "branch": "feat/REQ-616-local-engine-full-trained-window",
   "startedAt": "2026-09-04T19:34:00Z",
   "completed": false,
-  "currentPhase": 2,
+  "currentPhase": 3,
   "completedPhases": [
     0,
-    1
+    1,
+    2
   ],
   "phaseHistory": [
     {
@@ -19,6 +20,12 @@
       "name": "Validate Spec",
       "completedAt": "2026-09-04T19:41:22Z",
       "note": "3 blockers fixed (AC-3/AC-4/AC-5 arithmetic), BR-4/BR-5 clarified, OQ-1/OQ-2 resolved; approved on loop 2"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Tasks",
+      "completedAt": "2026-09-04T19:47:35Z",
+      "note": "7 ADRs; 9 tasks TASK-390..398; footprint published to PR #290"
     }
   ],
   "integrationBranch": "main",
