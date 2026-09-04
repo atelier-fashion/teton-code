@@ -250,6 +250,14 @@ impl CarriedTurn {
         // failing test. Restated rather than merged, for the reason
         // `with_system_sources` records.
         let mut ctx = ctx.with_system_sources(system_sources.clone());
+        // REQ-618 BR-8: the anchor set is re-stated, not carried, and both
+        // calls above already do it — `replay` at the end of the carried
+        // conversation and `push_user_from` once this turn's ask is on the end.
+        // So this seam owes no third call, and adding one would be a second
+        // spelling of a decision that has to have exactly one
+        // (`ContextManager::restate_anchors`). What it *does* owe is the
+        // ordering: the ask must be pushed after the replay, or the newest
+        // prompt block is the carried one and this turn's question is history.
         ctx.push_user_from(prompt, prompt_sources, prompt_unknown);
         Self {
             ctx: Some(ctx),
@@ -606,6 +614,7 @@ mod tests {
     fn model(text: &str) -> ContextBlock {
         ContextBlock {
             role: BlockRole::Assistant,
+            anchor: crate::harness::context::Anchor::None,
             text: text.to_owned(),
             provenance: Provenance::Model,
         }
@@ -614,6 +623,7 @@ mod tests {
     fn user(text: &str) -> ContextBlock {
         ContextBlock {
             role: BlockRole::User,
+            anchor: crate::harness::context::Anchor::None,
             text: text.to_owned(),
             provenance: Provenance::user(),
         }
@@ -622,6 +632,7 @@ mod tests {
     fn tool(text: &str) -> ContextBlock {
         ContextBlock {
             role: BlockRole::Tool,
+            anchor: crate::harness::context::Anchor::None,
             text: text.to_owned(),
             provenance: Provenance::Tool {
                 tool: "read".to_owned(),

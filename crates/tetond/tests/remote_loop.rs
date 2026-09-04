@@ -1002,51 +1002,63 @@ async fn a_128k_route_assembles_a_20000_word_prompt_whole_and_the_default_pair_c
         build_system_prompt(&rig.tools, &local),
         prompt.as_str(),
     );
-    drive(&mut source, &rig, &mut ctx, &local)
+    // REQ-618 BR-1 changed what "bounded" means on this half. The prompt is the
+    // turn's ask, and an ask may not be shortened, so the narrow pair no longer
+    // clamps it and sends a shortened question — it refuses the turn outright.
+    // The bound is therefore enforced *harder* than before: not "a smaller
+    // request reaches the provider" but "no request reaches it at all".
+    let err = drive(&mut source, &rig, &mut ctx, &local)
         .await
-        .expect("a clamped turn still completes — BR-4 degrades, it does not fail");
-
-    let sent = transport.requests()[0]["messages"]
-        .as_array()
-        .expect("messages")
-        .iter()
-        .filter_map(|m| m["content"].as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
+        .expect_err("the default pair must refuse a 20,000-word ask, not shorten it");
+    let HarnessError::AnchorsExceedBudget {
+        anchor_bytes,
+        budget_bytes,
+        anchor_kinds,
+        ..
+    } = &err
+    else {
+        panic!("the narrow pair must refuse by name: {err}");
+    };
+    assert!(*anchor_bytes > *budget_bytes, "{err}");
+    assert_eq!(anchor_kinds, "user_ask");
+    assert_eq!(
+        *budget_bytes, local.context_budget_bytes,
+        "the refusal carries the byte budget the gate enforced"
+    );
     assert!(
-        !sent.contains(&prompt),
-        "the default pair sent 20,000 words whole — the budget bounded nothing"
+        transport.requests().is_empty(),
+        "the default pair sent something — the budget bounded nothing: {} request(s)",
+        transport.requests().len()
     );
 
+    // BR-7's "nothing in silence" still holds, through the refusal rather than
+    // through an elision notice: the event names both figures and what could
+    // not be given up, and it never quotes what would not fit.
     let published = collect_events(&mut sub).await;
-    let pressure = pressure_events(&published);
-    let elision = pressure
+    let refusals: Vec<_> = published
         .iter()
-        .find(|p| p.newest_user_elided)
-        .unwrap_or_else(|| panic!("the clamp landed on the user's own message: {pressure:#?}"));
-    assert!(elision.elided_bytes > 0);
+        .filter_map(|e| match &e.event {
+            Event::TurnRefusedAnchorsExceedBudget(r) => Some(r),
+            _ => None,
+        })
+        .collect();
     assert_eq!(
-        elision.budget_tokens, local.context_budget_tokens as u64,
-        "the event carries the word budget the gate enforced"
+        refusals.len(),
+        1,
+        "one refusal, announced once: {published:#?}"
     );
-    assert_eq!(
-        elision.budget_bytes, local.context_budget_bytes as u64,
-        "and the byte budget, which is the one that actually bound here"
-    );
-    assert_eq!(elision.bound, local.budget.bound);
-
-    // BR-7's second surface. An elision of the newest *user* block is the one
-    // case where the model answers a prompt the user did not send, so it is
-    // reported in the turn the user is reading — not only on an event stream a
-    // client may render in a status line, or not at all.
-    let notice = streamed_text(&published);
+    assert_eq!(refusals[0].budget_bytes, local.context_budget_bytes as u64);
+    assert_eq!(refusals[0].anchor_kinds, vec!["user_ask".to_owned()]);
     assert!(
-        notice.contains("your message did not fit") && notice.contains(&local.budget.window_label),
-        "the newest-block elision was not reported in the turn's output: {notice}"
+        pressure_events(&published)
+            .iter()
+            .all(|p| !p.newest_user_elided),
+        "nothing was clamped, so nothing may say it was"
     );
+    let streamed = streamed_text(&published);
     assert!(
-        !notice.contains(&prompt[..64]),
-        "the notice must state what happened, never quote what was cut"
+        !streamed.contains(&prompt[..64]),
+        "no surface quotes what would not fit"
     );
 }
 

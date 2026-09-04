@@ -2650,6 +2650,7 @@ mod dispatch {
                     crate::harness::compact::compact_prompt(
                         &[crate::harness::context::ContextBlock {
                             role: crate::harness::context::BlockRole::User,
+                            anchor: crate::harness::context::Anchor::None,
                             text: "do the thing".to_owned(),
                             provenance: crate::harness::context::Provenance::user(),
                         }],
@@ -2970,8 +2971,12 @@ mod dispatch {
                 .expect("the stand-in answers the duty");
             // And with an answer the parser accepts, rather than one that
             // would make every pressured fixture report a duty failure.
-            let read = crate::harness::compact::read_compaction(&duty.text, blocks.len() - 1)
-                .expect("the stand-in's answer is a usable compaction");
+            let read = crate::harness::compact::read_compaction(
+                &duty.text,
+                blocks.len() - 1,
+                &std::collections::BTreeSet::new(),
+            )
+            .expect("the stand-in's answer is a usable compaction");
             assert_eq!(read.forget(), [0], "the oldest block, as the gate would");
 
             // The script has not moved: the next *turn* still gets block one.

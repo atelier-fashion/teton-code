@@ -102,10 +102,12 @@
 //! unchanged is the context the *turn* ends with, and the link-4 row is the
 //! mutation that proves it.
 
+use std::collections::BTreeSet;
+
 use teton_protocol::Category;
 
 use super::budget::LOCAL_GENERATION_RESERVATION;
-use super::context::{truncate_middle, ContextBlock, Provenance};
+use super::context::{truncate_middle, Anchor, ContextBlock, Provenance};
 use super::duty::{DutyKind, DUTY_REQUEST_BYTES_PER_TOKEN};
 use super::render::CHATML_DUTY_ENVELOPE_BYTES;
 use crate::runtime::LOCAL_ENGINE_N_CTX_DEFAULT;
@@ -350,6 +352,26 @@ const SUMMARY_MARKER: &str = "SUMMARY:";
 /// the sentence by `a_two_hundred_block_conversation_still_fits_the_duty_prompt`.
 const PROTECTED_BLOCK_NOTE: &str = "   (the step in progress — this block cannot be forgotten)\n";
 
+/// The note an **anchored** block is introduced with (REQ-618 BR-1).
+///
+/// Worded per kind rather than as one sentence, because the two are different
+/// things to a summarizer: one is what the person asked for and the other is
+/// the procedure the turn is following. A duty told only "cannot be forgotten"
+/// tends to summarize around the block; told what it is, it leaves it alone and
+/// spends its paragraph on the tool output instead.
+///
+/// Empty for an unanchored block, so the offer's byte accounting can add it
+/// unconditionally.
+const fn anchor_note(anchor: Anchor) -> &'static str {
+    match anchor {
+        Anchor::None => "",
+        Anchor::UserAsk => "   (the user's own question — this block cannot be forgotten)\n",
+        Anchor::SkillBody => {
+            "   (the skill body this turn is following — this block cannot be forgotten)\n"
+        }
+    }
+}
+
 /// The line that tells the duty exactly which slice of the conversation it was
 /// shown, and which block is protected (REQ-586 BR-6).
 ///
@@ -387,6 +409,15 @@ pub struct CompactOffer {
     prompt: String,
     offered: usize,
     total: usize,
+    /// Zero-based indices the duty may not name, beyond the step in progress
+    /// (REQ-618 BR-1).
+    ///
+    /// A *set* rather than a second count, because the anchors are not a
+    /// prefix: `droppable` can express "the leading n blocks" and nothing else,
+    /// while the ask can sit anywhere in the list — first on a fresh turn, in
+    /// the middle of a carried conversation. Expressing it as a count is what
+    /// would silently let one through.
+    protected: BTreeSet<usize>,
 }
 
 impl CompactOffer {
@@ -420,6 +451,13 @@ impl CompactOffer {
         } else {
             protected
         }
+    }
+
+    /// The anchored indices inside that range, which the duty may not name
+    /// either (REQ-618 BR-1).
+    #[must_use]
+    pub const fn protected(&self) -> &BTreeSet<usize> {
+        &self.protected
     }
 }
 
@@ -524,6 +562,16 @@ pub fn compact_offer(blocks: &[ContextBlock], prompt_budget_bytes: usize) -> Com
     // met whatever the loop decides.
     let footer_reserve = offer_footer(total, total).len();
     let mut offered = 0usize;
+    // REQ-618 BR-1: the anchor set, recorded whether or not each member was
+    // itself rendered. A duty shown blocks 1..20 of 200 must still be refused an
+    // answer naming block 3 if block 3 is the user's question — the same
+    // posture the step-in-progress note already takes.
+    let anchored: BTreeSet<usize> = blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.anchor.is_anchored())
+        .map(|(i, _)| i)
+        .collect();
     for (i, block) in blocks.iter().enumerate() {
         let line = format!(
             "{}. {}: {}\n",
@@ -532,10 +580,11 @@ pub fn compact_offer(blocks: &[ContextBlock], prompt_budget_bytes: usize) -> Com
             truncate_middle(&block.text, COMPACT_BLOCK_MAX_BYTES)
         );
         let protected = i + 1 == total;
+        let anchor_note = anchor_note(block.anchor);
         let extra = if protected {
             PROTECTED_BLOCK_NOTE.len()
         } else {
-            0
+            anchor_note.len()
         };
         if offered > 0 && prompt.len() + line.len() + extra + footer_reserve > prompt_budget_bytes {
             break;
@@ -543,6 +592,8 @@ pub fn compact_offer(blocks: &[ContextBlock], prompt_budget_bytes: usize) -> Com
         prompt.push_str(&line);
         if protected {
             prompt.push_str(PROTECTED_BLOCK_NOTE);
+        } else {
+            prompt.push_str(anchor_note);
         }
         offered += 1;
     }
@@ -556,6 +607,7 @@ pub fn compact_offer(blocks: &[ContextBlock], prompt_budget_bytes: usize) -> Com
         prompt,
         offered,
         total,
+        protected: anchored,
     }
 }
 
@@ -615,7 +667,11 @@ pub fn offered_block_count(prompt: &str) -> usize {
 /// may not be forgotten, an empty forget set, or an empty summary. Every one of
 /// them leaves the caller holding an explanation it can degrade with
 /// (LESSON-447).
-pub fn read_compaction(answer: &str, droppable: usize) -> Result<Compaction, String> {
+pub fn read_compaction(
+    answer: &str,
+    droppable: usize,
+    protected: &BTreeSet<usize>,
+) -> Result<Compaction, String> {
     let Some(forget_at) = answer.find(FORGET_MARKER) else {
         return Err(
             "the `compact` duty's answer named no blocks to forget (no `FORGET:` line)".to_owned(),
@@ -662,6 +718,19 @@ pub fn read_compaction(answer: &str, droppable: usize) -> Result<Compaction, Str
             return Err(format!(
                 "the `compact` duty's answer named block {n}, which it may not forget \
                  (blocks 1..={droppable} were offered)"
+            ));
+        }
+        // REQ-618 BR-1: an anchored block is refused by name, and the whole
+        // answer goes with it. Rejecting the *answer* rather than skipping the
+        // number is REQ-561 BR-4 unchanged — a compaction is applied whole or
+        // not at all, and silently keeping a block the duty's summary was
+        // written on the assumption of losing would leave the summary
+        // describing content that is still there.
+        if protected.contains(&(n - 1)) {
+            return Err(format!(
+                "the `compact` duty's answer named block {n}, which is part of this turn's \
+                 anchor set — the user's question, or the skill body the turn is running \
+                 under — and may not be forgotten"
             ));
         }
         if !taken[n - 1] {
@@ -985,8 +1054,12 @@ mod tests {
 
     #[test]
     fn a_well_formed_answer_reads_back_as_the_blocks_and_the_paragraph() {
-        let c = read_compaction("FORGET: 1, 3\nSUMMARY: they read one file.", 3)
-            .expect("a well-formed answer");
+        let c = read_compaction(
+            "FORGET: 1, 3\nSUMMARY: they read one file.",
+            3,
+            &BTreeSet::new(),
+        )
+        .expect("a well-formed answer");
         assert_eq!(c.forget(), [0, 2]);
         assert_eq!(c.summary(), "they read one file.");
     }
@@ -996,7 +1069,8 @@ mod tests {
     /// never drop more blocks than it named.
     #[test]
     fn a_repeated_or_unordered_answer_still_names_one_set_of_blocks() {
-        let c = read_compaction("FORGET: 3 3 1 3\nSUMMARY: x", 3).expect("readable");
+        let c =
+            read_compaction("FORGET: 3 3 1 3\nSUMMARY: x", 3, &BTreeSet::new()).expect("readable");
         assert_eq!(c.forget(), [0, 2]);
     }
 
@@ -1015,8 +1089,8 @@ mod tests {
             ("FORGET:\nSUMMARY: x", "no blocks named"),
             ("FORGET: none\nSUMMARY: x", "a word where a number belongs"),
         ] {
-            let err =
-                read_compaction(answer, 3).expect_err(&format!("{why} must fail the whole answer"));
+            let err = read_compaction(answer, 3, &BTreeSet::new())
+                .expect_err(&format!("{why} must fail the whole answer"));
             assert!(!err.is_empty(), "{why} must be explained");
         }
     }
@@ -1028,20 +1102,25 @@ mod tests {
     #[test]
     fn the_block_the_turn_is_working_on_cannot_be_forgotten() {
         // Four blocks offered, three droppable: 4 is the step in progress.
-        let err = read_compaction("FORGET: 1 4\nSUMMARY: x", 3).expect_err("4 is protected");
+        let err = read_compaction("FORGET: 1 4\nSUMMARY: x", 3, &BTreeSet::new())
+            .expect_err("4 is protected");
         assert!(err.contains("may not forget"), "{err}");
         // And it really is only the last one that is refused.
-        assert!(read_compaction("FORGET: 1 3\nSUMMARY: x", 3).is_ok());
+        assert!(read_compaction("FORGET: 1 3\nSUMMARY: x", 3, &BTreeSet::new()).is_ok());
     }
 
     /// A number nobody offered, and a number too large to be one, are both
     /// answers about a different conversation.
     #[test]
     fn a_number_that_was_never_offered_fails_the_whole_answer() {
-        assert!(read_compaction("FORGET: 0\nSUMMARY: x", 3).is_err());
-        assert!(read_compaction("FORGET: 99\nSUMMARY: x", 3).is_err());
-        let err = read_compaction(&format!("FORGET: {}\nSUMMARY: x", "9".repeat(64)), 3)
-            .expect_err("an overflowing number is still a number the duty meant");
+        assert!(read_compaction("FORGET: 0\nSUMMARY: x", 3, &BTreeSet::new()).is_err());
+        assert!(read_compaction("FORGET: 99\nSUMMARY: x", 3, &BTreeSet::new()).is_err());
+        let err = read_compaction(
+            &format!("FORGET: {}\nSUMMARY: x", "9".repeat(64)),
+            3,
+            &BTreeSet::new(),
+        )
+        .expect_err("an overflowing number is still a number the duty meant");
         assert!(err.contains("never offered"), "{err}");
     }
 
@@ -1088,7 +1167,7 @@ mod tests {
             long.len() - answer.len()
         );
         assert_eq!(
-            read_compaction(&answer, 3)
+            read_compaction(&answer, 3, &BTreeSet::new())
                 .expect("a whole answer parses")
                 .forget(),
             &[0, 1]
@@ -1233,7 +1312,7 @@ mod tests {
             )
             .await
             .expect("the local duty served");
-        let c = read_compaction(&answer, 3).expect("the answer parses");
+        let c = read_compaction(&answer, 3, &BTreeSet::new()).expect("the answer parses");
         assert_eq!(c.forget(), [0, 1]);
         assert!(c.summary().contains("src/download.rs"));
     }
@@ -1305,7 +1384,7 @@ mod tests {
             )
             .await
             .expect("with no boundary configured the duty sends");
-        let c = read_compaction(&answer, 3).expect("the answer parses");
+        let c = read_compaction(&answer, 3, &BTreeSet::new()).expect("the answer parses");
         assert_eq!(c.forget(), [0]);
         assert!(
             wire(&sent).contains("no longer fits the agent"),
@@ -1362,6 +1441,7 @@ mod tests {
     fn a_tool_block_is_introduced_by_its_tool() {
         let block = ContextBlock {
             role: BlockRole::Tool,
+            anchor: super::super::context::Anchor::None,
             text: "body".to_owned(),
             provenance: Provenance::Tool {
                 tool: "grep".to_owned(),
@@ -1369,5 +1449,108 @@ mod tests {
             },
         };
         assert_eq!(speaker(&block), "Tool (grep)");
+    }
+
+    // ---------------------------------------------------------------------
+    // REQ-618 BR-1/BR-2 — the anchor set is never on offer
+    // ---------------------------------------------------------------------
+
+    /// **BR-1.** An answer naming an anchored block is rejected **whole**, not
+    /// silently narrowed.
+    ///
+    /// Narrowing would be worse than rejecting: the duty's summary was written
+    /// on the assumption of losing every block it named, so keeping one back
+    /// leaves a paragraph describing content that is still in the context —
+    /// and, if the kept block is the user's question, a summary of the question
+    /// sitting beside the question. Whole-or-nothing is REQ-561 BR-4 unchanged.
+    ///
+    /// # Benign path
+    ///
+    /// The same offer, with an answer that names only droppable blocks, still
+    /// applies. A protection that retired compaction would be a different bug.
+    ///
+    /// # Inversion
+    ///
+    /// Dropping the `protected` check from `read_compaction` makes the first
+    /// half of this test pass an answer that forgets the ask.
+    #[test]
+    fn an_answer_naming_an_anchor_is_refused() {
+        let blocks = anchored_conversation();
+        let offer = compact_offer(&blocks, COMPACT_PROMPT_BUDGET_BYTES);
+        assert_eq!(
+            offer.protected(),
+            &BTreeSet::from([1, 2]),
+            "the fixture's anchors are blocks 2 and 3 (1-based); if these move \
+             the assertions below stop meaning what they say"
+        );
+
+        let err = read_compaction(
+            "FORGET: 1 2\nSUMMARY: they looked around.",
+            offer.droppable(),
+            offer.protected(),
+        )
+        .expect_err("block 2 is the user's question");
+        assert!(err.contains("anchor set"), "{err}");
+        assert!(err.contains("block 2"), "{err}");
+
+        let err = read_compaction(
+            "FORGET: 3\nSUMMARY: they looked around.",
+            offer.droppable(),
+            offer.protected(),
+        )
+        .expect_err("block 3 is the skill body this turn is following");
+        assert!(err.contains("anchor set"), "{err}");
+
+        // Benign: the same offer, an answer that names only what it may.
+        let ok = read_compaction(
+            "FORGET: 1\nSUMMARY: they looked around.",
+            offer.droppable(),
+            offer.protected(),
+        )
+        .expect("an answer that names only droppable blocks still applies");
+        assert_eq!(ok.forget(), [0]);
+    }
+
+    /// **BR-1/BR-2.** The prompt says which blocks are off limits and why, so
+    /// the duty spends its answer on blocks it can actually have.
+    ///
+    /// The note is worded per anchor kind. A summarizer told only "cannot be
+    /// forgotten" tends to summarize *around* the block; told that it is the
+    /// person's own question, it leaves it alone.
+    #[test]
+    fn an_anchored_block_is_marked_in_the_offer() {
+        let blocks = anchored_conversation();
+        let offer = compact_offer(&blocks, COMPACT_PROMPT_BUDGET_BYTES);
+        let prompt = offer.prompt();
+
+        assert!(
+            prompt.contains("the user's own question — this block cannot be forgotten"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("the skill body this turn is following"),
+            "{prompt}"
+        );
+        // And the step-in-progress note is unchanged and still marks exactly one
+        // block. (Counted on the note itself, not on the phrase: the footer
+        // names the protected block too, in its own sentence.)
+        assert_eq!(prompt.matches(PROTECTED_BLOCK_NOTE).count(), 1, "{prompt}");
+    }
+
+    /// `[tool, user(anchored), skill-body(anchored), tool]` — one anchored ask,
+    /// one anchored skill body, one droppable block ahead of them, and the step
+    /// in progress on the end.
+    ///
+    /// The trailing block matters: it keeps the *older* protection (the newest
+    /// block is the step in progress) off the two anchors, so the assertions
+    /// above are about REQ-618's rule rather than about the one it joined.
+    fn anchored_conversation() -> Vec<ContextBlock> {
+        let mut ctx = super::super::context::ContextManager::new("sys", 1_000_000);
+        ctx.push_tool_result("read", None, "a file");
+        ctx.push_user("what does this file do?");
+        ctx.push_tool_result("skill", None, "THE SKILL BODY");
+        ctx.anchor_last_as_skill_body();
+        ctx.push_tool_result("read", None, "another file");
+        ctx.blocks().to_vec()
     }
 }

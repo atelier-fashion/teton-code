@@ -39,8 +39,9 @@ use serde_json::Value;
 
 use teton_inference::{ChatFormat, Engine, EngineError, GenParams};
 use teton_protocol::events::{
-    CapabilityDeadEnd, ContextPressure, ContextPressureKind, Event, PrefixCache, SessionUpdate,
-    SessionUpdatePayload, ToolCallStatus,
+    CapabilityDeadEnd, CompactedBlock, CompactedBlockKind, ContextCompacted, ContextPressure,
+    ContextPressureKind, Event, PrefixCache, ProvenanceClass as WireProvenanceClass, SessionUpdate,
+    SessionUpdatePayload, ToolCallStatus, TurnRefusedAnchorsExceedBudget, COMPACTED_BLOCKS_LISTED,
 };
 use teton_protocol::methods::{SessionRoot, StopReason};
 use teton_protocol::{ProviderId, SessionId};
@@ -57,7 +58,10 @@ use super::compact::COMPACT_DUTY;
 use super::completion::{
     context_provenance, CompletionSource, LocalEngineSource, SourceTurn, TurnDecision,
 };
-use super::context::{summarize_if_large, ContextManager, PressureReport, ProvenanceHook};
+use super::context::{
+    summarize_if_large, BlockRole, CompactionRecord, ContextManager, PressureReport,
+    ProvenanceClass, ProvenanceHook,
+};
 use super::digest::DIGEST_DUTY;
 use super::duty::DutyRoute;
 use super::permissions::{PermissionDecision, PermissionGate};
@@ -235,6 +239,50 @@ pub enum HarnessError {
         /// The route's word budget, from the [`HarnessConfig`] the attempt ran
         /// under — never re-derived here.
         budget_tokens: usize,
+    },
+    /// The turn's **anchor set** alone exceeds the route's budget, so nothing
+    /// was sent (REQ-618 BR-1, AC-2).
+    ///
+    /// # Why this is not a `ContextLengthExceeded`
+    ///
+    /// Those two are a *provider's* answer, or the local engine's: the turn was
+    /// dispatched and refused. This one is refused by the daemon before any
+    /// dispatch, and the difference is what the sentence has to say — no
+    /// provider saw it, no health moved, and the remedy is the user's (a shorter
+    /// prompt) or the route's (a larger window), not a retry.
+    ///
+    /// It carries the pair in both currencies because the anchor set can be
+    /// over either half, and the kinds because the remedy depends on which
+    /// anchor is oversized: a pasted `user_ask` is shortened by the person who
+    /// pasted it, a `skill_body` by moving to a bigger route.
+    ///
+    /// # Both halves (conventions: *A typed outcome needs both halves*)
+    ///
+    /// It has no `failure_class` — nothing about it is a provider failure and
+    /// the retry/fallback/degrade machinery must not act on it — **and** it has
+    /// its own arm on the turn path in `runtime/turn.rs`. Without the second
+    /// half it would fall through to the generic remote arm and reach the user
+    /// as "provider failed unrecoverably", which is wrong about the cause and
+    /// names no remedy. That is the failure LESSON-557 records, and this is the
+    /// fourth outcome shaped this way.
+    #[error(
+        "this turn's {anchor_kinds} alone comes to about {anchor_tokens} words / {anchor_bytes} \
+         bytes, against a budget of {budget_tokens} words / {budget_bytes} bytes — and none of it \
+         may be shortened, so nothing was sent"
+    )]
+    AnchorsExceedBudget {
+        /// The anchor set's byte cost, system prompt included.
+        anchor_bytes: usize,
+        /// The anchor set's word cost, system prompt included.
+        anchor_tokens: usize,
+        /// The route's byte budget, from the [`HarnessConfig`] this turn ran
+        /// under — never re-derived.
+        budget_bytes: usize,
+        /// The route's word budget, from the same place.
+        budget_tokens: usize,
+        /// The kinds in the set, already joined for the sentence — `user_ask`,
+        /// or `user_ask and skill_body`.
+        anchor_kinds: String,
     },
 }
 
@@ -919,6 +967,90 @@ impl SessionEvents {
                 // budget the floor raised above that cap would be reporting a
                 // ceiling that is not in force (TASK-194 2b).
                 bound_floored: budget.floored,
+                // REQ-618 BR-1's witness, carried out of the manager exactly as
+                // measured. Never composed here: a call site that wrote `true`
+                // would be asserting the invariant rather than reporting it.
+                anchors_intact: report.anchors_intact,
+            }),
+        );
+    }
+
+    /// Announce what one compaction kept and let go (REQ-618 BR-5).
+    ///
+    /// Published on **every** compaction — the `compact` duty's, and the
+    /// mechanical truncation that stands in when the duty fails, which
+    /// `record.fallback` tells apart. Before this REQ a *successful* compaction
+    /// produced no event at all: the transcript held the duty's `route_decided`
+    /// line and nothing about what had been forgotten, which is how a session
+    /// could lose the user's ask ten times over with nothing in the file to show
+    /// for it.
+    ///
+    /// The provider is the *duty's*, not the turn's, because it is the duty
+    /// that ran — and `None` on the mechanical path, which ran on nothing. The
+    /// model is deliberately not carried; see the field's own doc.
+    pub fn context_compacted(&self, record: &CompactionRecord, provider_id: Option<&str>) {
+        self.bus.publish(
+            Some(self.session_id.clone()),
+            Event::ContextCompacted(ContextCompacted {
+                kept_bytes: record.kept_bytes as u64,
+                dropped_bytes: record.dropped_bytes as u64,
+                summarized_bytes: record.summarized_bytes as u64,
+                anchor_bytes: record.anchor_bytes as u64,
+                dropped_blocks_omitted: record
+                    .dropped_blocks
+                    .len()
+                    .saturating_sub(COMPACTED_BLOCKS_LISTED)
+                    as u64,
+                dropped_blocks: record
+                    .dropped_blocks
+                    .iter()
+                    .take(COMPACTED_BLOCKS_LISTED)
+                    .map(|&(role, class, bytes)| CompactedBlock {
+                        kind: match role {
+                            BlockRole::User => CompactedBlockKind::User,
+                            BlockRole::Assistant => CompactedBlockKind::Assistant,
+                            BlockRole::Tool => CompactedBlockKind::Tool,
+                        },
+                        provenance_class: match class {
+                            ProvenanceClass::None => WireProvenanceClass::None,
+                            ProvenanceClass::Rooted => WireProvenanceClass::Rooted,
+                            ProvenanceClass::Unknown => WireProvenanceClass::Unknown,
+                        },
+                        bytes: bytes as u64,
+                    })
+                    .collect(),
+                provider_id: provider_id.map(ToOwned::to_owned),
+                fallback: record.fallback,
+            }),
+        );
+    }
+
+    /// Announce that this turn's anchor set alone will not fit, so nothing was
+    /// sent (REQ-618 BR-1, AC-2).
+    ///
+    /// The outcome that replaced the middle-elision of the user's own message.
+    /// Published at the gate, before `prepare` — the last point at which
+    /// "no provider saw this turn" is still true.
+    pub fn turn_refused_anchors_exceed_budget(
+        &self,
+        anchor_bytes: usize,
+        anchor_tokens: usize,
+        anchor_kinds: Vec<String>,
+        budget_tokens: usize,
+        budget_bytes: usize,
+    ) {
+        self.bus.publish(
+            Some(self.session_id.clone()),
+            Event::TurnRefusedAnchorsExceedBudget(TurnRefusedAnchorsExceedBudget {
+                anchor_bytes: anchor_bytes as u64,
+                anchor_tokens: anchor_tokens as u64,
+                anchor_kinds,
+                // The pair the decision was taken on, handed in by the caller
+                // rather than read from a `RouteBudget` here — see the call
+                // site's note on why those are the same value in production and
+                // why this one is the honest one to print.
+                budget_tokens: budget_tokens as u64,
+                budget_bytes: budget_bytes as u64,
             }),
         );
     }
@@ -1989,7 +2121,18 @@ async fn run_the_allowed_tool(
     // what `note_committed` remembered and what is pushed
     // here are one string. Nothing may grow this block
     // between that check and this line.
+    let is_expansion = disposition == ResultDisposition::Expansion;
     ctx.push_tool_result_prov(name, provenance, folded);
+    // REQ-618 BR-2: a model-invoked skill expansion is the procedure this turn
+    // is following, so it is anchored for this turn and no longer. Unlike a
+    // typed `/name` — where the expansion *is* the prompt block and `UserAsk`
+    // already covers it — this one is a tool result and needs saying.
+    //
+    // Immediately after the push, because `anchor_last_as_skill_body` names the
+    // block on the end and any push between the two would move that.
+    if is_expansion {
+        ctx.anchor_last_as_skill_body();
+    }
     // The budget gate used to live here, right after the fold. It is now at the
     // top of the loop, which returning from this stage reaches before any
     // prompt is built — same measurement, one iteration later, and every
@@ -2135,16 +2278,72 @@ pub async fn run_session_turn_with_pressure_policy(
                      context was truncated deterministically instead"
                 );
             }
+            // REQ-618 BR-5: the duty's own compaction, recorded. Published
+            // before the hard gate runs, so the two events read in the order
+            // they happened — what the model chose to forget, then what the
+            // deterministic drop took on top of it.
+            if let Some(record) = &compaction.record {
+                events.context_compacted(record, compact.provider());
+            }
             // BR-7: never silent. This is the gate that fires on a carried
             // conversation meeting a smaller route (BR-10) and on a tool result
             // that outgrew the budget, so it is where most of this event comes
             // from.
-            announce_pressure(
-                events,
-                &ctx.truncate_to_budget(),
-                &config.budget,
-                &mut said_it_did_not_fit,
-            );
+            let report = ctx.truncate_to_budget();
+            // BR-5's other half, and AC-5's subject: when the duty could not be
+            // served, this drop *is* the compaction, so it owes the same record
+            // with `fallback: true`. `as_fallback_record` returns `None` for a
+            // gate that took nothing, which keeps the event's meaning — "a
+            // compaction happened" — true.
+            if let Some(record) = report.as_fallback_record() {
+                events.context_compacted(&record, None);
+            }
+            announce_pressure(events, &report, &config.budget, &mut said_it_did_not_fit);
+
+            // ---- REQ-618 BR-1 / AC-2: the anchors do not fit ----
+            //
+            // Placed **after** the gate above and **before** `prepare` below,
+            // which is the last point at which "nothing was sent and no
+            // provider saw this turn" is still true. The gate has by now
+            // dropped everything it is allowed to drop; if the ask, the
+            // previous ask and any active skill body still do not fit, there is
+            // nothing left to give up.
+            //
+            // Before this REQ the answer was to middle-elide the user's own
+            // message and answer the shortened version. That is the defect the
+            // REQ exists to close, and a refusal is the only other honest
+            // outcome: a turn that cannot hold the question must not answer it.
+            //
+            // Inside `enforces_this_iteration` on purpose. REQ-589 BR-12 / D-3
+            // suspends the gate for one iteration when the user was shown an
+            // over-budget measurement and accepted it — and a user who accepted
+            // an oversized expansion accepted *sending* it, which is exactly
+            // this turn. Refusing it here would answer their consent with a
+            // refusal.
+            if !ctx.anchors_fit() {
+                let anchor_kinds = ctx.anchor_kinds();
+                // The budgets come off the **manager**, not off `config.budget`,
+                // because the manager's pair is what `anchors_fit` just decided
+                // on. In production they are one value — `CarriedTurn::begin`
+                // seeds the manager from the same `RouteBudget` this config
+                // carries — so REQ-586 AC-12's single derivation is intact; the
+                // point of reading it here is that a refusal can never name a
+                // budget nothing was measured against.
+                events.turn_refused_anchors_exceed_budget(
+                    ctx.anchor_bytes(),
+                    ctx.anchor_tokens(),
+                    anchor_kinds.iter().map(|k| (*k).to_owned()).collect(),
+                    ctx.budget_tokens(),
+                    ctx.budget_bytes(),
+                );
+                return Err(HarnessError::AnchorsExceedBudget {
+                    anchor_bytes: ctx.anchor_bytes(),
+                    anchor_tokens: ctx.anchor_tokens(),
+                    budget_bytes: ctx.budget_bytes(),
+                    budget_tokens: ctx.budget_tokens(),
+                    anchor_kinds: anchor_kinds.join(" and "),
+                });
+            }
         }
 
         // ---- model call ----
@@ -4645,10 +4844,15 @@ mod tests {
         let tool_ctx = ToolContext::new(std::env::temp_dir());
         let mut hook = NoopProvenanceHook;
 
+        // REQ-618: droppable history, and one folded result too big to fit
+        // even clamped. The ask is small — it has to be, or the anchor gate
+        // would refuse the turn outright and no gate after the first would ever
+        // run. What keeps every gate over budget is the 1 KiB clamp floor on
+        // the newest block, which is the arm this test has always been about.
         let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(BUDGET_BYTES);
         ctx.push_user("do the thing");
         for i in 0..5 {
-            ctx.push_user(format!("block {i} {}", "x".repeat(1_000)));
+            ctx.push_tool_result("read", None, format!("block {i} {}", "x".repeat(1_000)));
         }
         assert!(
             ctx.estimated_bytes() > BUDGET_BYTES,
@@ -5076,6 +5280,12 @@ mod tests {
             elided_bytes,
             newest_user_elided: false,
             over_budget,
+            // A hand-built report for the kind classifier, which reads none of
+            // these; the real one comes from `truncate_to_budget`.
+            anchors_intact: true,
+            dropped: Vec::new(),
+            kept_bytes: 0,
+            anchor_bytes: 0,
         };
         // The three that fit.
         assert_eq!(
@@ -7824,6 +8034,115 @@ mod tests {
             .expect("the result was folded into context")
     }
 
+    /// The anchors the loop left on the context after one fold — the seam
+    /// `folded_result_with` cannot report, because it hands back a string
+    /// (REQ-618 BR-2).
+    async fn anchors_after_fold(
+        tool: Arc<dyn super::super::tools::Tool>,
+        name: &'static str,
+    ) -> Vec<crate::harness::context::Anchor> {
+        let session_id = SessionId::from("disposition-anchor");
+        let bus = Arc::new(EventBus::new());
+        let gate = PermissionGate::new(
+            session_id.clone(),
+            PermissionConfig::with_default(super::super::permissions::PermissionPolicy::Deny),
+            Arc::clone(&bus),
+            Arc::new(PendingPermissions::new()),
+        );
+        let events = SessionEvents::new(Arc::clone(&bus), session_id);
+        let config = HarnessConfig {
+            max_turns: 1,
+            summarize_threshold_tokens: NO_DIGEST,
+            ..HarnessConfig::default()
+        };
+        let mut tools = ToolRegistry::with_builtins();
+        tools.register_cap_exempt(tool);
+        let tool_ctx = ToolContext::new(std::env::temp_dir());
+        let mut hook = NoopProvenanceHook;
+        let mut ctx = ContextManager::new(FOLD_SYSTEM, 1_000_000);
+        ctx.push_user(FOLD_REQUEST);
+        let mut source = CallOnceThenEndSource {
+            name,
+            calls: 0,
+            dropped_calls: 0,
+        };
+        run_session_turn_with_source(
+            &mut source,
+            &tools,
+            &tool_ctx,
+            &gate,
+            &events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &DutyRoute::unresolved("nothing serves `digest` here"),
+            &DutyRoute::unresolved("no compact route in this test"),
+            &ToolDuties {
+                triage: &DutyRoute::unresolved("no triage route in this test"),
+                shell: &DutyRoute::unresolved("no shell route in this test"),
+            },
+        )
+        .await
+        .expect("the turn completes");
+        ctx.blocks().iter().map(|b| b.anchor).collect()
+    }
+
+    /// **REQ-618 BR-2, at the seam.** The loop anchors a model-invoked
+    /// expansion as this turn's skill body, and anchors an ordinary tool result
+    /// as nothing.
+    ///
+    /// The pair is the test. `ContextManager::anchor_last_as_skill_body` has its
+    /// own unit tests and would pass them with nothing calling it; what can only
+    /// be shown here is that the *loop* calls it, and calls it on the expansion
+    /// rather than on every fold. Deleting the call reddens the first half;
+    /// making it unconditional reddens the second.
+    #[tokio::test]
+    async fn the_loop_anchors_an_expansion_and_not_an_ordinary_result() {
+        use crate::harness::context::Anchor;
+
+        let expansion = anchors_after_fold(
+            Arc::new(StubDispositionTool {
+                name: EXPANSION_TOOL,
+                result: SMALL_BODY.to_owned(),
+                disposition: ResultDisposition::Expansion,
+            }),
+            EXPANSION_TOOL,
+        )
+        .await;
+        assert_eq!(
+            expansion.last(),
+            Some(&Anchor::SkillBody),
+            "the expansion is the procedure this turn is following: {expansion:?}"
+        );
+        assert_eq!(
+            expansion.first(),
+            Some(&Anchor::UserAsk),
+            "…and the ask is still the ask: {expansion:?}"
+        );
+
+        let ordinary = anchors_after_fold(
+            Arc::new(StubDispositionTool {
+                name: DATA_TOOL,
+                result: SMALL_BODY.to_owned(),
+                disposition: ResultDisposition::Data,
+            }),
+            DATA_TOOL,
+        )
+        .await;
+        // Non-vacuity: the fold has to have happened, or "no SkillBody here" is
+        // a statement about a context with no tool block in it.
+        assert_eq!(
+            ordinary.len(),
+            expansion.len(),
+            "the ordinary fold must produce the same shape of context as the \
+             expansion one, or this half asserts nothing: {ordinary:?}"
+        );
+        assert!(
+            ordinary.iter().all(|a| !matches!(a, Anchor::SkillBody)),
+            "an ordinary tool result is not a skill body: {ordinary:?}"
+        );
+    }
+
     /// A body no digest threshold in these tests can reach, so a framing test
     /// is about framing.
     const SMALL_BODY: &str = "Run the checks in order and report what failed.";
@@ -7999,6 +8318,10 @@ mod tests {
     /// `call_name` answers `None` and the loop falls back to the tool's own.
     const EXPANSION_TOOL: &str = "stub_expansion";
 
+    /// Its twin, registered the same way and folding as ordinary data — so the
+    /// anchor pair differs in the disposition and in nothing else.
+    const DATA_TOOL: &str = "stub_data";
+
     /// A body, and a route budget that holds **exactly** that body beside the
     /// system prompt and the turn's request — and nothing more.
     ///
@@ -8016,7 +8339,21 @@ mod tests {
         );
         RouteBudget {
             budget_tokens: snug.tokens,
-            budget_bytes: snug.bytes,
+            // **Snug in words, roomy in bytes** (REQ-618 BR-4).
+            //
+            // These fixtures probe the *band* between an expansion that fits
+            // and one that does not, one notice wide. A budget snug in **both**
+            // currencies would put the body at essentially 100% of the byte
+            // half, and BR-4's room fraction refuses a body over a quarter of it
+            // — so every one of them would come back `NoRoom` and none would
+            // reach the band it exists to measure.
+            //
+            // The band is the same claim in either currency: the notice is prose
+            // and adds words as surely as it adds bytes. So the word half stays
+            // snug and does the refusing, and the byte half is set to four times
+            // the body — exactly the room ceiling, which `leaves_no_room`
+            // admits — so the room question cannot answer for the band question.
+            budget_bytes: snug.bytes.max(body.len().saturating_mul(4)),
             ..HarnessConfig::default().budget
         }
     }
@@ -8331,17 +8668,37 @@ mod tests {
         }
         let _ = ctx.truncate_to_budget();
 
+        // REQ-618 BR-1 removed the state this test used to reproduce: the ask
+        // is an anchor, so the pressure that once dropped it now spends the
+        // forty model turns instead and leaves the user block exactly where it
+        // was. The defect — a retry ranking its matches against an empty
+        // request — is structurally impossible rather than merely guarded.
         assert!(
-            !ctx.blocks()
+            ctx.blocks()
                 .iter()
                 .any(|b| b.role == crate::harness::context::BlockRole::User),
-            "the fixture must actually drop the user block, or it tests nothing"
+            "the ask must survive the pressure that used to take it"
         );
         assert_eq!(
             latest_request(&ctx),
             REQUEST,
             "a retry ranked its matches against an empty request"
         );
+
+        // The fallback is still the answer for the one context that genuinely
+        // holds no user turn: a conversation carried in with its prompts
+        // already aged out, which `restate_anchors` cannot retro-anchor because
+        // there is nothing of that kind to anchor.
+        let mut no_ask = ContextManager::new("system", 64).with_budget_bytes(512);
+        no_ask.push_model("an assistant turn with nothing before it");
+        assert!(
+            !no_ask
+                .blocks()
+                .iter()
+                .any(|b| b.role == crate::harness::context::BlockRole::User),
+            "the fixture must hold no user turn, or the fallback is untested"
+        );
+        assert_eq!(latest_request(&no_ask), no_ask.request());
     }
 
     /// And it is the *latest* request, not the first one a manager ever saw —

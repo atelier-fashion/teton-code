@@ -846,17 +846,19 @@ async fn the_next_turn_after_a_window_refusal_carries_the_refusal_that_replaced_
          close: {assembled}"
     );
 
-    // **AC-22's other half is deliberately NOT asserted anywhere in this file,
-    // and this is the note that says why.** "The next turn assembles without
-    // the expansion" is **vacuous at every observation point**, measured rather
-    // than assumed: the oversized block does not survive REQ-586 BR-10's budget
-    // re-assertion at the commit itself, so it is gone from the session even on
-    // the path where the turn *succeeded* and nothing withdrew anything — and
-    // gone again from the next turn's prompt, dropped by ordinary pressure. An
-    // assertion that holds whether or not the mechanism exists proves nothing
-    // (LESSON-520). `an_accepted_turn_that_serves_still_loses_the_expansion_at_
-    // the_commit` pins both halves of that fact, so nobody re-adds the
-    // assertion here believing it means something.
+    // **AC-22's other half is still not asserted here, and the reason changed
+    // with REQ-618.** It used to be vacuity: the oversized block did not survive
+    // REQ-586 BR-10's budget re-assertion at the commit, so "the next turn
+    // assembles without the expansion" was true whether or not the withdrawal
+    // existed, and an assertion that holds either way proves nothing
+    // (LESSON-520).
+    //
+    // Since REQ-618 BR-2 the accepted expansion is the turn's **anchored** ask
+    // and survives that turn's commit, so on the *serving* path the sentence is
+    // false at the commit and true again one gate later — which is what the
+    // sibling test below pins, in both directions. On *this* path the expansion
+    // is gone because the withdrawal took it, and that is already what the
+    // presence assertion above proves, from the string that replaced it.
     //
     // What is left is the whole of what is real: the refusal *is there*, in the
     // session and on the next turn's wire, and it is there only because the
@@ -878,21 +880,24 @@ async fn the_next_turn_after_a_window_refusal_carries_the_refusal_that_replaced_
 /// 1. **The refusal's presence discriminates.** Here the refusal is in neither
 ///    the committed conversation nor the next turn's prompt, so the leg above is
 ///    not passing on a string that is always there.
-/// 2. **The expansion's *absence* discriminates nothing — at any observation
-///    point — which is why no test in this file asserts it.** This was measured,
-///    not reasoned: on this serving path the expansion is already gone from the
-///    session the moment turn one commits, because REQ-586 BR-10's budget
-///    re-assertion at the commit drops an oversized block like any other, and
-///    it is gone from turn two's prompt for the same reason one gate later.
-///    "The next turn assembles without the expansion" is therefore true on the
-///    success path, on the withdrawal path, and — as the mutation run showed —
-///    with the withdrawal deleted outright. That is LESSON-520's shape exactly,
-///    and it is the assertion AC-22's wording invites.
+/// 2. **The expansion *survives*, and that is what makes the leg above's
+///    absence mean something.** This used to read the other way. Before
+///    REQ-618, the expansion was already gone from the session the moment turn
+///    one committed — REQ-586 BR-10's budget re-assertion dropped an oversized
+///    block like any other — so "the next turn assembles without the expansion"
+///    held on the success path, on the withdrawal path, and with the withdrawal
+///    deleted outright: LESSON-520's shape exactly, and the reason no test here
+///    asserted it.
 ///
-/// So this test asserts those absences **as the facts they are**, on the path
-/// where nothing withdrew anything. If either ever starts failing, the vacuity
-/// has gone away and the leg above should gain the assertion it currently
-/// documents its reasons for omitting.
+///    REQ-618 BR-2 makes an accepted expansion the turn's **anchored** ask for
+///    the turn it belongs to, so it survives that turn's commit. The old note
+///    said to check exactly this, and it has happened: the absence at the commit
+///    has become a real discriminator, so this test asserts the presence there,
+///    and the leg above's absence is now evidence that the withdrawal removed
+///    something rather than that nothing was ever there. One gate later it is
+///    gone again — BR-2 makes it an ordinary block on the next prompt — and that
+///    absence is asserted too, so the "anchored" and "anchored for how long"
+///    halves are both pinned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_accepted_turn_that_serves_still_loses_the_expansion_at_the_commit() {
     // The one difference from the leg above: the provider serves it.
@@ -925,17 +930,22 @@ async fn an_accepted_turn_that_serves_still_loses_the_expansion_at_the_commit() 
          {:?}",
         block_heads(&committed)
     );
-    // (2a) …and the expansion is ALREADY gone, on a path where nothing withdrew
-    // it. This is the measured fact behind the omission the leg above documents.
+    // (2a) …and the expansion **survives** the commit, which is the fact
+    // REQ-618 changed. This assertion used to read the other way, with a note
+    // saying that the expansion's absence discriminated nothing because
+    // REQ-586 BR-10's budget re-assertion dropped an oversized block like any
+    // other. REQ-618 BR-2 makes it an anchor: a body the user was shown a
+    // measurement for and accepted is the turn's ask, and an ask is not
+    // something the commit gate may spend. So the absence stopped being the
+    // fact and the presence became one, exactly as the old note said to check.
     assert!(
         committed
             .blocks()
             .iter()
-            .all(|block| !block.text.contains(EXPANSION_MARKER)),
-        "the accepted expansion survived the commit's budget re-assertion. If that is \
-         now true, `the expansion is absent` has become a real discriminator and the \
-         leg above should assert it — read its closing note before changing either \
-         test: {:?}",
+            .any(|block| block.text.contains(EXPANSION_MARKER)),
+        "the accepted expansion did not survive the commit. It is this turn's \
+         anchored ask since REQ-618 BR-2, and a commit that spends it hands the \
+         next turn a conversation missing the thing the user paid to send: {:?}",
         block_heads(&committed)
     );
 
@@ -943,14 +953,34 @@ async fn an_accepted_turn_that_serves_still_loses_the_expansion_at_the_commit() 
         .await
         .expect("and the session takes another turn");
 
+    // Three requests since REQ-618, not two, and the middle one is the reason
+    // the expansion is gone by the end: turn one's ask survives its own commit
+    // (asserted above), so turn two opens on a conversation carrying a body
+    // larger than the route's budget, crosses the soft threshold, and buys a
+    // `compact` call. On this fixture the only route there is is the mock, so
+    // the duty's own prompt is request 1.
     let requests = provider.requests();
+    let bodies: Vec<String> = requests
+        .iter()
+        .map(|r| String::from_utf8_lossy(r).into_owned())
+        .collect();
+    let turns: Vec<&String> = bodies
+        .iter()
+        .filter(|b| !b.contains("Below is a numbered list of the blocks"))
+        .collect();
     assert_eq!(
-        requests.len(),
+        turns.len(),
         2,
         "non-vacuity: both turns must have reached the provider, or the assertions \
-         below are about a prompt that was never assembled"
+         below are about a prompt that was never assembled: {} request(s) in all",
+        requests.len()
     );
-    let assembled = String::from_utf8_lossy(&requests[1]).into_owned();
+    assert_eq!(
+        requests.len() - turns.len(),
+        1,
+        "…and exactly one of them is the compaction turn two had to buy"
+    );
+    let assembled = turns[1].clone();
 
     // (1b) the leg above's load-bearing wire assertion discriminates.
     assert!(
@@ -958,11 +988,23 @@ async fn an_accepted_turn_that_serves_still_loses_the_expansion_at_the_commit() 
         "nothing refused this turn at the window, so no refusal may reach the next \
          turn's prompt: {assembled}"
     );
-    // (2b) and the same absence, one gate later, still on the serving path.
+    // (2b) …and one gate later it is gone again, for a reason that is now the
+    // *rule* rather than an accident. REQ-618 BR-2: a skill expansion is
+    // anchored for the turn in which it was expanded and is an ordinary block
+    // on the next prompt turn. So turn two compacts it away like any other
+    // oversized block — which is exactly what REQ-589's acceptance sentence
+    // promises the user ("ordinary context pressure resumes on the turn after
+    // this one, which may drop this expansion like any other block").
+    //
+    // The distinction from the pre-REQ-618 behaviour is where it goes, and it
+    // is the whole of what this REQ bought here: it used to be spent at the
+    // *commit* of the turn the user paid for, before the answer to their own
+    // question had been assembled. Now it lives exactly as long as the turn it
+    // belongs to.
     assert!(
         !assembled.contains(EXPANSION_MARKER),
-        "the expansion reached the next turn's prompt on the serving path. If that is \
-         now true, the omission the leg above documents needs revisiting: {assembled}"
+        "the accepted expansion is anchored for its own turn only (BR-2), so the \
+         next turn's ordinary pressure must be free to take it: {assembled}"
     );
 }
 

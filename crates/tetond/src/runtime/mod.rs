@@ -125,9 +125,9 @@ use teton_protocol::events::{
     ModelLifecycle, ModelLifecycleStage, NotRunReason, PermissionSubject, PrivacyAction,
     ProviderTested, RemedyKind, SessionRootChanged, SessionTitled, SkillInvoked,
     SkillOverBudgetAccepted, SkillOverBudgetOffered, SkillOverBudgetRemedyApplied,
-    SkillStage as WireSkillStage, TierWarming, TranscriptStateReason, TurnQueued,
-    WebCapabilityState as WireWebCapabilityState, WebLookup, WebSetupCompleted, WebTaintOverridden,
-    WebTier as WireWebTier,
+    SkillRefusedNoRoom, SkillStage as WireSkillStage, TierWarming, TranscriptStateReason,
+    TurnQueued, WebCapabilityState as WireWebCapabilityState, WebLookup, WebSetupCompleted,
+    WebTaintOverridden, WebTier as WireWebTier,
 };
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
@@ -175,8 +175,8 @@ use crate::egress::{
 };
 use crate::grants::ConnectionId;
 use crate::harness::budget::{
-    proposed_window, skill_fit, OverBudgetOffer, PriorWindowRejection, RebindTarget, RebindWindow,
-    Remedy, RouteBudget, SkillCaller, SkillFit, SkillStage,
+    proposed_window, skill_fit, Measured, OverBudgetOffer, PriorWindowRejection, RebindTarget,
+    RebindWindow, Remedy, Room, RouteBudget, SkillCaller, SkillFit, SkillStage,
 };
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::{Fit, NoopProvenanceHook, PressureReport};
@@ -7356,14 +7356,23 @@ fn skill_would_not_survive_refit(
                 route.provider_id.as_ref().map(|id| id.0.as_str()),
             ) {
                 SkillFit::Fits => None,
-                SkillFit::TooLarge { message } => Some(RefitRefusal {
-                    // Who asked decides what can be done about it, which is why
-                    // this rides out with the message rather than being
-                    // re-derived against `typed` at each call site (BUG-188).
-                    caller,
-                    committed: text.clone(),
-                    message,
-                }),
+                // REQ-618 BR-4: a body the *reroute* leaves no room for is
+                // refused here like one that does not fit at all. This guard is
+                // refusal-only by design (BR-2, and REQ-589's own note above):
+                // the block is already in the conversation, so the choice is
+                // between refusing whole and middle-eliding it, and neither BR-8
+                // nor BR-4 answers that by asking.
+                SkillFit::TooLarge { message } | SkillFit::NoRoom { message, .. } => {
+                    Some(RefitRefusal {
+                        // Who asked decides what can be done about it, which is
+                        // why this rides out with the message rather than being
+                        // re-derived against `typed` at each call site
+                        // (BUG-188).
+                        caller,
+                        committed: text.clone(),
+                        message,
+                    })
+                }
             }
         })
 }

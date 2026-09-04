@@ -566,7 +566,7 @@ async fn exercise(duty: Duty, route: &DutyRoute, tainted: bool) -> Observed {
             let summary: String = ctx
                 .blocks()
                 .iter()
-                .filter(|b| b.text.starts_with("[earlier conversation compacted"))
+                .filter(|b| b.text.starts_with("[summary of "))
                 .map(|b| b.text.clone())
                 .collect();
             Observed {

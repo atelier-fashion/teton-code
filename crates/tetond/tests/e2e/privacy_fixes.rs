@@ -286,12 +286,36 @@ fn a_128k_turn_blocked_by_privacy_is_refitted_before_the_local_pin_serves_it() {
         &format!("Read the production configuration and summarize it.\n\n{paste}"),
     );
 
-    // The load-bearing claim: it finished. A context re-sent unchanged to the
-    // local pin is an over-window refusal, and the reroute has no fallback left.
+    // --- The load-bearing claim, as REQ-618 left it. ---
+    //
+    // REQ-586 wrote this as "it finished": a context re-sent unchanged to the
+    // local pin was an *engine* over-window refusal, the reroute had no
+    // fallback left, and a refused turn never commits — so the session replayed
+    // it into the same refusal forever. Clamping the paste and answering
+    // locally was the fix.
+    //
+    // REQ-618 BR-1 forbids the clamp: the paste is this turn's ask, and a
+    // middle-elided ask means the model answers a question the user did not
+    // send. So the turn now ends in a *typed* refusal instead — code -32025,
+    // naming both figures and both currencies — which keeps everything REQ-586
+    // actually needed (no engine error, no wedge, no replay: the turn does not
+    // commit and the user knows exactly why) and drops only the part REQ-618
+    // exists to remove.
+    //
+    // The practical bite of this is small and shrinking: it needs a paste
+    // larger than the *local* budget, and REQ-616 raises that window to
+    // 262,144 tokens, at which this 120 KB paste fits locally and the scenario
+    // stops arising at all.
     assert_eq!(
-        resp["result"]["stop_reason"].as_str(),
-        Some("end_turn"),
-        "the rerouted-to-local turn must complete, not die over-window: {resp}"
+        resp["error"]["code"].as_i64(),
+        Some(-32025),
+        "the rerouted-to-local turn must be refused by name, not die over-window \
+         and not answer a shortened question: {resp}"
+    );
+    let refusal = resp["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        refusal.contains("user_ask") && refusal.contains("nothing was sent"),
+        "the refusal names what could not be given up: {refusal}"
     );
     client.drain_events(Duration::from_millis(400));
 
@@ -313,13 +337,20 @@ fn a_128k_turn_blocked_by_privacy_is_refitted_before_the_local_pin_serves_it() {
     let blocked = client
         .event_index_from(0, |e| e["event"] == "privacy_block")
         .expect("the turn was blocked");
+    // The refit still runs, still first, and still names the local pair. Its
+    // *kind* is `did_not_fit` rather than `refit_on_reroute` since REQ-618:
+    // `rebudget` reports `over_budget` because the only thing left to cut is
+    // the ask, which is an anchor — and the publisher has always chosen the
+    // kind off that flag (an announcement that said "re-fitted" about a context
+    // that did not fit would be the wrong-name-for-what-happened defect
+    // `DidNotFit` was added to close).
     let refit = client
         .event_index_from(blocked, |e| {
-            e["event"] == "context_pressure" && e["kind"] == "refit_on_reroute"
+            e["event"] == "context_pressure" && e["kind"] == "did_not_fit"
         })
         .unwrap_or_else(|| {
             panic!(
-                "no refit_on_reroute after the block: {:?}",
+                "no refit announcement after the block: {:?}",
                 client.event_names()
             )
         });
@@ -350,16 +381,43 @@ fn a_128k_turn_blocked_by_privacy_is_refitted_before_the_local_pin_serves_it() {
     // nothing about how they were made.
     assert_eq!(event["budget_tokens"].as_u64(), Some(21_162), "{event}");
     assert_eq!(event["budget_bytes"].as_u64(), Some(63_488), "{event}");
+    // The refit took what it was allowed to take — the assistant turn the
+    // remote leg produced — and then stopped, because the only thing left is
+    // the user's own question and 120 KB does not fit 63,488 bytes
+    // (REQ-618 BR-1). It cut something *and* did not fit, which is exactly the
+    // pair of facts `did_not_fit` exists to report together.
     assert!(
-        event["dropped_blocks"].as_u64().unwrap_or(0) > 0
-            || event["elided_bytes"].as_u64().unwrap_or(0) > 0,
-        "a refit that cut nothing would leave this vacuous — 120 KB does not fit \
-         63,488 bytes: {event}"
+        event["dropped_blocks"].as_u64().unwrap_or(0) > 0,
+        "a refit that cut nothing at all would leave this vacuous: {event}"
     );
     assert_eq!(
-        client.events_named("context_pressure").len(),
+        event["elided_bytes"].as_u64(),
+        Some(0),
+        "and it cut by dropping, never by shortening the ask: {event}"
+    );
+    assert_eq!(
+        event["anchors_intact"].as_bool(),
+        Some(true),
+        "BR-1's witness, measured by the gate that produced this report: {event}"
+    );
+    // One reroute, one refit announcement before the local route was decided.
+    // The turn's own gate announces again afterwards and then refuses; what
+    // must not happen is the refit being announced twice for one reroute.
+    assert_eq!(
+        client.events()[blocked..local_route]
+            .iter()
+            .filter(|e| e["event"] == "context_pressure")
+            .count(),
         1,
-        "one reroute, one refit, one announcement"
+        "one reroute, one refit, one announcement: {:?}",
+        client.event_names()
+    );
+    assert_eq!(
+        client
+            .events_named("turn_refused_anchors_exceed_budget")
+            .len(),
+        1,
+        "and the turn ends by saying why, once"
     );
 
     // The boundary file's content never reached the mock provider.

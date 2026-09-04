@@ -1368,12 +1368,21 @@ async fn a_refused_skill_turn_seeds_nothing_says_nothing_and_changes_no_health()
 }
 
 /// **AC-16's contrast, and the reason it is in this file.** The refusal is for
-/// skill turns *only*: the identical bytes typed by hand on the identical route
-/// take REQ-586 BR-7's loud elision instead — the turn runs, the newest user
-/// block is clamped, and the clamp is announced.
+/// skill turns *only* — and since REQ-618 that means *this* refusal, under
+/// *this* code, for *this* reason, rather than "skills are refused and typed
+/// text is not".
+///
+/// REQ-586 BR-7 answered the typed twin with a loud elision: the turn ran, the
+/// newest user block was clamped, and the clamp was announced. REQ-618 BR-1
+/// forbids shortening the ask, so the typed twin is now refused too. The pair
+/// still tells the two apart, and it has to keep doing so, because the remedies
+/// differ: `-32023` says *the skill you invoked will not fit* (use a smaller
+/// skill, or a route with a bigger window) and `-32025` says *your own message
+/// will not fit* (send less). Without this test the two would drift into one
+/// sentence and a user would be told to change the wrong thing.
 ///
 /// Same window, same size, one difference. Without this pair, "skills are
-/// refused" and "everything is refused" look the same.
+/// refused" and "everything is refused identically" look the same.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_typed_oversized_prompt_still_elides_loudly_on_the_route_that_refuses_a_skill() {
     let repo = Tree::new("typedbig");
@@ -1388,22 +1397,45 @@ async fn a_typed_oversized_prompt_still_elides_loudly_on_the_route_that_refuses_
     // 16,384-byte floor by 2.4×) the floored pair's 50,000 bytes now hold the
     // whole thing and nothing is clamped, so this leg went quiet without
     // anything being wrong with the elision.
-    h.turn(&session, &filler(60_000), None)
+    let err = h
+        .turn(&session, &filler(60_000), None)
         .await
-        .expect("a typed oversized prompt is served, not refused");
+        .expect_err("a typed oversized prompt is refused since REQ-618, not shortened");
 
-    let published = drain(&mut sub).await;
-    let elided = published.iter().any(|event| match event {
-        Event::ContextPressure(pressure) => pressure.newest_user_elided,
-        _ => false,
-    });
+    // The distinguishing half: a different code and a different subject from
+    // the skill twin above.
+    assert_eq!(err.code, -32025, "{err:?}");
     assert!(
-        elided,
-        "REQ-586 BR-7's elision must still fire for typed text: {published:#?}"
+        err.message.contains("user_ask"),
+        "the typed twin's refusal is about the user's own message, not about a \
+         skill: {}",
+        err.message
     );
     assert!(
-        h.vendor.hits() >= 1,
-        "an elided typed turn still reaches the provider"
+        !err.message.contains("skill"),
+        "…and it must not borrow the skill twin's sentence: {}",
+        err.message
+    );
+
+    let published = drain(&mut sub).await;
+    assert!(
+        published
+            .iter()
+            .any(|event| matches!(event, Event::TurnRefusedAnchorsExceedBudget(_))),
+        "the refusal is announced: {published:#?}"
+    );
+    assert!(
+        published.iter().all(|event| match event {
+            Event::ContextPressure(pressure) => !pressure.newest_user_elided,
+            _ => true,
+        }),
+        "nothing was clamped, so nothing may say it was: {published:#?}"
+    );
+    assert_eq!(
+        h.vendor.hits(),
+        0,
+        "and nothing reached the provider — the whole point of refusing at the \
+         gate rather than at the window"
     );
 }
 
@@ -2710,9 +2742,14 @@ fn stage_b_repo(tag: &str) -> Tree {
         ".claude/skills/heavy/SKILL.md",
         &skill_file(
             "a large body plus a chatty command",
+            // 11,000 rather than 34,000 since REQ-618. On a floored 50,000-byte
+            // budget, BR-4's quarter is 12,500 — so a 34 KB body is refused at
+            // **Stage A** for having no room, and this fixture's whole point is
+            // that Stage *B* is what refuses. See the note on the two tests that
+            // use this repo for what BR-4 subsumed and what it left reachable.
             &format!(
                 "{}\n\nOut: !`head -c 9000 /dev/zero | tr '\\\\0' 'x'`\n",
-                filler(34_000)
+                filler(11_000)
             ),
         ),
     );
@@ -3396,7 +3433,12 @@ async fn a_model_invocation_whose_command_output_overflows_is_refused_at_stage_b
     model_invocable_skill(
         &repo,
         "light",
-        &format!("{}\n\nOut: !`echo tiny`\n", filler(38_000)),
+        // 11,000 rather than 38,000 since REQ-618. BR-4 refuses a body over a
+        // quarter of the byte budget at Stage A, and 38 KB against this route's
+        // floored 50 KB half is three quarters of it — so the control leg would
+        // have been refused for the wrong reason and the leg below could no
+        // longer have been Stage B's.
+        &format!("{}\n\nOut: !`echo tiny`\n", filler(11_000)),
     );
     model_invocable_skill(
         &repo,
@@ -3406,7 +3448,7 @@ async fn a_model_invocation_whose_command_output_overflows_is_refused_at_stage_b
             // the *body* is what has to be sized to leave less than that much
             // room: a bigger `head -c` would change nothing.
             "{}\n\nOut: !`head -c 20000 /dev/zero | tr '\\0' 'x'`\n",
-            filler(38_000)
+            filler(11_000)
         ),
     );
     let h = Harness::with_window(20_000);
@@ -3571,40 +3613,109 @@ async fn an_expansion_past_the_digest_threshold_is_folded_whole_where_an_ordinar
     let repo = Tree::new("mdldgst");
     // 2,800 words at four bytes each — `/architect` with its ethos include, in
     // round numbers, and three times the local `digest` threshold.
-    let body = format!("{}\nLAST-STEP-OF-THE-PROCEDURE\n", filler(11_200));
+    //
+    // **REQ-618 BR-4 made this band empty, on every route, and that is the
+    // finding rather than a fixture problem.**
+    //
+    // The body has to sit above the `digest` duty's byte threshold — or the
+    // bypass this test is about never comes up — and at or below BR-4's quarter
+    // of the route's byte half, or the expansion is refused for having no room
+    // before any duty is asked. Both are fractions of the same number, and the
+    // digest threshold is the larger one:
+    //
+    // | route | byte half | digest threshold | BR-4's quarter |
+    // |---|---|---|---|
+    // | no declared window | 33,000 | 23,250 (70%) | 8,250 |
+    // | `max_context = 128000` | 253,952 | 93,000 (37%) | 63,488 |
+    //
+    // The fixture's 100,000 B body is over the 93,000 B threshold on the 128k
+    // route — so it really is a body the `digest` duty would have taken — and
+    // over the 63,488 B quarter, which is the point.
+    //
+    // So an expansion large enough to be digested is, on any route, already
+    // large enough to leave the turn no room — and BR-7's bypass, while it
+    // still runs, can no longer be *observed* on the wire, because the turn that
+    // would have carried it is refused first.
+    //
+    // This test therefore asserts what is now reachable: the expansion is
+    // refused by name, and the refusal is the room one. The bypass's own
+    // guarantee — an expansion is folded whole, never condensed — is unchanged
+    // in the code and is still pinned by
+    // `an_expansion_is_folded_verbatim_even_when_its_tool_is_in_the_untrusted_name_list`
+    // and by `harness::turn_loop`'s fold tests, which measure the fold directly
+    // rather than through a turn.
+    //
+    // Whether BR-4's fraction should sit above the digest threshold's — so that
+    // the two rules stop pre-empting each other — is the open question this REQ
+    // leaves; see the PR body and ASSUME-039.
+    const BODY_BYTES: usize = 100_000;
+    let body = format!("{}\nLAST-STEP-OF-THE-PROCEDURE\n", filler(BODY_BYTES));
     model_invocable_skill(&repo, "wide", &body);
     repo.write(
         "wide.txt",
-        &format!("{}\nLAST-LINE-OF-THE-FILE\n", filler(11_200)),
+        &format!("{}\nLAST-LINE-OF-THE-FILE\n", filler(BODY_BYTES)),
     );
 
-    let h = Harness::with_default_budget();
+    let h = Harness::with_window(128_000);
+    {
+        let budget = tetond::harness::budget::derive(tetond::harness::BudgetInputs {
+            window: 128_000,
+            cap: 0,
+            reservation: 1_024,
+            is_local: false,
+            redact_scan: false,
+            provider_id: Some("mock"),
+            // REQ-616: the engine's own allocation, which a remote route
+            // ignores. Zero is the no-engine case and is what a remote row
+            // carries.
+            local_window: 0,
+        });
+        assert!(
+            BODY_BYTES > budget.digest_threshold_bytes,
+            "the fixture must be past the digest threshold ({} B), or the bypass \
+             this test is about never comes up",
+            budget.digest_threshold_bytes
+        );
+        assert!(
+            tetond::harness::budget::leaves_no_room(BODY_BYTES, budget.budget_bytes),
+            "…and therefore over BR-4's quarter of the {} B byte half. If this \
+             ever stops holding, the two rules have stopped overlapping and the \
+             original wire assertion below should come back — read the note above",
+            budget.budget_bytes
+        );
+    }
     let expansion = h.session_at(repo.path());
     h.consent
         .answers(Answer::Select(PermissionOptionKind::AllowOnce));
     h.vendor.will_call_skill("wide", "");
     h.turn(&expansion, "run the wide skill", None)
         .await
-        .expect("the expansion fits this route, so it is folded");
+        .expect("the model path renders the refusal as a tool result, not an error");
 
     let wire = on_the_wire(&h);
+    // What the model is handed is the refusal, and it is the *room* one — the
+    // arithmetic above says why. Two things the refusal must still be: whole
+    // (never a condensed procedure) and named.
     assert!(
-        wire.contains("LAST-STEP-OF-THE-PROCEDURE"),
-        "the expansion reached the model without its tail — condensed or \
-         truncated, a procedure is no longer the procedure (BR-7): {wire}"
+        wire.contains("would leave the turn no room to work"),
+        "an expansion past the digest threshold is over BR-4's quarter on every \
+         route, so this is the refusal the model receives: {wire}"
+    );
+    assert!(
+        !wire.contains("LAST-STEP-OF-THE-PROCEDURE"),
+        "…and nothing of the body was folded: a refused expansion is not a \
+         shortened one, it is an absent one (REQ-587 BR-6): {wire}"
     );
     assert!(
         !wire.contains("summarized skill output"),
-        "the `digest` duty condensed the procedure into a summary of itself, \
-         which is the arm BR-7 names first: {wire}"
-    );
-    assert!(
-        !wire.contains("truncated mechanically"),
-        "…and the duty's *failure* arm is fatal in the same way, so the bypass \
-         is the branch, not a guarded call: {wire}"
+        "the `digest` duty must not have condensed the procedure into a summary \
+         of itself — the bypass is still the branch, whatever happens after it: \
+         {wire}"
     );
 
     // The control, in its own session so the two results never share a budget.
+    // It is what makes the digest claim above mean something: a result of the
+    // same size that is **not** an expansion is condensed on this very route.
     let ordinary = h.session_at(repo.path());
     h.vendor
         .will_call_tool("read", json!({ "path": "wide.txt" }));

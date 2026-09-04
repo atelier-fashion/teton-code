@@ -11962,6 +11962,13 @@ mod tests {
             !measured.fits,
             "non-vacuity: the fixture must be over budget"
         );
+        // REQ-618: `OverBudgetOffer` takes the estimator's pair *and* the room
+        // verdict. This fixture is over budget, which is the case where the
+        // room question does not arise.
+        let measured = crate::harness::budget::Measured {
+            fit: measured,
+            room: crate::harness::budget::Room::Enough,
+        };
         let live = OverBudgetOffer::new(
             "bulky",
             SkillStage::Body,

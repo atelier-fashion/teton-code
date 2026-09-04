@@ -1271,6 +1271,15 @@ async fn the_reported_analyze_measurement_serves_on_both_halves_of_the_local_pai
     // at exactly `budget_bytes`. One byte separates this from leg 1, which is
     // what makes leg 1's refusal and this leg's silence a statement about the
     // guard rather than about either fixture.
+    // **REQ-618 BR-4 moved what is on the other side of that byte.** At exactly
+    // `budget_bytes` the body is 100% of the byte half, so it now raises the
+    // *room* question instead of nothing at all. The boundary is still one byte
+    // wide and still about the byte guard — what changed is which true sentence
+    // sits on each side of it: at +1 byte "does not fit this route's context
+    // budget", at exactly the budget "fits ... but would leave the turn no room
+    // to work". Legs 3 and 4 therefore assert an offer where they used to assert
+    // silence, and the standing `proceed once` answer from leg 2 is what carries
+    // them through to an answer.
     let tag = "at the byte budget exactly";
     let offers_so_far = fx.client.offers().len();
     fx.write_body(&marked_body(
@@ -1285,14 +1294,23 @@ async fn the_reported_analyze_measurement_serves_on_both_halves_of_the_local_pai
     let published = drain(&mut sub);
     assert_eq!(
         fx.client.offers().len(),
-        offers_so_far,
-        "{tag}: a turn that fits must raise **no** over-budget offer — a turn that \
-         served but asked anyway would pass a weaker test: {:?}",
+        offers_so_far + 1,
+        "{tag}: inside the byte budget and over BR-4's quarter of it, so the \
+         room question is asked once: {:?}",
         questions(&fx.client)
     );
-    assert!(
-        offered(&published).is_empty() && accepted(&published).is_empty(),
-        "{tag}: and announce nothing about a budget it did not exceed: {:?}",
+    // Which question it is, read off the event this REQ added rather than off
+    // the prompt's prose: `skill_refused_no_room` fires for the room case and
+    // for nothing else, so it is the discriminator the one byte moves.
+    let no_room: Vec<_> = published
+        .iter()
+        .filter(|e| matches!(e, Event::SkillRefusedNoRoom(_)))
+        .collect();
+    assert_eq!(
+        no_room.len(),
+        1,
+        "{tag}: this is the room question, not the over-budget one — one byte \
+         separates it from leg 1, which published none: {:?}",
         published.iter().map(Event::name).collect::<Vec<_>>()
     );
     assert!(
@@ -1327,25 +1345,49 @@ async fn the_reported_analyze_measurement_serves_on_both_halves_of_the_local_pai
     ));
     let served = fx.session();
     let mut sub = fx.events.subscribe(512);
+    // **REQ-618 BR-4 supersedes REQ-590 AC-12 here, deliberately.**
+    //
+    // AC-12 said this turn must serve *silently*: 4,097 words at a byte count
+    // the field report admits, no question, no announcement, an answer. It was
+    // written because REQ-590's byte half refused a turn the user had actually
+    // sent, and refusing it was the defect.
+    //
+    // REQ-618 read the same session and drew the opposite conclusion about the
+    // same turn. Its Description says so in as many words: the `/analyze` body
+    // came to 38% of the budget "before a single tool result", and "a body at
+    // 38% of the window is *under* budget and still leaves the turn no room to
+    // work". Twenty-six tool calls later that turn had lost the skill's
+    // instructions and the user's intent, and the next prompt was answered with
+    // fourteen directory listings. It served, and serving is what went wrong.
+    //
+    // So the outcome the REQ wants for this exact body is the **question**, and
+    // the answer to it is the user's. What survives from AC-12 unchanged is the
+    // half that was always the real claim: the turn is not *refused*, and it
+    // reaches the engine and produces an answer. Only now the user is asked
+    // first, and — with leg 2's standing `proceed once` — says yes.
     fx.invoke(&served).await.unwrap_or_else(|e| {
         panic!(
-            "REQ-590 AC-12: the reported /analyze turn — {REPORTED_WORDS} words / \
-             {A_BODY_INSIDE_THE_REPORTED_INTERVAL} bytes — must serve on the local tier. This \
-             is the size of the field report this REQ exists for, and a refusal here means the \
-             refusal has moved currencies rather than gone away: {e:?}"
+            "the reported /analyze turn — {REPORTED_WORDS} words / \
+             {A_BODY_INSIDE_THE_REPORTED_INTERVAL} bytes — must still be *sendable* on the \
+             local tier. REQ-618 BR-4 makes it a question rather than a silent send; it may \
+             not make it a refusal: {e:?}"
         )
     });
     let published = drain(&mut sub);
     assert_eq!(
         fx.client.offers().len(),
-        offers_so_far,
-        "{tag}: AC-12 requires the reported turn to raise no over-budget offer, not merely to \
-         survive one: {:?}",
+        offers_so_far + 1,
+        "{tag}: BR-4 asks about a body at 38% of the budget, exactly once: {:?}",
         questions(&fx.client)
     );
-    assert!(
-        offered(&published).is_empty() && accepted(&published).is_empty(),
-        "{tag}: and to announce nothing about a budget it did not exceed: {:?}",
+    assert_eq!(
+        published
+            .iter()
+            .filter(|e| matches!(e, Event::SkillRefusedNoRoom(_)))
+            .count(),
+        1,
+        "{tag}: and the question is the room one, not the over-budget one — this \
+         body is inside both halves of the pair: {:?}",
         published.iter().map(Event::name).collect::<Vec<_>>()
     );
     assert!(

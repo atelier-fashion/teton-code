@@ -584,6 +584,34 @@ pub mod error_code {
         /// this rather than leaving a user to discover that the figure they
         /// see exceeds the number they set.
         SPEND_CEILING_REACHED = -32024;
+        /// Teton refused to send a turn because its **anchor set** alone does
+        /// not fit the route's budget (REQ-618 BR-1, AC-2).
+        ///
+        /// The anchor set is the content a compaction and a truncation may not
+        /// touch: the user's prompt, the previous turn's prompt, and any skill
+        /// body the turn is running under. When the gate has dropped everything
+        /// it is allowed to drop and those alone are still over the budget,
+        /// there is nothing left to give up.
+        ///
+        /// **Who refused, again.** Like [`SKILL_EXPANSION_TOO_LARGE`] and
+        /// unlike [`CONTEXT_LENGTH_EXCEEDED`], this is *Teton* declining before
+        /// any dispatch: nothing left the machine, no provider has an opinion,
+        /// no health moved. It is its own code rather than that one because the
+        /// subject is different — an expansion the user invoked versus the
+        /// question itself — and so is the remedy: a shorter prompt, or a route
+        /// with a bigger window.
+        ///
+        /// **What it replaced.** Before REQ-618 an over-budget prompt was
+        /// middle-elided in place and the turn went ahead, so the model
+        /// answered a question the user had not asked and the only trace was a
+        /// `context_pressure` line saying how many bytes went. Refusing is the
+        /// louder half of "nothing is clamped in silence": the turn does not
+        /// happen, and the message says why in both currencies.
+        ///
+        /// Not retryable and not a health signal, for
+        /// [`SKILL_EXPANSION_TOO_LARGE`]'s reasons exactly: a retry assembles
+        /// the same anchors, and a failover may find a smaller window.
+        TURN_ANCHORS_EXCEED_BUDGET = -32025;
     }
 }
 

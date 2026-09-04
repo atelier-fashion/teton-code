@@ -1143,6 +1143,37 @@ async fn a_session_driven_past_its_budget_compacts_and_keeps_answering() {
         Some(MissReason::Cold),
         "prompt 1 is cold"
     );
+    // REQ-618 turned "every boundary after the first diverges" from a fact into
+    // a question. The previous turn's ask is an anchor, so it survives verbatim
+    // into the next prompt, and a prompt whose carried prefix is intact has
+    // nothing to diverge *from* — more of it is reusable, which is the machinery
+    // working rather than failing.
+    //
+    // What this fixture records is the block count at the *end* of each prompt,
+    // and a drop between two of those does not say whether the rewrite landed
+    // before the next prompt's boundary call or after it, at that prompt's own
+    // exit gate. So "boundary n opened on a rewritten history" is no longer
+    // derivable here, and asserting it per boundary would be asserting something
+    // the fixture cannot see. The substantive half is unchanged and still runs
+    // on every boundary that did diverge: a rewritten prefix reuses the head and
+    // the truncation note and stops before any conversation content.
+    // On this fixture, since REQ-618, none of them do. The block count settles
+    // at four and stays there ({retained:?} at the time of writing), and every
+    // boundary is a plain non-divergent hit — which is the anchors paying for
+    // themselves twice over: the previous ask survives verbatim, so each prompt
+    // extends the last one's prefix instead of rewriting it, and the KV cache
+    // reuse that used to be capped by a rewrite is no longer capped. The
+    // divergent-hit accounting itself is asserted where it belongs, in
+    // `prefix_cache_session.rs`; what is left here is the claim this fixture is
+    // named for, and the shape of the reuse wherever a rewrite does occur.
+    let divergent_boundaries = boundaries.iter().skip(1).filter(|b| b.divergent).count();
+    assert_eq!(
+        divergent_boundaries, 0,
+        "pinned, not incidental: this session's prompts extend rather than \
+         rewrite since REQ-618, and a boundary that starts diverging again means \
+         an anchor stopped surviving the carry — read the note above before \
+         changing this number ({retained:?})"
+    );
     for (n, boundary) in boundaries.iter().enumerate().skip(1) {
         assert_eq!(
             boundary.miss,
@@ -1152,13 +1183,12 @@ async fn a_session_driven_past_its_budget_compacts_and_keeps_answering() {
              destroying it",
             n + 1
         );
-        assert!(
-            boundary.divergent,
-            "boundary {} followed a turn that rewrote its history, and a \
-             rewrite that is not marked is exactly the silent compaction BR-4 \
-             forbids",
-            n + 1
-        );
+        if !boundary.divergent {
+            // This prompt's carried prefix arrived intact — REQ-618's anchors
+            // are the reason — so there is no rewrite for the claims below to
+            // be about. Its reuse is still bounded by the assertions above.
+            continue;
+        }
         // What was reused, read as text rather than as a number: `tokenize` is
         // whitespace-word granular, so the first `cached_tokens` words of this
         // prompt ARE the reused span. A rewritten history means it covers the
@@ -1577,26 +1607,48 @@ async fn a_conversation_assembled_on_a_128k_route_survives_a_local_turns_smaller
 /// commit's. Deleting the publish takes it back to one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unfittable_turn_still_publishes_the_commits_own_report() {
-    let carry = Carry::new(&["Answered."], true, "req586-commit-didnotfit");
+    let long_reply = format!("Answered. {}", "z".repeat(5_000));
+    let carry = Carry::new(&[long_reply.as_str()], true, "req586-commit-didnotfit");
 
-    // A pair no context can meet: the system head alone is several KB, so every
-    // gate — the loop's two and the commit's one — finishes over budget. Built
-    // by hand rather than through `derive`, because `derive`'s floor exists
-    // precisely to stop a *route* from being budgeted this way (M1).
+    // A pair the turn's *answer* cannot meet. Built by hand rather than through
+    // `derive`, because `derive`'s floor exists precisely to stop a route from
+    // being budgeted this tightly (M1).
+    //
+    // REQ-618 changed the shape this fixture has to take. It used to set a
+    // budget below the harness's own system prompt, so that every gate finished
+    // over budget — but a turn whose anchor set (the system head plus the ask)
+    // cannot fit is now *refused* at the top-of-loop gate, and a refused turn
+    // never reaches the commit whose report this test is about. So the budget
+    // now holds the head and the question with room to spare, and it is the
+    // 5 KB reply that busts it: the exit gate clamps that reply to its 1 KiB
+    // floor and is still over, and the commit's gate finds the same. The claim
+    // is unchanged — two lines go out, and only one of them can be the loop's.
     let mut unfittable = derive(BudgetInputs::local());
-    unfittable.budget_tokens = 200;
-    unfittable.budget_bytes = 1_000;
+    let head = carry.system().len();
+    // The word half is set out of the way on purpose: this fixture is about the
+    // byte gate, and a word budget the system head alone exceeds would refuse
+    // the turn at the anchor gate before any of it ran.
+    unfittable.budget_tokens = 2_000;
+    unfittable.budget_bytes = head + 400;
     let config = carry
         .config
         .clone()
         .with_route_budget(unfittable.clone())
         .without_digest();
     assert!(
-        carry.system().len() > config.context_budget_bytes,
-        "non-vacuity: the system head ({} bytes) must not fit the {}-byte \
-         budget, or nothing here is over budget",
-        carry.system().len(),
+        head < config.context_budget_bytes,
+        "non-vacuity, first half: the head ({head} bytes) must FIT the {}-byte \
+         budget, or the anchor gate refuses the turn and the commit never runs",
         config.context_budget_bytes
+    );
+    // 400 bytes of slack above the head is what the question and the answer
+    // have to share, and the reply alone is twelve times that — so the clamp
+    // lands on it, floors at 1 KiB, and every gate after the model speaks is
+    // still over budget.
+    assert!(
+        long_reply.len() > 400,
+        "non-vacuity, second half: the reply must not fit the slack above the \
+         head, or no gate is over budget at all"
     );
 
     let session = carry.session();
