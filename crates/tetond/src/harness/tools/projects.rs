@@ -164,6 +164,45 @@ pub fn register_projects_tool(
 
 #[cfg(test)]
 mod tests {
+
+    /// **REQ-615 BR-8 / AC-7: the listing names who can run `/cd`.**
+    ///
+    /// Every row above this line ends in a `/cd <name>` recipe, and the
+    /// 2026-09-04 session read those as instructions it could carry out — it
+    /// called `projects`, then went straight back to `shell: cd …`.
+    ///
+    /// Asserted against the renderer's own constant, so a test that passed
+    /// while the renderer had dropped the line is not expressible; and asserted
+    /// on **both** shapes, because a machine with no known projects still
+    /// carries `/cd` in the sentence about how a project becomes known.
+    ///
+    /// Mutation (AC-7 requires it): delete the `push_str` in `render_locator` —
+    /// both halves go red.
+    #[test]
+    fn the_listing_names_who_can_run_cd() {
+        let home = temp_dir("br8");
+        let alpha = project_at(&home, "dev/alpha");
+        let store = Arc::new(ProjectStore::in_memory());
+        store.record(alpha, ProjectSource::Launched);
+        let tool = ProjectsTool::new(store, Some(home.clone()));
+
+        let listed = run(&tool, json!({}));
+        assert!(
+            listed.contains("/cd alpha"),
+            "precondition — the row carries the recipe: {listed}"
+        );
+        assert!(
+            listed.ends_with(teton_core::projects::PROJECTS_ARE_THE_USERS_TO_MOVE_TO),
+            "the listing must end by saying whose act `/cd` is: {listed}"
+        );
+
+        let empty = run(&tool, json!({ "query": "nothing-matches-this" }));
+        assert!(
+            empty.ends_with(teton_core::projects::PROJECTS_ARE_THE_USERS_TO_MOVE_TO),
+            "an empty listing says it too: {empty}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
     use super::*;
     use std::path::Path;
     use teton_core::projects::ProjectSource;

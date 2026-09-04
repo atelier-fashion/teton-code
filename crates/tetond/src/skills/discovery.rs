@@ -641,6 +641,8 @@ fn register(
         // that arrived here with a flag dropped would be a skill the model may
         // run because a field defaulted (REQ-587 BR-3).
         model_invocable: parsed.model_invocable,
+        // REQ-615 BR-5's forward path, carried as declared.
+        requires_project: parsed.requires_project,
         user_invocable: parsed.user_invocable,
         ignored_keys: parsed.ignored_keys,
         name_note,

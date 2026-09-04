@@ -373,7 +373,7 @@ async fn edit_attributes_an_in_root_link_to_its_target_and_blocks_the_turn() {
     let egress = Egress::new(capture.clone(), local_only_boundaries(), sink.clone());
     let egress_ctx = EgressContext::new("anthropic").with_session("sess-edit-link");
 
-    let public = EditTool.run(
+    let public = EditTool::default().run(
         &ctx,
         &json!({
             "path": "src/main.rs",
@@ -389,7 +389,7 @@ async fn edit_attributes_an_in_root_link_to_its_target_and_blocks_the_turn() {
         "a public edit must still reach the wire"
     );
 
-    let out = EditTool.run(
+    let out = EditTool::default().run(
         &ctx,
         &json!({
             "path": "notes.txt",
@@ -464,7 +464,7 @@ fn edit_refuses_a_link_that_resolves_outside_the_root() {
     fx.link_out("escape.txt");
     let ctx = ToolContext::new(&fx.root);
 
-    let out = EditTool.run(
+    let out = EditTool::default().run(
         &ctx,
         &json!({
             "path": "escape.txt",
@@ -676,7 +676,7 @@ fn edit_shows_both_the_link_and_the_target_it_wrote() {
     fx.link_in("notes.txt");
     let ctx = ToolContext::new(&fx.root);
 
-    let out = EditTool.run(
+    let out = EditTool::default().run(
         &ctx,
         &json!({
             "path": "notes.txt",
@@ -723,7 +723,7 @@ fn a_matching_request_renders_byte_identically() {
     assert!(!out.is_error, "{}", out.content);
     assert_eq!(out.content, format!("     1\t{PUBLIC_CONTENT}\n"));
 
-    let out = EditTool.run(
+    let out = EditTool::default().run(
         &ctx,
         &json!({
             "path": "src/main.rs",
@@ -880,7 +880,7 @@ fn edit_refuses_to_reach_a_new_leaf_through_an_escaping_link() {
     let ctx = ToolContext::new(&fx.root);
 
     // Positive control: this tool, in this repo, does edit files.
-    let public = EditTool.run(
+    let public = EditTool::default().run(
         &ctx,
         &json!({
             "path": "src/main.rs",
@@ -890,7 +890,7 @@ fn edit_refuses_to_reach_a_new_leaf_through_an_escaping_link() {
     );
     assert!(!public.is_error, "{}", public.content);
 
-    let out = EditTool.run(
+    let out = EditTool::default().run(
         &ctx,
         &json!({
             "path": "escape-dir/new.txt",
@@ -943,7 +943,7 @@ fn a_dangling_link_is_refused_rather_than_minted_under_its_own_name() {
 
     for out in [
         ReadTool.run(&ctx, &json!({ "path": "notes.txt" })),
-        EditTool.run(
+        EditTool::default().run(
             &ctx,
             &json!({
                 "path": "notes.txt",

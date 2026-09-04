@@ -19,8 +19,24 @@ use super::read::shown_path;
 use super::{str_arg, Resolved, Tool, ToolContext, ToolOutcome};
 
 /// Replaces a single exact occurrence of a string in a file.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct EditTool;
+///
+/// Carries an optional event emitter for REQ-615 BR-4's refusal record —
+/// `ProjectsTool`'s shape, and optional for its reason: a tool built for a unit
+/// test has no bus, and a missing bus means "no record" rather than a panic.
+/// The `Default` is what keeps every existing `EditTool::default().run(…)` call
+/// site honest about having no session to report to.
+#[derive(Default)]
+pub struct EditTool {
+    events: Option<crate::harness::turn_loop::SessionEvents>,
+}
+
+impl EditTool {
+    /// An edit tool reporting REQ-615 BR-4 refusals to `events`.
+    #[must_use]
+    pub fn with_events(events: Option<crate::harness::turn_loop::SessionEvents>) -> Self {
+        Self { events }
+    }
+}
 
 impl Tool for EditTool {
     fn name(&self) -> &str {
@@ -46,6 +62,26 @@ impl Tool for EditTool {
     }
 
     fn run(&self, ctx: &ToolContext, args: &Value) -> ToolOutcome {
+        // REQ-615 BR-4, before the arguments are even read: `edit` is
+        // unconditionally a write, so at a root that gates writes there is
+        // nothing to validate. AC-3 asserts the target file is untouched
+        // afterwards by inspecting it, not by reading this error (LESSON-519).
+        if crate::harness::root_gate::edit_gate(ctx.root_kind())
+            == crate::harness::root_gate::WriteVerdict::RefusedNonProject
+        {
+            if let Some(events) = self.events.as_ref() {
+                events.write_refused_non_project(teton_protocol::events::WriteRefusedNonProject {
+                    tool: "edit".to_owned(),
+                    root_display: ctx.root_display().to_owned(),
+                    root_kind: ctx.root_kind(),
+                    remedy: crate::harness::root_gate::WRITE_REMEDY.to_owned(),
+                });
+            }
+            return ToolOutcome::error(crate::harness::root_gate::write_refusal(
+                ctx.root_display(),
+                ctx.root_kind(),
+            ));
+        }
         let raw = match str_arg(args, "path") {
             Ok(p) => p,
             Err(e) => return e.into(),
@@ -129,6 +165,7 @@ impl Tool for EditTool {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use teton_protocol::methods::RootKind;
 
     /// The counter, not the timestamp, guarantees uniqueness: `SystemTime::now()`
     /// can return the same value for two calls within one clock tick.
@@ -154,7 +191,7 @@ mod tests {
         let file = root.join("f.rs");
         std::fs::write(&file, "const V: u32 = 1;\n").unwrap();
         let ctx = ToolContext::new(&root);
-        let out = EditTool.run(
+        let out = EditTool::default().run(
             &ctx,
             &json!({ "path": "f.rs", "old_string": "const V: u32 = 1;", "new_string": "const V: u32 = 2;" }),
         );
@@ -176,7 +213,7 @@ mod tests {
         crate::mkfifo(&root.join("pipe"));
         let worker_root = root.clone();
         let out = crate::with_deadline("edit of a FIFO", move || {
-            EditTool.run(
+            EditTool::default().run(
                 &ToolContext::new(&worker_root),
                 &json!({ "path": "pipe", "old_string": "a", "new_string": "b" }),
             )
@@ -196,7 +233,7 @@ mod tests {
         let file = root.join("f.rs");
         std::fs::write(&file, "alpha\n").unwrap();
         let ctx = ToolContext::new(&root);
-        let out = EditTool.run(
+        let out = EditTool::default().run(
             &ctx,
             &json!({ "path": "f.rs", "old_string": "beta", "new_string": "gamma" }),
         );
@@ -213,7 +250,7 @@ mod tests {
         let file = root.join("f.rs");
         std::fs::write(&file, "x\nx\n").unwrap();
         let ctx = ToolContext::new(&root);
-        let out = EditTool.run(
+        let out = EditTool::default().run(
             &ctx,
             &json!({ "path": "f.rs", "old_string": "x", "new_string": "y" }),
         );
@@ -231,7 +268,7 @@ mod tests {
         let root = temp_root("bytes");
         std::fs::write(root.join("f.rs"), "const V: u32 = 1;\n").unwrap();
         let ctx = ToolContext::new(&root);
-        let out = EditTool.run(
+        let out = EditTool::default().run(
             &ctx,
             &json!({ "path": "f.rs", "old_string": "= 1;", "new_string": "= 2;" }),
         );
@@ -241,7 +278,7 @@ mod tests {
         );
 
         // And `./f.rs` is the same request in different words, so the same bytes.
-        let out = EditTool.run(
+        let out = EditTool::default().run(
             &ctx,
             &json!({ "path": "./f.rs", "old_string": "= 2;", "new_string": "= 3;" }),
         );
@@ -268,7 +305,7 @@ mod tests {
 
         for spelling in [absolute.as_str(), "src/../f.rs"] {
             std::fs::write(&file, "const V: u32 = 1;\n").unwrap();
-            let out = EditTool.run(
+            let out = EditTool::default().run(
                 &ctx,
                 &json!({ "path": spelling, "old_string": "= 1;", "new_string": "= 2;" }),
             );
@@ -318,7 +355,7 @@ mod tests {
         ] {
             // Restore the file so every spelling performs a real, unique edit.
             std::fs::write(&file, "API_KEY=1\n").unwrap();
-            let out = EditTool.run(
+            let out = EditTool::default().run(
                 &ctx,
                 &json!({
                     "path": spelling,
@@ -340,12 +377,76 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// **REQ-615 BR-4 / AC-3: an edit at a home root is refused and writes
+    /// nothing.**
+    ///
+    /// Asserted by reading the file back, not by reading the error: a gate that
+    /// refused *after* writing would produce the same error text (LESSON-519,
+    /// AC-3's own instruction).
+    ///
+    /// Mutation: move the gate below the `fs::write`, or drop `RootKind::Home`
+    /// from `gates_writes` — the byte comparison goes red.
+    #[test]
+    fn an_edit_at_a_home_root_is_refused_and_writes_nothing() {
+        let root = temp_root("homegate");
+        let file = root.join("notes.md");
+        std::fs::write(&file, "before\n").unwrap();
+        let ctx = ToolContext::new(&root).with_root_kind(RootKind::Home);
+
+        let out = EditTool::default().run(
+            &ctx,
+            &json!({ "path": "notes.md", "old_string": "before", "new_string": "after" }),
+        );
+        assert!(out.is_error, "{}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "before\n",
+            "the file must be untouched — the refusal is before the write"
+        );
+        assert!(
+            out.content.contains("/cd <name>"),
+            "the refusal names the remedy:\n{}",
+            out.content
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **REQ-615 BR-9 / BR-4's carve-out: an edit at a plain root still
+    /// writes.**
+    ///
+    /// The benign path, and it guards a shipped feature: a `plain` root is
+    /// where a user scaffolds a new project and where REQ-613's `TETON.md`
+    /// write lands. Gating it would break that with nothing else noticing.
+    ///
+    /// Mutation: add `RootKind::Plain` to `gates_writes` — this goes red.
+    #[test]
+    fn an_edit_at_a_plain_root_still_writes() {
+        let root = temp_root("plaingate");
+        let file = root.join("TETON.md");
+        std::fs::write(&file, "before\n").unwrap();
+        for kind in [RootKind::Plain, RootKind::Project] {
+            std::fs::write(&file, "before\n").unwrap();
+            let ctx = ToolContext::new(&root).with_root_kind(kind);
+            let out = EditTool::default().run(
+                &ctx,
+                &json!({ "path": "TETON.md", "old_string": "before", "new_string": "after" }),
+            );
+            assert!(!out.is_error, "{kind:?}: {}", out.content);
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                "after\n",
+                "{kind:?}"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn rejects_empty_old_string() {
         let root = temp_root("empty");
         std::fs::write(root.join("f.rs"), "a\n").unwrap();
         let ctx = ToolContext::new(&root);
-        let out = EditTool.run(
+        let out = EditTool::default().run(
             &ctx,
             &json!({ "path": "f.rs", "old_string": "", "new_string": "b" }),
         );

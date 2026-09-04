@@ -193,6 +193,14 @@ pub struct Skill {
     /// this row, because a shadowed row's name resolves elsewhere whatever its
     /// frontmatter says.
     pub model_invocable: bool,
+    /// Whether the file declared `requires: project` (REQ-615 BR-5).
+    ///
+    /// The **declaration**, not the verdict. Whether this skill is refused
+    /// depends on the session root's kind, which this value knows nothing
+    /// about — ask `root_gate`-adjacent [`Skill::needs_project`] for the
+    /// composed question, which also reads the `.adlc/` compatibility path out
+    /// of the body.
+    pub requires_project: bool,
     /// Whether the user may dispatch this skill by typing `/name` (REQ-587
     /// BR-3) — `false` for `user-invocable: false`, which is the *model-only*
     /// state: listed by `/help`, marked, and refused from `/name`.
@@ -261,6 +269,42 @@ impl Skill {
     #[must_use]
     pub fn invocable_by_model(&self) -> bool {
         self.is_dispatchable() && self.model_invocable
+    }
+
+    /// Whether this skill declares that it needs a project root (REQ-615 BR-5).
+    ///
+    /// Two declarations, one answer:
+    ///
+    /// * frontmatter `requires: project` — the forward path;
+    /// * a `!cmd` preamble whose **command text** names `.adlc/` — the
+    ///   compatibility path for the shipped ADLC skills, which carry no such
+    ///   key.
+    ///
+    /// # It reads commands, not prose
+    ///
+    /// The token is looked for in what [`dynamic::scan`] identified as a
+    /// command, never in the body as a whole. A skill that merely *mentions*
+    /// `.adlc/` in a sentence — this repository's own documentation skills do —
+    /// is not gated by it, and a substring search over the body could not tell
+    /// the two apart. Reusing the scanner is also what keeps the gate and the
+    /// runner agreeing on what a command is by construction rather than by two
+    /// parsers happening to concur on ordinary input (REQ-563's rule).
+    ///
+    /// # Nothing is executed
+    ///
+    /// [`dynamic::scan`] is pure. Running the preamble to find out whether the
+    /// preamble should run is precisely the harm this rule exists to prevent:
+    /// it is how `/analyze` came to `cat .adlc/context/architecture.md` in a
+    /// home folder (REQ-615 Description, consequence 1).
+    #[must_use]
+    pub fn needs_project(&self) -> bool {
+        if self.requires_project {
+            return true;
+        }
+        let (_pieces, commands) = dynamic::scan(&self.body);
+        commands
+            .iter()
+            .any(|command| command.as_str().contains(".adlc/"))
     }
 
     /// Which of BR-3's three states this row is in, for the **user's**
@@ -868,6 +912,7 @@ mod tests {
             argument_hint: None,
             body: String::new(),
             model_invocable: true,
+            requires_project: false,
             user_invocable: true,
             ignored_keys: Vec::new(),
             name_note: None,

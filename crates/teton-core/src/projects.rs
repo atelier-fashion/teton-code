@@ -392,8 +392,25 @@ pub fn render_locator(view: &LocatorView) -> String {
              launch teton from a project once and it is remembered.\n",
         );
     }
+    // REQ-615 BR-8. Every row above ends in a `/cd <name>` recipe, and the
+    // 2026-09-04 session read those recipes as instructions it could carry out
+    // — it called `projects`, then went back to `shell: cd …`. One line closes
+    // that reading: the recipe names an act, and the act is the user's.
+    //
+    // Last, after the budget notice, so it is the final thing read and no list
+    // can push it out; unconditional, because a listing with no matches still
+    // carries `/cd` in the sentence that says how a project becomes known.
+    out.push_str(PROJECTS_ARE_THE_USERS_TO_MOVE_TO);
     out
 }
+
+/// REQ-615 BR-8's trailing line — the sentence that turns the `/cd` recipes
+/// above it from something to run into something to ask for.
+///
+/// A named constant so the test that pins it and the renderer that emits it are
+/// one string: AC-7 requires a mutation deleting it to fail, and a hand-typed
+/// copy in the test would keep passing against a renderer that had dropped it.
+pub const PROJECTS_ARE_THE_USERS_TO_MOVE_TO: &str = "\nOnly the user can run `/cd`. Ask them.\n";
 
 /// How long ago `then` was, in the words the locator uses.
 ///

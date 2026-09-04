@@ -886,6 +886,51 @@ pub fn render_event(
         // REQ-613 BR-2/BR-5/BR-9: one line per stage, through the one composer
         // beside `format_repo_context` — the same fold-and-render shape the arm
         // above it takes, and for the same reason.
+        // REQ-615 BR-4: the refusal is already a sentence on the tool result the
+        // model reads, so this line is for the *person* — a session that just
+        // silently did nothing is the state this REQ exists to remove. One
+        // line, unconditional, in the vocabulary the daemon composed.
+        Event::WriteRefusedNonProject(refused) => {
+            surface.line(
+                LineKind::Notice,
+                &format!(
+                    "{} refused: {} is not a project. {} moves the root.",
+                    refused.tool, refused.root_display, refused.remedy
+                ),
+            );
+            EventOutcome::Rendered
+        }
+        // REQ-615 BR-5: likewise — and here the line matters more, because the
+        // alternative reading of a refused skill is "the skill is broken".
+        Event::SkillRefusedNeedsProject(refused) => {
+            surface.line(
+                LineKind::Notice,
+                &format!(
+                    "skill {} needs a project; this session is rooted at {}. \
+                     Run /cd <name> to move there.",
+                    refused.skill, refused.root_display
+                ),
+            );
+            EventOutcome::Rendered
+        }
+        // REQ-615 BR-6: diagnostic chrome. A fallback is normal in a skill
+        // written to tolerate a missing file; what makes it worth saying at all
+        // is a user wondering why a skill produced nothing useful, and that
+        // user is already reading `/verbose`.
+        Event::SkillPreambleFallback(fallback) => {
+            if state.verbose {
+                surface.line(
+                    LineKind::Notice,
+                    &format!(
+                        "skill {}: preamble {} fell back in {}",
+                        fallback.skill,
+                        fallback.command_index + 1,
+                        fallback.root_display
+                    ),
+                );
+            }
+            EventOutcome::Rendered
+        }
         Event::RepoContextGeneration(generation) => {
             if let Some(line) = format_repo_context_generation(generation, state.verbose) {
                 surface.line(LineKind::Notice, &line);

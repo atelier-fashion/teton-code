@@ -261,6 +261,13 @@ pub enum Event {
     /// stage of the generation that followed it finished (REQ-613 BR-2,
     /// architecture ADR-6).
     RepoContextGeneration(RepoContextGeneration),
+    /// A write was refused because the session root is not a project (REQ-615
+    /// BR-4).
+    WriteRefusedNonProject(WriteRefusedNonProject),
+    /// A skill that needs a project was refused outside one (REQ-615 BR-5).
+    SkillRefusedNeedsProject(SkillRefusedNeedsProject),
+    /// A skill preamble's `||` fallback branch fired (REQ-615 BR-6).
+    SkillPreambleFallback(SkillPreambleFallback),
 }
 
 impl Event {
@@ -313,6 +320,9 @@ impl Event {
             Event::TranscriptState(_) => "transcript_state",
             Event::RepoContextState(_) => "repo_context_state",
             Event::RepoContextGeneration(_) => "repo_context_generation",
+            Event::WriteRefusedNonProject(_) => "write_refused_non_project",
+            Event::SkillRefusedNeedsProject(_) => "skill_refused_needs_project",
+            Event::SkillPreambleFallback(_) => "skill_preamble_fallback",
         }
     }
 }
@@ -4312,6 +4322,82 @@ mod tests {
         let json = serde_json::to_string(value).unwrap();
         let back: T = serde_json::from_str(&json).unwrap();
         assert_eq!(&back, value);
+    }
+
+    /// **REQ-615 TASK-001: the three root-gate events carry the wire names the
+    /// spec's event table names, and round-trip.**
+    ///
+    /// The names are the contract: a client keys on the `event` tag, and the
+    /// daemon's own suites assert on these strings. Renaming one is a wire
+    /// break, so the spelling is asserted rather than left to the derive.
+    ///
+    /// Mutation: change any `name()` arm's string, or drop a `#[serde]` tag —
+    /// the `assert_eq!` on that arm goes red.
+    #[test]
+    fn the_root_gate_events_round_trip_their_wire_names() {
+        let write = Event::WriteRefusedNonProject(WriteRefusedNonProject {
+            tool: "shell".to_owned(),
+            root_display: "~".to_owned(),
+            root_kind: RootKind::Home,
+            remedy: "/cd <name>".to_owned(),
+        });
+        let skill = Event::SkillRefusedNeedsProject(SkillRefusedNeedsProject {
+            skill: "analyze".to_owned(),
+            source: crate::methods::SkillSource::User,
+            root_display: "~".to_owned(),
+            root_kind: RootKind::Home,
+            known_projects: vec!["teton-code".to_owned()],
+        });
+        let fallback = Event::SkillPreambleFallback(SkillPreambleFallback {
+            skill: "analyze".to_owned(),
+            command_index: 0,
+            root_display: "~".to_owned(),
+        });
+
+        for (event, expected) in [
+            (&write, "write_refused_non_project"),
+            (&skill, "skill_refused_needs_project"),
+            (&fallback, "skill_preamble_fallback"),
+        ] {
+            assert_eq!(event.name(), expected);
+            let json = serde_json::to_value(event).unwrap();
+            assert_eq!(
+                json.get("event").and_then(serde_json::Value::as_str),
+                Some(expected),
+                "the wire tag must be the same spelling `name()` reports: {json}"
+            );
+            round_trip(event);
+        }
+    }
+
+    /// **REQ-615 BR-6 / TASK-001: the preamble-fallback event carries no
+    /// output.**
+    ///
+    /// The bus fans out to every attached client and every declared monitor
+    /// (REQ-611 BR-4), so a field holding the preamble's bytes would copy
+    /// repository content onto it. The output reaches the model on the
+    /// expansion, framed; this record is only the notice.
+    ///
+    /// Mutation: add an `output` field to `SkillPreambleFallback` — the field
+    /// count assertion goes red.
+    #[test]
+    fn the_preamble_fallback_event_carries_no_output() {
+        let json = serde_json::to_value(SkillPreambleFallback {
+            skill: "analyze".to_owned(),
+            command_index: 2,
+            root_display: "~".to_owned(),
+        })
+        .unwrap();
+        let object = json.as_object().expect("a struct serializes to an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["command_index", "root_display", "skill"],
+            "the fallback notice may name the skill, the slot and the root and \
+             nothing else — an output field here copies repository bytes onto a \
+             bus every subscriber reads: {json}"
+        );
     }
 
     /// A representative first-run proposal: a 32 GiB Apple Silicon machine, a
@@ -9433,4 +9519,70 @@ pub struct PrefillProgress {
     pub tokens_total: u32,
     /// Throughput since the prefill started.
     pub tokens_per_second: f32,
+}
+
+// ---------------------------------------------------------------------------
+// The session-root gates (REQ-615)
+// ---------------------------------------------------------------------------
+
+/// A write was refused because the session root is a home folder or the
+/// filesystem root (REQ-615 BR-4).
+///
+/// The subject is the **place**, not the file: the payload names the root the
+/// tool was jailed to, what kind of place that is, and the one act that moves
+/// it. It deliberately carries no path — the refused target is the caller's own
+/// argument, already on the tool result the model reads, and a second copy on a
+/// bus whose audience is every attached client and every declared monitor is a
+/// disclosure surface with no actionable payload (REQ-607 BR-3, LESSON-513).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteRefusedNonProject {
+    /// Which tool was refused — `edit`, or `shell`.
+    pub tool: String,
+    /// The session root's display spelling, already bounded by the daemon: the
+    /// same bytes the environment block and every jail refusal print.
+    pub root_display: String,
+    /// What kind of place that root is. Only `home` and `filesystem_root`
+    /// reach here; a `project` or `plain` root is never gated (BR-4, BR-9).
+    pub root_kind: crate::methods::RootKind,
+    /// The act that lifts the refusal, worded as the user would type it.
+    pub remedy: String,
+}
+
+/// A skill that declares a project requirement was invoked outside one
+/// (REQ-615 BR-5).
+///
+/// Published *instead of* an expansion: by the time this record exists the
+/// gate has already returned, so no preamble command ran, no consent was asked
+/// and no model turn was spent on the body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillRefusedNeedsProject {
+    /// The skill's registered name.
+    pub skill: String,
+    /// Where the file came from — a user skills root, or the repository.
+    pub source: crate::methods::SkillSource,
+    /// The session root's display spelling, already bounded.
+    pub root_display: String,
+    /// What kind of place that root is.
+    pub root_kind: crate::methods::RootKind,
+    /// The projects this machine knows about, ranked and bounded at REQ-583's
+    /// ceiling by the daemon before it reaches here — the same list the
+    /// environment block draws its clause from, so the two cannot disagree.
+    pub known_projects: Vec<String>,
+}
+
+/// A skill preamble's `||` fallback branch fired (REQ-615 BR-6).
+///
+/// **Carries no output, deliberately.** The event is a notice that a fallback
+/// happened; the output itself reaches the model on the expansion, where it is
+/// framed and bounded. Putting the bytes here too would copy repository content
+/// onto a bus the daemon fans out to every subscriber (REQ-611 BR-4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillPreambleFallback {
+    /// The skill whose preamble fell back.
+    pub skill: String,
+    /// Which `!cmd` it was, in document order, 0-based — the same index the
+    /// fold's harness line renders (1-based, as a reader counts).
+    pub command_index: usize,
+    /// The session root the primary failed in, already bounded.
+    pub root_display: String,
 }
