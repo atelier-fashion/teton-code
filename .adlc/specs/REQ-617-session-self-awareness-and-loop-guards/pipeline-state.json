@@ -1,0 +1,32 @@
+{
+  "req": "REQ-617",
+  "branch": "feat/REQ-617-session-self-awareness-and-loop-guards",
+  "startedAt": "2026-09-04T00:00:00Z",
+  "completed": false,
+  "currentPhase": 0,
+  "completedPhases": [],
+  "integrationBranch": "main",
+  "phaseHistory": [],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-617",
+      "branch": "feat/REQ-617-session-self-awareness-and-loop-guards",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": ["teton-code"],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  },
+  "conflictsResolved": [],
+  "notes": []
+}
