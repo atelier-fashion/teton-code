@@ -60,8 +60,9 @@
 //!
 //! # `--force` is a rename, never a truncate
 //!
-//! [`replace`] writes `TETON.md.<pid>.tmp` with the same open and `rename`s it
-//! over the target. `rename(2)` is atomic within a directory: a reader between
+//! [`replace`] writes `TETON.md.<pid>.<serial>.tmp` with the same open and
+//! `rename`s it over the target. `rename(2)` is atomic within a directory: a
+//! reader between
 //! the two sees the old file or the new one, never a half-written one, and there
 //! is no moment at which `TETON.md` exists at zero length. A
 //! `truncate`-then-write would have exactly that moment, and REQ-612's loader
@@ -71,11 +72,39 @@
 //! The rename is also what keeps `--force` from writing *through* a symlink:
 //! `rename` replaces the entry, so a `TETON.md` that is a link to somewhere else
 //! becomes a regular file here and the link's target is untouched.
+//!
+//! # The scratch name is per *call*, and a collision is never unlinked
+//!
+//! One daemon process serves many sessions and `session/context` runs on spawned
+//! tasks, so two `--force` runs at one root can be inside [`replace`] at the same
+//! instant. A scratch name keyed on the pid alone would be the *same* name for
+//! both, and the loser of that race would be holding a descriptor on a file the
+//! winner had already unlinked and re-created — after which one run's `rename`
+//! publishes the other run's half-written bytes as `TETON.md`. That is the
+//! truncate window this whole design exists to close, arriving through the door
+//! marked "cleanup".
+//!
+//! So the name carries a process-wide [`SCRATCH_SERIAL`] as well as the pid, and
+//! it is drawn fresh on **every attempt**: two concurrent calls cannot name the
+//! same file, and a call that finds its name taken retries with a new serial
+//! rather than removing an entry it did not create. Nothing in this module ever
+//! unlinks a path it has not just successfully created with `O_EXCL`. After
+//! [`SCRATCH_ATTEMPTS`] collisions the write is refused as
+//! `WriteFailure::Io(ErrorKind::AlreadyExists)` — a root that can lose four
+//! `O_EXCL` creates in a row is not one to keep guessing at.
+//!
+//! The cost of never unlinking is that a run killed between the create and the
+//! rename leaves one scratch file behind, where the old code would eventually
+//! have reclaimed the name. That is the right trade: a stray
+//! `TETON.md.<pid>.<serial>.tmp` is inert — no session start reads it, since
+//! REQ-612's loader opens `TETON.md` and `AGENTS.md` by name — while the
+//! reclaiming version could publish another live run's partial file.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use teton_protocol::methods::RepoContextSource;
 
@@ -140,9 +169,12 @@ pub fn write_new(root: &Path, body: &str) -> Result<Written, WriteFailure> {
 
 /// Replace `<root>/TETON.md` with `body` — the `--force` path (BR-8, ADR-5).
 ///
-/// The new bytes go to `TETON.md.<pid>.tmp` first and are `rename`d over the
-/// target, so the target holds the old bytes or the new ones and never a
-/// truncated file. The scratch file is removed on every failing path.
+/// The new bytes go to `TETON.md.<pid>.<serial>.tmp` first and are `rename`d
+/// over the target, so the target holds the old bytes or the new ones and never
+/// a truncated file. The scratch file is removed on every failing path — and
+/// only ever the one *this call* created (see the module docs), so two
+/// concurrent `--force` runs at one root both finish and neither publishes the
+/// other's bytes.
 ///
 /// [`WriteFailure::AlreadyExists`] is not among this function's answers: it
 /// means "a `TETON.md` is already there", which is the case `--force` is *for*.
@@ -150,28 +182,7 @@ pub fn write_new(root: &Path, body: &str) -> Result<Written, WriteFailure> {
 pub fn replace(root: &Path, body: &str) -> Result<Written, WriteFailure> {
     let name = file_name(RepoContextSource::TetonMd);
     let target = root.join(name);
-    // Beside the target and inside the root, so the `rename` is within one
-    // directory and therefore atomic; a scratch file in `/tmp` would make it a
-    // cross-device copy, which is the truncate window under another name.
-    let temp = root.join(format!("{name}.{}.tmp", std::process::id()));
-
-    let file = match create_new(&temp) {
-        Ok(file) => file,
-        // Only this process can have written that name, so an entry there is a
-        // leftover from a run of ours that died — or, once pids wrap, of a
-        // long-dead stranger's. Unlink it and claim the name once more.
-        // `remove_file` unlinks the entry itself and never follows, so this is
-        // safe for the symlink case too.
-        Err(WriteFailure::AlreadyExists | WriteFailure::Symlink) => {
-            remove(&temp);
-            create_new(&temp).map_err(|failure| match failure {
-                WriteFailure::AlreadyExists => WriteFailure::Io(std::io::ErrorKind::AlreadyExists),
-                other => other,
-            })?
-        }
-        Err(other) => return Err(other),
-    };
-
+    let (temp, file) = claim_scratch(root, name)?;
     let written = fill(&temp, file, body)?;
     match std::fs::rename(&temp, &target) {
         Ok(()) => Ok(Written {
@@ -183,6 +194,53 @@ pub fn replace(root: &Path, body: &str) -> Result<Written, WriteFailure> {
             Err(classify(&error))
         }
     }
+}
+
+/// How many scratch names one [`replace`] will try before giving up.
+///
+/// Four, because each attempt draws a name no other attempt in this process can
+/// draw, so the only way to lose one is a foreign entry already sitting at it —
+/// and four of those in a row is a root doing something this function should
+/// stop guessing about rather than a race to ride out.
+const SCRATCH_ATTEMPTS: usize = 4;
+
+/// The process-wide counter that makes a scratch name unique per *call*.
+///
+/// Not per process: see the module docs — the pid is shared by every session
+/// this daemon serves, and two of them can be inside [`replace`] at once.
+static SCRATCH_SERIAL: AtomicU64 = AtomicU64::new(0);
+
+/// The scratch file name for `serial`, beside the target and never elsewhere.
+///
+/// Inside the root so the `rename` is within one directory and therefore atomic;
+/// a scratch file in `/tmp` would make it a cross-device copy, which is the
+/// truncate window under another name.
+fn scratch_name(name: &str, serial: u64) -> String {
+    format!("{name}.{}.{serial}.tmp", std::process::id())
+}
+
+/// Claim a scratch file beside `<root>/<name>`, or report why not.
+///
+/// Each attempt draws a **fresh** serial, so a name already taken is retried
+/// past rather than unlinked: this function removes nothing, and the file it
+/// returns is one `O_EXCL` just created. `AlreadyExists` and `Symlink` are the
+/// two shapes a foreign entry at the name can take and both mean the same thing
+/// here — the name is not ours — so both retry. Anything else is the
+/// filesystem refusing the whole directory and is reported straight away.
+fn claim_scratch(root: &Path, name: &str) -> Result<(PathBuf, File), WriteFailure> {
+    for _ in 0..SCRATCH_ATTEMPTS {
+        let serial = SCRATCH_SERIAL.fetch_add(1, Ordering::Relaxed);
+        let temp = root.join(scratch_name(name, serial));
+        match create_new(&temp) {
+            Ok(file) => return Ok((temp, file)),
+            Err(WriteFailure::AlreadyExists | WriteFailure::Symlink) => continue,
+            Err(other) => return Err(other),
+        }
+    }
+    // Not `AlreadyExists`: that verdict is [`write_new`]'s "your `TETON.md` is
+    // already there", and `--force` never says it. This is an I/O failure that
+    // happens to be a name clash.
+    Err(WriteFailure::Io(std::io::ErrorKind::AlreadyExists))
 }
 
 /// Create `path`, refusing an existing entry of any kind.
@@ -552,10 +610,10 @@ mod tests {
     /// - **The inode changes.** A `truncate`-then-write keeps the target's
     ///   inode; a rename replaces it. This is the whole difference, and it is
     ///   visible from outside.
-    /// - **The scratch name is exactly `TETON.md.<pid>.tmp`.** A *directory*
-    ///   planted there can be neither claimed by `create_new` nor cleared by
-    ///   `remove_file`, so a `replace` that used any other name would have
-    ///   sailed past it and replaced the target.
+    /// - **The scratch file is beside the target and gone afterwards.** The root
+    ///   holds exactly `TETON.md` when the call returns, so the temp was in this
+    ///   directory (a `rename` out of `/tmp` would not be atomic) and the rename
+    ///   consumed it.
     /// - **The rename is textually last** in `replace`'s body, which inside one
     ///   function body is execution order (conventions).
     ///
@@ -588,24 +646,6 @@ mod tests {
             "the scratch file outlived the rename"
         );
 
-        // The scratch name is the one ADR-5 specifies, and a failure to claim it
-        // leaves the target alone.
-        let root = scratch("temp-name");
-        let target = root.join("TETON.md");
-        std::fs::write(&target, "the old notes").expect("the old file is written");
-        std::fs::create_dir(root.join(format!("TETON.md.{}.tmp", std::process::id())))
-            .expect("the scratch name is occupied");
-        let failure = replace(&root, BODY);
-        assert!(
-            matches!(failure, Err(WriteFailure::Io(_))),
-            "an unclaimable scratch name did not report an I/O failure: {failure:?}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&target).expect("the file reads back"),
-            "the old notes",
-            "a replace that never wrote its scratch file still changed the target"
-        );
-
         // A symlink at the target is replaced, never written through — the
         // property `rename` gives for free and a truncating write would not.
         let root = scratch("replace-symlink");
@@ -634,7 +674,7 @@ mod tests {
         // and the rename is the last thing that happens.
         let body = body_of("replace");
         assert!(
-            body.contains("std::fs::rename(&temp, &target)") && body.contains(".tmp"),
+            body.contains("std::fs::rename(&temp, &target)") && body.contains("claim_scratch"),
             "the extracted slice is not `replace`"
         );
         assert!(
@@ -642,8 +682,8 @@ mod tests {
             "`replace` opens the target directly"
         );
         let created = body
-            .find("create_new(&temp)")
-            .expect("the scratch file is created");
+            .find("claim_scratch(root, name)")
+            .expect("the scratch file is claimed");
         let filled = body
             .find("fill(&temp,")
             .expect("the scratch file is filled");
@@ -652,12 +692,179 @@ mod tests {
             .expect("the scratch file is renamed");
         assert!(
             created < filled && filled < renamed,
-            "`replace` does not create, fill, then rename: {created} {filled} {renamed}"
+            "`replace` does not claim, fill, then rename: {created} {filled} {renamed}"
         );
         for after in ["create_new(", "fill(", "write_all"] {
             assert!(
                 !body[renamed + "std::fs::rename(&temp, &target)".len()..].contains(after),
                 "`{after}` runs after the rename"
+            );
+        }
+    }
+
+    /// A foreign scratch file is **retried past, never unlinked** — the half of
+    /// BR-8's atomicity that the collision arm used to defeat.
+    ///
+    /// Two legs, because there are two ways to name the same hazard:
+    ///
+    /// - **The pid-only name is never drawn.** `TETON.md.<pid>.tmp` was the
+    ///   scratch name before the serial existed, and the code that drew it
+    ///   `remove_file`d whatever it found there on the reasoning that "only this
+    ///   process can have written that name" — true, and the wrong conclusion,
+    ///   because *this process* is one daemon serving many sessions. A file
+    ///   planted at that name stands in for the other run's in-progress temp.
+    /// - **The name this very call is about to draw is retried past.** Bracketed
+    ///   on [`SCRATCH_SERIAL`] so the leg only concludes on a round it actually
+    ///   observed: two draws between the two loads means this call lost the
+    ///   planted name and claimed the next one. A round in which another test
+    ///   thread drew a serial is skipped rather than asserted on.
+    ///
+    /// Mutations, both run 2026-09-04 and restored: restoring the collision arm
+    /// — `Err(AlreadyExists | Symlink) => { remove(&temp); create_new(&temp) }`
+    /// in place of `claim_scratch`'s `continue` — fails leg two with "the
+    /// collision unlinked a scratch file this call did not create"; the whole
+    /// pre-review shape (that arm plus the pid-only name) fails leg one first,
+    /// with "a foreign temp at the pid-only name was unlinked".
+    #[test]
+    fn a_scratch_name_collision_is_retried_past_and_never_unlinked() {
+        const FOREIGN: &str = "another run's half-written draft\n";
+        let name = file_name(RepoContextSource::TetonMd);
+
+        // Leg one: the pid-only name is nobody's scratch name any more.
+        let root = scratch("legacy-temp");
+        let target = root.join(name);
+        std::fs::write(&target, "the old notes").expect("the old file is written");
+        let legacy = root.join(format!("{name}.{}.tmp", std::process::id()));
+        std::fs::write(&legacy, FOREIGN).expect("the foreign temp is planted");
+        replace(&root, BODY).expect("--force replaces");
+        assert_eq!(
+            std::fs::read_to_string(&legacy).ok().as_deref(),
+            Some(FOREIGN),
+            "a foreign temp at the pid-only name was unlinked"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("the file reads back"),
+            BODY
+        );
+
+        // Leg two: the name this call draws first is occupied.
+        let mut observed = false;
+        for round in 0..32 {
+            let root = scratch(&format!("collision-{round}"));
+            let target = root.join(name);
+            std::fs::write(&target, "the old notes").expect("the old file is written");
+            let before = SCRATCH_SERIAL.load(Ordering::Relaxed);
+            let planted = root.join(scratch_name(name, before));
+            std::fs::write(&planted, FOREIGN).expect("the foreign temp is planted");
+            let written = replace(&root, BODY);
+            let drawn = SCRATCH_SERIAL.load(Ordering::Relaxed) - before;
+            if !(1..=2).contains(&drawn) {
+                // Another test thread drew a serial inside the window, so this
+                // round did not run the race; nothing to conclude from it. One
+                // draw or two both mean this call was the only drawer and its
+                // first name was therefore the planted one — one when it claimed
+                // that name (the hazard), two when it left it alone and took the
+                // next (the fix).
+                continue;
+            }
+            observed = true;
+            written.expect("--force replaces past an occupied scratch name");
+            assert_eq!(
+                std::fs::read_to_string(&planted).ok().as_deref(),
+                Some(FOREIGN),
+                "the collision unlinked a scratch file this call did not create"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&target).expect("the file reads back"),
+                BODY
+            );
+            assert_eq!(
+                entries(&root),
+                vec![name.to_owned(), scratch_name(name, before),],
+                "the retried-past round left an entry of its own behind"
+            );
+            break;
+        }
+        assert!(
+            observed,
+            "no round ran the collision: `SCRATCH_SERIAL` moved under every one of them"
+        );
+    }
+
+    /// BR-8 under concurrency: two `--force` runs at one root both finish, and
+    /// `TETON.md` ends up holding one of the two bodies **whole**.
+    ///
+    /// One daemon process serves many sessions, so the pid is not a lock. With a
+    /// per-process scratch name the two runs name the same file: the second
+    /// create finds the first's temp, unlinks it, and re-creates it — after
+    /// which the first run is filling an unlinked inode and the second's
+    /// `rename` publishes whatever the first had managed to write, or fails
+    /// outright because the first renamed the entry away underneath it.
+    ///
+    /// The bodies are 128 KiB and differ in every byte, so a published mixture
+    /// of the two is not a subtle difference, and the `Barrier` plus 16 rounds
+    /// puts both calls inside `fill` at once often enough for the old shape to
+    /// show. What is asserted is the *outcome*, not the interleaving: both
+    /// answers are `Ok`, the target is byte-identical to one body or the other,
+    /// and no scratch file is left in the root.
+    ///
+    /// Mutations, both run 2026-09-04 and restored. The **whole pre-review
+    /// shape** — `scratch_name` dropping the serial *and* the collision arm
+    /// unlinking what it found — fails with "the second `--force` run failed:
+    /// Err(Io(NotFound))", which run it names varying with the interleaving: the
+    /// loser's `rename` finds the entry the winner already moved. Dropping the
+    /// serial **alone**, so the two runs share a name that neither will unlink,
+    /// fails with "the first `--force` run failed: Err(Io(AlreadyExists))" — the
+    /// loser exhausting [`SCRATCH_ATTEMPTS`] on the one name it can draw. Both
+    /// are red on the first round of sixteen.
+    #[test]
+    fn two_concurrent_replaces_both_finish_and_neither_publishes_a_mixture() {
+        use std::sync::{Arc, Barrier};
+
+        let first: String = "a".repeat(128 * 1024);
+        let second: String = "b".repeat(128 * 1024);
+        for round in 0..16 {
+            let root = scratch(&format!("concurrent-{round}"));
+            std::fs::write(root.join("TETON.md"), "the old notes").expect("the old file");
+            let barrier = Arc::new(Barrier::new(2));
+            let outcomes: Vec<_> = [&first, &second]
+                .into_iter()
+                .map(|body| {
+                    let root = root.clone();
+                    let body = body.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        replace(&root, &body)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().expect("the thread finished"))
+                .collect();
+
+            assert!(
+                outcomes[0].is_ok(),
+                "the first `--force` run failed: {:?}",
+                outcomes[0]
+            );
+            assert!(
+                outcomes[1].is_ok(),
+                "the second `--force` run failed: {:?}",
+                outcomes[1]
+            );
+            let published =
+                std::fs::read_to_string(root.join("TETON.md")).expect("the file reads back");
+            assert!(
+                published == first || published == second,
+                "`TETON.md` holds neither body whole: {} bytes, starts {:?}",
+                published.len(),
+                &published[..published.len().min(8)]
+            );
+            assert_eq!(
+                entries(&root),
+                vec!["TETON.md".to_owned()],
+                "a scratch file outlived the two runs"
             );
         }
     }

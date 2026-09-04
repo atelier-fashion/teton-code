@@ -2137,6 +2137,7 @@ impl NotesSession {
                 None,
             )
             .await
+            .expect("`status` takes no turn claim, so it is never refused")
     }
 }
 

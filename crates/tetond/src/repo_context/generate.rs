@@ -19,7 +19,8 @@
 //! [`write::write_new`]/[`write::replace`] are the no-clobber and `--force` writes
 //! (ADR-5), and [`RepoContext::load`] is REQ-612's loader unchanged. What this
 //! module owns is the **order**, the **event per stage**, and the rule that a
-//! failure at any of them leaves no file.
+//! failure at any of them leaves no file — with the one exception [`run`]'s doc
+//! names, where removing the file would destroy the one it replaced.
 //!
 //! ## The cost row is the duty's, and there is exactly one (BR-5)
 //!
@@ -47,7 +48,7 @@
 //! here rather than of a branch that remembers not to fire.
 
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use teton_core::boundary::BoundaryMatcher;
@@ -84,9 +85,10 @@ use super::{RepoContext, RepoContextState, RepoFileReader, CANDIDATE_NAMES};
 /// a monitor's line out of.
 const REASON_MAX_CHARS: usize = 200;
 
-/// The human said yes — or said it by asking (`/context init`).
+/// The human said yes — or said it by asking (`/context init`) — **about this
+/// directory**.
 ///
-/// A witness, and its only job is to make [`run`] unreachable from a path that
+/// A witness, and its first job is to make [`run`] unreachable from a path that
 /// never asked: a function taking `bool` is a function some later caller passes
 /// `true` to for convenience, and what would be waved through is a walk of the
 /// user's repository followed by a frontier model call.
@@ -96,14 +98,32 @@ const REASON_MAX_CHARS: usize = 200;
 /// [`Self::granted`] asserts is that the caller stood at a place where consent
 /// was settled: an accepted prompt, a `full`-level session, `generate = always`,
 /// or the user's own `/context init`.
+///
+/// # It carries the directory, because the question named one
+///
+/// The consent key is minted from the **canonical** root
+/// ([`durable_trust_root_name`]), so a root reached through a symlinked parent
+/// is one remembered answer however it was spelled. A write that then used the
+/// *spelled* path would put the file somewhere the answer was never given
+/// about — two directories for one question — and would defeat the key the
+/// moment the two spellings resolve differently. So the witness carries the
+/// directory consent was settled for and [`run`] writes there: the fact has one
+/// home, and it is the one that minted the key.
 #[derive(Debug, Clone, Copy)]
-pub struct ConsentGiven(());
+pub struct ConsentGiven<'a>(&'a Path);
 
-impl ConsentGiven {
-    /// Mint the witness. Call this only where the answer is actually in hand.
+impl<'a> ConsentGiven<'a> {
+    /// Mint the witness for `target`. Call this only where the answer is
+    /// actually in hand, and hand it the directory that answer was about.
     #[must_use]
-    pub fn granted() -> Self {
-        Self(())
+    pub fn granted(target: &'a Path) -> Self {
+        Self(target)
+    }
+
+    /// The directory the notes are written into.
+    #[must_use]
+    pub fn target(self) -> &'a Path {
+        self.0
     }
 }
 
@@ -151,6 +171,19 @@ pub enum Reason {
     /// canonicalized, or a byte budget too small for even the root's own line.
     /// Distinct from a budget *stop*, which is not a failure (BR-9).
     NothingToDraft,
+    /// The draft route's context window is too narrow to carry any evidence at
+    /// all: [`evidence_budget_for`] reserves the answer and the drafting
+    /// instruction out of it first, and what is left is nothing.
+    ///
+    /// Distinct from [`Self::NothingToDraft`], which is a statement about the
+    /// *repository* — and the reason this variant exists: a saturated budget
+    /// walks the tree, finds it, cannot afford a byte of it, and would then
+    /// report a repository with nothing in it. The remedy is a wider route, not
+    /// a different directory.
+    WindowTooNarrow {
+        /// The window the route was measured against, in bytes.
+        window_bytes: usize,
+    },
     /// The duty's own sentence, verbatim — an unresolvable binding, a provider
     /// error, a refusal at the egress choke point, a prompt the route's window
     /// would not take, or the seam's deadline.
@@ -170,8 +203,24 @@ pub enum Reason {
     /// Anything else the filesystem said, by kind.
     Io(ErrorKind),
     /// The bytes were written whole and REQ-612's loader would not make them
-    /// resident (BR-7). Carries what the loader answered instead.
-    NotLoaded(RepoContextStateKind),
+    /// resident (BR-7). Carries what the loader answered instead, and what
+    /// became of the file.
+    NotLoaded {
+        /// What the loader answered instead of `Loaded`.
+        kind: RepoContextStateKind,
+        /// Whether the bytes are still on disk.
+        ///
+        /// **The two doors part here, and only here.** A `write_new` that is
+        /// then refused by the loader is unlinked: nothing was there before, so
+        /// removing it restores the directory the run found. A `replace` has
+        /// already renamed over the file it was given permission to replace —
+        /// the old bytes are gone the instant the rename returns — so unlinking
+        /// would leave the user with *neither* file, which is the one outcome
+        /// `--force` cannot mean. It is carried rather than worded at the
+        /// detection point because the surface that renders this is the surface
+        /// that has to tell the user which of the two happened.
+        left_in_place: bool,
+    },
 }
 
 impl Reason {
@@ -184,13 +233,31 @@ impl Reason {
     pub(crate) fn as_news(&self) -> String {
         match self {
             Reason::NothingToDraft => "the walk found nothing to draft from".to_owned(),
+            Reason::WindowTooNarrow { window_bytes } => format!(
+                "the draft route's window ({window_bytes} bytes) is too narrow to carry any \
+                 evidence"
+            ),
             Reason::Duty(sentence) => sentence.clone(),
             Reason::EmptyDraft => "the draft came back empty".to_owned(),
             Reason::AlreadyExists => "a TETON.md is already there".to_owned(),
             Reason::Symlink => "the path is a symlink".to_owned(),
             Reason::Io(kind) => format!("the write failed: {kind}"),
-            Reason::NotLoaded(kind) => format!(
+            // The second clause is the whole of BR-9's exception: every other
+            // failure leaves no file, and a user owed that promise has to be
+            // told the one case where it does not hold — the replacement is
+            // there, unread, and `--force` will not un-replace what it replaced.
+            Reason::NotLoaded {
+                kind,
+                left_in_place: false,
+            } => format!(
                 "the file was written and read back as {}",
+                state_word(*kind)
+            ),
+            Reason::NotLoaded {
+                kind,
+                left_in_place: true,
+            } => format!(
+                "the replacement was written and read back as {}; it is left in place",
                 state_word(*kind)
             ),
         }
@@ -247,7 +314,10 @@ pub enum GenerationOutcome {
     Written(Generated),
     /// An existing file was replaced — only `force` reaches this (BR-8).
     Replaced(Generated),
-    /// A stage failed and **no file was left behind** (BR-9).
+    /// A stage failed. **No file was left behind** (BR-9), with the one
+    /// exception [`run`]'s doc names: a `force` run whose replacement would not
+    /// load back leaves the replacement, because the file it replaced is
+    /// already gone.
     Failed {
         /// Which act it failed in.
         stage: Stage,
@@ -290,6 +360,28 @@ impl GenerationOutcome {
 /// session these events are attributed to, and a second copy here would be a
 /// second spelling of one identity for the five publishing sites to drift on —
 /// the same reason `SessionEvents` owns the attribution in the first place.
+/// The draft route's window, and what the evidence body may spend of it
+/// (ADR-3).
+///
+/// **Both halves, because the subtraction can take the whole of it.** The
+/// evidence share is the window less the answer and the drafting instruction,
+/// and on a route narrower than that reserve it saturates to zero — at which
+/// point the share alone can no longer say what happened. A body of zero bytes
+/// and a window of 8,000 bytes are two different facts with two different
+/// remedies, and [`Reason::WindowTooNarrow`] can only tell them apart if the
+/// window travelled with the share.
+///
+/// Not a second field on [`EvidenceBudget`]: that type is the *assembly's*
+/// bound and is spent by the gatherer, which has no business knowing what the
+/// route's window was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DraftBudget {
+    /// The route's whole context budget, in bytes, as the router answered it.
+    pub window_bytes: usize,
+    /// What the evidence body may spend of it.
+    pub evidence: EvidenceBudget,
+}
+
 pub struct GenerationContext<'a> {
     /// The session's probed root: one probe, so the jail the walk runs under, the
     /// directory the file is written into and the root the loader reads at are
@@ -305,9 +397,9 @@ pub struct GenerationContext<'a> {
     /// The session's compiled boundary set — what the gatherer excludes by and
     /// what the loader withholds by.
     pub boundaries: &'a BoundaryMatcher<'a>,
-    /// The evidence body's byte budget, derived by the caller from the draft
-    /// route's own window (ADR-3: only the caller knows the route).
-    pub budget: EvidenceBudget,
+    /// The draft route's window and the evidence body's share of it, derived by
+    /// the caller (ADR-3: only the caller knows the route).
+    pub budget: DraftBudget,
     /// The walk's own budget — REQ-583's type, passed through.
     ///
     /// Not a second home for the bound (ADR-3's objection was to putting
@@ -350,21 +442,25 @@ pub struct GenerationContext<'a> {
 /// that is there — planted before the run, or created between consent and the
 /// write — is [`Reason::AlreadyExists`] and nothing on disk changes.
 ///
-/// # Every exit is one of four, and three of them leave no file
+/// # A failure leaves no file, with one named exception
 ///
-/// A stop the walk's budget imposed is **not** one of them: a partial listing is
-/// still a listing, it is written into the tree the model is shown and into the
-/// header the reader meets, and refusing to draft from it would turn a large
-/// repository into a repository that can never have notes (BR-9).
+/// Every stage that fails ends with the directory as this run found it — except
+/// a load-back refusal on the `force` door, where the replacement has already
+/// landed on top of the file it replaced and removing it would destroy both
+/// (see [`Reason::NotLoaded`]'s `left_in_place`).
+///
+/// A stop the walk's budget imposed is **not** a failure at all: a partial
+/// listing is still a listing, it is written into the tree the model is shown
+/// and into the header the reader meets, and refusing to draft from it would
+/// turn a large repository into a repository that can never have notes (BR-9).
 pub async fn run(
     ctx: GenerationContext<'_>,
-    consent: ConsentGiven,
+    consent: ConsentGiven<'_>,
     force: bool,
 ) -> GenerationOutcome {
-    // The witness has no fields to read: what it asserts is that this call
-    // happened at all. Bound rather than ignored in the signature so that the
-    // parameter cannot be quietly dropped by a later edit.
-    let ConsentGiven(()) = consent;
+    // The witness asserts that this call happened at all, and names the
+    // directory the answer was given about — which is where the bytes go.
+    let target = consent.target();
 
     // --- walking ---------------------------------------------------------
     publish(
@@ -372,13 +468,38 @@ pub async fn run(
         events::GenerationOutcome::Walking,
         &Progress::default(),
     );
-    let evidence = evidence::gather_with_walk_budget(
-        ctx.root,
-        ctx.reader,
-        ctx.boundaries,
-        ctx.budget,
-        ctx.walk,
-    );
+    // Before the walk, because a route that cannot carry a byte of evidence
+    // makes the walk pointless and its answer misleading: the assembly would
+    // spend a saturated budget, hand back an empty body, and the run would
+    // report a repository with nothing in it (BR-9's `NothingToDraft` is a fact
+    // about the tree). Published under `Stage::Walk` all the same — it is the
+    // walk's own budget that is missing.
+    if ctx.budget.evidence.max_bytes == 0 {
+        return fail(
+            &ctx,
+            &Progress::default(),
+            Stage::Walk,
+            Reason::WindowTooNarrow {
+                window_bytes: ctx.budget.window_bytes,
+            },
+        );
+    }
+    // BUG-184's rule: the gatherer is synchronous and unbounded in wall-clock
+    // terms up to REQ-583's budget — up to 100,000 entries or 10 seconds of
+    // `read_dir`, `stat` and read on user-controlled paths, and on macOS a root
+    // under `~/Documents` can raise a TCC dialog that blocks the syscall for as
+    // long as the user takes to answer it. This runs on the connection's
+    // spawned task, so the wait must not be taken on an async worker — the same
+    // wrapping `load_repo_context` takes one act earlier, for the same syscalls.
+    let evidence = crate::runtime::block_in_place_if_multithread(|| {
+        evidence::gather_with_walk_budget(
+            ctx.root,
+            ctx.reader,
+            ctx.boundaries,
+            ctx.budget.evidence,
+            ctx.walk,
+        )
+    });
     let walked = Progress {
         entries: Some(evidence.entries),
         excluded: Some(evidence.excluded),
@@ -429,10 +550,14 @@ pub async fn run(
     publish(&ctx, events::GenerationOutcome::Drafted, &drafted);
 
     // --- writing ---------------------------------------------------------
+    //
+    // Into the directory consent was settled for, never the session's own
+    // spelling of it: the two are the same directory reached two ways, and the
+    // permission key was minted from this one.
     let written = if force {
-        write::replace(&ctx.root.path, &body)
+        write::replace(target, &body)
     } else {
-        write::write_new(&ctx.root.path, &body)
+        write::write_new(target, &body)
     };
     let written = match written {
         Ok(written) => written,
@@ -442,9 +567,18 @@ pub async fn run(
     // --- loading ---------------------------------------------------------
     //
     // REQ-612's loader on the file just written, same run, same rules an authored
-    // file is read by (BR-7). Anything short of `Loaded` is a failure *and* an
-    // unlink: a file the loader will not make resident is a file the next session
-    // meets as if the repository had written it.
+    // file is read by (BR-7). Anything short of `Loaded` is a failure, and on the
+    // no-clobber door an unlink with it: a file the loader will not make resident
+    // is a file the next session meets as if the repository had written it, and
+    // nothing was there before this run to restore.
+    //
+    // **`--force` is the exception, and it is not a softening of BR-9.**
+    // `write::replace` renames over the old file, so by the time the loader
+    // answers there is exactly one file at the path and the bytes it displaced
+    // are gone. Unlinking here would leave the user with neither their file nor
+    // its replacement — destroying, on a *read* failure, the very thing they
+    // gave permission to replace. So the replacement stays and the reason says
+    // so.
     let state = RepoContext::load(
         ctx.root,
         ctx.boundaries,
@@ -452,9 +586,19 @@ pub async fn run(
         ctx.reader,
     );
     if !matches!(state, RepoContextState::Loaded(_)) {
-        write::remove(&written.path);
+        if !force {
+            write::remove(&written.path);
+        }
         let kind = state.kind();
-        return fail(&ctx, &drafted, Stage::Load, Reason::NotLoaded(kind));
+        return fail(
+            &ctx,
+            &drafted,
+            Stage::Load,
+            Reason::NotLoaded {
+                kind,
+                left_in_place: force,
+            },
+        );
     }
 
     let made = Generated {
@@ -633,10 +777,25 @@ fn cut_phrase(evidence: &Evidence) -> Option<String> {
 /// (`Router::budget_for`'s rule): the caller resolves the draft route once and
 /// asks the router for that provider's pair, so the evidence and the call that
 /// spends it are measured against one window.
+///
+/// The window rides back beside the share it produced: a route narrower than
+/// [`DRAFT_RESERVED_BYTES`] leaves nothing, and the share alone cannot then say
+/// whether the repository was empty or the route was ([`Reason::WindowTooNarrow`]).
 #[must_use]
-pub fn evidence_budget_for(window_bytes: usize) -> EvidenceBudget {
-    EvidenceBudget::new(window_bytes.saturating_sub(DRAFT_OUTPUT_MAX_BYTES + DRAFT_PROMPT_BYTES))
+pub fn evidence_budget_for(window_bytes: usize) -> DraftBudget {
+    DraftBudget {
+        window_bytes,
+        evidence: EvidenceBudget::new(window_bytes.saturating_sub(DRAFT_RESERVED_BYTES)),
+    }
 }
+
+/// What the request has to carry before a byte of evidence is added: the
+/// answer's reservation and the drafting instruction.
+///
+/// Named rather than spelled twice, because it is the threshold
+/// [`Reason::WindowTooNarrow`] is about — a window at or under this leaves the
+/// evidence body nothing at all.
+pub const DRAFT_RESERVED_BYTES: usize = DRAFT_OUTPUT_MAX_BYTES + DRAFT_PROMPT_BYTES;
 
 /// What the drafting instruction costs before a byte of evidence is added.
 ///
@@ -664,20 +823,23 @@ const DRAFT_PROMPT_BYTES: usize = 4_096;
 /// Goes through the injected [`RepoFileReader`], so a switched-off session's
 /// "off means unopened" stays a property of the code — the caller checks the
 /// switch before it asks.
+/// The size is an [`Option`] for the event's own reason: a `stat` that failed
+/// answered *something is there* and nothing about how big it is, and a `0`
+/// beside a name the user can `ls` would be a measurement — "an empty file is
+/// in your way" — where "the size is not known" is the truth.
 #[must_use]
 pub fn notes_present(
     root: &ProbedRoot,
     reader: &dyn RepoFileReader,
-) -> Option<(&'static str, u64)> {
+) -> Option<(&'static str, Option<u64>)> {
     CANDIDATE_NAMES.iter().find_map(|name| {
         match reader.stat(&root.path.join(name)) {
-            Ok(key) => Some((*name, key.len)),
+            Ok(key) => Some((*name, Some(key.len))),
             Err(super::RepoFileError::NotFound) => None,
             // A `stat` that failed for any other reason answered *something* is
             // there. Fail closed: refusing to write is recoverable, clobbering
-            // is not — and the size is unknown rather than zero, which is what a
-            // `0` beside a name the user can `ls` would claim.
-            Err(_) => Some((*name, 0)),
+            // is not — and the size is unknown rather than zero.
+            Err(_) => Some((*name, None)),
         }
     })
 }
@@ -692,6 +854,35 @@ pub enum Suppression {
     /// `[context] generate = never`. Never reached by `/context init`, which is
     /// the user's explicit act and outranks the setting (BR-8).
     Never,
+    /// `[context] repo_file = false` — the durable switch REQ-612's loader
+    /// obeys.
+    ///
+    /// **Reached by `/context init` too**, unlike [`Self::Never`], and the
+    /// difference is which question the setting answers. `generate` is a setting
+    /// about the *offer*, so a user who typed the command has said the thing it
+    /// exists to stop Teton assuming. `repo_file = false` says the file may not
+    /// be **opened** on this machine, and the pipeline reads back what it writes
+    /// (BR-7): a run under it walks the tree, spends a frontier model call,
+    /// writes the file, is refused by its own loader and unlinks it. Refusing in
+    /// front is the same answer for none of the cost.
+    SwitchedOff,
+    /// A notes file is already at the root and `force` was not set — the
+    /// no-clobber rule answered by a `stat`, in front of the walk (BR-6).
+    ///
+    /// **A suppression and not a [`GenerationOutcome::Failed`]**, though the two
+    /// carried the same sentence once: nothing ran. No tree was walked, no model
+    /// was called, nothing was written and nothing failed — and the session
+    /// record agrees, because `Suppressed` is what the arming already stores for
+    /// this exact fact. The genuine write-time race keeps
+    /// [`Reason::AlreadyExists`], which is a failure: that one drafted first.
+    AlreadyPresent {
+        /// The name found — an `AGENTS.md` stops this run as surely as a
+        /// `TETON.md`, and naming the one this build would have written sends
+        /// the user to the wrong file.
+        name: &'static str,
+        /// Its size, when the `stat` answered ([`notes_present`]).
+        bytes: Option<u64>,
+    },
     /// The level forbids the write, so **no prompt was drawn** (`plan`).
     /// Decided in front of the gate on LESSON-524's rule inverted — do not ask
     /// what you will deny — and carrying the gate's own denial sentence, so the
@@ -794,20 +985,24 @@ pub struct Offer<'a> {
 /// is what makes AC-8's "the same bytes come out of both doors" true by
 /// construction rather than by test.
 ///
-/// # Four things are settled before the gate, and each for its own reason
+/// # Five things are settled before the gate, and each for its own reason
 ///
 /// 1. **`generate = never`** — the config's answer, and asking a human a
 ///    question their config already answered is the offer this feature is most
 ///    likely to be uninstalled over. `/context init` skips this one.
-/// 2. **A root with no canonical name** — no key, so no answer could be
+/// 2. **`repo_file = false`** — the durable switch, and the one short-circuit
+///    `/context init` does *not* skip: the pipeline reads back what it writes
+///    (BR-7) with this very key, so a run under it can only end by unlinking
+///    the file it paid a model call for ([`Suppression::SwitchedOff`]).
+/// 3. **A root with no canonical name** — no key, so no answer could be
 ///    remembered against the directory it was given about (LESSON-495). Fail
 ///    closed rather than proceed under a name that names nothing.
-/// 3. **A file already there** — the no-clobber rule reaching the offer, so a
+/// 4. **A file already there** — the no-clobber rule reaching the offer, so a
 ///    file that appeared between the arming and this turn costs a `stat` rather
 ///    than a walk, a frontier model call and a refused write. The write is
 ///    still where the race is decided ([`write::write_new`]); this is the easy
-///    case, taken early.
-/// 4. **`plan`** — LESSON-524 inverted: do not draw a prompt for an act the
+///    case, taken early — and it is a *suppression*, because nothing ran.
+/// 5. **`plan`** — LESSON-524 inverted: do not draw a prompt for an act the
 ///    level will refuse. The gate would answer [`GenerationConsent::Denied`] to
 ///    a caller that skipped this, so the two cannot disagree; what the
 ///    short-circuit buys is that no human is shown a question with no yes in it.
@@ -831,6 +1026,18 @@ pub async fn offer_and_run(offer: Offer<'_>) -> OfferOutcome {
         return suppressed(&ctx, Suppression::Never);
     }
 
+    // --- the durable switch (REQ-612 BR-2, BR-7) ---------------------------
+    //
+    // Read here rather than at the load-back, which is the only place it used
+    // to be read: `run` loads with this same key, so a machine with the notes
+    // switched off would walk the tree, spend a frontier model call, write the
+    // file, be refused by its own loader and unlink it — paying for a file it
+    // was never going to keep. `explicit` does not relax it, for the reason
+    // `Suppression::SwitchedOff` gives.
+    if !ctx.config.context.repo_file {
+        return suppressed(&ctx, Suppression::SwitchedOff);
+    }
+
     // --- a root that will not canonicalise (ADR-2, REQ-591 BR-6) -----------
     //
     // Resolved here, at the moment the write would happen, which is the one
@@ -838,34 +1045,25 @@ pub async fn offer_and_run(offer: Offer<'_>) -> OfferOutcome {
     // display is the probe's — the same spelling the event carries and the
     // prompt shows — so the human and the monitor see one name for one root
     // while the key is minted from the other.
-    let durable = std::fs::canonicalize(&ctx.root.path)
-        .ok()
-        .map(|resolved| durable_trust_root_name(&resolved));
+    //
+    // The resolved path is kept, not just the name minted from it: it is the
+    // directory the question is asked about, so it is the directory the answer
+    // is honoured in (see [`ConsentGiven`]).
+    let resolved = std::fs::canonicalize(&ctx.root.path).ok();
+    let durable = resolved.as_deref().map(durable_trust_root_name);
     let trust = TrustRoot {
         display: &ctx.root.view.display,
         durable: durable.as_deref(),
     };
-    let Some(key) = repo_context_generation_key(trust) else {
+    let (Some(key), Some(target)) = (repo_context_generation_key(trust), resolved.as_deref())
+    else {
         return suppressed(&ctx, Suppression::NoDurableRoot);
     };
 
     // --- a file that is already there (BR-6, AC-8's easy half) -------------
     if !force {
         if let Some((name, bytes)) = notes_present(ctx.root, ctx.reader) {
-            emit_reason(
-                &ctx,
-                events::GenerationOutcome::Failed,
-                &Progress::default(),
-                // The name it found, never the name it would have written: an
-                // `AGENTS.md` is what stops this run as surely as a `TETON.md`,
-                // and telling the user about a file that is not the one on their
-                // disk is how a remedy sends them to the wrong place.
-                &format!("a {name} of {bytes} bytes is already there; `--force` replaces it"),
-            );
-            return OfferOutcome::Ran(GenerationOutcome::Failed {
-                stage: Stage::Write,
-                reason: Reason::AlreadyExists,
-            });
+            return suppressed(&ctx, Suppression::AlreadyPresent { name, bytes });
         }
     }
 
@@ -941,28 +1139,80 @@ pub async fn offer_and_run(offer: Offer<'_>) -> OfferOutcome {
         }
     }
 
-    OfferOutcome::Ran(run(ctx, ConsentGiven::granted(), force).await)
+    OfferOutcome::Ran(run(ctx, ConsentGiven::granted(target), force).await)
 }
 
 /// Publish a suppression and answer with it — the one place the two are built
 /// together, so a stage nobody was told about cannot be returned.
 fn suppressed(ctx: &GenerationContext<'_>, why: Suppression) -> OfferOutcome {
+    let reason = suppression_news(&why);
     let outcome = OfferOutcome::Suppressed(why);
-    let reason = match &outcome {
-        OfferOutcome::Suppressed(Suppression::Never) => {
-            "`[context] generate = never` — `/context init` still writes one".to_owned()
-        }
-        OfferOutcome::Suppressed(Suppression::DeniedLevel(note)) => note.clone(),
-        OfferOutcome::Suppressed(Suppression::NoDurableRoot) => {
-            "this root has no canonical name, so there is nothing to ask about".to_owned()
-        }
-        OfferOutcome::Suppressed(Suppression::Unconfigured) => {
-            "the configured privacy boundaries do not compile, so nothing was read".to_owned()
-        }
-        _ => unreachable!("built one line above"),
-    };
     emit_reason(ctx, outcome.wire(), &Progress::default(), &reason);
     outcome
+}
+
+/// A [`Suppression`]'s own words — the news half of LESSON-557 for the offer's
+/// short-circuits, in one place because [`announce_unconfigured`] publishes one
+/// of them from a call site that never built a [`GenerationContext`].
+fn suppression_news(why: &Suppression) -> String {
+    match why {
+        Suppression::Never => {
+            "`[context] generate = never` — `/context init` still writes one".to_owned()
+        }
+        // The key by its name and the command that flips it: this one refuses
+        // the explicit door too, so a user who typed `/context init` and got
+        // nothing is owed the setting that answered and the way to change it.
+        Suppression::SwitchedOff => "`[context] repo_file = false` — the notes are switched off \
+                                     durably, so nothing is written; `teton context enable` turns \
+                                     them back on"
+            .to_owned(),
+        Suppression::AlreadyPresent { name, bytes } => match bytes {
+            Some(bytes) => {
+                format!("a {name} of {bytes} bytes is already there; `--force` replaces it")
+            }
+            // The `stat` would not answer, so there is no size to state — and
+            // a `0` here would tell the user their file is empty.
+            None => format!("a {name} is already there; `--force` replaces it"),
+        },
+        Suppression::DeniedLevel(note) => note.clone(),
+        Suppression::NoDurableRoot => {
+            "this root has no canonical name, so there is nothing to ask about".to_owned()
+        }
+        Suppression::Unconfigured => {
+            "the configured privacy boundaries do not compile, so nothing was read".to_owned()
+        }
+    }
+}
+
+/// Publish [`Suppression::Unconfigured`] for a caller that has no
+/// [`GenerationContext`] to publish it from, and answer with it.
+///
+/// The boundary set is what a [`GenerationContext`] is *built* around — the
+/// gatherer excludes by it and the loader withholds by it — so the one caller
+/// that discovers it will not compile discovers it before there is a context to
+/// hand [`suppressed`]. Without this it returned silently, and a suppression
+/// nobody was told about is the one shape [`suppressed`] exists to prevent: the
+/// session record would say `Suppressed` and no line on the bus would say why.
+///
+/// Everything the event needs is here except the two things that do not exist
+/// yet: nothing has been measured, and no route has been resolved, so the tier
+/// is absent rather than guessed. The root is its **display** — home-relative
+/// and already bounded by the probe — never the absolute path, which is
+/// [`emit_news`]'s rule and the whole of the news/location split.
+#[must_use]
+pub fn announce_unconfigured(events: &SessionEvents, root: &ProbedRoot) -> OfferOutcome {
+    let why = Suppression::Unconfigured;
+    let news = suppression_news(&why);
+    events.repo_context_generation(RepoContextGeneration {
+        outcome: events::GenerationOutcome::Suppressed,
+        root: root.view.display.clone(),
+        entries: None,
+        excluded: None,
+        draft_bytes: None,
+        tier: None,
+        reason: Some(bounded_field(&news, REASON_MAX_CHARS)),
+    });
+    OfferOutcome::Suppressed(why)
 }
 
 /// Today, UTC, as `YYYY-MM-DD`.
@@ -1104,12 +1354,20 @@ mod tests {
     fn every_reason_has_bounded_news() {
         let reasons = [
             Reason::NothingToDraft,
+            Reason::WindowTooNarrow { window_bytes: 900 },
             Reason::Duty("x".repeat(4_000)),
             Reason::EmptyDraft,
             Reason::AlreadyExists,
             Reason::Symlink,
             Reason::Io(ErrorKind::PermissionDenied),
-            Reason::NotLoaded(RepoContextStateKind::Truncated),
+            Reason::NotLoaded {
+                kind: RepoContextStateKind::Truncated,
+                left_in_place: false,
+            },
+            Reason::NotLoaded {
+                kind: RepoContextStateKind::Truncated,
+                left_in_place: true,
+            },
         ];
         for reason in &reasons {
             let news = bounded_field(&reason.as_news(), REASON_MAX_CHARS);
@@ -1119,5 +1377,73 @@ mod tests {
                 "{reason:?} is unbounded"
             );
         }
+    }
+
+    /// **Every suppression has words too, and the two that name a fact state
+    /// it.**
+    ///
+    /// [`suppression_news`] is the offer's half of the same rule: four of these
+    /// are reached with nothing else on the bus, so a suppression with no words
+    /// is a `suppressed` line a client renders as "no offer to write TETON.md —"
+    /// and stops. The two assertions past the loop are the facts a user acts on:
+    /// the durable switch's key and the command that flips it, and the size of
+    /// the file that is in the way — the substring
+    /// `crates/teton/tests/cli_e2e.rs`'s AC-10 leg reads off stdout.
+    ///
+    /// Mutation (LESSON-441), run 2026-09-04 and restored: wording
+    /// `AlreadyPresent`'s unknown-size arm with `{bytes:?}` in place of the
+    /// no-size sentence puts `None` in the line; the `"None"` assertion below
+    /// fails, which is the `0`-that-was-never-measured this `Option` exists to
+    /// prevent.
+    #[test]
+    fn every_suppression_has_bounded_news_naming_its_own_fact() {
+        let whys = [
+            Suppression::Never,
+            Suppression::SwitchedOff,
+            Suppression::AlreadyPresent {
+                name: "TETON.md",
+                bytes: Some(412),
+            },
+            Suppression::AlreadyPresent {
+                name: "AGENTS.md",
+                bytes: None,
+            },
+            Suppression::DeniedLevel("the session's permission level forbids it".to_owned()),
+            Suppression::NoDurableRoot,
+            Suppression::Unconfigured,
+        ];
+        for why in &whys {
+            let news = bounded_field(&suppression_news(why), REASON_MAX_CHARS);
+            assert!(!news.trim().is_empty(), "{why:?} has no news");
+            assert!(
+                news.chars().count() <= REASON_MAX_CHARS,
+                "{why:?} is unbounded: {news}"
+            );
+        }
+
+        let switched = suppression_news(&Suppression::SwitchedOff);
+        assert!(
+            switched.contains("[context] repo_file = false")
+                && switched.contains("teton context enable"),
+            "the durable refusal names the key and the way back: {switched}"
+        );
+
+        let sized = suppression_news(&Suppression::AlreadyPresent {
+            name: "TETON.md",
+            bytes: Some(412),
+        });
+        assert_eq!(
+            sized, "a TETON.md of 412 bytes is already there; `--force` replaces it",
+            "AC-10 reads `412 bytes is already there` off this line"
+        );
+        let no_size = suppression_news(&Suppression::AlreadyPresent {
+            name: "AGENTS.md",
+            bytes: None,
+        });
+        assert_eq!(
+            no_size, "a AGENTS.md is already there; `--force` replaces it",
+            "an unanswered `stat` states no size rather than a zero"
+        );
+        assert!(!no_size.contains("None"), "{no_size}");
     }
 }

@@ -40,7 +40,7 @@ use futures::{stream, StreamExt};
 use serde_json::{json, Value};
 
 use teton_core::boundary::BoundaryMatcher;
-use teton_core::config::Config;
+use teton_core::config::{Config, GenerateMode};
 use teton_core::effort::{EffortLevel, ResolvedEffort};
 use teton_core::entities::{BoundaryMode, PrivacyBoundary};
 use teton_protocol::events::{
@@ -68,12 +68,15 @@ use tetond::broadcast::{EventBus, Subscription};
 use tetond::cost::{CostLedger, NoopCostSink, PriceTable};
 use tetond::egress::{Egress, NoopSink, Provenance};
 use tetond::grants::{ConnectionId, GrantRegistry};
-use tetond::harness::permissions::{AddressedPermissionDelivery, PendingPermissions};
+use tetond::harness::permissions::{
+    AddressedPermissionDelivery, PendingPermissions, PermissionGate,
+};
 use tetond::harness::tools::walk::WalkBudget;
 use tetond::harness::{Duty, DutyRoute, SessionEvents, DRAFT_DUTY};
 use tetond::repo_context::evidence::{self, EvidenceBudget, WalkStop};
 use tetond::repo_context::generate::{
-    self, ConsentGiven, GenerationContext, GenerationOutcome, Reason, Stage as FailStage,
+    self, ConsentGiven, DraftBudget, GenerationContext, GenerationOutcome, Offer, OfferOutcome,
+    Reason, Stage as FailStage, Suppression, DRAFT_RESERVED_BYTES,
 };
 use tetond::repo_context::{RealFiles, RepoContextBlock, RepoContextState, REPO_CONTEXT_MAX_BYTES};
 use tetond::runtime::{ClientPresence, DaemonRuntime};
@@ -189,7 +192,7 @@ struct Run<'a> {
     /// `await` on a spawned task (`GenerationContext::route`); every fixture
     /// below is already both.
     route: &'a (dyn Fn() -> DutyRoute + Send + Sync),
-    budget: EvidenceBudget,
+    budget: DraftBudget,
     walk: WalkBudget,
     force: bool,
 }
@@ -201,11 +204,25 @@ impl<'a> Run<'a> {
             route,
             // Roomy: every fixture's evidence is a few hundred bytes, so a cut is
             // something a test asks for rather than something it stumbles into.
-            budget: EvidenceBudget::new(64 * 1024),
+            // Spelled as a *window* and put through the production derivation,
+            // so a leg that wants a narrow body says how narrow the route was.
+            budget: generate::evidence_budget_for(64 * 1024),
             walk: WalkBudget::default(),
             force: false,
         }
     }
+}
+
+/// A [`DraftBudget`] whose evidence body may spend exactly `body_bytes`, over a
+/// route wide enough to have afforded it.
+///
+/// The derivation's own arithmetic rather than a hand-built struct: a leg that
+/// asked for a body of *n* bytes is asking about the assembly, and one that
+/// asked for a route of *n* bytes is asking about the window — keeping the two
+/// spellings apart is what makes `WindowTooNarrow`'s leg below a different
+/// claim from `NothingToDraft`'s.
+fn body_budget(body_bytes: usize) -> DraftBudget {
+    generate::evidence_budget_for(DRAFT_RESERVED_BYTES + body_bytes)
 }
 
 async fn generate(fx: &Fixture, run: Run<'_>) -> GenerationOutcome {
@@ -222,7 +239,11 @@ async fn generate(fx: &Fixture, run: Run<'_>) -> GenerationOutcome {
             tier: Tier::Think,
             config: &fx.config,
         },
-        ConsentGiven::granted(),
+        // The fixture's root is canonical (`Fixture::new` canonicalizes before
+        // it plants anything), so the directory consent is minted for and the
+        // directory the session stands on are one. The case where they are not
+        // is `offer_and_run`'s, and is pinned there.
+        ConsentGiven::granted(&fx.dir),
         run.force,
     )
     .await
@@ -743,7 +764,11 @@ async fn a_written_file_is_loaded_the_same_run_with_origin_generated() {
 ///
 /// **Mutations**, all five run 2026-09-03 and restored:
 /// 1. dropping the `write::remove` on the load failure — the file survives and
-///    the `Load` row's `notes_exist` assertion fails;
+///    the `Load` row's `notes_exist` assertion fails. **Re-run 2026-09-04**
+///    (LESSON-598) because the row's fixture changed underneath it: the refusal
+///    is now reached through a boundary rather than the durable switch, and
+///    deleting the `if !force { write::remove(..) }` still fails with `a file
+///    the loader refuses is removed, not left for the next session`;
 /// 2. treating `evidence.stop.is_some()` as a walk failure — the budget-stop leg
 ///    at the end fails;
 /// 3. answering `Stage::Failed` with no `reason` — the reason assertion fails on
@@ -754,6 +779,19 @@ async fn a_written_file_is_loaded_the_same_run_with_origin_generated() {
 /// 5. swapping `stop_phrase` and `cut_phrase` at the `generated_header` call
 ///    site — the budget-stop leg's ordering assertion fails, which is the one
 ///    place a run produces both omissions at once.
+///
+/// **Two more rows, two more mutations**, both run 2026-09-04 and restored,
+/// recorded as **observed**:
+/// 6. deleting the `budget.evidence.max_bytes == 0` short-circuit at the top of
+///    `run` — the narrow-window row fails with `left: NothingToDraft, right:
+///    WindowTooNarrow { window_bytes: 12287 }`. That *is* the defect: a route
+///    one byte under the reserve saturates the evidence budget to zero, the
+///    assembly fits nothing, and the user is told their repository has nothing
+///    in it when the remedy is a wider route;
+/// 7. unlinking unconditionally on the load failure (`if !force` removed) —
+///    the `--force` row fails at `a replacement the loader refuses is left
+///    where it landed: NotFound`, which is the user with neither their file nor
+///    Teton's.
 #[tokio::test]
 async fn every_stage_failure_is_typed_leaves_no_file_and_keeps_provider_health() {
     // --- non-vacuity: the same fixture really does write --------------------
@@ -776,8 +814,12 @@ async fn every_stage_failure_is_typed_leaves_no_file_and_keeps_provider_health()
         let outcome = generate(
             &fx,
             Run {
-                // Not even the root's own line fits, so the body is empty.
-                budget: EvidenceBudget::new(0),
+                // A route wide enough to have carried evidence, and a body of
+                // one byte: not even the root's own line fits, so the assembly
+                // is empty. One byte rather than zero because a zero body is
+                // `WindowTooNarrow`'s fact — the route — and this leg is about
+                // the repository.
+                budget: body_budget(1),
                 ..Run::new(&route)
             },
         )
@@ -789,6 +831,46 @@ async fn every_stage_failure_is_typed_leaves_no_file_and_keeps_provider_health()
             "nothing was routed and no model was called"
         );
         assert_failed_news(&mut sub, &fx);
+    }
+
+    // --- the route's window could not carry any evidence -------------------
+    //
+    // A different fact from the leg above and a different remedy: the walk was
+    // never the problem. `evidence_budget_for` reserves the answer and the
+    // drafting instruction out of the window first, so a route narrower than
+    // that reserve leaves a body of zero — and a build that let that through
+    // would walk the tree, assemble nothing out of a saturated budget, and tell
+    // the user their repository has nothing in it.
+    {
+        let fx = Fixture::new("narrow-window");
+        let mut sub = fx.subscribe();
+        let (seen, route) = answers_well();
+        let narrow = DRAFT_RESERVED_BYTES - 1;
+        let outcome = generate(
+            &fx,
+            Run {
+                budget: generate::evidence_budget_for(narrow),
+                ..Run::new(&route)
+            },
+        )
+        .await;
+        assert_failed(
+            &outcome,
+            FailStage::Walk,
+            &Reason::WindowTooNarrow {
+                window_bytes: narrow,
+            },
+        );
+        assert!(!fx.notes_exist(), "a route too narrow leaves no file");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "nothing was routed and no model was called"
+        );
+        let reason = assert_failed_news(&mut sub, &fx);
+        assert!(
+            reason.contains(&narrow.to_string()) && reason.contains("window"),
+            "the news names the window rather than blaming the repository: {reason}"
+        );
     }
 
     // --- the duty failed ---------------------------------------------------
@@ -900,27 +982,89 @@ async fn every_stage_failure_is_typed_leaves_no_file_and_keeps_provider_health()
 
     // --- the loader would not read it back --------------------------------
     //
-    // The file is written whole and successfully, and the switch is off — so the
-    // loader answers `WithheldOff` and the pipeline unlinks what it wrote. This is
-    // the one failure `write.rs` cannot see, and the one AC-9 is most about: a
-    // file left here is a file the next session loads as if the repository had
-    // authored it.
+    // The file is written whole and successfully, and one of the session's own
+    // privacy boundaries covers `TETON.md` — so REQ-612's loader answers
+    // `WithheldBoundary` and the pipeline unlinks what it wrote. This is the one
+    // failure `write.rs` cannot see, and the one AC-9 is most about: a file left
+    // here is a file the next session loads as if the repository had authored
+    // it.
+    //
+    // **A boundary rather than the durable switch**, which is what this leg used
+    // to flip. `[context] repo_file = false` no longer reaches the pipeline at
+    // all — `offer_and_run` refuses in front of the walk (`Suppression::
+    // SwitchedOff`), which is what stops a switched-off machine paying for a
+    // model call it will unlink — so a fixture built on it would be asserting
+    // about a state the daemon cannot be in. The boundary reaches the same
+    // load-back refusal through a mechanism that is still live.
+    let covers_the_notes = vec![PrivacyBoundary::user("TETON.md", BoundaryMode::LocalOnly)];
     {
-        let mut fx = Fixture::new("not-loaded");
-        fx.config.context.repo_file = false;
+        let fx = Fixture::new("not-loaded");
         let mut sub = fx.subscribe();
         let (_seen, route) = answers_well();
-        let outcome = generate(&fx, Run::new(&route)).await;
+        let outcome = generate(
+            &fx,
+            Run {
+                boundaries: &covers_the_notes,
+                ..Run::new(&route)
+            },
+        )
+        .await;
         assert_failed(
             &outcome,
             FailStage::Load,
-            &Reason::NotLoaded(RepoContextStateKind::WithheldOff),
+            &Reason::NotLoaded {
+                kind: RepoContextStateKind::WithheldBoundary,
+                left_in_place: false,
+            },
         );
         assert!(
             !fx.notes_exist(),
             "a file the loader refuses is removed, not left for the next session"
         );
         assert_failed_news(&mut sub, &fx);
+    }
+    // --- …and on the `--force` door the replacement stays -------------------
+    //
+    // The one exception to "a failure leaves no file", and it is not a
+    // softening: `write::replace` renames over the file it was given permission
+    // to replace, so the old bytes are gone before the loader is asked. Unlinking
+    // here would answer a *read* failure by destroying both files — the user
+    // would be left with neither their notes nor Teton's. The run still fails,
+    // and the reason says the replacement is where it landed.
+    {
+        let fx = Fixture::new("not-loaded-force");
+        let mut sub = fx.subscribe();
+        let (_seen, route) = answers_well();
+        std::fs::write(fx.notes(), "# hand written\n").unwrap();
+        let outcome = generate(
+            &fx,
+            Run {
+                boundaries: &covers_the_notes,
+                force: true,
+                ..Run::new(&route)
+            },
+        )
+        .await;
+        assert_failed(
+            &outcome,
+            FailStage::Load,
+            &Reason::NotLoaded {
+                kind: RepoContextStateKind::WithheldBoundary,
+                left_in_place: true,
+            },
+        );
+        let on_disk = std::fs::read_to_string(fx.notes())
+            .expect("a replacement the loader refuses is left where it landed");
+        assert!(
+            on_disk.starts_with("> Generated by Teton on ") && on_disk.contains("## Purpose"),
+            "the file left in place is the new body, whole: {on_disk}"
+        );
+        let reason = assert_failed_news(&mut sub, &fx);
+        assert!(
+            reason.contains("left in place"),
+            "the news says what became of the bytes, or a user reading `failed` \
+             deletes a file they still have: {reason}"
+        );
     }
 
     // --- and a budget stop with a usable tree is NOT a failure -------------
@@ -939,7 +1083,7 @@ async fn every_stage_failure_is_typed_leaves_no_file_and_keeps_provider_health()
                     max_entries: 2,
                     ..WalkBudget::default()
                 },
-                budget: EvidenceBudget::new(120),
+                budget: body_budget(120),
                 ..Run::new(&route)
             },
         )
@@ -991,7 +1135,10 @@ fn assert_failed(outcome: &GenerationOutcome, stage: FailStage, reason: &Reason)
 
 /// The news a failed run must publish: a `failed` stage with words on it, and no
 /// provider-health event anywhere on the bus.
-fn assert_failed_news(sub: &mut Subscription, fx: &Fixture) {
+///
+/// Answers with those words, for the one leg that has something further to say
+/// about them — the rest ignore the return.
+fn assert_failed_news(sub: &mut Subscription, fx: &Fixture) -> String {
     let events = published(sub);
     assert!(
         !events
@@ -1015,6 +1162,7 @@ fn assert_failed_news(sub: &mut Subscription, fx: &Fixture) {
         "the reason is bounded on the way to the wire: {reason}"
     );
     assert_eq!(last.root, fx.root.view.display);
+    reason.to_owned()
 }
 
 // ===========================================================================
@@ -1069,6 +1217,222 @@ async fn force_replaces_and_without_it_an_existing_file_is_refused_untouched() {
         .filter(|path| path.to_string_lossy().ends_with(".tmp"))
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+// ===========================================================================
+// The offer's own short-circuits (ADR-2), over the pipeline's fixture
+// ===========================================================================
+
+/// `offer_and_run` over a root of the caller's choosing, at a level that
+/// settles without asking.
+///
+/// `full` rather than a scripted client, because neither leg below is about the
+/// prompt: one is refused in front of the gate, and the other has to reach the
+/// write. A gate at `full` answers `ByLevel(Allowed)` before any delivery is
+/// attempted, so the only open question left in the run is the one the leg is
+/// about — and a gate that stopped allowing would fail loudly rather than
+/// quietly writing nothing.
+async fn offer_at(
+    fx: &Fixture,
+    root: &ProbedRoot,
+    run: Run<'_>,
+    mode: GenerateMode,
+    explicit: bool,
+) -> OfferOutcome {
+    let matcher = BoundaryMatcher::new(run.boundaries).expect("the fixture globs compile");
+    let gate = PermissionGate::with_level(
+        SessionId::from(SESSION),
+        PermissionLevel::Full,
+        Vec::new(),
+        Arc::clone(&fx.bus),
+        Arc::new(PendingPermissions::new()),
+    );
+    generate::offer_and_run(Offer {
+        ctx: GenerationContext {
+            root,
+            reader: &RealFiles,
+            boundaries: &matcher,
+            budget: run.budget,
+            walk: run.walk,
+            route: run.route,
+            events: &fx.events,
+            tier: Tier::Think,
+            config: &fx.config,
+        },
+        gate: &gate,
+        // Someone could be asked — so a refusal below is the short-circuit's,
+        // never `RefusedUnattended` standing in for it.
+        addressee: Some(GrantRegistry::new().next_connection_id()),
+        mode,
+        explicit,
+        force: run.force,
+    })
+    .await
+}
+
+/// A route that counts every time it is **resolved**, not merely every time it
+/// answers.
+///
+/// The distinction is the whole of the claim below: a short-circuit that ran the
+/// walk and then declined to draft would leave a `Recording`'s own counter at
+/// zero and look identical to one that refused in front. What must not happen is
+/// that a route is built at all.
+fn counted_route(seen: &Seen, resolved: &Arc<AtomicU64>) -> impl Fn() -> DutyRoute + Send + Sync {
+    let seen = Arc::clone(seen);
+    let resolved = Arc::clone(resolved);
+    move || {
+        resolved.fetch_add(1, Ordering::SeqCst);
+        recording_route(&seen, Ok(GOOD_DRAFT.to_owned()))
+    }
+}
+
+/// **REQ-612 BR-2 / REQ-613 BR-7.** A machine with `[context] repo_file = false`
+/// writes nothing and spends nothing — including through `/context init`, the
+/// explicit door — and says which key answered.
+///
+/// # Why the explicit door does not outrank this one
+///
+/// `[context] generate = never` is a setting about the *offer*, so a user who
+/// typed the command has said the thing it exists to stop Teton assuming. The
+/// durable switch says the notes file may not be **opened** on this machine, and
+/// the pipeline reads back what it writes (BR-7) under that very key: a run
+/// under it walks the tree, spends a frontier model call, writes the file, is
+/// refused by its own loader and unlinks it — ending with no file, no notes and
+/// one billed call. Refusing in front is the same outcome for none of the cost,
+/// which is what `generate_repo_context`'s doc already promised ("a machine that
+/// says the file may not be opened refuses the write outright").
+///
+/// # Non-vacuity (LESSON-485)
+///
+/// "No file" is satisfied by a pipeline that never writes anything, so the leg
+/// at the top is the same fixture, the same root and the same flags with the
+/// switch **on**, and it really does write.
+///
+/// **Mutation** (LESSON-441), run 2026-09-04 and restored, recorded as
+/// **observed**: replacing the short-circuit's condition with `false` — the
+/// build this finding was raised against — gives `Ran(Failed { stage: Load,
+/// reason: NotLoaded { kind: WithheldOff, left_in_place: false } })`. Every
+/// clause of the finding is in that one line: the route was resolved, the tree
+/// was walked, a frontier model call was spent, `TETON.md` was written, the
+/// loader refused it under the very switch that was set, and the file was
+/// unlinked — a machine that had said "never open this file" paying full price
+/// to end where it started.
+#[tokio::test]
+async fn the_durable_switch_refuses_in_front_of_the_walk_even_for_an_explicit_init() {
+    // --- non-vacuity: switched on, the same call writes ---------------------
+    {
+        let fx = Fixture::new("switch-on");
+        let seen: Seen = Arc::default();
+        let resolved = Arc::new(AtomicU64::new(0));
+        let route = counted_route(&seen, &resolved);
+        let outcome = offer_at(&fx, &fx.root, Run::new(&route), GenerateMode::Ask, true).await;
+        assert!(
+            matches!(outcome, OfferOutcome::Ran(GenerationOutcome::Written(_))),
+            "{outcome:?}"
+        );
+        assert!(fx.notes_exist());
+        assert_eq!(resolved.load(Ordering::SeqCst), 1, "one run is one route");
+    }
+
+    // --- switched off: nothing is resolved, walked, called or written -------
+    let mut fx = Fixture::new("switch-off");
+    fx.config.context.repo_file = false;
+    let mut sub = fx.subscribe();
+    let seen: Seen = Arc::default();
+    let resolved = Arc::new(AtomicU64::new(0));
+    let route = counted_route(&seen, &resolved);
+
+    let outcome = offer_at(&fx, &fx.root, Run::new(&route), GenerateMode::Ask, true).await;
+    assert!(
+        matches!(outcome, OfferOutcome::Suppressed(Suppression::SwitchedOff)),
+        "the durable switch is settled in front of the pipeline: {outcome:?}"
+    );
+    assert_eq!(
+        resolved.load(Ordering::SeqCst),
+        0,
+        "no draft route was even resolved"
+    );
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "and no model was called: the whole point is the call that is not billed"
+    );
+    assert!(
+        !fx.notes_exist(),
+        "nothing was written, and nothing unlinked"
+    );
+
+    let heard = stages(&mut sub);
+    assert_eq!(
+        names(&heard),
+        vec![Stage::Suppressed],
+        "one line, and it is a suppression rather than a failure: nothing ran"
+    );
+    let reason = heard[0].reason.as_deref().unwrap_or_default();
+    assert!(
+        reason.contains("[context] repo_file = false") && reason.contains("teton context enable"),
+        "the line names the key that answered and the way back: {reason}"
+    );
+}
+
+/// **S5.** The notes land in the **canonical** directory — the one the consent
+/// key was minted from — when the session's root is reached through a symlink.
+///
+/// The key is `repo_context:generate:<canonical root>`, so an answer given
+/// about `/tmp/link` and an answer given about the directory it points at are
+/// one remembered answer. A write that then used the session's *spelling* would
+/// be honouring that answer in a directory it was never about — harmless while
+/// the two resolve to one place, and a file in the wrong repository the day they
+/// do not.
+///
+/// Both spellings show the file afterwards, which is why the assertion is on the
+/// **path the run reports** and on `canonicalize` rather than on existence: a
+/// build that wrote through the symlink puts the same bytes in the same place
+/// and tells the caller a path that resolves somewhere it did not write from.
+///
+/// **Mutation** (LESSON-441), run 2026-09-04 and restored: writing to
+/// `ctx.root.path` — the spelling this finding was raised against — fails here
+/// with `left: …-symlinked-34731-0-link/TETON.md, right:
+/// …-symlinked-34731-0/TETON.md`, the two directories one answer was given
+/// about.
+#[tokio::test]
+async fn a_root_reached_through_a_symlink_writes_into_the_canonical_directory() {
+    let fx = Fixture::new("symlinked");
+    let link = fx.dir.with_file_name(format!(
+        "{}-link",
+        fx.dir.file_name().unwrap().to_string_lossy()
+    ));
+    std::os::unix::fs::symlink(&fx.dir, &link).expect("plant a symlinked spelling of the root");
+    // Non-vacuity for the assertion below: the two spellings really are
+    // different strings, and really are one directory.
+    assert_ne!(link, fx.dir);
+    assert_eq!(
+        std::fs::canonicalize(&link).unwrap(),
+        fx.dir,
+        "the symlink resolves to the fixture's own root"
+    );
+
+    let spelled = ProbedRoot {
+        path: link.clone(),
+        view: fx.root.view.clone(),
+    };
+    let (_seen, route) = answers_well();
+    let outcome = offer_at(&fx, &spelled, Run::new(&route), GenerateMode::Ask, false).await;
+
+    let made = outcome
+        .generated()
+        .unwrap_or_else(|| panic!("the run must write, or the path claim is vacuous: {outcome:?}"));
+    assert_eq!(
+        made.path,
+        fx.dir.join("TETON.md"),
+        "the file is written into the directory the consent key was minted from, \
+         not the one the session spells"
+    );
+    assert!(
+        fx.notes_exist(),
+        "and it really is there under the canonical spelling"
+    );
+
+    std::fs::remove_file(&link).ok();
 }
 
 // ===========================================================================
@@ -1834,6 +2198,11 @@ impl Wired {
                 Some(self.connection),
             )
             .await
+            .expect(
+                "`session/context` answers every fixture session here: the id is \
+                     live, no turn is in flight, and an RPC error would be a defect \
+                     rather than an outcome this test is about",
+            )
     }
 
     fn generation_state(&self, id: &SessionId) -> GenerationState {
@@ -2312,6 +2681,14 @@ async fn plan_suppresses_without_a_prompt_full_and_always_write_without_one_and_
 /// `authorize_repo_context_generation` makes the second leg's subject say
 /// `replace: false`, which is the first leg's question wearing the second's
 /// consequences.
+///
+/// **A third**, run 2026-09-04 and restored: answering the present-file
+/// short-circuit with `Ran(Failed { stage: Write, reason: AlreadyExists })` —
+/// the shape this finding was raised against — fails with `left: Some(Failed),
+/// right: Some(Suppressed)`. The word matters twice over: nothing ran, so
+/// `failed` is a claim about a write that was never attempted; and
+/// `generation_state_for` would store `GenerationState::Failed` where
+/// `arm_generation` stores `Suppressed` for the same fact about the same root.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn init_refuses_an_existing_file_without_force_and_asks_the_replace_question_with_it() {
     let project = Project::new("init");
@@ -2331,7 +2708,10 @@ async fn init_refuses_an_existing_file_without_force_and_asks_the_replace_questi
     let refused = wired
         .context(&session, ContextAction::Init { force: false })
         .await;
-    assert_eq!(refused.generation, Some(Stage::Failed));
+    // `suppressed`, not `failed`: nothing was walked, called, written or
+    // unlinked, and the session record stores the same word the arming already
+    // stored for this exact fact.
+    assert_eq!(refused.generation, Some(Stage::Suppressed));
     assert_eq!(
         std::fs::read_to_string(project.notes()).unwrap(),
         authored,
@@ -2348,7 +2728,7 @@ async fn init_refuses_an_existing_file_without_force_and_asks_the_replace_questi
     );
     assert_eq!(wired.vendor.draft_calls(), 0);
     let heard = offer_stages(&mut sub);
-    assert_eq!(names(&heard), vec![Stage::Failed]);
+    assert_eq!(names(&heard), vec![Stage::Suppressed]);
     let reason = heard[0].reason.as_deref().unwrap_or_default();
     assert!(
         reason.contains(&authored.len().to_string()) && reason.contains("--force"),

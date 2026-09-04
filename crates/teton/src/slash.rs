@@ -3023,6 +3023,16 @@ fn render_context(result: &SessionContextResult) -> Vec<String> {
             });
         }
         lines.push(line);
+    } else if result.origin == Some(RepoContextOrigin::Generated) {
+        // The one way a write leaves no figures: `/context init` in a session
+        // that said `/context off`. The file was written and is not carried
+        // (REQ-613 BR-7's two switches), and the user who asked for the write
+        // is owed the confirmation the figures line would otherwise have been.
+        lines.push(
+            "context: TETON.md written — origin: generated; not carried while this session's \
+             notes are off (`/context on` carries it)"
+                .to_owned(),
+        );
     }
     lines
 }
@@ -7464,6 +7474,45 @@ mod context_render_tests {
     /// in `ls`. Not merely uninformative — wrong, and the first figure they
     /// would check.
     ///
+    /// **REQ-613 BR-7 — an `init` that wrote and is not carried still says so.**
+    ///
+    /// `/context init` in a session that said `/context off` writes the file
+    /// and carries no block, so the daemon answers `absent` with no figures and
+    /// `origin: generated`. The figures line is where the origin clause lives,
+    /// and with no figures there was no line — the user who asked for a write
+    /// was told `context: absent` and nothing else. The benign half: an
+    /// `absent` with no origin (the ordinary no-notes case) stays one line.
+    ///
+    /// **Mutation, run and observed** (reverted): dropping the `else if` arm in
+    /// `render_context` fails the first assertion with one line instead of two.
+    #[test]
+    fn an_uncarried_generated_file_is_still_announced() {
+        let written_off = SessionContextResult {
+            state: RepoContextStateKind::Absent,
+            origin: Some(RepoContextOrigin::Generated),
+            generation: None,
+            source: None,
+            file: None,
+            bytes_on_disk: None,
+            resident_bytes: 0,
+            cap: 8_192,
+            truncated: false,
+        };
+        let lines = render_context(&written_off);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[1].contains("TETON.md written") && lines[1].contains("origin: generated"),
+            "{}",
+            lines[1]
+        );
+
+        let plain_absent = SessionContextResult {
+            origin: None,
+            ..written_off
+        };
+        assert_eq!(render_context(&plain_absent).len(), 1);
+    }
+
     /// Both directions are asserted together, because a fix that dropped the
     /// clause everywhere would be just as wrong: a withheld file's size is the
     /// one figure a state that read nothing can honestly give, and it still

@@ -3259,19 +3259,23 @@ async fn handle_session_context(
         .stamped_routes
         .stamped(&params.session_id)
         .map(|budget| budget.repo_context_cap);
-    ok_string(
-        id,
-        &daemon
-            .runtime
-            .session_context(
-                &params,
-                &daemon.sessions,
-                &daemon.events,
-                route_cap,
-                Some(conn.id),
-            )
-            .await,
-    )
+    match daemon
+        .runtime
+        .session_context(
+            &params,
+            &daemon.sessions,
+            &daemon.events,
+            route_cap,
+            Some(conn.id),
+        )
+        .await
+    {
+        Ok(result) => ok_string(id, &result),
+        // `SESSION_BUSY` from an `init` while a turn (or another `init`) holds
+        // the session — the same refusal `session/set_cwd` gives, for the same
+        // claim.
+        Err(err) => error_from(id, err),
+    }
 }
 
 /// Evict a cached document so the next lookup re-fetches (`web/refresh`,

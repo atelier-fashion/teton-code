@@ -615,6 +615,7 @@ impl Harness {
                 Some(self.connection),
             )
             .await
+            .expect("no turn holds these fixtures' sessions, so no action is refused")
     }
 
     /// Run one turn and require it to complete.

@@ -1106,6 +1106,13 @@ impl SessionRegistry {
     /// Unconditional, unlike [`Self::arm_generation`]: this is the answer to the
     /// question that method armed, and the caller has just finished asking it.
     /// `false` only for a session the registry does not have.
+    ///
+    /// Root-blind on purpose, and safe to be: both doors run under the turn
+    /// claim ([`Self::try_begin_turn`] — the prompt turn's own, and the one
+    /// `session/context`'s `init` takes), and `set_session_cwd` takes the same
+    /// claim, so no `/cd` can re-arm the record at another root between the
+    /// claim and this write. A root check here would be a second spelling of
+    /// that rule, and one that could come to disagree with it.
     pub fn set_generation(&self, id: &SessionId, state: GenerationState) -> bool {
         let mut sessions = self
             .sessions

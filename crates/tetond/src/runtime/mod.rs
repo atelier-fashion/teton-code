@@ -3833,8 +3833,11 @@ impl DaemonRuntime {
             // will not compile judges nothing, so nothing is read, nothing is
             // sent and nothing is written. `Config::validate` refuses an invalid
             // glob at load and at `config/set`, so this is unreachable from a
-            // shipped path rather than merely unlikely.
-            return OfferOutcome::Suppressed(generate::Suppression::Unconfigured);
+            // shipped path rather than merely unlikely. Announced all the same:
+            // every other suppression puts one line on the bus, and an `init`
+            // that answers `suppressed` with no reason is a refusal nobody can
+            // act on.
+            return generate::announce_unconfigured(stream, probed);
         };
         // One read of the engine slot for this act, exactly as a turn takes one
         // for its attempt — and no spend accumulator: the draft is metered as
@@ -4537,7 +4540,7 @@ impl DaemonRuntime {
         events: &Arc<EventBus>,
         route_cap: Option<usize>,
         invoker: Option<ConnectionId>,
-    ) -> SessionContextResult {
+    ) -> Result<SessionContextResult, RpcError> {
         let cap = route_cap.unwrap_or(REPO_CONTEXT_MAX_BYTES);
         if let Some(enabled) = match params.action {
             ContextAction::On => Some(true),
@@ -4563,11 +4566,33 @@ impl DaemonRuntime {
         // bytes, the gate, the walk and the header are the offer's, and what
         // differs is that `[context] generate = never` does not stop it and
         // `--force` may replace what is there.
+        //
+        // **Under the turn claim**, the same one `set_session_cwd` and every
+        // prompt turn take. `session/context` runs on its own spawned task
+        // (`handle_client`'s `blocks_on_a_human`), so without it two `init`
+        // frames — one connection pipelining, or two attached clients — would
+        // walk twice, bill two model calls and race at the write; and a `/cd`
+        // could land while the offer waits on a human, re-arming the record at
+        // a root the answer was never about. The claim refuses both with
+        // `SESSION_BUSY` naming what holds the session, and it is released when
+        // the pipeline returns, whatever it returned. `status`, `on` and `off`
+        // take no claim: they run no pipeline and move no root.
         let generation = match params.action {
-            ContextAction::Init { force } => Some(
-                self.init_repo_context(params, sessions, events, invoker, cap, force)
-                    .await,
-            ),
+            ContextAction::Init { force } => {
+                let _claim = sessions
+                    .try_begin_turn(
+                        &params.session_id,
+                        &teton_protocol::TurnId::from(format!(
+                            "init-{}",
+                            self.turn_counter.fetch_add(1, Ordering::SeqCst)
+                        )),
+                    )
+                    .map_err(|err| refused_claim_error(&err))?;
+                Some(
+                    self.init_repo_context(params, sessions, events, invoker, cap, force)
+                        .await,
+                )
+            }
             _ => None,
         };
         let mut result = repo_context_result(&sessions.repo_context(&params.session_id), cap);
@@ -4586,7 +4611,7 @@ impl DaemonRuntime {
             // later must not claim it does.
             .map(|_| RepoContextOrigin::Generated);
         result.generation = generation;
-        result
+        Ok(result)
     }
 
     /// Run `/context init` and answer with what the pipeline did (BR-8).
@@ -19171,6 +19196,68 @@ provider_id = \"deepseek\"
                 "the accepted move must actually land, or the refusal above \
                  proved nothing"
             );
+        }
+
+        /// **REQ-613 — `/context init` takes the same claim `/cd` does.**
+        ///
+        /// `session/context` runs on its own spawned task, so nothing but a
+        /// claim stops a second `init` (or a `/cd`) from interleaving with a
+        /// pipeline that is waiting on a human: two walks, two billed model
+        /// calls, a write race, and a record re-armed at a root the answer was
+        /// never about. The mechanism is `try_begin_turn`, so the test is the
+        /// same refuse/accept pair invariant 3 uses: refused while a claim is
+        /// held, naming the holder; accepted the moment it drops; and `status`
+        /// — which runs no pipeline — answered either way (the benign path).
+        ///
+        /// **Mutation, run and observed** (reverted): deleting the
+        /// `try_begin_turn` in `session_context`'s `Init` arm fails here at the
+        /// refuse half — "a claimed session refuses `init`" — with the call
+        /// having answered `Ok`.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_held_claim_refuses_context_init_and_not_status() {
+            let root = repo_with_notes("inv3-init-claim");
+            let (runtime, _seen) = carry_runtime(&[Scripted::Say("Noted.")]);
+            let events = Arc::new(EventBus::new());
+            let (sessions, session_id) = one_session_at(&root);
+            let context = |action: ContextAction| {
+                let runtime = Arc::clone(&runtime);
+                let events = Arc::clone(&events);
+                let sessions = &sessions;
+                let session_id = session_id.clone();
+                async move {
+                    runtime
+                        .session_context(
+                            &SessionContextParams { session_id, action },
+                            sessions,
+                            &events,
+                            None,
+                            None,
+                        )
+                        .await
+                }
+            };
+
+            let claim = sessions
+                .try_begin_turn(&session_id, &teton_protocol::TurnId::from("probe-1"))
+                .expect("the session is idle, so the claim is taken");
+
+            let refused = context(ContextAction::Init { force: false })
+                .await
+                .expect_err("a claimed session refuses `init`");
+            assert_eq!(refused.code, error_code::SESSION_BUSY);
+            assert!(
+                refused.message.contains("probe-1"),
+                "the refusal must name the turn that holds the session: {}",
+                refused.message
+            );
+            context(ContextAction::Status)
+                .await
+                .expect("`status` runs no pipeline and is answered under a claim");
+
+            drop(claim);
+            context(ContextAction::Init { force: false })
+                .await
+                .expect("with no turn in flight the identical `init` is accepted");
         }
 
         /// **REQ-604 — the two ordering fixtures REQ-599 AC-6 named and never

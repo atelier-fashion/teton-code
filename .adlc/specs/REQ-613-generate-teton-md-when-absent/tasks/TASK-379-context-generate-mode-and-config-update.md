@@ -58,7 +58,8 @@ rather than a claim, since it is a property of attributes in another crate and a
 | rule | kind | artifact | benign_path |
 |------|------|----------|-------------|
 | BR-10 | test-case | `crates/teton-core/src/config.rs::context_generate_defaults_to_ask_and_names_its_three_values` | yes |
-| AC-11 | test-case | `crates/tetond/tests/config_preservation.rs::set_repo_context_generate_writes_the_key_and_a_refused_write_leaves_the_bytes_identical` | yes |
+| BR-10 | test-case | `crates/tetond/tests/config_preservation.rs::set_repo_context_generate_writes_the_key_and_a_refused_write_leaves_the_bytes_identical` | yes |
+| AC-11 | test-case | `crates/tetond/tests/repo_context_generation.rs::plan_suppresses_without_a_prompt_full_and_always_write_without_one_and_never_suppresses` | yes |
 
 ## Technical Notes
 

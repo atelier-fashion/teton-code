@@ -161,7 +161,11 @@ bytes from the same evidence.
 same as consented, and a `plan` session is still refused. Without `--force` an
 existing file is left alone and one line names its size and the flag; with it
 the prompt says **replace** rather than write, and the replacement is a temp
-file and a rename, never a truncate-and-hope.
+file and a rename, never a truncate-and-hope. Two things `init` does not
+override: `[context] repo_file = false`, because a machine that will never open
+the file has no use for one and would only pay a model call to write it; and a
+turn already holding the session — `init` takes the same claim `/cd` does, so
+a second `init`, or one sent mid-turn, is refused as busy rather than run twice.
 
 ## What the draft is made of
 

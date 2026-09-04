@@ -60,7 +60,6 @@ use tetond::egress::provenance::{assembled_provenance, ContextBlock};
 use tetond::egress::{Egress, EgressContext, EgressError, PrivacyEventSink, Provenance};
 use tetond::harness::tools::walk::WalkBudget;
 use tetond::harness::{Duty, DutyRoute, SessionEvents, DRAFT_DUTY};
-use tetond::repo_context::evidence::EvidenceBudget;
 use tetond::repo_context::generate::{self, ConsentGiven, GenerationContext, GenerationOutcome};
 use tetond::repo_context::RealFiles;
 use tetond::session_root::ProbedRoot;
@@ -2016,15 +2015,20 @@ async fn a_boundary_covered_manifest_never_reaches_the_draft_provider_and_is_cou
             reader: &RealFiles,
             boundaries: &matcher,
             // Roomy: the fixture's evidence is a few hundred bytes, so a cut is
-            // something a test asks for rather than stumbles into.
-            budget: EvidenceBudget::new(64 * 1024),
+            // something a test asks for rather than stumbles into. Spelled as
+            // the route's *window* and put through the production derivation,
+            // which is what reserves the answer and the drafting instruction
+            // out of it.
+            budget: generate::evidence_budget_for(64 * 1024),
             walk: WalkBudget::default(),
             route: &route,
             events: &events,
             tier: Tier::Think,
             config: &config,
         },
-        ConsentGiven::granted(),
+        // The witness carries the directory the answer was about, and this
+        // fixture's root is the one it was planted at.
+        ConsentGiven::granted(&root),
         false,
     )
     .await;
