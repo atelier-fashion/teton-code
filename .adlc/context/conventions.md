@@ -102,6 +102,21 @@ teton-code/
   (REQ-592, LESSON-568). Where the rule is a property of a method rather than of
   its callers, put it on the method — `RpcMethod::ENDS_TURN` is the worked
   example.
+- **Assert the frame the product owns, not the values the platform chose.**
+  A test reading the output of a shell, an OS API or a filesystem carries
+  incidental values from the machine that produced it. `cd` to a missing
+  directory exits 1 under bash and 2 under dash, with different diagnostics, so
+  pinning `(exit 1)` and `No such file or directory` asserted which `/bin/sh`
+  the runner ships and split the CI matrix on identical code. Parse the frame
+  (`(exit N)`, the `[stderr]` marker) and assert its shape — non-zero, names the
+  builtin and the path — and correct any AC that transcribed the incidental
+  value as a requirement (REQ-617, LESSON-644).
+- **Re-measure a band before tuning inside it.** A comment stating a measured
+  range has no test behind it: the assertion stands at one point, and a point
+  inside a widened band stays green while the prose goes stale. A fixture
+  comment claiming a 1,000-token band was ~70,000 wide by the time it was
+  re-probed, so three REQs had each nudged to the minimum that passed. Sweeping
+  is usually a shell loop; write down the edges you found (REQ-617, LESSON-645).
 
 ## Error Handling
 
