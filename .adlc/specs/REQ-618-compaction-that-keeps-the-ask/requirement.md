@@ -1,7 +1,7 @@
 ---
 id: REQ-618
 title: "Compaction that keeps the ask — the user's prompt and the active skill body survive every compaction, a skill body that cannot fit the route is refused with its size, and every compaction is a transcript record"
-status: draft
+status: approved
 deployable: true
 created: 2026-09-04
 updated: 2026-09-04
@@ -88,7 +88,7 @@ turn.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: With a stub engine sized at 21,162 tokens, a turn that expands a 25 KB skill body and then receives 40 KB of tool results triggers compaction; after it, the user's prompt block and the skill body are byte-identical to what was pushed, and the dropped blocks are all tool results (`inspect, don't infer` — the retained context is read from `into_retained`, LESSON-519).
+- [ ] AC-1: With a stub engine sized at 21,162 tokens, a turn that expands a 25 KB skill body — over `room_fraction` at that budget, so admitted through BR-4's offer with `proceed once` — and then receives 40 KB of tool results triggers compaction; after it, the user's prompt block and the skill body are byte-identical to what was pushed, and the dropped blocks are all tool results (`inspect, don't infer` — the retained context is read from `into_retained`, LESSON-519).
 - [ ] AC-2: A turn whose anchors alone exceed the budget is refused with `turn_refused_anchors_exceed_budget` naming both figures; nothing is sent to the model.
 - [ ] AC-3: A skill body at 30 % of a route's byte budget (with `room_fraction = 0.25`) yields `skill_refused_no_room` and REQ-589's offer; `proceed once` expands it and anchors it; `decline` ends the turn with no model call.
 - [ ] AC-4: The transcript of AC-1's session contains one `context_compacted` record per compaction, each with `kept_bytes + dropped_bytes + summarized_bytes` equal to the pre-compaction total and `anchor_bytes ≤ kept_bytes`.
