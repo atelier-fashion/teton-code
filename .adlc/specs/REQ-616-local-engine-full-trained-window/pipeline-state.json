@@ -1,0 +1,32 @@
+{
+  "req": "REQ-616",
+  "branch": "feat/REQ-616-local-engine-full-trained-window",
+  "startedAt": "2026-09-04T19:34:00Z",
+  "completed": false,
+  "currentPhase": 0,
+  "completedPhases": [],
+  "phaseHistory": [],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-616",
+      "branch": "feat/REQ-616-local-engine-full-trained-window",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": ["teton-code"],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  },
+  "conflictsResolved": [],
+  "notes": []
+}
