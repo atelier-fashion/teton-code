@@ -1,7 +1,7 @@
 ---
 id: REQ-617
 title: "The model knows the session's own commands and stops repeating itself — built-in command awareness in the prompt and docs, a repeated-identical-call refusal for every tool, and an honest shell-duty note"
-status: approved
+status: complete
 deployable: true
 created: 2026-09-04
 updated: 2026-09-04
