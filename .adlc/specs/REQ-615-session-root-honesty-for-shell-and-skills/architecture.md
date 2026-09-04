@@ -101,25 +101,31 @@ Its budget, `environment_block_ceiling()`, is **measured** by rendering the
 worst-case *project* row — and the known-projects shrink loop in the non-project
 branch spends against that same number.
 
-BR-3 adds ~180 bytes of dictated ending to the **non-project** branch only. Three
-consequences, and all three are the change:
+BR-3 adds 176 bytes of dictated ending to the **non-project** branch only. Three
+consequences. *(Corrected at implementation — the first prediction below was
+wrong in the safe direction, and the third was wrong in the costly one.)*
 
-1. **The block becomes at most two lines**, and the ONE-line test becomes a
-   `matches('\n').count() <= 2` assertion whose *purpose* is preserved verbatim:
-   a project **name** still may not add a line. The invariant was never "one
-   line"; it was "user-controlled data cannot add structure". The new assertion
-   states that directly, and the dictation is harness-authored constant text
-   that no name can reach.
-2. **`environment_block_ceiling()` is re-derived from the new worst case** — the
-   larger of the worst-case project row and the worst-case *home* row (display at
-   the byte bound, dictation, plus the pointer clause). Still **measured by
-   calling the function that builds it**, never arithmetic: an arithmetic budget
-   here would be a second derivation free to drift, which is the exact defect the
-   current doc comment exists to prevent.
-3. **The known-projects shrink loop is unaffected in shape.** It still adds names
-   while the rendered whole stays within the ceiling; the ceiling simply now
-   accommodates the dictation the home row always carries, so step 1 (names that
-   fit) does not starve to step 3 (no clause).
+1. **The block stays ONE line**, and the ONE-line test is kept unedited. The
+   dictation is written with source line-continuations, so it contributes no
+   newline; the invariant "user-controlled data cannot add structure" holds
+   exactly as it did, and there was no reason to weaken an assertion that still
+   states it. *(Predicted a two-line block; the implementation did better.)*
+2. **`environment_block_ceiling()` stays REQ-583's worst-case project row**, and
+   `worst_case_session_root()` — the value the two resident sweeps consume —
+   becomes the **longer** of the project row and the home row, measured by
+   calling the builder on each. The two had been one function; they are two now
+   because the ceiling and the sweeps ask different questions, and since BR-3
+   they have different answers.
+3. **The dictation is not charged to the known-projects budget.** This is the
+   correction that matters. Charging it — the obvious first implementation —
+   measured out at *one* project name surviving where three had fitted, because
+   the ceiling is an absolute line length and the dictation ate 176 of it. A
+   home-rooted session would have traded away the project names it needs for the
+   sentence telling it to use them, which inverts BR-3's own instruction that
+   *"the known-projects list stays within REQ-583's byte ceiling"*. So the clause
+   is fitted against the facts alone and the dictation is spliced in afterwards:
+   it is constant harness text no name can reach or grow, so it does not belong
+   in a budget whose whole job is bounding user-controlled growth.
 
 The dictation is **data-shaped**, in the register the block already uses. It is
 placed after the facts, and it is the one directive on the line — justified

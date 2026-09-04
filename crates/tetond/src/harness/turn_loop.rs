@@ -2758,7 +2758,54 @@ pub(crate) fn environment_block(root: &SessionRoot) -> String {
 /// wording changed; a measured one cannot, because it *is* the measurement.
 #[must_use]
 pub(crate) fn environment_block_ceiling() -> usize {
-    environment_block(&worst_case_session_root()).len()
+    // REQ-615 ADR-3, corrected at implementation. This is the budget the
+    // **user-controlled** part of the line is fitted against — the
+    // known-projects clause — and it stays REQ-583's worst-case *project* row.
+    //
+    // BR-3's dictation is deliberately **not** charged to it. The dictation is
+    // harness-authored constant text that no name can reach or grow, and
+    // charging it here would have made a home session trade away the project
+    // names it needs for the sentence telling it to use them: measured, the
+    // home row's clause fell from three names to one. BR-3 says the list stays
+    // within REQ-583's ceiling, and this is what that costs to honour.
+    //
+    // Still measured by calling the builder, never arithmetic.
+    environment_block(&worst_case_project_root()).len()
+}
+
+/// REQ-615 BR-3's dictated ending for a root that is not a project.
+///
+/// The one directive on a line that is otherwise facts, and it earns the place
+/// because it is the *only* thing here a tool cannot tell the model: the tools
+/// enforce the jail, but nothing in a tool result says "do not scaffold a
+/// project into this folder". LESSON-532's rule — a small model transfers data
+/// reliably and directives unreliably — is an argument for not *relying* on it,
+/// which is why REQ-615's WriteGate and SkillGate enforce the same rule
+/// independently. The prompt says it; the gates make it true.
+///
+/// Harness-authored constant text, spliced after the facts, so no
+/// user-controlled value can reach it and no name can grow it.
+const NON_PROJECT_DICTATION: &str = " This is not a project. Do not create files or \
+                                     directories here. If the task needs a project, stop \
+                                     and ask the user to run `/cd <name>`; you cannot move \
+                                     the root yourself.";
+
+/// The largest **non-project** row the block can render (REQ-615): the display
+/// at its byte bound, plus BR-3's dictation.
+///
+/// Its own function rather than a flag on the project one, because the two rows
+/// differ in which fields exist at all — a non-project root carries no name and
+/// no branch, and giving it one to make a single worst case would measure a
+/// line the block can never emit.
+fn worst_case_non_project_root() -> SessionRoot {
+    use teton_protocol::methods::RootKind;
+
+    byte_bounded_root(&SessionRoot {
+        display: "/segment".repeat(25),
+        kind: RootKind::Home,
+        project_name: None,
+        vcs_branch: None,
+    })
 }
 
 /// The environment block, with BR-7's known-project clause for a non-project
@@ -2784,6 +2831,8 @@ pub(crate) fn environment_block_ceiling() -> usize {
 /// on this line.
 #[must_use]
 pub(crate) fn environment_block_with_projects(root: &SessionRoot, known: &[String]) -> String {
+    use teton_protocol::methods::RootKind;
+
     let paid = byte_bounded_root(root);
     let base = format!(
         "Session root: {} ({}). Platform: {}.",
@@ -2791,19 +2840,46 @@ pub(crate) fn environment_block_with_projects(root: &SessionRoot, known: &[Strin
         kind_phrase(&paid),
         platform_word()
     );
+    // REQ-615 BR-3: at a home or filesystem root the block dictates the ending.
+    // A `plain` root is untouched — it may be a project-to-be, and REQ-613's
+    // `TETON.md` write must keep working there (BR-4's carve-out, OQ-2).
+    //
+    // Spliced in **after** the clause has been fitted, not before, so it does
+    // not compete with the names for [`environment_block_ceiling`]'s budget:
+    // it is constant harness text that no name can reach, and charging it to
+    // the user-controlled budget cost a home session two of its three project
+    // names when it was tried the other way round.
+    let dictation = if matches!(paid.kind, RootKind::Home | RootKind::FilesystemRoot) {
+        NON_PROJECT_DICTATION
+    } else {
+        ""
+    };
 
     // BR-7: only a non-project root earns the clause.
-    if known.is_empty() || paid.kind == teton_protocol::methods::RootKind::Project {
-        return format!("{base}\n");
+    if known.is_empty() || paid.kind == RootKind::Project {
+        return format!("{base}{dictation}\n");
     }
 
     const POINTER: &str = " (more: the projects tool; /cd <name> moves there).";
     let ceiling = environment_block_ceiling();
+    // Fitted against the facts alone; the dictation is added to whatever this
+    // chooses. `render` is therefore the *budgeted* line, not the emitted one —
+    // `emit` below is what the model reads.
     let render = |names: &[&str]| {
         if names.is_empty() {
             format!("{base} Known projects:{POINTER}\n")
         } else {
             format!("{base} Known projects: {}.{POINTER}\n", names.join(", "))
+        }
+    };
+    let emit = |names: &[&str]| {
+        if names.is_empty() {
+            format!("{base}{dictation} Known projects:{POINTER}\n")
+        } else {
+            format!(
+                "{base}{dictation} Known projects: {}.{POINTER}\n",
+                names.join(", ")
+            )
         }
     };
 
@@ -2817,14 +2893,13 @@ pub(crate) fn environment_block_with_projects(root: &SessionRoot, known: &[Strin
         taken = candidate;
     }
     if !taken.is_empty() {
-        return render(&taken);
+        return emit(&taken);
     }
     // Step 2, then step 3.
-    let pointer_only = render(&[]);
-    if pointer_only.len() <= ceiling {
-        pointer_only
+    if render(&[]).len() <= ceiling {
+        emit(&[])
     } else {
-        format!("{base}\n")
+        format!("{base}{dictation}\n")
     }
 }
 
@@ -2880,6 +2955,25 @@ fn byte_bounded_root(root: &SessionRoot) -> SessionRoot {
 /// to drift from the sweeps: one derivation, now shared by the clause and the
 /// two ceiling sweeps that already read it.
 pub(crate) fn worst_case_session_root() -> SessionRoot {
+    // REQ-615: the largest row is no longer always the project one. BR-3's
+    // dictation rides the non-project branch and is longer than the name and
+    // branch the project row carries, so the two are measured and the longer
+    // wins. The resident-prompt sweeps consume this, and a sweep measuring the
+    // *second* largest row is a sweep that passes on a prompt the daemon can
+    // still exceed.
+    let project = worst_case_project_root();
+    let non_project = worst_case_non_project_root();
+    if environment_block(&non_project).len() > environment_block(&project).len() {
+        non_project
+    } else {
+        project
+    }
+}
+
+/// REQ-583's worst-case **project** row — the one
+/// [`environment_block_ceiling`] measures, and the budget the known-projects
+/// clause is fitted against.
+fn worst_case_project_root() -> SessionRoot {
     use teton_core::session_root::NAME_MAX_CHARS;
     use teton_protocol::methods::RootKind;
 
@@ -6350,6 +6444,86 @@ mod tests {
         lines[0]
     }
 
+    /// **REQ-615 BR-3: a home or filesystem root gets the dictated ending, and
+    /// a project or plain root gets nothing.**
+    ///
+    /// The benign half guards two shipped things at once: BR-9's "a project
+    /// session is unchanged", and BR-4's carve-out that a `plain` root is where
+    /// a project is scaffolded — REQ-613's `TETON.md` write lands there, and
+    /// telling that session not to create files would contradict the tool that
+    /// is about to.
+    ///
+    /// Mutation: add `RootKind::Plain` to the dictation's match, or drop
+    /// `RootKind::FilesystemRoot` from it — the corresponding row goes red.
+    #[test]
+    fn the_environment_block_dictates_the_ending_at_a_non_project_root() {
+        use teton_protocol::methods::RootKind;
+
+        let row = |kind: RootKind, display: &str| SessionRoot {
+            display: display.to_owned(),
+            kind,
+            project_name: None,
+            vcs_branch: None,
+        };
+
+        for (kind, display) in [(RootKind::Home, "~"), (RootKind::FilesystemRoot, "/")] {
+            let block = environment_block(&row(kind, display));
+            for needle in [
+                "This is not a project.",
+                "Do not create files or directories here.",
+                "stop and ask the user to run `/cd <name>`",
+                "you cannot move the root yourself",
+            ] {
+                assert!(
+                    block.contains(needle),
+                    "a {kind:?} root must dictate `{needle}`:\n{block}"
+                );
+            }
+        }
+
+        for (kind, display) in [(RootKind::Plain, "~/scratch")] {
+            let block = environment_block(&row(kind, display));
+            assert!(
+                !block.contains("This is not a project."),
+                "a {kind:?} root is where a project gets scaffolded — REQ-613's \
+                 TETON.md write lands here (BR-4's carve-out):\n{block}"
+            );
+        }
+    }
+
+    /// **REQ-615 BR-9: a project root's block is what REQ-583 rendered.**
+    ///
+    /// Byte-for-byte against a hand-written expectation, because "unchanged" is
+    /// the whole claim and a substring check would pass on a block that gained
+    /// a sentence.
+    ///
+    /// Mutation: drop the `RootKind::Project` guard from the dictation's match
+    /// — this goes red.
+    #[test]
+    fn a_project_block_is_unchanged_by_this_req() {
+        use teton_protocol::methods::RootKind;
+
+        let project = SessionRoot {
+            display: "~/GitHub/teton-code".to_owned(),
+            kind: RootKind::Project,
+            project_name: Some("teton-code".to_owned()),
+            vcs_branch: Some("main".to_owned()),
+        };
+        assert_eq!(
+            environment_block(&project),
+            format!(
+                "Session root: ~/GitHub/teton-code (project teton-code, branch main). \
+                 Platform: {}.\n",
+                platform_word()
+            )
+        );
+        // And with names on hand, which a project root still declines (BR-7).
+        assert_eq!(
+            environment_block_with_projects(&project, &["other".to_owned()]),
+            environment_block(&project)
+        );
+    }
+
     /// **REQ-584 BR-7 / AC-8.** Known names ride a non-project root's line,
     /// inside the byte cost REQ-583 already pays.
     #[test]
@@ -6374,12 +6548,22 @@ mod tests {
             line.contains("/cd <name> moves there"),
             "the clause carries the recipe, not just the names: {line}"
         );
+        // REQ-615: the ceiling bounds the **user-controlled** part — the names.
+        // BR-3's dictation is constant harness text no name can reach or grow,
+        // and it is spliced in after the fitting, so it is removed here before
+        // the comparison. Charging it to this budget cost the home row two of
+        // its three names, which is the opposite of what BR-3 asks for.
+        let budgeted = line.replace(NON_PROJECT_DICTATION, "");
         assert!(
-            line.len() <= environment_block_ceiling(),
+            budgeted.len() <= environment_block_ceiling(),
             "the clause must fit inside REQ-583's worst-case project row \
-             ({} bytes) — the row both resident sweeps measure: {} bytes\n{line}",
+             ({} bytes): {} bytes\n{budgeted}",
             environment_block_ceiling(),
-            line.len()
+            budgeted.len()
+        );
+        assert!(
+            line.contains(NON_PROJECT_DICTATION.trim()),
+            "and the dictation is still on the emitted line:\n{line}"
         );
 
         // Ordered as given — the caller ranks by `last_seen`, this places.
@@ -6455,7 +6639,13 @@ mod tests {
         };
         let line = environment_block_with_projects(&short, &names);
         assert!(line.contains("Known projects: project-00"), "{line}");
-        assert!(line.len() <= ceiling, "{} > {ceiling}", line.len());
+        // The dictation is not part of the budget the names are fitted against
+        // (REQ-615) — see the sibling test for why.
+        assert!(
+            line.replace(NON_PROJECT_DICTATION, "").len() <= ceiling,
+            "{} > {ceiling}",
+            line.replace(NON_PROJECT_DICTATION, "").len()
+        );
         assert!(
             !line.contains("project-39"),
             "it takes what fits, not everything: {line}"
@@ -6485,6 +6675,7 @@ mod tests {
                     vcs_branch: None,
                 };
                 let line = environment_block_with_projects(&root, &names);
+                let line = line.replace(NON_PROJECT_DICTATION, "");
                 assert!(
                     line.len() <= ceiling,
                     "no root may push the line past the ceiling: {} > {ceiling}\n{line}",
@@ -6608,13 +6799,21 @@ mod tests {
                 "a {kind:?} root has no branch, and the block must not guess one \
                  (BR-1):\n{block}"
             );
-            // BR-3: "project" only when the kind is one. `not a project` is the
-            // plain kind's own phrase and the one permitted appearance.
-            let project_mentions = block.matches("project").count();
-            let permitted = usize::from(kind == RootKind::Plain);
-            assert_eq!(
-                project_mentions, permitted,
-                "a {kind:?} root must not be called a project:\n{block}"
+            // BR-3: the block must never *describe this root as* a project.
+            //
+            // Asserted on the hazard rather than on a word count (REQ-600's
+            // rule, conventions.md). Counting bare occurrences of "project"
+            // was the old proxy, and REQ-615's dictation — "This is not a
+            // project… if the task needs a project" — says the right thing
+            // twice while the proxy reads it as two violations. The hazard is
+            // the *kind phrase*: `(project <name>)` is how the block claims one.
+            assert!(
+                !block.contains("(project"),
+                "a {kind:?} root must not be described as a project:\n{block}"
+            );
+            assert!(
+                !block.contains("Known projects: (project"),
+                "no clause may smuggle the project phrase back in:\n{block}"
             );
             assert!(
                 block.contains(&format!("Platform: {}.", platform_word())),
@@ -6873,15 +7072,28 @@ mod tests {
             "the display was not elided to the ceiling: {display_chars} chars"
         );
 
-        let worst = worst_case_session_root();
-        assert_eq!(worst.display.chars().count(), DISPLAY_MAX_CHARS);
+        // REQ-615: `worst_case_session_root` is now whichever row renders
+        // longest, and since BR-3's dictation that is the **home** row — which
+        // carries no name and no branch by construction. The name and branch
+        // ceilings are therefore asserted where they live, on the project row,
+        // and the "is it really the worst" property is asserted below on what
+        // the sweeps actually consume. Asserting both on one value is what
+        // stopped being possible, not either property.
+        let project_worst = worst_case_project_root();
+        assert_eq!(project_worst.display.chars().count(), DISPLAY_MAX_CHARS);
         assert_eq!(
-            worst.project_name.as_deref().map(|n| n.chars().count()),
+            project_worst.project_name.as_deref().map(|n| n.chars().count()),
             Some(NAME_MAX_CHARS)
         );
         assert_eq!(
-            worst.vcs_branch.as_deref().map(|b| b.chars().count()),
+            project_worst.vcs_branch.as_deref().map(|b| b.chars().count()),
             Some(NAME_MAX_CHARS)
+        );
+        let worst = worst_case_session_root();
+        assert_eq!(worst.display.chars().count(), DISPLAY_MAX_CHARS);
+        assert!(
+            environment_block(&worst).len() >= environment_block(&project_worst).len(),
+            "the sweeps' worst case must not render shorter than the project row"
         );
         let worst_block = environment_block(&worst);
         assert!(
@@ -6933,18 +7145,43 @@ mod tests {
             bounded_field, byte_ceiling, DISPLAY_MAX_CHARS, NAME_MAX_CHARS,
         };
 
-        let worst = worst_case_session_root();
-        let worst_block = environment_block(&worst);
-        // The row costs exactly what the three byte ceilings and the fixed
-        // words add up to — a fixture under any ceiling would come up short.
-        let fixed = format!(
+        // REQ-615: there are two candidate rows now, and each is pinned to its
+        // own arithmetic — a fixture that quietly slipped under a ceiling comes
+        // up short on its own line rather than hiding behind the other's.
+        let project_block = environment_block(&worst_case_project_root());
+        let project_fixed = format!(
             "Session root:  (project , branch ). Platform: {}.\n",
             platform_word()
         );
         assert_eq!(
+            project_block.len(),
+            project_fixed.len()
+                + byte_ceiling(DISPLAY_MAX_CHARS)
+                + 2 * byte_ceiling(NAME_MAX_CHARS),
+            "the project row is not at its byte ceilings:\n{project_block}"
+        );
+
+        let home_block = environment_block(&worst_case_non_project_root());
+        let home_fixed = format!(
+            "Session root:  (your home folder). Platform: {}.{NON_PROJECT_DICTATION}\n",
+            platform_word()
+        );
+        assert_eq!(
+            home_block.len(),
+            home_fixed.len() + byte_ceiling(DISPLAY_MAX_CHARS),
+            "the home row is not at its byte ceiling:\n{home_block}"
+        );
+
+        // And the value the sweeps consume is whichever of the two is longer.
+        // Since BR-3's dictation that is the home row; asserting the *relation*
+        // rather than the winner means the next wording change moves it back
+        // without a test having to be told.
+        let worst = worst_case_session_root();
+        let worst_block = environment_block(&worst);
+        assert_eq!(
             worst_block.len(),
-            fixed.len() + byte_ceiling(DISPLAY_MAX_CHARS) + 2 * byte_ceiling(NAME_MAX_CHARS),
-            "the row is not at its byte ceilings:\n{worst_block}"
+            project_block.len().max(home_block.len()),
+            "the sweeps must measure the longer of the two rows:\n{worst_block}"
         );
 
         for (script, ch) in [("cjk", '漢'), ("astral", '𝔘')] {
