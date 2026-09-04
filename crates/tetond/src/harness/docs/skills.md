@@ -9,6 +9,11 @@ among them.
 Four locations, one level deep, no recursion: `skills/<name>/SKILL.md` and
 `commands/<name>.md`, each under `~/.claude/` and `<root>/.claude/`.
 
+The `skill` tool is the only way **you** run one. There is no other route: not
+`shell`, not a built-in command, not naming the file to `read`. A built-in `/`
+command is the other way round — only the user runs those, and
+`teton_docs commands` lists them.
+
 The name is the directory or file stem (`^[a-z0-9][a-z0-9_-]{0,63}$`), not
 frontmatter `name`. Built-in beats skill, project beats user, `skills/` beats
 `commands/`; the loser is shadowed and does not dispatch. Discovery re-runs on

@@ -1,7 +1,7 @@
 ---
 id: TASK-002
 title: "teton_docs gains `commands` and `transcript`, completes `context` and `skills`, and pays for both names out of the frame"
-status: draft
+status: complete
 parent: REQ-617
 created: 2026-09-04
 updated: 2026-09-04

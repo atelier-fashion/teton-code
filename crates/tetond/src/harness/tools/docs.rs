@@ -117,6 +117,14 @@ const TOPICS: &[(&str, &str)] = &[
     ("context", include_str!("../docs/context.md")),
     ("web", include_str!("../docs/web.md")),
     ("skills", include_str!("../docs/skills.md")),
+    // REQ-617 BR-2. The two the 2026-09-04 transcript proved were missing: asked
+    // "is transcript on?", the model had no topic to fetch and no command name in
+    // its prompt, so it searched a repository for seven tool calls and reported
+    // another tool's setting as Teton's. `commands` is the roster with the shell
+    // twins; `transcript` is the two switches, the directory, and the fact that
+    // the model's own tools are refused there.
+    ("commands", include_str!("../docs/commands.md")),
+    ("transcript", include_str!("../docs/transcript.md")),
     ("doctor", include_str!("../docs/doctor.md")),
     ("cost", include_str!("../docs/cost.md")),
 ];
@@ -128,7 +136,8 @@ const TOPICS: &[(&str, &str)] = &[
 /// are `const` — and because a hand-written second spelling is what
 /// `the_description_indexes_every_bundled_topic` can compare against, the same
 /// golden posture the recipe catalog takes.
-const TOPIC_INDEX: &str = "providers, policy, context, web, skills, doctor, cost";
+const TOPIC_INDEX: &str =
+    "providers, policy, context, web, skills, commands, transcript, doctor, cost";
 
 /// The longest echo of a caller-supplied topic any message here will carry.
 ///
@@ -185,9 +194,25 @@ pub(crate) fn bounded_topic_echo(topic: &str) -> String {
 /// moved. The seventh, `cost`, took six of what was left for a 2.6 KB topic
 /// (REQ-588 BR-5) — a page a user consults about their own money, which is not
 /// a page to make them find by guessing. **Spent: 108. Left: 12.**
+///
+/// The eighth and ninth, `commands` and `transcript` (REQ-617 BR-2), cost 22
+/// between them against the 12 that were left, so **the frame paid a third
+/// time**: `Read Teton's own docs, bundled in this binary. ` →
+/// `Teton's own bundled docs. `, recovering 20. `bundled` is the load-bearing
+/// word and it survives — it is the sentence that says these pages are not read
+/// from the repository, which is precisely the mistake the two new topics exist
+/// to stop (LESSON-493). `Read` went because the tool is named `teton_docs` and
+/// its schema has one string field; `in this binary` went because it elaborates
+/// `bundled` and elaboration is what a resident description cannot afford.
+/// **Spent: 109. Left: 11.** `MAX_DESCRIPTION_CHARS` has still not moved.
+///
+/// That leaves roughly one more name at today's spelling and then this frame is
+/// out of road. The next topic either shortens `topics: ` (7 characters that say
+/// nothing the list does not), or makes the case for a bigger ceiling out loud —
+/// which is a decision, and this ledger is where it gets written down.
 const DESCRIPTION: &str = concat!(
-    "Read Teton's own docs, bundled in this binary. ",
-    "topics: providers, policy, context, web, skills, doctor, cost"
+    "Teton's own bundled docs. ",
+    "topics: providers, policy, context, web, skills, commands, transcript, doctor, cost"
 );
 
 /// The body of `topic`, or `None` when nothing by that name is bundled.
@@ -398,7 +423,7 @@ mod tests {
     fn every_topic_serves_its_whole_bundled_body() {
         assert_eq!(
             TOPICS.len(),
-            7,
+            9,
             "the topic roster changed: {:?}",
             TOPICS.iter().map(|(name, _)| *name).collect::<Vec<_>>()
         );
@@ -1109,5 +1134,199 @@ mod tests {
                  has to type is exactly this string"
             );
         }
+    }
+
+    /// One topic, whitespace-collapsed and un-emphasised, for the phrase
+    /// assertions below — the same normalization [`skills_topic`] does, which
+    /// exists so a line wrap in the Markdown cannot break a needle.
+    fn topic(name: &str) -> String {
+        let served = call(name);
+        assert!(!served.is_error, "{}", served.content);
+        served
+            .content
+            .replace('*', "")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// A phrase a topic has to carry, with the reason it exists in the failure.
+    fn states(body: &str, name: &str, phrase: &str, claim: &str) {
+        assert!(
+            body.contains(phrase),
+            "the `{name}` topic no longer says `{phrase}`, so it no longer states that \
+             {claim}. Fix crates/tetond/src/harness/docs/{name}.md, or — if the wording \
+             changed on purpose — move the needle with it. Deleting the needle deletes \
+             the only thing that notices when the topic and the product disagree."
+        );
+    }
+
+    /// **BR-2, the `commands` topic.** Its whole job is to stop the seven-tool-call
+    /// repository search, so the three claims that do that are pinned.
+    #[test]
+    fn the_commands_topic_refuses_to_run_a_command_and_says_where_config_is_not() {
+        let body = topic("commands");
+        states(
+            &body,
+            "commands",
+            "You cannot run any of them",
+            "the model does not dispatch a built-in command (BR-1's sentence, on the \
+             page as well as in the guide)",
+        );
+        states(
+            &body,
+            "commands",
+            "never inside the repository you are working in",
+            "Teton's configuration is not in the tree, which is the fact whose absence \
+             cost seven tool calls and a wrong answer off another tool's file \
+             (LESSON-493)",
+        );
+        states(
+            &body,
+            "commands",
+            "Type `/transcript`",
+            "the page shows the exact reply shape for a session-state question, worked \
+             on the question that was actually asked",
+        );
+    }
+
+    /// **BR-2, the `transcript` topic.** The two switches, the directory, and the
+    /// refusal — the last being the one a model cannot learn by trying, because
+    /// trying is what the refusal stops.
+    #[test]
+    fn the_transcript_topic_names_both_switches_and_the_tool_refusal() {
+        let body = topic("transcript");
+        states(
+            &body,
+            "transcript",
+            "[transcript] enabled",
+            "the durable switch is named with the table it lives in",
+        );
+        states(
+            &body,
+            "transcript",
+            "`/transcript on` / `/transcript off`",
+            "the session switch is named beside the durable one, since the whole \
+             difficulty is that there are two with different lifetimes",
+        );
+        states(
+            &body,
+            "transcript",
+            "denied prefix",
+            "the topic says why `read`, `glob` and `grep` refuse the directory, rather \
+             than leaving the model to discover it one refusal at a time (REQ-611 ADR-7)",
+        );
+        states(
+            &body,
+            "transcript",
+            "I cannot run it",
+            "the topic dictates the honest half of the answer: naming the command is not \
+             the same as being able to run it",
+        );
+    }
+
+    /// **AC-2: a new command cannot be added without its docs line.**
+    ///
+    /// The enumeration source is `teton_protocol::commands::SESSION_COMMANDS`,
+    /// not the CLI's `slash::COMMANDS` — the `teton` crate is not a dependency of
+    /// this one (the arrow runs the other way, and `cli_rows.rs` reaches the
+    /// bundled guide by `include_str!` rather than by a crate edge), so a test
+    /// here cannot see that table.
+    ///
+    /// **The guarantee is therefore a composition of two guards, and it is worth
+    /// naming as such rather than glossing:** `slash.rs`'s
+    /// `the_protocol_roster_and_the_command_table_are_the_same_set` pins the
+    /// roster to the dispatch table in *both* directions, and this test pins the
+    /// page to the roster. A command added to `COMMANDS` with no roster row fails
+    /// there; a roster row with no docs line fails here. Neither guard alone is
+    /// AC-2, and the chain has no gap only because the first one asserts equality
+    /// rather than containment.
+    ///
+    /// # Mutation
+    ///
+    /// Deleting any single `- **`/name`**` line from `commands.md` goes red here
+    /// naming that command. Run before trusting it.
+    #[test]
+    fn the_commands_topic_names_every_registered_command() {
+        let body = topic("commands");
+        let missing: Vec<&str> = teton_protocol::commands::SESSION_COMMANDS
+            .iter()
+            .filter(|c| !body.contains(&format!("`/{}`", c.name)))
+            .map(|c| c.name)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "`teton_docs commands` does not name {missing:?}. A command the page \
+             omits is one the model will never offer the user, which is the whole \
+             defect REQ-617 exists to close. Add a line to \
+             crates/tetond/src/harness/docs/commands.md."
+        );
+
+        // The count too, because `contains` on `/model` is satisfied by the line
+        // for `/model set`. Without this, deleting the `/model` line alone would
+        // leave the loop above green.
+        let named = body.matches("- `/").count() + body.matches("- **`/").count();
+        assert_eq!(
+            named,
+            teton_protocol::commands::SESSION_COMMANDS.len(),
+            "the page carries {named} command lines for {} roster rows. A prefix \
+             match hides a missing line when one name is a prefix of another \
+             (`/model` inside `/model set`), so the count is what actually \
+             catches it.",
+            teton_protocol::commands::SESSION_COMMANDS.len()
+        );
+    }
+
+    /// **BR-2, the two completed topics.** `context` must name all three switch
+    /// forms and the config key; `skills` must name the four load globs and say
+    /// that `skill` is the model's only route.
+    #[test]
+    fn the_context_and_skills_topics_carry_what_br_2_completes() {
+        let ctx = topic("context");
+        states(
+            &ctx,
+            "context",
+            "/context on|off",
+            "the session switch is named in its typed form",
+        );
+        states(
+            &ctx,
+            "context",
+            "/context init",
+            "the generation command is named, since it is the one that writes",
+        );
+        states(
+            &ctx,
+            "context",
+            "[context] repo_file",
+            "the durable key is named with its table",
+        );
+
+        let sk = topic("skills");
+        states(
+            &sk,
+            "skills",
+            "skills/<name>/SKILL.md",
+            "the directory-form glob is named",
+        );
+        states(
+            &sk,
+            "skills",
+            "commands/<name>.md",
+            "the file-form glob is named",
+        );
+        states(
+            &sk,
+            "skills",
+            "under `~/.claude/` and `<root>/.claude/`",
+            "both roots are named, which with the two forms above is the four locations",
+        );
+        states(
+            &sk,
+            "skills",
+            "The `skill` tool is the only way you run one",
+            "the model's single route is stated outright — the transcript's model called \
+             `skill` correctly four times and still hunted for another way in",
+        );
     }
 }
