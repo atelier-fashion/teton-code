@@ -1,7 +1,7 @@
 ---
 id: REQ-616
 title: "The local engine serves its full trained window — 262,144 tokens on the local tier, remote providers at their declared window, and every budget half, scan bound and surface following the window it runs under"
-status: approved
+status: complete
 deployable: true
 created: 2026-09-04
 updated: 2026-09-04
