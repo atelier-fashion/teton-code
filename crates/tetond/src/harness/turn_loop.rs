@@ -1951,15 +1951,6 @@ async fn run_the_allowed_tool(
         }
     }
     let outcome = tools.dispatch(name, tool_ctx, arguments);
-    // REQ-617 BR-6: recorded from the outcome's own length,
-    // after the dispatch that produced it. The refusal above
-    // quotes this number back so the model can find the
-    // result it already holds.
-    if name != SKILL_TOOL_NAME {
-        latches
-            .repeats
-            .record(name, arguments, outcome.content.len());
-    }
     // REQ-567 OQ-1: the tool has RUN. Everything from here
     // to the fold below awaits — the tool's own duty, then
     // `digest` — and a cancellation landing in one of those
@@ -2199,6 +2190,40 @@ async fn run_the_allowed_tool(
     // before Stage B, so measured and pushed are one
     // `String` rather than two that happen to agree.
     let folded = with_dropped_calls_notice(folded, dropped_calls);
+    // ── REQ-617 BR-6: record the dispatch ────────────────
+    //
+    // **Here, and the position was got wrong twice before it
+    // was got right. Both mistakes are worth naming.**
+    //
+    // It was first written immediately after `tools.dispatch`,
+    // measuring `outcome.content`. Wrong number: BR-4's
+    // refusal says *"returned <n> bytes; the result is
+    // above"*, and between the dispatch and the conversation
+    // the result is refined by the tool's own duty, wrapped
+    // in the untrusted envelope, given BUG-147's notice —
+    // and, the one that matters, **condensed by the `digest`
+    // duty** when it is oversized. A 200 KB `grep` result
+    // enters context as a couple of kilobytes; a refusal
+    // quoting 200,000 points the model at something that is
+    // not there.
+    //
+    // It then moved to the push itself, which is the right
+    // number and the wrong line: the Stage B skill refusal
+    // below **returns** between here and there. That path is
+    // skill-only *by disposition*, and this ledger excludes
+    // `skill` *by name* — two different predicates agreeing
+    // today, which is exactly the shape that stops agreeing.
+    //
+    // So: above every early return, below every rebinding of
+    // `folded`. This line is the last point at which the
+    // string is final and the only point every path still
+    // passes through. `with_dropped_calls_notice` above is
+    // the last thing that may grow it, and the comment on
+    // that line already says nothing may grow the block
+    // between it and the push.
+    if name != SKILL_TOOL_NAME {
+        latches.repeats.record(name, arguments, folded.len());
+    }
     // ── REQ-587 BR-7 / ADR-2: Stage B ────────────────────
     //
     // Stage A measured the body with `[dynamic context

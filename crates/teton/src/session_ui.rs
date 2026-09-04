@@ -3354,6 +3354,14 @@ fn asks_about_a_session_switch(prompt: &str) -> Option<&'static str> {
     {
         return None;
     }
+    // `context` is the one switch name this product also uses for something
+    // else, and it uses it constantly: "is the context window big enough?" is a
+    // question about the route's budget, not about `/context`. Found in verify
+    // rather than in the wild, and excluded by the word that follows because
+    // that is checkable — a heuristic about what the user "meant" is not.
+    let asked = asked
+        .replace("context window", " ")
+        .replace("context budget", " ");
     let mut found = SESSION_SWITCHES
         .iter()
         .filter(|switch| contains_word(&asked, switch));
@@ -8069,6 +8077,19 @@ mod tests {
     /// still given the wrong answer, and the correction is still true.
     #[test]
     fn a_session_state_reply_that_cannot_answer_earns_the_line() {
+        // The narrowing that keeps `context window` out (see
+        // `asks_about_a_session_switch`) must not also keep the switch itself
+        // out. Asserted first, because an exclusion that swallowed its own
+        // subject would leave every other case below passing.
+        let surface = state_turn("is context on for this repo?", "I am not sure.", &[]);
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec![session_state_line("context")],
+            "the `context window` exclusion must not swallow a genuine question \
+             about `/context`: {:?}",
+            surface.calls
+        );
+
         for (case, prompt, reply, tools) in [
             (
                 "it read another tool's config file",
@@ -8150,6 +8171,24 @@ mod tests {
                 "what does this function do?",
                 "it parses a config file.",
                 &["read: config.toml"][..],
+            ),
+            // Found in verify. `context` is the one switch name this product
+            // also uses for something else, and it is the phrase a user of THIS
+            // product is most likely to type: the route's budget is printed as
+            // a context window on every `/verbose` line. A predicate that fired
+            // here would correct a question nobody asked, on a turn that
+            // answered correctly.
+            (
+                "the context WINDOW, which is not the /context switch",
+                "is the context window big enough for this file?",
+                "the route's budget is 63 KB, so yes.",
+                &[][..],
+            ),
+            (
+                "the context budget, likewise",
+                "is the context budget being exceeded?",
+                "no — the last turn used 12 KB of 63 KB.",
+                &[][..],
             ),
         ] {
             let surface = state_turn(prompt, reply, tools);

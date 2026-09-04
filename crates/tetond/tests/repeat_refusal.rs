@@ -543,6 +543,71 @@ async fn the_repeated_event_carries_no_arguments() {
     );
 }
 
+/// **The byte count is the one the model can act on** (BR-4, found in verify).
+///
+/// The refusal says *"returned N bytes; the result is above"*, so N has to
+/// describe the block that is actually above. The ledger was first recorded at
+/// `tools.dispatch`, off the tool's raw output — which is not what enters the
+/// conversation: the result is framed in the untrusted envelope on its way
+/// there, and an oversized one is condensed by the `digest` duty first.
+///
+/// This asserts the recorded figure against the **framed** result the model
+/// holds, by finding the tool result in the conversation and comparing lengths.
+/// Recording at the dispatch instead makes the two disagree by the frame's own
+/// bytes — several hundred on every `shell` call — and by orders of magnitude
+/// on anything digested.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_refusal_counts_the_bytes_the_model_actually_holds() {
+    let repo = Tree::new("bytes");
+    let h = Harness::new();
+    let session = h.session_at(repo.path());
+
+    let call = json!({ "command": "ls -la" });
+    h.vendor.will_call("shell", &call);
+    h.vendor.will_call("shell", &call);
+    h.vendor.will_finish();
+    h.turn(&session, "list the files").await;
+
+    let results = tool_results(&h.vendor);
+    let dispatched = results
+        .iter()
+        .find(|r| !r.contains("repeated: this exact call"))
+        .expect("one dispatch");
+    let refusal = results
+        .iter()
+        .find(|r| r.contains("repeated: this exact call"))
+        .expect("one refusal");
+
+    // The conversation stores the result body; `Tool result (shell):\n` is the
+    // renderer's own prefix on the way to the wire, so it is taken back off
+    // before the comparison.
+    let body = dispatched
+        .split_once('\n')
+        .map_or(dispatched.as_str(), |(_, rest)| rest);
+    let claimed: usize = refusal
+        .split(" and returned ")
+        .nth(1)
+        .and_then(|tail| tail.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no byte count in the refusal: {refusal}"));
+
+    assert_eq!(
+        claimed,
+        body.len(),
+        "the refusal claims {claimed} bytes; the block the model holds is {} \
+         bytes. Recording the ledger at `tools.dispatch` rather than at the \
+         push produces exactly this gap — the untrusted frame's own bytes on \
+         every call, and the whole difference on anything the `digest` duty \
+         condensed.\nbody: {body:?}",
+        body.len()
+    );
+    assert!(
+        body.len() > 200,
+        "non-vacuity: the framed body must be substantially larger than the raw \
+         listing, or this test cannot tell the two recording points apart"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // AC-5 — the two thresholds
 // ---------------------------------------------------------------------------
