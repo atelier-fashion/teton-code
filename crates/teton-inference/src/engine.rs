@@ -582,6 +582,14 @@ mod llama {
     struct LoadedMeta {
         chat_format: ChatFormat,
         template_fallback_reason: Option<&'static str>,
+        /// The model's own `n_ctx_train`, read from the loaded GGUF (REQ-616).
+        ///
+        /// The window was already decided from the **catalog's** declared
+        /// figure, because `config/set` has to refuse an over-large `n_ctx`
+        /// before any weights exist. This is the authoritative one, reported
+        /// back so the daemon can cross-check the declaration against it rather
+        /// than trusting either silently.
+        n_ctx_train: u32,
     }
 
     /// A llama.cpp-backed [`Engine`]. Metal is used automatically on Apple
@@ -618,6 +626,8 @@ mod llama {
         /// BR-2, LESSON-456: never discard the reason a degradation happened).
         /// `None` when a template was recognized.
         template_fallback_reason: Option<&'static str>,
+        /// The model's trained window, read from the GGUF at load (REQ-616).
+        n_ctx_train: u32,
         /// To the model-owning thread. Dropping it ends that thread's loop,
         /// which is how [`Drop`] shuts the worker down without a sentinel
         /// message that could be missed.
@@ -649,6 +659,7 @@ mod llama {
             path: &Path,
             gpu_layers: u32,
             n_ctx: u32,
+            kv: crate::window::KvCacheType,
         ) -> Result<Self, EngineError> {
             let model_id = model_id.into();
             let owned_path = path.to_path_buf();
@@ -659,7 +670,7 @@ mod llama {
                 // Named so a stuck inference is identifiable in a sample/backtrace
                 // rather than being one anonymous thread among the pool's.
                 .name(format!("teton-llama-{model_id}"))
-                .spawn(move || worker_main(&owned_path, gpu_layers, n_ctx, &load_tx, &rx))
+                .spawn(move || worker_main(&owned_path, gpu_layers, n_ctx, kv, &load_tx, &rx))
                 .map_err(|e| {
                     EngineError::Backend(format!("could not start the inference thread: {e}"))
                 })?;
@@ -680,9 +691,20 @@ mod llama {
                 model_id,
                 chat_format: meta.chat_format,
                 template_fallback_reason: meta.template_fallback_reason,
+                n_ctx_train: meta.n_ctx_train,
                 tx: Some(tx),
                 worker: Some(worker),
             })
+        }
+
+        /// The model's trained window, as its GGUF states it (REQ-616 BR-1).
+        ///
+        /// Authoritative, unlike the catalog's declaration — the loader
+        /// compares the two and reports a disagreement rather than preferring
+        /// one silently.
+        #[must_use]
+        pub fn n_ctx_train(&self) -> u32 {
+            self.n_ctx_train
         }
 
         /// Why this engine is on the flat fallback, when it is (REQ-554 BR-2).
@@ -806,6 +828,7 @@ mod llama {
         path: &Path,
         gpu_layers: u32,
         n_ctx: u32,
+        kv: crate::window::KvCacheType,
         load_tx: &Sender<Result<LoadedMeta, EngineError>>,
         rx: &Receiver<Request>,
     ) {
@@ -851,6 +874,7 @@ mod llama {
             .send(Ok(LoadedMeta {
                 chat_format,
                 template_fallback_reason,
+                n_ctx_train: model.n_ctx_train(),
             }))
             .is_err()
         {
@@ -880,6 +904,7 @@ mod llama {
                         backend,
                         &model,
                         n_ctx,
+                        kv,
                         &mut resident,
                         &mut cache,
                         cache_key.as_deref(),
@@ -900,6 +925,7 @@ mod llama {
         backend: &'static LlamaBackend,
         model: &'m LlamaModel,
         n_ctx: u32,
+        kv: crate::window::KvCacheType,
         resident: &mut Option<LlamaContext<'m>>,
         cache: &mut PrefixCacheState,
         cache_key: Option<&str>,
@@ -936,7 +962,7 @@ mod llama {
         // A duty call (no cache key) gets its own throwaway context and never
         // touches the resident one (BR-5).
         let Some(session) = cache_key else {
-            let mut ctx = new_context(model, backend, n_ctx)?;
+            let mut ctx = new_context(model, backend, n_ctx, kv)?;
             let generated = run_generation(&mut ctx, model, &tokens, 0, params, out_tx, ctrl_rx)?;
             return Ok(generated.into_completion(prompt_tokens, 0, Some(MissReason::Cold), false));
         };
@@ -944,7 +970,7 @@ mod llama {
         // The context must exist before the probe can mean anything: a slot
         // whose context was dropped describes nothing.
         if resident.is_none() {
-            *resident = Some(new_context(model, backend, n_ctx)?);
+            *resident = Some(new_context(model, backend, n_ctx, kv)?);
             // Losing the context loses the KV it held, so the description must
             // go with it or the next probe compares against a phantom.
             if !cache.is_empty() {
@@ -1008,10 +1034,21 @@ mod llama {
         model: &'m LlamaModel,
         backend: &'static LlamaBackend,
         n_ctx: u32,
+        kv: crate::window::KvCacheType,
     ) -> Result<LlamaContext<'m>, EngineError> {
+        // REQ-616 BR-3: the KV cache element type the probe chose. Mapped from
+        // Teton's own enum at the FFI boundary rather than shared, so
+        // `crate::window` stays compilable without the `llama` feature — which
+        // is what lets every CI build test the decision that produced this.
+        let kv_type = match kv {
+            crate::window::KvCacheType::F16 => llama_cpp_2::context::params::KvCacheType::F16,
+            crate::window::KvCacheType::Q8_0 => llama_cpp_2::context::params::KvCacheType::Q8_0,
+        };
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(n_ctx))
-            .with_n_batch(N_BATCH);
+            .with_n_batch(N_BATCH)
+            .with_type_k(kv_type)
+            .with_type_v(kv_type);
         model
             .new_context(backend, ctx_params)
             .map_err(|e| EngineError::Backend(e.to_string()))
@@ -1438,5 +1475,69 @@ mod tests {
             .complete("x", &GenParams::default(), &mut |_| true)
             .unwrap();
         assert_eq!(completion.text, "ok");
+    }
+}
+
+#[cfg(test)]
+mod resident_window_tests {
+    /// BR-9's first clause: the persistent context REQ-564 keeps across turns is
+    /// allocated at the **fitted** window, not at a constant.
+    ///
+    /// # Why this is a source check rather than a behavioural one
+    ///
+    /// `new_context` is behind the `llama` feature and needs real weights, so no
+    /// test in this repository can call it. What *can* be checked is that the
+    /// three call sites hand it the `n_ctx` the worker was started with rather
+    /// than a literal — which is the whole of the property, since the worker's
+    /// `n_ctx` is the fitted window by construction (`LlamaEngine::load` takes
+    /// it as a parameter).
+    ///
+    /// Bounded to this file and keyed on the hazard — a numeric literal reaching
+    /// `new_context` — per conventions.md's rules for source-scanning checks.
+    ///
+    /// **Mutation run.** Changing any `new_context(model, backend, n_ctx, kv)`
+    /// to `new_context(model, backend, 32_768, kv)` fails this test (1
+    /// assertion).
+    #[test]
+    fn resident_context_uses_the_fitted_window() {
+        let source = include_str!("engine.rs");
+        // Cut at the first column-0 `#[cfg(test)]` so this check does not match
+        // its own text (conventions.md).
+        let production = source
+            .find("\n#[cfg(test)]\n")
+            .map_or(source, |end| &source[..end]);
+        assert!(
+            production.len() > 10_000,
+            "vacuity floor: the production slice is {} bytes, so this check is \
+             scanning nothing",
+            production.len()
+        );
+
+        let calls: Vec<&str> = production
+            .match_indices("new_context(")
+            .map(|(at, _)| {
+                let rest = &production[at..];
+                let end = rest.find(')').map_or(rest.len(), |e| e + 1);
+                &rest[..end]
+            })
+            .collect();
+        assert!(
+            calls.len() >= 3,
+            "vacuity floor: expected at least three `new_context(` call sites \
+             (the definition and its two callers), found {}",
+            calls.len()
+        );
+
+        for call in &calls {
+            // The definition itself names the parameter type; the callers name
+            // the variable. Neither may name a number.
+            assert!(
+                !call.chars().any(|c| c.is_ascii_digit()),
+                "a `new_context` call passes a literal window: {call:?}. The resident \
+                 context must be sized from the window the engine was loaded with, or a \
+                 262,144-token engine will serve its prefix cache from a 32,768-token \
+                 context (REQ-616 BR-9)."
+            );
+        }
     }
 }

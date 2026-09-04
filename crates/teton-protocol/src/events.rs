@@ -157,6 +157,13 @@ pub enum Event {
     ProviderDegraded(ProviderDegraded),
     /// Local-model lifecycle progress: download / benchmark / step-down (BR-9).
     ModelLifecycle(ModelLifecycle),
+    /// The local engine's context window was decided at load (REQ-616 BR-3).
+    LocalWindowDecided(LocalWindowDecided),
+    /// The local engine could not be loaded at any window worth serving, and no
+    /// override said to try anyway (REQ-616 BR-4).
+    LocalWindowRefused(LocalWindowRefused),
+    /// A long local prefill is making progress (REQ-616 BR-9).
+    PrefillProgress(PrefillProgress),
     /// The daemon proposes a local model and awaits an answer (REQ-547 BR-1).
     ModelSelectionProposed(ModelSelectionProposed),
     /// A model-selection decision was recorded (REQ-547 BR-4/BR-10).
@@ -276,6 +283,9 @@ impl Event {
             Event::CostRecorded(_) => "cost_recorded",
             Event::ProviderDegraded(_) => "provider_degraded",
             Event::ModelLifecycle(_) => "model_lifecycle",
+            Event::LocalWindowDecided(_) => "local_window_decided",
+            Event::LocalWindowRefused(_) => "local_window_refused",
+            Event::PrefillProgress(_) => "prefill_progress",
             Event::ModelSelectionProposed(_) => "model_selection_proposed",
             Event::ModelSelectionDecided(_) => "model_selection_decided",
             Event::PermissionRequest(_) => "permission_request",
@@ -502,6 +512,22 @@ pub struct RouteDecided {
     /// (BR-6).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub effort: Option<ResolvedEffort>,
+    /// The **window** this route's budget was derived from, in the route's own
+    /// tokens (REQ-616 BR-6): the provider's declared `max_context` (or the
+    /// user's cap, when that is smaller), or the local engine's `n_ctx`.
+    ///
+    /// Carried beside [`Self::budget_tokens`] rather than left to be inferred
+    /// from it, because the two are different currencies. A provider declaring
+    /// 1,000,000 tokens derives a 665,984-**word** budget, and a surface that
+    /// prints only the second reads as though the window shrank by a third —
+    /// the confusion LESSON-446 records.
+    ///
+    /// `Option` for **wire additivity only**, exactly as [`Self::effort`]: a
+    /// daemon that has this field always populates it, and a frame from a
+    /// daemon predating it reads `None`. Moves neither
+    /// [`crate::PROTOCOL_VERSION`] nor [`crate::PROTOCOL_VERSION_MIN`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub window_tokens: Option<u32>,
     /// The word budget this route attempt's context was fitted to (REQ-586
     /// BR-8) — the `HarnessConfig` pair's token half, as the router derived it
     /// for this attempt, never recomputed by a surface.
@@ -1145,6 +1171,15 @@ pub struct CatalogEntryView {
     /// Present on every entry so the consent screen can always show the source,
     /// not only the name.
     pub provenance: CatalogProvenance,
+    /// The model's trained context window, as its publisher declares it
+    /// (REQ-616 BR-10). `None` where the catalog states none.
+    ///
+    /// Projected so `teton model list` can state what a model *could* serve
+    /// beside what this machine will actually serve it at — the two are
+    /// different numbers on any machine that cannot hold the trained window,
+    /// and a listing showing only one of them invites the wrong conclusion.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub n_ctx_train: Option<u32>,
 }
 
 /// The entry the daemon proposes, plus what installing it will take.
@@ -4383,6 +4418,7 @@ mod tests {
                     band: TierBand::Mid,
                     size_bytes: 4_700_000_000,
                     ram_floor_bytes: 12_884_901_888,
+                    n_ctx_train: Some(32_768),
                     provenance: CatalogProvenance {
                         repo: "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF".to_owned(),
                         host: "huggingface.co".to_owned(),
@@ -4396,6 +4432,7 @@ mod tests {
                 band: TierBand::Small,
                 size_bytes: 2_000_000_000,
                 ram_floor_bytes: 5_368_709_120,
+                n_ctx_train: Some(32_768),
                 provenance: CatalogProvenance {
                     repo: "Qwen/Qwen2.5-Coder-3B-Instruct-GGUF".to_owned(),
                     host: "huggingface.co".to_owned(),
@@ -4426,6 +4463,7 @@ mod tests {
             model: Some("opus".to_owned()),
             reason: "architecture phase routes to the frontier tier".to_owned(),
             effort: Some(ResolvedEffort::effort(crate::effort::EffortLevel::Xhigh)),
+            window_tokens: None,
             budget_tokens: Some(132_650),
             budget_bytes: Some(397_952),
             bound: Some(BudgetBound::Window),
@@ -4464,6 +4502,7 @@ mod tests {
                     model: None,
                     reason: "r".to_owned(),
                     effort: None,
+                    window_tokens: None,
                     budget_tokens: None,
                     budget_bytes: None,
                     bound: None,
@@ -5778,6 +5817,7 @@ mod tests {
             model: None,
             reason: "r".to_owned(),
             effort: None,
+            window_tokens: None,
             budget_tokens: Some(6_250),
             budget_bytes: Some(50_000),
             bound: Some(BudgetBound::UserCap),
@@ -5923,6 +5963,7 @@ mod tests {
             model: Some("deepseek-coder".to_owned()),
             reason: "implement phase routes to the configured cheap tier".to_owned(),
             effort: Some(ResolvedEffort::effort(crate::effort::EffortLevel::High)),
+            window_tokens: None,
             budget_tokens: None,
             budget_bytes: None,
             bound: None,
@@ -5949,6 +5990,7 @@ mod tests {
                 model: Some("deepseek-coder".to_owned()),
                 reason: "implement phase routes to the configured cheap tier".to_owned(),
                 effort: Some(ResolvedEffort::effort(crate::effort::EffortLevel::High)),
+                window_tokens: None,
                 budget_tokens: Some(84_650),
                 budget_bytes: Some(253_952),
                 bound: Some(bound),
@@ -6007,6 +6049,7 @@ mod tests {
             model: Some("kimi-k3".to_owned()),
             reason: "implement routes to the cheap tier".to_owned(),
             effort: Some(ResolvedEffort::effort(crate::effort::EffortLevel::High)),
+            window_tokens: None,
             budget_tokens: Some(84_650),
             budget_bytes: Some(253_952),
             bound: Some(BudgetBound::UserCap),
@@ -7178,6 +7221,7 @@ mod tests {
             effort: Some(ResolvedEffort::omit(
                 crate::effort::EffortOmission::ShapeNone,
             )),
+            window_tokens: None,
             budget_tokens: None,
             budget_bytes: None,
             bound: None,
@@ -7638,6 +7682,7 @@ mod tests {
                 band: TierBand::Small,
                 size_bytes: 1_100_000_000,
                 ram_floor_bytes: 3_221_225_472,
+                n_ctx_train: Some(32_768),
                 provenance: CatalogProvenance {
                     repo: "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF".to_owned(),
                     host: "huggingface.co".to_owned(),
@@ -9391,6 +9436,89 @@ pub struct UnboundedRootWarning {
 pub struct BoundaryDefaultsApplied {
     /// How many builtin rows were composed into the effective set.
     pub count: usize,
+}
+
+/// The local engine's context window, as the probe decided it (REQ-616 BR-3).
+///
+/// Every figure the decision turned on is carried, not just the outcome: a user
+/// reading `n_ctx = 65536` on a machine that could have held 262,144 should be
+/// able to see *why* from this event alone, without a second surface and
+/// without re-deriving anything (the REQ-586 `bound` posture, and BR-8's
+/// one-classifier-per-fact rule).
+///
+/// # Why a top-level event rather than a `model_lifecycle` stage
+///
+/// REQ-616 ADR-616-6 originally placed these beside `Probed` in
+/// `ModelLifecycleStage`. That is the worse shape on the wire. `Event` is an
+/// externally-tagged enum, so a client predating a **top-level** variant fails
+/// to deserialize that one envelope and drops it — a lost line. A client
+/// predating a nested `ModelLifecycleStage` variant fails to deserialize the
+/// whole `model_lifecycle` frame, which breaks stages it *does* understand.
+/// Additivity is about what an old peer keeps working on (REQ-573 BR-2), and
+/// the top-level variant keeps more.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalWindowDecided {
+    /// The window the engine was loaded with, in engine tokens.
+    pub n_ctx: u32,
+    /// The model's trained window — the ceiling no scaling is applied above.
+    pub n_ctx_train: u32,
+    /// The KV cache element type: `f16` or `q8_0`.
+    pub kv_cache_type: String,
+    /// Weights + KV at `n_ctx` + compute buffers.
+    pub resident_bytes_estimate: u64,
+    /// What the machine allowed the daemon to plan to occupy.
+    pub admissible_bytes: u64,
+    /// `trained_window`, `memory_fit`, or `config_override`.
+    pub reason: String,
+    /// True when the per-token KV cost came from the measured fallback rather
+    /// than from the model's own metadata.
+    ///
+    /// A fallback that does not announce itself is a silent downgrade
+    /// (LESSON-456), and this one changes the arithmetic every other figure
+    /// here rests on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub kv_cost_estimated: bool,
+}
+
+/// The local engine could not be loaded at any window worth serving (REQ-616
+/// BR-4).
+///
+/// Carries the arithmetic rather than a verdict, because the remedies differ by
+/// which figure is the problem: more RAM, a smaller model, a smaller
+/// `[inference] n_ctx`, or `allow_over_memory`. A message that said only "not
+/// enough memory" would leave the user to guess which.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalWindowRefused {
+    /// The smallest window that would have been accepted — a quarter of the
+    /// trained window — or the user's own `n_ctx` when they set one.
+    pub wanted_n_ctx: u32,
+    /// The model's trained window.
+    pub n_ctx_train: u32,
+    /// Resident bytes at `wanted_n_ctx`, at the cheapest KV type available.
+    pub resident_bytes_estimate: u64,
+    /// What the machine allowed.
+    pub admissible_bytes: u64,
+    /// `resident_bytes_estimate − admissible_bytes`: how much more is needed.
+    pub shortfall_bytes: u64,
+    /// The remedies, named rather than implied.
+    pub remedies: Vec<String>,
+}
+
+/// A long local prefill is making progress (REQ-616 BR-9, AC-9).
+///
+/// A cold 262,144-token prefill runs for a minute or two on Apple Silicon, and a
+/// turn that prints nothing for that long is indistinguishable from a hung one.
+/// Emitted only above `teton_inference::window::prefill`'s threshold — the
+/// pre-REQ-616 window — so an ordinary turn stays quiet: a progress bar on every
+/// turn is noise, and noise is what makes a real one easy to miss.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PrefillProgress {
+    /// Prompt tokens decoded so far.
+    pub tokens_done: u32,
+    /// Prompt tokens in total.
+    pub tokens_total: u32,
+    /// Throughput since the prefill started.
+    pub tokens_per_second: f32,
 }
 
 // ---------------------------------------------------------------------------

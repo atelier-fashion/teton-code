@@ -733,6 +733,7 @@ async fn weak_capability_provider_gets_degraded_harness_profile() {
             is_local: false,
             redact_scan: false,
             provider_id: Some("kimi"),
+            local_window: 0,
         }),
         "the route's budget is the declared window's, through `budget::derive`"
     );

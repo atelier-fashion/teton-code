@@ -521,3 +521,132 @@ fn a_full_word_budget_turn_of_token_dense_byte_light_content_overruns_the_engine
         row.tokens
     );
 }
+
+/// REQ-616 AC-4: where the two budget halves cross, and which one binds.
+///
+/// # The claim this replaces
+///
+/// AC-4 originally read "the byte half is never the binding half for prose or
+/// code". That is false, and it is false for a reason no window can fix. The
+/// pair is `(usable × 2/3 words, usable × 2 bytes)`, so the halves meet at
+/// exactly **3 bytes per whitespace-word** — a ratio with no window in it.
+/// Raising 32,768 → 262,144 multiplies both halves by the same 8.226 and moves
+/// the crossover not at all. And the corpus is unambiguous about which side of
+/// it real content sits on:
+///
+/// | sample | B/word | binds |
+/// |---|---:|---|
+/// | `prose.txt` | 5.56 | byte |
+/// | `rust.rs` | 6.80 | byte |
+/// | `base64.txt` | 76.85 | byte |
+/// | `numeric_grid.txt` | 2.00 | **word** |
+///
+/// So the byte half binds for prose, for code, and for base64 — the three
+/// contents AC-4 names — at both windows, unchanged. The one sample where the
+/// word half binds is `numeric_grid.txt`, which is ASSUME-022's pathological
+/// case and is byte-*light* precisely because it is token-dense.
+///
+/// This is LESSON-565 discharged rather than assumed: "for any AND-of-limits,
+/// compute and publish the crossover before changing either limit, and state
+/// which conjunct binds for the target content before and after."
+///
+/// **Mutation run.** Changing either ratio in `window_pair` (2/3 or 2) moves the
+/// crossover off 3 and fails the first assertion; raising only one of them makes
+/// the two windows disagree and fails the scale-invariance one.
+#[test]
+fn crossover_is_three_bytes_per_word_at_every_window() {
+    const SMALL: u32 = 32_768;
+    const TRAINED: u32 = 262_144;
+
+    let small = derive(BudgetInputs::local_at(SMALL));
+    let big = derive(BudgetInputs::local_at(TRAINED));
+
+    // 1. The crossover is 3 B/word, at both windows.
+    for (name, b) in [("32,768", &small), ("262,144", &big)] {
+        assert_eq!(
+            b.budget_bytes / b.budget_tokens,
+            3,
+            "the halves must meet at 3 bytes per word at {name}: {} bytes / {} words",
+            b.budget_bytes,
+            b.budget_tokens
+        );
+    }
+
+    // 2. And it is *scale-invariant*: an 8.226x window buys 8.226x of both
+    //    halves and moves the crossover by nothing. This is the assertion that
+    //    would have caught REQ-590's regression, where one half moved alone.
+    assert_eq!(
+        big.budget_bytes / big.budget_tokens,
+        small.budget_bytes / small.budget_tokens,
+        "raising the window must not move the crossover"
+    );
+    // Both halves grow by the same factor, asserted as the figures rather than
+    // as an arithmetic identity: the word half floors, so the two ratios are
+    // equal to the integer but not to the byte, and writing the identity would
+    // have been asserting that the flooring does not happen.
+    assert_eq!((small.budget_tokens, small.budget_bytes), (21_162, 63_488));
+    assert_eq!((big.budget_tokens, big.budget_bytes), (174_080, 522_240));
+    assert_eq!(
+        big.budget_bytes / small.budget_bytes,
+        big.budget_tokens / small.budget_tokens,
+        "both halves must scale by the same factor"
+    );
+
+    // 3. Which half binds, per sample, at BOTH windows — and that it is the
+    //    same half at both. A sample whose binding half changed with the window
+    //    would mean a refusal had changed currency, which is exactly the
+    //    failure LESSON-565 records.
+    let rows = load_rows();
+    assert!(
+        rows.len() >= 6,
+        "vacuity floor: the corpus must carry every sample, found {}",
+        rows.len()
+    );
+    let mut byte_bound = BTreeSet::new();
+    for row in &rows {
+        let binds_on_bytes_at = |b: &tetond::harness::budget::RouteBudget| {
+            // The byte half binds when the content is denser than the budget's
+            // own ratio: `bytes/words > budget_bytes/budget_tokens`.
+            row.bytes * b.budget_tokens as u64 > row.words * b.budget_bytes as u64
+        };
+        let at_small = binds_on_bytes_at(&small);
+        let at_big = binds_on_bytes_at(&big);
+        assert_eq!(
+            at_small,
+            at_big,
+            "{}: the binding half changed with the window ({} B/word). A refusal that \
+             changes currency when the window moves is the LESSON-565 failure.",
+            row.file,
+            row.bytes as f64 / row.words as f64
+        );
+        if at_small {
+            byte_bound.insert(row.file.as_str());
+        }
+    }
+
+    // 4. The three contents AC-4 names are all byte-bound.
+    for sample in ["prose.txt", "rust.rs", "base64.txt"] {
+        assert!(
+            byte_bound.contains(sample),
+            "{sample} must be bound by the byte half — it runs above 3 B/word, and \
+             asserting otherwise is what the original AC-4 got wrong. byte-bound: \
+             {byte_bound:?}"
+        );
+    }
+
+    // 5. And the one that is not, named rather than left as a silent exception:
+    //    `numeric_grid.txt` is token-dense and byte-light (ASSUME-022), so the
+    //    word half binds. Asserted so that a corpus change which quietly made
+    //    everything byte-bound would fail here rather than making assertion 4
+    //    vacuously true.
+    assert!(
+        !byte_bound.contains("numeric_grid.txt"),
+        "numeric_grid.txt is byte-light (2.00 B/word) and must be word-bound; if that \
+         changed, assertion 4 above no longer discriminates"
+    );
+
+    // 6. The capacity that follows, pinned: the byte half is what a real turn
+    //    actually gets, and it grew from 63,488 to 522,240 bytes.
+    assert_eq!(small.budget_bytes, 63_488);
+    assert_eq!(big.budget_bytes, 522_240);
+}

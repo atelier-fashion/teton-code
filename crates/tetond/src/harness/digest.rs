@@ -372,6 +372,7 @@ mod tests {
             Some(SessionId::from("sess")),
             Some(RouteDecided {
                 effort: None,
+                window_tokens: None,
                 budget_tokens: None,
                 budget_bytes: None,
                 bound: None,

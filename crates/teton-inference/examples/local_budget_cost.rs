@@ -18,7 +18,7 @@
 //!
 //! * **AC-10(a)** wall-clock prefill — time to first token, with generation
 //!   capped at a handful of tokens so decode is noise — for a prompt at the
-//!   derived budget (31,744 tokens: `LOCAL_ENGINE_N_CTX` less the 1,024-token
+//!   derived budget (31,744 tokens: `LOCAL_ENGINE_N_CTX_DEFAULT` less the 1,024-token
 //!   generation reservation) against one at the previous window's budget
 //!   (15,360 tokens: the 16,384-token window less the same reservation).
 //!   REQ-590 measured prefill as **super-linear** on this engine (6,164 →
@@ -76,7 +76,7 @@ mod llama {
         default_prompts, run_benchmark, DutySpec, Engine, EngineError, GenParams, LlamaEngine,
     };
 
-    /// `LOCAL_ENGINE_N_CTX` (`tetond/src/runtime.rs`) — the window the daemon
+    /// `LOCAL_ENGINE_N_CTX_DEFAULT` (`tetond/src/runtime.rs`) — the window the daemon
     /// loads with. Duplicated rather than imported because it is `pub(crate)` in
     /// a crate this one does not depend on; a measurement taken against a
     /// *different* window would be measuring nothing, so it is printed in the
@@ -261,7 +261,7 @@ fn resolve_route(&self, session: &SessionId, hint: Option<&RouteHint>) -> RouteD
 
         println!("REQ-590 AC-10 — local context budget cost");
         println!("weights:      {}", path.display());
-        println!("n_ctx:        {N_CTX} (LOCAL_ENGINE_N_CTX)");
+        println!("n_ctx:        {N_CTX} (LOCAL_ENGINE_N_CTX_DEFAULT)");
         println!("reservation:  {RESERVATION} (LOCAL_GENERATION_RESERVATION)");
         println!("before/after: {BEFORE_TOKENS} → {AFTER_TOKENS} prompt tokens");
         println!();
@@ -269,7 +269,16 @@ fn resolve_route(&self, session: &SessionId, hint: Option<&RouteHint>) -> RouteD
         let load_start = Instant::now();
         // `u32::MAX` layers = the Metal fast path, matching what
         // `LlamaEngineLoader` requests on Apple Silicon (`runtime.rs`).
-        let engine = LlamaEngine::load("local-budget-cost", &path, u32::MAX, N_CTX)?;
+        let engine = LlamaEngine::load(
+            "local-budget-cost",
+            &path,
+            u32::MAX,
+            N_CTX,
+            // REQ-616: this example measures the budget at the *default*
+            // window, so it loads at the default KV type too. A real load picks
+            // both from `fit_window`.
+            teton_inference::KvCacheType::F16,
+        )?;
         println!("model loaded in {} ms", load_start.elapsed().as_millis());
         println!("model_id: {}", engine.model_id());
         println!();

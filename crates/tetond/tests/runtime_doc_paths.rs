@@ -47,7 +47,7 @@
 //! |---|---|
 //! | typo one cited path (`write_config_atomically` → `…atomicaly`) | that path, named with its file and line |
 //! | `let structural = true` — stop tracking string literals | `runtime::tests::a_typed_project_skill_is_acknowledged_first::…`, 13k lines from any fixture |
-//! | skip the `use x::*` re-exports | `runtime::LOCAL_ENGINE_N_CTX` |
+//! | skip the `use x::*` re-exports | `runtime::LOCAL_ENGINE_N_CTX_DEFAULT` |
 //! | stop treating `impl` as a scope | `runtime::DaemonRuntime::accept_invocation` |
 //! | silence the citation scanner | the citation vacuity floor, at 0 paths |
 //! | silence the module-tree parser | the declaration vacuity floor, at 0 declarations |

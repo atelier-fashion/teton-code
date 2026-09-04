@@ -249,7 +249,7 @@ table, which do not move.
 |---|---:|---|
 | `mod.rs` | 7,849 | `DaemonRuntime` and everything not yet sliced. Was 10,306 at REQ-599's close; REQ-600 moved the turn path out, REQ-603 the session lifecycle |
 | `turn.rs` | 3,705 | **REQ-600.** `run_prompt_turn` and the fifteen methods only it reaches — the god-impl slice REQ-599 deferred as its step 8 |
-| `engine.rs` | 1,098 | probe, installer, engine loaders, `EngineSlot`, `StagedEngines` |
+| `engine.rs` | 1,351 | probe, installer, engine loaders, `EngineSlot`, `StagedEngines` |
 | `config_document.rs` | 888 | rendering and persisting the config document |
 | `duty.rs` | 632 | the five `*_route` resolvers, `resolve_duty`, `spawn_title_session`, `RedactionGateImpl` |
 | `taint.rs` | 535 | `SessionTaint`, the lookup seam, `TaintingPrivacySink` |

@@ -785,6 +785,7 @@ fn route_config(window: u32) -> HarnessConfig {
         is_local: false,
         redact_scan: false,
         provider_id: Some("kimi"),
+        local_window: 0,
     }))
 }
 

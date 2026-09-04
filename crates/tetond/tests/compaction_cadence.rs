@@ -270,6 +270,7 @@ fn pair_before_this_req() -> RouteBudget {
         is_local: false,
         redact_scan: false,
         provider_id: None,
+        local_window: 0,
     });
     assert_eq!(budget.bound, BudgetBound::DefaultUnknown);
     assert_eq!(

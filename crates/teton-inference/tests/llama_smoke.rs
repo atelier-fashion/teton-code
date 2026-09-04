@@ -19,8 +19,14 @@ fn llama_engine_streams_a_completion() {
     let path =
         std::env::var("TETON_TEST_GGUF").expect("set TETON_TEST_GGUF to a local GGUF model file");
     // Offload everything to the GPU (the Metal fast path on Apple Silicon).
-    let engine =
-        LlamaEngine::load("smoke", std::path::Path::new(&path), u32::MAX, 2048).expect("load GGUF");
+    let engine = LlamaEngine::load(
+        "smoke",
+        std::path::Path::new(&path),
+        u32::MAX,
+        2048,
+        teton_inference::KvCacheType::F16,
+    )
+    .expect("load GGUF");
 
     let mut streamed = String::new();
     let completion = engine

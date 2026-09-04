@@ -26,6 +26,8 @@
 //! and a scripted engine is how they arrange it.
 
 use super::*;
+use teton_inference::window::{WindowDecision, WindowReason};
+use teton_protocol::events::{LocalWindowDecided, LocalWindowRefused};
 
 /// The installer the consent gate hands a decided model to.
 ///
@@ -813,6 +815,9 @@ pub(super) fn build_engine_loader(
     profile: &HardwareProfile,
     base_dir: &Path,
     scripted_engine: bool,
+    catalog: teton_inference::Catalog,
+    inference: teton_core::config::InferenceConfig,
+    events: Arc<crate::broadcast::EventBus>,
 ) -> Option<Arc<dyn crate::model_consent::LocalEngineLoader>> {
     if scripted_engine {
         return None;
@@ -821,16 +826,27 @@ pub(super) fn build_engine_loader(
         staged: StagedEngines::new(Arc::clone(slot)),
         base_dir: base_dir.to_owned(),
         gpu: profile.gpu,
+        // REQ-616: the loader sizes its context from this machine's RAM and the
+        // user's `[inference]` table. Captured here rather than read at load
+        // time so the loader stays a plain struct with no config handle.
+        ram_bytes: profile.ram_bytes,
+        catalog,
+        inference,
+        events,
     }))
 }
 
 /// The loaderless build: no `llama` feature, nothing can load a GGUF.
 #[cfg(not(feature = "llama"))]
+#[allow(clippy::needless_pass_by_value)]
 pub(super) fn build_engine_loader(
     _slot: &Arc<EngineSlot>,
     _profile: &HardwareProfile,
     _base_dir: &Path,
     _scripted_engine: bool,
+    _catalog: teton_inference::Catalog,
+    _inference: teton_core::config::InferenceConfig,
+    _events: Arc<crate::broadcast::EventBus>,
 ) -> Option<Arc<dyn crate::model_consent::LocalEngineLoader>> {
     None
 }
@@ -884,7 +900,14 @@ impl crate::model_consent::LocalEngineLoader for FakeEngineLoader {
                 None,
             );
         }
-        Ok(crate::model_consent::EngineLoadReport { benchmark, duty })
+        Ok(crate::model_consent::EngineLoadReport {
+            benchmark,
+            duty,
+            // The fake loader sizes no context: it exists to drive the gate's
+            // stage/commit path, not to allocate one.
+            window: None,
+            window_event: None,
+        })
     }
 
     fn commit(&self, model_name: &str) {
@@ -1021,7 +1044,173 @@ pub(super) fn fake_engine_loader(
 /// passed the cap and then failed as an opaque engine error, blocking with
 /// the wrong reason. One number, one place; the scan's total cap
 /// (`REDACT_INPUT_MAX_BYTES`) is in turn a stated multiple of the chunk cap.
-pub(crate) const LOCAL_ENGINE_N_CTX: u32 = 32_768;
+/// ## Why this is a *default* since REQ-616 (ADR-616-1)
+///
+/// The name gained its suffix when the local window became a runtime fact. The
+/// constant used to do two jobs, and only the first was about a real engine:
+/// the `n_ctx` handed to `LlamaEngine::load`, and the compile-time basis for
+/// the two derived byte caps and [`derive`](crate::harness::budget::derive)'s
+/// local arm — the second evaluated in **every** build, including every CI
+/// build, none of which compile llama.cpp.
+///
+/// Deleting the constant in favour of a runtime lookup would have left that
+/// second job with no value to compute from in exactly the builds that do all
+/// the testing, and every assertion derived from it either rewritten or
+/// vacuous (LESSON-569, LESSON-598). So it keeps the second job and says what
+/// it now is: the window used when **no real engine is loaded**, which is the
+/// `MockEngine` path and all of CI. A loaded engine's window travels as
+/// `BudgetInputs::local_window`.
+///
+/// The property that follows is the one that made REQ-616 tractable in a single
+/// pass: **CI's window is still 32,768, so every existing assertion on
+/// 21,162 / 63,488 / 184,265 keeps its number**, and the 262,144 path is
+/// exercised by tests that pass an explicit window.
+pub(crate) const LOCAL_ENGINE_N_CTX_DEFAULT: u32 = 32_768;
+
+// REQ-616 ADR-616-3. The three functions below are used by the `llama`-gated
+// loader and by this module's own unit tests, which run in **every** build. They
+// are therefore dead only in a default build's *library* target, and that is the
+// price of the split: gating them would move the window rule — and the refusal
+// sentence a user actually reads — into a configuration CI never compiles, where
+// no test could reach it. `allow(dead_code)` scoped to the non-`llama` build says
+// exactly that, rather than hiding it behind a blanket allow.
+/// Decide the local engine's window for `entry` on a machine with `ram_bytes`,
+/// under the user's `[inference]` table (REQ-616 BR-1..BR-4).
+///
+/// Returns the decision and the trained window it was made against, so the
+/// caller can build the event without re-deriving either.
+///
+/// **Ungated and pure.** Everything that decides anything lives here; the
+/// `llama` feature wraps only the FFI call that acts on the result. That split
+/// is what lets CI — which never compiles llama.cpp — test the rule, and it is
+/// the same split `probe::decide` already uses for model selection.
+///
+/// `None` when the catalog states no trained window for this model: the window
+/// cannot be decided from a figure nobody declared, and the loader falls back
+/// to the default rather than inventing one (REQ-557 ADR-D).
+#[must_use]
+#[cfg_attr(not(feature = "llama"), allow(dead_code))]
+pub(super) fn decide_local_window(
+    entry: &teton_inference::ModelEntry,
+    ram_bytes: u64,
+    inference: &teton_core::config::InferenceConfig,
+) -> Option<(WindowDecision, u32, u64)> {
+    let n_ctx_train = entry.n_ctx_train?;
+    let admissible = teton_inference::window::admissible_bytes(ram_bytes);
+    let inputs = teton_inference::window::WindowFitInputs {
+        n_ctx_train,
+        weights_bytes: entry.size_bytes,
+        admissible_bytes: admissible,
+        // Metadata-derived cost is not available before the model is loaded, so
+        // the measured figure is used and the event says so
+        // (`kv_cost_estimated`). LESSON-456: a fallback that does not announce
+        // itself is a silent downgrade.
+        kv_bytes_per_token_f16: teton_inference::window::MEASURED_KV_BYTES_PER_TOKEN_F16,
+        config_n_ctx: inference.n_ctx,
+        config_kv: inference
+            .kv_cache_type
+            .as_deref()
+            .and_then(teton_inference::window::KvCacheType::parse),
+        allow_over_memory: inference.allow_over_memory,
+    };
+    Some((
+        teton_inference::window::fit_window(&inputs),
+        n_ctx_train,
+        admissible,
+    ))
+}
+
+/// Turn a [`WindowDecision`] into the event that announces it (REQ-616 BR-3,
+/// BR-4).
+///
+/// **Deliberately outside the `llama` feature gate**, and pure. The gate wraps
+/// only the FFI call that acts on the decision; the decision itself, and the
+/// sentence it produces, are compiled and tested in every build — which is
+/// every CI build, none of which compile llama.cpp. A refusal message that only
+/// exists in a build nobody runs tests in is a message nobody has read.
+#[must_use]
+#[cfg_attr(not(feature = "llama"), allow(dead_code))]
+pub(super) fn window_event(
+    decision: &WindowDecision,
+    n_ctx_train: u32,
+    admissible_bytes: u64,
+    kv_cost_estimated: bool,
+) -> Event {
+    match *decision {
+        WindowDecision::Fits {
+            n_ctx,
+            kv,
+            resident_bytes,
+            reason,
+        } => Event::LocalWindowDecided(LocalWindowDecided {
+            n_ctx,
+            n_ctx_train,
+            kv_cache_type: kv.as_str().to_owned(),
+            resident_bytes_estimate: resident_bytes,
+            // Carried even when the load fits: a reader comparing it against
+            // `resident_bytes_estimate` is how `allow_over_memory` shows itself
+            // as arithmetic rather than as a label (see `WindowReason`).
+            admissible_bytes,
+            reason: match reason {
+                WindowReason::TrainedWindow => "trained_window",
+                WindowReason::MemoryFit => "memory_fit",
+                WindowReason::ConfigOverride => "config_override",
+            }
+            .to_owned(),
+            kv_cost_estimated,
+        }),
+        WindowDecision::Refused {
+            wanted_n_ctx,
+            resident_bytes,
+            admissible_bytes: refused_admissible,
+            shortfall_bytes,
+        } => Event::LocalWindowRefused(LocalWindowRefused {
+            wanted_n_ctx,
+            n_ctx_train,
+            resident_bytes_estimate: resident_bytes,
+            admissible_bytes: refused_admissible,
+            shortfall_bytes,
+            remedies: refusal_remedies(shortfall_bytes),
+        }),
+        WindowDecision::AboveTrained {
+            requested,
+            n_ctx_train: trained,
+        } => Event::LocalWindowRefused(LocalWindowRefused {
+            wanted_n_ctx: requested,
+            n_ctx_train: trained,
+            // No memory arithmetic applies: this refusal is about the model's
+            // trained window, not about this machine. Zero says "not the
+            // question here" rather than "no RAM".
+            resident_bytes_estimate: 0,
+            admissible_bytes,
+            shortfall_bytes: 0,
+            remedies: vec![format!(
+                "set `[inference] n_ctx` to {trained} or below — the engine applies no RoPE or \
+                 YaRN scaling, so a larger window is not available at any quality"
+            )],
+        }),
+    }
+}
+
+/// The three remedies a memory refusal offers, named rather than implied
+/// (BR-4).
+///
+/// Separate from [`window_event`] so the list can be asserted on its own: the
+/// claim "the refusal names all three" is what LESSON-456 is about, and it is
+/// easier to keep true when it has its own function than when it is a literal
+/// inside a match arm.
+#[must_use]
+#[cfg_attr(not(feature = "llama"), allow(dead_code))]
+fn refusal_remedies(shortfall_bytes: u64) -> Vec<String> {
+    let gib = shortfall_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    vec![
+        format!("free about {gib:.1} GiB of RAM, or run on a machine with more of it"),
+        "set `[inference] n_ctx` to a window this machine can hold".to_owned(),
+        "set `[inference] allow_over_memory = true` to load anyway, accepting the overcommit"
+            .to_owned(),
+        "choose a smaller model with `teton model use <name>`".to_owned(),
+    ]
+}
 
 /// The real weights loader: llama.cpp behind the [`Engine`] trait (AC-2).
 ///
@@ -1037,6 +1226,19 @@ pub(super) struct LlamaEngineLoader {
     staged: StagedEngines,
     base_dir: PathBuf,
     gpu: GpuClass,
+    /// This machine's physical RAM, for the REQ-616 window fit.
+    ram_bytes: u64,
+    /// The catalog, for the model's declared trained window.
+    catalog: teton_inference::Catalog,
+    /// The user's `[inference]` overrides.
+    inference: teton_core::config::InferenceConfig,
+    /// Where `local_window_refused` goes (REQ-616 BR-4).
+    ///
+    /// The *decided* event rides the load report so the gate can withhold it
+    /// from a superseded load. A refusal has no report — it returns `Err` — and
+    /// there is nothing to withhold: the load did not happen and the user needs
+    /// the arithmetic. So it is published here, directly.
+    events: Arc<crate::broadcast::EventBus>,
 }
 
 /// Strip any rendering of `path` out of a third-party error message (BR-11).
@@ -1065,13 +1267,93 @@ impl crate::model_consent::LocalEngineLoader for LlamaEngineLoader {
             GpuClass::AppleSilicon | GpuClass::Cuda => u32::MAX,
             GpuClass::Cpu => 0,
         };
-        let engine =
-            LlamaEngine::load(model_name, &path, gpu_layers, LOCAL_ENGINE_N_CTX).map_err(|e| {
-                format!(
-                    "{model_name}'s weights could not be loaded: {}",
-                    without_path(&e.to_string(), &path)
-                )
-            })?;
+        // REQ-616 BR-1/BR-3/BR-4: decide the window and the KV type before
+        // touching the FFI. The decision is made by `decide_local_window`, which
+        // is ungated and unit-tested; this arm only acts on it.
+        //
+        // A model the catalog states no trained window for falls back to the
+        // default rather than to a guess (REQ-557 ADR-D).
+        let fitted = self
+            .catalog
+            .get(model_name)
+            .and_then(|entry| decide_local_window(entry, self.ram_bytes, &self.inference));
+        // BR-3: the event the gate publishes if this load commits. Built here,
+        // where the decision is, so the announcement and the allocation cannot
+        // describe different windows. `kv_cost_estimated` is true because the
+        // decision was made from the measured fallback -- metadata is not
+        // readable until the weights are mapped (LESSON-456: say so).
+        let decided_event = fitted.as_ref().map(|(decision, trained, admissible)| {
+            window_event(decision, *trained, *admissible, true)
+        });
+        let (n_ctx, kv) = match fitted {
+            Some((WindowDecision::Fits { n_ctx, kv, .. }, _, _)) => (n_ctx, kv),
+            Some((
+                WindowDecision::Refused {
+                    shortfall_bytes, ..
+                },
+                _,
+                _,
+            )) => {
+                // BR-4: refused loudly, and it does not load. The remedies are
+                // the same list the event carries. Published directly rather
+                // than carried on a report, because a refusal returns `Err` and
+                // has none -- and there is nothing to withhold, since the load
+                // did not happen.
+                if let Some(event) = decided_event {
+                    self.events.publish(None, event);
+                }
+                return Err(format!(
+                    "{model_name} needs about {:.1} GiB more RAM than this machine allows the \
+                     daemon to use, so no context worth serving fits. Remedies: {}.",
+                    shortfall_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    refusal_remedies(shortfall_bytes).join("; ")
+                ));
+            }
+            Some((
+                WindowDecision::AboveTrained {
+                    requested,
+                    n_ctx_train,
+                },
+                _,
+                _,
+            )) => {
+                if let Some(event) = decided_event {
+                    self.events.publish(None, event);
+                }
+                return Err(format!(
+                    "`[inference] n_ctx = {requested}` exceeds {model_name}'s trained window \
+                     (n_ctx_train = {n_ctx_train}). The engine applies no RoPE or YaRN scaling, \
+                     so set it to {n_ctx_train} or below."
+                ));
+            }
+            None => (
+                LOCAL_ENGINE_N_CTX_DEFAULT,
+                teton_inference::window::KvCacheType::F16,
+            ),
+        };
+
+        let engine = LlamaEngine::load(model_name, &path, gpu_layers, n_ctx, kv).map_err(|e| {
+            format!(
+                "{model_name}'s weights could not be loaded: {}",
+                without_path(&e.to_string(), &path)
+            )
+        })?;
+
+        // The catalog's declared trained window is what the decision above was
+        // made against; the GGUF's own figure is authoritative. Report a
+        // disagreement rather than preferring one silently — a catalog that
+        // drifted from the weights would otherwise size every context wrongly
+        // and say nothing (LESSON-456).
+        if let Some(declared) = self.catalog.get(model_name).and_then(|e| e.n_ctx_train) {
+            let actual = engine.n_ctx_train();
+            if actual != declared {
+                eprintln!(
+                    "teton: {model_name}'s catalog entry declares n_ctx_train = {declared} but \
+                     its GGUF says {actual}; the context was sized against the declaration. \
+                     Update the catalog entry."
+                );
+            }
+        }
 
         let benchmark = run_benchmark(&engine, &default_prompts(), &GenParams::default())
             .map_err(|e| format!("{model_name} loaded but failed its benchmark: {e}"))?;
@@ -1102,7 +1384,14 @@ impl crate::model_consent::LocalEngineLoader for LlamaEngineLoader {
                 template_note,
             );
         }
-        Ok(crate::model_consent::EngineLoadReport { benchmark, duty })
+        Ok(crate::model_consent::EngineLoadReport {
+            benchmark,
+            duty,
+            // REQ-616 AC-11: what this load actually allocated, for the gate to
+            // record once it commits.
+            window: Some((n_ctx, kv.as_str().to_owned())),
+            window_event: decided_event,
+        })
     }
 
     fn commit(&self, model_name: &str) {
@@ -1176,5 +1465,189 @@ mod tests {
             local_tier_gated(false, true),
             "a real engine must not un-gate the tier before the user has decided"
         );
+    }
+}
+
+#[cfg(test)]
+mod local_window_tests {
+    use super::*;
+    use teton_inference::window::KvCacheType;
+    use teton_inference::{ModelEntry, TierBand};
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// The shipped 30B as the catalog carries it.
+    fn thirty_b() -> ModelEntry {
+        ModelEntry {
+            name: "qwen3-coder-30b-a3b".to_owned(),
+            url: format!(
+                "https://example.test/Org/Repo/resolve/{}/m.gguf",
+                "a".repeat(40)
+            ),
+            revision: "a".repeat(40),
+            sha256: "b".repeat(64),
+            size_bytes: 18_556_689_568,
+            ram_floor_bytes: 20 * GIB,
+            band: TierBand::Large,
+            n_ctx_train: Some(262_144),
+        }
+    }
+
+    fn cfg() -> teton_core::config::InferenceConfig {
+        teton_core::config::InferenceConfig::default()
+    }
+
+    /// BR-1: the loader asks for the window the probe fitted, not a constant.
+    ///
+    /// The dogfood machine is the case the REQ was written for: 48 GiB, which
+    /// admits q8_0 at the trained window and refuses f16.
+    ///
+    /// Mutation: return `LOCAL_ENGINE_N_CTX_DEFAULT` from `decide_local_window`
+    /// and this fails on both the window and the KV type.
+    #[test]
+    fn loader_requests_the_fitted_window() {
+        let (decision, trained, admissible) = decide_local_window(&thirty_b(), 48 * GIB, &cfg())
+            .expect("the catalog states a window");
+        assert_eq!(trained, 262_144);
+        assert_eq!(admissible, 36 * GIB);
+        match decision {
+            WindowDecision::Fits {
+                n_ctx, kv, reason, ..
+            } => {
+                assert_eq!(n_ctx, 262_144, "the whole point of the REQ");
+                assert_eq!(kv, KvCacheType::Q8_0);
+                assert_eq!(reason, WindowReason::MemoryFit);
+            }
+            other => panic!("48 GiB should fit at q8_0: {other:?}"),
+        }
+    }
+
+    /// A catalog entry with no declared window yields no decision — the daemon
+    /// does not invent a ceiling it was not told (REQ-557 ADR-D).
+    ///
+    /// The benign path is the entry that *does* declare one, asserted beside it
+    /// so the `None` is a decision rather than a bug.
+    #[test]
+    fn an_undeclared_trained_window_yields_no_decision() {
+        let mut silent = thirty_b();
+        silent.n_ctx_train = None;
+        assert!(decide_local_window(&silent, 48 * GIB, &cfg()).is_none());
+        assert!(decide_local_window(&thirty_b(), 48 * GIB, &cfg()).is_some());
+    }
+
+    /// BR-3: the decided event names both KV figures and the arithmetic behind
+    /// them, so a user who got q8_0 can see why without a second surface.
+    #[test]
+    fn decided_event_names_both_kv_figures() {
+        let (decision, trained, admissible) =
+            decide_local_window(&thirty_b(), 48 * GIB, &cfg()).expect("declared");
+        let Event::LocalWindowDecided(d) = window_event(&decision, trained, admissible, true)
+        else {
+            panic!("a fitting decision must announce itself as decided");
+        };
+        assert_eq!(d.n_ctx, 262_144);
+        assert_eq!(d.n_ctx_train, 262_144);
+        assert_eq!(d.kv_cache_type, "q8_0");
+        assert_eq!(d.reason, "memory_fit");
+        assert_eq!(d.admissible_bytes, 36 * GIB);
+        assert!(d.resident_bytes_estimate <= d.admissible_bytes);
+        assert!(
+            d.kv_cost_estimated,
+            "the measured-fallback KV cost must announce itself (LESSON-456)"
+        );
+    }
+
+    /// BR-4: a refusal does not load, and it names every remedy rather than
+    /// leaving the user to guess which figure is the problem.
+    ///
+    /// The benign path is the machine that fits: it produces a *decided* event
+    /// with no remedies at all, so the refusal path is not simply always taken.
+    #[test]
+    fn refusal_does_not_load_and_names_remedies() {
+        let (decision, trained, admissible) =
+            decide_local_window(&thirty_b(), 16 * GIB, &cfg()).expect("declared");
+        assert!(matches!(decision, WindowDecision::Refused { .. }));
+        let Event::LocalWindowRefused(r) = window_event(&decision, trained, admissible, true)
+        else {
+            panic!("a refusal must announce itself as refused");
+        };
+        assert_eq!(r.wanted_n_ctx, 65_536);
+        assert_eq!(r.n_ctx_train, 262_144);
+        assert!(r.shortfall_bytes > 0);
+        assert_eq!(
+            r.shortfall_bytes,
+            r.resident_bytes_estimate - r.admissible_bytes
+        );
+        let joined = r.remedies.join(" | ");
+        for expected in ["n_ctx", "allow_over_memory", "smaller model", "RAM"] {
+            assert!(
+                joined.contains(expected),
+                "the refusal must name the {expected} remedy: {joined}"
+            );
+        }
+
+        // Benign path: 96 GiB decides rather than refuses.
+        let (ok, t, a) = decide_local_window(&thirty_b(), 96 * GIB, &cfg()).expect("declared");
+        assert!(matches!(
+            window_event(&ok, t, a, false),
+            Event::LocalWindowDecided(_)
+        ));
+    }
+
+    /// BR-2 over the whole path: an `[inference] n_ctx` above the trained window
+    /// is refused with a remedy naming the trained figure, and no memory
+    /// arithmetic is reported because memory is not the question.
+    #[test]
+    fn a_window_above_the_trained_one_is_refused_on_its_own_terms() {
+        let mut over = cfg();
+        over.n_ctx = Some(300_000);
+        let (decision, trained, admissible) =
+            decide_local_window(&thirty_b(), 96 * GIB, &over).expect("declared");
+        assert!(matches!(decision, WindowDecision::AboveTrained { .. }));
+        let Event::LocalWindowRefused(r) = window_event(&decision, trained, admissible, false)
+        else {
+            panic!("above-trained must refuse");
+        };
+        assert_eq!(r.wanted_n_ctx, 300_000);
+        assert_eq!(r.shortfall_bytes, 0, "memory is not the problem here");
+        assert_eq!(r.resident_bytes_estimate, 0);
+        assert!(r.remedies.iter().any(|m| m.contains("262144")));
+        assert!(r.remedies.iter().any(|m| m.contains("no RoPE")));
+    }
+
+    /// The `[inference]` table reaches the decision — all three keys, each
+    /// changing the outcome, so none of them is silently dropped on the way.
+    #[test]
+    fn the_inference_table_reaches_the_decision() {
+        // A smaller explicit window is honoured.
+        let mut smaller = cfg();
+        smaller.n_ctx = Some(65_536);
+        let (d, _, _) = decide_local_window(&thirty_b(), 96 * GIB, &smaller).expect("declared");
+        assert!(matches!(
+            d,
+            WindowDecision::Fits {
+                n_ctx: 65_536,
+                reason: WindowReason::ConfigOverride,
+                ..
+            }
+        ));
+
+        // A pinned KV type is not second-guessed.
+        let mut pinned = cfg();
+        pinned.kv_cache_type = Some("q8_0".to_owned());
+        let (d, _, _) = decide_local_window(&thirty_b(), 96 * GIB, &pinned).expect("declared");
+        assert!(matches!(
+            d,
+            WindowDecision::Fits {
+                kv: KvCacheType::Q8_0,
+                ..
+            }
+        ));
+
+        // allow_over_memory turns the 16 GiB refusal into a load.
+        let mut over = cfg();
+        over.allow_over_memory = true;
+        let (d, _, _) = decide_local_window(&thirty_b(), 16 * GIB, &over).expect("declared");
+        assert!(matches!(d, WindowDecision::Fits { n_ctx: 262_144, .. }));
     }
 }

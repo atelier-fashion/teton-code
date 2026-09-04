@@ -25,6 +25,10 @@
 //!   on recovery.
 //! - [`lifecycle`] — the [`LifecycleEvent`] progress type shared by all of the
 //!   above, mapping onto the daemon's `model_lifecycle` protocol event.
+//! - [`window`] — the REQ-616 local-window decision ([`fit_window`]): trained
+//!   window, KV cache type and admissible RAM resolved to the context the
+//!   daemon loads with. Pure, like [`probe::decide`], so CI can prove the rule
+//!   without a machine that could hold the model.
 //!
 //! ## The `llama` feature
 //!
@@ -44,6 +48,7 @@ pub mod lifecycle;
 pub mod prefix_cache;
 pub mod pressure;
 pub mod probe;
+pub mod window;
 
 pub use benchmark::{
     benchmark_with_step_down, default_prompts, run_benchmark, BenchmarkResult, BenchmarkSelection,
@@ -66,6 +71,11 @@ pub use lifecycle::LifecycleEvent;
 pub use prefix_cache::{CacheDecision, EvictionReason, MissReason, PrefixCacheState};
 pub use pressure::{MemoryPressure, PressureController};
 pub use probe::{band_for_ram, decide, probe, GpuClass, HardwareProfile, TierDecision};
+pub use window::{
+    admissible_bytes, fit_window, kv_bytes_per_token, minimum_unconfigured_window, KvCacheType,
+    WindowDecision, WindowFitInputs, WindowReason, ADMISSIBLE_RAM_PERCENT,
+    MEASURED_KV_BYTES_PER_TOKEN_F16, WINDOW_STEP,
+};
 
 #[cfg(feature = "llama")]
 pub use engine::LlamaEngine;

@@ -1360,6 +1360,14 @@ pub struct ModelSelectionView {
     pub declined_local: bool,
     /// When the decision was recorded, in Unix epoch milliseconds.
     pub decided_at_ms: u64,
+    /// The KV cache element type the engine was loaded at (REQ-616 BR-10).
+    /// `None` until a load records one.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub kv_cache_type: Option<String>,
+    /// The context window the engine was loaded with, in engine tokens
+    /// (REQ-616 BR-10). `None` until a load records one.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub served_n_ctx: Option<u32>,
 }
 
 /// Install state of a model's weights (spec entity `InstallState.status`).
@@ -2215,6 +2223,31 @@ pub enum ConfigUpdate {
     /// A new `ConfigUpdate` variant, not a new RPC — `config/set` already
     /// carries every configuration mutation.
     SetEffort(EffortLevel),
+    /// Set the local engine's context allocation (`[inference]`, REQ-616 BR-2).
+    ///
+    /// **A struct variant**, for [`Self::SetTranscriptEnabled`]'s reason: three
+    /// independent optional keys have no sensible newtype, and naming them on
+    /// the wire keeps a caller from having to remember an order.
+    ///
+    /// The keys are *overrides*, and `None` means "leave the probe's decision
+    /// alone" rather than "clear it" — clearing is not expressible here on
+    /// purpose, because the probe's decision is not a stored value to clear.
+    ///
+    /// `n_ctx` above the model's trained window is refused by `config/set`
+    /// naming the trained figure: no RoPE or YaRN scaling is applied, so a
+    /// larger window is not something the daemon can deliver by trying harder.
+    SetInference {
+        /// An explicit window in tokens, at or below the model's trained window.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        n_ctx: Option<u32>,
+        /// `f16` or `q8_0`; validated against
+        /// `teton_inference::window::KvCacheType::parse`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kv_cache_type: Option<String>,
+        /// Permit a load whose resident estimate exceeds admissible RAM.
+        #[serde(default)]
+        allow_over_memory: bool,
+    },
     /// Turn daemon-side transcript recording on or off for **every future
     /// session** (REQ-611 BR-15, architecture ADR-5) — the `[transcript]
     /// enabled` key in `config.toml`.
@@ -4501,6 +4534,7 @@ mod tests {
             band: TierBand::Mid,
             size_bytes: 4_700_000_000,
             ram_floor_bytes: 12_884_901_888,
+            n_ctx_train: Some(32_768),
             provenance: crate::events::CatalogProvenance {
                 repo: "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF".to_owned(),
                 host: "huggingface.co".to_owned(),
@@ -4522,6 +4556,7 @@ mod tests {
                 band: TierBand::Small,
                 size_bytes: 2_104_932_800,
                 ram_floor_bytes: 8_589_934_592,
+                n_ctx_train: Some(32_768),
                 provenance: crate::events::CatalogProvenance {
                     repo: "Qwen/Qwen2.5-Coder-3B-Instruct-GGUF".to_owned(),
                     host: "huggingface.co".to_owned(),
@@ -4538,6 +4573,8 @@ mod tests {
             source: SelectionSource::Probe,
             declined_local: false,
             decided_at_ms: 1_771_200_000_000,
+            kv_cache_type: None,
+            served_n_ctx: None,
         }
     }
 
@@ -4648,6 +4685,7 @@ mod tests {
                         band: TierBand::Large,
                         size_bytes: 18_000_000_000,
                         ram_floor_bytes: 51_539_607_552,
+                        n_ctx_train: Some(32_768),
                         provenance: crate::events::CatalogProvenance {
                             repo: "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF".to_owned(),
                             host: "huggingface.co".to_owned(),
@@ -4684,6 +4722,8 @@ mod tests {
                 source: SelectionSource::UserOverride,
                 declined_local: false,
                 decided_at_ms: 1_771_200_000_001,
+                kv_cache_type: None,
+                served_n_ctx: None,
             },
         });
     }
@@ -4713,6 +4753,8 @@ mod tests {
                 source: SelectionSource::UserOverride,
                 declined_local: true,
                 decided_at_ms: 1_771_200_000_002,
+                kv_cache_type: None,
+                served_n_ctx: None,
             }),
             install: None,
             pending_proposal: None,

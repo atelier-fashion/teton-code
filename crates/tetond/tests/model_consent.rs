@@ -94,6 +94,7 @@ fn entry(
         size_bytes: body.len() as u64,
         ram_floor_bytes,
         band,
+        n_ctx_train: Some(32_768),
     }
 }
 
@@ -131,6 +132,8 @@ impl LocalEngineLoader for InstantLoader {
                 tokens_per_sec: 120.0,
             },
             duty: DutyOutcome::Pass,
+            window: None,
+            window_event: None,
         })
     }
 }
@@ -166,6 +169,8 @@ impl LocalEngineLoader for RecordingSlowLoader {
                 tokens_per_sec: 120.0,
             },
             duty: DutyOutcome::Pass,
+            window: None,
+            window_event: None,
         })
     }
 
@@ -186,6 +191,8 @@ impl LocalEngineLoader for SlowLoader {
         Ok(EngineLoadReport {
             duty: teton_inference::DutySpec::default().evaluate(&benchmark),
             benchmark,
+            window: None,
+            window_event: None,
         })
     }
 }

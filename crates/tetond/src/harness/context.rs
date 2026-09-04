@@ -2126,7 +2126,7 @@ pub const APPROX_BYTES_PER_TOKEN: usize = 8;
 /// unbounded result to the engine that exists to shrink it just moves the
 /// over-window failure one call earlier (the pre-fix behavior). 16 KiB is at
 /// most ~8k BPE tokens of pathological input, a quarter of the 32,768-token
-/// window (`LOCAL_ENGINE_N_CTX`), leaving ample room for the instruction and
+/// window (`LOCAL_ENGINE_N_CTX_DEFAULT`), leaving ample room for the instruction and
 /// generation.
 pub const SUMMARIZER_INPUT_MAX_BYTES: usize = 16_384;
 
@@ -3151,6 +3151,7 @@ mod tests {
             is_local: false,
             redact_scan: false,
             provider_id: Some("kimi"),
+            local_window: 0,
         });
         let mut ctx = ContextManager::new("sys", remote.budget_tokens)
             .with_budget_bytes(remote.budget_bytes)
@@ -3342,6 +3343,7 @@ mod tests {
             is_local: false,
             redact_scan: false,
             provider_id: Some("silent"),
+            local_window: 0,
         });
         assert_eq!(silent.digest_threshold_tokens, 1_500);
         assert_eq!(silent.digest_threshold_bytes, 12_000);
@@ -3424,6 +3426,7 @@ mod tests {
             is_local: false,
             redact_scan: false,
             provider_id: Some("kimi"),
+            local_window: 0,
         });
         let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(MockEngine::with_response(
             "mock-3b",

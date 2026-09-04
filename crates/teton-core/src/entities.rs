@@ -400,6 +400,26 @@ pub struct ModelSelection {
     /// rather than a formatted stamp, matching the cost ledger's
     /// `recorded_at_ms` — and keeping this crate free of a date-time dependency.
     pub decided_at_ms: u64,
+    /// The KV cache element type the engine was loaded at — `f16` or `q8_0`
+    /// (REQ-616 BR-10, AC-11). `None` until a load records one.
+    ///
+    /// Recorded here rather than re-derived on read because it is a fact about
+    /// *what happened*, not a decision that can be recomputed: the probe's
+    /// inputs (free RAM, the `[inference]` table) can change between a load and
+    /// the next `teton model status`, and a status line that re-ran the probe
+    /// would report what the daemon *would* choose rather than what it is
+    /// serving.
+    ///
+    /// Additive and optional, so a `model-selection.toml` written by an earlier
+    /// release still parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_cache_type: Option<String>,
+    /// The context window the engine was loaded with, in engine tokens
+    /// (REQ-616 BR-10). `None` until a load records one, and — like
+    /// [`Self::kv_cache_type`] — a record of what is being served rather than a
+    /// derivation that could disagree with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_n_ctx: Option<u32>,
 }
 
 impl ModelSelection {
@@ -415,6 +435,8 @@ impl ModelSelection {
             source,
             declined_local: false,
             decided_at_ms,
+            kv_cache_type: None,
+            served_n_ctx: None,
         }
     }
 
@@ -430,6 +452,8 @@ impl ModelSelection {
             source: SelectionSource::UserOverride,
             declined_local: true,
             decided_at_ms,
+            kv_cache_type: None,
+            served_n_ctx: None,
         }
     }
 

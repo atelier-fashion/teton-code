@@ -1981,7 +1981,7 @@ fn over_budget_skill_body() -> String {
 /// The budget pair the local route derives, spelled as the terminal spells it.
 ///
 /// Since REQ-590 the local tier's pair derives from the engine's own window
-/// like any declared one: `LOCAL_ENGINE_N_CTX` (32,768) less the generation
+/// like any declared one: `LOCAL_ENGINE_N_CTX_DEFAULT` (32,768) less the generation
 /// reservation (1,024) is 31,744 usable → 31,744 × 2/3 = **21,162 words**, and
 /// 31,744 × 2 = **63,488 B**, which `bytes_figure` (`(bytes + 500) / 1000`)
 /// rounds to `63 KB`.

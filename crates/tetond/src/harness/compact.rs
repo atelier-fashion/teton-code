@@ -108,7 +108,7 @@ use super::budget::LOCAL_GENERATION_RESERVATION;
 use super::context::{truncate_middle, ContextBlock, Provenance};
 use super::duty::{DutyKind, DUTY_REQUEST_BYTES_PER_TOKEN};
 use super::render::CHATML_DUTY_ENVELOPE_BYTES;
-use crate::runtime::LOCAL_ENGINE_N_CTX;
+use crate::runtime::LOCAL_ENGINE_N_CTX_DEFAULT;
 
 /// Byte ceiling on what a `compact` duty may return (BR-8).
 ///
@@ -125,7 +125,7 @@ use crate::runtime::LOCAL_ENGINE_N_CTX;
 /// # One chain, written down once (REQ-590 ADR-5, LESSON-491)
 ///
 /// ```text
-///   engine window          32,768 tokens   (LOCAL_ENGINE_N_CTX)
+///   engine window          32,768 tokens   (LOCAL_ENGINE_N_CTX_DEFAULT)
 ///   − the generation        1,024 tokens   (LOCAL_GENERATION_RESERVATION)
 ///   = 31,744 usable        × 2 B/token     (DUTY_REQUEST_BYTES_PER_TOKEN)
 ///   = 63,488 bytes  — everything a prompt of this window can hold once the
@@ -175,9 +175,13 @@ use crate::runtime::LOCAL_ENGINE_N_CTX;
 /// the whole window must land where the budget lands, not stop the build here
 /// while the budget quietly derives 0. Following the neighbour's arithmetic is
 /// the whole point of following the neighbour.
-pub const COMPACT_OUTPUT_MAX_BYTES: usize =
-    LOCAL_ENGINE_N_CTX.saturating_sub(LOCAL_GENERATION_RESERVATION) as usize
-        * DUTY_REQUEST_BYTES_PER_TOKEN;
+pub const COMPACT_OUTPUT_MAX_BYTES: usize = compact_output_max_bytes(LOCAL_ENGINE_N_CTX_DEFAULT);
+
+/// [`COMPACT_OUTPUT_MAX_BYTES`] at an arbitrary engine window (REQ-616 BR-8).
+#[must_use]
+pub const fn compact_output_max_bytes(n_ctx: u32) -> usize {
+    n_ctx.saturating_sub(LOCAL_GENERATION_RESERVATION) as usize * DUTY_REQUEST_BYTES_PER_TOKEN
+}
 
 /// The `compact` duty on the shared seam: its category and its output ceiling.
 ///
@@ -193,7 +197,7 @@ pub const COMPACT_DUTY: DutyKind = DutyKind::new(Category::Compact, COMPACT_OUTP
 /// [`REDACT_PROMPT_BUDGET_BYTES`](crate::egress::redact::REDACT_PROMPT_BUDGET_BYTES):
 ///
 /// ```text
-///   engine window            32,768 tokens   (LOCAL_ENGINE_N_CTX)
+///   engine window            32,768 tokens   (LOCAL_ENGINE_N_CTX_DEFAULT)
 ///   − the duty's generation   4,096 tokens   (COMPACT_DUTY.max_tokens())
 ///   = 28,672 tokens × 2 B/token             (DUTY_REQUEST_BYTES_PER_TOKEN)
 ///   − the ChatML envelope        55 bytes   (CHATML_DUTY_ENVELOPE_BYTES)
@@ -212,10 +216,25 @@ pub const COMPACT_DUTY: DutyKind = DutyKind::new(Category::Compact, COMPACT_OUTP
 /// A remote `compact` binding has a larger window than this and is simply
 /// offered less than it could take, which costs a partial offer — and a partial
 /// offer still compacts, because the answer is block numbers.
-pub const COMPACT_PROMPT_BUDGET_BYTES: usize = (LOCAL_ENGINE_N_CTX as usize
-    - COMPACT_DUTY.max_tokens() as usize)
-    * DUTY_REQUEST_BYTES_PER_TOKEN
-    - CHATML_DUTY_ENVELOPE_BYTES;
+pub const COMPACT_PROMPT_BUDGET_BYTES: usize =
+    compact_prompt_budget_bytes(LOCAL_ENGINE_N_CTX_DEFAULT);
+
+/// [`COMPACT_PROMPT_BUDGET_BYTES`] at an arbitrary engine window (REQ-616
+/// BR-8). The `compact` duty runs on the local engine, so this follows the
+/// local window exactly as the redact chain does.
+#[must_use]
+pub const fn compact_prompt_budget_bytes(n_ctx: u32) -> usize {
+    // Saturating, because `n_ctx` is a **runtime** value since REQ-616 and both
+    // subtractions underflow below it: `COMPACT_DUTY.max_tokens()` is 4,096, so
+    // a window under that wrapped to an enormous budget in release and panicked
+    // in debug. Reachable through `[inference] n_ctx`, which is also refused
+    // below the floor now — this is the second of the two guards, and it is the
+    // one that holds if a future caller finds another way in.
+    (n_ctx as usize)
+        .saturating_sub(COMPACT_DUTY.max_tokens() as usize)
+        .saturating_mul(DUTY_REQUEST_BYTES_PER_TOKEN)
+        .saturating_sub(CHATML_DUTY_ENVELOPE_BYTES)
+}
 
 /// The compact duty's output contract, verbatim: the last sentence of the
 /// instruction, before the numbered blocks it embeds.
@@ -764,6 +783,7 @@ mod tests {
                 is_local: false,
                 redact_scan: false,
                 provider_id: Some("kimi"),
+                local_window: 0,
             })
             .budget_bytes,
         ] {
@@ -856,7 +876,7 @@ mod tests {
             // envelope really was charged.
             assert!(
                 COMPACT_PROMPT_BUDGET_BYTES
-                    < LOCAL_ENGINE_N_CTX as usize * DUTY_REQUEST_BYTES_PER_TOKEN
+                    < LOCAL_ENGINE_N_CTX_DEFAULT as usize * DUTY_REQUEST_BYTES_PER_TOKEN
             );
             // And what is left still holds a decision: more than the minimum
             // number of blocks worth asking about, at the per-block display

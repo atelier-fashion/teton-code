@@ -403,6 +403,7 @@ pub fn entry_view(entry: &ModelEntry) -> CatalogEntryView {
         size_bytes: entry.size_bytes,
         ram_floor_bytes: entry.ram_floor_bytes,
         provenance: provenance_view(entry),
+        n_ctx_train: entry.n_ctx_train,
     }
 }
 
@@ -437,6 +438,8 @@ pub fn selection_view(selection: &ModelSelection) -> ModelSelectionView {
         source: wire_source(selection.source),
         declined_local: selection.declined_local,
         decided_at_ms: selection.decided_at_ms,
+        kv_cache_type: selection.kv_cache_type.clone(),
+        served_n_ctx: selection.served_n_ctx,
     }
 }
 
@@ -669,6 +672,23 @@ pub struct EngineLoadReport {
     pub benchmark: BenchmarkResult,
     /// The BR-8 latency-duty judgement of that measurement.
     pub duty: DutyOutcome,
+    /// The context window this load allocated, and the KV cache type it used
+    /// (REQ-616 AC-11). `None` from a loader that does not size a context — the
+    /// fake loader the acceptance suite drives, and the scripted tier.
+    ///
+    /// Carried on the report rather than recorded by the loader itself so the
+    /// loader stays a thing that loads: the decision to *persist* belongs to
+    /// the gate, which already owns every other write to the selection record
+    /// and is the only place that knows whether this load was committed or
+    /// abandoned.
+    pub window: Option<(u32, String)>,
+    /// `local_window_decided` for this load (REQ-616 BR-3), for the gate to
+    /// publish once it commits.
+    ///
+    /// Carried rather than published by the loader for the same reason
+    /// [`Self::window`] is: a superseded or duty-failed load must not announce a
+    /// window nothing is serving. `None` from a loader that sizes no context.
+    pub window_event: Option<Event>,
 }
 
 /// Loads a local inference engine from installed weights and reports how it
@@ -1576,6 +1596,26 @@ impl ModelConsentGate {
                         // the `ready` claim — so `ready` is published only for a
                         // slot that actually holds this flow's engine.
                         loader.commit(model_name);
+                        // REQ-616 AC-11: record what this load actually
+                        // allocated, and only now — after the supersede
+                        // re-check and the commit, so the record describes an
+                        // engine that is genuinely serving. Recording before
+                        // the commit would leave a superseded or duty-failed
+                        // load's window in the file, describing a context
+                        // nothing is running under.
+                        //
+                        // A write failure is not fatal: the engine is live and
+                        // serving, and losing the *record* of its window costs
+                        // a status line, not a turn.
+                        if let Some((n_ctx, ref kv)) = report.window {
+                            let _ = self.store.record_window(kv, n_ctx);
+                        }
+                        // BR-3: and announce the window, on the same terms —
+                        // after the commit, so the event describes an engine
+                        // that is genuinely serving.
+                        if let Some(event) = report.window_event.clone() {
+                            self.events.publish(None, event);
+                        }
                         self.events.publish(
                             None,
                             Event::ModelLifecycle(ModelLifecycle {
@@ -1869,6 +1909,7 @@ mod tests {
             size_bytes,
             ram_floor_bytes,
             band,
+            n_ctx_train: Some(32_768),
         }
     }
 

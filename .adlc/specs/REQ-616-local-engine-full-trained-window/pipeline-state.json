@@ -1,0 +1,108 @@
+{
+  "req": "REQ-616",
+  "branch": "feat/REQ-616-local-engine-full-trained-window",
+  "startedAt": "2026-09-04T19:34:00Z",
+  "completed": false,
+  "currentPhase": 7,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree + Preflight",
+      "completedAt": "2026-09-04T19:34:14Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-09-04T19:41:22Z",
+      "note": "3 blockers fixed (AC-3/AC-4/AC-5 arithmetic), BR-4/BR-5 clarified, OQ-1/OQ-2 resolved; approved on loop 2"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Tasks",
+      "completedAt": "2026-09-04T19:47:35Z",
+      "note": "7 ADRs; 9 tasks TASK-390..398; footprint published to PR #290"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-09-04T19:48:23Z",
+      "note": "approved first loop; coverage+DAG verified mechanically"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-09-04T21:08:00Z",
+      "note": "9/9 tasks; workspace 78 targets green; clippy clean"
+    },
+    {
+      "phase": 5,
+      "name": "Verify",
+      "completedAt": "2026-09-04T21:13:43Z",
+      "note": "inline reflector+5 reviewers; 1 Critical found and fixed (window-derived budget underflow reachable via [inference] n_ctx); 78 targets green, clippy clean"
+    },
+    {
+      "phase": 6,
+      "name": "Create PR",
+      "completedAt": "2026-09-04T21:14:43Z",
+      "note": "draft #290 flipped to ready; footprint block preserved"
+    }
+  ],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-616",
+      "branch": "feat/REQ-616-local-engine-full-trained-window",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/290",
+      "prNumber": 290,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null,
+      "prCreatedAt": "2026-09-04T19:34:14Z"
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-390",
+      "TASK-391",
+      "TASK-392",
+      "TASK-393",
+      "TASK-394",
+      "TASK-395",
+      "TASK-396",
+      "TASK-397",
+      "TASK-398"
+    ],
+    "failedTasks": []
+  },
+  "conflictsResolved": [
+    {
+      "phase": 7,
+      "files": [
+        "crates/teton-protocol/src/events.rs"
+      ],
+      "resolvedBy": "runner",
+      "strategy": "both-sides-append",
+      "verified": true,
+      "verifiedHow": "adlc_conflict_append_only returned rc=0 with no offenders (empty diff3 base section); adlc_conflict_verify_kept confirmed every line from both sides survived; cargo build --workspace clean; both REQ-616 window structs and REQ-615 session-root structs present",
+      "resolvedAt": "2026-09-04T21:18:13Z",
+      "note": "REQ-615 (already merged to main) appended session-root event structs at the end of events.rs where REQ-616 appended its window events"
+    }
+  ],
+  "notes": []
+}

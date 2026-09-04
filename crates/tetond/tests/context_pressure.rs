@@ -478,6 +478,7 @@ async fn an_elided_newest_user_message_is_an_event_and_a_notice_in_the_turns_out
         is_local: false,
         redact_scan: false,
         provider_id: Some("kimi"),
+        local_window: 0,
     });
     assert_eq!(budget.bound, BudgetBound::Window);
     assert_eq!(budget.window_label, "kimi's context window");
@@ -627,6 +628,7 @@ async fn a_two_hundred_block_conversation_on_a_big_route_compacts_through_the_lo
         is_local: false,
         redact_scan: false,
         provider_id: Some("kimi"),
+        local_window: 0,
     });
 
     let mut ctx = fixture.context(&budget);
@@ -753,6 +755,7 @@ async fn the_marker_names_the_routes_window_when_the_turn_is_seeded_by_carried_t
         is_local: false,
         redact_scan: false,
         provider_id: Some("kimi"),
+        local_window: 0,
     });
     assert_eq!(budget.window_label, "kimi's context window");
     assert!(

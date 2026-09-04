@@ -1576,6 +1576,7 @@ fn catalogued_window_for_kimi(measured: Fit) -> ProposedWindow {
             is_local: false,
             redact_scan: false,
             provider_id: Some("kimi"),
+            local_window: 0,
         },
         measured,
     )
@@ -1821,6 +1822,7 @@ fn a_refused_second_write_leaves_a_declared_window_on_an_unbound_tier_never_the_
         is_local: false,
         redact_scan: false,
         provider_id: Some("kimi"),
+        local_window: 0,
     });
     assert_eq!(
         circle.bound,
@@ -1929,6 +1931,7 @@ fn the_window_written_to_disk_is_the_one_the_offer_named_with_its_date() {
         is_local: false,
         redact_scan: false,
         provider_id: Some("kimi"),
+        local_window: 0,
     };
     let budget = budget::derive(inputs);
     assert_eq!(

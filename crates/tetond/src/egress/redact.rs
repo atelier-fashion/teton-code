@@ -98,7 +98,7 @@ use crate::harness::redact::{
     REDACT_DEFUSE_GROWTH_DIVISOR, REDACT_DUTY, REDACT_PROMPT_OVERHEAD_BYTES,
 };
 use crate::harness::render::CHATML_DUTY_ENVELOPE_BYTES;
-use crate::runtime::LOCAL_ENGINE_N_CTX;
+use crate::runtime::LOCAL_ENGINE_N_CTX_DEFAULT;
 
 /// Bytes the duty seam assumes per BPE token, sizing a prompt against a context
 /// window.
@@ -131,7 +131,22 @@ const DUTY_BYTES_PER_TOKEN: usize = DUTY_REQUEST_BYTES_PER_TOKEN;
 /// This is the budget the **rendered** prompt has to fit, which is what
 /// [`crate::harness::redact::scan`] measures against before it calls the model.
 pub(crate) const REDACT_PROMPT_BUDGET_BYTES: usize =
-    (LOCAL_ENGINE_N_CTX as usize - REDACT_DUTY.max_tokens() as usize) * DUTY_BYTES_PER_TOKEN;
+    redact_prompt_budget_bytes(LOCAL_ENGINE_N_CTX_DEFAULT);
+
+/// [`REDACT_PROMPT_BUDGET_BYTES`] at an arbitrary engine window (REQ-616 BR-7).
+///
+/// The redact duty runs on the **local engine**, so this chain follows the
+/// local window wherever it lands — including on a remote route, whose byte
+/// budget is clamped to what the scan can actually read.
+#[must_use]
+pub(crate) const fn redact_prompt_budget_bytes(n_ctx: u32) -> usize {
+    // Saturating, for the reason `compact_prompt_budget_bytes` is: `n_ctx` is a
+    // runtime value since REQ-616, and a window below the duty's generation
+    // reservation underflowed.
+    (n_ctx as usize)
+        .saturating_sub(REDACT_DUTY.max_tokens() as usize)
+        .saturating_mul(DUTY_BYTES_PER_TOKEN)
+}
 
 /// The largest payload the redactor will hand to a **single** model call, in
 /// bytes (ADR-6, BR-7).
@@ -141,7 +156,7 @@ pub(crate) const REDACT_PROMPT_BUDGET_BYTES: usize =
 /// to be two independently chosen numbers:
 ///
 /// ```text
-///   engine window            32,768 tokens   (LOCAL_ENGINE_N_CTX)
+///   engine window            32,768 tokens   (LOCAL_ENGINE_N_CTX_DEFAULT)
 ///   − the duty's generation   1,024 tokens   (REDACT_DUTY.max_tokens())
 ///   = prompt budget          31,744 tokens
 ///   × 2 bytes/token          63,488 bytes    (the seam's convention — an
@@ -234,10 +249,18 @@ pub(crate) const REDACT_PROMPT_BUDGET_BYTES: usize =
 /// **one** number: the cap belongs to the engine that has to hold the prompt
 /// and to the prompt that has to fit in it, and a copy of any of its inputs
 /// here would be the second number LESSON-446 is about.
-pub const REDACT_CHUNK_MAX_BYTES: usize =
-    (REDACT_PROMPT_BUDGET_BYTES - CHATML_DUTY_ENVELOPE_BYTES - REDACT_PROMPT_OVERHEAD_BYTES - 1)
+pub const REDACT_CHUNK_MAX_BYTES: usize = redact_chunk_max_bytes(LOCAL_ENGINE_N_CTX_DEFAULT);
+
+/// [`REDACT_CHUNK_MAX_BYTES`] at an arbitrary engine window (REQ-616 BR-7).
+#[must_use]
+pub const fn redact_chunk_max_bytes(n_ctx: u32) -> usize {
+    (redact_prompt_budget_bytes(n_ctx)
+        - CHATML_DUTY_ENVELOPE_BYTES
+        - REDACT_PROMPT_OVERHEAD_BYTES
+        - 1)
         * REDACT_DEFUSE_GROWTH_DIVISOR
-        / (REDACT_DEFUSE_GROWTH_DIVISOR + 1);
+        / (REDACT_DEFUSE_GROWTH_DIVISOR + 1)
+}
 
 /// The escaping factor an outbound body is modelled with: the JSON escaping of
 /// the assembled context costs **one part in this many** of the context's own
@@ -610,7 +633,13 @@ const REDACT_TOTAL_CAP_CHUNKS: usize = 4;
 /// The collision is closed rather than measured; what
 /// `docs/manual-verification.md` now records is the *chunk-count distribution*,
 /// which is where the cost went.
-pub const REDACT_INPUT_MAX_BYTES: usize = REDACT_TOTAL_CAP_CHUNKS * REDACT_CHUNK_MAX_BYTES;
+pub const REDACT_INPUT_MAX_BYTES: usize = redact_input_max_bytes(LOCAL_ENGINE_N_CTX_DEFAULT);
+
+/// [`REDACT_INPUT_MAX_BYTES`] at an arbitrary engine window (REQ-616 BR-7).
+#[must_use]
+pub const fn redact_input_max_bytes(n_ctx: u32) -> usize {
+    REDACT_TOTAL_CAP_CHUNKS * redact_chunk_max_bytes(n_ctx)
+}
 
 /// The largest assembled **context** a `[privacy] redact = true` route may
 /// carry, in bytes — the bound the redact scan places on a remote route's byte
@@ -674,8 +703,24 @@ pub const REDACT_INPUT_MAX_BYTES: usize = REDACT_TOTAL_CAP_CHUNKS * REDACT_CHUNK
 /// comments and the one re-stating assertion only) would be the drift
 /// LESSON-446 is about.
 pub const REDACT_SCANNABLE_CONTEXT_BYTES: usize =
-    (REDACT_INPUT_MAX_BYTES - REDACT_BODY_OVERHEAD_BYTES) * REDACT_ESCAPING_DIVISOR
-        / (REDACT_ESCAPING_DIVISOR + 1);
+    redact_scannable_context_bytes(LOCAL_ENGINE_N_CTX_DEFAULT);
+
+/// [`REDACT_SCANNABLE_CONTEXT_BYTES`] at an arbitrary engine window
+/// (REQ-616 BR-7).
+///
+/// The constant above is this function at the no-engine default, which is what
+/// keeps REQ-562's "one number, one place" property true at *any* window: the
+/// bound is still derived from the engine window through the chunk cap, and it
+/// is still stated in exactly one expression — that expression now takes the
+/// window as an argument instead of reading it from a literal.
+///
+/// `184_265`, the figure the one-home grep looks for, is this function at
+/// 32,768 and stays the value of the constant.
+#[must_use]
+pub const fn redact_scannable_context_bytes(n_ctx: u32) -> usize {
+    (redact_input_max_bytes(n_ctx) - REDACT_BODY_OVERHEAD_BYTES) * REDACT_ESCAPING_DIVISOR
+        / (REDACT_ESCAPING_DIVISOR + 1)
+}
 
 /// How much the pipeline trusts a finding — **derived, never self-reported**
 /// (BR-4, ADR-4).
@@ -2130,7 +2175,7 @@ mod tests {
     fn a_chunk_at_the_per_chunk_cap_still_fits_the_engines_window() {
         use crate::harness::redact::{redact_prompt, rendered_prompt_bytes};
 
-        let budget = (LOCAL_ENGINE_N_CTX as usize - REDACT_DUTY.max_tokens() as usize)
+        let budget = (LOCAL_ENGINE_N_CTX_DEFAULT as usize - REDACT_DUTY.max_tokens() as usize)
             * DUTY_BYTES_PER_TOKEN;
         assert_eq!(
             REDACT_PROMPT_BUDGET_BYTES, budget,
