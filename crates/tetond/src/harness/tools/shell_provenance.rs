@@ -434,6 +434,22 @@ fn classify_segment(
 
     let mut saw_boundary = false;
     let mut saw_directory = false;
+    // A content-reading verb whose arguments do not all name **existing regular
+    // files** has unproven reach, and must be scanned against the root.
+    //
+    // This is not a refinement — it closes a leak. `grep -r foo` names one
+    // token, `foo`, which is a *pattern* and not a path; the first draft
+    // resolved it to a nonexistent file under the root, found `paths` non-empty
+    // and therefore skipped the BR-1(d) root scan, and returned `Rooted`. GNU
+    // grep's `-r` with no path searches `.` recursively, so a repository
+    // holding a `.env` would have had its contents read and sent with a clean
+    // provenance.
+    //
+    // Telling a pattern from a path needs a per-verb option table, which is the
+    // kind of second parser ADR-614-1 refuses. The fail-closed reading needs no
+    // such table: if a token is not an existing regular file, the verb may
+    // reach further than the tokens name, so scan.
+    let mut unproven_reach = false;
 
     for token in &paths {
         let resolved = resolve_token(root, token);
@@ -482,8 +498,13 @@ fn classify_segment(
                             "a directory the command reads could hold a protected file",
                         );
                     }
-                } else {
+                } else if abs.is_file() {
                     sources.insert(id);
+                } else {
+                    // Neither a file nor a directory: a pattern, a flag's
+                    // argument, or a path that does not exist. The verb's reach
+                    // is not what this token says.
+                    unproven_reach = true;
                 }
             }
             Resolved::RootItself(abs) => {
@@ -524,9 +545,12 @@ fn classify_segment(
 
     // BR-1(d): a content-reading verb given no path at all reads whatever is
     // under the root.
+    // BR-1(d): a content-reading verb reads the root when it names no path, and
+    // may read it when its tokens do not name existing files (see
+    // `unproven_reach` above). Either way the root's subtree decides.
     if reads_content
+        && (paths.is_empty() || unproven_reach)
         && !saw_directory
-        && paths.is_empty()
         && !subtree_is_boundary_free(root, denied_prefixes, matcher, budget)
     {
         return SegmentVerdict::Unknown(
@@ -984,6 +1008,68 @@ mod tests {
             "and it must not claim a privacy boundary was crossed"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **The Phase-5 review finding.** A content-reading verb whose tokens do
+    /// not name existing files is scanned against the root.
+    ///
+    /// `grep -r foo` names exactly one token, and it is a **pattern**. The first
+    /// implementation resolved it as a path — to a nonexistent file under the
+    /// root — found `paths` non-empty, and therefore skipped BR-1(d)'s root
+    /// scan, returning `Rooted`. GNU grep's `-r` with no path argument searches
+    /// `.` recursively, so in a repository holding a `.env` that command reads
+    /// it and the output would have gone to a remote provider under a clean
+    /// provenance. Nothing in the suite caught it: every earlier fixture either
+    /// named a real file or named nothing at all.
+    ///
+    /// Telling a pattern from a path needs a per-verb option table, which is
+    /// the second parser ADR-614-1 refuses. The fail-closed rule needs none: a
+    /// token that is not an existing regular file means the verb may reach
+    /// further than its tokens say, so scan.
+    ///
+    /// **Mutation**: drop `|| unproven_reach` from the root-scan condition and
+    /// this test goes red.
+    #[test]
+    fn a_pattern_argument_does_not_pass_for_a_path() {
+        let root = project_root("pattern");
+        std::fs::write(root.join(".env"), "K=v\n").unwrap();
+
+        for command in [
+            "grep -r foo",
+            "grep -R foo",
+            "grep foo",
+            "head -n 5 src/main.rs",
+        ] {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Unknown,
+                "{command:?} can reach past the files it names, and the root holds a \
+                 boundary file: {:?} ({})",
+                v.kind,
+                v.reason
+            );
+        }
+
+        // The benign twin, and the reason this rule is affordable: with **no**
+        // boundary file under the root, the same commands are `Rooted`. The
+        // scan is what decides, not the shape of the argument list — so an
+        // ordinary repository pays nothing for this.
+        let clean = project_root("pattern-clean");
+        for command in ["grep -r foo", "grep foo src/main.rs", "cat"] {
+            let v = verdict(&clean, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Rooted,
+                "{command:?} in a boundary-free repo must stay Rooted ({})",
+                v.reason
+            );
+        }
+        // And an explicit read of a real file needs no scan at all.
+        assert_eq!(verdict(&clean, "cat src/main.rs").kind, VerdictKind::Rooted);
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&clean).ok();
     }
 
     /// AC-9's other half: the opaque set is one pinned table. A verb removed
