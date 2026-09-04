@@ -1,7 +1,7 @@
 ---
 id: REQ-614
 title: "Proportionate shell provenance — a shell result pins the session to the local tier only when it could have touched a boundary, the pin is announced, and the user can lift it"
-status: approved
+status: complete
 deployable: true
 created: 2026-09-04
 updated: 2026-09-04
