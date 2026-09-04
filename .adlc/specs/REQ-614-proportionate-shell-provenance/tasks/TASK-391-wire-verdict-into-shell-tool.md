@@ -1,7 +1,7 @@
 ---
 id: TASK-391
 title: "Wire the verdict into the shell tool — ToolProvenance::BoundaryTouch and boundaries on ToolContext"
-status: draft
+status: complete
 parent: REQ-614
 created: 2026-09-04
 updated: 2026-09-04

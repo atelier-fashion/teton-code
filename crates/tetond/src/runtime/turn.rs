@@ -1022,8 +1022,16 @@ impl DaemonRuntime {
                     })
                     .collect()
             };
+        // REQ-614: the same `effective_boundaries()` composition egress
+        // inspects against, handed to the tool jail so the `shell` classifier
+        // decides on the set that will actually judge the result. Two readings
+        // of the boundary set that could disagree is the parser-differential
+        // shape LESSON-494 is about; there is one composition site
+        // (`Config::effective_boundaries`, REQ-597 ADR-1) and this is a read of
+        // it, not a second one.
         let tool_ctx = ToolContext::for_root(probed)
             .with_denied_prefix(effective_transcript_dir(&config.transcript))
+            .with_boundaries(config.effective_boundaries())
             .with_known_projects(known_projects.clone());
         // REQ-611 BR-4: the turn's streaming surface also carries the sink, so
         // the tool input and the tool result — neither of which the bus has ever

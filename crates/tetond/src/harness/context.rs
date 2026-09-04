@@ -92,6 +92,29 @@ pub enum ToolProvenance {
     /// The tool's touched files cannot be determined (e.g. `shell`): fail-closed
     /// at egress whenever any boundary is configured.
     Unknown,
+    /// A path the tool named matches a `local-only` boundary glob, and the
+    /// ordinary identity path cannot say so (REQ-614 ADR-614-3).
+    ///
+    /// Egress treats this **exactly** as [`Self::Unknown`] —
+    /// [`tool_result_provenance`](crate::harness::digest::tool_result_provenance)
+    /// maps both to `Provenance::unknown()` — so BR-2's fail-closed refusal is
+    /// unchanged by construction. What the variant carries is the *cause*: an
+    /// `Unknown` pin is liftable with `/shell allow`, a `BoundaryTouch` pin is
+    /// permanent.
+    ///
+    /// It exists for the out-of-root case. `~/.ssh/config` read from a project
+    /// root resolves outside the session root, so `ProvenanceId::from_resolved`
+    /// mints nothing for it and no glob can match it through
+    /// [`Self::Sources`] (LESSON-623). An **in-root** boundary path needs none
+    /// of this — it already mints an id, already matches, already pins
+    /// permanently through `BlockCause::Boundary`.
+    ///
+    /// A variant rather than a flag beside the provenance, because this fact
+    /// has to survive the tool result -> context block -> context-provenance
+    /// union -> carry-commit path, and carried state sheds its invariants
+    /// silently on a round trip (LESSON-501, LESSON-502). A variant makes the
+    /// compiler enumerate every seam that must handle it.
+    BoundaryTouch,
 }
 
 impl ToolProvenance {
@@ -314,7 +337,12 @@ impl DroppedProvenance {
         match provenance {
             Provenance::Tool { provenance, .. } => match provenance {
                 ToolProvenance::Sources(paths) => self.sources.extend(paths.iter().cloned()),
-                ToolProvenance::Unknown => self.unknown = true,
+                // REQ-614: a boundary touch folds exactly as an unknown does.
+                // The accumulator's job is "may this leave the machine", and the
+                // answer is no for both; which of them *pinned* the session, and
+                // whether that pin lifts, is decided at the tool seam and lives
+                // on `SessionTaint`, not here.
+                ToolProvenance::Unknown | ToolProvenance::BoundaryTouch => self.unknown = true,
             },
             Provenance::User { sources, unknown } => {
                 self.sources.extend(sources.iter().cloned());
@@ -956,8 +984,14 @@ impl ProvenanceClass {
     #[must_use]
     pub fn of(provenance: &Provenance) -> Self {
         match provenance {
+            // REQ-614's `BoundaryTouch` classes as `Unknown` here for the same
+            // reason it maps to `Provenance::unknown()` at egress (ADR-614-3):
+            // the two are byte-identical to every reader downstream of the
+            // verdict, and this manager still holds no matcher with which to
+            // tell them apart. REQ-618's argument above is unchanged — the
+            // boundary *verdict* is still computed where the matcher lives.
             Provenance::Tool {
-                provenance: ToolProvenance::Unknown,
+                provenance: ToolProvenance::Unknown | ToolProvenance::BoundaryTouch,
                 ..
             } => ProvenanceClass::Unknown,
             Provenance::Tool {
@@ -2200,7 +2234,10 @@ impl ContextManager {
             match &block.provenance {
                 Provenance::Tool { provenance, .. } => match provenance {
                     ToolProvenance::Sources(paths) => sources.extend(paths.iter().cloned()),
-                    ToolProvenance::Unknown => unknown = true,
+                    // REQ-614, same reading as `absorb` above: a summary that
+                    // folded a boundary-touching block must be at least as
+                    // restrictive as the block was.
+                    ToolProvenance::Unknown | ToolProvenance::BoundaryTouch => unknown = true,
                 },
                 // **The fourth seam** (REQ-585 verify). ADR-9 named three places
                 // that had to learn a user block can carry file provenance —

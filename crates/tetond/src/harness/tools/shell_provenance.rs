@@ -79,7 +79,7 @@ use teton_core::provenance_id::ProvenanceId;
 use teton_protocol::methods::RootKind;
 
 use super::walk::{self, WalkBudget, WalkPolicy};
-use super::{canonical_through_existing_ancestor, lexical_normalize};
+use super::{canonical_through_existing_ancestor, lexical_normalize, under_denied_prefix};
 
 /// The scan budget, and deliberately far below [`WalkBudget::default`].
 ///
@@ -427,7 +427,30 @@ fn classify_segment(
     let mut saw_directory = false;
 
     for token in &paths {
-        match resolve_token(root, token) {
+        let resolved = resolve_token(root, token);
+        // REQ-611 BR-8 / ADR-7, and the regression the transcript suite caught:
+        // a denied prefix is **not** a privacy boundary — it is a directory no
+        // tool may read at all — so it has no glob for the matcher above to
+        // find. Before REQ-614 a `shell` reading one was held at egress by the
+        // constant `Unknown`, which was the whole of `shell`'s standing as "the
+        // named exception, fail-closed at egress like every other file on the
+        // machine". Narrowing the verdict without this check handed that file a
+        // clean `Rooted` provenance and let it egress.
+        //
+        // `Unknown` rather than `BoundaryTouch`: no boundary was crossed, and a
+        // pin that claimed one would be a false sentence to the user. This is
+        // exactly the pre-REQ-614 answer for exactly the pre-REQ-614 reason.
+        if let Resolved::InsideRoot(abs, _)
+        | Resolved::RootItself(abs)
+        | Resolved::OutsideRoot(abs) = &resolved
+        {
+            if under_denied_prefix(denied_prefixes, abs) {
+                return SegmentVerdict::Unknown(
+                    "a path argument is inside a directory tools may not read",
+                );
+            }
+        }
+        match resolved {
             Resolved::InsideRoot(abs, id) => {
                 if matcher.match_path(id.as_str()).is_some() {
                     saw_boundary = true;
@@ -889,6 +912,59 @@ mod tests {
         assert_eq!(
             verdict(&root, "base64 src/main.rs").reason,
             "the command's verb is not one this classifier recognises"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// REQ-611 BR-8: a path under a denied prefix — a session transcript — is
+    /// never `Rooted`, even though it sits inside the session root and carries a
+    /// perfectly good `ProvenanceId` that matches no boundary glob.
+    ///
+    /// The transcript directory is deliberately **not** a privacy boundary
+    /// (REQ-611 ADR-7): there is nothing to taint, the read simply must not
+    /// happen. `shell` is the named exception the jail cannot refuse, and before
+    /// REQ-614 it was held at egress by the constant `Unknown`. The first draft
+    /// of this module narrowed the verdict without checking denied prefixes and
+    /// handed a `cat` of a transcript a clean `Rooted` provenance — caught by
+    /// `transcript::every_file_tool_refuses_the_transcript_and_shell_output_is_held_at_egress`,
+    /// not by anything in this file.
+    ///
+    /// **Mutation**: delete the `under_denied_prefix` check in
+    /// [`classify_segment`] and this test goes red.
+    #[test]
+    fn a_path_under_a_denied_prefix_is_never_rooted() {
+        let root = project_root("denied");
+        let transcripts = root.join("transcripts");
+        std::fs::create_dir_all(&transcripts).unwrap();
+        std::fs::write(transcripts.join("s.jsonl"), "{}\n").unwrap();
+
+        // Benign twin first: with no denied prefix the same read is `Rooted`,
+        // so the difference below is the check and nothing else.
+        let free = classify(
+            &root,
+            RootKind::Project,
+            &builtins(),
+            Vec::new(),
+            "cat transcripts/s.jsonl",
+        );
+        assert_eq!(free.kind, VerdictKind::Rooted, "{}", free.reason);
+
+        let denied = classify(
+            &root,
+            RootKind::Project,
+            &builtins(),
+            vec![transcripts.canonicalize().unwrap()],
+            "cat transcripts/s.jsonl",
+        );
+        assert_eq!(
+            denied.kind,
+            VerdictKind::Unknown,
+            "a transcript read must stay fail-closed ({})",
+            denied.reason
+        );
+        assert_eq!(
+            denied.reason, "a path argument is inside a directory tools may not read",
+            "and it must not claim a privacy boundary was crossed"
         );
         std::fs::remove_dir_all(&root).ok();
     }

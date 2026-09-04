@@ -176,6 +176,17 @@ pub struct ToolContext {
     /// [`denied_prefix_forms`] derives for it, so the list is longer than the
     /// set of directories it came from.
     denied_prefixes: Vec<PathBuf>,
+    /// The effective privacy boundaries this session runs under (REQ-614).
+    ///
+    /// Read by the `shell` provenance classifier, and by nothing else: this is
+    /// **not** a second enforcement point. Egress still inspects provenance at
+    /// the choke point exactly as before; what this buys is the ability to
+    /// decide, *before* a command runs, whether its result has to be `Unknown`.
+    ///
+    /// Empty on every context that was not given one — which is the same thing
+    /// as `disable_default_boundaries`, and yields the pre-REQ-614 verdict
+    /// (BR-9).
+    boundaries: Vec<teton_core::entities::PrivacyBoundary>,
     /// The projects this machine knows about, ranked and already bounded by the
     /// caller (REQ-615 ADR-5).
     ///
@@ -203,6 +214,7 @@ impl ToolContext {
             kind: RootKind::Plain,
             walk: walk::WalkPolicy::default(),
             denied_prefixes: Vec::new(),
+            boundaries: Vec::new(),
             known_projects: Vec::new(),
         }
     }
@@ -222,6 +234,7 @@ impl ToolContext {
             kind: probed.view.kind,
             walk: walk::WalkPolicy::default(),
             denied_prefixes: Vec::new(),
+            boundaries: Vec::new(),
             known_projects: Vec::new(),
         }
     }
@@ -268,6 +281,26 @@ impl ToolContext {
         self.denied_prefixes.extend(denied_prefix_forms(dir));
         self.walk = self.walk.with_denied_prefix(dir);
         self
+    }
+
+    /// The effective privacy boundaries this session runs under (REQ-614).
+    ///
+    /// Replacing, not additive: the boundary set is composed in exactly one
+    /// place (`Config::effective_boundaries`, REQ-597 ADR-1) and this carries
+    /// that composition rather than accumulating a second one.
+    #[must_use]
+    pub fn with_boundaries(
+        mut self,
+        boundaries: Vec<teton_core::entities::PrivacyBoundary>,
+    ) -> Self {
+        self.boundaries = boundaries;
+        self
+    }
+
+    /// What the `shell` provenance classifier matches against (REQ-614).
+    #[must_use]
+    pub fn boundaries(&self) -> &[teton_core::entities::PrivacyBoundary] {
+        &self.boundaries
     }
 
     /// The same context carrying the machine's ranked, bounded project names
