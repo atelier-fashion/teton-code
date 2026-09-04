@@ -1,7 +1,7 @@
 ---
 id: TASK-390
 title: "The shell provenance classifier — a fail-closed allowlist grammar over the command"
-status: draft
+status: complete
 parent: REQ-614
 created: 2026-09-04
 updated: 2026-09-04

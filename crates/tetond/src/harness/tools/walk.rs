@@ -172,6 +172,38 @@ impl WalkPolicy {
         self
     }
 
+    /// A policy for a **security** scan rather than a discovery walk (REQ-614
+    /// ADR-614-5): nothing is pruned by name.
+    ///
+    /// [`WALK_SKIP_DIRS`] exists so a walk the *model* reads is not drowned in
+    /// `node_modules` and `target`. A scan asking "does any file under this
+    /// subtree match a privacy boundary?" is answering a different question,
+    /// and the default skip set is actively wrong for it: `**/.npmrc` is one of
+    /// the thirteen builtin boundaries and `node_modules/<pkg>/.npmrc` is where
+    /// it most often lives. A pruned walk would report *no boundary file here*
+    /// about a tree a `grep -r` reads in full — a false `rooted`, which is a
+    /// leak rather than a slow walk.
+    ///
+    /// The home-top-level prune and the media-bundle suffixes go for the same
+    /// reason; the denied prefixes stay, because a transcript is a file no tool
+    /// may read at all and pruning it is not a boundary decision.
+    ///
+    /// The budget is the caller's, and it is expected to be far tighter than
+    /// [`WalkBudget::default`]: this runs synchronously before a shell command
+    /// spawns. A scan that exhausts it has **not** shown the absence of a
+    /// boundary file — it stopped looking — and the caller must read
+    /// [`WalkReport::truncated_by`] and fail closed.
+    #[must_use]
+    pub fn for_boundary_scan(budget: WalkBudget, denied_prefixes: Vec<PathBuf>) -> Self {
+        Self {
+            skip: &[],
+            home_top: &[],
+            bundles: &[],
+            budget,
+            denied_prefixes,
+        }
+    }
+
     /// The same policy with `dir` denied — REQ-611 BR-8 / ADR-7, the walker
     /// half of the transcript denial.
     ///
