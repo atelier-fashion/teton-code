@@ -90,6 +90,19 @@
     ],
     "failedTasks": []
   },
-  "conflictsResolved": [],
+  "conflictsResolved": [
+    {
+      "phase": 7,
+      "files": [
+        "crates/teton-protocol/src/events.rs"
+      ],
+      "resolvedBy": "runner",
+      "strategy": "both-sides-append",
+      "verified": true,
+      "verifiedHow": "adlc_conflict_append_only returned rc=0 with no offenders (empty diff3 base section); adlc_conflict_verify_kept confirmed every line from both sides survived; cargo build --workspace clean; both REQ-616 window structs and REQ-615 session-root structs present",
+      "resolvedAt": "2026-09-04T21:18:13Z",
+      "note": "REQ-615 (already merged to main) appended session-root event structs at the end of events.rs where REQ-616 appended its window events"
+    }
+  ],
   "notes": []
 }
