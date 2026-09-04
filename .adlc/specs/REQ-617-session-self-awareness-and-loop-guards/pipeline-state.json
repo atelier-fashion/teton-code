@@ -2,8 +2,8 @@
   "req": "REQ-617",
   "branch": "feat/REQ-617-session-self-awareness-and-loop-guards",
   "startedAt": "2026-09-04T19:34:15.216475Z",
-  "completed": false,
-  "currentPhase": 7,
+  "completed": true,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
@@ -11,7 +11,9 @@
     3,
     4,
     5,
-    6
+    6,
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -49,6 +51,18 @@
       "phase": 6,
       "name": "Create PR",
       "completedAt": "2026-09-04T21:08:41.405958Z"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup",
+      "completedAt": "2026-09-04T22:45:00Z",
+      "note": "Resumed from the needs-manual-rebase hold. Rebased twice onto origin/main (8280202, then c9c7364), resolved five conflicting files, re-measured both prompt-margin pins and re-tuned the over-budget window fixture empirically."
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup and Merge",
+      "completedAt": "2026-09-04T23:03:12Z",
+      "note": "PR #291 squash-merged to main as 24218ca at 2026-09-04T23:03:12Z, with the trial-merge gate clean (rc=0) against origin/main c9c7364 immediately before it."
     }
   ],
   "repos": {
@@ -60,9 +74,10 @@
       "touched": true,
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/291",
       "prNumber": 291,
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
-      "snapshotPR": null
+      "snapshotPR": null,
+      "mergeCommit": "24218caf"
     }
   },
   "mergeOrder": [
@@ -101,25 +116,13 @@
     }
   ],
   "notes": [
-    "Phases 0-6 complete. PR #291 is OPEN and review-ready with a full body.",
-    "Workspace suite was green at 4,336 passed / 0 failed and clippy clean on 295c082, the branch tip, before origin/main moved.",
-    "CI has NOT run on the tip: GitHub does not compute checks for a PR whose merge commit is unresolvable, and the PR reads CONFLICTING/DIRTY since REQ-615 merged. CI was green on 5f3d4e5, two commits earlier.",
-    "Halted at Phase 7 per BUG-207: the trial merge returns rc=1 and adlc_conflict_append_only names two modified-line offenders, so the bounded keep-both path does not apply. Nothing was resolved and nothing was pushed; the merge was aborted and the worktree is clean at 295c082.",
-    "conflictsResolved is deliberately empty: a conflict occurred and was NOT resolved, which blockers records and conflictsResolved must not."
+    "Phases 0-6 completed 2026-09-04. PR #291 opened review-ready.",
+    "Phase 7 halted at 2026-09-04T21:22Z per BUG-207: the trial merge against origin/main returned rc=1 and adlc_conflict_append_only named two modified-line offenders (redact.rs, skill_over_budget_offer.rs), so the bounded keep-both path did not apply. Nothing was resolved and nothing was pushed.",
+    "Resumed 2026-09-04T22:30Z on an explicit product decision from the user: option 1 of the two the blocker recorded -- shorten REQ-617's own prompt addition, do NOT raise REDACT_BODY_OVERHEAD_BYTES and do NOT re-derive the redact constants. See conflictsResolved for what was done and how it was verified.",
+    "The rebase base moved twice while the resume ran: origin/main was 8280202 (REQ-615, REQ-616, REQ-618) at the first rebase and c9c7364 (REQ-618's wrapup) at the second. Two more REQs than the blocker was recorded against, which is why the blocker's DERIVED 133-byte relief figure was wrong: the measured deficit at the rebased tip was 85 bytes over the ceiling.",
+    "Two CI failures on the rebased tip, both real signal, neither caused by the resolution. (1) `a_failed_command_comes_back_raw_with_no_interpretation` pinned `(exit 1)` and `No such file or directory` -- a failed `cd` exits 1 under bash (macOS's /bin/sh) and 2 under dash (Ubuntu's). The test asserted which shell the runner ships; fixed to parse the `(exit N)` marker and assert non-zero, and to match the `[stderr]` line on the builtin and the path. AC-7's wording corrected in the requirement. This defect was in the branch before the rebase and had never been seen: CI could not compute checks for a PR whose merge commit was unresolvable, so the tip was never built until now. (2) `attach_authorization::a_client_that_attached_through_the_grant_flow_receives_that_sessions_events` failed once on the Linux leg, seeing both context_cleared envelopes where one was its to see; it passed on a same-commit re-run and 15/15 locally. A pre-existing latent race in a file REQ-617 does not touch -- LESSON-450's class. Recorded, not chased.",
+    "Final verification on the merged tip: cargo test --workspace --no-fail-fast green at 4,446 passed / 0 failed, cargo clippy --workspace --all-targets -- -D warnings clean, cargo clippy --workspace --all-targets --all-features -- -D warnings clean, cargo fmt --all --check clean, and cargo test -p tetond --test e2e green at 67 passed after rebuilding the binaries.",
+    "AC-1 (b) and AC-8 (b) remain deferred-to-a-machine-with-weights, as the validation pass recorded: both need the `llama` feature and several GB of downloaded model weights, neither of which exists in this pipeline or in CI."
   ],
-  "blockers": [
-    {
-      "blockedBy": "manual",
-      "resolvedBlocker": "REQ-615",
-      "conflictFiles": [
-        "crates/tetond/src/egress/redact.rs",
-        "crates/tetond/tests/skill_over_budget_offer.rs",
-        "crates/teton-protocol/src/events.rs"
-      ],
-      "unblockCondition": "REQ-615 merged to main while REQ-617 was in Phase 5-6. Rebase onto origin/main and resolve. Two of the three conflicts are NOT append-point collisions (partials/conflict-bound.sh returns rc=1, naming redact.rs and skill_over_budget_offer.rs), so BUG-207's bounded keep-both path does not apply and the runner halted rather than resolving. (1) redact.rs is the real decision: REQ-615 spent 278 bytes of the prompt margin (733 -> 455) and REQ-617 spent 540 (733 -> 193). Together that is 818 against 733, with a 48-byte floor -- the combined prompt does NOT fit inside REDACT_BODY_OVERHEAD_BYTES (23 KiB) and needs about 133 bytes of relief. That arithmetic is DERIVED, not measured; the constant's own doc says re-measure rather than reason, so whoever resolves must take the figure the failing assertion reports. Two options: shorten one of the two prompt additions (REQ-617's command roster is the more compressible -- the 29 names could drop to families), or raise REDACT_BODY_OVERHEAD_BYTES to 24 KiB and re-derive REDACT_TOTAL_CAP_CHUNKS, REDACT_INPUT_MAX_BYTES, REDACT_SCANNABLE_CONTEXT_BYTES and REDACT_MAX_CHUNKS, adding a ledger line. The RECORDED_MARGIN_GAP_BYTES const-assert REQ-617 added will refuse a resolution that moves one margin and not the other. (2) skill_over_budget_offer.rs is downstream of (1): REQ-617 moved the Window/FitsWindow cell's declared window 30,000 -> 31,000 because its own prompt growth flipped the verdict. The band is ~1,000 tokens wide, so the combined growth will need it moved again -- re-tune empirically after (1) is settled, and see that fixture's own comment for the durable fix. (3) events.rs IS append-only (both REQs added event variants) and keep-both resolves it.",
-      "holdState": "needs-manual-rebase",
-      "rebaseAttempts": 0,
-      "detectedAt": "2026-09-04T21:22:26.680363Z"
-    }
-  ]
+  "blockers": []
 }

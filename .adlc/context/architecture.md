@@ -552,6 +552,18 @@
   scan calls (up to five) instead of onto context (REQ-612 ADR-1/ADR-4/ADR-5,
   LESSON-477, LESSON-543, LESSON-593, LESSON-597).
 
+  **The margin that ledger records is now spent** (REQ-617). REQ-615 and
+  REQ-617 both drew on it in one sprint, each having measured against the same
+  733 before the other merged, and the combined prompt overran 23 KiB by 85
+  bytes. The resolution shortened REQ-617's own roster twice — 29 command names
+  to 17 families, `teton_docs commands` carrying the sub-commands — and
+  re-measured both pins to **112** and **159**, the gap still 47 and now held by
+  a `const` assert (`RECORDED_MARGIN_GAP_BYTES`). 64 bytes of usable room remain
+  above the 48-byte floor, less than the 81 the pin was introduced at. The next
+  REQ that needs a sentence in the resident prompt cannot shorten its way in and
+  should plan to raise the ceiling and re-derive the four figures below it
+  (ASSUME-043).
+
 - **A repository-touching act with no human typing a name gets its own gate
   entry point, keyed by the durable root** (REQ-613). Writing a missing
   `TETON.md` is a *daemon* act rather than a tool call, so no tool name is on
