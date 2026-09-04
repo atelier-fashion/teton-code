@@ -1,7 +1,7 @@
 ---
 id: TASK-007
 title: "The deterministic session-state nudge: when the reply cannot answer, the harness names the command"
-status: draft
+status: complete
 parent: REQ-617
 created: 2026-09-04
 updated: 2026-09-04

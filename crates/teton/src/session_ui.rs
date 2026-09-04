@@ -3274,6 +3274,159 @@ fn shell_probed_teton(title: &str) -> bool {
 /// already true.
 const GENERIC_HAND_OFF_PREFIX: &str = "in this session: ";
 
+// ---------------------------------------------------------------------------
+// The session-state hand-off (REQ-617 BR-3, architecture ADR-6)
+// ---------------------------------------------------------------------------
+//
+// A third line through the same seam, for the failure that opened REQ-617.
+// Asked "is transcript on?", the shipped local model had no idea `/transcript`
+// existed — nothing in its prompt named it — so it searched the repository for
+// seven tool calls, read a Claude Code file, and reported that file's setting as
+// Teton's.
+//
+// REQ-617 puts the command names in the prompt and in `teton_docs commands`, and
+// LESSON-532 says exactly how far that gets: the **data** crosses perfectly, so
+// the model can now name `/transcript`. What does not cross is the *directive* —
+// three rounds of moving, dictating and isolating such a sentence scored 0/3 —
+// so "and call no tool" is not something a guide sentence can guarantee.
+//
+// This is the guarantee, in the one place a test can pin it: REQ-579 ADR-9's
+// shape, reused rather than reinvented.
+
+/// The five session switches a user asks the state of, each with the command
+/// that answers it.
+///
+/// Derived from `teton_protocol::commands`, so a command renamed there renames
+/// itself here. The five *names* are spelled because they are the subject a
+/// prompt is matched against, not because the roster does not have them: the
+/// roster knows `/permissions` exists, it does not know that a user asking about
+/// "permissions" is asking about that row.
+const SESSION_SWITCHES: &[&str] = &["transcript", "context", "verbose", "effort", "permissions"];
+
+/// Words that make a mention of a switch into a question about its **state**.
+///
+/// Without this the predicate fires on "add verbose logging to the parser",
+/// which is the benign case that decides whether this line is a help or a
+/// nuisance. `on` and `off` are absent deliberately — "turn verbose on" is an
+/// instruction, and the line would be right to fire, but "the tests ran on
+/// linux" would trip it constantly.
+const STATE_QUESTION_WORDS: &[&str] = &[
+    "is",
+    "are",
+    "was",
+    "does",
+    "do",
+    "did",
+    "enabled",
+    "disabled",
+    "status",
+    "state",
+    "check",
+    "whether",
+    "currently",
+];
+
+/// How a model tries to answer a state question when it does not know the
+/// command — the shapes the 2026-09-04 transcript recorded.
+///
+/// Read off the tool-call titles the renderer already drew, in the `<tool>:
+/// <argument>` form [`shell_probed_teton`] parses. A `read` of a dotfile and a
+/// `glob` for config are both "went looking in the repository for a setting that
+/// is not there".
+const CONFIG_HUNT_FRAGMENTS: &[&str] = &[
+    ".claude.json",
+    "config.json",
+    "config.toml",
+    "settings.json",
+    ".teton",
+];
+
+/// The switch this prompt asks the state of, if it asks about one.
+///
+/// One switch, not a list: a prompt naming two is asking a broader question than
+/// this line answers, and naming two commands in one nudge is how a small model
+/// picks a third.
+fn asks_about_a_session_switch(prompt: &str) -> Option<&'static str> {
+    let asked = without_backticks(prompt).to_lowercase();
+    if !STATE_QUESTION_WORDS
+        .iter()
+        .any(|word| contains_word(&asked, word))
+    {
+        return None;
+    }
+    let mut found = SESSION_SWITCHES
+        .iter()
+        .filter(|switch| contains_word(&asked, switch));
+    let first = found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
+
+/// True when the turn answered a state question by hunting for a file.
+///
+/// The tool half is the one that matters and is the one the transcript
+/// recorded: seven calls looking for a configuration file, then a `read` of
+/// `.claude.json`. The reply half catches the case where the model names such a
+/// file without having opened it, which is the same wrong answer delivered with
+/// more confidence.
+fn hunted_for_a_config_file(plain_reply: &str, turn_tools: &[String]) -> bool {
+    let lowered = plain_reply.to_lowercase();
+    CONFIG_HUNT_FRAGMENTS
+        .iter()
+        .any(|fragment| lowered.contains(fragment))
+        || turn_tools.iter().any(|title| {
+            let lowered = title.to_lowercase();
+            CONFIG_HUNT_FRAGMENTS
+                .iter()
+                .any(|fragment| lowered.contains(fragment))
+        })
+}
+
+/// The line a session-state question earns, naming the command and who runs it.
+///
+/// Plain text, no fence, no em-dash aside — the same shape as the two lines
+/// above and for the same reasons (LESSON-517, BUG-168).
+fn session_state_line(switch: &str) -> String {
+    format!("in this session, /{switch} prints that state; only you can run it.")
+}
+
+/// BR-3's predicate, over the same backtick-stripped reading every other
+/// predicate here uses.
+///
+/// Two halves, symmetric with REQ-579 ADR-9's, and the second is the one that
+/// hole was found in:
+///
+/// * **recital** — the reply went looking for the state in a file, which is the
+///   thing it cannot do;
+/// * **dormancy** — the reply already names the command, in which case the
+///   harness stays quiet.
+///
+/// A reply that does **both** still earns the line. That is REQ-579's dormancy
+/// hole, closed here rather than reopened: naming `/transcript` while also
+/// telling the user that `.claude.json` says it is on has still given the wrong
+/// answer, and the correction is still true.
+///
+/// # Mutations (all three run, all three red)
+///
+/// | Mutation | What went red |
+/// |---|---|
+/// | `hunted \|\| !named` → `!named` (drop the dormancy hole) | `a_session_state_reply_that_cannot_answer_earns_the_line` |
+/// | `hunted \|\| !named` → `hunted` (drop the not-named arm) | the same test |
+/// | drop the question-shape requirement in [`asks_about_a_session_switch`] | `a_reply_that_answers_a_state_question_correctly_earns_nothing` |
+///
+/// The third is the one worth reading twice: it is caught by the **benign**
+/// test, not by the firing one. A detector validated only against the inputs it
+/// is supposed to fire on ships broken and passes its own suite, and dropping
+/// the question shape is exactly the widening that would make this line fire on
+/// "add verbose logging to the parser".
+fn earns_session_state_line(switch: &str, plain_reply: &str, turn_tools: &[String]) -> bool {
+    let hunted = hunted_for_a_config_file(plain_reply, turn_tools);
+    let named = contains_word(plain_reply, &format!("/{switch}"));
+    hunted || !named
+}
+
 /// ADR-6's line for `names`, in the order given (which is the caller's table
 /// order, never the order the reply happened to mention them in).
 ///
@@ -3340,6 +3493,21 @@ pub(crate) fn hand_off_after_turn(state: &mut SessionState, surface: &mut dyn Su
             .any(|command| plain.contains(command))
     {
         surface.line(LineKind::Notice, connection_test_line());
+        return;
+    }
+    // REQ-617 BR-3. After the two older corrections and before the generic
+    // line, which is the position its subject earns: it carries a reason (the
+    // state is not in a file you can read), so it outranks the bare list of
+    // spellings, and its subject is narrower than either correction above so it
+    // cannot displace them.
+    if let Some(switch) = asks_about_a_session_switch(&prompt) {
+        if earns_session_state_line(switch, &plain, &tools) {
+            surface.line(LineKind::Notice, &session_state_line(switch));
+            return;
+        }
+        // Dormant: the reply named the command and hunted for nothing. The
+        // model got it right, so the harness says nothing — the property that
+        // keeps this a help rather than a nuisance.
         return;
     }
     // Neither correction was earned, so the only thing left to say about a reply
@@ -7869,6 +8037,202 @@ mod tests {
         }
         hand_off_after_turn(&mut state, &mut surface, tty);
         surface
+    }
+
+    /// A whole turn with a prompt and tool-call titles, for REQ-617's predicate.
+    ///
+    /// `hand_off_turn` above starts every turn with an empty prompt, which is
+    /// right for REQ-579's line (it reads the reply only) and useless here: the
+    /// session-state predicate keys on what the **user asked**.
+    fn state_turn(prompt: &str, reply: &str, tools: &[&str]) -> RecordingSurface {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.begin_turn(prompt);
+        for title in tools {
+            state.turn_tools.push((*title).to_owned());
+        }
+        render_event(&envelope(chunk(reply)), &mut surface, &mut state);
+        hand_off_after_turn(&mut state, &mut surface, true);
+        surface
+    }
+
+    /// **REQ-617 BR-3 / AC-1(a): a session-state question the reply cannot
+    /// answer earns the line.**
+    ///
+    /// The first case is the transcript's own: asked whether the transcript was
+    /// on, the model read `.claude.json` — a Claude Code file — and reported
+    /// that file's setting as Teton's. The second is the same wrong answer with
+    /// no tool call behind it.
+    ///
+    /// The third is REQ-579's **dormancy hole**, closed here rather than
+    /// reopened: a reply that names `/transcript` *and* cites `.claude.json` has
+    /// still given the wrong answer, and the correction is still true.
+    #[test]
+    fn a_session_state_reply_that_cannot_answer_earns_the_line() {
+        for (case, prompt, reply, tools) in [
+            (
+                "it read another tool's config file",
+                "is transcript on?",
+                "yes — tengu_auto_mode_config.jsonlTranscript is true.",
+                &["read: .claude.json"][..],
+            ),
+            (
+                "it named the file without opening it",
+                "is transcript on?",
+                "check config.json in the repository root.",
+                &[][..],
+            ),
+            (
+                "it said nothing useful at all",
+                "is the transcript enabled?",
+                "I am not sure.",
+                &[][..],
+            ),
+            (
+                "the dormancy hole: it named the command AND hunted",
+                "is transcript on?",
+                "run /transcript, though .claude.json also says it is on.",
+                &[][..],
+            ),
+        ] {
+            let surface = state_turn(prompt, reply, tools);
+            assert_eq!(
+                surface.lines_of(LineKind::Notice),
+                vec![session_state_line("transcript")],
+                "{case}: {:?}",
+                surface.calls
+            );
+        }
+    }
+
+    /// **The benign path, and it is the one that decides whether this line is a
+    /// help or a nuisance.**
+    ///
+    /// Four ways to earn nothing:
+    ///
+    /// * the reply named the command and only the command — the model got it
+    ///   right, so the harness is silent;
+    /// * the prompt mentions a switch word with no question in it (`add verbose
+    ///   logging`), which is the false positive a switch-word-only predicate
+    ///   would produce constantly;
+    /// * the prompt asks about two switches at once, which is a broader question
+    ///   than one command answers;
+    /// * the prompt asks nothing about a switch at all.
+    #[test]
+    fn a_reply_that_answers_a_state_question_correctly_earns_nothing() {
+        for (case, prompt, reply, tools) in [
+            (
+                "it named the command and stopped",
+                "is transcript on?",
+                "type /transcript — it prints the state and the file's path. I cannot run it.",
+                &[][..],
+            ),
+            (
+                "fenced, which is a markdown accident and not an answer",
+                "is transcript on?",
+                "type `/transcript` at the prompt.",
+                &[][..],
+            ),
+            (
+                "the switch word appears in an instruction, not a question",
+                "add verbose logging to the parser",
+                "done — I added three log lines.",
+                &[][..],
+            ),
+            (
+                "two switches: a broader question than one command answers",
+                "are transcript and verbose both on?",
+                "I am not sure.",
+                &[][..],
+            ),
+            (
+                "no switch in the prompt at all",
+                "what does this function do?",
+                "it parses a config file.",
+                &["read: config.toml"][..],
+            ),
+        ] {
+            let surface = state_turn(prompt, reply, tools);
+            assert!(
+                surface.lines_of(LineKind::Notice).is_empty(),
+                "{case}: {:?}",
+                surface.calls
+            );
+        }
+    }
+
+    /// Both halves read the **same** backtick-stripped text.
+    ///
+    /// REQ-579's verify pass found exactly this hole in the older predicate:
+    /// the recital half stripped backticks and the dormancy half did not, so
+    /// `` `/provider setup` `` and `/provider setup` were two different answers
+    /// to one question. Fencing is a markdown accident, and a matcher whose
+    /// behaviour depends on how the model felt about code spans is a matcher
+    /// with a gap in it. Asserted here rather than assumed, because this
+    /// predicate is new and inherits nothing automatically.
+    #[test]
+    fn the_session_state_halves_read_the_same_backtick_stripped_text() {
+        // Dormant either way.
+        for reply in [
+            "run /transcript to see.",
+            "run `/transcript` to see.",
+            "run `/transcript` to see, or `/transcript on` to start.",
+        ] {
+            let surface = state_turn("is transcript on?", reply, &[]);
+            assert!(
+                surface.lines_of(LineKind::Notice).is_empty(),
+                "{reply:?} must stay dormant; got {:?}",
+                surface.calls
+            );
+        }
+        // And earns the line either way, fencing or not.
+        for reply in [
+            "check .claude.json — it says true.",
+            "check `.claude.json` — it says true.",
+        ] {
+            let surface = state_turn("is transcript on?", reply, &[]);
+            assert_eq!(
+                surface.lines_of(LineKind::Notice),
+                vec![session_state_line("transcript")],
+                "{reply:?} earned nothing; got {:?}",
+                surface.calls
+            );
+        }
+        // The prompt is stripped too — a user who typed the switch inside a
+        // code span asked the same question.
+        let surface = state_turn("is `transcript` on?", "I am not sure.", &[]);
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec![session_state_line("transcript")],
+            "a fenced switch word in the PROMPT is the same question: {:?}",
+            surface.calls
+        );
+    }
+
+    /// The line names a command the session actually has (REQ-617 TASK-001).
+    ///
+    /// Every switch this predicate can fire on must be a real row of the
+    /// protocol roster, or the harness's deterministic correction names a
+    /// command the user cannot type — which is worse than the silence it
+    /// replaced.
+    #[test]
+    fn every_session_switch_is_a_registered_command() {
+        for switch in SESSION_SWITCHES {
+            assert!(
+                teton_protocol::commands::find(switch).is_some(),
+                "`/{switch}` is not in the session command roster, so this line \
+                 would name a command that does not exist"
+            );
+            assert!(
+                session_state_line(switch).contains(&format!("/{switch}")),
+                "the line must name the command it is about"
+            );
+            assert!(
+                session_state_line(switch).contains("only you can run it"),
+                "and say who runs it — the half a model cannot be relied on to \
+                 say for itself (LESSON-532)"
+            );
+        }
     }
 
     /// **AC-1, the deterministic half.** A reply that reached for the shell
