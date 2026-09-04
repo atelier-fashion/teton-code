@@ -1982,14 +1982,28 @@ search_key_ref = "env:{web_var}"
 
     /// **REQ-617 AC-7, end to end: the transcript's own command.**
     ///
-    /// `cd /nonexistent && pwd` — exit 1, the raw stderr, the harness's own
-    /// `ERROR:` line, and **no** `[shell: …]` prefix. The four halves are
-    /// asserted together because the defect was all four at once: the result
-    /// came back wearing an interpretation that had invented an instruction.
+    /// `cd /nonexistent && pwd` — a non-zero exit, the raw stderr, the
+    /// harness's own `ERROR:` line, and **no** `[shell: …]` prefix. The four
+    /// halves are asserted together because the defect was all four at once:
+    /// the result came back wearing an interpretation that had invented an
+    /// instruction.
     ///
     /// Distinct from the table above, which counts model calls. This one reads
     /// what the *model* receives, and the `[shell: ` needle is the one a reader
     /// of the 2026-09-04 transcript would recognise.
+    ///
+    /// # Why neither the status nor the wording is pinned
+    ///
+    /// AC-7 says *"returns exit 1"* and names `No such file or directory`.
+    /// Both are readings of **one** `/bin/sh`. A failed `cd` exits 1 under bash
+    /// (macOS's `/bin/sh`) and 2 under dash (Ubuntu's), and dash's diagnostic
+    /// is `can't cd to /nonexistent`. Pinning either asserts which shell the
+    /// runner ships, which is not this REQ's claim and went red on the Linux
+    /// leg while the macOS leg passed. What BR-7 actually promises is that the
+    /// command's *own* failure — a non-zero status and the shell's own line —
+    /// reaches the model unedited, and that is what is asserted: the status
+    /// parsed and checked non-zero, the stderr line matched on the builtin and
+    /// the path it names, which every `/bin/sh` puts in it.
     #[tokio::test]
     async fn a_failed_command_comes_back_raw_with_no_interpretation() {
         let root = temp_root("ac7-raw");
@@ -2016,19 +2030,42 @@ search_key_ref = "env:{web_var}"
              directory first…` arrived under.\ncontent: {}",
             refined.outcome.content
         );
-        assert!(
-            refined.outcome.content.contains("(exit 1)"),
-            "the raw exit status must survive: {}",
+        let status = refined
+            .outcome
+            .content
+            .split_once("(exit ")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .and_then(|(code, _)| code.trim().parse::<i32>().ok())
+            .unwrap_or_else(|| {
+                panic!(
+                    "the raw exit status must survive, as a parseable `(exit N)`: {}",
+                    refined.outcome.content
+                )
+            });
+        assert_ne!(
+            status, 0,
+            "a failed command must arrive carrying a non-zero status; the value \
+             itself is the shell's (1 under bash, 2 under dash) and is \
+             deliberately not pinned.\ncontent: {}",
             refined.outcome.content
         );
+        let stderr = refined
+            .outcome
+            .content
+            .lines()
+            .find(|line| line.starts_with("[stderr] "))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the command's own stderr must survive, which is the whole of \
+                     what the model needs here: {}",
+                    refined.outcome.content
+                )
+            });
         assert!(
-            refined
-                .outcome
-                .content
-                .contains("No such file or directory"),
-            "and so must the command's own stderr, which is the whole of what \
-             the model needs here: {}",
-            refined.outcome.content
+            stderr.contains("cd") && stderr.contains("/nonexistent"),
+            "the stderr line must be the *command's* diagnostic — every `/bin/sh` \
+             names the builtin and the path it could not reach, whatever else it \
+             says around them.\nstderr: {stderr}"
         );
         assert_eq!(
             refined.outcome, raw,
