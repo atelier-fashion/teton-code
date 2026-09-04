@@ -2,8 +2,8 @@
   "req": "REQ-614",
   "branch": "feat/REQ-614-proportionate-shell-provenance",
   "startedAt": "2026-09-04T00:00:00Z",
-  "completed": false,
-  "currentPhase": 7,
+  "completed": true,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -62,6 +63,12 @@
       "name": "PR Cleanup (rebase onto origin/main)",
       "completedAt": "2026-09-04T23:33:13.029999Z",
       "result": "Blocker cleared by the user's decision: rebased 18 commits onto origin/main (587c2bc), composing REQ-614 with REQ-615/616/617/618. Six conflicting files across three commits. Three integration gaps that existed on neither side alone were found and fixed: the /shell allow roster row REQ-617's command-awareness guard requires (plus its commands.md line), the BoundaryTouch arm REQ-618's ProvenanceClass::of needs, and REQ-599's drifted module map. ADR-614-2 and REQ-615's root_gate.rs were read against each other and compose \u2014 different axes, each ADR citing the other. Resident prompt untouched: margin measured at 112 bytes against a floor of 48, ASSUME-043's 64 usable bytes unmoved, so REDACT_BODY_OVERHEAD_BYTES is left alone. 4,495 tests pass; clippy clean with and without --all-features; binaries rebuilt and the pty/cli e2e suites re-run green (106 tests)."
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup and Merge",
+      "completedAt": "2026-09-04T23:38:11.626911Z",
+      "result": "PR #288 squash-merged to main as 4f13cf01f614 (mergedAt 2026-09-04T23:37:22Z) after all 8 required checks went green on the rebased tip, on both ubuntu-latest and macos-latest (LESSON-643: the pre-rebase tip had never been built by CI, so the rebased tip was treated as untested until both platforms reported). gh's post-merge local-branch delete failed because the worktree owned the branch; the adapter deleted the remote branch itself (branch_deleted=1) and local cleanup was completed in teardown."
     }
   ],
   "repos": {
@@ -73,9 +80,10 @@
       "touched": true,
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/288",
       "prNumber": 288,
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
-      "snapshotPR": null
+      "snapshotPR": null,
+      "mergeCommit": "4f13cf01f614"
     }
   },
   "mergeOrder": [
