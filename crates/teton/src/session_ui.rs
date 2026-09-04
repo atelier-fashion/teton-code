@@ -44,7 +44,7 @@ use teton_protocol::methods::{
     AttachConsentOutcome, AttachConsentParams, PermissionOutcome, PermissionRespondParams,
     RefusalReason, RootKind, SessionRoot, SkillSource,
 };
-use teton_protocol::{Phase, RequestId, SessionId};
+use teton_protocol::{Phase, RequestId, SessionId, Tier};
 
 use crate::banner;
 use crate::cost_ui::CostMeter;
@@ -201,6 +201,29 @@ pub struct SessionState {
     /// render identically because both mean the route line has no notes figure
     /// to spend, and the `absent` state deliberately draws no line either.
     pub repo_context_resident_bytes: Option<u64>,
+    /// The kind of the last `repo_context_state` this client saw, or `None`
+    /// where the daemon has said nothing (REQ-613 BR-1).
+    ///
+    /// **`None` and `Some(Absent)` mean the same thing, and that is the
+    /// daemon's own convention rather than this client's shortcut.** The
+    /// session record seeds its published state with `absent` precisely so that
+    /// silence on this event *is* an `absent` — a project with no notes stores
+    /// `Absent` over `Absent` at create and publishes nothing, which is the
+    /// session BR-1's announcement is about. Reading the silence any other way
+    /// would leave the clause undrawn in exactly the case it exists for.
+    ///
+    /// Read by [`crate::banner::generation_notice`] and by nothing else: it is
+    /// a launch-time fact, not a status field, and the byte figures the route
+    /// line spends stay [`Self::repo_context_resident_bytes`]'s.
+    pub repo_context_state: Option<teton_protocol::methods::RepoContextStateKind>,
+    /// The durable `[context] generate` posture, once `config/get` has been read
+    /// (REQ-613 BR-1, BR-10).
+    ///
+    /// A render cache of a daemon fact, `None` for [`Self::permission_level`]'s
+    /// two reasons — nobody has asked yet, or the daemon predates the key — and
+    /// in either case the launch clause is drawn rather than suppressed: a
+    /// posture nobody reported is not a posture that says `never`.
+    pub generate_posture: Option<teton_protocol::methods::RepoContextGenerateMode>,
     /// The session this client is *in*, once `session/create` (or
     /// `session/attach`) has answered — `None` before that.
     ///
@@ -791,26 +814,22 @@ pub fn render_event(
             // `repo_context_state` passes through, so the figure the route line
             // spends and the line the user reads come out of one reading.
             state.repo_context_resident_bytes = notes_resident_bytes(rc);
+            // REQ-613 BR-1: and the state word itself, for the launch clause.
+            // Same fold, same reason — a second reader of this event would be a
+            // second answer to "does this repository have notes".
+            state.repo_context_state = Some(rc.state);
             if let Some(line) = format_repo_context(rc, state.verbose) {
                 surface.line(LineKind::Notice, &line);
             }
             EventOutcome::Rendered
         }
-        // REQ-613 minimal arm; TASK-387 owns the full rendering.
+        // REQ-613 BR-2/BR-5/BR-9: one line per stage, through the one composer
+        // beside `format_repo_context` — the same fold-and-render shape the arm
+        // above it takes, and for the same reason.
         Event::RepoContextGeneration(generation) => {
-            let outcome = match generation.outcome {
-                events::GenerationOutcome::Offered => "offered",
-                events::GenerationOutcome::Declined => "declined",
-                events::GenerationOutcome::RefusedUnattended => "refused (not a terminal)",
-                events::GenerationOutcome::DeniedLevel => "not offered at this level",
-                events::GenerationOutcome::Suppressed => "suppressed",
-                events::GenerationOutcome::Walking => "reading the repository",
-                events::GenerationOutcome::Drafted => "drafted",
-                events::GenerationOutcome::Written => "written",
-                events::GenerationOutcome::Replaced => "replaced",
-                events::GenerationOutcome::Failed => "failed",
-            };
-            surface.line(LineKind::Notice, &format!("repo notes: {outcome}"));
+            if let Some(line) = format_repo_context_generation(generation, state.verbose) {
+                surface.line(LineKind::Notice, &line);
+            }
             EventOutcome::Rendered
         }
         Event::PrefixCache(cache) => {
@@ -3643,10 +3662,26 @@ fn render_consent_subject(subject: Option<&PermissionSubject>, surface: &mut dyn
                 surface.line(LineKind::Prompt, WINDOW_VERDICT_HEDGE);
             }
         }
-        // REQ-613 minimal arm; TASK-387 owns the full rendering. Every field is
-        // bound rather than wildcarded, on this function's own rule: a new field
-        // must be a compile error at the surface that has to decide what to do
-        // with it.
+        // REQ-613 BR-2/BR-8's offer. **Two sentences, and the second is the
+        // whole of what `--force` changes.** Every field is bound rather than
+        // wildcarded, on this function's own rule: a new field must be a compile
+        // error at the surface that has to decide what to do with it.
+        //
+        // The first sentence is what Teton would *do* — walk, spend a model
+        // call, write one named file — because BR-2 asks the prompt to name what
+        // it will do, and a question that said only "write TETON.md?" would hide
+        // both costs the human is actually agreeing to.
+        //
+        // The second is the question, and it is a different question in the two
+        // spellings: creating a file that is not there and overwriting one that
+        // is. `replace` rides the subject precisely so this line can differ
+        // (`PermissionSubject::RepoContextGeneration::replace`), and rendering
+        // one sentence for both would put the human's `y` on a question they
+        // were not shown.
+        //
+        // `root` is the daemon's home-relative display, never an absolute path,
+        // and it is repository-authored text like every other file-derived
+        // string here — `Surface::line` defuses it.
         Some(PermissionSubject::RepoContextGeneration {
             root,
             path,
@@ -3655,10 +3690,20 @@ fn render_consent_subject(subject: Option<&PermissionSubject>, surface: &mut dyn
             surface.line(
                 LineKind::Prompt,
                 &format!(
-                    "  Teton would {verb} `{path}` in {root}",
+                    "  Teton would {verb} `{path}` in {root}: walk this tree for evidence, \
+                     spend one model call to draft it, and write the file.",
                     verb = if *replace { "replace" } else { "write" },
                 ),
             );
+            let question = if *replace {
+                format!("  The `{path}` that is there now would be overwritten — replace it?")
+            } else {
+                format!(
+                    "  Nothing is at `{path}` now, and the file is yours to edit afterwards — \
+                     write it?"
+                )
+            };
+            surface.line(LineKind::Prompt, &question);
         }
     }
 }
@@ -3848,6 +3893,16 @@ fn refusal_line(req: &PermissionRequest, reason: RefusalReason) -> String {
         &req.subject,
         Some(PermissionSubject::SkillOverBudget { .. })
     );
+    // REQ-613 BR-10: the unattended posture is one sentence, and this is where
+    // it is said. It is a **third** shape of `NoTerminal` refusal because the
+    // standard remedy is wrong here in a way that costs the reader: a level is
+    // not what settles this question, and `[context] generate = always` is —
+    // the durable opt-in with the same character as `[skills]
+    // trusted_project_roots`, which is exactly how the docs word it.
+    let repo_context_generation = matches!(
+        &req.subject,
+        Some(PermissionSubject::RepoContextGeneration { .. })
+    );
     let subject = match &req.subject {
         Some(PermissionSubject::SkillDynamicContext { skill, .. }) => {
             format!("skill `{skill}`'s dynamic context")
@@ -3867,12 +3922,21 @@ fn refusal_line(req: &PermissionRequest, reason: RefusalReason) -> String {
         Some(PermissionSubject::ProjectSkillTrust { root, .. }) => {
             format!("running `{root}`'s skills as instructions")
         }
-        // REQ-613 minimal arm; TASK-387 owns the full rendering. Named from the
-        // subject like the three rows above it: the key spells
-        // `repo_context:generate:~/dev/teton`, which names the same root in the
-        // vocabulary of a log rather than of a question.
-        Some(PermissionSubject::RepoContextGeneration { root, path, .. }) => {
-            format!("writing `{path}` in {root}")
+        // REQ-613 BR-2/BR-8. Named from the subject like the three rows above
+        // it: the key spells `repo_context:generate:~/dev/teton`, which names the
+        // same root in the vocabulary of a log rather than of a question.
+        //
+        // The verb tracks `replace` for the reason the prompt's second sentence
+        // does: a user reading "writing TETON.md was refused" about a `--force`
+        // run would be told a smaller thing happened than the one they asked
+        // for.
+        Some(PermissionSubject::RepoContextGeneration {
+            root,
+            path,
+            replace,
+        }) => {
+            let verb = if *replace { "replacing" } else { "writing" };
+            format!("{verb} `{path}` in {root}")
         }
         _ => format!("`{}`", req.tool_name),
     };
@@ -3884,6 +3948,18 @@ fn refusal_line(req: &PermissionRequest, reason: RefusalReason) -> String {
              repository whose skill shadows one of your own; `[skills] trusted_project_roots` \
              does, and the turn goes ahead where it already names this repository — acknowledge \
              it once at a terminal and answer `p` to add it."
+        ),
+        // BR-2's client-side refusal and BR-10's one sentence, together: nothing
+        // was read, the next line of stdin is still the user's next prompt, and
+        // the two doors out are named — a terminal, or the durable `always` that
+        // answers the question in advance.
+        RefusalReason::NoTerminal if repo_context_generation => format!(
+            "{subject} was refused without asking: this session's input is not a terminal, so \
+             nobody could be asked — no line of your input was read for it, and the session \
+             goes on without the notes. `[context] generate = always` (`teton context generate \
+             always`) is the unattended opt-in: it writes the file into whichever project a \
+             session is launched in, without asking, at every level but `plan`. At a terminal, \
+             `/context init` writes one on demand."
         ),
         RefusalReason::NoTerminal if over_budget => format!(
             "{subject} was refused without asking: this session's input is not a terminal, so \
@@ -4270,6 +4346,166 @@ fn format_repo_context(rc: &events::RepoContextState, verbose: bool) -> Option<S
         (Some(reason), K::Unreadable | K::WithheldBoundary) => format!("{line} ({reason})"),
         _ => line,
     })
+}
+
+/// The file this build's generation pipeline writes, spelled for a person
+/// (REQ-613 BR-6).
+///
+/// A constant here and **not** a field off the event, which is the opposite of
+/// what [`render_consent_subject`] does with the same file — and the difference
+/// is the wire's own split. The *subject* carries `path` because the human is
+/// answering about a named file and a client that hard-coded it would print the
+/// wrong one the day this build writes elsewhere. The *event* deliberately
+/// carries no path at all (`RepoContextGeneration`'s news/location split: a
+/// monitor learns a repository got notes and does not learn where the working
+/// tree is), so the news lines name the file by the name BR-6 gives it rather
+/// than inventing a path for it.
+const GENERATED_NOTES_FILE: &str = "TETON.md";
+
+/// One line for one stage of the generation pipeline (REQ-613 BR-2, BR-5, BR-9;
+/// architecture ADR-6), or `None` for a stage this session did not ask to see.
+///
+/// **Which stages are quiet, and why they are the two they are.** `walking` and
+/// `drafted` are progress: they say a wait has a cause, which is worth saying to
+/// someone watching a slow turn and is chrome to everyone else — the same gate
+/// `route [` and the prefix-cache notices sit behind. Every stage that *settles*
+/// the question prints unconditionally, because each of them is a different
+/// reason a file the user may have been expecting is not there and each sends
+/// them somewhere different (`GenerationOutcome`'s own argument for being a
+/// closed enum).
+///
+/// The one stage that is quiet **conditionally** is `offered`, and the condition
+/// is the daemon's `reason`. An offer that drew a prompt needs no line — the
+/// prompt is on screen, and a notice restating it would be the second composer
+/// LESSON-456 is about. An offer that drew *none* is `[context] generate =
+/// always` answering in a human's place, and a user reading a file they were
+/// never asked about is owed the setting's name; the daemon puts it in `reason`
+/// for exactly that.
+///
+/// Every figure is the daemon's own and none is re-derived: `entries`,
+/// `excluded`, `draft_bytes` and `tier` arrive measured, and each is optional
+/// because most stages are published before there is anything to measure — a
+/// `0` here would be a measurement (`RepoContextGeneration`'s rule), so an
+/// absent figure drops its clause rather than printing a zero nobody counted.
+///
+/// `root` and `reason` are repository-adjacent text, bounded by the daemon and
+/// defused again by [`Surface::line`] — the two-layer rule.
+fn format_repo_context_generation(
+    ev: &events::RepoContextGeneration,
+    verbose: bool,
+) -> Option<String> {
+    use events::GenerationOutcome as G;
+    let root = &ev.root;
+    let file = GENERATED_NOTES_FILE;
+    let reason = ev.reason.as_deref();
+    Some(match ev.outcome {
+        G::Offered => match reason {
+            // Nobody was asked. The setting that answered is the news.
+            Some(reason) => {
+                format!("context: writing {file} in {root} without asking — {reason}")
+            }
+            None if !verbose => return None,
+            None => format!("context: offering to write {file} in {root}"),
+        },
+        // Session-scoped by construction: the daemon writes a decline nowhere,
+        // so the line names the two doors that survive the session rather than
+        // implying the answer was remembered.
+        G::Declined => format!(
+            "context: no {file} was written — you declined. `/context init` writes one on \
+             demand; `[context] generate = never` stops the offer for good."
+        ),
+        // The client's own refusal, echoed as news for the other attached
+        // clients. The refusal line the refusing client printed already carries
+        // the remedy in full, so this one states the fact and stops.
+        G::RefusedUnattended => format!(
+            "context: no {file} was written — this session takes no typed input, so nobody \
+             could be asked."
+        ),
+        // `plan`. The daemon's note says which level and why; AC-2 asks the line
+        // to name the door that is left.
+        G::DeniedLevel => match reason {
+            Some(reason) => format!(
+                "context: no {file} was written — {reason}. `/context init` at a level that \
+                 allows a write does it."
+            ),
+            None => format!(
+                "context: no {file} was written — this session's permission level forbids it."
+            ),
+        },
+        // Nothing was asked and nothing ran. The reason is the whole of the
+        // line: four different facts reach here (a file already present, the
+        // switch, a root with no canonical name, `generate = never`) and each
+        // has its own remedy.
+        G::Suppressed => match reason {
+            Some(reason) => format!("context: no offer to write {file} — {reason}"),
+            None => format!("context: no offer to write {file} in {root}"),
+        },
+        G::Walking if !verbose => return None,
+        G::Walking => format!("context: walking {root} for evidence"),
+        G::Drafted if !verbose => return None,
+        // BR-5's line, and the one place the tier is worth saying: the draft is
+        // the single model call this feature spends, and which tier served it is
+        // what a user checks a `/cost` row against.
+        G::Drafted => format!(
+            "context: drafting {file} on {tier} — 1 model call, {entries} entries walked, \
+             {excluded} excluded",
+            tier = tier_word(ev.tier),
+            entries = count_or_unknown(ev.entries),
+            excluded = count_or_unknown(ev.excluded.map(u64::from)),
+        ),
+        G::Written => format!(
+            "context: {file} written in {root} — {}",
+            written_figures(ev)
+        ),
+        G::Replaced => format!(
+            "context: {file} replaced in {root} — {}",
+            written_figures(ev)
+        ),
+        // BR-9: one line naming the cause, no file left behind, and the on-demand
+        // remedy. The stage is inside the daemon's own sentence.
+        G::Failed => match reason {
+            Some(reason) => {
+                format!("context: no {file} was written — {reason}. `/context init` retries.")
+            }
+            None => format!(
+                "context: no {file} was written — generation failed. `/context init` retries."
+            ),
+        },
+    })
+}
+
+/// The measured half of a `written`/`replaced` line: what the model drafted, on
+/// which tier, out of how many entries (REQ-613 BR-5, BR-6).
+///
+/// The draft's own bytes and not the file's, because that is what the event
+/// carries — the header BR-6 prepends is this build's text and is counted where
+/// the file is written, not here.
+fn written_figures(ev: &events::RepoContextGeneration) -> String {
+    format!(
+        "{} bytes drafted on {}, from {} entries",
+        count_or_unknown(ev.draft_bytes),
+        tier_word(ev.tier),
+        count_or_unknown(ev.entries),
+    )
+}
+
+/// A measured count, or the word for a daemon that sent none.
+///
+/// `RepoContextGeneration` makes every figure optional because most stages are
+/// published before anything has measured them, and a `0` would be a
+/// measurement. So an absent figure says it is not known rather than claiming a
+/// count of nothing.
+fn count_or_unknown(figure: Option<u64>) -> String {
+    figure.map_or_else(|| "an unstated number of".to_owned(), thousands)
+}
+
+/// The tier a stage names, or the word for a daemon that named none.
+///
+/// `tier` is present from the first stage — the caller resolves the draft route
+/// before the pipeline runs — so the fallback is for a daemon that predates the
+/// field rather than for an ordinary run.
+fn tier_word(tier: Option<Tier>) -> String {
+    tier.map_or_else(|| "an unnamed tier".to_owned(), |tier| tier.to_string())
 }
 
 /// One measurement, in both currencies: `4,097 words / 31 KB`.
@@ -12480,5 +12716,330 @@ mod repo_context_tests {
             &mut state,
         );
         assert_eq!(state.repo_context_resident_bytes, Some(8_192));
+    }
+}
+
+#[cfg(test)]
+mod repo_context_generation_tests {
+    use super::*;
+    use crate::render::RecordingSurface;
+    use teton_protocol::events::GenerationOutcome as G;
+    use teton_protocol::methods::RepoContextStateKind;
+
+    fn subject(replace: bool) -> PermissionSubject {
+        PermissionSubject::RepoContextGeneration {
+            root: "~/dev/teton".to_owned(),
+            path: "TETON.md".to_owned(),
+            replace,
+        }
+    }
+
+    /// **REQ-613 BR-2 / BR-8, AC-10's prompt half.** The offer is two sentences
+    /// — what Teton would do, and the question — and the *question* is a
+    /// different one under `--force`. The root is the daemon's home-relative
+    /// display, and the file is the subject's own `path` rather than a name this
+    /// client hard-coded.
+    ///
+    /// Both spellings are asserted against each other and not only against
+    /// themselves: what BR-8 asks for is that the human can see **which** of the
+    /// two questions is on screen, and a pair of sentences that merely both
+    /// mention `TETON.md` would satisfy neither the rule nor a reader.
+    ///
+    /// **Mutation (run 2026-09-03):** rendering one question for both values of
+    /// `replace` reddened the `overwritten`/`Nothing is at` pair; dropping the
+    /// first sentence's walk-and-call clause reddened the cost assertions.
+    /// Restored both.
+    #[test]
+    fn the_offer_names_both_costs_and_asks_a_different_question_under_force() {
+        let lines = |replace: bool| {
+            let mut surface = RecordingSurface::new();
+            render_consent_subject(Some(&subject(replace)), &mut surface);
+            surface.lines_of(LineKind::Prompt).join("\n")
+        };
+
+        let write = lines(false);
+        let replace = lines(true);
+
+        for (what, rendered) in [("write", &write), ("replace", &replace)] {
+            // BR-2: the prompt names what it will do — and both costs, because
+            // a question that said only "write a file?" would hide the walk and
+            // the model call the human is actually agreeing to.
+            assert!(
+                rendered.contains("TETON.md") && rendered.contains("~/dev/teton"),
+                "the {what} offer names the file and the root; got:\n{rendered}"
+            );
+            assert!(
+                rendered.contains("walk this tree") && rendered.contains("one model call"),
+                "the {what} offer names both costs; got:\n{rendered}"
+            );
+        }
+
+        assert!(
+            write.contains("Nothing is at `TETON.md` now") && write.contains("write it?"),
+            "the ordinary offer asks about a file that is not there; got:\n{write}"
+        );
+        assert!(
+            replace.contains("overwritten") && replace.contains("replace it?"),
+            "`--force` asks about the file that is; got:\n{replace}"
+        );
+        assert!(
+            !write.contains("overwritten"),
+            "the ordinary offer must not threaten a file it is not touching; got:\n{write}"
+        );
+        assert!(
+            !replace.contains("Nothing is at"),
+            "`--force` must not claim the directory is empty; got:\n{replace}"
+        );
+    }
+
+    /// **REQ-613 BR-2 / BR-10, AC-3's client half.** On a surface that takes no
+    /// typed input the offer is refused *without asking*, and the sentence is
+    /// BR-10's one sentence: nothing of the user's input was read, the session
+    /// goes on, and the durable `always` is named as the unattended opt-in.
+    ///
+    /// The gate is asserted beside the sentence because the two are one claim:
+    /// a client that drew the question on a pipe would consume the user's next
+    /// prompt as the answer (LESSON-537), and a client that refused it with the
+    /// *standard* remedy would send them to set a permission level, watch it
+    /// change nothing, and conclude the refusal is a bug.
+    ///
+    /// **Mutation (run 2026-09-03):** returning `ConsentGate::Answerable` for
+    /// this subject on a pipe reddened the gate assertion; dropping the
+    /// `repo_context_generation` arm from `refusal_line` reddened the
+    /// `generate = always` one — the line then read as the generic
+    /// `/permissions full` remedy, which does not settle this question.
+    /// Restored both.
+    #[test]
+    fn a_pipe_refuses_the_offer_without_asking_and_the_line_names_the_durable_opt_in() {
+        assert_eq!(
+            consent_gate(Some(&subject(false)), true),
+            ConsentGate::Answerable,
+            "at a terminal the question is asked"
+        );
+        assert_eq!(
+            consent_gate(Some(&subject(false)), false),
+            ConsentGate::RefuseNoTerminal,
+            "on a pipe it is refused without reading a line"
+        );
+
+        let request = PermissionRequest {
+            request_id: RequestId::from("r1"),
+            tool_name: "repo_context".to_owned(),
+            description: None,
+            options: Vec::new(),
+            subject: Some(subject(false)),
+        };
+        let line = refusal_line(&request, RefusalReason::NoTerminal);
+        assert!(
+            line.contains("writing `TETON.md` in ~/dev/teton"),
+            "the refusal names the question, not the key; got: {line}"
+        );
+        assert!(
+            line.contains("no line of your input was read"),
+            "AC-3's whole point: the next stdin line is still the next prompt; got: {line}"
+        );
+        assert!(
+            line.contains("[context] generate = always"),
+            "BR-10's sentence names the unattended opt-in; got: {line}"
+        );
+
+        // And the verb tracks `--force`, so a user is not told a smaller thing
+        // happened than the one they asked for.
+        let forced = PermissionRequest {
+            subject: Some(subject(true)),
+            ..request
+        };
+        assert!(
+            refusal_line(&forced, RefusalReason::NoTerminal).contains("replacing `TETON.md`"),
+            "a refused `--force` says what it was refusing"
+        );
+    }
+
+    fn generation(outcome: G) -> events::RepoContextGeneration {
+        events::RepoContextGeneration {
+            outcome,
+            root: "~/dev/teton".to_owned(),
+            entries: matches!(outcome, G::Drafted | G::Written | G::Replaced | G::Failed)
+                .then_some(1_840),
+            excluded: matches!(outcome, G::Drafted | G::Written | G::Replaced).then_some(2),
+            draft_bytes: matches!(outcome, G::Drafted | G::Written | G::Replaced).then_some(2_400),
+            tier: Some(Tier::Think),
+            reason: None,
+        }
+    }
+
+    /// **REQ-613 BR-5 / AC-7.** Two stages are progress and ride `/verbose`;
+    /// every stage that *settles* the question prints whether the session asked
+    /// for notices or not, because each of them is a different reason a file the
+    /// user may have been expecting is not there.
+    ///
+    /// `offered` is the one conditional row, and its condition is the daemon's
+    /// `reason`: an offer that drew a prompt needs no line (the prompt is on
+    /// screen), while one that drew none is `generate = always` answering in a
+    /// human's place — and a user reading a file they were never asked about is
+    /// owed the setting's name.
+    ///
+    /// **Mutation (run 2026-09-03):** putting `written` behind the verbose gate
+    /// reddened its quiet row; printing `offered` unconditionally reddened the
+    /// `offered`-with-no-reason row. Restored both.
+    #[test]
+    fn only_the_progress_stages_ride_verbose() {
+        for (outcome, quiet, loud) in [
+            (G::Offered, false, true),
+            (G::Declined, true, true),
+            (G::RefusedUnattended, true, true),
+            (G::DeniedLevel, true, true),
+            (G::Suppressed, true, true),
+            (G::Walking, false, true),
+            (G::Drafted, false, true),
+            (G::Written, true, true),
+            (G::Replaced, true, true),
+            (G::Failed, true, true),
+        ] {
+            let event = generation(outcome);
+            assert_eq!(
+                format_repo_context_generation(&event, false).is_some(),
+                quiet,
+                "{outcome:?} with /verbose off"
+            );
+            assert_eq!(
+                format_repo_context_generation(&event, true).is_some(),
+                loud,
+                "{outcome:?} with /verbose on"
+            );
+        }
+
+        // The conditional row: the same stage, with the daemon's own words for
+        // why nobody was asked, prints in a quiet session.
+        let mut answered_by_config = generation(G::Offered);
+        answered_by_config.reason = Some("[context] generate = always".to_owned());
+        let line = format_repo_context_generation(&answered_by_config, false)
+            .expect("an unasked write is news in any session");
+        assert!(
+            line.contains("without asking") && line.contains("[context] generate = always"),
+            "the setting that answered is the news; got: {line}"
+        );
+    }
+
+    /// **REQ-613 BR-5 / BR-9, AC-7's line.** The drafting line names the tier,
+    /// the one model call, the entries walked and the files a boundary excluded
+    /// — every figure the daemon measured, none of them re-derived here — and
+    /// each terminal stage names its own remedy.
+    ///
+    /// **Mutation (run 2026-09-03):** dropping the entry count from the drafting
+    /// line reddened the first assertion; wording every terminal stage as
+    /// "generation failed" reddened the decline and the suppression, which name
+    /// different doors. Restored both.
+    #[test]
+    fn each_stage_names_its_figures_and_its_remedy() {
+        let drafting =
+            format_repo_context_generation(&generation(G::Drafted), true).expect("a line");
+        assert_eq!(
+            drafting,
+            "context: drafting TETON.md on think — 1 model call, 1,840 entries walked, \
+             2 excluded"
+        );
+
+        let written =
+            format_repo_context_generation(&generation(G::Written), false).expect("a line");
+        assert!(
+            written.contains("TETON.md written in ~/dev/teton")
+                && written.contains("2,400 bytes drafted on think")
+                && written.contains("1,840 entries"),
+            "{written}"
+        );
+        let replaced =
+            format_repo_context_generation(&generation(G::Replaced), false).expect("a line");
+        assert!(
+            replaced.contains("replaced"),
+            "a replacement is a different fact about the same directory: {replaced}"
+        );
+
+        let declined =
+            format_repo_context_generation(&generation(G::Declined), false).expect("a line");
+        assert!(
+            declined.contains("/context init") && declined.contains("generate = never"),
+            "a decline names the on-demand door and the durable stop; got: {declined}"
+        );
+
+        let refused = format_repo_context_generation(&generation(G::RefusedUnattended), false)
+            .expect("a line");
+        assert!(
+            refused.contains("no typed input"),
+            "nobody could be asked, which is not the same as a decline; got: {refused}"
+        );
+
+        // The three that carry the daemon's own words carry them verbatim: this
+        // client mints no second explanation of a fact the daemon typed
+        // (LESSON-557's rule at the surface).
+        for outcome in [G::Suppressed, G::DeniedLevel, G::Failed] {
+            let mut event = generation(outcome);
+            event.reason = Some("a TETON.md of 412 bytes is already there".to_owned());
+            let line = format_repo_context_generation(&event, false).expect("a line");
+            assert!(
+                line.contains("a TETON.md of 412 bytes is already there"),
+                "{outcome:?} must quote the daemon rather than re-word it; got: {line}"
+            );
+        }
+        // AC-10's refusal, end to end at this surface: the size and the flag.
+        let mut already = generation(G::Failed);
+        already.reason =
+            Some("a TETON.md of 412 bytes is already there; `--force` replaces it".to_owned());
+        let line = format_repo_context_generation(&already, false).expect("a line");
+        assert!(
+            line.contains("412 bytes") && line.contains("`--force`"),
+            "AC-10: the refusal names the size and the flag; got: {line}"
+        );
+
+        // A daemon that measured nothing yet says so rather than printing a zero
+        // it never counted (`RepoContextGeneration`'s own rule).
+        let mut unmeasured = generation(G::Drafted);
+        unmeasured.entries = None;
+        unmeasured.excluded = None;
+        assert!(
+            format_repo_context_generation(&unmeasured, true)
+                .expect("a line")
+                .contains("an unstated number of"),
+            "an absent figure is not a measured zero"
+        );
+    }
+
+    /// **REQ-613 BR-1.** The fold that feeds the launch clause: `render_event`
+    /// is the one place a `repo_context_state` passes through, so the state the
+    /// clause reads and the line the user sees come out of one reading.
+    ///
+    /// **Mutation (run 2026-09-03):** dropping the assignment from the
+    /// `RepoContextState` arm left the state `None` after a `loaded` event — and
+    /// `None` is the silence the clause reads as *absent*, so the launch line
+    /// would have promised an offer for a repository that already had notes.
+    /// Restored.
+    #[test]
+    fn the_event_arm_remembers_the_state_the_launch_clause_reads() {
+        let envelope = |event| EventEnvelope::new(1, Some(SessionId::from("s1")), event);
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        assert_eq!(
+            state.repo_context_state, None,
+            "before any event, silence — which on this event means `absent`"
+        );
+
+        render_event(
+            &envelope(Event::RepoContextState(events::RepoContextState {
+                state: RepoContextStateKind::Loaded,
+                source: Some(teton_protocol::methods::RepoContextSource::TetonMd),
+                origin: None,
+                bytes_on_disk: Some(3_120),
+                resident_bytes: 3_120,
+                truncated: false,
+                reason: None,
+            })),
+            &mut surface,
+            &mut state,
+        );
+        assert_eq!(
+            state.repo_context_state,
+            Some(RepoContextStateKind::Loaded),
+            "a repository with notes must not be told an offer is coming"
+        );
     }
 }

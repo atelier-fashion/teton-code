@@ -2109,6 +2109,25 @@ pub struct RepoContextPosture {
     /// no derived route does). Stated so `doctor` can name the worst case BR-7 asks it to
     /// state, without a second copy of the constant on this side of the wire.
     pub max_bytes: u64,
+    /// The durable `[context] generate` posture — whether Teton offers to
+    /// **write** a missing notes file, writes one without asking, or never
+    /// offers (REQ-613 BR-10, ADR-7).
+    ///
+    /// The second half of the `[context]` table, beside [`Self::enabled`]'s
+    /// first: `repo_file` decides whether a file that exists is read, this
+    /// decides whether one that does not is written. `doctor` names it because
+    /// [`RepoContextGenerateMode::Always`] is a standing permission to write
+    /// into a working tree — the same class of durable opt-in as `[skills]
+    /// trusted_project_roots` — and a user is owed one line saying it is on.
+    ///
+    /// **Additive, and absent means "not reported" rather than
+    /// [`RepoContextGenerateMode::Ask`]**, on [`ConfigSnapshot::repo_context`]'s
+    /// own rule: a daemon predating REQ-613 sends no key, and flattening its
+    /// silence to the shipped default would put a posture on `doctor`'s line
+    /// that nothing asserted. A client that reads `None` prints the notes line
+    /// without the clause, which is the pre-REQ-613 line byte for byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generate: Option<RepoContextGenerateMode>,
 }
 
 /// What `doctor` says about transcripts (REQ-611 BR-15, AC-20).
@@ -4809,6 +4828,11 @@ mod tests {
                 repo_context: Some(RepoContextPosture {
                     enabled: true,
                     max_bytes: 8_192,
+                    // REQ-613 BR-10: the posture a daemon that has the field
+                    // always sends, and the value that is *not* the shipped
+                    // default — a fixture built on `ask` would round-trip
+                    // identically to one that dropped the field.
+                    generate: Some(RepoContextGenerateMode::Always),
                 }),
             },
         });
@@ -4848,6 +4872,11 @@ mod tests {
             repo_context: Some(RepoContextPosture {
                 enabled: true,
                 max_bytes: 8_192,
+                // Deliberately absent: this leg's literal is the two-key object
+                // a REQ-612 daemon sends, and REQ-613's own key is additive
+                // *within* the posture on the same rule the posture is additive
+                // on the snapshot.
+                generate: None,
             }),
             ..ConfigSnapshot::default()
         })
@@ -4875,6 +4904,28 @@ mod tests {
         assert!(
             empty.get("repo_context").is_none(),
             "a default snapshot omits the key rather than sending null: {empty}"
+        );
+
+        // REQ-613 BR-10: `generate` is additive *within* the posture on the same
+        // rule the posture is additive on the snapshot, and the distinction it
+        // has to survive is the same one — a REQ-612 daemon reports no posture
+        // for the offer, and `doctor` must say nothing rather than print the
+        // shipped default as though the daemon had claimed it.
+        let with_generate = serde_json::to_string(&RepoContextPosture {
+            enabled: true,
+            max_bytes: 8_192,
+            generate: Some(RepoContextGenerateMode::Never),
+        })
+        .unwrap();
+        assert!(
+            with_generate.contains(r#""generate":"never""#),
+            "the mode travels as its own key: {with_generate}"
+        );
+        let older: RepoContextPosture =
+            serde_json::from_str(r#"{"enabled":true,"max_bytes":8192}"#).unwrap();
+        assert!(
+            older.generate.is_none(),
+            "a REQ-612 daemon's posture must read as `not reported`, never as `ask`"
         );
     }
 

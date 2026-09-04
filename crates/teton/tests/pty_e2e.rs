@@ -1624,6 +1624,14 @@ fn the_acknowledgment_prompt_names_the_root_its_skills_and_what_it_left_out() {
     let project = daemon.root.join("proj");
     std::fs::create_dir_all(&project).unwrap();
     std::fs::write(project.join("Cargo.toml"), "[package]\nname = \"proj\"\n").unwrap();
+    // REQ-613 BR-1: an **empty** `TETON.md`, which is the documented way to say
+    // "no notes here" — the loader counts it present, so no block is resident
+    // and nothing about this session changes, and the generation offer is not
+    // raised. Without it the first prompt of this fixture draws *two* permission
+    // questions at one terminal and the expect script answers the wrong one.
+    // This test is about the acknowledgment, so it says "not here" rather than
+    // arranging to answer an offer it is not testing.
+    std::fs::write(project.join("TETON.md"), "").unwrap();
     // The shadowing one, plus 21 others: 22 against a bound of 20 leaves 2.
     for name in std::iter::once("validate".to_owned()).chain((1..=21).map(|n| format!("s{n:02}"))) {
         let dir = project.join(".claude/skills").join(&name);

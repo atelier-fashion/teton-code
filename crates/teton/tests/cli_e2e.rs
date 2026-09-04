@@ -874,6 +874,30 @@ fn a_refused_config_is_reported_by_the_cli_that_autostarted_the_daemon() {
 //     wording of their fixture prompts rather than for the property under test —
 //     the trap BUG-155 named and this REQ removes.
 
+/// The distinctive phrases of every line `session_ui::format_pressure` can draw
+/// (REQ-586 BR-7).
+///
+/// The two assertions below originally matched the bare `context: ` label, which
+/// was a sound proxy while the pressure lines were the only ungated members of
+/// that family. REQ-613 gave the label a second, unrelated one — the generation
+/// news, which prints `context: no TETON.md was written …` in a **quiet**
+/// session by design (BR-2/BR-9: a file the user might have expected is not
+/// there, and each reason sends them somewhere different). Every session in this
+/// suite runs on a pipe at a project root, so that line is now ordinary output
+/// and the prefix no longer distinguishes "was anything clamped" from "was
+/// anything said".
+///
+/// So the needle is what the assertion was always about: the clamp sentences
+/// themselves. Narrower, not weaker — a pressure line that appeared in a quiet
+/// segment still reddens this, which is the whole claim.
+const CLAMP_PHRASES: &[&str] = &[
+    "dropped to fit the",
+    "middle-elided by",
+    "re-fitted to the",
+    "could not be fitted to the",
+    "adjusted to fit the",
+];
+
 /// The scripted engine's replies, one per turn in order. Each is a distinct
 /// marker, so a test can say *which* turn produced a line — and so a slash
 /// command that leaked into the prompt path shows up as a reply that should not
@@ -1233,7 +1257,7 @@ fn slash_verbose_toggles_the_route_notice_around_real_turns() {
     // and rides its own fixture; what this pins is that the never-gated line is
     // not chatter on every turn.
     assert!(
-        !quiet.contains("context: "),
+        !CLAMP_PHRASES.iter().any(|phrase| quiet.contains(phrase)),
         "a turn that clamped nothing must say nothing about context; segment:\n{quiet}"
     );
 
@@ -1273,7 +1297,9 @@ fn slash_verbose_toggles_the_route_notice_around_real_turns() {
         "a second `/verbose` must hide the notices again; segment:\n{quiet_again}"
     );
     assert!(
-        !quiet_again.contains("context: "),
+        !CLAMP_PHRASES
+            .iter()
+            .any(|phrase| quiet_again.contains(phrase)),
         "still nothing to clamp, so still nothing to say; segment:\n{quiet_again}"
     );
 
@@ -8109,4 +8135,426 @@ fn a_truncated_or_withheld_notes_file_is_announced_and_doctor_advises() {
             advisories[0]
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// REQ-613 — generating the notes when the repository has none (TASK-387)
+// ---------------------------------------------------------------------------
+//
+// AC → test map for this section:
+//
+//   BR-2 + BR-10 + AC-3 (the pipe refuses without reading stdin; `always` writes
+//   on the same pipe)
+//       → `a_piped_session_refuses_the_generation_offer_without_reading_stdin_and_always_writes_instead`
+//   BR-8 + AC-10 (a file present refuses naming its size and `--force`; the
+//   shell door writes the bytes the session door writes)
+//       → `context_init_refuses_without_force_and_the_shell_door_writes_the_same_bytes`
+//
+// Two properties of the fixture make these legs mean what they say:
+//
+//   * The scripted engine answers the `draft` duty **off script**, from its own
+//     `SCRIPTED_DRAFT` constant, so the drafted body is deterministic and does
+//     not consume one of `TURN_REPLIES` — which is what lets a leg count turns
+//     and compare bytes at the same time.
+//   * `run_cli_process` always gives the CLI a **pipe** for stdin. So every
+//     session here is unattended by construction: under `generate = ask` the
+//     offer is refused without a line being read, and `generate = always` is the
+//     only way a fixture reaches the write. That is not a limitation of the
+//     harness — it is AC-3's subject.
+
+/// A project fixture under `root` with **no** notes file: a `Cargo.toml`, a
+/// `src/main.rs`, and a README, so the evidence walk has a tree, a manifest and
+/// an entry point to draft from.
+///
+/// A `Cargo.toml` because only a `project`-kind root raises the offer at all
+/// (BR-1), and the rest because a walk that found nothing to draft from ends in
+/// `Failed { NothingToDraft }` — an outcome a fixture cannot tell from a broken
+/// pipeline.
+fn bare_project(root: &Path, name: &str) -> PathBuf {
+    let project = root.join(name);
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    std::fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"bare\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("README.md"),
+        "# bare\n\nA fixture repository.\n",
+    )
+    .unwrap();
+    std::fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
+    project
+}
+
+/// The `[context]` table a fixture needs to reach the write from a pipe.
+const GENERATE_ALWAYS: &str = "[context]\ngenerate = \"always\"\n\n";
+
+/// **REQ-613 BR-2 / BR-10 / AC-3.** At `guarded` on a pipe the client refuses
+/// the offer **without reading a line** — the next stdin line is still the next
+/// prompt — one line says so, and no file is written. With `generate = always`
+/// on the same pipe the file is written instead.
+///
+/// The load-bearing assertion is the **turn count**, not the refusal text. AC-3
+/// is a claim about stdin: a client that drew the question on a pipe would eat
+/// the user's second prompt as the answer to it (LESSON-537), and the only way
+/// to see that from outside the process is to send two prompts and require two
+/// distinct scripted replies. A test that read the refusal line alone would pass
+/// on exactly the build the AC exists to forbid.
+///
+/// The second leg is a different daemon rather than a `config/set` on the first,
+/// because `[context] generate` is read when the offer is raised and the point
+/// of the leg is the **same pipe, different posture**: same fixture shape, same
+/// unattended session, and the only difference is the durable key.
+///
+/// The shell door rides the first leg rather than the second because it is the
+/// same claim about the same posture: the task's own note says `teton context
+/// init` "answers the gate on its own TTY through the ordinary prompter, or
+/// refuses on a pipe as the session would", and this is the pipe. It is also the
+/// only leg that exercises the one-shot context's `answer_permissions: true` —
+/// a context that answered nothing would leave the daemon's gate waiting on a
+/// client that had already printed "in another session".
+///
+/// **Mutation (run 2026-09-03):** making `consent_gate` answer `Answerable` for
+/// `RepoContextGeneration` reddened the two-replies assertion — the session then
+/// consumed `second` as the answer to the prompt and ran one turn. Dropping the
+/// `repo_context_generation` arm from `refusal_line` reddened both the session's
+/// and the shell door's sentence assertions. Restored both.
+#[test]
+fn a_piped_session_refuses_the_generation_offer_without_reading_stdin_and_always_writes_instead() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+
+    // Leg one: the shipped posture. Nobody can be asked, so nothing is written
+    // and nothing is consumed.
+    {
+        let daemon = TestDaemon::spawn_scripted(&daemon_bin, TURN_REPLIES);
+        let project = bare_project(&daemon.root, "asked");
+        let notes = project.join("TETON.md");
+
+        let (stdout, stderr, status) = daemon.run_cli_from(
+            &teton,
+            &["--cwd", project.to_str().unwrap()],
+            "first\nsecond\n",
+            Some(&daemon.root),
+            &[],
+        );
+        assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+        // The refusal, in BR-10's one sentence: what was refused, that no input
+        // was read for it, and the durable opt-in that settles it.
+        assert!(
+            stdout.contains("writing `TETON.md`"),
+            "the refusal names the question rather than the permission key; \
+             stdout:\n{stdout}\ndaemon log:\n{}",
+            daemon.log()
+        );
+        assert!(
+            stdout.contains("no line of your input was read"),
+            "AC-3: the client must say it consumed nothing; stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("[context] generate = always"),
+            "BR-10's unattended posture is one sentence and names the opt-in; \
+             stdout:\n{stdout}"
+        );
+
+        // AC-3's other half, and the one a reader of the line alone cannot see:
+        // **both** prompts ran, so the second stdin line was still a prompt.
+        assert!(
+            stdout.contains(TURN_REPLIES[0]) && stdout.contains(TURN_REPLIES[1]),
+            "the offer ate a prompt: the session must have run one turn per stdin \
+             line; stdout:\n{stdout}\ndaemon log:\n{}",
+            daemon.log()
+        );
+
+        assert!(
+            !notes.exists(),
+            "a refused offer must leave no file at {}",
+            notes.display()
+        );
+
+        // The shell door, on the same pipe and the same posture: `teton context
+        // init` creates its own session at the directory it was pointed at and
+        // then inherits the session's refusal rather than re-implementing it
+        // (ADR-7). It is the explicit act, so it is not suppressed by anything —
+        // and it is still refused, because explicit is not the same as
+        // consented and nobody is at this terminal either.
+        let shell = daemon.run_cli(
+            &teton,
+            &["--cwd", project.to_str().unwrap(), "context", "init"],
+        );
+        assert!(
+            shell.contains("writing `TETON.md`")
+                && shell.contains("no line of your input was read"),
+            "the shell door answers the gate on its own surface and refuses like the \
+             session does; output:\n{shell}\ndaemon log:\n{}",
+            daemon.log()
+        );
+        assert!(
+            !notes.exists(),
+            "a refused `teton context init` must leave no file either"
+        );
+    }
+
+    // Leg two: the automation opt-in, on the same shape of pipe.
+    {
+        let daemon =
+            TestDaemon::spawn_scripted_with_config(&daemon_bin, TURN_REPLIES, GENERATE_ALWAYS);
+        let project = bare_project(&daemon.root, "always");
+        let notes = project.join("TETON.md");
+
+        let (stdout, stderr, status) = daemon.run_cli_from(
+            &teton,
+            &["--cwd", project.to_str().unwrap()],
+            "first\n",
+            Some(&daemon.root),
+            &[],
+        );
+        assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+        let written = std::fs::read_to_string(&notes).unwrap_or_else(|err| {
+            panic!(
+                "BR-10: `generate = always` writes on an unattended session; {err}\n\
+                 stdout:\n{stdout}\ndaemon log:\n{}",
+                daemon.log()
+            )
+        });
+        // BR-6's header, so a reader of the file knows who wrote it — and the
+        // sections the draft prompt asks for, so this is the pipeline's output
+        // and not a placeholder.
+        assert!(
+            written.starts_with("> Generated by Teton on "),
+            "the file opens with the header BR-6 requires; got:\n{written}"
+        );
+        assert!(
+            written.contains("## Purpose") && written.contains("## Where to look"),
+            "the body is the drafted file; got:\n{written}"
+        );
+
+        // And the user was told, in a quiet session, that a file was written
+        // without them being asked — the setting's name is the news.
+        assert!(
+            stdout.contains("without asking") && stdout.contains("[context] generate = always"),
+            "a write nobody approved is owed the setting that approved it; \
+             stdout:\n{stdout}\ndaemon log:\n{}",
+            daemon.log()
+        );
+        assert!(
+            stdout.contains("TETON.md written in"),
+            "the terminal stage prints in a quiet session; stdout:\n{stdout}"
+        );
+    }
+}
+
+/// **REQ-613 BR-8 / AC-10.** `/context init` in a project that already has notes
+/// refuses, naming the file's size and `--force`; and `teton context init` on
+/// the shell drives the daemon to write **the same bytes** the in-session
+/// command writes for the same evidence.
+///
+/// # Why the two doors run against one directory, in turn
+///
+/// AC-10 says "the same evidence", and the only way to have literally the same
+/// evidence is to have literally the same directory: the tree, the manifest, the
+/// README and the entry point are all inputs to the draft prompt, and two
+/// fixtures that merely *look* alike would make a byte comparison a claim about
+/// the fixture builder. So the session door writes, the test records the bytes
+/// and removes the file — restoring the tree the first run saw — and the shell
+/// door writes again into the same directory.
+///
+/// The comparison is meaningful because the scripted engine answers a `draft`
+/// duty off script: the body is a constant, so what is actually being compared
+/// is everything *this* feature composes around it — the header, the tier word,
+/// the cut facts, and the bounding — from two entry points.
+///
+/// `generate = always` for the same reason the leg above needs it: every CLI in
+/// this suite runs on a pipe, so it is the only posture under which either door
+/// reaches the write at all. It changes nothing about what `init` does; it
+/// answers the question the prompt would have asked.
+///
+/// **Mutation (run 2026-09-03):** dropping the `cwd` from `run_context_init`'s
+/// `session/create` reddened the shell-door write — the one-shot session then
+/// anchored to the daemon's own directory (launchd gives it `/`), which is not a
+/// project, and nothing was written at all. Dropping the daemon's `reason` from
+/// the `Failed` line reddened the size-and-flag assertion. Restored both.
+#[test]
+fn context_init_refuses_without_force_and_the_shell_door_writes_the_same_bytes() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+    let daemon = TestDaemon::spawn_scripted_with_config(&daemon_bin, TURN_REPLIES, GENERATE_ALWAYS);
+
+    // --- the no-clobber refusal (AC-10's first clause) ----------------------
+    let occupied = bare_project(&daemon.root, "occupied");
+    let existing = "# occupied\n\nWritten by a person, not by Teton.\n";
+    std::fs::write(occupied.join("TETON.md"), existing).unwrap();
+
+    let (stdout, stderr, status) = daemon.run_cli_from(
+        &teton,
+        &["--cwd", occupied.to_str().unwrap()],
+        "/context init\n",
+        Some(&daemon.root),
+        &[],
+    );
+    assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains(&format!("{} bytes is already there", existing.len()))
+            && stdout.contains("`--force`"),
+        "AC-10: the refusal names the size and the flag; stdout:\n{stdout}\n\
+         daemon log:\n{}",
+        daemon.log()
+    );
+    assert_eq!(
+        std::fs::read_to_string(occupied.join("TETON.md")).unwrap(),
+        existing,
+        "BR-6: a refused `init` must not touch the file it refused to clobber"
+    );
+
+    // --- the same bytes out of both doors (AC-10's third clause) ------------
+    let project = bare_project(&daemon.root, "both");
+    let notes = project.join("TETON.md");
+
+    let (stdout, stderr, status) = daemon.run_cli_from(
+        &teton,
+        &["--cwd", project.to_str().unwrap()],
+        "/context init\n",
+        Some(&daemon.root),
+        &[],
+    );
+    assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let from_the_session = std::fs::read_to_string(&notes).unwrap_or_else(|err| {
+        panic!(
+            "`/context init` writes the file; {err}\nstdout:\n{stdout}\ndaemon log:\n{}",
+            daemon.log()
+        )
+    });
+    assert!(
+        stdout.contains("TETON.md written in"),
+        "the session door reports the write; stdout:\n{stdout}"
+    );
+    // BR-7: the file is loaded the same call, and `/context` names who wrote it.
+    assert!(
+        stdout.contains("origin: generated"),
+        "BR-7: the routed answer says the file is Teton's; stdout:\n{stdout}"
+    );
+
+    // Restore the tree the first run walked, so the second run sees the same
+    // evidence rather than a directory that now contains its own output.
+    std::fs::remove_file(&notes).unwrap();
+
+    let shell = daemon.run_cli(
+        &teton,
+        &["--cwd", project.to_str().unwrap(), "context", "init"],
+    );
+    let from_the_shell = std::fs::read_to_string(&notes).unwrap_or_else(|err| {
+        panic!(
+            "`teton context init` writes the file; {err}\noutput:\n{shell}\n\
+             daemon log:\n{}",
+            daemon.log()
+        )
+    });
+    assert!(
+        shell.contains("TETON.md written in"),
+        "the shell door reports the write on its own surface; output:\n{shell}"
+    );
+
+    assert_eq!(
+        from_the_session, from_the_shell,
+        "AC-10: one pipeline behind two doors — the shell form must produce the \
+         bytes the session form produces for the same evidence"
+    );
+}
+
+/// **REQ-613 BR-10 / AC-4.** `teton context generate <mode>` writes the durable
+/// key through `config/set` — read back off `config/get`, never echoed — and the
+/// two doctor advisories report the two postures a user meant once and may not
+/// mean now.
+///
+/// One daemon, both postures, because the claim is about a key that *moves*: a
+/// fixture that only ever saw one value would prove the line renders, not that
+/// the write landed. `config.toml` is compared on disk for the same reason the
+/// REQ-612 leg compares it — a durable write is a claim about a file, and the
+/// only honest way to check one is to read the file.
+///
+/// The two advisories are drawn from different surfaces, and that split is the
+/// design rather than the fixture's convenience: `always` is a standing
+/// permission on the **machine**, so the shell's `teton doctor` — which owns no
+/// session — must name it; `never` is only worth saying at a root that has no
+/// notes, so it is `/doctor` inside a session that does.
+///
+/// **Mutation (run 2026-09-03):** making the `Generate` arm of `context_on` send
+/// no `ConfigUpdate` at all reddened the on-disk comparison — the posture line
+/// still rendered, off a key nothing had moved. Moving the `always` advisory
+/// into the session-scoped pass reddened the shell `doctor` leg, which is the
+/// whole reason it is not there. Inverting the `never` advisory's posture guard
+/// reddened the `/doctor` leg. Restored all three.
+#[test]
+fn teton_context_generate_writes_the_durable_key_and_doctor_reports_both_postures() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+    let daemon = TestDaemon::spawn_scripted(&daemon_bin, TURN_REPLIES);
+    let project = bare_project(&daemon.root, "posture");
+    let config_path = daemon.root.join("config.toml");
+    let before = std::fs::read_to_string(&config_path).expect("the fixture config is readable");
+
+    // The shipped posture, before anything is written: the clause is there and
+    // it says `ask`.
+    let shipped = daemon.run_cli(&teton, &["context", "status"]);
+    assert!(
+        shipped.contains("repo notes: on (default)") && shipped.contains("generate = ask"),
+        "the posture line carries the offer setting; output:\n{shipped}"
+    );
+
+    // The write, read back off `config/get` rather than echoed.
+    let never = daemon.run_cli(&teton, &["context", "generate", "never"]);
+    assert!(
+        never.contains("generate = never"),
+        "`teton context generate never` reports the posture the daemon holds; \
+         output:\n{never}"
+    );
+    let after = std::fs::read_to_string(&config_path).expect("the fixture config is readable");
+    assert_ne!(before, after, "the durable posture is the half that writes");
+    assert!(
+        after.contains("generate = \"never\""),
+        "AC-4: the key lands in config.toml; got:\n{after}"
+    );
+
+    // The `never` advisory, from the surface that has a root to judge: this one
+    // has no notes, so the only door left is `/context init`.
+    let (stdout, stderr, status) = daemon.run_cli_from(
+        &teton,
+        &["--cwd", project.to_str().unwrap()],
+        "/doctor\n",
+        Some(&daemon.root),
+        &[],
+    );
+    assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains(ADVISORY)
+            && stdout.contains("generate = never")
+            && stdout.contains("/context init"),
+        "AC-4: `never` at a root with no notes names the door that is left; \
+         stdout:\n{stdout}"
+    );
+
+    // And the other posture, on the surface that needs no session at all.
+    let always = daemon.run_cli(&teton, &["context", "generate", "always"]);
+    assert!(always.contains("generate = always"), "output:\n{always}");
+    let doctor = daemon.run_cli(&teton, &["doctor"]);
+    assert!(
+        doctor.contains(ADVISORY) && doctor.contains("standing permission"),
+        "AC-4: `always` is named wherever it is set, session or no session; \
+         output:\n{doctor}"
+    );
+    assert!(
+        !doctor.contains("only door left"),
+        "the two advisories are two reports, not one: {doctor}"
+    );
+
+    // An advisory is still an advisory: REQ-578's posture, unchanged.
+    let (_out, _err, doctor_status) =
+        daemon.run_cli_from(&teton, &["doctor"], "", Some(&daemon.root), &[]);
+    assert!(
+        doctor_status.success(),
+        "a posture advisory must not change doctor's exit status"
+    );
 }

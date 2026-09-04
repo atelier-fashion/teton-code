@@ -512,6 +512,24 @@ pub(super) fn snapshot_from_config(
         repo_context: Some(teton_protocol::methods::RepoContextPosture {
             enabled: config.context.repo_file,
             max_bytes: crate::repo_context::REPO_CONTEXT_MAX_BYTES as u64,
+            // REQ-613 BR-10: the other half of the `[context]` table, read from
+            // the config's own key beside `repo_file` for the reason above it.
+            // Mapped by an exhaustive `match` and not a `From`, which is the
+            // same discipline `apply_update` takes at the other end of the same
+            // pair of enums: a fourth posture added to either crate is a compile
+            // error at both boundaries rather than a value quietly
+            // reinterpreted at one of them.
+            generate: Some(match config.context.generate {
+                teton_core::config::GenerateMode::Ask => {
+                    teton_protocol::methods::RepoContextGenerateMode::Ask
+                }
+                teton_core::config::GenerateMode::Always => {
+                    teton_protocol::methods::RepoContextGenerateMode::Always
+                }
+                teton_core::config::GenerateMode::Never => {
+                    teton_protocol::methods::RepoContextGenerateMode::Never
+                }
+            }),
         }),
     }
 }

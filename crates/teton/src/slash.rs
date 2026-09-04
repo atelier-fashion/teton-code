@@ -109,7 +109,8 @@ use teton_protocol::methods::{
     WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams, WebRefreshResult,
 };
 use teton_protocol::methods::{
-    ContextAction, RepoContextStateKind, SessionContextParams, SessionContextResult,
+    ContextAction, RepoContextOrigin, RepoContextStateKind, SessionContextParams,
+    SessionContextResult,
 };
 use teton_protocol::methods::{SessionTranscriptParams, SessionTranscriptResult, TranscriptAction};
 use teton_protocol::permissions::PermissionLevel;
@@ -682,6 +683,32 @@ const COMMANDS: &[CommandSpec] = &[
         args: Args::Optional,
         mirror: None,
         handler: handle_context,
+    },
+    // REQ-613 BR-8: the third verb of the same family, and a row of its own for
+    // the reason `/model set` is one beside `/model` — [`split_name`]'s longest
+    // match routes `/context init --force` here without the row above ever
+    // seeing the argument, and `/help` lists a command a user can otherwise only
+    // learn from the README.
+    //
+    // `Args::Optional` because both forms are real commands: bare, it writes a
+    // file that is not there; with `--force`, it replaces one that is. The flag
+    // is parsed in the handler and not by the table, which polices arity and not
+    // vocabulary.
+    //
+    // `mirror: None` like the row above it. `teton context init` exists and is
+    // the *same* grammar, unlike `teton context enable`, but a mirrored row is
+    // one this session runs by re-parsing a `teton …` line through
+    // [`cli_rows`], and this one is a session command that happens to have a
+    // shell twin — the twin creates its own session, which is precisely what a
+    // row inside a session must not do.
+    CommandSpec {
+        name: "context init",
+        aliases: &[],
+        summary: "Write this repository's TETON.md now: /context init [--force] — walk the \
+                  tree, spend one model call, write the file (asks first).",
+        args: Args::Optional,
+        mirror: None,
+        handler: handle_context_init,
     },
     // REQ-560's permission level. Placed beside `/clear` and `/verbose` because
     // all three are about *this session* rather than about the machine's
@@ -1511,6 +1538,23 @@ pub fn run_cli_line(
             crate::ContextCli::Enable => "enable".to_owned(),
             crate::ContextCli::Disable => "disable".to_owned(),
             crate::ContextCli::Status => "status".to_owned(),
+            // REQ-613 BR-8: `init` is the **reachable** arm of this match, and
+            // the only one in the family. It is not shell-only — its session
+            // form is `/context init`, a row of this table with its own handler
+            // — so a typed `teton context init --force` walks clap's tree to the
+            // leaf `context init`, lands here, and hands the row exactly the
+            // argument the row's own grammar takes. The name is not repeated:
+            // `dispatch` is called with the row's name, and `row_args` is what
+            // follows it.
+            crate::ContextCli::Init { force } => if force { "--force" } else { "" }.to_owned(),
+            // `generate` is shell-only (it writes `config.toml`), so the
+            // classifier refuses it before this parse — unreachable for the
+            // reason the three above are, and named for the same reason.
+            crate::ContextCli::Generate { mode } => match mode {
+                crate::CliGenerateMode::Ask => "ask".to_owned(),
+                crate::CliGenerateMode::Always => "always".to_owned(),
+                crate::CliGenerateMode::Never => "never".to_owned(),
+            },
         },
         Some(crate::Command::Model {
             action: crate::ModelAction::Set { name },
@@ -2796,12 +2840,100 @@ fn handle_context(
                 LineKind::Error,
                 &format!(
                     "unknown context argument `{other}` — use `/context`, \
-                     `/context on` or `/context off`."
+                     `/context on`, `/context off` or `/context init [--force]`."
                 ),
             );
             return Ok(CommandOutcome::Continue);
         }
     };
+    send_context_action(conn, ctx, session_id, action)?;
+    Ok(CommandOutcome::Continue)
+}
+
+/// `/context init [--force]` (REQ-613 BR-8, architecture ADR-7).
+///
+/// The explicit door onto the **same** pipeline the first prompt's offer takes.
+/// It still asks — explicit is not the same as consented, and a `plan` session
+/// is still refused — and it runs even where `[context] generate = never`,
+/// because that setting suppresses Teton's *offer* and this is the user's own
+/// act.
+///
+/// **It never calls `config/set`**, which is [`handle_context`]'s rule reaching
+/// the third verb unchanged: writing a file is not changing a default, and a
+/// row inside a session must not move a machine-wide key (REQ-611 BR-2's split).
+///
+/// The flag is parsed here rather than in the table because it is vocabulary,
+/// not arity — and a typo is worth one line naming the one flag this row takes
+/// rather than a round trip that ends in `INVALID_PARAMS`.
+fn handle_context_init(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    args: &str,
+) -> anyhow::Result<CommandOutcome> {
+    let Some(session_id) = ctx.session_id.clone() else {
+        ctx.surface.line(LineKind::Error, CONTEXT_NEEDS_A_SESSION);
+        return Ok(CommandOutcome::Continue);
+    };
+    let force = match args.trim() {
+        "" => false,
+        "--force" => true,
+        other => {
+            ctx.surface.line(
+                LineKind::Error,
+                &format!(
+                    "unknown `/context init` argument `{other}` — the only flag it takes is \
+                     `--force`, which replaces an existing TETON.md."
+                ),
+            );
+            return Ok(CommandOutcome::Continue);
+        }
+    };
+    context_init_on(conn, ctx, session_id, force)?;
+    Ok(CommandOutcome::Continue)
+}
+
+/// The body both `init` doors run (REQ-613 ADR-7).
+///
+/// `/context init` reaches it with the session it is already in;
+/// `teton context init` reaches it with the one-shot session it just created.
+/// One call site of `session/context { action: init }` and one renderer, which
+/// is what keeps the shell form from drifting into sending different params or
+/// printing a different answer (REQ-582 BR-2/BR-3's rule, one feature over).
+///
+/// # Errors
+///
+/// Propagates a transport error. A daemon that *answers* — with a refusal, or
+/// with "no such method" — is reported on the surface and returns `Ok`.
+pub(crate) fn context_init_on(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    session_id: SessionId,
+    force: bool,
+) -> anyhow::Result<()> {
+    send_context_action(conn, ctx, session_id, ContextAction::Init { force })
+}
+
+/// One `session/context` call and its rendering — the one place either lives.
+///
+/// Four actions, one renderer, for [`render_context`]'s own reason: the answer
+/// is always the state the session is in afterwards, and a per-action rendering
+/// would be four chances to word one state four ways.
+///
+/// What the outcome of an `init` did is deliberately **not** rendered here. The
+/// daemon publishes it as `repo_context_generation` to every attached client,
+/// and this one renders that event like any other — so the line a typing user
+/// reads is the same line their second terminal reads, and there is no second
+/// composer of it (LESSON-456).
+///
+/// # Errors
+///
+/// Propagates a transport error.
+fn send_context_action(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    session_id: SessionId,
+    action: ContextAction,
+) -> anyhow::Result<()> {
     match conn.call(SessionContextParams { session_id, action }, ctx)? {
         Ok(result) => {
             for line in render_context(&result) {
@@ -2816,7 +2948,7 @@ fn handle_context(
             &format!("the repository notes are unavailable: {}", err.message),
         ),
     }
-    Ok(CommandOutcome::Continue)
+    Ok(())
 }
 
 /// The lines `/context` draws: the state first, then — when there are byte
@@ -2877,6 +3009,18 @@ fn render_context(result: &SessionContextResult) -> Vec<String> {
         ));
         if result.truncated {
             line.push_str(" (truncated)");
+        }
+        // REQ-613 BR-7: who wrote it, when this call is in a position to know.
+        // Only an `init` that actually wrote populates it — the daemon leaves it
+        // absent everywhere else, because nothing on disk records authorship and
+        // a `/context` a turn later must not claim it does. So the clause is on
+        // the answer to the write, which is the one moment the fact is true and
+        // known.
+        if let Some(origin) = result.origin {
+            line.push_str(match origin {
+                RepoContextOrigin::Generated => " — origin: generated",
+                RepoContextOrigin::Authored => " — origin: authored",
+            });
         }
         lines.push(line);
     }
@@ -3792,6 +3936,12 @@ mod tests {
             // REQ-584 BR-9: the locator's user surface, declared here first for
             // the reason this list exists — a new row is a spec decision.
             "projects",
+            // REQ-613 BR-8: the on-demand write, a row of its own beside the
+            // switch for `/model set`'s reason — the longest match routes
+            // `/context init --force` here without the `context` row ever seeing
+            // the argument, and `/help` lists it. Declared here because a new
+            // row is a spec decision rather than a drive-by.
+            "context init",
         ];
         for expected in promised {
             assert!(
@@ -6506,6 +6656,7 @@ mod tests {
                 "context enable",
                 "context disable",
                 "context status",
+                "context generate",
             ],
             "a new shell-only command needs its own reason in `refusal_for_path`"
         );
@@ -6533,6 +6684,31 @@ mod tests {
                 "{line}"
             );
         }
+        // REQ-613: the fourth entry, and the one that would have been *wrong*
+        // under the sentence above it. `generate` is not the durable half of the
+        // on/off switch — it decides whether a file that is missing gets
+        // written — so a refusal pointing at `/context on` would send a user to
+        // a command that answers a different question. The session form it names
+        // is `/context init`.
+        let generate = cli_rows::refusal_for_path(&["context", "generate"]);
+        assert!(
+            generate.contains("generate") && generate.contains("/context init"),
+            "{generate}"
+        );
+        assert!(
+            !generate.contains("/context on"),
+            "the offer posture is not the read switch: {generate}"
+        );
+
+        // REQ-613 BR-8, the other direction: `teton context init` is **not**
+        // shell-only. It is the one verb of this family whose session form is a
+        // row of the table, so a typed `teton context init` must reach that row
+        // rather than a refusal.
+        assert!(
+            !cli_rows::SHELL_ONLY.contains(&"context init"),
+            "`/context init` is a session row; exempting its shell twin would make the \
+             typed line a refusal instead of the command"
+        );
     }
 
     /// **ADR-8, reverse direction.** A line that opens with `teton` but names no
