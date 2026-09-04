@@ -1,7 +1,7 @@
 ---
 id: TASK-390
 title: "The pure window-fit probe: n_ctx_train, KV type, admissible RAM"
-status: draft
+status: complete
 parent: REQ-616
 created: 2026-09-04
 updated: 2026-09-04
