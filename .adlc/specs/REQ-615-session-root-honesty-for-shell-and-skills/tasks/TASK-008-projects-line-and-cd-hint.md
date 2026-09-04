@@ -1,7 +1,7 @@
 ---
 id: TASK-008
 title: "The projects tool names the mechanism, and a typed `cd` is offered as `/cd`"
-status: draft
+status: complete
 parent: REQ-615
 created: 2026-09-04
 updated: 2026-09-04

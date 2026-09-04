@@ -938,6 +938,52 @@ const COMMANDS: &[CommandSpec] = &[
 /// output lifetime is the *input line's* (`'a`), and [`Input::Skill`] owns its
 /// two strings. A snapshot is replaced on `/cd`, so a name that outlived one
 /// would name a skill the session no longer has.
+/// REQ-615 BR-7's hint, or `None` when the line is not a bare `cd`.
+///
+/// A `cd` typed as a prompt is almost always a `/cd`: the 2026-09-04 session
+/// began with exactly that line, the model correctly treated it as text, and
+/// every tool call for the rest of the session ran in the wrong directory.
+///
+/// # Pure, and gated at the call site
+///
+/// This takes no context. The piped exemption is an `if ctx.typed_input` in the
+/// entry loop, which is where that flag already lives — one `IsTerminal` read
+/// at the edge, the same gate REQ-584's writing commands use. Making it a
+/// `classify` arm instead would put a terminal fact inside the one function
+/// whose whole value is that it has none, and a piped `cd x` must still reach
+/// the model unchanged.
+///
+/// # What it matches
+///
+/// `^cd(\s+\S+)?\s*$` — the canonical spelling, stated here and referenced by
+/// the spec's PromptHint row. A bare `cd`, or `cd` with exactly one argument.
+/// `cd a b` and `cd x && y` are not offered: they are not what `/cd` would do,
+/// and a hint that pointed at a different act would be worse than silence.
+/// `cdto /x` is not matched either — the `cd` must be the whole word.
+#[must_use]
+pub fn cd_as_prompt_hint(input: &str) -> Option<&'static str> {
+    let line = input.trim();
+    let rest = line.strip_prefix("cd")?;
+    // Either nothing follows, or whitespace and exactly one more word.
+    let matches = match rest.trim_start() {
+        "" if rest.is_empty() || rest.trim().is_empty() => true,
+        argument => {
+            // `cdto` — no whitespace between `cd` and the rest — is not a `cd`.
+            !rest.starts_with(|c: char| !c.is_whitespace())
+                && argument.split_whitespace().count() == 1
+        }
+    };
+    matches.then_some(CD_AS_PROMPT_HINT)
+}
+
+/// The line BR-7 prints instead of sending the prompt.
+///
+/// A constant so the test that pins it and the loop that prints it are one
+/// string, for [`PROJECTS_ARE_THE_USERS_TO_MOVE_TO`]'s reason.
+pub const CD_AS_PROMPT_HINT: &str =
+    "`cd` is a session command here: `/cd <path>` moves the root (`/cd` alone \
+     shows it). Send as a prompt anyway with `//cd …`.";
+
 #[must_use]
 pub fn classify<'a>(input: &'a str, registry: &SkillSnapshot) -> Input<'a> {
     let Some(rest) = input.strip_prefix('/') else {
@@ -3552,6 +3598,68 @@ fn handle_quit(
 
 #[cfg(test)]
 mod tests {
+
+    /// **REQ-615 BR-7 / AC-6: the hint matches a bare `cd` and nothing else.**
+    ///
+    /// The benign half is the whole risk. This predicate stands between the
+    /// user and the model on every typed line, and a false positive silently
+    /// swallows a prompt — a far worse failure than the one it fixes, because
+    /// the user gets no turn and no explanation they asked for.
+    ///
+    /// Mutation: drop the one-argument bound (`cd a b` starts matching); drop
+    /// the whitespace check (`cdto /x` starts matching). Either goes red.
+    #[test]
+    fn the_cd_hint_matches_a_bare_cd_and_nothing_else() {
+        for line in ["cd", "cd /teton-code", "cd ~/GitHub/teton-code", "  cd /x  "] {
+            assert!(
+                cd_as_prompt_hint(line).is_some(),
+                "`{line}` is a `cd` and should be offered as `/cd`"
+            );
+        }
+        for line in [
+            "cd a b",
+            "cd x && pwd",
+            "cdto /x",
+            // A bare `cdto` is the case the whitespace check exists for: strip
+            // "cd" and "to" is one word, so a count-only rule matches it.
+            "cdto",
+            "cdx",
+            "cd; ls",
+            "change directory to /x",
+            "/cd /x",
+            "what does cd do",
+            "",
+        ] {
+            assert!(
+                cd_as_prompt_hint(line).is_none(),
+                "`{line}` must reach the model untouched — swallowing a prompt \
+                 is worse than the defect this fixes"
+            );
+        }
+        assert!(cd_as_prompt_hint("cd /x").unwrap().contains("/cd <path>"));
+        assert!(cd_as_prompt_hint("cd /x").unwrap().contains("//cd"));
+    }
+
+    /// **REQ-615 AC-6: `//cd …` sends `/cd …` as prompt text.**
+    ///
+    /// Asserted rather than changed: `classify` has stripped one leading `/`
+    /// and returned `EscapedPrompt` since REQ-582, so the escape BR-7's hint
+    /// points at already works. A test is what stops the hint outliving it.
+    ///
+    /// Mutation: remove the `rest.starts_with('/')` arm from `classify` — this
+    /// goes red.
+    #[test]
+    fn the_double_slash_escape_sends_the_slash_command_as_text() {
+        let empty = SkillSnapshot::default();
+        assert!(
+            matches!(classify("//cd /teton-code", &empty), Input::EscapedPrompt(rest)
+                if rest == "/cd /teton-code"),
+            "the hint tells the user to type `//cd …`; that must send `/cd …`"
+        );
+        // And a bare `cd` line is not a command — the hint is the loop's, and
+        // the classifier keeps knowing nothing about how a line arrived.
+        assert!(matches!(classify("cd /teton-code", &empty), Input::Prompt(_)));
+    }
     use super::*;
     use crate::prompt::ScriptedPrompter;
     use crate::render::RecordingSurface;

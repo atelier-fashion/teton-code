@@ -1346,6 +1346,22 @@ fn run_session(
             if text.is_empty() {
                 continue;
             }
+            // REQ-615 BR-7: a line that is a bare `cd` is almost always a
+            // `/cd`. It is not sent — the model would correctly treat it as
+            // text, which is exactly what happened on 2026-09-04 and left the
+            // rest of that session running in the wrong directory.
+            //
+            // **Typed input only.** A piped `cd x` goes to the model unchanged
+            // (REQ-584's rule for the writing commands, applied here): nobody is
+            // at the terminal to read a hint, and a script that meant to send
+            // the words must still be able to. `//cd …` is the typed escape and
+            // needs no code — `classify` already returns `EscapedPrompt`.
+            if ctx.typed_input {
+                if let Some(hint) = slash::cd_as_prompt_hint(text) {
+                    ctx.surface.line(LineKind::Notice, hint);
+                    continue;
+                }
+            }
             // REQ-585 ADR-2: a `/cd` that moved this session re-derives the
             // project half of the registry, so the snapshot is refreshed here —
             // after the line was read and before it is classified, which is the
