@@ -41,8 +41,8 @@ use std::sync::{Arc, Mutex};
 
 use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams};
 use teton_protocol::events::{
-    BudgetBound, ContextPressure, ContextPressureKind, Event, SessionUpdatePayload,
-    TurnRefusedAnchorsExceedBudget,
+    BudgetBound, ContextCompacted, ContextPressure, ContextPressureKind, Event,
+    SessionUpdatePayload, TurnRefusedAnchorsExceedBudget,
 };
 use teton_protocol::SessionId;
 
@@ -358,6 +358,8 @@ struct Published {
     chunks: Vec<String>,
     /// REQ-618 BR-1's refusals.
     anchors_exceeded: Vec<TurnRefusedAnchorsExceedBudget>,
+    /// REQ-618 BR-5's compaction ledgers.
+    compacted: Vec<ContextCompacted>,
 }
 
 /// Drain `sub` without a wall-clock timeout: `EventBus::publish` is synchronous
@@ -367,10 +369,12 @@ fn drain(sub: &mut tetond::broadcast::Subscription) -> Published {
     let mut pressure = Vec::new();
     let mut chunks = Vec::new();
     let mut anchors_exceeded = Vec::new();
+    let mut compacted = Vec::new();
     while let Some(envelope) = sub.try_recv() {
         match envelope.event {
             Event::ContextPressure(p) => pressure.push(p),
             Event::TurnRefusedAnchorsExceedBudget(r) => anchors_exceeded.push(r),
+            Event::ContextCompacted(c) => compacted.push(c),
             Event::SessionUpdate(update) => {
                 if let SessionUpdatePayload::AgentMessageChunk { text } = update.update {
                     chunks.push(text);
@@ -388,6 +392,7 @@ fn drain(sub: &mut tetond::broadcast::Subscription) -> Published {
         pressure,
         chunks,
         anchors_exceeded,
+        compacted,
     }
 }
 
@@ -1223,4 +1228,85 @@ fn the_local_route_refuses_an_oversized_skill_and_names_the_local_engine() {
     );
     client.drain_events(Duration::from_millis(300));
     assert_pressure_silent(&client, "local");
+}
+
+// ===========================================================================
+// REQ-618 BR-5 / AC-5 — every compaction is a record
+// ===========================================================================
+
+/// **BR-5 and AC-5.** A turn whose `compact` duty cannot be served still
+/// publishes a `context_compacted`, marked `fallback: true`, and the anchors
+/// come through it intact.
+///
+/// The fallback is the half that used to be invisible twice over: before this
+/// REQ a *successful* compaction produced no event at all, and a degraded one
+/// produced a line on the daemon's stderr. A reader of the transcript could see
+/// that the `compact` duty had been routed and nothing about what the session
+/// had lost.
+///
+/// The fixture's `compact` route is unresolved, which is the cheapest honest
+/// way to reach the mechanical path — a machine with no binding for the duty is
+/// the case LESSON-447 is about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mechanical_fallback_still_records_and_keeps_anchors() {
+    let fixture = Fixture::new("fallback", "Answered from what is left.");
+    let budget = derive(BudgetInputs::local());
+    let config = HarnessConfig::default().with_route_budget(budget.clone());
+
+    let mut ctx = fixture.context(&budget);
+    let block_words = budget.budget_tokens + budget.budget_tokens / 4;
+    for n in 0..3 {
+        ctx.push_tool_result("read", None, format!("paste {n}: {}", filler(block_words)));
+    }
+    ctx.push_user("what did those three files have in common?");
+
+    let mut sub = fixture.bus.subscribe(1_024);
+    fixture.turn(&mut ctx, &config).await;
+    let published = drain(&mut sub);
+
+    assert_eq!(
+        published.compacted.len(),
+        1,
+        "one compaction, one record: {:?}",
+        published.compacted
+    );
+    let record = &published.compacted[0];
+    assert!(
+        record.fallback,
+        "this fixture has no `compact` binding, so the deterministic drop IS the \
+         compaction and must say so: {record:?}"
+    );
+    assert!(
+        record.provider_id.is_none(),
+        "it ran on nothing: {record:?}"
+    );
+    assert!(record.dropped_bytes > 0, "{record:?}");
+    assert_eq!(
+        record.summarized_bytes, 0,
+        "the mechanical drop replaces what it takes with nothing: {record:?}"
+    );
+    assert!(!record.dropped_blocks.is_empty());
+    assert!(
+        record
+            .dropped_blocks
+            .iter()
+            .all(|b| b.kind == teton_protocol::events::CompactedBlockKind::Tool),
+        "the ask was kept and the tool results went: {record:?}"
+    );
+    assert!(
+        record.anchor_bytes > 0 && record.anchor_bytes <= record.kept_bytes,
+        "the ask is among what stayed, and is a subset of it: {record:?}"
+    );
+    // AC-5's second half, read off the event stream rather than inferred.
+    assert!(
+        published.pressure.iter().all(|p| p.anchors_intact),
+        "{:?}",
+        published.pressure
+    );
+    assert!(
+        ctx.blocks().iter().any(|b| b
+            .text
+            .contains("what did those three files have in common?")),
+        "…and the question itself is still there"
+    );
 }

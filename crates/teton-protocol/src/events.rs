@@ -3165,11 +3165,20 @@ pub struct ContextCompacted {
     pub anchor_bytes: u64,
     /// The blocks that went, without their content.
     pub dropped_blocks: Vec<CompactedBlock>,
-    /// The provider the `compact` duty ran on, as `route_decided` reports it.
-    /// `None` on the mechanical fallback, which ran on nothing.
+    /// The provider the `compact` duty ran on. `None` on the mechanical
+    /// fallback, which ran on nothing.
+    ///
+    /// # Why the model is not here beside it
+    ///
+    /// The spec asked for the pair, "as `route_decided` already reports". It
+    /// already reporting them is the reason: a performed compaction publishes
+    /// its own `route_decided` naming category, tier, provider and model
+    /// (REQ-561 AC-2), so the model has a home in this session's stream and
+    /// repeating it here would be a second reading of one fact — the shape
+    /// REQ-586's own verify found on `/verbose`. The provider *is* carried
+    /// because `DutyRoute` holds it directly, and because it is what tells the
+    /// duty path from the fallback at a glance.
     pub provider_id: Option<String>,
-    /// The model the duty ran on. `None` for the same reason.
-    pub model: Option<String>,
     /// Whether this was the mechanical truncation standing in for a duty that
     /// could not be served (LESSON-447: degrade loudly).
     pub fallback: bool,

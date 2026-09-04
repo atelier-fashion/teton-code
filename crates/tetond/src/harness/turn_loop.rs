@@ -39,7 +39,8 @@ use serde_json::Value;
 
 use teton_inference::{ChatFormat, Engine, EngineError, GenParams};
 use teton_protocol::events::{
-    CapabilityDeadEnd, ContextPressure, ContextPressureKind, Event, PrefixCache, SessionUpdate,
+    CapabilityDeadEnd, CompactedBlock, CompactedBlockKind, ContextCompacted, ContextPressure,
+    ContextPressureKind, Event, PrefixCache, ProvenanceClass as WireProvenanceClass, SessionUpdate,
     SessionUpdatePayload, ToolCallStatus, TurnRefusedAnchorsExceedBudget,
 };
 use teton_protocol::methods::{SessionRoot, StopReason};
@@ -57,7 +58,10 @@ use super::compact::COMPACT_DUTY;
 use super::completion::{
     context_provenance, CompletionSource, LocalEngineSource, SourceTurn, TurnDecision,
 };
-use super::context::{summarize_if_large, ContextManager, PressureReport, ProvenanceHook};
+use super::context::{
+    summarize_if_large, BlockRole, CompactionRecord, ContextManager, PressureReport,
+    ProvenanceClass, ProvenanceHook,
+};
 use super::digest::DIGEST_DUTY;
 use super::duty::DutyRoute;
 use super::permissions::{PermissionDecision, PermissionGate};
@@ -967,6 +971,50 @@ impl SessionEvents {
                 // measured. Never composed here: a call site that wrote `true`
                 // would be asserting the invariant rather than reporting it.
                 anchors_intact: report.anchors_intact,
+            }),
+        );
+    }
+
+    /// Announce what one compaction kept and let go (REQ-618 BR-5).
+    ///
+    /// Published on **every** compaction — the `compact` duty's, and the
+    /// mechanical truncation that stands in when the duty fails, which
+    /// `record.fallback` tells apart. Before this REQ a *successful* compaction
+    /// produced no event at all: the transcript held the duty's `route_decided`
+    /// line and nothing about what had been forgotten, which is how a session
+    /// could lose the user's ask ten times over with nothing in the file to show
+    /// for it.
+    ///
+    /// The provider is the *duty's*, not the turn's, because it is the duty
+    /// that ran — and `None` on the mechanical path, which ran on nothing. The
+    /// model is deliberately not carried; see the field's own doc.
+    pub fn context_compacted(&self, record: &CompactionRecord, provider_id: Option<&str>) {
+        self.bus.publish(
+            Some(self.session_id.clone()),
+            Event::ContextCompacted(ContextCompacted {
+                kept_bytes: record.kept_bytes as u64,
+                dropped_bytes: record.dropped_bytes as u64,
+                summarized_bytes: record.summarized_bytes as u64,
+                anchor_bytes: record.anchor_bytes as u64,
+                dropped_blocks: record
+                    .dropped_blocks
+                    .iter()
+                    .map(|&(role, class, bytes)| CompactedBlock {
+                        kind: match role {
+                            BlockRole::User => CompactedBlockKind::User,
+                            BlockRole::Assistant => CompactedBlockKind::Assistant,
+                            BlockRole::Tool => CompactedBlockKind::Tool,
+                        },
+                        provenance_class: match class {
+                            ProvenanceClass::None => WireProvenanceClass::None,
+                            ProvenanceClass::Rooted => WireProvenanceClass::Rooted,
+                            ProvenanceClass::Unknown => WireProvenanceClass::Unknown,
+                        },
+                        bytes: bytes as u64,
+                    })
+                    .collect(),
+                provider_id: provider_id.map(ToOwned::to_owned),
+                fallback: record.fallback,
             }),
         );
     }
@@ -2067,7 +2115,18 @@ async fn run_the_allowed_tool(
     // what `note_committed` remembered and what is pushed
     // here are one string. Nothing may grow this block
     // between that check and this line.
+    let is_expansion = disposition == ResultDisposition::Expansion;
     ctx.push_tool_result_prov(name, provenance, folded);
+    // REQ-618 BR-2: a model-invoked skill expansion is the procedure this turn
+    // is following, so it is anchored for this turn and no longer. Unlike a
+    // typed `/name` — where the expansion *is* the prompt block and `UserAsk`
+    // already covers it — this one is a tool result and needs saying.
+    //
+    // Immediately after the push, because `anchor_last_as_skill_body` names the
+    // block on the end and any push between the two would move that.
+    if is_expansion {
+        ctx.anchor_last_as_skill_body();
+    }
     // The budget gate used to live here, right after the fold. It is now at the
     // top of the loop, which returning from this stage reaches before any
     // prompt is built — same measurement, one iteration later, and every
@@ -2213,16 +2272,27 @@ pub async fn run_session_turn_with_pressure_policy(
                      context was truncated deterministically instead"
                 );
             }
+            // REQ-618 BR-5: the duty's own compaction, recorded. Published
+            // before the hard gate runs, so the two events read in the order
+            // they happened — what the model chose to forget, then what the
+            // deterministic drop took on top of it.
+            if let Some(record) = &compaction.record {
+                events.context_compacted(record, compact.provider());
+            }
             // BR-7: never silent. This is the gate that fires on a carried
             // conversation meeting a smaller route (BR-10) and on a tool result
             // that outgrew the budget, so it is where most of this event comes
             // from.
-            announce_pressure(
-                events,
-                &ctx.truncate_to_budget(),
-                &config.budget,
-                &mut said_it_did_not_fit,
-            );
+            let report = ctx.truncate_to_budget();
+            // BR-5's other half, and AC-5's subject: when the duty could not be
+            // served, this drop *is* the compaction, so it owes the same record
+            // with `fallback: true`. `as_fallback_record` returns `None` for a
+            // gate that took nothing, which keeps the event's meaning — "a
+            // compaction happened" — true.
+            if let Some(record) = report.as_fallback_record() {
+                events.context_compacted(&record, None);
+            }
+            announce_pressure(events, &report, &config.budget, &mut said_it_did_not_fit);
 
             // ---- REQ-618 BR-1 / AC-2: the anchors do not fit ----
             //
@@ -7958,6 +8028,115 @@ mod tests {
             .expect("the result was folded into context")
     }
 
+    /// The anchors the loop left on the context after one fold — the seam
+    /// `folded_result_with` cannot report, because it hands back a string
+    /// (REQ-618 BR-2).
+    async fn anchors_after_fold(
+        tool: Arc<dyn super::super::tools::Tool>,
+        name: &'static str,
+    ) -> Vec<crate::harness::context::Anchor> {
+        let session_id = SessionId::from("disposition-anchor");
+        let bus = Arc::new(EventBus::new());
+        let gate = PermissionGate::new(
+            session_id.clone(),
+            PermissionConfig::with_default(super::super::permissions::PermissionPolicy::Deny),
+            Arc::clone(&bus),
+            Arc::new(PendingPermissions::new()),
+        );
+        let events = SessionEvents::new(Arc::clone(&bus), session_id);
+        let config = HarnessConfig {
+            max_turns: 1,
+            summarize_threshold_tokens: NO_DIGEST,
+            ..HarnessConfig::default()
+        };
+        let mut tools = ToolRegistry::with_builtins();
+        tools.register_cap_exempt(tool);
+        let tool_ctx = ToolContext::new(std::env::temp_dir());
+        let mut hook = NoopProvenanceHook;
+        let mut ctx = ContextManager::new(FOLD_SYSTEM, 1_000_000);
+        ctx.push_user(FOLD_REQUEST);
+        let mut source = CallOnceThenEndSource {
+            name,
+            calls: 0,
+            dropped_calls: 0,
+        };
+        run_session_turn_with_source(
+            &mut source,
+            &tools,
+            &tool_ctx,
+            &gate,
+            &events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &DutyRoute::unresolved("nothing serves `digest` here"),
+            &DutyRoute::unresolved("no compact route in this test"),
+            &ToolDuties {
+                triage: &DutyRoute::unresolved("no triage route in this test"),
+                shell: &DutyRoute::unresolved("no shell route in this test"),
+            },
+        )
+        .await
+        .expect("the turn completes");
+        ctx.blocks().iter().map(|b| b.anchor).collect()
+    }
+
+    /// **REQ-618 BR-2, at the seam.** The loop anchors a model-invoked
+    /// expansion as this turn's skill body, and anchors an ordinary tool result
+    /// as nothing.
+    ///
+    /// The pair is the test. `ContextManager::anchor_last_as_skill_body` has its
+    /// own unit tests and would pass them with nothing calling it; what can only
+    /// be shown here is that the *loop* calls it, and calls it on the expansion
+    /// rather than on every fold. Deleting the call reddens the first half;
+    /// making it unconditional reddens the second.
+    #[tokio::test]
+    async fn the_loop_anchors_an_expansion_and_not_an_ordinary_result() {
+        use crate::harness::context::Anchor;
+
+        let expansion = anchors_after_fold(
+            Arc::new(StubDispositionTool {
+                name: EXPANSION_TOOL,
+                result: SMALL_BODY.to_owned(),
+                disposition: ResultDisposition::Expansion,
+            }),
+            EXPANSION_TOOL,
+        )
+        .await;
+        assert_eq!(
+            expansion.last(),
+            Some(&Anchor::SkillBody),
+            "the expansion is the procedure this turn is following: {expansion:?}"
+        );
+        assert_eq!(
+            expansion.first(),
+            Some(&Anchor::UserAsk),
+            "…and the ask is still the ask: {expansion:?}"
+        );
+
+        let ordinary = anchors_after_fold(
+            Arc::new(StubDispositionTool {
+                name: DATA_TOOL,
+                result: SMALL_BODY.to_owned(),
+                disposition: ResultDisposition::Data,
+            }),
+            DATA_TOOL,
+        )
+        .await;
+        // Non-vacuity: the fold has to have happened, or "no SkillBody here" is
+        // a statement about a context with no tool block in it.
+        assert_eq!(
+            ordinary.len(),
+            expansion.len(),
+            "the ordinary fold must produce the same shape of context as the \
+             expansion one, or this half asserts nothing: {ordinary:?}"
+        );
+        assert!(
+            ordinary.iter().all(|a| !matches!(a, Anchor::SkillBody)),
+            "an ordinary tool result is not a skill body: {ordinary:?}"
+        );
+    }
+
     /// A body no digest threshold in these tests can reach, so a framing test
     /// is about framing.
     const SMALL_BODY: &str = "Run the checks in order and report what failed.";
@@ -8132,6 +8311,10 @@ mod tests {
     /// refusal therefore quotes: the stub's arguments carry no `name`, so
     /// `call_name` answers `None` and the loop falls back to the tool's own.
     const EXPANSION_TOOL: &str = "stub_expansion";
+
+    /// Its twin, registered the same way and folding as ordinary data — so the
+    /// anchor pair differs in the disposition and in nothing else.
+    const DATA_TOOL: &str = "stub_data";
 
     /// A body, and a route budget that holds **exactly** that body beside the
     /// system prompt and the turn's request — and nothing more.
