@@ -96,15 +96,19 @@ const MUST_BE_PRESENT: &[&str] = &[
 /// | item | reached from |
 /// |---|---|
 /// | `LOCAL_ENGINE_N_CTX_DEFAULT` | `egress/redact.rs`, `harness/budget.rs`, `harness/compact.rs` |
-/// | `TAINT_BY_CONTEXT`, `taint_pin_line` | `carry.rs` |
+/// | `taint_pin_line` | `carry.rs` |
 /// | `endpoint_query_names_a_credential` | `provider_recipes.rs`, `web_setup_catalog.rs` |
 ///
 /// `RenderedProviderSetup` was on this list and is not any more: see the module
 /// docs. Nothing outside `runtime/` names it, and the accessor that appeared to
 /// require it did not need crate reach either.
+/// `TAINT_BY_CONTEXT` was on this list until REQ-614 **deleted the constant**.
+/// It was one of three `TAINT_BY_*` words that `taint_pin_line` selected
+/// between; the cause is now the vocabulary (`TaintCause::as_str`), so there is
+/// one spelling instead of three that could drift. A narrowing would need a
+/// reason recorded here — a removal needs the item to be gone, and it is.
 const CRATE_WIDE: &[&str] = &[
     "LOCAL_ENGINE_N_CTX_DEFAULT",
-    "TAINT_BY_CONTEXT",
     "endpoint_query_names_a_credential",
     "taint_pin_line",
 ];
@@ -156,13 +160,26 @@ const PUBLIC: &[&str] = &[
     "session.rs::clear_session",
     "session.rs::session_root_for",
     "session.rs::set_session_cwd",
+    // REQ-614 added seven names to this file. Each is a **reader** or a type;
+    // the one setter the REQ introduces — `ShellTaintOverride::lift` — is
+    // `pub(super)`, exactly as `WebTaintOverride::lift` is and for exactly the
+    // reason this test's doc comment records: `pub` there makes a model-issued
+    // lift compile from `crate::harness::tools`. `taint.rs`'s own
+    // `the_lift_setter_is_not_crate_visible` asserts that spelling directly.
+    "taint.rs::RoutePin",
     "taint.rs::SessionTaint",
     "taint.rs::SessionTaintView",
+    "taint.rs::ShellTaintOverride",
+    "taint.rs::TaintCause",
     "taint.rs::WebTaintOverride",
+    "taint.rs::as_str",
+    "taint.rs::cause",
     "taint.rs::is_lifted",
     "taint.rs::is_tainted",
+    "taint.rs::liftable",
     "taint.rs::mark",
     "taint.rs::new",
+    "taint.rs::pins",
     "taint.rs::try_mark",
     "views.rs::BoundaryPosture",
     "views.rs::builtin_count",
@@ -181,7 +198,14 @@ const PUBLIC: &[&str] = &[
 /// 14 -> 17 at REQ-603, when `clear_session`, `session_root_for` and
 /// `set_session_cwd` moved from `mod.rs` into `session.rs` the same way. Their
 /// visibility did not change either.
-const PUBLIC_DECLARATIONS: usize = 17;
+///
+/// 17 -> 29 at REQ-614. Seven new unique names (`RoutePin`,
+/// `ShellTaintOverride`, `TaintCause`, `as_str`, `cause`, `liftable`, `pins`)
+/// and five new duplicates: `new` is now declared four times, `is_lifted`
+/// three, `cause` twice. Every one is a reader or a type — the REQ's one new
+/// setter, `ShellTaintOverride::lift`, is `pub(super)` and therefore does not
+/// appear here, which is the property this test exists to protect.
+const PUBLIC_DECLARATIONS: usize = 29;
 
 fn runtime_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime")

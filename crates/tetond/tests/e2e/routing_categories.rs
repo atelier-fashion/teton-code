@@ -796,10 +796,29 @@ fn a_tainted_session_is_served_on_device_and_never_reaches_the_tiers_fallback() 
     // The provider the taint pin names. Its one scripted reply issues a `shell`
     // call, whose result is unknown-provenance and taints the session; every
     // call after that fails with a fallback-class error.
+    //
+    // **The command must be one whose reach the daemon cannot prove** (REQ-614).
+    // It used to be `echo probing`, back when *every* `shell` result carried
+    // unknown provenance; since REQ-614 that command is classified `Rooted` —
+    // `echo` reads nothing — and would not taint anything, which silently
+    // removed this test's whole premise. `sh -c` is BR-1(e)'s first opaque form
+    // and is what taints the session now.
+    //
+    // Written without quotes on purpose: these arguments are a JSON string
+    // nested inside the mock's JSON response, so a quoted form has to survive
+    // two levels of encoding and instead breaks the response — the turn then
+    // ends with no tool call at all, and the test fails for a reason that has
+    // nothing to do with what it is testing. `sh -c echo` runs `echo` with no
+    // arguments: opaque verb, no quoting, nothing on the wire.
+    //
+    // The subject of this test is BUG-156 — a pinned session must never reach
+    // its tier's fallback — not what does the pinning. Only the fixture's
+    // mechanism changed (LESSON-569: verify the failure mechanism before
+    // building a fixture around it).
     let pinned = MockProvider::start(
         vec![MockResponse::ok(openai_turn(
             "Checking the build first.",
-            Some(("c1", "shell", r#"{"command":"echo probing"}"#)),
+            Some(("c1", "shell", r#"{"command":"sh -c echo"}"#)),
             80,
             10,
         ))],
@@ -825,7 +844,7 @@ fn a_tainted_session_is_served_on_device_and_never_reaches_the_tiers_fallback() 
     // shape the local-first pitch invites.
     config.push_str(&tier_block_with_fallback("think", "local", "backup"));
     // A boundary must exist for the taint backstop to arm at all
-    // (`context_is_sensitive` returns false with none configured) — which is
+    // (`context_taint_cause` returns false with none configured) — which is
     // itself worth knowing: there is no state in which a session is tainted by
     // unknown provenance and egress would have let that same content through.
     config.push_str("[[boundaries]]\npath_glob = \"secrets/**\"\nmode = \"local-only\"\n\n");

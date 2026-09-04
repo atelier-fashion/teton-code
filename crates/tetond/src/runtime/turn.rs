@@ -1022,8 +1022,16 @@ impl DaemonRuntime {
                     })
                     .collect()
             };
+        // REQ-614: the same `effective_boundaries()` composition egress
+        // inspects against, handed to the tool jail so the `shell` classifier
+        // decides on the set that will actually judge the result. Two readings
+        // of the boundary set that could disagree is the parser-differential
+        // shape LESSON-494 is about; there is one composition site
+        // (`Config::effective_boundaries`, REQ-597 ADR-1) and this is a read of
+        // it, not a second one.
         let tool_ctx = ToolContext::for_root(probed)
             .with_denied_prefix(effective_transcript_dir(&config.transcript))
+            .with_boundaries(config.effective_boundaries())
             .with_known_projects(known_projects.clone());
         // REQ-611 BR-4: the turn's streaming surface also carries the sink, so
         // the tool input and the tool result — neither of which the bus has ever
@@ -1644,8 +1652,29 @@ impl DaemonRuntime {
                 // Read as one value rather than asked twice — a block with no
                 // detail is not a block (see `HarnessError::privacy_block_detail`).
                 if let Some(detail) = err.privacy_block_detail() {
-                    if taints_the_session(detail) && self.session_taint.mark(tctx.core.session_id) {
-                        eprintln!("{}", taint_pin_line(taint_detail_word(detail)));
+                    // REQ-614: a **backstop** cause, and permanent on purpose.
+                    // The egress sink has already marked this session with the
+                    // cause read off the block's path — it runs at the choke
+                    // point, inside the transport call whose error this arm is
+                    // handling — and `mark` keeps the first cause. So this value
+                    // is only reachable if that ordering ever stopped holding,
+                    // and the fail-closed direction there is a pin the user
+                    // cannot lift rather than one they can lift wrongly.
+                    // `BlockDetail` is `Copy` and carries no path, so the
+                    // unknown/boundary distinction is not available here at all
+                    // (conventions.md: a refusal message cannot ride a `Copy`
+                    // enum). AC-3's end-to-end lift test is what would catch a
+                    // regression in the ordering.
+                    let backstop = match detail {
+                        BlockDetail::Redaction => TaintCause::RedactionFinding,
+                        BlockDetail::Boundary | BlockDetail::ScanUnavailable => {
+                            TaintCause::BoundaryHit
+                        }
+                    };
+                    if taints_the_session(detail)
+                        && self.session_taint.mark(tctx.core.session_id, backstop)
+                    {
+                        eprintln!("{}", taint_pin_line(backstop));
                     }
                     if !self.engine.present() {
                         break 'turn Err(RpcError::new(
@@ -3381,8 +3410,18 @@ impl DaemonRuntime {
         core_phase: Option<CorePhase>,
         prompt: &str,
     ) -> crate::router::Route {
-        if self.session_taint.is_tainted(session_id) {
-            return router.resolve_local_pin(taint_pin_reason("this turn"));
+        // REQ-614 ADR-614-4: `RoutePin`, not the raw taint bit. The lift is
+        // honored here and at the six duty routes by the predicate rather than
+        // by a conjunction repeated seven times.
+        if let Some(cause) = self.route_pin().cause(session_id) {
+            if self.route_pin().pins(session_id) {
+                // Counted here because this is the only place that knows a turn
+                // was served locally *because of* the pin, rather than by
+                // policy or by a heuristic that would have chosen local anyway.
+                // It is what `session_pin_lifted` reports the pin cost.
+                self.count_pinned_turn(session_id);
+                return router.resolve_local_pin(taint_pin_reason_for("this turn", cause));
+            }
         }
 
         match mode {

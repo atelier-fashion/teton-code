@@ -246,6 +246,11 @@ fn identities(outcome: &ToolOutcome) -> Vec<String> {
         ToolProvenance::Unknown => {
             panic!("a first-party file tool must never report unknown provenance")
         }
+        // REQ-614: only `shell` produces this variant, and no `shell` outcome
+        // reaches this helper. Named rather than folded into a catch-all.
+        ToolProvenance::BoundaryTouch => {
+            panic!("a first-party file tool reports a boundary hit as a Sources id, not a touch")
+        }
     }
 }
 

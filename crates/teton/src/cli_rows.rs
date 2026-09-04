@@ -574,7 +574,43 @@ pub(crate) fn handle_doctor(
     ctx: &mut UiContext<'_>,
     args: &str,
 ) -> anyhow::Result<CommandOutcome> {
-    run_mirrored(DOCTOR, args, conn, ctx)
+    let outcome = run_mirrored(DOCTOR, args, conn, ctx)?;
+    // REQ-614 AC-10. The diagnosis the daemon returns is daemon-wide; whether
+    // *this* session is pinned to the local tier is a fact about the session,
+    // and it is the question a user asks after wondering why their turns got
+    // slow. Appended here, where the session's own state lives.
+    //
+    // Only the in-session `/doctor` can answer it: `teton doctor` from a shell
+    // owns no session, so it has none to report on — which is why this hangs off
+    // the session handler rather than the mirrored row's daemon payload.
+    if let Some(line) = doctor_pin_line(ctx) {
+        ctx.surface.line(LineKind::Notice, &line);
+    }
+    Ok(outcome)
+}
+
+/// What `/doctor` says about this session's local-tier pin, or `None` when it
+/// is not pinned (REQ-614 AC-10).
+///
+/// Named separately so it is testable without a daemon: the interesting part is
+/// the wording, and the wording has to distinguish a pin that lifts from one
+/// that does not.
+fn doctor_pin_line(ctx: &UiContext<'_>) -> Option<String> {
+    ctx.pinned_cause().map(doctor_pin_wording)
+}
+
+/// The wording, from the cause alone — split from [`doctor_pin_line`] so the
+/// interesting half is testable without building a `UiContext`.
+///
+/// `unknown_shell` is the one liftable cause (REQ-614 BR-4); every other cause
+/// must be told plainly that no command undoes it, or a user spends the rest of
+/// the session looking for one.
+fn doctor_pin_wording(cause: &str) -> String {
+    if cause == "unknown_shell" {
+        format!("session: pinned to the local tier (cause: {cause}); `/shell allow` lifts it.")
+    } else {
+        format!("session: pinned to the local tier (cause: {cause}); no command lifts this pin.")
+    }
 }
 
 /// The CLI's subcommand tree, built once.
@@ -2299,6 +2335,45 @@ mod readme_tests {
                 "the bundled guide names `{shell}`, and `/{row}` is a session-only row: \
                  either there is no such shell command, or it is a different lifetime \
                  from the one a session user is asking about. Name `/{row}` instead."
+            );
+        }
+    }
+}
+
+/// REQ-614 AC-10 — what `/doctor` says about this session's pin.
+#[cfg(test)]
+mod doctor_pin {
+    use super::doctor_pin_wording;
+
+    /// AC-10. Pinned, the cause, and whether a lift exists — the three facts a
+    /// user asking "why did this get slow" needs.
+    ///
+    /// `teton doctor` from a shell owns no session, so it has none of this to
+    /// report; the in-session `/doctor` is where the question is asked and
+    /// where it is answered.
+    #[test]
+    fn doctor_reports_pin_state_cause_and_whether_a_lift_exists() {
+        let liftable = doctor_pin_wording("unknown_shell");
+        assert!(liftable.contains("pinned to the local tier"), "{liftable}");
+        assert!(liftable.contains("unknown_shell"), "{liftable}");
+        assert!(liftable.contains("/shell allow"), "{liftable}");
+
+        for permanent_cause in [
+            "boundary_hit",
+            "malformed_provenance",
+            "mcp_untrusted",
+            "redaction_finding",
+        ] {
+            let line = doctor_pin_wording(permanent_cause);
+            assert!(line.contains(permanent_cause), "{line}");
+            assert!(
+                line.contains("no command lifts"),
+                "a permanent pin must say so rather than leaving the user to \
+                 hunt for a command: {line}"
+            );
+            assert!(
+                !line.contains("/shell allow"),
+                "and it must not name one that refuses them: {line}"
             );
         }
     }

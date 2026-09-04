@@ -160,7 +160,7 @@ fn a_tainted_sessions_duties_never_reach_the_provider_they_are_bound_to() {
     // per-category override is the one way a user can bind it off the machine,
     // and binding it is what makes the taint override load-bearing here.
     config.push_str(&category_block("title", "duties"));
-    // The backstop only arms when a boundary exists (`context_is_sensitive`
+    // The backstop only arms when a boundary exists (`context_taint_cause`
     // returns false with none configured).
     config.push_str("[[boundaries]]\npath_glob = \"secrets/**\"\nmode = \"local-only\"\n\n");
 

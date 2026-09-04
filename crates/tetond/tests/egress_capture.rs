@@ -554,6 +554,12 @@ fn sole_identity(outcome: &tetond::harness::ToolOutcome) -> String {
         tetond::harness::ToolProvenance::Unknown => {
             panic!("a first-party file tool must never report unknown provenance")
         }
+        // REQ-614: only `shell` can produce this, and this matrix covers the
+        // tools that resolve a path through the jail. Named rather than folded
+        // into a catch-all, so the next variant is a compile error here too.
+        tetond::harness::ToolProvenance::BoundaryTouch => {
+            panic!("a first-party file tool reports a boundary hit as a Sources id, not a touch")
+        }
     }
 }
 
@@ -836,6 +842,11 @@ async fn teton_docs_serves_its_topic_without_reaching_the_transport() {
         ),
         ToolProvenance::Unknown => {
             panic!("a body compiled into this binary has knowable provenance")
+        }
+        // REQ-614: `docs` names no path at all, so a boundary touch is
+        // impossible here by construction — asserted rather than assumed.
+        ToolProvenance::BoundaryTouch => {
+            panic!("a body compiled into this binary cannot touch a privacy boundary")
         }
     }
 

@@ -1,0 +1,125 @@
+{
+  "req": "REQ-614",
+  "branch": "feat/REQ-614-proportionate-shell-provenance",
+  "startedAt": "2026-09-04T00:00:00Z",
+  "completed": false,
+  "currentPhase": 7,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "integrationBranch": "main",
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree + Preflight",
+      "completedAt": "2026-09-04T19:34:01.479126Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-09-04T19:37:10.718425Z",
+      "result": "approved with 4 in-place fixes (BR-1(d) truncated-scan verdict, BR-5 typed-only precedent, session_pinned.budget_tokens, AC-4 named command)"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Tasks",
+      "completedAt": "2026-09-04T19:43:51.206718Z",
+      "result": "7 ADRs, 8 tasks (TASK-390..397), OQ-1/2/3 resolved, footprint published to PR #288"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-09-04T19:45:12.068846Z",
+      "result": "APPROVED; fixed TASK-397 dep count (4->3), added boundary-mode and project-root fixture notes. Obligation coverage 10/10 BR, 12/12 AC; benign paths present for all 4 detection-shaped BRs. Vacuous-run gate deferred to the real cargo test run in Phase 4/5."
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-09-04T21:31:48.763275Z",
+      "result": "8/8 tasks complete; 4,346 workspace tests pass; clippy clean under -D warnings"
+    },
+    {
+      "phase": 5,
+      "name": "Verify (reflect + review, inline)",
+      "completedAt": "2026-09-04T21:48:08.599186Z",
+      "result": "6 checklists run inline. 1 Critical (grep -r foo classified Rooted -> leak) found and fixed with a regression test + mutation; 1 over-strictness found, measured on a 192k-file repo, and refined; symlink coverage added (LESSON-550 class); 2 stale references fixed. No user-facing questions. 4,348 tests pass, clippy clean under -D warnings."
+    },
+    {
+      "phase": 6,
+      "name": "Create PR",
+      "completedAt": "2026-09-04T21:49:03.591513Z",
+      "result": "draft PR #288 flipped to ready; [WIP] dropped; footprint block preserved"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup (rebase onto origin/main)",
+      "completedAt": "2026-09-04T23:33:13.029999Z",
+      "result": "Blocker cleared by the user's decision: rebased 18 commits onto origin/main (587c2bc), composing REQ-614 with REQ-615/616/617/618. Six conflicting files across three commits. Three integration gaps that existed on neither side alone were found and fixed: the /shell allow roster row REQ-617's command-awareness guard requires (plus its commands.md line), the BoundaryTouch arm REQ-618's ProvenanceClass::of needs, and REQ-599's drifted module map. ADR-614-2 and REQ-615's root_gate.rs were read against each other and compose \u2014 different axes, each ADR citing the other. Resident prompt untouched: margin measured at 112 bytes against a floor of 48, ASSUME-043's 64 usable bytes unmoved, so REDACT_BODY_OVERHEAD_BYTES is left alone. 4,495 tests pass; clippy clean with and without --all-features; binaries rebuilt and the pty/cli e2e suites re-run green (106 tests)."
+    }
+  ],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-614",
+      "branch": "feat/REQ-614-proportionate-shell-provenance",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/288",
+      "prNumber": 288,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-390",
+      "TASK-391",
+      "TASK-392",
+      "TASK-393",
+      "TASK-394",
+      "TASK-395",
+      "TASK-396",
+      "TASK-397"
+    ],
+    "failedTasks": []
+  },
+  "conflictsResolved": [
+    {
+      "phase": 7,
+      "files": [
+        "crates/teton-protocol/src/events.rs",
+        "crates/teton/src/session_ui.rs",
+        "crates/tetond/src/harness/tools/mod.rs",
+        "crates/tetond/src/harness/tools/shell.rs",
+        "crates/tetond/src/runtime/turn.rs",
+        "crates/tetond/tests/runtime_visibility.rs",
+        "crates/tetond/src/harness/context.rs"
+      ],
+      "resolvedBy": "user",
+      "strategy": "manual \u2014 rebase onto origin/main (587c2bc), composing REQ-614 with REQ-615/616/617/618 per the user's explicit instruction. Not append-only: three hunks required composing two edits to one construct. (1) shell.rs render_output: REQ-615's cd_note(...) argument AND REQ-614's .with_provenance(provenance.clone()) on one call. (2) turn.rs tool_ctx: REQ-615's .with_known_projects(...) AND REQ-614's .with_boundaries(...) on one builder chain. (3) runtime_visibility.rs CRATE_WIDE: REQ-616 renamed LOCAL_ENGINE_N_CTX -> LOCAL_ENGINE_N_CTX_DEFAULT while REQ-614 deleted TAINT_BY_CONTEXT \u2014 the union is the new name without the deleted item, which is neither side verbatim. session_ui.rs import list and the two tail test-module collisions in events.rs/session_ui.rs were unions. context.rs needed a new arm: REQ-618's ProvenanceClass::of match became non-exhaustive once REQ-614 added ToolProvenance::BoundaryTouch; it classes as Unknown, matching ADR-614-3's egress mapping.",
+      "verified": true,
+      "verifiedHow": "Import union computed programmatically, not by eye: the 5 symbols only main had (ContextCompacted, ShellDutySkipped, SkillRefusedNoRoom, ToolCallRepeated, TurnRefusedAnchorsExceedBudget) were asserted present in the result, which a take-theirs would have dropped. CRATE_WIDE composed against grep of the live tree (TAINT_BY_CONTEXT has zero references; LOCAL_ENGINE_N_CTX_DEFAULT is the live spelling). cargo check --workspace --all-targets clean after every conflicting commit during the rebase, then cargo test --workspace --no-fail-fast and cargo clippy --workspace --all-targets --all-features -D warnings on the rebased tip, plus CI green on both platforms.",
+      "resolvedAt": "2026-09-04T23:23:03.691661Z",
+      "note": "Resolves the blockers[0] entry whose holdState was needs-manual-rebase. REQ-615 and REQ-616 (its named blockers) had already merged; REQ-617 and REQ-618 landed as well, so the rebase composed four REQs, not two. ADR-614-2 (a rooted verdict requires RootKind::Project) and REQ-615's root_gate.rs were read against each other and compose: they gate different axes (read-reach verdict vs write permission), each ADR cites the other by name, and the one root kind where they differ (Plain: writes allowed, provenance still unknown) is coherent in both directions."
+    }
+  ],
+  "notes": [
+    "Phases 0-6 complete; PR #288 is OPEN and review-ready with the full body and the adlc-footprint block. Phase 7 halted: the PR is CONFLICTING against origin/main, which is also why GitHub started no CI run for the tip (no checks run on an unmergeable head). The last CI run on this branch, commit 6c71c2c, was green.",
+    "Local verification on the pre-rebase tree: 4,348 workspace tests pass and clippy is clean under -D warnings.",
+    "Not resolved by the runner by design: partials/conflict-bound.sh returned rc=1 with three offenders, so BUG-207's bounded keep-both path does not apply. No conflictsResolved entry is appended, per the rule that a conflict which halted and was never resumed is recorded in blockers only.",
+    "Phase 7 resumed 2026-09-04T23:33:13.029999Z: the branch is now rebased onto origin/main (587c2bc) and the PR is mergeable. LESSON-643 applies \u2014 the pre-rebase tip had never had CI (GitHub starts no run on an unmergeable head), so the rebased tip is treated as untested until CI reports green on both platforms."
+  ],
+  "blockers": []
+}

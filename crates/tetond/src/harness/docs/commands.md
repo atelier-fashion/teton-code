@@ -43,6 +43,7 @@ search the tree. Do not guess from a filename.
 - **`/web setup`** — set up web lookup: pick a tier, name a backend, confirm before anything is written.
 - **`/web allow`** — lift this session's web taint restriction; grants no new tier.
 - **`/web refresh`** — drop a URL's cached copy so the next lookup re-fetches: /web refresh <url>.
+- **`/shell allow`** — lift this session's local-tier pin after an unknown-reach shell command; typed input only.
 - **`/provider setup`** — register a provider and route a tier to it: /provider setup [vendor] [tier].
 - **`/provider test`** — test a registered provider with one consented call: /provider test <id>.
 - **`/provider list`** — list the providers registered on this machine, with what each one calls. *(same as `teton provider list`)*

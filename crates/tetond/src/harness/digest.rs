@@ -104,7 +104,13 @@ pub fn tool_result_provenance(provenance: &ToolProvenance) -> Provenance {
             }
             prov
         }
+        // REQ-614 ADR-614-3: both map to the same egress value on purpose. The
+        // variants differ in what they say about the *pin* (permanent vs
+        // liftable), never in what egress does with the block — which is what
+        // makes BR-2's "the narrowing removes nothing from the existing
+        // refusal" true by construction rather than by argument.
         ToolProvenance::Unknown => Provenance::unknown(),
+        ToolProvenance::BoundaryTouch => Provenance::boundary_touch(),
     }
 }
 

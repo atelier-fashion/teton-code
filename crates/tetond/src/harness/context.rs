@@ -92,6 +92,29 @@ pub enum ToolProvenance {
     /// The tool's touched files cannot be determined (e.g. `shell`): fail-closed
     /// at egress whenever any boundary is configured.
     Unknown,
+    /// A path the tool named matches a `local-only` boundary glob, and the
+    /// ordinary identity path cannot say so (REQ-614 ADR-614-3).
+    ///
+    /// Egress treats this **exactly** as [`Self::Unknown`] —
+    /// [`tool_result_provenance`](crate::harness::digest::tool_result_provenance)
+    /// maps both to `Provenance::unknown()` — so BR-2's fail-closed refusal is
+    /// unchanged by construction. What the variant carries is the *cause*: an
+    /// `Unknown` pin is liftable with `/shell allow`, a `BoundaryTouch` pin is
+    /// permanent.
+    ///
+    /// It exists for the out-of-root case. `~/.ssh/config` read from a project
+    /// root resolves outside the session root, so `ProvenanceId::from_resolved`
+    /// mints nothing for it and no glob can match it through
+    /// [`Self::Sources`] (LESSON-623). An **in-root** boundary path needs none
+    /// of this — it already mints an id, already matches, already pins
+    /// permanently through `BlockCause::Boundary`.
+    ///
+    /// A variant rather than a flag beside the provenance, because this fact
+    /// has to survive the tool result -> context block -> context-provenance
+    /// union -> carry-commit path, and carried state sheds its invariants
+    /// silently on a round trip (LESSON-501, LESSON-502). A variant makes the
+    /// compiler enumerate every seam that must handle it.
+    BoundaryTouch,
 }
 
 impl ToolProvenance {
@@ -292,6 +315,14 @@ pub struct DroppedProvenance {
     /// carries the same pair, and collapsing them here would drop the named
     /// files from a context that also holds a `shell` result.
     unknown: bool,
+    /// Whether any forgotten block carried [`ToolProvenance::BoundaryTouch`].
+    ///
+    /// Beside `unknown` for the same reason `unknown` is beside `sources`: a
+    /// boundary touch is also unknown, and folding the two would downgrade a
+    /// **permanent** pin to a liftable one the moment the block that caused it
+    /// was compacted away. A multi-seam invariant needs the fact at every seam;
+    /// carried state sheds it silently on the round trip (LESSON-501/502).
+    boundary_touch: bool,
 }
 
 impl DroppedProvenance {
@@ -314,7 +345,14 @@ impl DroppedProvenance {
         match provenance {
             Provenance::Tool { provenance, .. } => match provenance {
                 ToolProvenance::Sources(paths) => self.sources.extend(paths.iter().cloned()),
+                // REQ-614: both block, so both set `unknown` — but a boundary
+                // touch additionally records *why*, because the pin it produces
+                // is permanent and an unknown's is liftable.
                 ToolProvenance::Unknown => self.unknown = true,
+                ToolProvenance::BoundaryTouch => {
+                    self.unknown = true;
+                    self.boundary_touch = true;
+                }
             },
             Provenance::User { sources, unknown } => {
                 self.sources.extend(sources.iter().cloned());
@@ -329,6 +367,7 @@ impl DroppedProvenance {
     pub fn merge(&mut self, other: &Self) {
         self.sources.extend(other.sources.iter().cloned());
         self.unknown |= other.unknown;
+        self.boundary_touch |= other.boundary_touch;
     }
 
     /// The identities forgotten blocks touched.
@@ -341,6 +380,13 @@ impl DroppedProvenance {
     #[must_use]
     pub fn is_unknown(&self) -> bool {
         self.unknown
+    }
+
+    /// Whether a forgotten block named a boundary file outside the session root
+    /// (REQ-614). Implies [`Self::is_unknown`].
+    #[must_use]
+    pub fn is_boundary_touch(&self) -> bool {
+        self.boundary_touch
     }
 
     /// Whether anything with egress provenance has been forgotten at all.
@@ -956,8 +1002,14 @@ impl ProvenanceClass {
     #[must_use]
     pub fn of(provenance: &Provenance) -> Self {
         match provenance {
+            // REQ-614's `BoundaryTouch` classes as `Unknown` here for the same
+            // reason it maps to `Provenance::unknown()` at egress (ADR-614-3):
+            // the two are byte-identical to every reader downstream of the
+            // verdict, and this manager still holds no matcher with which to
+            // tell them apart. REQ-618's argument above is unchanged — the
+            // boundary *verdict* is still computed where the matcher lives.
             Provenance::Tool {
-                provenance: ToolProvenance::Unknown,
+                provenance: ToolProvenance::Unknown | ToolProvenance::BoundaryTouch,
                 ..
             } => ProvenanceClass::Unknown,
             Provenance::Tool {
@@ -2196,11 +2248,21 @@ impl ContextManager {
         }
         let mut sources = BTreeSet::new();
         let mut unknown = false;
+        let mut boundary_touch = false;
         for block in &self.blocks {
             match &block.provenance {
                 Provenance::Tool { provenance, .. } => match provenance {
                     ToolProvenance::Sources(paths) => sources.extend(paths.iter().cloned()),
+                    // REQ-614, same reading as `absorb` above: a summary that
+                    // folded a boundary-touching block must be at least as
+                    // restrictive as the block was — and must stay *permanent*,
+                    // or compaction would quietly make a `~/.ssh/config` pin
+                    // liftable.
                     ToolProvenance::Unknown => unknown = true,
+                    ToolProvenance::BoundaryTouch => {
+                        unknown = true;
+                        boundary_touch = true;
+                    }
                 },
                 // **The fourth seam** (REQ-585 verify). ADR-9 named three places
                 // that had to learn a user block can carry file provenance —
@@ -2255,7 +2317,9 @@ impl ContextManager {
             ),
             provenance: Provenance::Tool {
                 tool: COMPACT_SUMMARY_TOOL.to_owned(),
-                provenance: if unknown {
+                provenance: if boundary_touch {
+                    ToolProvenance::BoundaryTouch
+                } else if unknown {
                     ToolProvenance::Unknown
                 } else {
                     ToolProvenance::Sources(sources)

@@ -29,7 +29,8 @@ use teton_core::boundary::BoundaryMatcher;
 use teton_protocol::events::{PrivacyAction, ProvenanceRejection};
 
 use crate::egress::provenance::{
-    sanitize_reported_source, Provenance, MALFORMED_PROVENANCE_PATH, UNKNOWN_PROVENANCE_PATH,
+    sanitize_reported_source, Provenance, BOUNDARY_TOUCH_PATH, MALFORMED_PROVENANCE_PATH,
+    UNKNOWN_PROVENANCE_PATH,
 };
 
 /// The outcome of inspecting a request's provenance against the boundaries.
@@ -183,6 +184,16 @@ pub fn inspect(
     if first_malformed_source(provenance).is_some() {
         return Inspection::Blocked(Violation {
             path: MALFORMED_PROVENANCE_PATH.to_owned(),
+            action,
+        });
+    }
+    // REQ-614: ahead of the plain unknown arm, because a boundary touch is
+    // also unknown and the more specific reading is the true one. The order is
+    // the whole of the distinction — both block, and only the reported path
+    // tells the taint machinery whether the pin lifts.
+    if provenance.is_boundary_touch() {
+        return Inspection::Blocked(Violation {
+            path: BOUNDARY_TOUCH_PATH.to_owned(),
             action,
         });
     }

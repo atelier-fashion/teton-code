@@ -96,9 +96,11 @@ use teton_protocol::methods::RootKind;
 use super::{
     opt_str_arg, opt_u64_arg, str_arg, RefinedOutcome, Tool, ToolContext, ToolDuties, ToolOutcome,
 };
+use crate::harness::context::ToolProvenance;
 use crate::harness::digest::tool_result_provenance;
 use crate::harness::root_gate;
 use crate::harness::shell_duty;
+use crate::harness::tools::shell_provenance;
 
 /// The sentence appended to a timeout from a `home`/`filesystem_root` context
 /// on macOS (REQ-583 BR-14): the one place a killed command is plausibly a
@@ -265,12 +267,61 @@ impl Tool for ShellTool {
             .unwrap_or(self.default_timeout_ms)
             .min(self.max_timeout_ms);
 
-        // BR-1 (REQ-544 C-1): a shell command runs arbitrary code, so the daemon
-        // cannot know which files its output was derived from. Every result of a
-        // command that actually started is therefore tagged UNKNOWN provenance,
-        // which egress fail-closes whenever a boundary is configured. (The three
-        // arms that carry none — the two pre-spawn ones above and the failed
-        // spawn below — surface no command output.)
+        // REQ-614 BR-1/BR-10: the verdict is computed **here**, before the
+        // command spawns and before any arm measures — so the `shell` duty's
+        // interpretation, the `digest` summary and any compaction all inherit
+        // it (BR-10), and so no arm can reach a different answer.
+        //
+        // It replaces REQ-544 C-1's constant `Unknown`. That constant was
+        // right about the general case — a shell command runs arbitrary code —
+        // but composing it with REQ-597's always-on builtin boundaries pinned
+        // every session to the local tier on its first shell call. `classify`
+        // narrows the opacity and nothing else: its default is `Unknown`, so a
+        // command it cannot prove anything about is tagged exactly as it was
+        // before (ADR-614-1).
+        //
+        // Taken once, ahead of `run_bounded`, and reused by every arm. That is
+        // what makes BR-8 structural: a `pwd` that timed out and a `pwd` that
+        // succeeded are handed the same value, because there is only one.
+        let verdict = shell_provenance::classify(
+            &root,
+            ctx.root_kind(),
+            ctx.boundaries(),
+            ctx.denied_prefixes().to_vec(),
+            &command,
+        );
+        // REQ-614: the classifier's content-free reason on the daemon's own
+        // stderr, for the case a user asks *why* a command they thought was
+        // harmless pinned their session. `&'static str` from a closed set, so
+        // this cannot print command text or file content (shell_provenance's
+        // module docs) — which is the only reason it is safe to log at all.
+        if verdict.kind != shell_provenance::VerdictKind::Rooted {
+            eprintln!(
+                "tetond: shell provenance — {} ({})",
+                match verdict.kind {
+                    shell_provenance::VerdictKind::BoundaryTouch => "boundary touch",
+                    _ => "unknown reach",
+                },
+                verdict.reason
+            );
+        }
+        let provenance = match verdict.kind {
+            shell_provenance::VerdictKind::Rooted => {
+                ToolProvenance::Sources(verdict.sources.clone())
+            }
+            // An **in-root** boundary path carries its own minted id, so the
+            // result reports it as a source and egress blocks naming the actual
+            // file — a `read` of `.env` and a `cat .env` produce the same
+            // `privacy_block`. The sentinel variant is for the out-of-root case
+            // alone, where no id exists for a glob to match (ADR-614-3).
+            shell_provenance::VerdictKind::BoundaryTouch if !verdict.sources.is_empty() => {
+                ToolProvenance::Sources(verdict.sources.clone())
+            }
+            shell_provenance::VerdictKind::BoundaryTouch => ToolProvenance::BoundaryTouch,
+            shell_provenance::VerdictKind::Unknown => ToolProvenance::Unknown,
+        };
+        // (The three arms that carry none — the two pre-spawn ones above and
+        // the failed spawn below — surface no command output.)
         //
         // Every arm below also *measures* — `Some(n)`, even when `n` is zero —
         // because a spawned command's arms are exactly the arms where a command
@@ -289,6 +340,10 @@ impl Tool for ShellTool {
                 stdout,
                 stderr,
                 withheld,
+                // REQ-615's cd note and REQ-614's computed verdict compose on one
+                // call: the note is what the *user* is told about a `cd` that did
+                // not persist, the provenance is what *egress* is told about what
+                // the command could have read. Two different readers, one result.
             } => render_output(
                 &command,
                 status,
@@ -302,13 +357,13 @@ impl Tool for ShellTool {
                     crate::session_root::home().as_deref(),
                 ),
             )
-            .with_unknown_provenance(),
+            .with_provenance(provenance.clone()),
             // The third arm with no measurement and no provenance: nothing ran,
             // so nothing this machine holds is in the answer. The runner has
             // already phrased the reason.
             BoundedRun::SpawnFailed(reason) => ToolOutcome::error(reason),
             BoundedRun::Lost(reason) => ToolOutcome::error(reason)
-                .with_unknown_provenance()
+                .with_provenance(provenance.clone())
                 .measuring(NO_OUTPUT_CAPTURED),
             BoundedRun::TimedOut => {
                 let mut message = format!("command timed out after {timeout_ms}ms and was killed");
@@ -326,7 +381,7 @@ impl Tool for ShellTool {
                     message.push_str(TIMEOUT_CONSENT_HINT);
                 }
                 ToolOutcome::error(message)
-                    .with_unknown_provenance()
+                    .with_provenance(provenance)
                     .measuring(NO_OUTPUT_CAPTURED)
             }
         }
@@ -1111,21 +1166,193 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// A boundary-configured project context — the shape REQ-614's verdict is
+    /// interesting in. `ToolContext::new` is `RootKind::Plain` with no
+    /// boundaries, which is the BR-9 no-op case.
+    fn project_ctx(root: &Path) -> ToolContext {
+        ToolContext::new(root)
+            .with_root_kind(RootKind::Project)
+            .with_boundaries(
+                teton_core::config::DEFAULT_BOUNDARIES
+                    .iter()
+                    .map(|g| teton_core::entities::PrivacyBoundary::builtin(*g))
+                    .collect(),
+            )
+    }
+
+    /// REQ-614 BR-9. **This is what `any_shell_result_carries_unknown_provenance`
+    /// became.**
+    ///
+    /// That test asserted the pre-REQ-614 invariant — every `shell` result is
+    /// `Unknown`, boundary-free commands included — and it was true because the
+    /// daemon never parsed the command at all. It is no longer the general rule:
+    /// a command whose reach the daemon can prove now carries its sources.
+    ///
+    /// What survives of it is this: with **no boundary configured**, nothing
+    /// changed. `ToolContext::new` carries an empty boundary set, which is
+    /// exactly `disable_default_boundaries`, and the verdict is the old constant.
     #[test]
-    fn any_shell_result_carries_unknown_provenance() {
+    fn no_boundaries_configured_changes_nothing() {
         use crate::harness::context::ToolProvenance;
         let root = temp_root("prov");
         std::fs::create_dir_all(root.join("secrets")).unwrap();
         std::fs::write(root.join("secrets/prod.env"), "API_KEY=sk-live\n").unwrap();
         let ctx = ToolContext::new(&root);
-        // REQ-544 C-1: `cat`-ing a boundary file cannot be parsed by the daemon,
-        // so the result is UNKNOWN provenance — fail-closed at egress.
         let out = ShellTool::default().run(&ctx, &json!({ "command": "cat secrets/prod.env" }));
         assert!(!out.is_error, "{}", out.content);
         assert_eq!(out.provenance, ToolProvenance::Unknown);
-        // Even a boundary-free command is UNKNOWN — the daemon never parses it.
         let out2 = ShellTool::default().run(&ctx, &json!({ "command": "echo hi" }));
         assert_eq!(out2.provenance, ToolProvenance::Unknown);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// REQ-614 BR-1 / AC-1, the benign path: the command the 2026-09-04 session
+    /// would have run harmlessly now reaches the remote tier, and the result
+    /// carries the root's provenance rather than the constant `Unknown`.
+    #[test]
+    fn ls_la_from_a_project_root_is_rooted() {
+        use crate::harness::context::ToolProvenance;
+        let root = temp_root("lsla");
+        std::fs::write(root.join("marker.txt"), "x").unwrap();
+        let ctx = project_ctx(&root);
+        let out = ShellTool::default().run(&ctx, &json!({ "command": "ls -la" }));
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            out.provenance,
+            ToolProvenance::Sources(std::collections::BTreeSet::new()),
+            "`ls -la` names no file, so it is Rooted with no sources"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// REQ-614 BR-1: a `Rooted` result carries the resolved path set, exactly as
+    /// a `glob` over the same paths would.
+    #[test]
+    fn a_rooted_command_carries_its_resolved_sources() {
+        use crate::harness::context::ToolProvenance;
+        let root = temp_root("sources");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let ctx = project_ctx(&root);
+        let out = ShellTool::default().run(&ctx, &json!({ "command": "cat src/main.rs" }));
+        assert!(!out.is_error, "{}", out.content);
+        let ToolProvenance::Sources(ids) = &out.provenance else {
+            panic!("expected Sources, got {:?}", out.provenance);
+        };
+        assert_eq!(
+            ids.iter().map(|i| i.as_str()).collect::<Vec<_>>(),
+            vec!["src/main.rs"]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// REQ-614 BR-2: the narrowing removes nothing. A command the classifier
+    /// cannot prove anything about is tagged exactly as every `shell` result was
+    /// before, and a boundary path gets the variant that pins permanently.
+    #[test]
+    fn an_unknown_verdict_still_maps_to_unknown_provenance() {
+        use crate::harness::context::ToolProvenance;
+        let root = temp_root("unknownprov");
+        std::fs::write(root.join(".env"), "K=v\n").unwrap();
+        let ctx = project_ctx(&root);
+        let opaque = ShellTool::default().run(&ctx, &json!({ "command": "echo $(ls)" }));
+        assert_eq!(opaque.provenance, ToolProvenance::Unknown);
+        // An **in-root** boundary path rides the existing machinery: the result
+        // names the real file, and egress blocks on the glob exactly as it does
+        // for a `read` of it. `ToolProvenance::BoundaryTouch` is reserved for
+        // the out-of-root case, where no id exists for a glob to match.
+        let boundary = ShellTool::default().run(&ctx, &json!({ "command": "cat .env" }));
+        let ToolProvenance::Sources(ids) = &boundary.provenance else {
+            panic!(
+                "expected Sources for an in-root boundary, got {:?}",
+                boundary.provenance
+            );
+        };
+        assert_eq!(
+            ids.iter().map(|i| i.as_str()).collect::<Vec<_>>(),
+            vec![".env"]
+        );
+        // Both fail closed at egress; the unknown one names no path at all.
+        assert!(crate::harness::digest::tool_result_provenance(&opaque.provenance).is_unknown());
+        assert!(!crate::harness::digest::tool_result_provenance(&boundary.provenance).is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// REQ-614 BR-8 / AC-4. The 2026-09-04 session was pinned by a command that
+    /// **failed** — a 30 s timeout on a macOS consent dialog. A timeout must not
+    /// change the verdict in either direction.
+    ///
+    /// `sleep` reads nothing, so the verdict is `Rooted`; the `ERROR:` text is
+    /// still in the result, and the next turn may still leave the machine.
+    ///
+    /// **Mutation**: make `run` compute the verdict per-arm instead of once
+    /// ahead of `run_bounded`, and give the timeout arm `Unknown` — this test is
+    /// what goes red.
+    #[test]
+    fn a_timed_out_pwd_is_still_rooted() {
+        use crate::harness::context::ToolProvenance;
+        let root = temp_root("timeout");
+        let ctx = project_ctx(&root);
+        let out =
+            ShellTool::default().run(&ctx, &json!({ "command": "sleep 60", "timeout_ms": 200 }));
+        assert!(
+            out.is_error,
+            "the command must have timed out: {}",
+            out.content
+        );
+        assert!(out.content.contains("timed out"), "{}", out.content);
+        assert_eq!(
+            out.provenance,
+            ToolProvenance::Sources(std::collections::BTreeSet::new()),
+            "a timeout does not change the verdict (BR-8)"
+        );
+        // The benign twin: the same verb, not timed out, same verdict.
+        let quick = ShellTool::default().run(&ctx, &json!({ "command": "pwd" }));
+        assert!(!quick.is_error, "{}", quick.content);
+        assert_eq!(quick.provenance, out.provenance);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// REQ-614 BR-10: the verdict is computed before anything measures, so the
+    /// `shell` duty, the `digest` summary and any compaction inherit it.
+    ///
+    /// A bounded region check over `run`'s body — an unbounded slice would be a
+    /// claim about the rest of the file (conventions.md, REQ-600). The floors
+    /// come first: a slice that has stopped containing the subject would satisfy
+    /// the ordering assertion vacuously (BUG-159's shape).
+    #[test]
+    fn the_verdict_is_computed_before_measurement() {
+        let source = include_str!("shell.rs");
+        let source = &source[..source.find("\n#[cfg(test)]").unwrap_or(source.len())];
+        let start = source
+            .find("    fn run(&self, ctx: &ToolContext, args: &Value) -> ToolOutcome {")
+            .expect("`run` is declared");
+        let body = &source[start..];
+        let end = body
+            .find("\n    /// Interpret this command's output")
+            .expect("`run` ends");
+        let body = &body[..end];
+
+        for floor in ["shell_provenance::classify", "run_bounded", ".measuring("] {
+            assert!(
+                body.contains(floor),
+                "the extracted region is not `run` — it is missing {floor:?}"
+            );
+        }
+        let classify_at = body.find("shell_provenance::classify").unwrap();
+        let spawn_at = body.find("run_bounded(&root").expect("the spawn call");
+        let measure_at = body.find(".measuring(").unwrap();
+        assert!(
+            classify_at < spawn_at && classify_at < measure_at,
+            "BR-10: the verdict must be computed before the command spawns and \
+             before any arm measures"
+        );
+        // Exactly one `classify` call: a per-arm verdict is what BR-8 forbids.
+        assert_eq!(
+            body.matches("shell_provenance::classify").count(),
+            1,
+            "BR-8/BR-10: the verdict is taken once and reused by every arm"
+        );
     }
 
     #[test]

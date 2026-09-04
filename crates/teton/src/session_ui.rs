@@ -31,16 +31,16 @@ use teton_protocol::events::{
     ConsentScope, ContextCompacted, ContextPressure, ContextPressureKind, DaemonClientAttach,
     DaemonLifetimeStage, DynamicOutcome, DynamicOutcomeView, Event, EventEnvelope, EvictionReason,
     FailureClass, ModelLifecycle, ModelSelectionProposed, NotRunReason, PermissionOption,
-    PermissionOptionKind, PermissionRequest, PermissionSubject, PhaseTransition, PrefixCache,
-    PrefixCacheMiss, PrefixCacheOutcome, PrivacyAction, PrivacyBlock, ProvenanceRejected,
-    ProvenanceRejection, ProviderDegraded, ProviderSetupCompleted, ProviderSetupRejected,
-    ProviderTested, RemedyKind, RouteDecided, SessionGrantMinted, SessionUpdatePayload,
-    ShellDutySkipped, SkillInvoked, SkillOverBudgetAccepted, SkillOverBudgetOffered,
-    SkillOverBudgetRemedyApplied, SkillRefusedNoRoom, SkillStage, TierWarming, ToolCallRepeated,
-    ToolCallStatus, TurnQueued, TurnRefusedAnchorsExceedBudget, UnboundedRootWarning,
-    WebCapabilityState, WebConsentDecided, WebConsentScope, WebLookup, WebLookupKind,
-    WebLookupOutcome, WebSetupCompleted, WebSetupRejected, WebTier, WindowVerdict,
-    OPTION_ID_ENABLE_PERMANENT,
+    PermissionOptionKind, PermissionRequest, PermissionSubject, PhaseTransition, PinRemedy,
+    PrefixCache, PrefixCacheMiss, PrefixCacheOutcome, PrivacyAction, PrivacyBlock,
+    ProvenanceRejected, ProvenanceRejection, ProviderDegraded, ProviderSetupCompleted,
+    ProviderSetupRejected, ProviderTested, RemedyKind, RouteDecided, SessionGrantMinted,
+    SessionPinLifted, SessionPinned, SessionUpdatePayload, ShellDutySkipped, SkillInvoked,
+    SkillOverBudgetAccepted, SkillOverBudgetOffered, SkillOverBudgetRemedyApplied,
+    SkillRefusedNoRoom, SkillStage, TierWarming, ToolCallRepeated, ToolCallStatus, TurnQueued,
+    TurnRefusedAnchorsExceedBudget, UnboundedRootWarning, WebCapabilityState, WebConsentDecided,
+    WebConsentScope, WebLookup, WebLookupKind, WebLookupOutcome, WebSetupCompleted,
+    WebSetupRejected, WebTier, WindowVerdict, OPTION_ID_ENABLE_PERMANENT,
 };
 use teton_protocol::methods::{
     AttachConsentOutcome, AttachConsentParams, PermissionOutcome, PermissionRespondParams,
@@ -138,6 +138,13 @@ pub struct SessionState {
     /// in-session `/verbose` command toggles it mid-session (REQ-555 BR-5).
     /// Session-scoped either way — nothing here is persisted.
     pub verbose: bool,
+    /// The cause pinning this session to the local tier, or `None` (REQ-614).
+    ///
+    /// Held so `/doctor` can answer "is this session pinned, and why" without a
+    /// round trip, and so the standing line prints once: the daemon already
+    /// publishes `session_pinned` on the transition only, and this mirrors that
+    /// rather than re-deriving it.
+    pub pinned: Option<String>,
     /// The local tier's loading indicator (REQ-556).
     ///
     /// It lives in session state, beside `cost`, for the same reason `cost`
@@ -800,6 +807,29 @@ pub fn render_event(
             // Never verbose-gated: a consent decision is the user's own answer
             // coming back, and the persistent one changed a file on disk.
             surface.line(LineKind::Notice, &format_web_consent(decided));
+            EventOutcome::Rendered
+        }
+        // REQ-614 BR-7. **Never verbose-gated**, and that is the whole point of
+        // the event: on 2026-09-04 a session was pinned to the local tier by its
+        // first shell command and the user never found out. `/verbose` was off,
+        // and neither `privacy_block` nor the reroute renders as a standing
+        // notice — so 65 model calls ran on a 21,162-token local tier while the
+        // user waited for the 665,984-token remote one they had configured.
+        //
+        // The daemon publishes this on the **transition only**, so a session
+        // pinned twice prints one line.
+        Event::SessionPinned(pinned) => {
+            state.pinned = Some(pinned.cause.clone());
+            surface.line(LineKind::Notice, &format_session_pinned(pinned));
+            EventOutcome::Rendered
+        }
+        // Not verbose-gated either, for the reason `context_cleared` is not: the
+        // lift changes where every later turn runs, and a second attached client
+        // that did not type `/shell allow` would otherwise watch the session
+        // change tier in silence.
+        Event::SessionPinLifted(lifted) => {
+            state.pinned = None;
+            surface.line(LineKind::Notice, &format_session_pin_lifted(lifted));
             EventOutcome::Rendered
         }
         Event::WebTaintOverridden(overridden) => {
@@ -2742,6 +2772,38 @@ fn format_web_consent(decided: &WebConsentDecided) -> String {
 }
 
 /// The notice a `web_taint_overridden` draws.
+/// The standing line a pinned session prints once (REQ-614 BR-7).
+///
+/// Three facts, in the order a reader needs them: what happened, what it costs,
+/// and what to do about it. The remedy is a typed absence rather than an empty
+/// string, so "no command lifts this" is a sentence the user gets rather than a
+/// blank where one should be.
+fn format_session_pinned(pinned: &SessionPinned) -> String {
+    let budget = match pinned.budget_tokens {
+        Some(tokens) => format!(" (context budget {tokens} tokens)"),
+        None => String::new(),
+    };
+    let remedy = match &pinned.remedy {
+        PinRemedy::Command(cmd) => {
+            format!("`{cmd}` lifts it if you know the command touched no protected file.")
+        }
+        PinRemedy::None => "No remedy: a protected file was read.".to_owned(),
+    };
+    format!(
+        "privacy — this session is pinned to the local tier{budget}; cause: {}. {remedy}",
+        pinned.cause
+    )
+}
+
+/// The counterpart line when `/shell allow` lifts a pin.
+fn format_session_pin_lifted(lifted: &SessionPinLifted) -> String {
+    format!(
+        "privacy — local-tier pin lifted for this session after {} pinned turn(s); \
+         routing resumes by category.",
+        lifted.turns_pinned
+    )
+}
+
 fn format_web_taint_overridden(tiers: &[WebTier]) -> String {
     if tiers.is_empty() {
         return "web taint restriction lifted for this session; no tiers were granted to \
@@ -5310,11 +5372,16 @@ mod tests {
                     phase,
                     provider_id: ProviderId::from("local"),
                     model: Some("qwen2.5-coder-7b".to_owned()),
-                    // The daemon's own `taint_pin_reason` sentence, verbatim. It
-                    // names no specific cause since REQ-562 — the pin has three
-                    // sources and only one of them is boundary content — and
-                    // this renderer keys on the absent category/tier rather than
-                    // on the wording, which is what the assertions below check.
+                    // The daemon's own pin sentence, verbatim. Since REQ-614 it
+                    // is `taint_pin_reason_for` and it **does** name the cause
+                    // (and, for a liftable pin, the remedy) — but this renderer
+                    // keys on the absent category/tier rather than on the
+                    // wording, which is what the assertions below check and why
+                    // the wording change did not reach here. The literal below
+                    // is deliberately the pre-REQ-614 spelling: it is a fixture
+                    // for "some pinned-route reason", not a copy of the daemon's
+                    // current sentence, and pinning it to the live wording would
+                    // make this a second place that has to be kept in step.
                     reason: "an earlier privacy decision in this session; this turn is \
                              pinned to the local tier (BR-1 backstop)"
                         .to_owned(),
@@ -13790,5 +13857,126 @@ mod window_clause_client_tests {
             clause.starts_with(" · budget 665,984 words"),
             "a zero window is omitted, leaving the pre-REQ-616 line: {clause}"
         );
+    }
+}
+
+/// REQ-614 TASK-396 — the standing pin line the user actually sees.
+#[cfg(test)]
+mod session_pin_render {
+    use super::*;
+    use crate::render::RecordingSurface;
+    use teton_protocol::events::{PinRemedy, SessionPinLifted, SessionPinned};
+
+    fn envelope(event: Event) -> EventEnvelope {
+        EventEnvelope::new(1, Some(SessionId::from("s1")), event)
+    }
+
+    fn pinned(cause: &str, liftable: bool, remedy: PinRemedy) -> Event {
+        Event::SessionPinned(SessionPinned {
+            cause: cause.to_owned(),
+            liftable,
+            remedy,
+            budget_tokens: Some(21_162),
+        })
+    }
+
+    /// BR-7. **Verbose off**, and the line still prints.
+    ///
+    /// This is the whole point of the REQ's announcement half: on 2026-09-04
+    /// `/verbose` was off, the client rendered neither `privacy_block` nor the
+    /// reroute as a standing notice, and the user watched 65 turns run on a
+    /// 21,162-token tier without being told why.
+    ///
+    /// **Mutation**: wrap the `SessionPinned` arm in `if state.verbose` and this
+    /// goes red.
+    #[test]
+    fn the_pin_line_prints_once_with_verbose_off() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.verbose = false;
+
+        render_event(
+            &envelope(pinned(
+                "unknown_shell",
+                true,
+                PinRemedy::Command("/shell allow".to_owned()),
+            )),
+            &mut surface,
+            &mut state,
+        );
+
+        assert!(
+            surface.any_line_contains(LineKind::Notice, "pinned to the local tier"),
+            "the pin must be announced with verbose off"
+        );
+        assert!(surface.any_line_contains(LineKind::Notice, "unknown_shell"));
+        assert!(surface.any_line_contains(LineKind::Notice, "/shell allow"));
+        assert!(
+            surface.any_line_contains(LineKind::Notice, "21162"),
+            "the line names the budget the session dropped to"
+        );
+        assert_eq!(state.pinned.as_deref(), Some("unknown_shell"));
+    }
+
+    /// The permanent arm must not offer a remedy that would refuse the user,
+    /// and must say plainly that none exists.
+    #[test]
+    fn a_permanent_pin_says_there_is_no_remedy() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        render_event(
+            &envelope(pinned("boundary_hit", false, PinRemedy::None)),
+            &mut surface,
+            &mut state,
+        );
+        assert!(surface.any_line_contains(LineKind::Notice, "No remedy"));
+        assert!(surface.any_line_contains(LineKind::Notice, "protected file was read"));
+        assert!(
+            !surface.any_line_contains(LineKind::Notice, "/shell allow"),
+            "a permanent pin must not name a command that refuses it"
+        );
+    }
+
+    /// The lift's counterpart line, and the state it clears — so a later
+    /// `/doctor` does not report a pin that is gone.
+    #[test]
+    fn a_lift_prints_its_own_line_and_clears_the_state() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.pinned = Some("unknown_shell".to_owned());
+        render_event(
+            &envelope(Event::SessionPinLifted(SessionPinLifted {
+                turns_pinned: 65,
+            })),
+            &mut surface,
+            &mut state,
+        );
+        assert!(surface.any_line_contains(LineKind::Notice, "pin lifted"));
+        assert!(
+            surface.any_line_contains(LineKind::Notice, "65"),
+            "the line says what the pin cost"
+        );
+        assert!(state.pinned.is_none());
+    }
+
+    /// The benign path: a session that was never pinned prints no standing line.
+    /// Without this the assertions above would pass for a renderer that
+    /// announced on every event.
+    #[test]
+    fn an_unpinned_session_prints_no_standing_line() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        render_event(
+            &envelope(Event::ContextCleared(
+                teton_protocol::events::ContextCleared { blocks_dropped: 0 },
+            )),
+            &mut surface,
+            &mut state,
+        );
+        assert!(
+            !surface.any_line_contains(LineKind::Notice, "pinned to the local tier"),
+            "nothing but a pin announces a pin"
+        );
+        assert!(state.pinned.is_none());
     }
 }

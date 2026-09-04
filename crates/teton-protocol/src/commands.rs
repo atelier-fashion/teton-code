@@ -181,6 +181,11 @@ pub const SESSION_COMMANDS: &[SessionCommand] = &[
         user_only: true,
     },
     SessionCommand {
+        name: "shell allow",
+        effect: "lift this session's local-tier pin after an unknown-reach shell command; typed input only",
+        user_only: true,
+    },
+    SessionCommand {
         name: "provider setup",
         effect: "register a provider and route a tier to it: /provider setup [vendor] [tier]",
         user_only: true,

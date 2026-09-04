@@ -171,11 +171,24 @@ fn temp_repo() -> PathBuf {
 }
 
 fn boundaries() -> Vec<PrivacyBoundary> {
-    vec![PrivacyBoundary {
-        path_glob: "secrets/**".to_owned(),
-        mode: BoundaryMode::LocalOnly,
-        origin: Default::default(),
-    }]
+    vec![
+        PrivacyBoundary {
+            path_glob: "secrets/**".to_owned(),
+            mode: BoundaryMode::LocalOnly,
+            origin: Default::default(),
+        },
+        // REQ-614: one `**/`-anchored glob, so the fixture can reach a path
+        // **outside** the session root. `secrets/**` is repo-relative and
+        // matches nothing absolute, which is the whole difficulty AC-5 is about
+        // (LESSON-623: a boundary glob cannot name an out-of-root path through
+        // the ordinary identity seam). This is one of the thirteen builtins, so
+        // the fixture is not inventing a shape the product does not ship.
+        PrivacyBoundary {
+            path_glob: "**/.ssh/**".to_owned(),
+            mode: BoundaryMode::LocalOnly,
+            origin: Default::default(),
+        },
+    ]
 }
 
 fn contains_bytes(haystack: &[u8], needle: &str) -> bool {
@@ -259,7 +272,13 @@ async fn drive_scripted_turn(
         None,
         None,
     );
-    let tool_ctx = ToolContext::new(repo);
+    // REQ-614: the classifier needs a **project** root and the effective
+    // boundary set to reach any verdict but `Unknown`. Without both, every
+    // shell result here would be `Unknown` — the pre-REQ-614 answer — so the
+    // cases below would pass without exercising the narrowing at all.
+    let tool_ctx = ToolContext::new(repo)
+        .with_root_kind(teton_protocol::methods::RootKind::Project)
+        .with_boundaries(boundaries());
 
     let pending = Arc::new(PendingPermissions::new());
     let gate = PermissionGate::new(
@@ -378,14 +397,156 @@ async fn shell_cat_of_a_boundary_file_blocks_the_next_remote_turn() {
     )
     .await;
 
-    // A shell result cannot be attributed to a file set, so it is UNKNOWN — and
-    // the context is therefore unknown-provenance, which egress fail-closes.
+    // **REQ-614 changed this for the better.** Before, a shell result could not
+    // be attributed to a file set at all, so this was `unknown` and blocked on
+    // the sentinel path. Now the classifier resolves `secrets/prod.env` as an
+    // in-root path token that matches a boundary glob, so the result carries
+    // that identity and the block **names the actual file** — the same
+    // `privacy_block` a `read` of it produces.
+    //
+    // The guarantee is unchanged and the report is better: what the assertion
+    // moved from is a weaker claim, not a lost one.
+    let prov = context_provenance(&ctx);
     assert!(
-        context_provenance(&ctx).is_unknown(),
-        "a shell result must taint the context as unknown provenance"
+        !prov.is_unknown(),
+        "REQ-614: an in-root boundary path is named, not folded into `unknown`"
+    );
+    assert!(
+        prov.contains("secrets/prod.env"),
+        "the block must name the file the command read: {:?}",
+        prov.sources().collect::<Vec<_>>()
     );
     assert_blocked_and_clean(&result, &captured, &blocks);
+    assert_eq!(
+        blocks[0].path, "secrets/prod.env",
+        "and the event reports it too, rather than `<unknown-provenance>`"
+    );
     assert_last_tool_result_is_framed(&ctx);
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+// ---------------------------------------------------------------------------
+// REQ-614 — the narrowing, at the wire
+// ---------------------------------------------------------------------------
+
+/// **AC-1.** With the boundaries in force, `shell: ls -la` followed by a second
+/// prompt lets the second prompt reach the provider. The request body **leaves**.
+///
+/// This is the whole point of REQ-614, asserted where it can be observed. Before
+/// this REQ the same two turns produced a `privacy_block` on the second one,
+/// because every shell result carried unknown provenance and REQ-597 had made
+/// the builtin boundaries always-on — so the first shell command of any session
+/// pinned it to the local tier for life.
+///
+/// **Mutation**: make `ShellTool::run` tag `ToolProvenance::Unknown`
+/// unconditionally again and this test goes red — the second turn is refused
+/// and `captured` holds one body instead of two.
+#[tokio::test]
+async fn ls_la_then_a_second_prompt_reaches_the_remote_provider() {
+    let repo = temp_repo();
+    let (result, captured, blocks, ctx) =
+        run_touching_tool(&repo, ("c1", "shell", r#"{"command":"ls -la"}"#)).await;
+
+    // The turn completed rather than being refused at egress.
+    assert!(
+        result.is_ok(),
+        "AC-1: `ls -la` must not block the next remote turn, got {result:?}"
+    );
+    assert!(
+        blocks.is_empty(),
+        "AC-1: no privacy_block — the session carries no taint: {blocks:?}"
+    );
+
+    // The evidence that a request actually left: two bodies on the wire, the
+    // tool-call turn and the one carrying its result.
+    assert_eq!(
+        captured.len(),
+        2,
+        "AC-1: the second prompt's request body must have left the machine"
+    );
+
+    // And the context is clean — not merely unblocked.
+    let prov = context_provenance(&ctx);
+    assert!(
+        !prov.is_unknown(),
+        "AC-1: `ls -la` names no file and reads none, so it is provably rooted"
+    );
+    assert!(
+        !prov.is_boundary_touch(),
+        "AC-1: and it touched no boundary"
+    );
+
+    // Nothing leaked on the way: the boundary file exists in this repo and its
+    // contents must appear in neither body.
+    for body in &captured {
+        assert!(
+            !contains_bytes(body, SECRET),
+            "AC-1: boundary content reached the wire"
+        );
+    }
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// **BR-2, the benign path's twin.** The narrowing removes nothing: a command
+/// the classifier cannot prove anything about is refused exactly as every shell
+/// result was before, and the block names no path because there is none.
+///
+/// `ls -la` above and `curl` here differ only in the verb; that they land on
+/// opposite sides is the narrowing working rather than a coincidence of the
+/// fixture.
+#[tokio::test]
+async fn an_unknown_shell_result_still_blocks_its_own_turn() {
+    let repo = temp_repo();
+    let (result, captured, blocks, ctx) = run_touching_tool(
+        &repo,
+        ("c1", "shell", r#"{"command":"curl https://example.com"}"#),
+    )
+    .await;
+
+    assert!(
+        context_provenance(&ctx).is_unknown(),
+        "BR-2: an opaque verb is still unknown provenance"
+    );
+    assert_blocked_and_clean(&result, &captured, &blocks);
+    assert_eq!(
+        blocks[0].path, "<unknown-provenance>",
+        "BR-2: and it blocks on the sentinel, naming no file"
+    );
+    // Only one body left the machine — the tool-call turn. The second never went.
+    assert_eq!(captured.len(), 1, "the blocked turn sent nothing");
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// **AC-5 at the wire.** A path argument outside the session root that matches a
+/// boundary glob blocks on the `<boundary-touch>` sentinel, **not** on
+/// `<unknown-provenance>` — which is what makes the pin permanent rather than
+/// liftable (BR-3).
+///
+/// The distinction has no observable effect on *this* turn (both refuse), which
+/// is exactly why it needs its own assertion: the difference is in the pin, and
+/// a test that only checked "was it blocked" would pass with the two folded.
+#[tokio::test]
+async fn an_out_of_root_boundary_path_blocks_on_the_boundary_touch_sentinel() {
+    let repo = temp_repo();
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        std::fs::remove_dir_all(&repo).ok();
+        return;
+    };
+    if !home.join(".ssh/config").exists() {
+        // Nothing to resolve; skip rather than assert against a machine that
+        // has no ssh config.
+        std::fs::remove_dir_all(&repo).ok();
+        return;
+    }
+    let (result, captured, blocks, _ctx) =
+        run_touching_tool(&repo, ("c1", "shell", r#"{"command":"cat ~/.ssh/config"}"#)).await;
+
+    assert_blocked_and_clean(&result, &captured, &blocks);
+    assert_eq!(
+        blocks[0].path, "<boundary-touch>",
+        "AC-5/BR-3: an out-of-root boundary path must be distinguishable from a \
+         plain unknown, or `/shell allow` would lift a pin that must not lift"
+    );
     std::fs::remove_dir_all(&repo).ok();
 }
 
@@ -716,7 +877,7 @@ struct SessionProbe {
     turn_blocked: bool,
     privacy_blocks: usize,
     /// The commit pinned the session to the local tier (REQ-544 C-2, evaluated
-    /// by `runtime::context_is_sensitive` inside [`CarriedTurn`]).
+    /// by `runtime::context_taint_cause` inside [`CarriedTurn`]).
     pinned: bool,
     /// A later **model-composed** `web_fetch` in the same session, and the
     /// lookup transport's call count once it has been answered.
@@ -742,7 +903,7 @@ async fn probe_spelling(repo: &std::path::Path, path_arg: &str) -> (SessionProbe
         .session_id;
     let taint = Arc::new(SessionTaint::new());
 
-    // The real commit protocol. `runtime::context_is_sensitive` is crate-private
+    // The real commit protocol. `runtime::context_taint_cause` is crate-private
     // and `CarriedTurn` is the only path to it an integration test has — which
     // is also the only path production has.
     let mut turn = CarriedTurn::begin(
@@ -882,7 +1043,7 @@ fn assert_no_boundary_bytes(captured: &[Vec<u8>]) {
 /// This test verifies that *existing* behavior is now **reached**; it adds no
 /// new behavior. The local-tier pin and the model-composed web refusal it
 /// asserts were both delivered by **BUG-156** (resolved), and REQ-571 does not
-/// touch either: `context_is_sensitive` and the lookup taint gate are unchanged.
+/// touch either: `context_taint_cause` and the lookup taint gate are unchanged.
 /// What changed is that this spelling gets there. Before TASK-119 the `read`
 /// tagged the result with `/abs/root/secrets/prod.env` verbatim, `secrets/**`
 /// matched nothing, and every assertion below was false for this spelling while

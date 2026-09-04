@@ -105,8 +105,9 @@ use teton_protocol::methods::ProjectsListParams;
 use teton_protocol::methods::{
     ConfigGetParams, ConfigSetParams, ConfigUpdate, ModelStatusParams, PromptBlock,
     PromptTurnParams, SessionClearParams, SessionPermissionsParams, SessionPermissionsResult,
-    SessionRoot, SessionSetCwdParams, SkillSkipped, SkillSource, SkillView, SkillsListResult,
-    WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams, WebRefreshResult,
+    SessionRoot, SessionSetCwdParams, ShellOverrideParams, ShellOverrideResult, SkillSkipped,
+    SkillSource, SkillView, SkillsListResult, WebOverrideParams, WebOverrideResult,
+    WebRefreshOutcome, WebRefreshParams, WebRefreshResult,
 };
 use teton_protocol::methods::{
     ContextAction, RepoContextOrigin, RepoContextStateKind, SessionContextParams,
@@ -213,6 +214,28 @@ const CLI_FLAGS_ARE_SHELL_ONLY: &str =
 /// script that reaches for `teton model set` without the flag meets the
 /// above-RAM-floor confirmation on a stdin nobody is typing into, and an EOF
 /// declines it silently — a second dead end one step further along.
+/// What a piped `/shell allow` gets back (REQ-614 BR-5 / AC-6).
+///
+/// **A lift is the user's act, not a script's.** `/shell allow` releases a
+/// privacy pin caused by a shell command whose reach the daemon could not
+/// prove; the whole value of the pin is that a person decided the command
+/// touched nothing protected. A pipeline cannot make that judgement, so the
+/// gate refuses rather than assuming consent from an EOF.
+///
+/// This is deliberately **stricter than `/web allow`**, which carries no such
+/// gate. `/shell allow` borrows `/web allow`'s lift *semantics* — idempotence,
+/// the ledger row, session scope, the private setter — and `/model set`'s
+/// *gate*, because what it releases is a read of the filesystem rather than a
+/// restriction on model-composed lookups (REQ-614 ADR-614-6).
+const SHELL_ALLOW_TYPED_ONLY: &str =
+    "/shell allow is typed-input-only: this session's input is not a terminal, so the pin \
+     was not lifted. Lifting it is a judgement that the shell command touched no protected \
+     file, and only a person at the keyboard can make it.";
+
+/// What `/shell allow` says when there is no session to act on.
+const SHELL_ALLOW_NEEDS_A_SESSION: &str =
+    "`/shell allow` needs a session to act on, and this command owns none.";
+
 const MODEL_SET_TYPED_ONLY: &str =
     "/model set is typed-input-only: this session's input is not a terminal, so nothing was \
      changed — run `teton model set <name>` from a shell instead (add --yes for a pick above \
@@ -765,6 +788,14 @@ const COMMANDS: &[CommandSpec] = &[
         args: Args::Required("a URL — `/web refresh <url>`"),
         mirror: None,
         handler: handle_web_refresh,
+    },
+    CommandSpec {
+        name: "shell allow",
+        aliases: &[],
+        summary: "Lift this session's local-tier pin after an unknown-reach shell command.",
+        args: Args::None,
+        mirror: None,
+        handler: handle_shell_allow,
     },
     // REQ-579: the second instance of the guided-enablement pattern `/web setup`
     // opened, and it sits beside it for that reason. `Args::Optional` because
@@ -2495,6 +2526,83 @@ fn handle_web_allow(
     Ok(CommandOutcome::Continue)
 }
 
+/// The `/shell allow` handler: lift this session's `unknown_shell` pin
+/// (REQ-614 BR-5).
+///
+/// User-only **by construction**, not by check — the same argument
+/// [`handle_web_allow`] makes: the lift is a client RPC, tool dispatch has no
+/// path to one, and a model that emits a tool call named `shell allow` reaches
+/// the tool registry and finds no such tool. A `/shell allow` line inside a
+/// skill body, a `TETON.md` or a tool result is data: none of those are the
+/// entry line this table dispatches on.
+///
+/// **And typed-input-only on top of that**, which `/web allow` is not. See
+/// [`SHELL_ALLOW_TYPED_ONLY`].
+///
+/// It renders the daemon's answer rather than the event, because only the
+/// answer distinguishes the three outcomes: lifted now, pinned by a cause no
+/// command lifts, or not pinned at all.
+fn handle_shell_allow(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    _args: &str,
+) -> anyhow::Result<CommandOutcome> {
+    if cli_rows::write_gate(ctx.typed_input, test_seams_allowed()) == WriteGate::Refuse {
+        ctx.surface.line(LineKind::Error, SHELL_ALLOW_TYPED_ONLY);
+        return Ok(CommandOutcome::Continue);
+    }
+    let Some(session_id) = ctx.session_id.clone() else {
+        ctx.surface
+            .line(LineKind::Error, SHELL_ALLOW_NEEDS_A_SESSION);
+        return Ok(CommandOutcome::Continue);
+    };
+    let answered = conn.call(ShellOverrideParams { session_id }, ctx)?;
+    match answered {
+        Ok(result) => {
+            let (kind, line) = render_shell_override(&result);
+            ctx.surface.line(kind, &line);
+        }
+        Err(err) => {
+            ctx.surface
+                .line(LineKind::Error, &format!("`/shell allow` failed: {err}"));
+        }
+    }
+    Ok(CommandOutcome::Continue)
+}
+
+/// The line `/shell allow` renders from the daemon's answer (REQ-614).
+///
+/// Four outcomes, and each says something different, because "that did not
+/// work" without a reason is what sends a user looking for a command that does
+/// not exist.
+fn render_shell_override(result: &ShellOverrideResult) -> (LineKind, String) {
+    if !result.was_pinned {
+        return (
+            LineKind::Notice,
+            "this session is not pinned; nothing to lift.".to_owned(),
+        );
+    }
+    match (&result.cause, result.lifted_now) {
+        (Some(cause), false) if cause != "unknown_shell" => (
+            LineKind::Error,
+            format!(
+                "this session's pin cannot be lifted: {cause}. A protected file was read, and \
+                 no command undoes that for this session."
+            ),
+        ),
+        (_, false) => (
+            LineKind::Notice,
+            "this session's pin was already lifted; nothing changed.".to_owned(),
+        ),
+        (_, true) => (
+            LineKind::Notice,
+            "local-tier pin lifted for this session; routing resumes by category. Blocks \
+             already in context keep their provenance and are still refused."
+                .to_owned(),
+        ),
+    }
+}
+
 /// The `/web setup` handler: the guided enablement walkthrough (REQ-572 BR-2,
 /// ADR-1/ADR-3).
 ///
@@ -4157,6 +4265,11 @@ mod tests {
             // the argument, and `/help` lists it. Declared here because a new
             // row is a spec decision rather than a drive-by.
             "context init",
+            // REQ-614 BR-5: the user's lift for an `unknown_shell` pin. A row of
+            // its own rather than an argument to an existing one, because it is
+            // the only command in this table that releases a privacy decision —
+            // and, unlike `/web allow`, it is typed-input-only.
+            "shell allow",
         ];
         for expected in promised {
             assert!(
@@ -4305,6 +4418,105 @@ mod tests {
         // human. Over-claiming here is how a control becomes load-bearing for
         // something it never enforced.
         assert!(MODEL_SET_TYPED_ONLY.contains("not a terminal"));
+    }
+
+    /// REQ-614 BR-5 / AC-6. `/shell allow` runs only from a terminal.
+    ///
+    /// The gate is `/model set`'s — reused rather than re-implemented, so there
+    /// is one answer to "is a person typing this" and not two that could drift.
+    ///
+    /// **Mutation (recorded per conventions.md):** deleting the
+    /// `write_gate(..) == WriteGate::Refuse` early return from
+    /// `handle_shell_allow` makes `piped_shell_allow_is_refused_and_changes_nothing`
+    /// in `tests/cli_e2e.rs` go red — that is the test with a real piped stdin.
+    /// This one pins the *message*, which the e2e test cannot read.
+    #[test]
+    fn shell_allow_runs_only_from_a_terminal() {
+        // Benign path first: a real terminal runs, and so does the e2e seam.
+        assert_eq!(cli_rows::write_gate(true, false), WriteGate::Run);
+        assert_eq!(cli_rows::write_gate(false, true), WriteGate::Run);
+        // The shape that matters: piped input, no seam, no lift.
+        assert_eq!(cli_rows::write_gate(false, false), WriteGate::Refuse);
+
+        // What the message claims is what the gate checks — a terminal, not a
+        // human. And it says *why* a person is required, because "typed-input
+        // only" without the reason reads as an arbitrary restriction on a
+        // command a script has every reason to want.
+        assert!(SHELL_ALLOW_TYPED_ONLY.contains("not a terminal"));
+        assert!(SHELL_ALLOW_TYPED_ONLY.contains("judgement"));
+        assert!(SHELL_ALLOW_TYPED_ONLY.contains("was not lifted"));
+        // It must NOT point at an unattended surface the way `/model set` does:
+        // there is no `teton shell allow` that a script may run instead, and
+        // naming one would be an instruction to work around the gate.
+        assert!(!SHELL_ALLOW_TYPED_ONLY.contains("teton shell allow"));
+    }
+
+    /// The four outcomes `/shell allow` renders, each saying something
+    /// different (REQ-614 BR-5, AC-2, AC-3).
+    ///
+    /// A refusal that did not name the cause is what sends a user hunting for a
+    /// command that does not exist, and a "lifted" line on a session that was
+    /// never pinned confirms something that did not happen.
+    #[test]
+    fn shell_allow_renders_four_distinguishable_outcomes() {
+        let not_pinned = render_shell_override(&ShellOverrideResult {
+            was_pinned: false,
+            lifted_now: false,
+            cause: None,
+        });
+        assert_eq!(not_pinned.0, LineKind::Notice);
+        assert!(not_pinned.1.contains("not pinned"), "{}", not_pinned.1);
+
+        // AC-2: the refusal NAMES the cause.
+        let permanent = render_shell_override(&ShellOverrideResult {
+            was_pinned: true,
+            lifted_now: false,
+            cause: Some("boundary_hit".to_owned()),
+        });
+        assert_eq!(permanent.0, LineKind::Error);
+        assert!(permanent.1.contains("boundary_hit"), "{}", permanent.1);
+        assert!(permanent.1.contains("cannot be lifted"), "{}", permanent.1);
+
+        let lifted = render_shell_override(&ShellOverrideResult {
+            was_pinned: true,
+            lifted_now: true,
+            cause: Some("unknown_shell".to_owned()),
+        });
+        assert_eq!(lifted.0, LineKind::Notice);
+        assert!(lifted.1.contains("pin lifted"), "{}", lifted.1);
+        // BR-6: the lift does not un-taint what is already in context, and the
+        // line says so rather than letting the user infer a clean slate.
+        assert!(lifted.1.contains("still refused"), "{}", lifted.1);
+
+        let again = render_shell_override(&ShellOverrideResult {
+            was_pinned: true,
+            lifted_now: false,
+            cause: Some("unknown_shell".to_owned()),
+        });
+        assert!(again.1.contains("already lifted"), "{}", again.1);
+
+        // All four are distinguishable, which is the property the pair of
+        // booleans on the result exists to give.
+        let all = [not_pinned.1, permanent.1, lifted.1, again.1];
+        let unique: std::collections::BTreeSet<&String> = all.iter().collect();
+        assert_eq!(
+            unique.len(),
+            4,
+            "two outcomes render the same line: {all:?}"
+        );
+    }
+
+    /// AC-7. `/shell allow` is a **built-in row**, so no skill may take the
+    /// name — a repository shipping `.claude/skills/shell/SKILL.md` cannot
+    /// shadow the one command that releases a privacy pin.
+    ///
+    /// This is the structural half of AC-7's claim. The behavioural half — that
+    /// the text appearing inside a skill body or a tool result is inert — holds
+    /// because only an *entry line* reaches `classify`, and a tool result is
+    /// not an entry line.
+    #[test]
+    fn no_skill_may_take_the_shell_name() {
+        assert!(teton_protocol::methods::is_reserved_skill_name("shell"));
     }
 
     // The unknown-command arm echoes bytes the user chose, and a `Surface`

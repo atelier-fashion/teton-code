@@ -18,6 +18,65 @@
 
 use super::*;
 
+/// Why a session is pinned to the local tier (REQ-614 System Model).
+///
+/// The cause is what decides whether a lift exists. It is recorded once — the
+/// **first** cause wins — because a session pinned by reading `.env` and then
+/// again by an opaque `shell` must not become liftable on the second event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaintCause {
+    /// A `local-only` boundary was crossed. Permanent; no lift exists.
+    BoundaryHit,
+    /// A `shell` result whose reach the daemon could not prove entered context.
+    /// The one liftable cause (`/shell allow`, REQ-614 BR-4/BR-5).
+    UnknownShell,
+    /// A provenance source failed the canonical form. Permanent.
+    MalformedProvenance,
+    /// An untrusted MCP server's content was refused. Permanent.
+    McpUntrusted,
+    /// The redaction scan found something in an outbound payload (REQ-562).
+    /// Permanent.
+    ///
+    /// **Not in REQ-614's System Model table**, which lists four causes. The
+    /// table was written from the shell-provenance side and missed a cause the
+    /// daemon already pins with: `TaintingPrivacySink` taints on
+    /// `BlockCause::Redaction` today. Folding it into `BoundaryHit` would have
+    /// made the pin line say a boundary was crossed when none was — the class
+    /// of false sentence REQ-562 BR-3 exists to forbid.
+    RedactionFinding,
+}
+
+impl TaintCause {
+    /// Whether `/shell allow` can lift a pin with this cause.
+    ///
+    /// Exactly one cause is liftable, and the match is exhaustive rather than
+    /// `matches!(self, UnknownShell)` so that adding a fifth cause is a compile
+    /// error here — the place where "is this safe to let the user undo?" has to
+    /// be answered — instead of silently defaulting to permanent.
+    #[must_use]
+    pub fn liftable(self) -> bool {
+        match self {
+            TaintCause::UnknownShell => true,
+            TaintCause::BoundaryHit
+            | TaintCause::MalformedProvenance
+            | TaintCause::McpUntrusted
+            | TaintCause::RedactionFinding => false,
+        }
+    }
+
+    /// The wire spelling, for events and the doctor report.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaintCause::BoundaryHit => "boundary_hit",
+            TaintCause::UnknownShell => "unknown_shell",
+            TaintCause::MalformedProvenance => "malformed_provenance",
+            TaintCause::McpUntrusted => "mcp_untrusted",
+            TaintCause::RedactionFinding => "redaction_finding",
+        }
+    }
+}
+
 /// Per-session privacy taint — the BR-1 backstop (REQ-544 C-2).
 ///
 /// Once any tool result's provenance intersects a `local-only` boundary **or** is
@@ -29,9 +88,18 @@ use super::*;
 /// whole session is held local once it has seen boundary/unknown content. Shared
 /// across turns via the [`DaemonRuntime`] `Arc`, so the pin lives as long as the
 /// session (BR-4).
+///
+/// Since REQ-614 the pin is read through [`RoutePin`] rather than directly:
+/// one cause is liftable, and composing the lift into the predicate is what
+/// keeps all seven pinned-route sites honoring it.
 #[derive(Debug, Default)]
 pub struct SessionTaint {
-    tainted: Mutex<HashSet<SessionId>>,
+    /// Session -> the **first** cause that pinned it (REQ-614).
+    ///
+    /// Was a `HashSet<SessionId>`. The cause is what makes a pin explicable to
+    /// the user and what decides whether a lift exists; a bare set could say
+    /// only *that* a session was pinned.
+    tainted: Mutex<HashMap<SessionId, TaintCause>>,
 }
 
 impl SessionTaint {
@@ -57,11 +125,14 @@ impl SessionTaint {
     /// mutated would each have to say so, and the announcement is a call-site
     /// concern (`template_fallback_line`'s shape) rather than something this
     /// type performs.
-    pub fn mark(&self, session: &SessionId) -> bool {
-        self.tainted
-            .lock()
-            .expect("taint mutex poisoned")
-            .insert(session.clone())
+    pub fn mark(&self, session: &SessionId, cause: TaintCause) -> bool {
+        // `or_insert` and not `insert`: the first cause wins, so a session
+        // pinned permanently by a boundary read cannot be downgraded to a
+        // liftable `unknown_shell` by a later opaque command.
+        let mut tainted = self.tainted.lock().expect("taint mutex poisoned");
+        let before = tainted.len();
+        tainted.entry(session.clone()).or_insert(cause);
+        tainted.len() != before
     }
 
     /// The same mark, on a path that must not panic (REQ-567 verify).
@@ -83,22 +154,31 @@ impl SessionTaint {
     ///
     /// The explicit path keeps [`Self::mark`]'s `expect`: a poisoned set there
     /// is a bug to surface loudly, on a stack where surfacing it is safe.
-    pub fn try_mark(&self, session: &SessionId) -> bool {
+    pub fn try_mark(&self, session: &SessionId, cause: TaintCause) -> bool {
         let mut tainted = match self.tainted.lock() {
             Ok(tainted) => tainted,
             Err(poisoned) => poisoned.into_inner(),
         };
-        tainted.insert(session.clone())
+        let before = tainted.len();
+        tainted.entry(session.clone()).or_insert(cause);
+        tainted.len() != before
     }
 
     /// Whether `session` is pinned to the local tier by a prior boundary/unknown
     /// exposure.
     #[must_use]
     pub fn is_tainted(&self, session: &SessionId) -> bool {
+        self.cause(session).is_some()
+    }
+
+    /// The cause that pinned `session`, or `None` if it is not pinned.
+    #[must_use]
+    pub fn cause(&self, session: &SessionId) -> Option<TaintCause> {
         self.tainted
             .lock()
             .expect("taint mutex poisoned")
-            .contains(session)
+            .get(session)
+            .copied()
     }
 }
 
@@ -157,6 +237,119 @@ impl WebTaintOverride {
             .lock()
             .expect("web override mutex poisoned")
             .contains(session)
+    }
+}
+
+/// Per-session lift of a **liftable** taint pin — `/shell allow` (REQ-614 BR-5).
+///
+/// A sibling of [`SessionTaint`] and deliberately not a field on it, for
+/// exactly the reason [`WebTaintOverride`] gives: taint is a privacy fact the
+/// daemon establishes about a session, and this is a decision the *user* made
+/// about that fact. Folding the second into the first would let anything that
+/// can mark taint also unmark its consequence.
+///
+/// ## The setter is private, which is the whole of BR-5's last sentence
+///
+/// [`Self::lift`] carries no `pub`, so it is reachable from this module and its
+/// children and from nowhere else in the crate — in particular not from
+/// `crate::harness::tools`, where a model's tool call lands. The single caller
+/// is the `shell/override` client RPC. "The model cannot lift its own pin" is
+/// therefore not a runtime check somebody could forget; a model-issued lift
+/// does not compile.
+///
+/// Session-scoped and never persisted: a fresh session starts pinned-on-taint
+/// again.
+#[derive(Debug, Default)]
+pub struct ShellTaintOverride {
+    lifted: Mutex<HashSet<SessionId>>,
+}
+
+impl ShellTaintOverride {
+    /// An empty set — nothing lifted.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Lift the pin for `session`, returning whether this call was the
+    /// pinned->lifted transition.
+    ///
+    /// Idempotent, and the returned transition is what keeps the ledger honest:
+    /// a second `/shell allow` in a lifted session writes no row (BR-5).
+    ///
+    /// **Intentionally not `pub`** — see the type docs.
+    ///
+    /// The single production caller is `DaemonRuntime::shell_override`, the
+    /// `shell/override` RPC handler.
+    pub(super) fn lift(&self, session: &SessionId) -> bool {
+        self.lifted
+            .lock()
+            .expect("shell override mutex poisoned")
+            .insert(session.clone())
+    }
+
+    /// Whether the user has lifted this session's pin.
+    #[must_use]
+    pub fn is_lifted(&self, session: &SessionId) -> bool {
+        self.lifted
+            .lock()
+            .expect("shell override mutex poisoned")
+            .contains(session)
+    }
+}
+
+/// The one question every route asks about taint: **does this session's pin
+/// force the local tier right now?** (REQ-614 ADR-614-4)
+///
+/// Seven call sites used to read `SessionTaint::is_tainted` directly — the turn
+/// path's `dispatch_route` and the six duty routes. Teaching each of them about
+/// the lift would be seven chances to miss one, and a missed one is a session
+/// that stays pinned after the user lifted it with nothing failing. So the
+/// *predicate* changed instead: the lift is honored at all seven by
+/// construction, which is what "where the rule is a property of a method rather
+/// than of its callers, put it on the method" means here.
+///
+/// Read-only by construction — it holds two `Arc`s and exposes no setter, the
+/// same inversion [`SessionTaintView`] uses for the lookup seam. Nothing that
+/// can reach a `RoutePin` gains the ability to mark or to lift.
+#[derive(Clone)]
+pub struct RoutePin {
+    taint: Arc<SessionTaint>,
+    lifted: Arc<ShellTaintOverride>,
+}
+
+impl RoutePin {
+    /// Compose the two handles into the one read.
+    #[must_use]
+    pub fn new(taint: Arc<SessionTaint>, lifted: Arc<ShellTaintOverride>) -> Self {
+        Self { taint, lifted }
+    }
+
+    /// Whether this session's turns must be served locally.
+    ///
+    /// `false` only when the pin's cause is liftable **and** the user has
+    /// lifted it. A `boundary_hit` pin ignores the override set entirely, which
+    /// is BR-3's "no lift exists for this cause" expressed as code rather than
+    /// as a check somewhere upstream.
+    #[must_use]
+    pub fn pins(&self, session: &SessionId) -> bool {
+        match self.taint.cause(session) {
+            None => false,
+            Some(cause) => !(cause.liftable() && self.lifted.is_lifted(session)),
+        }
+    }
+
+    /// The cause pinning `session`, whether or not it has been lifted — what
+    /// `/doctor` reports and what a refusal names.
+    #[must_use]
+    pub fn cause(&self, session: &SessionId) -> Option<TaintCause> {
+        self.taint.cause(session)
+    }
+
+    /// Whether the user has already lifted this session's pin.
+    #[must_use]
+    pub fn is_lifted(&self, session: &SessionId) -> bool {
+        self.lifted.is_lifted(session)
     }
 }
 
@@ -312,7 +505,7 @@ impl WebLookupSeam for RuntimeLookupSeam {
 ///
 /// The gap it closes is not hypothetical but it is currently *masked*: the
 /// content that got the duty refused is still in the turn's context, so
-/// `context_is_sensitive` taints the session when the turn ends. That is an
+/// `context_taint_cause` taints the session when the turn ends. That is an
 /// incidental cover — it depends on the refusing content still being in `ctx`
 /// at the end of the turn, which compaction and truncation are both entitled to
 /// change — and it is exactly the almost-true invariant a later change builds
@@ -341,6 +534,12 @@ pub(super) struct TaintingPrivacySink {
     pub(super) taint: Arc<SessionTaint>,
     /// Which causes pin, for the choke point this sink was built for.
     pub(super) taints: CauseGate,
+    /// The local tier's configured token budget, for `session_pinned` (REQ-614).
+    ///
+    /// A static fact of the tier, not a per-route derivation: this sink fires
+    /// before the next turn's route is decided, so no per-route figure exists
+    /// yet — respected by not pretending to have one here.
+    pub(super) local_budget_tokens: Option<u64>,
 }
 
 /// Which block causes pin their session — a rule a [`TaintingPrivacySink`] is
@@ -355,7 +554,16 @@ impl TaintingPrivacySink {
             events,
             taint,
             taints: cause_taints_the_session,
+            local_budget_tokens: None,
         }
+    }
+
+    /// The same sink, told the local tier's token budget so `session_pinned`
+    /// can state what the session dropped to (REQ-614 BR-7).
+    #[must_use]
+    pub(super) fn with_local_budget(mut self, tokens: Option<u64>) -> Self {
+        self.local_budget_tokens = tokens;
+        self
     }
 
     /// The sink for the **MCP** choke point: [`mcp_cause_taints_the_session`],
@@ -366,6 +574,7 @@ impl TaintingPrivacySink {
             events,
             taint,
             taints: mcp_cause_taints_the_session,
+            local_budget_tokens: None,
         }
     }
 }
@@ -378,8 +587,18 @@ impl crate::egress::PrivacyEventSink for TaintingPrivacySink {
     ) {
         if let Some(session_id) = &session_id {
             // One line per session, on the transition only — `mark` reports it.
-            if (self.taints)(&block.cause) && self.taint.mark(session_id) {
-                eprintln!("{}", taint_pin_line(taint_cause_word(&block.cause)));
+            let cause = cause_of(&block);
+            if (self.taints)(&block.cause) && self.taint.mark(session_id, cause) {
+                eprintln!("{}", taint_pin_line(cause));
+                // REQ-614 BR-7. The stderr line above is the **daemon's** log,
+                // which the user does not read — that is exactly why the
+                // 2026-09-04 session was pinned for 65 turns with nobody the
+                // wiser. The event is what reaches the client, which renders it
+                // as a standing line whether or not `/verbose` is on.
+                self.events.publish(
+                    Some(session_id.clone()),
+                    Event::SessionPinned(session_pinned_payload(cause, self.local_budget_tokens)),
+                );
             }
         }
         self.events.privacy_block(session_id, block);
@@ -490,43 +709,85 @@ pub(super) fn taints_the_session(detail: BlockDetail) -> bool {
     }
 }
 
-/// A `local-only` boundary was crossed — REQ-544 C-2's original cause.
-pub(super) const TAINT_BY_BOUNDARY: &str = "a `local-only` privacy boundary was crossed";
-/// The redaction scan found something in an outbound payload (REQ-562).
-pub(super) const TAINT_BY_REDACTION: &str =
-    "the redaction scan found sensitive content in an outbound payload";
-/// This turn's assembled context carried boundary or unknown-provenance content.
-pub(crate) const TAINT_BY_CONTEXT: &str = "this turn read boundary or unknown-provenance content";
-/// Unreachable: [`cause_taints_the_session`] and [`mcp_cause_taints_the_session`]
-/// both answer `false` for `ScanUnavailable`, so no announcement is ever minted
-/// for it. Present so the maps below are total, and worded so that a future
-/// change which *does* pin on it produces a puzzling line rather than a panic in
-/// the daemon.
-pub(super) const TAINT_BY_UNSTATED_CAUSE: &str = "a blocked outbound payload";
-
-pub(crate) fn taint_pin_line(cause: &'static str) -> String {
-    format!(
-        "tetond: privacy — this session is pinned to the local tier for the rest of its life \
-         ({cause}); remote providers will not be used in it again."
-    )
-}
-
-/// The class word a [`BlockCause`] announces its pin with.
-pub(super) fn taint_cause_word(cause: &BlockCause) -> &'static str {
-    match cause {
-        BlockCause::Boundary => TAINT_BY_BOUNDARY,
-        BlockCause::Redaction { .. } => TAINT_BY_REDACTION,
-        BlockCause::ScanUnavailable => TAINT_BY_UNSTATED_CAUSE,
+/// The [`TaintCause`] a `privacy_block` records (REQ-614).
+///
+/// Derived from the block's **path**, not from its `cause`, because that is
+/// where the distinction this REQ turns on survives: `BlockCause::Boundary`
+/// covers a real boundary path, an unknown-provenance sentinel and a
+/// boundary-touch sentinel alike, and only the first and third are permanent.
+/// A pin whose cause came from `BlockCause` alone would make `~/.ssh/config`
+/// liftable.
+fn cause_of(block: &teton_protocol::events::PrivacyBlock) -> TaintCause {
+    use crate::egress::provenance::{MALFORMED_PROVENANCE_PATH, UNKNOWN_PROVENANCE_PATH};
+    match &block.cause {
+        BlockCause::Redaction { .. } => TaintCause::RedactionFinding,
+        // Unreachable in production — `cause_taints_the_session` answers `false`
+        // for it — and mapped rather than left to a catch-all so the map is
+        // total. Permanent, which is the fail-closed direction for a cause
+        // nothing is supposed to pin on.
+        BlockCause::ScanUnavailable => TaintCause::BoundaryHit,
+        BlockCause::Boundary => match block.path.as_str() {
+            UNKNOWN_PROVENANCE_PATH => TaintCause::UnknownShell,
+            MALFORMED_PROVENANCE_PATH => TaintCause::MalformedProvenance,
+            // A real repo path, or `BOUNDARY_TOUCH_PATH`. Both mean a
+            // `local-only` file was named, and neither lifts.
+            _ => TaintCause::BoundaryHit,
+        },
     }
 }
 
-/// The same word, from the turn path's [`BlockDetail`] vocabulary — the second
-/// spelling [`taints_the_session`] already exists in, for the same reason.
-pub(super) fn taint_detail_word(detail: BlockDetail) -> &'static str {
-    match detail {
-        BlockDetail::Boundary => TAINT_BY_BOUNDARY,
-        BlockDetail::Redaction => TAINT_BY_REDACTION,
-        BlockDetail::ScanUnavailable => TAINT_BY_UNSTATED_CAUSE,
+/// The daemon's own stderr line when a session is pinned.
+///
+/// **This is the daemon's log, not the user's notice** — which is exactly why
+/// the 2026-09-04 session ran 65 pinned turns with nobody the wiser. BR-7's
+/// user-facing line is the client's render of `session_pinned`.
+///
+/// REQ-614 replaced the three `TAINT_BY_*` word constants and the two maps that
+/// selected between them (`taint_cause_word`, `taint_detail_word`) with
+/// `TaintCause::as_str`. Three vocabularies for one fact is three places for
+/// the wording to drift; the cause is now the vocabulary.
+pub(crate) fn taint_pin_line(cause: TaintCause) -> String {
+    // REQ-614: two arms, because the old sentence — "for the rest of its life
+    // … remote providers will not be used in it again" — became **false** the
+    // moment one cause gained a lift. One composer with a `liftable` branch
+    // rather than two sentences in two places, which is what keeps the liftable
+    // arm from inheriting the permanent arm's claim as the wording drifts
+    // (LESSON-557).
+    if cause.liftable() {
+        format!(
+            "tetond: privacy — this session is pinned to the local tier because a shell \
+             result of unknown reach entered its context ({}); `/shell allow` lifts it if \
+             you know the command touched no protected file.",
+            cause.as_str()
+        )
+    } else {
+        format!(
+            "tetond: privacy — this session is pinned to the local tier for the rest of its \
+             life ({}); remote providers will not be used in it again.",
+            cause.as_str()
+        )
+    }
+}
+
+/// The `session_pinned` payload for a cause (REQ-614 BR-7).
+///
+/// One composer, so the event's `liftable` flag and its `remedy` cannot
+/// disagree with each other or with [`taint_pin_line`]: all three read
+/// `TaintCause::liftable`.
+pub(super) fn session_pinned_payload(
+    cause: TaintCause,
+    budget_tokens: Option<u64>,
+) -> teton_protocol::events::SessionPinned {
+    use teton_protocol::events::{PinRemedy, SessionPinned};
+    SessionPinned {
+        cause: cause.as_str().to_owned(),
+        liftable: cause.liftable(),
+        remedy: if cause.liftable() {
+            PinRemedy::Command("/shell allow".to_owned())
+        } else {
+            PinRemedy::None
+        },
+        budget_tokens,
     }
 }
 
@@ -829,7 +1090,9 @@ mod web_lookup_seam {
         let events = Arc::new(EventBus::new());
         let mut sub = events.subscribe(16);
         let session = SessionId::from("sess-under-test");
-        runtime.session_taint.mark(&session);
+        runtime
+            .session_taint
+            .mark(&session, TaintCause::BoundaryHit);
 
         // Non-vacuity: the gate really is restricted before the RPC.
         let view = runtime.web_taint_view();
@@ -874,7 +1137,9 @@ mod web_lookup_seam {
         let runtime = runtime_with(WebTier::FetchUserUrl, false);
         let events = Arc::new(EventBus::new());
         let session = SessionId::from("sess-under-test");
-        runtime.session_taint.mark(&session);
+        runtime
+            .session_taint
+            .mark(&session, TaintCause::BoundaryHit);
 
         let result = runtime.web_override(
             &WebOverrideParams {
@@ -931,7 +1196,9 @@ mod web_lookup_seam {
         );
 
         // The restriction that arrives afterwards must actually restrict.
-        runtime.session_taint.mark(&session);
+        runtime
+            .session_taint
+            .mark(&session, TaintCause::BoundaryHit);
         let view = runtime.web_taint_view();
         assert!(view.is_tainted(&session));
         assert!(
@@ -958,7 +1225,9 @@ mod web_lookup_seam {
         );
         assert!(runtime.ledger.all_web_overrides().expect("read").is_empty());
 
-        runtime.session_taint.mark(&session);
+        runtime
+            .session_taint
+            .mark(&session, TaintCause::BoundaryHit);
         runtime.web_override(
             &WebOverrideParams {
                 session_id: session.clone(),
@@ -995,7 +1264,9 @@ mod web_lookup_seam {
         let events = Arc::new(EventBus::new());
         let mut sub = events.subscribe(16);
         let session = SessionId::from("sess-under-test");
-        runtime.session_taint.mark(&session);
+        runtime
+            .session_taint
+            .mark(&session, TaintCause::BoundaryHit);
         let params = WebOverrideParams {
             session_id: session,
         };
@@ -1856,5 +2127,534 @@ mod web_lookup_seam {
              wire; request head:\n{}",
             kagi.requests()[0]
         );
+    }
+}
+
+/// REQ-614 TASK-392 — the cause, the lift, and the one predicate seven routes
+/// share.
+#[cfg(test)]
+mod shell_pin {
+    use super::*;
+
+    fn pin() -> (Arc<SessionTaint>, Arc<ShellTaintOverride>, RoutePin) {
+        let taint = Arc::new(SessionTaint::new());
+        let lifted = Arc::new(ShellTaintOverride::new());
+        let route = RoutePin::new(taint.clone(), lifted.clone());
+        (taint, lifted, route)
+    }
+
+    /// BR-3. A boundary pin ignores the override set entirely — there is no
+    /// lift for this cause, and that is a property of `RoutePin::pins` rather
+    /// than a check someone remembered to put upstream.
+    ///
+    /// **Mutation**: drop `cause.liftable() &&` from `RoutePin::pins` and this
+    /// goes red.
+    #[test]
+    fn a_boundary_hit_pin_is_never_liftable() {
+        let (taint, lifted, route) = pin();
+        let s = SessionId::from("perm");
+        taint.mark(&s, TaintCause::BoundaryHit);
+        assert!(route.pins(&s));
+        lifted.lift(&s);
+        assert!(
+            route.pins(&s),
+            "BR-3: a boundary hit stays pinned however many lifts are recorded"
+        );
+        assert!(!TaintCause::BoundaryHit.liftable());
+    }
+
+    /// BR-4/BR-5, and the benign twin of the test above: the one liftable cause
+    /// really does lift.
+    #[test]
+    fn an_unknown_shell_pin_lifts_and_nothing_else_does() {
+        let (taint, lifted, route) = pin();
+        let s = SessionId::from("liftable");
+        taint.mark(&s, TaintCause::UnknownShell);
+        assert!(route.pins(&s), "pinned before the lift");
+        assert!(lifted.lift(&s), "the first lift is the transition");
+        assert!(!route.pins(&s), "BR-4: routing by category resumes");
+        assert!(!lifted.lift(&s), "a second lift is not a transition");
+        // A different session is untouched — the lift is per session.
+        let other = SessionId::from("bystander");
+        taint.mark(&other, TaintCause::UnknownShell);
+        assert!(route.pins(&other));
+    }
+
+    /// The first cause wins. A session pinned permanently by reading `.env` and
+    /// then again by an opaque `shell` must not become liftable.
+    ///
+    /// **Mutation**: use `insert` instead of `entry().or_insert()` in
+    /// `SessionTaint::mark` and this goes red.
+    #[test]
+    fn the_first_cause_wins_so_a_permanent_pin_cannot_be_downgraded() {
+        let (taint, lifted, route) = pin();
+        let s = SessionId::from("both");
+        assert!(
+            taint.mark(&s, TaintCause::BoundaryHit),
+            "first is a transition"
+        );
+        assert!(
+            !taint.mark(&s, TaintCause::UnknownShell),
+            "second is a re-mark"
+        );
+        assert_eq!(taint.cause(&s), Some(TaintCause::BoundaryHit));
+        lifted.lift(&s);
+        assert!(route.pins(&s), "still permanently pinned");
+    }
+
+    /// BR-4's remedy sentence, and the permanent arm's refusal to make it.
+    #[test]
+    fn an_unknown_shell_pin_names_its_remedy() {
+        let liftable = crate::runtime::taint_pin_reason_for("this turn", TaintCause::UnknownShell);
+        assert!(liftable.contains("/shell allow"), "{liftable}");
+        assert!(
+            liftable.contains("shell result of unknown reach"),
+            "{liftable}"
+        );
+        let permanent = crate::runtime::taint_pin_reason_for("this turn", TaintCause::BoundaryHit);
+        assert!(!permanent.contains("/shell allow"), "{permanent}");
+        assert!(permanent.contains("boundary_hit"), "{permanent}");
+    }
+
+    /// ADR-614-4 — **the sweep**, asserted as a region check rather than a count.
+    ///
+    /// Relocating a call keeps a count identical (LESSON-568), so this reads the
+    /// bodies of the seven functions that force a local route and requires each
+    /// to consult `route_pin()`. A site that reverted to the raw taint bit would
+    /// still route correctly for an unlifted session and would silently ignore
+    /// every lift — nothing else in the suite looks at all seven.
+    ///
+    /// **Mutation**: change any one of the seven back to
+    /// `self.session_taint.is_tainted(session_id)` and this goes red naming it.
+    #[test]
+    fn every_pinned_route_site_reads_the_composed_predicate() {
+        // Cut each corpus at its first column-0 `#[cfg(test)]`, or the tests
+        // below (which legitimately call `is_tainted`) would be scanned too.
+        let duty = include_str!("duty.rs");
+        let duty = &duty[..duty.find("\n#[cfg(test)]").unwrap_or(duty.len())];
+        let turn = include_str!("turn.rs");
+        let turn = &turn[..turn.find("\n#[cfg(test)]").unwrap_or(turn.len())];
+
+        // Floors: a corpus that has stopped containing the subject would satisfy
+        // the prohibition vacuously (BUG-159).
+        for (name, text, anchor) in [
+            ("duty.rs", duty, "fn digest_route("),
+            ("turn.rs", turn, "fn dispatch_route("),
+        ] {
+            assert!(text.contains(anchor), "{name} is not the file this scans");
+        }
+
+        let duty_sites = duty.matches("self.route_pin().pins(session_id)").count();
+        assert_eq!(
+            duty_sites, 6,
+            "the six duty routes must all read the composed predicate; found {duty_sites}"
+        );
+        assert_eq!(
+            turn.matches("self.route_pin().pins(session_id)").count(),
+            1,
+            "`dispatch_route` must read the composed predicate"
+        );
+        for (name, text) in [("duty.rs", duty), ("turn.rs", turn)] {
+            assert!(
+                !text.contains("session_taint.is_tainted(session_id)"),
+                "{name} still forces a local route from the raw taint bit, which \
+                 ignores every `/shell allow` lift"
+            );
+        }
+    }
+
+    /// The lift's setter is not `pub` — the property that makes "a model cannot
+    /// lift its own pin" a compile-time fact rather than a runtime check.
+    ///
+    /// Asserted on the source, as `runtime_visibility.rs` does for
+    /// `WebTaintOverride::lift`: there is no way to write a test that fails to
+    /// compile on purpose.
+    #[test]
+    fn the_lift_setter_is_not_crate_visible() {
+        let source = include_str!("taint.rs");
+        let source = &source[..source.find("\n#[cfg(test)]").unwrap_or(source.len())];
+        assert!(
+            source.contains("pub(super) fn lift(&self, session: &SessionId) -> bool"),
+            "ShellTaintOverride::lift must stay `pub(super)`"
+        );
+        assert!(
+            !source.contains("pub fn lift(&self, session: &SessionId)"),
+            "a `pub fn lift` is reachable from `crate::harness::tools`, where a \
+             model's tool call lands"
+        );
+    }
+}
+
+/// REQ-614 TASK-395 — the daemon half of `/shell allow`.
+#[cfg(test)]
+mod shell_override_rpc {
+    use super::*;
+    use teton_protocol::methods::ShellOverrideParams;
+
+    fn params(session: &SessionId) -> ShellOverrideParams {
+        ShellOverrideParams {
+            session_id: session.clone(),
+        }
+    }
+
+    /// AC-2. A `boundary_hit` pin is refused, and the refusal **names the
+    /// cause** — "that did not work" without a reason is what sends a user
+    /// looking for a command that does not exist.
+    #[test]
+    fn shell_allow_is_refused_on_a_boundary_hit_and_names_the_cause() {
+        let runtime = DaemonRuntime::minimal();
+        let events = Arc::new(EventBus::new());
+        let session = SessionId::from("perm");
+        runtime
+            .session_taint
+            .mark(&session, TaintCause::BoundaryHit);
+
+        let result = runtime.shell_override(&params(&session), &events);
+        assert!(result.was_pinned);
+        assert!(!result.lifted_now, "BR-3: no lift exists for this cause");
+        assert_eq!(result.cause.as_deref(), Some("boundary_hit"));
+        // And the route still pins.
+        assert!(runtime.route_pin().pins(&session));
+        // Nothing was written: a refused lift leaves no ledger row (assert the
+        // absence — LESSON-550).
+        assert!(runtime
+            .ledger
+            .all_shell_overrides()
+            .expect("read")
+            .is_empty());
+    }
+
+    /// AC-3. The liftable cause lifts, writes exactly one row, and a second
+    /// call writes none.
+    #[test]
+    fn a_second_shell_allow_writes_no_row() {
+        let runtime = DaemonRuntime::minimal();
+        let events = Arc::new(EventBus::new());
+        let session = SessionId::from("liftable");
+        runtime
+            .session_taint
+            .mark(&session, TaintCause::UnknownShell);
+
+        let first = runtime.shell_override(&params(&session), &events);
+        assert!(first.was_pinned && first.lifted_now);
+        assert!(!runtime.route_pin().pins(&session), "routing resumes");
+        assert_eq!(runtime.ledger.all_shell_overrides().expect("read").len(), 1);
+
+        let second = runtime.shell_override(&params(&session), &events);
+        assert!(second.was_pinned, "the session is still recorded as pinned");
+        assert!(!second.lifted_now, "a second lift is not a transition");
+        assert_eq!(
+            runtime.ledger.all_shell_overrides().expect("read").len(),
+            1,
+            "BR-5: a second `/shell allow` writes no row"
+        );
+    }
+
+    /// An unpinned session is a third outcome, distinct from both — a client
+    /// that could not tell it from "already lifted" would confirm a lift that
+    /// never happened.
+    #[test]
+    fn shell_allow_on_an_unpinned_session_changes_nothing() {
+        let runtime = DaemonRuntime::minimal();
+        let events = Arc::new(EventBus::new());
+        let session = SessionId::from("clean");
+        let result = runtime.shell_override(&params(&session), &events);
+        assert!(!result.was_pinned);
+        assert!(!result.lifted_now);
+        assert!(result.cause.is_none());
+        assert!(runtime
+            .ledger
+            .all_shell_overrides()
+            .expect("read")
+            .is_empty());
+    }
+
+    /// AC-7, the absence half. A `/shell allow` that arrives as **text** —
+    /// inside a skill body, a `TETON.md` or a tool result — reaches no handler,
+    /// so the session stays pinned and the ledger stays empty.
+    ///
+    /// The structural reason is that the lift is a client RPC and tool dispatch
+    /// has no path to one; this asserts the consequence rather than the
+    /// mechanism, because a mechanism can be re-implemented and a consequence
+    /// cannot be argued with (LESSON-550: assert the absence).
+    #[test]
+    fn shell_allow_as_text_is_inert() {
+        let runtime = DaemonRuntime::minimal();
+        let session = SessionId::from("texty");
+        runtime
+            .session_taint
+            .mark(&session, TaintCause::UnknownShell);
+
+        // The mechanism, asserted rather than described: there is no **tool**
+        // by any of these names, so a model that emits one gets "no such tool"
+        // and the text never reaches a lift. This is the daemon-side half of
+        // "a `/shell allow` line inside a tool result is data".
+        let registry = crate::harness::tools::ToolRegistry::new();
+        let names = registry.names();
+        for forbidden in ["shell allow", "shell_allow", "shell/override"] {
+            assert!(
+                !names.contains(&forbidden),
+                "a tool named {forbidden:?} would give the model a path to the lift: {names:?}"
+            );
+        }
+        // And no skill may take the name either, so a repository-supplied
+        // `.claude/skills/shell/SKILL.md` cannot shadow the row (LESSON-578: a
+        // rule attached to one flow guards one door — this is the second).
+        assert!(teton_protocol::methods::is_reserved_skill_name("shell"));
+
+        // The consequence, which is what AC-7 actually claims: after all of
+        // that, the session is still pinned and the ledger is still empty.
+        assert!(
+            runtime.route_pin().pins(&session),
+            "the session must still be pinned"
+        );
+        assert!(
+            runtime
+                .ledger
+                .all_shell_overrides()
+                .expect("read")
+                .is_empty(),
+            "AC-7: the ledger has no row"
+        );
+    }
+}
+
+/// REQ-614 TASK-397 — the routing and event claims the wire tests cannot make.
+///
+/// These need the runtime's route decision, its taint map and its lift set;
+/// `provenance_egress.rs` drives the harness loop directly and has none of them.
+#[cfg(test)]
+mod shell_pin_lifecycle {
+    use super::*;
+    use teton_protocol::methods::ShellOverrideParams;
+
+    /// **AC-8.** An `unknown` block carried into a later turn of a **lifted**
+    /// session is still refused at egress, and the turn is rerouted local
+    /// **without re-pinning** the session.
+    ///
+    /// This is the case that makes the lift honest rather than a leak: what
+    /// `/shell allow` changes is that *later* turns are routed by category
+    /// again, not that the blocks already in context become sendable (BR-6).
+    /// The context is re-inspected every turn (REQ-567), so the carried block
+    /// keeps refusing on its own merits.
+    ///
+    /// "Without re-pinning" is the subtle half. `context_taint_cause` runs at
+    /// the carried turn's commit and marks again — but `mark` keeps the first
+    /// cause, so the session's recorded cause and its lift both survive, and
+    /// the route stays unpinned.
+    #[test]
+    fn a_carried_unknown_block_in_a_lifted_session_is_still_refused() {
+        use crate::egress::{inspect, Provenance};
+        use teton_core::boundary::BoundaryMatcher;
+        use teton_protocol::events::PrivacyAction;
+
+        let runtime = DaemonRuntime::minimal();
+        let events = Arc::new(EventBus::new());
+        let session = SessionId::from("lifted-carry");
+        runtime
+            .session_taint
+            .mark(&session, TaintCause::UnknownShell);
+        assert!(
+            runtime
+                .shell_override(
+                    &ShellOverrideParams {
+                        session_id: session.clone()
+                    },
+                    &events
+                )
+                .lifted_now
+        );
+        assert!(!runtime.route_pin().pins(&session), "routing resumed");
+
+        // The carried block. Egress inspects provenance, not the pin, so the
+        // lift has no bearing on it.
+        let bounds = vec![teton_core::entities::PrivacyBoundary::builtin("**/.env")];
+        let matcher = BoundaryMatcher::new(&bounds).expect("compiles");
+        let verdict = inspect(
+            &Provenance::unknown(),
+            &matcher,
+            PrivacyAction::ReroutedToLocal,
+        );
+        let crate::egress::Inspection::Blocked(violation) = verdict else {
+            panic!("BR-6: a carried unknown block must still be refused after a lift");
+        };
+        assert_eq!(
+            violation.path, "<unknown-provenance>",
+            "AC-8: and the block names the sentinel"
+        );
+
+        // No re-pin: the cause is unchanged and the lift still holds, so the
+        // *next* turn is still routed by category.
+        runtime
+            .session_taint
+            .mark(&session, TaintCause::UnknownShell);
+        assert_eq!(
+            runtime.session_taint.cause(&session),
+            Some(TaintCause::UnknownShell)
+        );
+        assert!(
+            !runtime.route_pin().pins(&session),
+            "AC-8: the turn is rerouted local without re-pinning the session"
+        );
+    }
+
+    /// **AC-11.** The transcript for a pinned session carries one
+    /// `session_pinned` **before** the first pinned `route_decided`, and one
+    /// `session_pin_lifted` after `/shell allow`.
+    ///
+    /// Ordering, not presence. A `session_pinned` published after the routes it
+    /// explains would reach the user's scrollback below the slow turns it is
+    /// the reason for — which is the same failure as not publishing it, one
+    /// step subtler.
+    #[test]
+    fn pinned_session_records_the_two_events_in_order() {
+        let runtime = DaemonRuntime::minimal();
+        let events = Arc::new(EventBus::new());
+        let mut sub = events.subscribe(64);
+        let session = SessionId::from("ordered");
+
+        // The pin, through the sink that publishes it — not by calling `mark`
+        // directly, which would prove nothing about the publish.
+        let sink = TaintingPrivacySink::for_turn_path(
+            Arc::clone(&events),
+            Arc::clone(&runtime.session_taint),
+        )
+        .with_local_budget(Some(21_162));
+        crate::egress::PrivacyEventSink::privacy_block(
+            &sink,
+            Some(session.clone()),
+            teton_protocol::events::PrivacyBlock {
+                path: crate::egress::provenance::UNKNOWN_PROVENANCE_PATH.to_owned(),
+                provider_id: teton_protocol::ProviderId::from("kimi-k3"),
+                action: teton_protocol::events::PrivacyAction::ReroutedToLocal,
+                cause: BlockCause::Boundary,
+            },
+        );
+
+        let lifted = runtime.shell_override(
+            &ShellOverrideParams {
+                session_id: session.clone(),
+            },
+            &events,
+        );
+        assert!(lifted.lifted_now, "the fixture's pin must be liftable");
+
+        let mut names = Vec::new();
+        while let Some(env) = sub.try_recv() {
+            names.push(env.event.name().to_owned());
+        }
+        let pinned_at = names.iter().position(|n| n == "session_pinned");
+        let lifted_at = names.iter().position(|n| n == "session_pin_lifted");
+        assert!(
+            pinned_at.is_some(),
+            "AC-11: a pinned session records `session_pinned`: {names:?}"
+        );
+        assert!(
+            lifted_at.is_some(),
+            "AC-11: and `session_pin_lifted` after the lift: {names:?}"
+        );
+        assert!(
+            pinned_at < lifted_at,
+            "AC-11: the pin is recorded before the lift: {names:?}"
+        );
+        // And the pin's payload is the liftable one, since the block named the
+        // unknown sentinel rather than a file.
+        assert_eq!(
+            runtime.session_taint.cause(&session),
+            Some(TaintCause::UnknownShell),
+            "the sentinel path is what makes this pin liftable (cause_of)"
+        );
+    }
+
+    /// **AC-12 — the 2026-09-04 cost shape cannot recur.**
+    ///
+    /// The REQ's headline claim, and the one the description says was
+    /// *inferred* from `cost.db` rather than observed: one to four `kimi-k3`
+    /// rows, then dozens of `qwen3-coder-30b-a3b` rows, in session after
+    /// session.
+    ///
+    /// The four commands AC-12 scripts — `pwd`, `ls -la`, `git status`,
+    /// `git log -3` — are the ones a model runs while orienting itself, and
+    /// every one of them used to pin the session on the first call. Here they
+    /// leave it unpinned, so every turn is routed by category. A fifth prompt
+    /// running `cargo test` pins it (BR-1(e): a build tool can read anything),
+    /// and `/shell allow` restores routing for a sixth.
+    ///
+    /// **Written against the classifier rather than a live six-prompt daemon**,
+    /// because what decides the shape is the verdict: the routing consequence
+    /// of a verdict is `RoutePin`'s, and `every_pinned_route_site_reads_the_
+    /// composed_predicate` already pins that all seven sites read it. A daemon
+    /// fixture here would re-test those two facts through six process spawns.
+    ///
+    /// **Mutation**: stub `classify` back to a constant `Unknown` — the
+    /// pre-REQ-614 behaviour — and the first loop fails on `pwd`, which is
+    /// exactly the 2026-09-04 shape reappearing.
+    #[test]
+    fn the_2026_09_04_cost_shape_cannot_recur() {
+        use crate::harness::tools::shell_provenance::{classify, VerdictKind};
+        use teton_core::config::DEFAULT_BOUNDARIES;
+        use teton_core::entities::PrivacyBoundary;
+        use teton_protocol::methods::RootKind;
+
+        let root = std::env::temp_dir().join(format!("teton-ac12-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).expect("fixture root");
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("a file");
+        let bounds: Vec<PrivacyBoundary> = DEFAULT_BOUNDARIES
+            .iter()
+            .map(|g| PrivacyBoundary::builtin(*g))
+            .collect();
+
+        let runtime = DaemonRuntime::minimal();
+        let events = Arc::new(EventBus::new());
+        let session = SessionId::from("ac12");
+
+        // Prompts 1-4: the orienting commands. Every one is provably rooted, so
+        // nothing pins and every agent turn routes by category — the remote
+        // provider the user configured.
+        for command in ["pwd", "ls -la", "git status", "git log -3"] {
+            let verdict = classify(&root, RootKind::Project, &bounds, Vec::new(), command);
+            assert_eq!(
+                verdict.kind,
+                VerdictKind::Rooted,
+                "AC-12: `{command}` must not pin the session ({})",
+                verdict.reason
+            );
+            assert!(
+                !runtime.route_pin().pins(&session),
+                "AC-12: the session is still routed by category after `{command}`"
+            );
+        }
+
+        // Prompt 5: `cargo test`. A build tool can read anything, so BR-1(e)
+        // makes it unknown — and unknown pins, liftably.
+        let build = classify(&root, RootKind::Project, &bounds, Vec::new(), "cargo test");
+        assert_eq!(build.kind, VerdictKind::Unknown, "{}", build.reason);
+        runtime
+            .session_taint
+            .mark(&session, TaintCause::UnknownShell);
+        assert!(
+            runtime.route_pin().pins(&session),
+            "AC-12: the fifth prompt pins the session"
+        );
+
+        // Prompt 6: the lift, then routing by category again.
+        let lifted = runtime.shell_override(
+            &ShellOverrideParams {
+                session_id: session.clone(),
+            },
+            &events,
+        );
+        assert!(lifted.lifted_now);
+        assert_eq!(
+            runtime.ledger.all_shell_overrides().expect("read").len(),
+            1,
+            "AC-12: one ledger row for the one lift"
+        );
+        assert!(
+            !runtime.route_pin().pins(&session),
+            "AC-12: the sixth prompt's rows go to the remote provider again"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

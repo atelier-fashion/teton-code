@@ -495,7 +495,7 @@ impl Harness {
     /// is visibly the one that is.
     ///
     /// The reason it is needed: with the builtin set present,
-    /// `context_is_sensitive` no longer short-circuits on an empty boundary
+    /// `context_taint_cause` no longer short-circuits on an empty boundary
     /// list, so REQ-585's unpinnable provenance — a skill's command output —
     /// pins the turn to a local tier `minimal()` has not got. Every assertion in
     /// this file about what the *loop* did would become an assertion about
@@ -2428,7 +2428,7 @@ async fn ran_output_enters_inside_the_untrusted_envelope_with_its_markers_neutra
 /// does not delete coverage: it is the one that leaves the stock posture on.
 ///
 /// The mechanism, which is second-order and easy to mistake for a broken
-/// harness: `context_is_sensitive` returns `false` immediately when the boundary
+/// harness: `context_taint_cause` returns `false` immediately when the boundary
 /// list is empty. Before REQ-597 a stock machine's list *was* empty, so
 /// REQ-585's `Unknown` provenance — what a skill's command output carries,
 /// having no path to mint an identity from — never reached the inspector. With
