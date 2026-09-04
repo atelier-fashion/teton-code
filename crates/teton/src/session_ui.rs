@@ -28,18 +28,65 @@ use std::collections::{HashMap, HashSet};
 use teton_protocol::events;
 use teton_protocol::events::{
     AttachConsentRequested, BlockCause, BoundaryDefaultsApplied, BudgetBound, CapabilityDeadEnd,
-    ConsentScope, ContextCompacted, ContextPressure, ContextPressureKind, DaemonClientAttach,
-    DaemonLifetimeStage, DynamicOutcome, DynamicOutcomeView, Event, EventEnvelope, EvictionReason,
-    FailureClass, ModelLifecycle, ModelSelectionProposed, NotRunReason, PermissionOption,
-    PermissionOptionKind, PermissionRequest, PermissionSubject, PhaseTransition, PrefixCache,
-    PrefixCacheMiss, PrefixCacheOutcome, PrivacyAction, PrivacyBlock, ProvenanceRejected,
-    ProvenanceRejection, ProviderDegraded, ProviderSetupCompleted, ProviderSetupRejected,
-    ProviderTested, RemedyKind, RouteDecided, SessionGrantMinted, SessionUpdatePayload,
-    SkillInvoked, SkillOverBudgetAccepted, SkillOverBudgetOffered, SkillOverBudgetRemedyApplied,
-    SkillRefusedNoRoom, SkillStage, TierWarming, ToolCallStatus, TurnQueued,
-    TurnRefusedAnchorsExceedBudget, UnboundedRootWarning, WebCapabilityState, WebConsentDecided,
-    WebConsentScope, WebLookup, WebLookupKind, WebLookupOutcome, WebSetupCompleted,
-    WebSetupRejected, WebTier, WindowVerdict, OPTION_ID_ENABLE_PERMANENT,
+    ConsentScope,
+    ContextCompacted,
+    ContextPressure,
+    ContextPressureKind,
+    DaemonClientAttach,
+    DaemonLifetimeStage,
+    DynamicOutcome,
+    DynamicOutcomeView,
+    Event,
+    EventEnvelope,
+    EvictionReason,
+    FailureClass,
+    ModelLifecycle,
+    ModelSelectionProposed,
+    NotRunReason,
+    PermissionOption,
+    PermissionOptionKind,
+    PermissionRequest,
+    PermissionSubject,
+    PhaseTransition,
+    PrefixCache,
+    PrefixCacheMiss,
+    PrefixCacheOutcome,
+    PrivacyAction,
+    PrivacyBlock,
+    ProvenanceRejected,
+    ProvenanceRejection,
+    ProviderDegraded,
+    ProviderSetupCompleted,
+    ProviderSetupRejected,
+    ProviderTested,
+    RemedyKind,
+    RouteDecided,
+    SessionGrantMinted,
+    SessionUpdatePayload,
+    ShellDutySkipped,
+    SkillInvoked,
+    SkillOverBudgetAccepted,
+    SkillOverBudgetOffered,
+    SkillOverBudgetRemedyApplied,
+    SkillRefusedNoRoom,
+    SkillStage,
+    TierWarming,
+    ToolCallRepeated,
+    ToolCallStatus,
+    TurnQueued,
+    TurnRefusedAnchorsExceedBudget,
+    UnboundedRootWarning,
+    WebCapabilityState,
+    WebConsentDecided,
+    WebConsentScope,
+    WebLookup,
+    WebLookupKind,
+    WebLookupOutcome,
+    WebSetupCompleted,
+    WebSetupRejected,
+    WebTier,
+    WindowVerdict,
+    OPTION_ID_ENABLE_PERMANENT,
 };
 use teton_protocol::methods::{
     AttachConsentOutcome, AttachConsentParams, PermissionOutcome, PermissionRespondParams,
@@ -1271,6 +1318,68 @@ pub fn render_event(
             }
             EventOutcome::Rendered
         }
+        // REQ-617 BR-4. Verbose-gated, and the gate is the decision: a refused
+        // repeat is the harness working, not a problem the user has to act on,
+        // and a turn that loops five times would otherwise paint five lines
+        // over the answer the user is waiting for. Under `/verbose` it is
+        // exactly what someone debugging a slow turn wants to see.
+        Event::ToolCallRepeated(repeated) => {
+            if state.verbose {
+                surface.line(LineKind::Notice, &format_tool_call_repeated(repeated));
+            }
+            EventOutcome::Rendered
+        }
+        // REQ-617 BR-7. Verbose-gated for the same reason, and doubly so: the
+        // common case (`under_size_trigger`) fires on almost every short
+        // command, so an ungated line here would be one per `ls`.
+        Event::ShellDutySkipped(skipped) => {
+            if state.verbose {
+                surface.line(LineKind::Notice, &format_shell_duty_skipped(skipped));
+            }
+            EventOutcome::Rendered
+        }
+    }
+}
+
+/// The verbose line a refused repeat renders (REQ-617 BR-4).
+///
+/// It names the tool and the count and **cannot** name the arguments, because
+/// the event does not carry them — the daemon's ledger hashes them. So this
+/// renderer is short by construction rather than by restraint.
+fn format_tool_call_repeated(repeated: &ToolCallRepeated) -> String {
+    let already = if repeated.count == 1 {
+        "already ran once".to_owned()
+    } else {
+        format!("already ran {} times", repeated.count)
+    };
+    format!(
+        "repeated `{}` call refused — the same call {already} this turn.",
+        repeated.tool
+    )
+}
+
+/// The verbose line a skipped `shell` duty renders (REQ-617 BR-7).
+///
+/// The two reasons say different things and are worth telling apart: one is a
+/// deliberate refusal to interpret a failure, the other is the cost gate doing
+/// its job on a short command.
+fn format_shell_duty_skipped(skipped: &ShellDutySkipped) -> String {
+    match skipped.reason.as_str() {
+        "failed_exit" => {
+            "the command failed, so its output is shown raw — the shell duty does not \
+             interpret a failure."
+                .to_owned()
+        }
+        "under_size_trigger" => {
+            "the command's output was short enough to read unaided, so no interpretation \
+             was spent on it."
+                .to_owned()
+        }
+        // A daemon newer than this client. Rendered rather than dropped: the
+        // fact that the duty was skipped is still true and still useful, and a
+        // client that cannot name the reason should say so rather than pretend
+        // nothing happened.
+        other => format!("the shell duty did not interpret this result ({other})."),
     }
 }
 

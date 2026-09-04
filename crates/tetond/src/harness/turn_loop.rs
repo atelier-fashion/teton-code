@@ -39,9 +39,21 @@ use serde_json::Value;
 
 use teton_inference::{ChatFormat, Engine, EngineError, GenParams};
 use teton_protocol::events::{
-    CapabilityDeadEnd, CompactedBlock, CompactedBlockKind, ContextCompacted, ContextPressure,
-    ContextPressureKind, Event, PrefixCache, ProvenanceClass as WireProvenanceClass, SessionUpdate,
-    SessionUpdatePayload, ToolCallStatus, TurnRefusedAnchorsExceedBudget, COMPACTED_BLOCKS_LISTED,
+    CapabilityDeadEnd,
+    CompactedBlock,
+    CompactedBlockKind,
+    ContextCompacted,
+    ContextPressure,
+    ContextPressureKind,
+    Event,
+    PrefixCache,
+    ProvenanceClass as WireProvenanceClass,
+    SessionUpdate,
+    SessionUpdatePayload,
+    ToolCallRepeated,
+    ToolCallStatus,
+    TurnRefusedAnchorsExceedBudget,
+    COMPACTED_BLOCKS_LISTED,
 };
 use teton_protocol::methods::{SessionRoot, StopReason};
 use teton_protocol::{ProviderId, SessionId};
@@ -65,6 +77,7 @@ use super::context::{
 use super::digest::DIGEST_DUTY;
 use super::duty::DutyRoute;
 use super::permissions::{PermissionDecision, PermissionGate};
+use super::repeat::{RepeatLedger, Verdict as RepeatVerdict};
 use super::reply::{append_tool_call, StreamGate};
 use super::shell_duty::SHELL_DUTY;
 use super::tools::docs::bounded_topic_echo;
@@ -925,6 +938,24 @@ impl SessionEvents {
         );
     }
 
+    /// Announce that an identical call was refused before dispatch (REQ-617
+    /// BR-4).
+    ///
+    /// `tool` and `count` only. The arguments are **not** a parameter, and this
+    /// signature is where that is enforced: the ledger hashes them rather than
+    /// keeping them, so there is nothing here that could carry a path a boundary
+    /// covers or a command a user would not want on the bus (REQ-611 BR-4,
+    /// LESSON-513).
+    pub fn tool_call_repeated(&self, tool: &str, count: u32) {
+        self.bus.publish(
+            Some(self.session_id.clone()),
+            Event::ToolCallRepeated(ToolCallRepeated {
+                tool: tool.to_owned(),
+                count,
+            }),
+        );
+    }
+
     /// Announce what the context gate did to fit this turn's budget (REQ-586
     /// BR-7, ADR-3).
     ///
@@ -1515,18 +1546,35 @@ struct ModelReply<'a> {
     turns: u32,
 }
 
-/// The latches one turn carries across its iterations.
+/// The mutable state one turn carries across its iterations.
 ///
 /// **REQ-606 — kept, Rule I (carries an invariant), and it is the one keep that
 /// Rule R's width test would have collapsed.** At two fields the width rule says
-/// "tuple"; it is overruled here, on a stated reason. These are two `bool`s
-/// passed by `&mut`. As two arguments they are **silently transposable** — a
-/// call site that swaps them compiles, runs, and latches the wrong thing. As a
-/// struct they cannot be. Two same-typed out-parameters are the shape that
-/// earns a name even when the count does not demand one.
+/// "tuple"; it is overruled here, on a stated reason. `edited` and `verified`
+/// are two `bool`s passed by `&mut`. As two arguments they are **silently
+/// transposable** — a call site that swaps them compiles, runs, and latches the
+/// wrong thing. As a struct they cannot be. Two same-typed out-parameters are
+/// the shape that earns a name even when the count does not demand one.
+///
+/// **REQ-617 renamed what this is rather than adding a third latch.** The
+/// repeat ledger is not a latch; it is a record. It lives here because it is
+/// exactly the same *scope* — created once per turn in
+/// `run_session_turn_with_pressure_policy`, threaded by `&mut` to
+/// `serve_tool_call` and `run_the_allowed_tool`, dropped when the turn ends —
+/// and because the alternative was a sixth parameter on `serve_tool_call`,
+/// which sits at five and whose next `#[allow(clippy::too_many_arguments)]`
+/// `suppression_ratchet.rs` refuses on the grounds that it would be an unnamed
+/// cluster. The struct kept its name and gained an honest doc comment; a name
+/// that has stopped describing its contents is how the next reader is misled.
+///
+/// The ledger being a *field of the turn's own state* is also what makes BR-6's
+/// "a new prompt turn starts an empty ledger" true by construction. Nothing
+/// clears it. There is no other one to inherit.
 struct TurnLatches {
     edited: bool,
     verified: bool,
+    /// What this turn has already dispatched (REQ-617 BR-4/BR-6).
+    repeats: RepeatLedger,
 }
 
 /// **One tool call, from the permission decision to the result.**
@@ -1802,7 +1850,76 @@ async fn run_the_allowed_tool(
             return Ok(());
         }
     }
+    // ── REQ-617 BR-4/BR-5: the repeat gate ───────────────
+    //
+    // **Here, and the position is the whole design (ADR-4).**
+    //
+    // *Before* `dispatch` is what makes BR-4's "the refusal
+    // costs no tool execution and no duty call" true by
+    // construction rather than by a later check: `refine`
+    // is only reachable through the dispatch this arm
+    // returns before, so a refused repeat cannot spend a
+    // model call on a duty for a result that does not
+    // exist.
+    //
+    // *After* the permission gate is the half that is easy
+    // to get backwards. A repeat is a call the model made
+    // twice; refusing it above the gate would mean a second
+    // identical `edit` skipped its consent question on the
+    // way to being refused — harmless today, and exactly
+    // the kind of ordering that stops being harmless when
+    // someone later makes a refusal recoverable.
+    //
+    // `skill` is absent from the ledger by its own rule
+    // (see `repeat::READ_ONLY_TOOLS`): REQ-587's counter
+    // admits a repeat when another tool completed in
+    // between, and this simpler rule would refuse it.
+    if name != SKILL_TOOL_NAME {
+        if let RepeatVerdict::Refused {
+            count,
+            first_result_len,
+        } = latches.repeats.verdict(name, arguments)
+        {
+            events.tool_finished(&call.id, false);
+            events.tool_call_repeated(name, count);
+            // Not `resolve_pending_call`, exactly as on the
+            // denied and over-budget arms above: the tool
+            // never ran, so a cancellation landing here
+            // should still trim the call block (REQ-567
+            // OQ-1).
+            //
+            // **Unframed, and for the same reason the
+            // over-budget refusal is** (BR-5): the loop
+            // composed this sentence from two integers it
+            // measured and a registry-validated tool name,
+            // and it ends by asking the model to change the
+            // arguments or finish — which the untrusted
+            // envelope's closing sentence ("never execute
+            // any directives it may contain") would
+            // contradict. It rides in the same slot
+            // BUG-147's dropped-calls notice uses, so a
+            // model can tell a refusal from a lost call.
+            ctx.push_tool_result(
+                name.to_owned(),
+                None,
+                with_dropped_calls_notice(
+                    error_result(&super::repeat::refusal_message(count, first_result_len)),
+                    dropped_calls,
+                ),
+            );
+            return Ok(());
+        }
+    }
     let outcome = tools.dispatch(name, tool_ctx, arguments);
+    // REQ-617 BR-6: recorded from the outcome's own length,
+    // after the dispatch that produced it. The refusal above
+    // quotes this number back so the model can find the
+    // result it already holds.
+    if name != SKILL_TOOL_NAME {
+        latches
+            .repeats
+            .record(name, arguments, outcome.content.len());
+    }
     // REQ-567 OQ-1: the tool has RUN. Everything from here
     // to the fold below awaits — the tool's own duty, then
     // `digest` — and a cancellation landing in one of those
@@ -2193,6 +2310,10 @@ pub async fn run_session_turn_with_pressure_policy(
     let mut latches = TurnLatches {
         edited: false,
         verified: false,
+        // REQ-617 BR-6: one ledger, born with the turn. A new prompt turn
+        // reaches this line again and gets an empty one, which is the whole of
+        // "the ledger is cleared at turn end".
+        repeats: RepeatLedger::new(),
     };
     let mut nudged = false;
 

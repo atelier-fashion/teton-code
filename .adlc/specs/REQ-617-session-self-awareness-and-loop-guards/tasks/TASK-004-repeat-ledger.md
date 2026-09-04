@@ -1,7 +1,7 @@
 ---
 id: TASK-004
 title: "The per-turn repeat ledger: an identical call is refused by the harness before dispatch"
-status: draft
+status: complete
 parent: REQ-617
 created: 2026-09-04
 updated: 2026-09-04

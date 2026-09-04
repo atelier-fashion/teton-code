@@ -1,7 +1,7 @@
 ---
 id: TASK-008
 title: "The AC-10 replay: the recorded 26-call turn completes in at most 9 dispatches"
-status: draft
+status: complete
 parent: REQ-617
 created: 2026-09-04
 updated: 2026-09-04

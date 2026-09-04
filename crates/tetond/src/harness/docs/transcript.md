@@ -12,6 +12,9 @@ not search the repository. Teton's own configuration is never inside the
 repository you are working in, and a file you find there named for another tool
 is another tool's file.
 
+You also cannot turn recording on or off. Both switches below are the user's to
+type; no tool in this session reaches either one, and there is nothing to call.
+
 ## Two switches, two lifetimes
 
 | Switch | Where | Lifetime |

@@ -1795,11 +1795,10 @@ fn route_for(bound: BudgetBound, verdict: WindowVerdict) -> (Fixture, Option<Moc
             (fx, Some(provider))
         }
         (BudgetBound::Window, WindowVerdict::FitsWindow) => {
-            // 30,000 declared: the budget is (19,317 words / 57,952 B). The body
-            // is over in **bytes only**, and half the measured bytes still sit
-            // under the raw window — the band this cell lives in is
-            // `(window − reservation) × 2 < measured ≤ window × 2`, 2,048 bytes
-            // wide at any window.
+            // 31,000 declared. The body is over budget in **bytes only**, and
+            // half the measured bytes still sit under the raw window — the band
+            // this cell lives in is
+            // `(window − reservation) × 2 < measured ≤ window × 2`.
             //
             // It was 20,000 declared with a 31,000-byte body until REQ-612
             // raised `MIN_BUDGET_BYTES` to 50,000: that floored the 20,000-token
@@ -1820,13 +1819,38 @@ fn route_for(bound: BudgetBound, verdict: WindowVerdict) -> (Fixture, Option<Moc
             // clearance on each side, where 51,700 had 221 bytes above it. Two
             // REQs in a row have moved this cell by growing the prompt, and the
             // next one should not have to.
+            //
+            // 30,000 was then the narrowest round window that is **not** floored.
+            //
+            // **REQ-617 moved it again, 30,000 → 31,000, and this is the second
+            // re-tune for the same underlying cause.** `measured` is the whole
+            // prompt, not just the body, so *any* growth in the resident system
+            // prompt pushes `claimed_provider_tokens` — `max(words × 3/2,
+            // bytes / 2)` — toward the window. REQ-617 spent 540 bytes on the
+            // command roster, which is 270 tokens on the bytes arm, and that was
+            // enough to flip the verdict to `ExceedsWindow`.
+            //
+            // **The band is one thousand tokens wide, measured.** 31,000 passes;
+            // 32,000 fails, because by then the derived budget has grown past
+            // the body and there is no over-budget offer to make at all. Shrinking
+            // the body does not help — it moves the lower edge of the band down
+            // with it. So the only free variable is the window.
+            //
+            // **This will break again on the next prompt edit** (REQ-615 is
+            // spending from the same margin as this REQ). The durable fix is to
+            // size the fixture *relative to* the budget `derive` produces for the
+            // route rather than as two absolute constants, which would let it
+            // track prompt growth on its own; that is a change to this file's
+            // whole `Spec` shape and is deliberately not made here. Recorded so
+            // the third person to hit it does not have to re-derive any of the
+            // above.
             let provider = vendor();
             let fx = Fixture::new(Spec::new(
                 "v6wfit",
                 remote_route(
                     &provider.openai_endpoint(),
                     UNRECOGNIZED_MODEL,
-                    Some(30_000),
+                    Some(31_000),
                     None,
                 ),
                 sized_body(10_000, 50_600),

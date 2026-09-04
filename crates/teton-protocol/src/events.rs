@@ -277,6 +277,11 @@ pub enum Event {
     SkillRefusedNeedsProject(SkillRefusedNeedsProject),
     /// A skill preamble's `||` fallback branch fired (REQ-615 BR-6).
     SkillPreambleFallback(SkillPreambleFallback),
+    /// A tool call identical to one this turn already made was refused before
+    /// dispatch (REQ-617 BR-4).
+    ToolCallRepeated(ToolCallRepeated),
+    /// The `shell` duty declined to interpret a result (REQ-617 BR-7).
+    ShellDutySkipped(ShellDutySkipped),
 }
 
 impl Event {
@@ -314,6 +319,8 @@ impl Event {
             Event::ProviderSetupCompleted(_) => "provider_setup_completed",
             Event::ProviderSetupRejected(_) => "provider_setup_rejected_nonuser",
             Event::CapabilityDeadEnd(_) => "capability_dead_end",
+            Event::ToolCallRepeated(_) => "tool_call_repeated",
+            Event::ShellDutySkipped(_) => "shell_duty_skipped",
             Event::TurnQueued(_) => "turn_queued",
             Event::ProviderTested(_) => "provider_tested",
             Event::SessionRootChanged(_) => "session_root_changed",
@@ -9856,4 +9863,56 @@ pub struct SkillPreambleFallback {
     pub command_index: usize,
     /// The session root the primary failed in, already bounded.
     pub root_display: String,
+}
+
+/// A tool call identical to one this turn already made, refused before dispatch
+/// (REQ-617 BR-4).
+///
+/// # What it carries, and what it must never carry
+///
+/// The tool's name, how many times the identical call had already been
+/// dispatched, and nothing else. **No arguments.** A `read` path, a `grep`
+/// pattern and a `shell` command are all things a user may have configured a
+/// privacy boundary over, and an event is the one surface that reaches every
+/// attached client and every declared monitor (REQ-611 BR-4, LESSON-513). The
+/// daemon-side ledger hashes the arguments rather than storing them, so this
+/// event could not carry them even if a future field asked for them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallRepeated {
+    /// The tool that was called, e.g. `shell` or `read`.
+    pub tool: String,
+    /// How many times this exact call had already been dispatched when the
+    /// refusal fired. One for a read-only tool, two for a write-capable one.
+    pub count: u32,
+}
+
+/// The `shell` duty declined to interpret a result (REQ-617 BR-7).
+///
+/// Emitted where the duty would have run, so a reader can tell an
+/// uninterpreted result from an interpretation that failed — the two look the
+/// same in the conversation and have entirely different causes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellDutySkipped {
+    /// Why. `failed_exit` when the command did not succeed — a failed result is
+    /// never interpreted, whatever its size. `under_size_trigger` when it
+    /// succeeded and was short enough to read unaided.
+    pub reason: String,
+}
+
+impl ShellDutySkipped {
+    /// The command failed, so the duty did not run (BR-7).
+    #[must_use]
+    pub fn failed_exit() -> Self {
+        Self {
+            reason: "failed_exit".to_owned(),
+        }
+    }
+
+    /// The command succeeded and was short enough to read unaided.
+    #[must_use]
+    pub fn under_size_trigger() -> Self {
+        Self {
+            reason: "under_size_trigger".to_owned(),
+        }
+    }
 }

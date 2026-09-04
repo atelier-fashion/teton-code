@@ -1403,6 +1403,11 @@ fn status_answers_the_asker_and_the_state_event_carries_no_path() {
 /// `handle_session_transcript` turned this test red at the unattached-
 /// connection leg (the bystander's `session/transcript` was answered instead
 /// of refused `NOT_ATTACHED`). Restored; green again.
+/// **Mutation (run 2026-09-04, after REQ-617 narrowed the docs half):**
+/// prefixing the `shell` tool's description with `Toggle the transcript.` turned
+/// this red, naming that line. This is the mutation that matters now — the
+/// docs assertion no longer forbids the word outright, so it had to be shown
+/// that it still forbids an offer. Restored; green again.
 #[test]
 fn no_tool_reaches_the_transcript_toggle_and_an_unattached_connection_is_refused() {
     use tetond::harness::tools::ToolRegistry;
@@ -1421,11 +1426,74 @@ fn no_tool_reaches_the_transcript_toggle_and_an_unattached_connection_is_refused
              among {names:?}"
         );
     }
+    // --- nor may a tool's description offer it ---
+    //
+    // **Amended by REQ-617 BR-2, deliberately and with the claim made stronger
+    // rather than weaker.** This used to forbid the substring `transcript`
+    // anywhere in the rendered docs. REQ-617 gives `teton_docs` a `transcript`
+    // topic — a page whose entire content is *the two switches are the user's,
+    // you cannot toggle recording, and your tools are refused the directory* —
+    // and the topic's name necessarily appears in the tool's index and schema.
+    //
+    // A word-level prohibition cannot tell that page apart from an offer, so it
+    // would have forced the choice between documenting the refusal and keeping
+    // a guard. Both are worth having, so the guard moves to what it was always
+    // about: no tool may *offer an action* on the transcript.
+    //
+    // The three exempted spellings are the topic **name** in `teton_docs`'s
+    // description and schema. Every other appearance of the word in any tool's
+    // docs still fails, and the name enumeration above — the claim that
+    // actually makes the capability unreachable — is untouched.
     let docs = registry.docs(None);
+    let offers: Vec<&str> = docs
+        .lines()
+        .filter(|line| line.to_lowercase().contains("transcript"))
+        .filter(|line| {
+            let name = line.trim_start();
+            !(name.starts_with("- teton_docs:") || name.starts_with("arguments: {"))
+        })
+        .collect();
     assert!(
-        !docs.to_lowercase().contains("transcript"),
-        "BR-3: nor may a tool's description offer it — a model reads these:\n{docs}"
+        offers.is_empty(),
+        "BR-3: no tool's description may offer the transcript toggle. These \
+         lines name it and are not `teton_docs`'s topic index: {offers:?}\n\
+         A model reads these:\n{docs}"
     );
+
+    // And the positive half, which is what makes the narrowing above an
+    // improvement rather than a concession: the page the index points at says
+    // outright that the model cannot do either thing. A guard that only forbids
+    // an offer is satisfied by silence; this one is not.
+    let topic = registry
+        .get("teton_docs")
+        .expect("teton_docs is registered in every session")
+        .run(
+            // The jail has nothing to say about a body that never leaves this
+            // binary; pointed at the temp dir so a topic that started reading
+            // the filesystem would be visible as one.
+            &tetond::harness::tools::ToolContext::new(std::env::temp_dir()),
+            &serde_json::json!({ "topic": "transcript" }),
+        );
+    assert!(!topic.is_error, "{}", topic.content);
+    // Whitespace-collapsed before matching, the same normalization
+    // `harness::tools::docs`'s own topic tests use: a needle that happens to
+    // straddle a line wrap in the Markdown would otherwise report the page as
+    // missing a sentence it plainly makes.
+    let body = topic
+        .content
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for needle in ["cannot run it", "denied prefix", "the user's to type"] {
+        assert!(
+            body.contains(needle),
+            "the `transcript` topic must say `{needle}` — it is the page the \
+             index above points a model at, and the only reason that index \
+             entry is exempted from the offer check (REQ-617 BR-2). \
+             Body:\n{}",
+            topic.content
+        );
+    }
 
     // --- and the client method is gated on driving the session ---
     let provider = MockProvider::always(openai_turn("Done.", None, 120, 20));
