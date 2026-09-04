@@ -3415,6 +3415,11 @@ impl DaemonRuntime {
         // by a conjunction repeated seven times.
         if let Some(cause) = self.route_pin().cause(session_id) {
             if self.route_pin().pins(session_id) {
+                // Counted here because this is the only place that knows a turn
+                // was served locally *because of* the pin, rather than by
+                // policy or by a heuristic that would have chosen local anyway.
+                // It is what `session_pin_lifted` reports the pin cost.
+                self.count_pinned_turn(session_id);
                 return router.resolve_local_pin(taint_pin_reason_for("this turn", cause));
             }
         }

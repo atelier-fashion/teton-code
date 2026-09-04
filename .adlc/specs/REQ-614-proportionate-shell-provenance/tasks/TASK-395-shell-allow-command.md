@@ -1,7 +1,7 @@
 ---
 id: TASK-395
 title: "/shell allow — the user's typed lift, refused on piped stdin and on a non-liftable cause"
-status: draft
+status: complete
 parent: REQ-614
 created: 2026-09-04
 updated: 2026-09-04

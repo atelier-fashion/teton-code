@@ -409,6 +409,11 @@ pub const RESERVED_SKILL_NAMES: &[&str] = &[
     "projects",
     "provider",
     "quit",
+    // REQ-614: `/shell allow` is a built-in row, so no skill may take the name.
+    // A repository-supplied `.claude/skills/shell/SKILL.md` answering `/shell`
+    // would be a repository shadowing the one command that releases a privacy
+    // pin — the exact confusion AC-7 exists to rule out.
+    "shell",
     "teton",
     "transcript",
     "verbose",

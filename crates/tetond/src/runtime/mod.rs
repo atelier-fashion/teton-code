@@ -123,7 +123,7 @@ use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, Mo
 use teton_protocol::events::{
     BlockCause, BudgetBound, CapabilityDeadEnd, ContextCleared, ContextPressureKind, Event,
     ModelLifecycle, ModelLifecycleStage, NotRunReason, PermissionSubject, PrivacyAction,
-    ProviderTested, RemedyKind, SessionRootChanged, SessionTitled, SkillInvoked,
+    ProviderTested, RemedyKind, SessionPinLifted, SessionRootChanged, SessionTitled, SkillInvoked,
     SkillOverBudgetAccepted, SkillOverBudgetOffered, SkillOverBudgetRemedyApplied,
     SkillRefusedNoRoom, SkillStage as WireSkillStage, TierWarming, TranscriptStateReason,
     TurnQueued, WebCapabilityState as WireWebCapabilityState, WebLookup, WebSetupCompleted,
@@ -140,11 +140,11 @@ use teton_protocol::methods::{
     RepoContextGenerateMode, RepoContextOrigin, RepoContextStateKind, SessionClearParams,
     SessionClearResult, SessionContextParams, SessionContextResult, SessionPermissionsParams,
     SessionPermissionsResult, SessionSetCwdParams, SessionSetCwdResult, SessionTranscriptParams,
-    SessionTranscriptResult, SkillInvocation, TierBinding as WireTierBinding, TierBindingConfig,
-    TierRouteView, TierSummary, TranscriptAction, WebOverrideParams, WebOverrideResult,
-    WebRefreshOutcome, WebRefreshParams, WebRefreshResult, WebSetupCommitParams,
-    WebSetupCommitResult, WebSetupPlanResult, WebSetupPreviewParams, WebSetupPreviewResult,
-    WebTableSummary, WebTotalsView,
+    SessionTranscriptResult, ShellOverrideParams, ShellOverrideResult, SkillInvocation,
+    TierBinding as WireTierBinding, TierBindingConfig, TierRouteView, TierSummary,
+    TranscriptAction, WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams,
+    WebRefreshResult, WebSetupCommitParams, WebSetupCommitResult, WebSetupPlanResult,
+    WebSetupPreviewParams, WebSetupPreviewResult, WebTableSummary, WebTotalsView,
 };
 use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::{
@@ -2212,6 +2212,9 @@ pub struct DaemonRuntime {
     /// Beside `web_override` rather than folded into it: the two lift different
     /// restrictions and a single flag would let one command undo the other's.
     shell_override: Arc<ShellTaintOverride>,
+    /// How many turns each session has been served locally *because of* a pin
+    /// (REQ-614). Reported by `session_pin_lifted` as what the pin cost.
+    pinned_turns: Mutex<HashMap<SessionId, u64>>,
     /// Per-session sets of the URLs the **user** pasted (REQ-563 BR-3).
     ///
     /// Session-scoped and in memory only, like the permission grants and the
@@ -2389,6 +2392,7 @@ impl DaemonRuntime {
             window_rejections: Arc::new(ObservedWindowRejections::new()),
             web_override: Arc::new(WebTaintOverride::new()),
             shell_override: Arc::new(ShellTaintOverride::new()),
+            pinned_turns: Mutex::new(HashMap::new()),
             session_user_urls: Mutex::new(HashMap::new()),
             session_gates: Mutex::new(HashMap::new()),
             // A minimal runtime has no state directory. It also has an empty
@@ -2750,6 +2754,7 @@ impl DaemonRuntime {
             window_rejections: Arc::new(ObservedWindowRejections::new()),
             web_override: Arc::new(WebTaintOverride::new()),
             shell_override: Arc::new(ShellTaintOverride::new()),
+            pinned_turns: Mutex::new(HashMap::new()),
             session_user_urls: Mutex::new(HashMap::new()),
             session_gates: Mutex::new(HashMap::new()),
             data_dir: base_dir.to_path_buf(),
@@ -4177,12 +4182,6 @@ impl DaemonRuntime {
         RoutePin::new(self.session_taint.clone(), self.shell_override.clone())
     }
 
-    /// The lift set, for the `shell/override` handler and `/doctor`.
-    #[must_use]
-    pub fn shell_override(&self) -> Arc<ShellTaintOverride> {
-        self.shell_override.clone()
-    }
-
     pub fn session_taint(&self) -> Arc<SessionTaint> {
         Arc::clone(&self.session_taint)
     }
@@ -4786,6 +4785,92 @@ impl DaemonRuntime {
             was_restricted,
             tiers_restored,
         }
+    }
+
+    /// Lift this session's `unknown_shell` pin — `/shell allow` (REQ-614 BR-5).
+    ///
+    /// Three outcomes, and a client must be able to tell them apart: the pin was
+    /// lifted now; the session is pinned by a cause **no command lifts**, and
+    /// the refusal names it; or the session was never pinned. Collapsing the
+    /// last two would have the CLI confirm a lift that never happened.
+    ///
+    /// The lift reaches `ShellTaintOverride::lift` from here and from nowhere
+    /// else: the setter is `pub(super)`, so a model-issued lift does not
+    /// compile rather than being rejected at runtime (BR-5's last sentence).
+    pub fn shell_override(
+        &self,
+        params: &ShellOverrideParams,
+        events: &Arc<EventBus>,
+    ) -> ShellOverrideResult {
+        let Some(cause) = self.session_taint.cause(&params.session_id) else {
+            return ShellOverrideResult {
+                was_pinned: false,
+                lifted_now: false,
+                cause: None,
+            };
+        };
+        // BR-3: no lift exists for a boundary hit. The refusal **names the
+        // cause**, because "that did not work" without a reason is what sends a
+        // user looking for a command that does not exist.
+        if !cause.liftable() {
+            return ShellOverrideResult {
+                was_pinned: true,
+                lifted_now: false,
+                cause: Some(cause.as_str().to_owned()),
+            };
+        }
+        let lifted_now = self.shell_override.lift(&params.session_id);
+        if lifted_now {
+            let row = crate::cost::ledger::ShellOverrideRow {
+                session_id: params.session_id.to_string(),
+                cause_lifted: cause.as_str().to_owned(),
+            };
+            if let Err(err) = self.ledger.record_shell_override(&row) {
+                // The pin *is* lifted; a ledger that could not be written is an
+                // accounting failure, not a reason to refuse the user's own
+                // decision (the posture `web_override` takes).
+                eprintln!(
+                    "teton: a shell override could not be recorded in the cost ledger ({err})"
+                );
+            }
+            events.publish(
+                Some(params.session_id.clone()),
+                Event::SessionPinLifted(SessionPinLifted {
+                    turns_pinned: self.turns_pinned(&params.session_id),
+                }),
+            );
+        }
+        // A second `/shell allow` in a lifted session: acknowledged, no row, no
+        // event (BR-5's no-op clause).
+        ShellOverrideResult {
+            was_pinned: true,
+            lifted_now,
+            cause: Some(cause.as_str().to_owned()),
+        }
+    }
+
+    /// Record that this turn was served locally because of the pin (REQ-614).
+    pub(super) fn count_pinned_turn(&self, session: &SessionId) {
+        *self
+            .pinned_turns
+            .lock()
+            .expect("pinned turns mutex poisoned")
+            .entry(session.clone())
+            .or_insert(0) += 1;
+    }
+
+    /// How many turns ran pinned before a lift — what the pin actually cost.
+    ///
+    /// Zero when nothing has been counted; the counter is incremented where the
+    /// route is decided, which is the only place that knows a turn was served
+    /// locally *because of* the pin rather than by policy.
+    fn turns_pinned(&self, session: &SessionId) -> u64 {
+        self.pinned_turns
+            .lock()
+            .expect("pinned turns mutex poisoned")
+            .get(session)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Evict a cached document so the next lookup of that URL re-fetches

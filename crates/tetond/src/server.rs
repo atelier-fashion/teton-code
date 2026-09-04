@@ -128,9 +128,10 @@ use teton_protocol::methods::{
     ProviderTestParams, RootKind, RpcMethod, SessionAttachParams, SessionAttachResult,
     SessionClearParams, SessionContextParams, SessionCreateParams, SessionCreateResult,
     SessionListParams, SessionListResult, SessionPermissionsParams, SessionSetCwdParams,
-    SessionSummary, SessionTranscriptParams, SkillSkipped, SkillView, SkillsListParams,
-    SkillsListResult, SkillsPreflightParams, SkillsPreflightResult, WebOverrideParams,
-    WebRefreshParams, WebSetupCommitParams, WebSetupPlanParams, WebSetupPreviewParams,
+    SessionSummary, SessionTranscriptParams, ShellOverrideParams, SkillSkipped, SkillView,
+    SkillsListParams, SkillsListResult, SkillsPreflightParams, SkillsPreflightResult,
+    WebOverrideParams, WebRefreshParams, WebSetupCommitParams, WebSetupPlanParams,
+    WebSetupPreviewParams,
 };
 use teton_protocol::{RequestId, SessionId};
 
@@ -2521,6 +2522,7 @@ fn dispatch(
         ConfigGetParams::METHOD => Some(handle_config_get(daemon, conn, id)),
         CostQueryParams::METHOD => Some(handle_cost_query(daemon, conn, id)),
         WebOverrideParams::METHOD => Some(handle_web_override(daemon, conn, id, params)),
+        ShellOverrideParams::METHOD => Some(handle_shell_override(daemon, conn, id, params)),
         // REQ-572: the setup *reads* are session-scoped, so they belong here
         // beside `web/override` and **not** in `refuse_daemon_wide`'s list — the
         // question they ask is "may this connection drive this session", which is
@@ -2604,6 +2606,30 @@ fn handle_web_override(daemon: &Daemon, conn: &ConnState, id: Id, params: Value)
         return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
     }
     ok_string(id, &daemon.runtime.web_override(&params, &daemon.events))
+}
+
+/// `shell/override` — lift this session's `unknown_shell` pin (REQ-614 BR-5).
+///
+/// Hangs off the **client RPC** channel, exactly as `web/override` does and for
+/// the same reason: tool dispatch has no path to a client RPC, so a model that
+/// emits a call named `shell allow` reaches the tool registry, finds no such
+/// tool, and is told so. "The model cannot lift its own pin" is a fact about
+/// which channel this hangs off, not a check that could be omitted — and the
+/// daemon-side setter is `pub(super)`, which is the compile-time half.
+///
+/// Gated on attachment like its twin: lifting a pin is driving that session.
+fn handle_shell_override(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    let params: ShellOverrideParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+    if let Some(refusal) = refuse_unmintable_session_id(&id, &params.session_id) {
+        return refusal;
+    }
+    if !conn.may_drive(&params.session_id) {
+        return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
+    }
+    ok_string(id, &daemon.runtime.shell_override(&params, &daemon.events))
 }
 
 /// What a gate-failed setup call is announced as (REQ-572 BR-4/AC-4).

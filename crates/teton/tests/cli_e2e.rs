@@ -1871,6 +1871,53 @@ fn slash_model_set_runs_the_shared_flow_against_a_live_daemon() {
 /// same connection immediately afterwards and must not name the model the
 /// refused line asked for. A gate that rejected loudly but set the selection
 /// anyway would pass every assertion but that one.
+/// REQ-614 AC-6. A piped `/shell allow` is refused and changes nothing.
+///
+/// The reason this gate exists is narrower than `/model set`'s. That command
+/// writes daemon state; this one **releases a privacy decision** — it tells the
+/// daemon that a shell command whose reach could not be proven touched no
+/// protected file. A pipeline cannot make that judgement, and an EOF is not a
+/// yes.
+///
+/// **Mutation (AC-6, LESSON-520):** delete the `write_gate(..) == Refuse` early
+/// return from `handle_shell_allow` and this test goes red. Verified by doing
+/// it: without the gate the command reaches the daemon, which answers "not
+/// pinned" on a fresh session, and the refusal line disappears from the output.
+///
+/// What proves "nothing changed" is the absence of the refusal's opposite: no
+/// "pin lifted" line anywhere in the session. Asserting the presence of the
+/// refusal alone would pass a gate that printed the refusal and lifted anyway.
+#[test]
+fn piped_shell_allow_is_refused_and_changes_nothing() {
+    let daemon = daemon_bin();
+    let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
+    let teton = teton_bin();
+
+    // Deliberately NOT seamed — this is what a released binary does with a pipe.
+    let session = daemon.run_cli_with_stdin(&teton, &[], "/shell allow\n");
+
+    assert!(
+        session.contains("/shell allow is typed-input-only"),
+        "a piped /shell allow must be refused; output:\n{session}"
+    );
+    assert!(
+        session.contains("not a terminal"),
+        "the refusal must say what the gate actually checks; output:\n{session}"
+    );
+    // Nothing was lifted, and nothing claimed to be.
+    assert!(
+        !session.contains("pin lifted"),
+        "a refused lift must not also lift; output:\n{session}"
+    );
+    // And it must not point at an unattended surface: there is no
+    // `teton shell allow` for a script to run instead, and naming one would be
+    // an instruction to work around the gate.
+    assert!(
+        !session.contains("teton shell allow"),
+        "the refusal must not offer a bypass; output:\n{session}"
+    );
+}
+
 #[test]
 fn a_piped_model_set_is_refused_and_changes_nothing() {
     let daemon = daemon_bin();

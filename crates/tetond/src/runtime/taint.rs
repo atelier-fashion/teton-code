@@ -279,10 +279,8 @@ impl ShellTaintOverride {
     ///
     /// **Intentionally not `pub`** — see the type docs.
     ///
-    /// The single production caller is the `shell/override` RPC handler, which
-    /// TASK-395 adds; this allow goes with it. `the_lift_setter_is_not_crate_visible`
-    /// keeps the visibility honest in the meantime.
-    #[allow(dead_code)]
+    /// The single production caller is `DaemonRuntime::shell_override`, the
+    /// `shell/override` RPC handler.
     pub(super) fn lift(&self, session: &SessionId) -> bool {
         self.lifted
             .lock()
@@ -2242,6 +2240,140 @@ mod shell_pin {
             !source.contains("pub fn lift(&self, session: &SessionId)"),
             "a `pub fn lift` is reachable from `crate::harness::tools`, where a \
              model's tool call lands"
+        );
+    }
+}
+
+/// REQ-614 TASK-395 — the daemon half of `/shell allow`.
+#[cfg(test)]
+mod shell_override_rpc {
+    use super::*;
+    use teton_protocol::methods::ShellOverrideParams;
+
+    fn params(session: &SessionId) -> ShellOverrideParams {
+        ShellOverrideParams {
+            session_id: session.clone(),
+        }
+    }
+
+    /// AC-2. A `boundary_hit` pin is refused, and the refusal **names the
+    /// cause** — "that did not work" without a reason is what sends a user
+    /// looking for a command that does not exist.
+    #[test]
+    fn shell_allow_is_refused_on_a_boundary_hit_and_names_the_cause() {
+        let runtime = DaemonRuntime::minimal();
+        let events = Arc::new(EventBus::new());
+        let session = SessionId::from("perm");
+        runtime
+            .session_taint
+            .mark(&session, TaintCause::BoundaryHit);
+
+        let result = runtime.shell_override(&params(&session), &events);
+        assert!(result.was_pinned);
+        assert!(!result.lifted_now, "BR-3: no lift exists for this cause");
+        assert_eq!(result.cause.as_deref(), Some("boundary_hit"));
+        // And the route still pins.
+        assert!(runtime.route_pin().pins(&session));
+        // Nothing was written: a refused lift leaves no ledger row (assert the
+        // absence — LESSON-550).
+        assert!(runtime
+            .ledger
+            .all_shell_overrides()
+            .expect("read")
+            .is_empty());
+    }
+
+    /// AC-3. The liftable cause lifts, writes exactly one row, and a second
+    /// call writes none.
+    #[test]
+    fn a_second_shell_allow_writes_no_row() {
+        let runtime = DaemonRuntime::minimal();
+        let events = Arc::new(EventBus::new());
+        let session = SessionId::from("liftable");
+        runtime
+            .session_taint
+            .mark(&session, TaintCause::UnknownShell);
+
+        let first = runtime.shell_override(&params(&session), &events);
+        assert!(first.was_pinned && first.lifted_now);
+        assert!(!runtime.route_pin().pins(&session), "routing resumes");
+        assert_eq!(runtime.ledger.all_shell_overrides().expect("read").len(), 1);
+
+        let second = runtime.shell_override(&params(&session), &events);
+        assert!(second.was_pinned, "the session is still recorded as pinned");
+        assert!(!second.lifted_now, "a second lift is not a transition");
+        assert_eq!(
+            runtime.ledger.all_shell_overrides().expect("read").len(),
+            1,
+            "BR-5: a second `/shell allow` writes no row"
+        );
+    }
+
+    /// An unpinned session is a third outcome, distinct from both — a client
+    /// that could not tell it from "already lifted" would confirm a lift that
+    /// never happened.
+    #[test]
+    fn shell_allow_on_an_unpinned_session_changes_nothing() {
+        let runtime = DaemonRuntime::minimal();
+        let events = Arc::new(EventBus::new());
+        let session = SessionId::from("clean");
+        let result = runtime.shell_override(&params(&session), &events);
+        assert!(!result.was_pinned);
+        assert!(!result.lifted_now);
+        assert!(result.cause.is_none());
+        assert!(runtime
+            .ledger
+            .all_shell_overrides()
+            .expect("read")
+            .is_empty());
+    }
+
+    /// AC-7, the absence half. A `/shell allow` that arrives as **text** —
+    /// inside a skill body, a `TETON.md` or a tool result — reaches no handler,
+    /// so the session stays pinned and the ledger stays empty.
+    ///
+    /// The structural reason is that the lift is a client RPC and tool dispatch
+    /// has no path to one; this asserts the consequence rather than the
+    /// mechanism, because a mechanism can be re-implemented and a consequence
+    /// cannot be argued with (LESSON-550: assert the absence).
+    #[test]
+    fn shell_allow_as_text_is_inert() {
+        let runtime = DaemonRuntime::minimal();
+        let session = SessionId::from("texty");
+        runtime
+            .session_taint
+            .mark(&session, TaintCause::UnknownShell);
+
+        // The mechanism, asserted rather than described: there is no **tool**
+        // by any of these names, so a model that emits one gets "no such tool"
+        // and the text never reaches a lift. This is the daemon-side half of
+        // "a `/shell allow` line inside a tool result is data".
+        let registry = crate::harness::tools::ToolRegistry::new();
+        let names = registry.names();
+        for forbidden in ["shell allow", "shell_allow", "shell/override"] {
+            assert!(
+                !names.contains(&forbidden),
+                "a tool named {forbidden:?} would give the model a path to the lift: {names:?}"
+            );
+        }
+        // And no skill may take the name either, so a repository-supplied
+        // `.claude/skills/shell/SKILL.md` cannot shadow the row (LESSON-578: a
+        // rule attached to one flow guards one door — this is the second).
+        assert!(teton_protocol::methods::is_reserved_skill_name("shell"));
+
+        // The consequence, which is what AC-7 actually claims: after all of
+        // that, the session is still pinned and the ledger is still empty.
+        assert!(
+            runtime.route_pin().pins(&session),
+            "the session must still be pinned"
+        );
+        assert!(
+            runtime
+                .ledger
+                .all_shell_overrides()
+                .expect("read")
+                .is_empty(),
+            "AC-7: the ledger has no row"
         );
     }
 }
