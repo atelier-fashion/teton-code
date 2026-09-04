@@ -285,7 +285,9 @@ pub struct Generated {
     pub path: PathBuf,
     /// What REQ-612's loader made of it, the same run (BR-7). Always a
     /// [`RepoContextState::Loaded`]; anything else is a
-    /// [`GenerationOutcome::Failed`] with the file removed.
+    /// [`GenerationOutcome::Failed`] — with the file removed on the create-new
+    /// door, and left in place on `--force` (see
+    /// [`Reason::NotLoaded`]'s `left_in_place`).
     pub state: RepoContextState,
     /// Bytes on disk, header included.
     pub bytes: usize,

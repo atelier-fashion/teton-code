@@ -344,6 +344,16 @@ mod tests {
     /// house pattern (`transcript::writer::tests::scratch`): a counter, not a
     /// timestamp, because two calls inside one clock tick return the same
     /// instant. Created, so every leg starts from a real, empty root.
+    /// Serialises the tests that reason about `SCRATCH_SERIAL`'s movement.
+    ///
+    /// The collision and exhaustion legs decide whether a round "ran the race"
+    /// by how far the process-wide serial moved during one `replace`, and the
+    /// concurrent-replace test draws thirty-two serials of its own; run side by
+    /// side, every guarded round could see the counter move and conclude
+    /// nothing. The lock is what makes "no round ran" a finding rather than a
+    /// scheduling accident.
+    static SERIAL_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn scratch(tag: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -719,16 +729,26 @@ mod tests {
     ///   planted name and claimed the next one. A round in which another test
     ///   thread drew a serial is skipped rather than asserted on.
     ///
-    /// Mutations, both run 2026-09-04 and restored: restoring the collision arm
+    /// - **Every name it can draw is occupied.** [`SCRATCH_ATTEMPTS`] foreign
+    ///   files at the next serials, and the answer is `Io(AlreadyExists)` with
+    ///   the target and every foreign file untouched — bracketed on the serial
+    ///   the same way, concluding only on a round that drew exactly the bound.
+    ///
+    /// Mutations, all run 2026-09-04 and restored: restoring the collision arm
     /// — `Err(AlreadyExists | Symlink) => { remove(&temp); create_new(&temp) }`
     /// in place of `claim_scratch`'s `continue` — fails leg two with "the
     /// collision unlinked a scratch file this call did not create"; the whole
     /// pre-review shape (that arm plus the pid-only name) fails leg one first,
-    /// with "a foreign temp at the pid-only name was unlinked".
+    /// with "a foreign temp at the pid-only name was unlinked"; answering
+    /// exhaustion with `WriteFailure::AlreadyExists` fails leg three with
+    /// "left: AlreadyExists, right: Io(AlreadyExists)".
     #[test]
     fn a_scratch_name_collision_is_retried_past_and_never_unlinked() {
         const FOREIGN: &str = "another run's half-written draft\n";
         let name = file_name(RepoContextSource::TetonMd);
+        let _serial = SERIAL_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // Leg one: the pid-only name is nobody's scratch name any more.
         let root = scratch("legacy-temp");
@@ -789,6 +809,52 @@ mod tests {
             observed,
             "no round ran the collision: `SCRATCH_SERIAL` moved under every one of them"
         );
+
+        // Leg three: every name this call can draw is occupied. The bound is
+        // what stops a hostile root from spinning the serial forever, and the
+        // answer is the I/O verdict, not `write_new`'s "already there" — with
+        // the target untouched and every foreign entry still where it was.
+        let mut observed = false;
+        for round in 0..32 {
+            let root = scratch(&format!("exhausted-{round}"));
+            let target = root.join(name);
+            std::fs::write(&target, "the old notes").expect("the old file is written");
+            let before = SCRATCH_SERIAL.load(Ordering::Relaxed);
+            let planted: Vec<PathBuf> = (0..SCRATCH_ATTEMPTS as u64)
+                .map(|offset| root.join(scratch_name(name, before + offset)))
+                .collect();
+            for path in &planted {
+                std::fs::write(path, FOREIGN).expect("the foreign temp is planted");
+            }
+            let written = replace(&root, BODY);
+            let drawn = SCRATCH_SERIAL.load(Ordering::Relaxed) - before;
+            if drawn != SCRATCH_ATTEMPTS as u64 {
+                continue;
+            }
+            observed = true;
+            assert_eq!(
+                written.expect_err("every scratch name was taken"),
+                WriteFailure::Io(std::io::ErrorKind::AlreadyExists),
+                "exhaustion is an I/O verdict, not `--force`'s own `AlreadyExists`"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&target).expect("the old file reads back"),
+                "the old notes",
+                "exhaustion touched the target"
+            );
+            for path in &planted {
+                assert_eq!(
+                    std::fs::read_to_string(path).ok().as_deref(),
+                    Some(FOREIGN),
+                    "exhaustion unlinked a foreign scratch file"
+                );
+            }
+            break;
+        }
+        assert!(
+            observed,
+            "no round ran the exhaustion: `SCRATCH_SERIAL` moved under every one of them"
+        );
     }
 
     /// BR-8 under concurrency: two `--force` runs at one root both finish, and
@@ -820,6 +886,9 @@ mod tests {
     #[test]
     fn two_concurrent_replaces_both_finish_and_neither_publishes_a_mixture() {
         use std::sync::{Arc, Barrier};
+        let _serial = SERIAL_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let first: String = "a".repeat(128 * 1024);
         let second: String = "b".repeat(128 * 1024);
