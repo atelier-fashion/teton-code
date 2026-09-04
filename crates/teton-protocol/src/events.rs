@@ -232,6 +232,15 @@ pub enum Event {
     /// The context gate dropped, elided, or re-fitted conversation to a
     /// turn's budget (REQ-586 BR-7).
     ContextPressure(ContextPressure),
+    /// A compaction happened, and this is what it kept and what it let go
+    /// (REQ-618 BR-5).
+    ContextCompacted(ContextCompacted),
+    /// A skill body fit the budget and still left the turn no room to work, so
+    /// it was refused with the arithmetic (REQ-618 BR-4).
+    SkillRefusedNoRoom(SkillRefusedNoRoom),
+    /// A turn's anchor set alone exceeded the budget, so nothing was sent
+    /// (REQ-618 BR-1).
+    TurnRefusedAnchorsExceedBudget(TurnRefusedAnchorsExceedBudget),
     /// A user-typed `/name` expanded into a prompt turn (REQ-585 BR-12).
     SkillInvoked(SkillInvoked),
     /// A skill call was refused before any file was resolved (BUG-189).
@@ -309,6 +318,9 @@ impl Event {
             Event::ProviderTested(_) => "provider_tested",
             Event::SessionRootChanged(_) => "session_root_changed",
             Event::ContextPressure(_) => "context_pressure",
+            Event::ContextCompacted(_) => "context_compacted",
+            Event::SkillRefusedNoRoom(_) => "skill_refused_no_room",
+            Event::TurnRefusedAnchorsExceedBudget(_) => "turn_refused_anchors_exceed_budget",
             Event::SkillInvoked(_) => "skill_invoked",
             Event::SkillRefused(_) => "skill_refused",
             Event::ProjectMatch(_) => "project_match",
@@ -3040,6 +3052,163 @@ pub struct ContextPressure {
     /// predating the field means — that daemon floored nothing it could report.
     #[serde(default)]
     pub bound_floored: bool,
+    /// Whether the turn's anchor set — the user's prompt, the previous
+    /// prompt, an active skill body — came through this gate untouched
+    /// (REQ-618 BR-1).
+    ///
+    /// `true` on every frame this daemon emits, and that is the point: it is
+    /// *measured* by the gate that produced it (count and bytes of the anchor
+    /// set, before and after), so a build in which the invariant stopped
+    /// holding would say `false` here rather than say nothing. Its presence in
+    /// the stream is the witness; a reader who never sees `false` has seen the
+    /// guarantee hold on every turn it could have failed on.
+    ///
+    /// `#[serde(default)]` — `false` from a daemon predating the field, which
+    /// makes no claim either way, exactly as `bound_floored` reads.
+    #[serde(default)]
+    pub anchors_intact: bool,
+}
+
+// ---------------------------------------------------------------------------
+// context_compacted / skill_refused_no_room / turn_refused_anchors_exceed_budget
+// (REQ-618)
+// ---------------------------------------------------------------------------
+
+/// What a summarized-away block derived from, without saying what it said
+/// (REQ-618 BR-5).
+///
+/// # Why there is no `boundary` variant
+///
+/// The spec named three classes — `rooted`, `boundary`, `unknown` — and two of
+/// them are REQ-614's vocabulary. `ContextManager` holds no `Config` and no
+/// boundary matcher: the boundary verdict is computed at *egress*, from
+/// `Config::effective_boundaries`, and a class the record could never assign
+/// would be a documented guarantee that is false. So this enum carries what the
+/// manager provably knows — whether a repo-relative identity was minted for the
+/// block, or whether its reach could not be determined at all — and a privacy
+/// reader's "did this derive from a protected file?" is answered where the
+/// matcher lives, by the session taint. When REQ-614 lands a per-result verdict
+/// on the block, `Boundary` becomes assignable and is added then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceClass {
+    /// No file provenance at all: typed prompt text, a model turn.
+    None,
+    /// The block named repo-relative identities — a `read`, a `grep`, a skill
+    /// expansion.
+    Rooted,
+    /// The block's reach could not be determined (a `shell` result, a skill
+    /// file outside the session root). Fail-closed at egress.
+    Unknown,
+    /// A class this build does not know.
+    ///
+    /// Tolerant for the reason [`ContextPressureKind::Unknown`] is: this
+    /// travels daemon → client only and feeds a record, so failing closed on
+    /// an unfamiliar class would take the whole frame down and turn BR-5's
+    /// "every compaction is a record" quietly false.
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// One block a compaction let go — its kind, what it derived from, and how big
+/// it was. Never its content (REQ-618 BR-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactedBlock {
+    /// `user`, `assistant` or `tool` — the transcript's own vocabulary.
+    pub kind: CompactedBlockKind,
+    /// What the block derived from, at the resolution the manager can prove.
+    pub provenance_class: ProvenanceClass,
+    /// The block's text length in bytes.
+    pub bytes: u64,
+}
+
+/// The speaker of a block a compaction let go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactedBlockKind {
+    /// A user prompt.
+    User,
+    /// A model turn.
+    Assistant,
+    /// A tool result.
+    Tool,
+    /// A kind this build does not know — tolerant for BR-5's reason.
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// A compaction happened; this is its ledger (REQ-618 BR-5).
+///
+/// Published on **every** compaction — the `compact` duty's and the mechanical
+/// truncation that stands in when the duty fails, which `fallback` tells apart.
+/// Before this REQ a *successful* compaction produced no event at all: the
+/// transcript held the duty's `route_decided` line and nothing about what had
+/// been forgotten, which is how a session could lose the user's ask ten times
+/// over with nothing in the file to show for it.
+///
+/// It carries counts and kinds, never content, which is what keeps it inside
+/// the transcript's `max_record_bytes`.
+///
+/// The session is named by [`EventEnvelope::session_id`] rather than by a field
+/// here — the same shape [`ContextPressure`] documents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompacted {
+    /// Bytes of block text that survived, measured before the summary block
+    /// was inserted.
+    pub kept_bytes: u64,
+    /// Bytes of block text removed with no replacement.
+    pub dropped_bytes: u64,
+    /// Bytes of block text replaced by the summary.
+    pub summarized_bytes: u64,
+    /// Bytes of the anchor set, which is a subset of [`Self::kept_bytes`] —
+    /// reported separately so a reader can see the ask was among what stayed.
+    pub anchor_bytes: u64,
+    /// The blocks that went, without their content.
+    pub dropped_blocks: Vec<CompactedBlock>,
+    /// The provider the `compact` duty ran on, as `route_decided` reports it.
+    /// `None` on the mechanical fallback, which ran on nothing.
+    pub provider_id: Option<String>,
+    /// The model the duty ran on. `None` for the same reason.
+    pub model: Option<String>,
+    /// Whether this was the mechanical truncation standing in for a duty that
+    /// could not be served (LESSON-447: degrade loudly).
+    pub fallback: bool,
+}
+
+/// A skill body fit the budget and still left the turn no room (REQ-618 BR-4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillRefusedNoRoom {
+    /// The skill's registered name.
+    pub skill: String,
+    /// The expansion's measured size in bytes.
+    pub body_bytes: u64,
+    /// The route's byte budget.
+    pub budget_bytes: u64,
+    /// The fraction of that budget a body may take, in percent.
+    pub room_percent: u64,
+    /// The provider the route runs on, where one is named.
+    pub provider_id: Option<String>,
+}
+
+/// A turn's anchor set alone exceeded the budget, so nothing was sent
+/// (REQ-618 BR-1, AC-2).
+///
+/// The outcome that replaced the middle-elision of the user's own message. A
+/// clamped prompt let the turn proceed against a question the user did not ask;
+/// this ends the turn instead, naming both figures, with no provider reached.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnRefusedAnchorsExceedBudget {
+    /// The anchor set's measured size in bytes, system prompt included.
+    pub anchor_bytes: u64,
+    /// The route's byte budget.
+    pub budget_bytes: u64,
+    /// The anchor set's word estimate.
+    pub anchor_tokens: u64,
+    /// The route's word budget.
+    pub budget_tokens: u64,
+    /// Which kinds are in the set — `user_ask`, `skill_body` — so the sentence
+    /// can say what could not be given up.
+    pub anchor_kinds: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -4696,6 +4865,7 @@ mod tests {
                     budget_bytes: 32_768,
                     bound: BudgetBound::LocalEngine,
                     bound_floored: false,
+                    anchors_intact: true,
                 }),
                 "context_pressure",
             ),
@@ -5645,6 +5815,7 @@ mod tests {
             budget_bytes: 32_768,
             bound: BudgetBound::LocalEngine,
             bound_floored: false,
+            anchors_intact: true,
         };
         round_trip(&pressure);
 
@@ -5681,6 +5852,7 @@ mod tests {
                 budget_bytes: 253_952,
                 bound: BudgetBound::RedactScan,
                 bound_floored: false,
+                anchors_intact: true,
             };
             round_trip(&pressure);
             let wire = envelope_wire(Event::ContextPressure(pressure));
@@ -5759,6 +5931,7 @@ mod tests {
             budget_bytes: 50_000,
             bound: BudgetBound::UserCap,
             bound_floored: true,
+            anchors_intact: true,
         };
         round_trip(&pressure);
         let wire = envelope_wire(Event::ContextPressure(pressure));

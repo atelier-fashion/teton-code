@@ -641,7 +641,7 @@ pub struct ContextManager {
 /// `#[must_use]` because a dropped report is a silent clamp, which is exactly
 /// what BR-7 forbids: a call site that genuinely wants nothing must say so.
 #[must_use]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PressureReport {
     /// How many oldest blocks were dropped to fit the budget.
     pub dropped_blocks: usize,
@@ -668,6 +668,42 @@ pub struct PressureReport {
     /// Stated as "over" rather than "fits" so that [`Default`] — the report of
     /// a gate that had nothing to do — is still the quiet one.
     pub over_budget: bool,
+    /// Whether the anchor set came through this gate untouched (REQ-618 BR-1).
+    ///
+    /// # It is measured, not asserted
+    ///
+    /// The drop loop skips anchored blocks and the clamp refuses an anchored
+    /// last block, so this *should* be `true` on every path — which is exactly
+    /// why writing `true` unconditionally would be worthless. It is instead
+    /// read off the anchor set before and after the gate runs (count and total
+    /// bytes: a drop changes the first, an elision the second), so a future edit
+    /// that lets an anchor through turns this field `false` and the event
+    /// carrying it says so. A witness that cannot report a violation is not a
+    /// witness; it is a comment (LESSON-598, and REQ-592's seven green
+    /// assertions that could not have failed).
+    ///
+    /// `true` on [`Default`], and that is not a vacuous claim: a report nobody
+    /// produced describes a gate that dropped nothing and elided nothing, and
+    /// such a gate cannot have disturbed an anchor. Hand-written rather than
+    /// derived for exactly that reason — `derive(Default)` would say `false`,
+    /// i.e. "the anchors were disturbed", of a gate that did nothing at all.
+    pub anchors_intact: bool,
+}
+
+impl Default for PressureReport {
+    /// The quiet report: nothing dropped, nothing elided, inside both budgets,
+    /// and the anchors necessarily untouched. See
+    /// [`PressureReport::anchors_intact`] for why the last one is not the
+    /// `bool` default.
+    fn default() -> Self {
+        Self {
+            dropped_blocks: 0,
+            elided_bytes: 0,
+            newest_user_elided: false,
+            over_budget: false,
+            anchors_intact: true,
+        }
+    }
 }
 
 impl PressureReport {
@@ -1246,7 +1282,11 @@ impl ContextManager {
             .map(|(i, _)| i)
             .rev();
         let newest = prompts.next();
-        let previous = prompts.next();
+        // The previous turn's ask — but only when it is a prompt the user
+        // *typed*. See `carries_forward` below.
+        let previous = prompts
+            .next()
+            .filter(|&i| Self::carries_forward(&self.blocks[i]));
         for (i, block) in self.blocks.iter_mut().enumerate() {
             block.anchor = if Some(i) == newest || Some(i) == previous {
                 Anchor::UserAsk
@@ -1256,6 +1296,46 @@ impl ContextManager {
                 Anchor::None
             };
         }
+    }
+
+    /// Whether a prompt block keeps its anchor into the **next** turn
+    /// (REQ-618 BR-1 against BR-2).
+    ///
+    /// # The two rules disagree, and BR-2 is the specific one
+    ///
+    /// BR-1 anchors "the previous turn's user prompt block". BR-2 anchors a
+    /// skill expansion "for the turn in which it was expanded" and says that
+    /// "on the next prompt turn it is an ordinary block". On a typed `/name`
+    /// those are the *same block* — `CarriedTurn::begin` seeds the expansion as
+    /// the prompt — so one of the two has to give, and it is BR-1: BR-2 is
+    /// written about exactly this case, and BR-1 about asks in general.
+    ///
+    /// # What it costs to get this wrong
+    ///
+    /// Everything, on the path REQ-589 built. A user shown an over-budget
+    /// measurement who answers `proceed once` gets a body larger than the
+    /// route's budget admitted into the conversation. Anchoring it for a second
+    /// turn makes the *next* prompt's anchor set that body plus the new
+    /// question — over budget by construction, with nothing droppable — so the
+    /// turn after the one they consented to is refused, and so is every turn
+    /// until the body ages out. `proceed once` would come to mean "and lose the
+    /// next turn as well". REQ-589's own acceptance sentence promises the
+    /// opposite: *"ordinary context pressure resumes on the turn after this
+    /// one, which may drop this expansion like any other block."*
+    ///
+    /// # How a skill expansion is told apart
+    ///
+    /// By its provenance, not by its text. A file-supplied prompt carries the
+    /// identities it was drawn from, or `unknown` when the file had no mintable
+    /// identity (REQ-585 BR-7, ADR-9); ordinary typed text is the empty set with
+    /// `unknown` clear, the state every `push_user` caller is in. So this reads
+    /// the same field egress reads, and nothing in a block's content can change
+    /// the answer.
+    fn carries_forward(block: &ContextBlock) -> bool {
+        matches!(
+            &block.provenance,
+            Provenance::User { sources, unknown } if sources.is_empty() && !unknown
+        )
     }
 
     /// Anchor the block just pushed as this turn's skill body (REQ-618 BR-2).
@@ -2019,16 +2099,55 @@ impl ContextManager {
 
     pub fn truncate_to_budget(&mut self) -> PressureReport {
         let mut report = PressureReport::default();
-        while (self.estimated_tokens() > self.budget_tokens
-            || self.estimated_bytes() > self.budget_bytes)
-            && self.blocks.len() > 1
+        // BR-1's witness, taken before anything moves. Count and total bytes
+        // rather than the texts themselves: a drop changes the count, a
+        // middle-elision changes the byte total, and those are the only two
+        // things this method can do to a block. Three anchors at most, so the
+        // measurement costs nothing on a gate that runs every loop iteration.
+        let anchors_before = self.anchor_shape();
+        while self.estimated_tokens() > self.budget_tokens
+            || self.estimated_bytes() > self.budget_bytes
         {
-            let dropped = self.blocks.remove(0);
+            // The oldest droppable block, where "droppable" now has two
+            // exclusions rather than one.
+            //
+            // **The newest block is still exempt**, as it always was: it is the
+            // step the turn is working on, and `compact_offer` protects the same
+            // one. That is why the search stops at `len - 1` instead of running
+            // to the end — dropping the newest block would delete the tool
+            // result the turn just asked for rather than middle-eliding it,
+            // which is a loss where the clamp below is a shortening.
+            //
+            // **And anchored blocks are exempt** (REQ-618 BR-1). Before this REQ
+            // the loop took `blocks[0]`, and the oldest block in a turn is the
+            // user's prompt — or, on a `/skill` turn, the expansion that *is*
+            // the prompt — so the first thing a pressured turn forgot was what
+            // it had been asked to do. The 2026-09-04 session in the REQ's
+            // Description is that, ten times over.
+            let Some(oldest) = self
+                .blocks
+                .get(..self.blocks.len().saturating_sub(1))
+                .and_then(|droppable| droppable.iter().position(|b| !b.anchor.is_anchored()))
+            else {
+                // Nothing left but anchors and the step in progress. Stop, and
+                // let the clamp below shorten that last block if it is not
+                // itself an anchor; `over_budget` carries whatever remains. The
+                // *refusal* is BR-1's and belongs at the gate, not here: this
+                // method runs from `Drop` in `CarriedTurn::commit_now`, where
+                // there is no turn to refuse and no caller to tell.
+                break;
+            };
+            let dropped = self.blocks.remove(oldest);
             self.dropped.absorb(&dropped.provenance);
             self.truncated = true;
             report.dropped_blocks += 1;
         }
-        if self.estimated_bytes() > self.budget_bytes {
+        // REQ-618 BR-1: a middle-elision is a lossy edit of the same kind as a
+        // drop, so the clamp does not land on an anchor either. The context is
+        // left over budget instead and says so through `over_budget` — which is
+        // exactly what the gate's refusal reads.
+        let last_is_anchored = self.blocks.last().is_some_and(|b| b.anchor.is_anchored());
+        if self.estimated_bytes() > self.budget_bytes && !last_is_anchored {
             // Room for the last block's TEXT is the budget minus everything
             // else the estimate charges — system prompt and the per-block
             // render reserves (REQ-554 BR-5) — so the post-clamp estimate
@@ -2064,7 +2183,88 @@ impl ContextManager {
         // left behind is what the provider is about to be handed (verify m1).
         report.over_budget = self.estimated_bytes() > self.budget_bytes
             || self.estimated_tokens() > self.budget_tokens;
+        // The other half of BR-1's witness. Compared, not restated: if a future
+        // edit lets the drop loop or the clamp reach an anchor, this goes false
+        // and `context_pressure` carries the fact out.
+        report.anchors_intact = self.anchor_shape() == anchors_before;
         report
+    }
+
+    /// The anchor set's shape — how many blocks and how many bytes of text —
+    /// which is everything [`Self::truncate_to_budget`] could change about it
+    /// (REQ-618 BR-1).
+    fn anchor_shape(&self) -> (usize, usize) {
+        self.anchors()
+            .fold((0, 0), |(n, bytes), b| (n + 1, bytes + b.text.len()))
+    }
+
+    /// The rendered cost of the anchor set, in bytes and in words
+    /// (REQ-618 BR-1).
+    ///
+    /// The system prompt is charged into both figures because it is charged
+    /// into every other estimate this manager makes — it is the fixed cost of
+    /// running the turn at all, and a comparison that left it out would say a
+    /// turn fits when it cannot be sent.
+    ///
+    /// Measured through the same `tokens_of`/`bytes_of` estimators as
+    /// everything else, at `truncated = true`: a context whose anchors are the
+    /// only thing left has necessarily dropped something, so the elision note
+    /// `prepare` appends is a cost this measurement owes.
+    #[must_use]
+    pub fn anchor_bytes(&self) -> usize {
+        let anchors: Vec<ContextBlock> = self.anchors().cloned().collect();
+        self.bytes_of(&anchors, true)
+    }
+
+    /// Whether the anchor set alone fits both budgets (REQ-618 BR-1, AC-2).
+    ///
+    /// `false` is the condition the turn is refused on — with
+    /// `turn_refused_anchors_exceed_budget`, at the gate, before anything is
+    /// sent. It is deliberately **not** checked inside
+    /// [`Self::truncate_to_budget`]: that method runs from `Drop` during
+    /// `CarriedTurn::commit_now`, where a refusal has nothing to refuse.
+    /// The byte budget this manager is enforcing (REQ-618 BR-1).
+    ///
+    /// Read by the turn gate's refusal so the figures it prints are the pair
+    /// that actually refused the turn. In production this is the route's own —
+    /// `CarriedTurn::begin` chains it straight from `HarnessConfig`, which is
+    /// where `RouteBudget` put it — so REQ-586's one-derivation rule holds; a
+    /// fixture that builds a manager by hand can diverge, and reporting the
+    /// route's number there would name a budget nothing was measured against.
+    #[must_use]
+    pub const fn budget_bytes(&self) -> usize {
+        self.budget_bytes
+    }
+
+    /// The word budget this manager is enforcing — [`Self::budget_bytes`]'s
+    /// twin, and never read without it.
+    #[must_use]
+    pub const fn budget_tokens(&self) -> usize {
+        self.budget_tokens
+    }
+
+    /// The anchor set's word cost, system prompt included — the other half of
+    /// what [`Self::anchors_fit`] compares (REQ-618 BR-1).
+    #[must_use]
+    pub fn anchor_tokens(&self) -> usize {
+        let anchors: Vec<ContextBlock> = self.anchors().cloned().collect();
+        self.tokens_of(&anchors)
+    }
+
+    #[must_use]
+    pub fn anchors_fit(&self) -> bool {
+        let anchors: Vec<ContextBlock> = self.anchors().cloned().collect();
+        self.bytes_of(&anchors, true) <= self.budget_bytes
+            && self.tokens_of(&anchors) <= self.budget_tokens
+    }
+
+    /// The kinds in the anchor set, deduplicated and in a stable order — what
+    /// `turn_refused_anchors_exceed_budget` names alongside the arithmetic.
+    #[must_use]
+    pub fn anchor_kinds(&self) -> Vec<&'static str> {
+        let mut kinds: Vec<&'static str> = self.anchors().map(|b| b.anchor.label()).collect();
+        kinds.dedup();
+        kinds
     }
 
     /// Re-budget this manager to a new pair and run the gate (REQ-586 BR-1,
@@ -2721,10 +2921,17 @@ mod tests {
         // block first. The byte budget is kept ample so the eviction is
         // token-driven — the per-block render reserve (REQ-554 BR-5) would
         // otherwise dominate the default byte twin at this scale.
-        let mut ctx = ContextManager::new("s", 8).with_budget_bytes(10_000);
-        ctx.push_user("aaa aaa aaa aaa aaa"); // 5 tokens — the oldest, evicted first
-        ctx.push_model("bbb bbb bbb bbb bbb"); // 5 tokens
-        ctx.push_user("ccc"); // 1 token — most recent, always preserved
+        // REQ-618 anchors the newest two prompt blocks, so reaching a
+        // leading-assistant state takes a third prompt: the oldest prompt is
+        // then ordinary history and goes first, leaving the model turn that
+        // followed it at the head. This is the shape a real session reaches —
+        // three prompts in, under pressure — rather than a shape only a fixture
+        // could produce.
+        let mut ctx = ContextManager::new("s", 6).with_budget_bytes(10_000);
+        ctx.push_user("aaa aaa aaa aaa aaa"); // 5 tokens — three prompts back, evicted
+        ctx.push_model("bbb bbb"); // 2 tokens — the oldest survivor
+        ctx.push_user("ccc"); // 1 token — the previous turn's ask (anchored)
+        ctx.push_user("ddd"); // 1 token — this turn's ask (anchored)
         let _ = ctx.truncate_to_budget();
 
         assert!(ctx.was_truncated());
@@ -3161,9 +3368,12 @@ mod tests {
     fn truncation_evicts_on_bytes_even_when_tokens_fit() {
         // Two dense single-word blocks: 2 tokens (far under the token budget) but
         // way over the byte budget — the byte currency must drive eviction.
+        // Tool results rather than prompts: this test's subject is which
+        // *currency* drives eviction, and REQ-618's anchors would otherwise make
+        // both blocks undroppable and the answer "neither".
         let mut ctx = ContextManager::new("sys", 10_000).with_budget_bytes(5_000);
-        ctx.push_user("a".repeat(4_000));
-        ctx.push_user("b".repeat(4_000));
+        ctx.push_tool_result("read", None, "a".repeat(4_000));
+        ctx.push_tool_result("read", None, "b".repeat(4_000));
         assert!(ctx.estimated_tokens() < 10_000);
         let _ = ctx.truncate_to_budget();
         assert!(ctx.was_truncated());
@@ -3173,10 +3383,13 @@ mod tests {
 
     #[test]
     fn a_single_oversized_block_is_clamped_in_place() {
-        // Eviction preserves the most recent block, so a lone pathological block
-        // must be clamped rather than handed to the engine over-window.
+        // A lone pathological block that is NOT the ask — a giant tool result
+        // folded into a turn — is still clamped rather than handed to the
+        // engine over-window. The ask's own case moved to
+        // `a_lone_oversized_ask_is_refused_rather_than_clamped` below, which is
+        // where REQ-618 BR-1 put it.
         let mut ctx = ContextManager::new("sys", 10_000).with_budget_bytes(5_000);
-        ctx.push_user("z".repeat(50_000));
+        ctx.push_tool_result("read", None, "z".repeat(50_000));
         let _ = ctx.truncate_to_budget();
         assert_eq!(ctx.blocks().len(), 1);
         assert!(
@@ -3185,6 +3398,49 @@ mod tests {
             ctx.estimated_bytes()
         );
         assert!(ctx.blocks()[0].text.contains("middle elided"));
+    }
+
+    /// **REQ-618 BR-1.** The ask is not clamped either — a middle-elision is a
+    /// lossy edit of the same kind as a drop, and the spec's anchor set forbids
+    /// all three verbs.
+    ///
+    /// # What replaced the clamp
+    ///
+    /// Before this REQ the block was middle-elided and the turn went ahead
+    /// answering a question the user did not ask. Now the context is left over
+    /// budget with `over_budget: true`, and the gate in the turn loop reads
+    /// exactly that and refuses the turn with
+    /// `turn_refused_anchors_exceed_budget` — naming the two figures, sending
+    /// nothing. Silence is the one outcome neither design allows.
+    ///
+    /// The consequence for `newest_user_elided`: it can no longer be set. The
+    /// newest **prompt** block is always anchored, and no other block can be
+    /// `BlockRole::User`, so the clamp cannot land on one. The field and its
+    /// wire counterpart stay for clients that predate this daemon; nothing here
+    /// writes them any more.
+    #[test]
+    fn a_lone_oversized_ask_is_refused_rather_than_clamped() {
+        let mut ctx = ContextManager::new("sys", 10_000).with_budget_bytes(5_000);
+        ctx.push_user("z".repeat(50_000));
+
+        let report = ctx.truncate_to_budget();
+
+        assert_eq!(ctx.blocks().len(), 1);
+        assert_eq!(
+            ctx.blocks()[0].text.len(),
+            50_000,
+            "the ask is byte-identical to what was pushed"
+        );
+        assert!(!ctx.blocks()[0].text.contains("middle elided"));
+        assert_eq!(report.elided_bytes, 0, "{report:?}");
+        assert!(!report.newest_user_elided, "{report:?}");
+        assert!(report.anchors_intact, "{report:?}");
+        assert!(
+            report.over_budget,
+            "the news the gate owes: this turn cannot be sent as it stands"
+        );
+        assert!(!report.is_quiet());
+        assert!(!ctx.anchors_fit(), "which is what the turn gate refuses on");
     }
 
     // ------------------------------------------------------------------
@@ -3202,9 +3458,15 @@ mod tests {
         // Four 1,000-byte blocks against a budget that fits exactly one of them
         // plus the fixed per-prompt terms. The token budget is set far out of
         // reach so the byte currency is unambiguously what drives this.
+        //
+        // Model turns, not user turns: REQ-618 anchors the newest two *prompt*
+        // blocks, so a filler conversation built out of four `push_user` calls
+        // would have two undroppable members and this test would be measuring
+        // the anchor rule instead of the report's arithmetic. The claim here is
+        // the arithmetic.
         let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(1_500);
         for i in 0..4 {
-            ctx.push_user(format!("{i}{}", "a".repeat(999)));
+            ctx.push_model(format!("{i}{}", "a".repeat(999)));
         }
 
         let report = ctx.truncate_to_budget();
@@ -3227,14 +3489,22 @@ mod tests {
     /// not only an event.
     #[test]
     fn an_oversized_newest_user_block_reports_the_bytes_it_lost() {
+        // REQ-618 BR-1 moved the *user* half of this to
+        // `a_lone_oversized_ask_is_refused_rather_than_clamped`: the ask is
+        // never elided, so there are no bytes to report. What this still pins
+        // is the arithmetic — an elision reports its own before/after — on the
+        // block that can still be elided, a folded tool result.
         let mut ctx = ContextManager::new("sys", 10_000).with_budget_bytes(5_000);
-        ctx.push_user("z".repeat(50_000));
+        ctx.push_tool_result("read", None, "z".repeat(50_000));
 
         let report = ctx.truncate_to_budget();
 
         assert_eq!(report.dropped_blocks, 0, "there was nothing to drop");
         assert!(report.elided_bytes > 0, "{report:?}");
-        assert!(report.newest_user_elided, "{report:?}");
+        assert!(
+            !report.newest_user_elided,
+            "a tool result is not the user's message: {report:?}"
+        );
         assert!(!report.is_quiet());
         assert_eq!(
             report.elided_bytes,
@@ -3261,35 +3531,72 @@ mod tests {
         let mut ctx = ContextManager::new("sys", 10_000).with_budget_bytes(20_000);
         ctx.push_user("z".repeat(200_000));
 
-        // The turn's entry gate: clamped in place, nothing to drop yet.
+        // The turn's entry gate. REQ-618 BR-1: the ask is an anchor, so it is
+        // neither dropped nor clamped — the context is left over budget and the
+        // turn gate refuses it. BUG-182's defect is closed here by a stronger
+        // route than the reply reserve it originally needed: there is no longer
+        // a clamp whose arithmetic could be off by the size of a reply, because
+        // there is no longer a clamp.
         let entry = ctx.truncate_to_budget();
-        assert!(
-            entry.newest_user_elided,
-            "the fixture must clamp: {entry:?}"
-        );
         assert_eq!(entry.dropped_blocks, 0, "{entry:?}");
+        assert_eq!(entry.elided_bytes, 0, "{entry:?}");
+        assert!(entry.anchors_intact, "{entry:?}");
+        assert!(entry.over_budget, "{entry:?}");
 
-        // The model answers, and the turn's exit gate runs.
+        assert!(
+            !ctx.anchors_fit(),
+            "in production the turn ends here: the gate reads this and refuses \
+             with turn_refused_anchors_exceed_budget, so no model is called and \
+             there is no reply to lose"
+        );
+
+        // Past that point only because this is a unit test. The model answers,
+        // and the turn's exit gate runs.
+        ctx.push_model("the answer");
+        let exit = ctx.truncate_to_budget();
+
+        assert_eq!(
+            ctx.blocks()
+                .iter()
+                .filter(|b| matches!(b.role, BlockRole::User))
+                .map(|b| b.text.len())
+                .collect::<Vec<_>>(),
+            vec![200_000],
+            "BUG-182: the user's own message outlives the turn that answered \
+             it — and byte-identically, which the clamp could never promise. \
+             The reply is what the gate spends ({exit:?})"
+        );
+        assert!(exit.anchors_intact, "{exit:?}");
+    }
+
+    /// **BUG-182's arithmetic, on the block that can still be clamped.**
+    ///
+    /// The reply reserve exists so the clamp does not fill the byte budget
+    /// exactly and leave the very next append over it. REQ-618 took the ask out
+    /// of the clamp's reach, but a folded tool result is still clamped and the
+    /// reserve still has to hold: the reply appended after it must not push the
+    /// exit gate into dropping anything.
+    #[test]
+    fn the_reply_reserve_still_holds_for_a_clamped_tool_result() {
+        // The result alone, so the drop loop has nothing to take and the clamp
+        // is what runs. With an ask in front of it the loop would simply drop
+        // the result whole, which is the better outcome and not this test's
+        // subject.
+        let mut ctx = ContextManager::new("sys", 10_000).with_budget_bytes(20_000);
+        ctx.push_tool_result("read", None, "z".repeat(200_000));
+
+        let entry = ctx.truncate_to_budget();
+        assert!(entry.elided_bytes > 0, "the fixture must clamp: {entry:?}");
+        assert!(!entry.newest_user_elided, "{entry:?}");
+
         ctx.push_model("the answer");
         let exit = ctx.truncate_to_budget();
 
         assert_eq!(
             exit.dropped_blocks, 0,
-            "the reply must fit in the room the clamp reserved for it, so the \
-             exit gate has nothing to drop: {exit:?}"
+            "the reply must fit in the room the clamp reserved for it: {exit:?}"
         );
-        assert!(
-            ctx.blocks()
-                .iter()
-                .any(|b| matches!(b.role, BlockRole::User)),
-            "the user's own message must outlive the turn that answered it"
-        );
-        assert_eq!(
-            ctx.blocks().len(),
-            2,
-            "question and answer, in that order: {:?}",
-            ctx.blocks().iter().map(|b| b.role).collect::<Vec<_>>()
-        );
+        assert_eq!(ctx.blocks().len(), 2);
     }
 
     /// A tool result clamped in place is an elision, but it is not the user's
@@ -3429,7 +3736,11 @@ mod tests {
         let mut ctx = ContextManager::new("sys", 10_000)
             .with_budget_bytes(5_000)
             .with_window_label("kimi-k2's context window");
-        ctx.push_user("z".repeat(50_000));
+        // A tool result, not the ask: REQ-618 BR-1 makes the ask unclampable,
+        // so the marker's remaining subject is a folded result. The claim is
+        // unchanged — the sentence the model reads names the window this route
+        // actually runs under, not the local engine's.
+        ctx.push_tool_result("read", None, "z".repeat(50_000));
 
         let report = ctx.truncate_to_budget();
 
@@ -4207,7 +4518,13 @@ mod tests {
     /// would leave this test green.
     #[tokio::test]
     async fn a_conversation_too_short_to_hold_a_decision_buys_no_compact_call() {
-        let mut ctx = conversation(2, 3_000);
+        // A prompt and one folded result rather than `conversation(2, …)`:
+        // REQ-618 anchors every prompt block in a two-prompt conversation, and
+        // the coda below — that the hard gate still fits the budget without the
+        // duty — needs one block the gate is allowed to take.
+        let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(TEST_BUDGET_BYTES);
+        ctx.push_tool_result("read", None, format!("block 0 {}", "x".repeat(3_000)));
+        ctx.push_user(format!("block 1 {}", "x".repeat(3_000)));
         assert!(
             ctx.under_compaction_pressure(),
             "the fixture must be pressured, or it declines for the other reason"
@@ -5045,7 +5362,10 @@ mod tests {
             false,
         );
         ctx.push_model("y".repeat(1_500));
+        // See the sibling test: the newest two prompts are anchored, so the
+        // skill expansion has to be three prompts back to be droppable.
         ctx.push_user("and now the next prompt");
+        ctx.push_user("and the one after that");
 
         let report = ctx.truncate_to_budget();
         assert!(
@@ -5078,7 +5398,12 @@ mod tests {
         let mut ctx = ContextManager::new("HEAD", 1_000_000).with_budget_bytes(2_000);
         ctx.push_user_from("x".repeat(1_500), BTreeSet::new(), true);
         ctx.push_model("y".repeat(1_500));
+        // Two later prompts, not one: REQ-618 anchors the newest two, so a
+        // block that is only one prompt old is still the ask and is not
+        // droppable. Three prompts in, it is ordinary history — which is the
+        // state this test is about.
         ctx.push_user("and now the next prompt");
+        ctx.push_user("and the one after that");
 
         let report = ctx.truncate_to_budget();
         assert!(
@@ -5202,15 +5527,27 @@ mod tests {
             ctx.was_truncated(),
             "…which is what lands the 142-byte surcharge"
         );
-        assert!(
-            report.newest_user_elided && report.elided_bytes > 0,
-            "the block the clamp lands on is the skill expansion itself: {report:?}"
-        );
+        // What the session would have done to it, restated for REQ-618. The
+        // expansion is the turn's ask, so it is an anchor: it is neither
+        // clamped nor dropped, the history is spent trying to make room for it,
+        // and the turn is then refused at the gate anyway. That is a *better*
+        // reason for the early refusal than the middle-elision this used to
+        // assert — the elision cost the user a shortened procedure, this costs
+        // them the whole conversation and still fails.
+        assert_eq!(report.elided_bytes, 0, "{report:?}");
+        assert!(!report.newest_user_elided, "{report:?}");
+        assert!(report.anchors_intact, "{report:?}");
+        assert!(report.over_budget, "{report:?}");
         assert!(
             ctx.blocks()
                 .last()
-                .is_some_and(|b| b.text.len() < body.len()),
-            "the skill expansion must have been middle-elided for this test to mean anything"
+                .is_some_and(|b| b.text.len() == body.len()),
+            "the expansion is byte-identical: nothing shortened it"
+        );
+        assert!(
+            !ctx.anchors_fit(),
+            "…and this is what the turn gate would refuse on, after the history \
+             had already been spent"
         );
     }
 
@@ -5424,10 +5761,14 @@ mod tests {
             "the history should have gone first"
         );
         assert!(ctx.was_truncated());
-        assert!(
-            report.newest_user_elided && report.elided_bytes > 0,
-            "the block the clamp lands on is the expansion itself: {report:?}"
-        );
+        // As in the seed test above: REQ-618 makes the expansion an anchor, so
+        // the history goes and the turn is refused rather than the expansion
+        // being middle-elided. Refusing at the append is what saves the
+        // conversation from being spent on a turn that cannot run.
+        assert_eq!(report.elided_bytes, 0, "{report:?}");
+        assert!(!report.newest_user_elided, "{report:?}");
+        assert!(report.anchors_intact, "{report:?}");
+        assert!(report.over_budget, "{report:?}");
     }
 
     // ---------------------------------------------------------------------

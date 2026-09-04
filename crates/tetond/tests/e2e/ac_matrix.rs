@@ -701,8 +701,73 @@ fn ac15b_paste() -> String {
     format!("HEAD-OF-THE-PASTE-MARKER {half}{AC15B_MIDDLE} {half}TAIL-OF-THE-PASTE-MARKER")
 }
 
+/// **AC-7's completion claim, on a prompt that fits both windows.**
+///
+/// Its own test since REQ-618. The AC-15b fixture below shares AC-7's shape but
+/// carries a 120 KB paste sized to fit the primary's window and not the
+/// fallback's — and REQ-618 BR-1 makes that turn end in a refusal rather than
+/// an answer, because the paste is the user's own question and may not be
+/// shortened. That is the right outcome for *that* turn and the wrong fixture
+/// for this claim: "a degraded provider still gets you an answer" is a product
+/// promise about ordinary turns, and it needs a prompt an ordinary turn would
+/// carry.
 #[test]
 fn ac7_degraded_provider_falls_back_and_completes() {
+    let flaky = MockProvider::always_bad();
+    let healthy = MockProvider::always(openai_turn("Recovered and done.", None, 120, 20));
+
+    let mut config = String::new();
+    config.push_str(&remote_provider_block_with_window(
+        "flaky",
+        &flaky.openai_endpoint(),
+        "deepseek-chat",
+        128_000,
+    ));
+    config.push_str(&remote_provider_block_with_window(
+        "healthy",
+        &healthy.openai_endpoint(),
+        "deepseek-chat",
+        32_000,
+    ));
+    config.push_str(&tier_block("build", "flaky", Some("healthy")));
+
+    let ws = Workspace::new("ac7ok");
+    ws.write_config(&config);
+    let daemon = Daemon::spawn(&ws, probe_16gb());
+    let mut client = daemon.connect();
+
+    let session = client.create_session("structured", Some("implement"));
+    let resp = client.prompt(&session, "implement the feature");
+
+    assert_eq!(
+        result_stop_reason(&resp),
+        Some("end_turn"),
+        "session did not recover via fallback: {resp}"
+    );
+    client.drain_events(Duration::from_millis(400));
+
+    let degraded = client.events_named("provider_degraded");
+    assert!(
+        degraded
+            .iter()
+            .any(|e| e["provider_id"].as_str() == Some("flaky")
+                && e["fallback_id"].as_str() == Some("healthy")),
+        "expected provider_degraded flaky -> healthy; saw {degraded:?}"
+    );
+    assert_no_boundary_bytes();
+}
+
+/// **REQ-586 AC-15b, and what REQ-618 made of it.** A turn assembled against a
+/// 128k primary is re-budgeted for a 32k fallback *before* the fallback's own
+/// `route_decided` — choose route, refit, say so, retry.
+///
+/// The outcome at the end of that sequence changed. REQ-586 clamped the paste
+/// and completed the turn on the fallback; REQ-618 BR-1 will not shorten the
+/// user's question, so the turn ends in the typed refusal instead. Both prevent
+/// the over-window 400 this AC exists to prevent — which is the claim — and the
+/// refusal additionally says which window ran out and by how much.
+#[test]
+fn ac15b_a_turn_refit_for_a_smaller_fallback_never_reaches_it_over_window() {
     let flaky = MockProvider::always_bad();
     let healthy = MockProvider::always(openai_turn("Recovered and done.", None, 120, 20));
 
@@ -738,11 +803,12 @@ fn ac7_degraded_provider_falls_back_and_completes() {
     let paste = ac15b_paste();
     let resp = client.prompt(&session, &format!("implement the feature\n\n{paste}"));
 
-    // The session completed rather than failing.
+    // The turn ends by naming what would not fit, rather than by answering a
+    // shortened question (REQ-618 BR-1) — and, as before, never by a 400.
     assert_eq!(
-        result_stop_reason(&resp),
-        Some("end_turn"),
-        "session did not recover via fallback: {resp}"
+        resp["error"]["code"].as_i64(),
+        Some(-32025),
+        "the refit found nothing it was allowed to cut and must say so: {resp}"
     );
     client.drain_events(Duration::from_millis(400));
 
@@ -765,13 +831,16 @@ fn ac7_degraded_provider_falls_back_and_completes() {
     let failed = client
         .event_index_from(0, |e| e["event"] == "provider_degraded")
         .expect("the primary was degraded");
+    // `did_not_fit` rather than `refit_on_reroute` since REQ-618: the refit ran
+    // and could not fit, because the only block left to cut is the ask. The
+    // publisher has always chosen the kind off that flag.
     let refit = client
         .event_index_from(failed, |e| {
-            e["event"] == "context_pressure" && e["kind"] == "refit_on_reroute"
+            e["event"] == "context_pressure" && e["kind"] == "did_not_fit"
         })
         .unwrap_or_else(|| {
             panic!(
-                "no refit_on_reroute before the fallback attempt: {:?}",
+                "no refit announcement before the fallback attempt: {:?}",
                 client.event_names()
             )
         });
@@ -798,34 +867,33 @@ fn ac7_degraded_provider_falls_back_and_completes() {
         Some((32_000u64 - 1_024) * 2),
         "the event must carry the pair derived from the *fallback's* window:          {event}"
     );
-    assert!(
-        event["elided_bytes"].as_u64().unwrap_or(0) > 0
-            || event["dropped_blocks"].as_u64().unwrap_or(0) > 0,
-        "a refit that cut nothing would leave AC-15b vacuous — the paste is          sized to fit one window and not the other: {event}"
+    assert_eq!(
+        event["anchors_intact"].as_bool(),
+        Some(true),
+        "BR-1's witness on the refit that could not fit: {event}"
+    );
+    assert_eq!(
+        event["elided_bytes"].as_u64(),
+        Some(0),
+        "the refit never shortens the ask: {event}"
     );
 
-    // …and the bytes agree with the event. The primary was sent the whole
-    // paste; the fallback was sent one with its middle taken out. That is the
-    // "no 400" claim read off the wire rather than off an event.
+    // …and the bytes agree with the event, read off the wire rather than off an
+    // event. The primary was sent the whole paste. The fallback was sent
+    // **nothing at all** — which is the stronger form of the claim REQ-586 made
+    // here: a context assembled for a window four times the fallback's is not
+    // re-sent to it over-window, and since REQ-618 it is not re-sent shortened
+    // either, because a shortened question is not the user's question.
     let sent_to_flaky = String::from_utf8_lossy(&flaky.requests()[0]).into_owned();
-    let sent_to_healthy = String::from_utf8_lossy(&healthy.requests()[0]).into_owned();
     assert!(
         sent_to_flaky.contains(AC15B_MIDDLE),
         "the primary's 128k window had room for the whole paste"
     );
     assert!(
-        !sent_to_healthy.contains(AC15B_MIDDLE),
-        "the fallback was re-sent a context assembled for a window four times          its own — the over-window 400 BR-1 exists to prevent"
-    );
-    assert!(
-        sent_to_healthy.contains("HEAD-OF-THE-PASTE-MARKER"),
-        "…but it was re-fitted, not emptied: the clamp keeps a head and a tail"
-    );
-    assert!(
-        sent_to_healthy.len() < sent_to_flaky.len(),
-        "the fallback's request must be the smaller one: {} against {}",
-        sent_to_healthy.len(),
-        sent_to_flaky.len()
+        healthy.requests().is_empty(),
+        "the fallback must not be sent an over-window context, and must not be \
+         sent a shortened one: {} request(s) reached it",
+        healthy.requests().len()
     );
 
     assert_no_boundary_bytes();

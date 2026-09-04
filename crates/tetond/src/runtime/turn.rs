@@ -1815,6 +1815,26 @@ impl DaemonRuntime {
                             .unwrap_or_else(|| err.to_string()),
                     ));
                 }
+                // REQ-618 BR-1 / AC-2 — the second half of the typed outcome.
+                //
+                // Its own arm, immediately beside the two window refusals it is
+                // a sibling of, and **ahead** of the generic remote arm below
+                // for the reason the spend ceiling is: that arm asks for a
+                // `failure_class`, this error deliberately has none, and
+                // without a branch here a refused turn would reach the user as
+                // "provider failed unrecoverably" — wrong about the cause,
+                // wrong about who refused, and naming no remedy (LESSON-557).
+                //
+                // The sentence is the error's own `Display`: every figure it
+                // names was measured by the gate that raised it, so there is
+                // nothing to re-compose here and nothing a second wording could
+                // add but a chance to disagree.
+                Err(err @ HarnessError::AnchorsExceedBudget { .. }) => {
+                    break 'turn Err(RpcError::new(
+                        error_code::TURN_ANCHORS_EXCEED_BUDGET,
+                        err.to_string(),
+                    ));
+                }
                 // REQ-588 BR-3 / ADR-4: the spend ceiling, answered here and
                 // **before** the generic remote arm below. That arm asks for a
                 // `failure_class`, and this error deliberately has none, so

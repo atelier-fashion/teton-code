@@ -40,7 +40,7 @@ use serde_json::Value;
 use teton_inference::{ChatFormat, Engine, EngineError, GenParams};
 use teton_protocol::events::{
     CapabilityDeadEnd, ContextPressure, ContextPressureKind, Event, PrefixCache, SessionUpdate,
-    SessionUpdatePayload, ToolCallStatus,
+    SessionUpdatePayload, ToolCallStatus, TurnRefusedAnchorsExceedBudget,
 };
 use teton_protocol::methods::{SessionRoot, StopReason};
 use teton_protocol::{ProviderId, SessionId};
@@ -235,6 +235,50 @@ pub enum HarnessError {
         /// The route's word budget, from the [`HarnessConfig`] the attempt ran
         /// under — never re-derived here.
         budget_tokens: usize,
+    },
+    /// The turn's **anchor set** alone exceeds the route's budget, so nothing
+    /// was sent (REQ-618 BR-1, AC-2).
+    ///
+    /// # Why this is not a `ContextLengthExceeded`
+    ///
+    /// Those two are a *provider's* answer, or the local engine's: the turn was
+    /// dispatched and refused. This one is refused by the daemon before any
+    /// dispatch, and the difference is what the sentence has to say — no
+    /// provider saw it, no health moved, and the remedy is the user's (a shorter
+    /// prompt) or the route's (a larger window), not a retry.
+    ///
+    /// It carries the pair in both currencies because the anchor set can be
+    /// over either half, and the kinds because the remedy depends on which
+    /// anchor is oversized: a pasted `user_ask` is shortened by the person who
+    /// pasted it, a `skill_body` by moving to a bigger route.
+    ///
+    /// # Both halves (conventions: *A typed outcome needs both halves*)
+    ///
+    /// It has no `failure_class` — nothing about it is a provider failure and
+    /// the retry/fallback/degrade machinery must not act on it — **and** it has
+    /// its own arm on the turn path in `runtime/turn.rs`. Without the second
+    /// half it would fall through to the generic remote arm and reach the user
+    /// as "provider failed unrecoverably", which is wrong about the cause and
+    /// names no remedy. That is the failure LESSON-557 records, and this is the
+    /// fourth outcome shaped this way.
+    #[error(
+        "this turn's {anchor_kinds} alone comes to about {anchor_tokens} words / {anchor_bytes} \
+         bytes, against a budget of {budget_tokens} words / {budget_bytes} bytes — and none of it \
+         may be shortened, so nothing was sent"
+    )]
+    AnchorsExceedBudget {
+        /// The anchor set's byte cost, system prompt included.
+        anchor_bytes: usize,
+        /// The anchor set's word cost, system prompt included.
+        anchor_tokens: usize,
+        /// The route's byte budget, from the [`HarnessConfig`] this turn ran
+        /// under — never re-derived.
+        budget_bytes: usize,
+        /// The route's word budget, from the same place.
+        budget_tokens: usize,
+        /// The kinds in the set, already joined for the sentence — `user_ask`,
+        /// or `user_ask and skill_body`.
+        anchor_kinds: String,
     },
 }
 
@@ -919,6 +963,40 @@ impl SessionEvents {
                 // budget the floor raised above that cap would be reporting a
                 // ceiling that is not in force (TASK-194 2b).
                 bound_floored: budget.floored,
+                // REQ-618 BR-1's witness, carried out of the manager exactly as
+                // measured. Never composed here: a call site that wrote `true`
+                // would be asserting the invariant rather than reporting it.
+                anchors_intact: report.anchors_intact,
+            }),
+        );
+    }
+
+    /// Announce that this turn's anchor set alone will not fit, so nothing was
+    /// sent (REQ-618 BR-1, AC-2).
+    ///
+    /// The outcome that replaced the middle-elision of the user's own message.
+    /// Published at the gate, before `prepare` — the last point at which
+    /// "no provider saw this turn" is still true.
+    pub fn turn_refused_anchors_exceed_budget(
+        &self,
+        anchor_bytes: usize,
+        anchor_tokens: usize,
+        anchor_kinds: Vec<String>,
+        budget_tokens: usize,
+        budget_bytes: usize,
+    ) {
+        self.bus.publish(
+            Some(self.session_id.clone()),
+            Event::TurnRefusedAnchorsExceedBudget(TurnRefusedAnchorsExceedBudget {
+                anchor_bytes: anchor_bytes as u64,
+                anchor_tokens: anchor_tokens as u64,
+                anchor_kinds,
+                // The pair the decision was taken on, handed in by the caller
+                // rather than read from a `RouteBudget` here — see the call
+                // site's note on why those are the same value in production and
+                // why this one is the honest one to print.
+                budget_tokens: budget_tokens as u64,
+                budget_bytes: budget_bytes as u64,
             }),
         );
     }
@@ -2145,6 +2223,51 @@ pub async fn run_session_turn_with_pressure_policy(
                 &config.budget,
                 &mut said_it_did_not_fit,
             );
+
+            // ---- REQ-618 BR-1 / AC-2: the anchors do not fit ----
+            //
+            // Placed **after** the gate above and **before** `prepare` below,
+            // which is the last point at which "nothing was sent and no
+            // provider saw this turn" is still true. The gate has by now
+            // dropped everything it is allowed to drop; if the ask, the
+            // previous ask and any active skill body still do not fit, there is
+            // nothing left to give up.
+            //
+            // Before this REQ the answer was to middle-elide the user's own
+            // message and answer the shortened version. That is the defect the
+            // REQ exists to close, and a refusal is the only other honest
+            // outcome: a turn that cannot hold the question must not answer it.
+            //
+            // Inside `enforces_this_iteration` on purpose. REQ-589 BR-12 / D-3
+            // suspends the gate for one iteration when the user was shown an
+            // over-budget measurement and accepted it — and a user who accepted
+            // an oversized expansion accepted *sending* it, which is exactly
+            // this turn. Refusing it here would answer their consent with a
+            // refusal.
+            if !ctx.anchors_fit() {
+                let anchor_kinds = ctx.anchor_kinds();
+                // The budgets come off the **manager**, not off `config.budget`,
+                // because the manager's pair is what `anchors_fit` just decided
+                // on. In production they are one value — `CarriedTurn::begin`
+                // seeds the manager from the same `RouteBudget` this config
+                // carries — so REQ-586 AC-12's single derivation is intact; the
+                // point of reading it here is that a refusal can never name a
+                // budget nothing was measured against.
+                events.turn_refused_anchors_exceed_budget(
+                    ctx.anchor_bytes(),
+                    ctx.anchor_tokens(),
+                    anchor_kinds.iter().map(|k| (*k).to_owned()).collect(),
+                    ctx.budget_tokens(),
+                    ctx.budget_bytes(),
+                );
+                return Err(HarnessError::AnchorsExceedBudget {
+                    anchor_bytes: ctx.anchor_bytes(),
+                    anchor_tokens: ctx.anchor_tokens(),
+                    budget_bytes: ctx.budget_bytes(),
+                    budget_tokens: ctx.budget_tokens(),
+                    anchor_kinds: anchor_kinds.join(" and "),
+                });
+            }
         }
 
         // ---- model call ----
@@ -4645,10 +4768,15 @@ mod tests {
         let tool_ctx = ToolContext::new(std::env::temp_dir());
         let mut hook = NoopProvenanceHook;
 
+        // REQ-618: droppable history, and one folded result too big to fit
+        // even clamped. The ask is small — it has to be, or the anchor gate
+        // would refuse the turn outright and no gate after the first would ever
+        // run. What keeps every gate over budget is the 1 KiB clamp floor on
+        // the newest block, which is the arm this test has always been about.
         let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(BUDGET_BYTES);
         ctx.push_user("do the thing");
         for i in 0..5 {
-            ctx.push_user(format!("block {i} {}", "x".repeat(1_000)));
+            ctx.push_tool_result("read", None, format!("block {i} {}", "x".repeat(1_000)));
         }
         assert!(
             ctx.estimated_bytes() > BUDGET_BYTES,
@@ -5076,6 +5204,9 @@ mod tests {
             elided_bytes,
             newest_user_elided: false,
             over_budget,
+            // A hand-built report for the kind classifier, which does not read
+            // this field; the real one comes from `truncate_to_budget`.
+            anchors_intact: true,
         };
         // The three that fit.
         assert_eq!(
@@ -8331,17 +8462,37 @@ mod tests {
         }
         let _ = ctx.truncate_to_budget();
 
+        // REQ-618 BR-1 removed the state this test used to reproduce: the ask
+        // is an anchor, so the pressure that once dropped it now spends the
+        // forty model turns instead and leaves the user block exactly where it
+        // was. The defect — a retry ranking its matches against an empty
+        // request — is structurally impossible rather than merely guarded.
         assert!(
-            !ctx.blocks()
+            ctx.blocks()
                 .iter()
                 .any(|b| b.role == crate::harness::context::BlockRole::User),
-            "the fixture must actually drop the user block, or it tests nothing"
+            "the ask must survive the pressure that used to take it"
         );
         assert_eq!(
             latest_request(&ctx),
             REQUEST,
             "a retry ranked its matches against an empty request"
         );
+
+        // The fallback is still the answer for the one context that genuinely
+        // holds no user turn: a conversation carried in with its prompts
+        // already aged out, which `restate_anchors` cannot retro-anchor because
+        // there is nothing of that kind to anchor.
+        let mut no_ask = ContextManager::new("system", 64).with_budget_bytes(512);
+        no_ask.push_model("an assistant turn with nothing before it");
+        assert!(
+            !no_ask
+                .blocks()
+                .iter()
+                .any(|b| b.role == crate::harness::context::BlockRole::User),
+            "the fixture must hold no user turn, or the fallback is untested"
+        );
+        assert_eq!(latest_request(&no_ask), no_ask.request());
     }
 
     /// And it is the *latest* request, not the first one a manager ever saw —

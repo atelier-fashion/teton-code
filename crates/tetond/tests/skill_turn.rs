@@ -1368,12 +1368,21 @@ async fn a_refused_skill_turn_seeds_nothing_says_nothing_and_changes_no_health()
 }
 
 /// **AC-16's contrast, and the reason it is in this file.** The refusal is for
-/// skill turns *only*: the identical bytes typed by hand on the identical route
-/// take REQ-586 BR-7's loud elision instead — the turn runs, the newest user
-/// block is clamped, and the clamp is announced.
+/// skill turns *only* — and since REQ-618 that means *this* refusal, under
+/// *this* code, for *this* reason, rather than "skills are refused and typed
+/// text is not".
+///
+/// REQ-586 BR-7 answered the typed twin with a loud elision: the turn ran, the
+/// newest user block was clamped, and the clamp was announced. REQ-618 BR-1
+/// forbids shortening the ask, so the typed twin is now refused too. The pair
+/// still tells the two apart, and it has to keep doing so, because the remedies
+/// differ: `-32023` says *the skill you invoked will not fit* (use a smaller
+/// skill, or a route with a bigger window) and `-32025` says *your own message
+/// will not fit* (send less). Without this test the two would drift into one
+/// sentence and a user would be told to change the wrong thing.
 ///
 /// Same window, same size, one difference. Without this pair, "skills are
-/// refused" and "everything is refused" look the same.
+/// refused" and "everything is refused identically" look the same.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_typed_oversized_prompt_still_elides_loudly_on_the_route_that_refuses_a_skill() {
     let repo = Tree::new("typedbig");
@@ -1388,22 +1397,45 @@ async fn a_typed_oversized_prompt_still_elides_loudly_on_the_route_that_refuses_
     // 16,384-byte floor by 2.4×) the floored pair's 50,000 bytes now hold the
     // whole thing and nothing is clamped, so this leg went quiet without
     // anything being wrong with the elision.
-    h.turn(&session, &filler(60_000), None)
+    let err = h
+        .turn(&session, &filler(60_000), None)
         .await
-        .expect("a typed oversized prompt is served, not refused");
+        .expect_err("a typed oversized prompt is refused since REQ-618, not shortened");
 
-    let published = drain(&mut sub).await;
-    let elided = published.iter().any(|event| match event {
-        Event::ContextPressure(pressure) => pressure.newest_user_elided,
-        _ => false,
-    });
+    // The distinguishing half: a different code and a different subject from
+    // the skill twin above.
+    assert_eq!(err.code, -32025, "{err:?}");
     assert!(
-        elided,
-        "REQ-586 BR-7's elision must still fire for typed text: {published:#?}"
+        err.message.contains("user_ask"),
+        "the typed twin's refusal is about the user's own message, not about a \
+         skill: {}",
+        err.message
     );
     assert!(
-        h.vendor.hits() >= 1,
-        "an elided typed turn still reaches the provider"
+        !err.message.contains("skill"),
+        "…and it must not borrow the skill twin's sentence: {}",
+        err.message
+    );
+
+    let published = drain(&mut sub).await;
+    assert!(
+        published
+            .iter()
+            .any(|event| matches!(event, Event::TurnRefusedAnchorsExceedBudget(_))),
+        "the refusal is announced: {published:#?}"
+    );
+    assert!(
+        published.iter().all(|event| match event {
+            Event::ContextPressure(pressure) => !pressure.newest_user_elided,
+            _ => true,
+        }),
+        "nothing was clamped, so nothing may say it was: {published:#?}"
+    );
+    assert_eq!(
+        h.vendor.hits(),
+        0,
+        "and nothing reached the provider — the whole point of refusing at the \
+         gate rather than at the window"
     );
 }
 

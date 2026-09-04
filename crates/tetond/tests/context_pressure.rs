@@ -42,6 +42,7 @@ use std::sync::{Arc, Mutex};
 use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams};
 use teton_protocol::events::{
     BudgetBound, ContextPressure, ContextPressureKind, Event, SessionUpdatePayload,
+    TurnRefusedAnchorsExceedBudget,
 };
 use teton_protocol::SessionId;
 
@@ -54,9 +55,9 @@ use tetond::harness::compact::{
 use tetond::harness::context::PressureReport;
 use tetond::harness::{
     build_system_prompt, run_session_turn_with_source, BudgetInputs, ContextManager, DutyRoute,
-    HarnessConfig, LocalEngineSource, NoopProvenanceHook, PendingPermissions, PermissionConfig,
-    PermissionGate, RouteBudget, SessionEvents, ToolContext, ToolDuties, ToolRegistry,
-    COMPACT_DUTY, DIGEST_DUTY, SHELL_DUTY, TRIAGE_DUTY,
+    HarnessConfig, HarnessError, LocalEngineSource, NoopProvenanceHook, PendingPermissions,
+    PermissionConfig, PermissionGate, RouteBudget, SessionEvents, ToolContext, ToolDuties,
+    ToolRegistry, COMPACT_DUTY, DIGEST_DUTY, SHELL_DUTY, TRIAGE_DUTY,
 };
 use tetond::runtime::SessionTaint;
 use tetond::sessions::SessionRegistry;
@@ -271,6 +272,51 @@ impl Fixture {
         outcome.final_text
     }
 
+    /// The same turn, handed back whole rather than unwrapped — for the one
+    /// case where the *refusal* is the subject (REQ-618 AC-2).
+    async fn try_turn(
+        &self,
+        ctx: &mut ContextManager,
+        config: &HarnessConfig,
+    ) -> Result<String, HarnessError> {
+        let gate = PermissionGate::new(
+            self.session.clone(),
+            PermissionConfig::permissive(),
+            Arc::clone(&self.bus),
+            Arc::new(PendingPermissions::new()),
+        );
+        let events = SessionEvents::new(Arc::clone(&self.bus), self.session.clone());
+        let mut source = LocalEngineSource::new(
+            Arc::clone(&self.engine),
+            ChatFormat::Flat,
+            self.session.clone(),
+        );
+        let digest = DutyRoute::local(DIGEST_DUTY, "local", Arc::clone(&self.engine));
+        let triage = DutyRoute::local(TRIAGE_DUTY, "local", Arc::clone(&self.engine));
+        let shell = DutyRoute::local(SHELL_DUTY, "local", Arc::clone(&self.engine));
+        let compact = DutyRoute::unresolved("no `compact` binding in this fixture");
+        let mut hook = NoopProvenanceHook;
+
+        run_session_turn_with_source(
+            &mut source,
+            &self.tools,
+            &self.tool_ctx,
+            &gate,
+            &events,
+            ctx,
+            config,
+            &mut hook,
+            &digest,
+            &compact,
+            &ToolDuties {
+                triage: &triage,
+                shell: &shell,
+            },
+        )
+        .await
+        .map(|outcome| outcome.final_text)
+    }
+
     /// The `compact` duty route these fixtures use when the duty is the subject
     /// rather than the scenery.
     fn compact_route(&self) -> DutyRoute {
@@ -280,6 +326,12 @@ impl Fixture {
     /// The prompt the engine was handed for its `n`th call.
     fn prompt(&self, n: usize) -> String {
         self.prompts.lock().expect("prompt log mutex")[n].clone()
+    }
+
+    /// How many prompts the engine was handed at all — `0` is the assertion
+    /// that a refusal really sent nothing (REQ-618 AC-2).
+    fn prompts(&self) -> usize {
+        self.prompts.lock().expect("prompt log mutex").len()
     }
 
     fn prompts_matching(&self, needle: &str) -> Vec<String> {
@@ -304,6 +356,8 @@ struct Published {
     pressure: Vec<ContextPressure>,
     /// The `agent_message_chunk` texts, in order.
     chunks: Vec<String>,
+    /// REQ-618 BR-1's refusals.
+    anchors_exceeded: Vec<TurnRefusedAnchorsExceedBudget>,
 }
 
 /// Drain `sub` without a wall-clock timeout: `EventBus::publish` is synchronous
@@ -312,9 +366,11 @@ struct Published {
 fn drain(sub: &mut tetond::broadcast::Subscription) -> Published {
     let mut pressure = Vec::new();
     let mut chunks = Vec::new();
+    let mut anchors_exceeded = Vec::new();
     while let Some(envelope) = sub.try_recv() {
         match envelope.event {
             Event::ContextPressure(p) => pressure.push(p),
+            Event::TurnRefusedAnchorsExceedBudget(r) => anchors_exceeded.push(r),
             Event::SessionUpdate(update) => {
                 if let SessionUpdatePayload::AgentMessageChunk { text } = update.update {
                     chunks.push(text);
@@ -328,7 +384,11 @@ fn drain(sub: &mut tetond::broadcast::Subscription) -> Published {
         "the subscription was evicted for falling behind, so an absent event \
          here would prove nothing"
     );
-    Published { pressure, chunks }
+    Published {
+        pressure,
+        chunks,
+        anchors_exceeded,
+    }
 }
 
 // ===========================================================================
@@ -379,8 +439,13 @@ async fn three_dropped_blocks_are_one_event_naming_all_three() {
         block_words * 4 > budget.budget_bytes,
         "fixture: one block must bust the byte half on its own"
     );
+    // Read results rather than typed pastes: REQ-618 anchors the newest two
+    // *prompt* blocks, so four `push_user` calls would leave two of them
+    // undroppable and this test would be measuring the anchor rule instead of
+    // the report's arithmetic. Three files read into the turn, then the
+    // question about them, is also the shape the closing assertion describes.
     for n in 0..3 {
-        ctx.push_user(format!("paste {n}: {}", filler(block_words)));
+        ctx.push_tool_result("read", None, format!("paste {n}: {}", filler(block_words)));
     }
     ctx.push_user("what did those three files have in common?");
     assert_eq!(ctx.blocks().len(), 4);
@@ -444,33 +509,33 @@ async fn three_dropped_blocks_are_one_event_naming_all_three() {
 // AC-10 — an elided newest user message is news twice over
 // ===========================================================================
 
-/// **AC-10 / BR-7.** A single user message too large for the route's byte budget
-/// is middle-elided in place, and that is reported **twice**: as
-/// `context_pressure { kind: block_elided, newest_user_elided: true }` and as a
-/// one-line notice in the turn's own output — because an event a client may
-/// render in a status line is not where "the model is answering a shortened
-/// version of what you sent" belongs.
+/// **REQ-618 BR-1 / AC-2 — a turn whose ask alone will not fit is refused.**
 ///
-/// ## The route is a real 128k one
+/// # What this replaced
 ///
-/// The budget comes from `derive` for a provider declaring `max_context =
-/// 128_000`, so the pair here (84,650 words / 253,952 bytes) is the pair
-/// production computes, and the fixture pastes 75,000 words at 4 B/word —
-/// **under** the word budget and **over** the byte budget. That is deliberate:
-/// on a window-derived pair the 2 B/token byte floor is what binds for prose and
-/// code, and a fixture that busted the word guard instead would be testing the
-/// local shape while claiming a remote one.
+/// This test used to be `an_elided_newest_user_message_is_an_event_and_a_notice_in_the_turns_output`,
+/// and it asserted the opposite outcome: the user's own message middle-elided
+/// in place, a `context_pressure { newest_user_elided: true }` event, and a
+/// turn notice telling them how many bytes had gone. The turn then ran, and the
+/// model answered a question the user had not asked.
 ///
-/// ## And the marker names Kimi's window, not the local engine's
+/// REQ-618's anchor set forbids all three verbs on the ask — summarize, drop,
+/// middle-elide — so the elision is gone and with it the only path that could
+/// set `newest_user_elided`. What stands in its place is louder, not quieter:
+/// the turn does not happen, and the refusal names both figures in both
+/// currencies.
 ///
-/// The third assertion is BR-7's other half. Before REQ-586 the in-prompt
-/// elision marker hard-coded "the local context window", which on this route is
-/// simply false — and it is the sentence REQ-585's oversized-skill refusal is
-/// built on. The marker the engine was handed is read back here, out of the
-/// assembled prompt, rather than out of the manager's field.
+/// # The three claims
+///
+/// 1. Nothing was sent. The engine was never called, so no provider — and on
+///    this fixture no local engine either — saw the turn (AC-2).
+/// 2. The ask is byte-identical to what was pushed. Not "mostly there": the
+///    whole point is that no shortening happened.
+/// 3. The refusal is typed, and it names the anchor kinds so a reader knows
+///    which of the protected things was too big.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_elided_newest_user_message_is_an_event_and_a_notice_in_the_turns_output() {
-    let fixture = Fixture::new("elided", "I answered the shortened version.");
+async fn a_turn_whose_ask_alone_exceeds_the_budget_is_refused_and_nothing_is_sent() {
+    let fixture = Fixture::new("refused", "this answer must never be produced");
     let budget = derive(BudgetInputs {
         window: 128_000,
         cap: 0,
@@ -481,17 +546,16 @@ async fn an_elided_newest_user_message_is_an_event_and_a_notice_in_the_turns_out
         local_window: 0,
     });
     assert_eq!(budget.bound, BudgetBound::Window);
-    assert_eq!(budget.window_label, "kimi's context window");
     let config = HarnessConfig::default().with_route_budget(budget.clone());
 
-    // 75,000 words × 4 B/word = 300,000 bytes: under the 84,650-word budget and
-    // over the 253,952-byte one, so the byte guard is what clamps.
+    // 75,000 words x 4 B/word = 300,000 bytes: under the word budget and over
+    // the byte one, so it is the byte guard that refuses — the same fixture the
+    // elision test used, taken to its new outcome.
     let pasted = filler(75_000);
     assert!(
         pasted.split_whitespace().count() < budget.budget_tokens
             && pasted.len() > budget.budget_bytes,
-        "this fixture is about the byte guard: {} words / {} bytes against \
-         {} / {}",
+        "this fixture is about the byte guard: {} words / {} bytes against {} / {}",
         pasted.split_whitespace().count(),
         pasted.len(),
         budget.budget_tokens,
@@ -502,90 +566,67 @@ async fn an_elided_newest_user_message_is_an_event_and_a_notice_in_the_turns_out
     assert_eq!(ctx.blocks().len(), 1, "nothing here is droppable");
 
     let mut sub = fixture.bus.subscribe(1_024);
-    fixture.turn(&mut ctx, &config).await;
+    let error = fixture
+        .try_turn(&mut ctx, &config)
+        .await
+        .expect_err("a turn that cannot hold the question must not answer it");
     let published = drain(&mut sub);
 
-    // --- Surface one: the event.
-    //
-    // The elision is the *first* thing announced, and it is the only thing
-    // announced about the user's own message. A second, later event is expected
-    // and is not this one: the clamp fills the byte budget exactly, so once the
-    // model's reply is appended the exit gate has to drop the oldest block to
-    // make room for it — a genuinely separate clamp, at a different point in the
-    // turn, correctly announced separately rather than folded into this one.
-    let event = published
-        .pressure
-        .first()
-        .expect("the clamp must be announced");
-    assert_eq!(event.kind, ContextPressureKind::BlockElided);
+    // --- Claim 1: nothing was sent.
     assert_eq!(
-        published
-            .pressure
-            .iter()
-            .filter(|p| p.newest_user_elided)
-            .count(),
-        1,
-        "the user's message was clamped once and must be named once: {:?}",
-        published.pressure
+        fixture.prompts(),
+        0,
+        "the refusal is raised before `prepare`, so no prompt was ever built"
     );
-    assert_eq!(
-        event.dropped_blocks, 0,
-        "there was only ever one block, so nothing was dropped"
-    );
-    assert!(
-        event.elided_bytes > 0,
-        "an elision that took no bytes is not an elision"
-    );
-    assert!(
-        event.newest_user_elided,
-        "the clamped block was the user's own newest message, and that is the \
-         whole reason this case is louder than the others"
-    );
-    assert_eq!(event.budget_bytes, budget.budget_bytes as u64);
-    assert_eq!(event.bound, BudgetBound::Window);
 
-    // --- Surface two: the turn's own output.
-    let notices: Vec<&String> = published
-        .chunks
+    // --- Claim 2: the ask is untouched.
+    assert_eq!(
+        ctx.blocks()[0].text.len(),
+        pasted.len(),
+        "the ask was neither dropped nor shortened"
+    );
+    assert_eq!(ctx.blocks()[0].text, pasted);
+
+    // --- Claim 3: the refusal is typed and names the figures.
+    let HarnessError::AnchorsExceedBudget {
+        anchor_bytes,
+        budget_bytes,
+        anchor_kinds,
+        ..
+    } = &error
+    else {
+        panic!("the turn must be refused as an anchor overrun, not as something else: {error}");
+    };
+    assert!(*anchor_bytes > *budget_bytes, "{error}");
+    assert_eq!(anchor_kinds, "user_ask");
+
+    // …and the same figures reach the client as an event, so a user watching
+    // the stream is told why the turn did not happen.
+    let refusals: Vec<_> = published
+        .anchors_exceeded
         .iter()
-        .filter(|c| c.contains("[note:"))
+        .filter(|r| r.anchor_bytes == *anchor_bytes as u64)
         .collect();
     assert_eq!(
-        notices.len(),
+        refusals.len(),
         1,
-        "exactly one notice, in the transcript the user is reading: {:?}",
-        published.chunks
+        "one refusal, announced once: {:?}",
+        published.anchors_exceeded
     );
-    let notice = notices[0];
-    assert!(
-        notice.contains("your message did not fit kimi's context window"),
-        "the notice must name the window that ran out: {notice}"
-    );
-    assert!(
-        notice.contains(&format!("({} bytes)", event.elided_bytes)),
-        "the notice and the event must agree on how much went: {notice}"
-    );
-    assert!(
-        !notice.contains("abc abc"),
-        "the notice says how much was cut and never what was cut (BR-11): {notice}"
-    );
+    assert_eq!(refusals[0].budget_bytes, *budget_bytes as u64);
+    assert_eq!(refusals[0].anchor_kinds, vec!["user_ask".to_owned()]);
 
-    // --- And the sentence the *model* reads names the same window.
-    let prompt = fixture.prompt(0);
+    // And the pressure line, if any, may not claim an elision that did not
+    // happen — the field that used to carry this case can no longer be set.
     assert!(
-        prompt.contains("kimi's context window"),
-        "the in-prompt elision marker must name the route's window; the \
-         pre-REQ-586 marker said 'the local context window' on every route"
+        published.pressure.iter().all(|p| !p.newest_user_elided),
+        "nothing was clamped, so nothing may say it was: {:?}",
+        published.pressure
     );
     assert!(
-        !prompt.contains("the local context window"),
-        "…and must not still say the local engine's on a 128k remote route"
-    );
-    assert!(
-        prompt.len() <= budget.budget_bytes,
-        "the clamp exists to bound this: {} bytes against {}",
-        prompt.len(),
-        budget.budget_bytes
+        published.pressure.iter().all(|p| p.anchors_intact),
+        "BR-1's witness: {:?}",
+        published.pressure
     );
 }
 
@@ -776,11 +817,21 @@ async fn the_marker_names_the_routes_window_when_the_turn_is_seeded_by_carried_t
         &config,
         Arc::new(SessionTaint::new()),
         Vec::new(),
-        format!("review this paste:\n{}", filler(16_000)),
+        "review this paste".to_owned(),
         std::collections::BTreeSet::new(),
         false,
         // No notes in this fixture, so a reroute has nothing to re-render.
         None,
+    );
+    // The oversized block is a folded result, not the ask: REQ-618 BR-1 makes
+    // the ask unclampable, so the marker's subject is now a tool result. What
+    // this test is about is unchanged — the *label* in that marker has to come
+    // from `CarriedTurn::begin`'s stamping of the route's window, and nothing
+    // here sets it by hand.
+    conversation.ctx_mut().push_tool_result(
+        "read",
+        None,
+        format!("the paste:\n{}", filler(16_000)),
     );
     // Non-vacuity: the pasted block really is over the route's byte budget, so
     // the clamp has to fire and a marker has to be written.
@@ -811,8 +862,14 @@ async fn the_marker_names_the_routes_window_when_the_turn_is_seeded_by_carried_t
         published
             .pressure
             .iter()
-            .any(|p| p.newest_user_elided && p.bound == BudgetBound::Window),
-        "the clamp landed on the user's own message and is announced: {:?}",
+            .any(|p| p.kind == ContextPressureKind::BlockElided
+                && p.elided_bytes > 0
+                && p.bound == BudgetBound::Window),
+        // Was `newest_user_elided` until REQ-618 BR-1 made the ask unclampable.
+        // The subject of this test is the *label* in the marker, and the block
+        // the marker is written onto is now a folded result — which is what the
+        // fixture pushes. The clamp still fires and is still announced.
+        "the clamp landed and is announced: {:?}",
         published.pressure
     );
 }

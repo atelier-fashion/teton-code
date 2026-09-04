@@ -28,17 +28,18 @@ use std::collections::{HashMap, HashSet};
 use teton_protocol::events;
 use teton_protocol::events::{
     AttachConsentRequested, BlockCause, BoundaryDefaultsApplied, BudgetBound, CapabilityDeadEnd,
-    ConsentScope, ContextPressure, ContextPressureKind, DaemonClientAttach, DaemonLifetimeStage,
-    DynamicOutcome, DynamicOutcomeView, Event, EventEnvelope, EvictionReason, FailureClass,
-    ModelLifecycle, ModelSelectionProposed, NotRunReason, PermissionOption, PermissionOptionKind,
-    PermissionRequest, PermissionSubject, PhaseTransition, PrefixCache, PrefixCacheMiss,
-    PrefixCacheOutcome, PrivacyAction, PrivacyBlock, ProvenanceRejected, ProvenanceRejection,
-    ProviderDegraded, ProviderSetupCompleted, ProviderSetupRejected, ProviderTested, RemedyKind,
-    RouteDecided, SessionGrantMinted, SessionUpdatePayload, SkillInvoked, SkillOverBudgetAccepted,
-    SkillOverBudgetOffered, SkillOverBudgetRemedyApplied, SkillStage, TierWarming, ToolCallStatus,
-    TurnQueued, UnboundedRootWarning, WebCapabilityState, WebConsentDecided, WebConsentScope,
-    WebLookup, WebLookupKind, WebLookupOutcome, WebSetupCompleted, WebSetupRejected, WebTier,
-    WindowVerdict, OPTION_ID_ENABLE_PERMANENT,
+    ConsentScope, ContextCompacted, ContextPressure, ContextPressureKind, DaemonClientAttach,
+    DaemonLifetimeStage, DynamicOutcome, DynamicOutcomeView, Event, EventEnvelope, EvictionReason,
+    FailureClass, ModelLifecycle, ModelSelectionProposed, NotRunReason, PermissionOption,
+    PermissionOptionKind, PermissionRequest, PermissionSubject, PhaseTransition, PrefixCache,
+    PrefixCacheMiss, PrefixCacheOutcome, PrivacyAction, PrivacyBlock, ProvenanceRejected,
+    ProvenanceRejection, ProviderDegraded, ProviderSetupCompleted, ProviderSetupRejected,
+    ProviderTested, RemedyKind, RouteDecided, SessionGrantMinted, SessionUpdatePayload,
+    SkillInvoked, SkillOverBudgetAccepted, SkillOverBudgetOffered, SkillOverBudgetRemedyApplied,
+    SkillRefusedNoRoom, SkillStage, TierWarming, ToolCallStatus, TurnQueued,
+    TurnRefusedAnchorsExceedBudget, UnboundedRootWarning, WebCapabilityState, WebConsentDecided,
+    WebConsentScope, WebLookup, WebLookupKind, WebLookupOutcome, WebSetupCompleted,
+    WebSetupRejected, WebTier, WindowVerdict, OPTION_ID_ENABLE_PERMANENT,
 };
 use teton_protocol::methods::{
     AttachConsentOutcome, AttachConsentParams, PermissionOutcome, PermissionRespondParams,
@@ -1185,6 +1186,29 @@ pub fn render_event(
             surface.line(LineKind::Notice, &format_context_pressure(pressure));
             EventOutcome::Rendered
         }
+        // REQ-618 BR-5. Verbose-gated: a compaction that kept the ask is the
+        // machinery working, and its value is in the *transcript* — which
+        // receives it either way, because the tap sits on the publish path and
+        // not on this subscriber. What the user needs on screen is the case
+        // where something went wrong, and that is the refusal two arms down.
+        Event::ContextCompacted(compacted) => {
+            if state.verbose {
+                surface.line(LineKind::Notice, &format_context_compacted(compacted));
+            }
+            EventOutcome::Rendered
+        }
+        // REQ-618 BR-4. Never gated: a skill the user asked for did not run.
+        Event::SkillRefusedNoRoom(refused) => {
+            surface.line(LineKind::Notice, &format_refused_no_room(refused));
+            EventOutcome::Rendered
+        }
+        // REQ-618 BR-1, AC-2. Never gated, and the loudest of the three: the
+        // turn did not happen. This is what replaced silently answering a
+        // middle-elided version of the user's own question.
+        Event::TurnRefusedAnchorsExceedBudget(refused) => {
+            surface.line(LineKind::Notice, &format_anchors_exceed_budget(refused));
+            EventOutcome::Rendered
+        }
         // REQ-589 BR-3. **Verbose-gated, and it is the only one of the three
         // that is.** The offer is *raised*, not answered, and the connection
         // this event reaches is the same one the addressed `permission_request`
@@ -1345,6 +1369,53 @@ fn remedy_words(remedy: RemedyKind) -> &'static str {
         RemedyKind::NotOffered => "none — this bound has no durable fix",
         RemedyKind::Unknown => "a fix this build cannot name",
     }
+}
+
+/// The `context_compacted` notice (REQ-618 BR-5).
+///
+/// States the three totals and that the ask survived, which is the one fact a
+/// reader of a compacted session actually wants. It does not list the dropped
+/// blocks: the event carries them for the transcript, and a terminal line
+/// enumerating forty tool results is not a line anyone reads.
+fn format_context_compacted(compacted: &ContextCompacted) -> String {
+    format!(
+        "compacted{}: kept {} B ({} B of it the ask and any active skill body), summarized {} B          from {} block(s), dropped {} B",
+        if compacted.fallback {
+            " (mechanically — the `compact` duty could not be served)"
+        } else {
+            ""
+        },
+        compacted.kept_bytes,
+        compacted.anchor_bytes,
+        compacted.summarized_bytes,
+        compacted.dropped_blocks.len(),
+        compacted.dropped_bytes,
+    )
+}
+
+/// The `skill_refused_no_room` notice (REQ-618 BR-4).
+fn format_refused_no_room(refused: &SkillRefusedNoRoom) -> String {
+    format!(
+        "no room: skill `{}` fits this route's budget ({} B against {} B) but would take more          than {}% of it, leaving the turn nothing to work with",
+        refused.skill, refused.body_bytes, refused.budget_bytes, refused.room_percent,
+    )
+}
+
+/// The `turn_refused_anchors_exceed_budget` notice (REQ-618 BR-1).
+///
+/// Names both figures and what could not be given up. It does not offer a
+/// remedy sentence of its own: what to do about it depends on which anchor is
+/// oversized — a pasted prompt is shortened by the user, a skill body by a
+/// larger route — and a generic instruction here would be wrong half the time.
+fn format_anchors_exceed_budget(refused: &TurnRefusedAnchorsExceedBudget) -> String {
+    format!(
+        "nothing sent: this turn's {} alone comes to {} words / {} B, against a budget of {}          words / {} B — and none of it may be shortened, so no provider saw this turn",
+        refused.anchor_kinds.join(" and "),
+        refused.anchor_tokens,
+        refused.anchor_bytes,
+        refused.budget_tokens,
+        refused.budget_bytes,
+    )
 }
 
 /// The `skill_over_budget_offered` notice (REQ-589 BR-3).
@@ -5503,6 +5574,7 @@ mod tests {
                 budget_bytes: 32_768,
                 bound: BudgetBound::LocalEngine,
                 bound_floored: false,
+                anchors_intact: true,
             }))
         };
 
@@ -5545,6 +5617,7 @@ mod tests {
                 budget_bytes: 32_768,
                 bound,
                 bound_floored: false,
+                anchors_intact: true,
             })
         };
 
@@ -5657,6 +5730,7 @@ mod tests {
                 budget_bytes: 50_000,
                 bound: BudgetBound::UserCap,
                 bound_floored,
+                anchors_intact: true,
             })
         };
         assert_eq!(
