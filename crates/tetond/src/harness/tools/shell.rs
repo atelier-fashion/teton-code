@@ -365,6 +365,10 @@ impl Tool for ShellTool {
         let Some(raw_output_chars) = outcome.measured else {
             return RefinedOutcome::unrefined(outcome);
         };
+        // Read once, before any arm below consumes `outcome`, so the reason the
+        // skip is announced under and the flag the gate was asked about are
+        // provably the same value rather than two reads that could diverge.
+        let is_error_before_refine = outcome.is_error;
         // **ADR-5, the whole of it.** The size arm is answered by the length of
         // the stdout+stderr the command really produced, which `render_output`
         // captured at the one moment it existed — before the cap was applied.
@@ -372,10 +376,24 @@ impl Tool for ShellTool {
         // post-truncation length against the cap that produced it, so the arm
         // could never fire on the results it exists for (LESSON-443).
         if !shell_duty::worth_interpreting(outcome.is_error, raw_output_chars) {
-            // A command that succeeded and fit is already legible. No model call,
-            // and nothing to report: a duty not worth making is not a duty that
-            // failed. This is the case `shell` is in for most of a session.
-            return RefinedOutcome::unrefined(outcome);
+            // No model call — and since REQ-617 BR-7 the *reason* rides back
+            // with the result rather than being inferred from its absence.
+            //
+            // Two things reach this line and they are not the same event. A
+            // command that succeeded and fit is already legible, which is the
+            // case `shell` is in for most of a session and costs nothing. A
+            // command that **failed** is never interpreted whatever its size,
+            // which is a rule rather than a saving. Both leave an unrefined
+            // result behind, so a reader who cannot tell them apart cannot tell
+            // the gate working from the gate over-reaching.
+            //
+            // Announced by the loop, not here: this tool holds no event sink,
+            // and the layer that does is the one that knows whose session it is
+            // (REQ-572 ADR-4, the `dead_end` precedent).
+            return RefinedOutcome::skipped(
+                outcome,
+                shell_duty::skip_reason(is_error_before_refine),
+            );
         }
         // BR-7 / LESSON-432: the egress provenance of the command output, as this
         // tool itself reported it on the outcome — `Unknown` for anything a
@@ -1846,7 +1864,8 @@ search_key_ref = "env:{web_var}"
         root
     }
 
-    /// **AC-13, the load-bearing test.** Four commands, one duty, counted calls.
+    /// **AC-13, the load-bearing test — and REQ-617 AC-7's table.** Five
+    /// commands, one duty, counted calls.
     ///
     /// The row that matters is the first: a short successful command — most of
     /// what a session runs — costs **zero** model calls. Everything else this
@@ -1858,32 +1877,61 @@ search_key_ref = "env:{web_var}"
     /// and a trigger evaluated on the rendered result instead of on the raw
     /// length would fire, because the status line pushes the rendered result
     /// past the cap.
+    ///
+    /// **REQ-617 BR-7 flipped the last two rows from 1 call to 0**, and they are
+    /// kept rather than deleted for the reason the module doc gives: the
+    /// `fail-small` row is the defect (a one-line stderr paraphrased into an
+    /// instruction the harness never authorized) and the `fail-over` row is the
+    /// price (a failing `cargo build`'s compiler wall, which REQ-561 wrote this
+    /// duty to explain). A table that dropped them would show the new rule and
+    /// hide what it cost.
+    ///
+    /// Each zero-call row now also asserts **which** silence it is, via
+    /// `duty_skipped`. Without that, `fail-over` and `ok-exact` are the same
+    /// observation, and the difference between them is the whole of BR-7.
     #[tokio::test]
-    async fn the_duty_fires_on_failure_or_a_capped_output_and_on_nothing_else() {
+    async fn the_duty_fires_only_on_a_capped_successful_output() {
         let over = SHELL_TRIGGER_OUTPUT_CHARS + 1_000;
-        for (label, tag, chars, command, expected_calls) in [
-            ("exit 0, small", "ok-small", 16usize, "cat out.txt", 0usize),
+        for (label, tag, chars, command, expected_calls, expected_skip) in [
+            (
+                "exit 0, small",
+                "ok-small",
+                16usize,
+                "cat out.txt",
+                0usize,
+                Some("under_size_trigger"),
+            ),
             (
                 "exit 0, exactly at the cap",
                 "ok-exact",
                 SHELL_TRIGGER_OUTPUT_CHARS,
                 "cat out.txt",
                 0,
+                Some("under_size_trigger"),
             ),
-            ("exit 0, over the cap", "ok-over", over, "cat out.txt", 1),
+            (
+                "exit 0, over the cap",
+                "ok-over",
+                over,
+                "cat out.txt",
+                1,
+                None,
+            ),
             (
                 "exit non-zero, small",
                 "fail-small",
                 16,
                 "cat out.txt; exit 3",
-                1,
+                0,
+                Some("failed_exit"),
             ),
             (
                 "exit non-zero, over the cap",
                 "fail-over",
                 over,
                 "cat out.txt; exit 3",
-                1,
+                0,
+                Some("failed_exit"),
             ),
         ] {
             let root = repo_printing(tag, chars);
@@ -1909,6 +1957,12 @@ search_key_ref = "env:{web_var}"
                 expected_calls,
                 "{label}: expected {expected_calls} model call(s)"
             );
+            assert_eq!(
+                refined.duty_skipped, expected_skip,
+                "{label}: the skip reason must say WHICH silence this is — \
+                 `failed_exit` and `under_size_trigger` are the two halves of \
+                 BR-7 and look identical without it"
+            );
             if expected_calls == 0 {
                 assert_eq!(
                     refined.outcome, raw,
@@ -1924,6 +1978,63 @@ search_key_ref = "env:{web_var}"
             }
             std::fs::remove_dir_all(&root).ok();
         }
+    }
+
+    /// **REQ-617 AC-7, end to end: the transcript's own command.**
+    ///
+    /// `cd /nonexistent && pwd` — exit 1, the raw stderr, the harness's own
+    /// `ERROR:` line, and **no** `[shell: …]` prefix. The four halves are
+    /// asserted together because the defect was all four at once: the result
+    /// came back wearing an interpretation that had invented an instruction.
+    ///
+    /// Distinct from the table above, which counts model calls. This one reads
+    /// what the *model* receives, and the `[shell: ` needle is the one a reader
+    /// of the 2026-09-04 transcript would recognise.
+    #[tokio::test]
+    async fn a_failed_command_comes_back_raw_with_no_interpretation() {
+        let root = temp_root("ac7-raw");
+        let args = json!({ "command": "cd /nonexistent && pwd" });
+        let (route, calls) = counting_route("The directory does not exist.");
+
+        let (raw, refined) = run_and_refine(&root, &args, &route).await;
+
+        assert!(raw.is_error, "the fixture must fail");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a failed command buys no model call (BR-7)"
+        );
+        assert_eq!(
+            refined.duty_skipped,
+            Some("failed_exit"),
+            "and says that is why it bought none"
+        );
+        assert!(
+            !refined.outcome.content.contains("[shell: "),
+            "the result must carry NO interpretation — this prefix is what the \
+             2026-09-04 transcript's `The agent needs to either create this \
+             directory first…` arrived under.\ncontent: {}",
+            refined.outcome.content
+        );
+        assert!(
+            refined.outcome.content.contains("(exit 1)"),
+            "the raw exit status must survive: {}",
+            refined.outcome.content
+        );
+        assert!(
+            refined
+                .outcome
+                .content
+                .contains("No such file or directory"),
+            "and so must the command's own stderr, which is the whole of what \
+             the model needs here: {}",
+            refined.outcome.content
+        );
+        assert_eq!(
+            refined.outcome, raw,
+            "a skipped duty must return the tool's own result byte for byte"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// **BR-3, the whole of it.** Every way the duty can fail returns the value
@@ -1982,30 +2093,59 @@ search_key_ref = "env:{web_var}"
     /// The interpretation is added *above* the command's own result, and the
     /// facts the rest of the loop reads off that result are untouched.
     ///
-    /// `is_error` in particular: REQ-544 MED-4 makes the BR-6 verification gate
-    /// turn on it, so a failing `cargo test` that has been *explained* must still
-    /// count as unverified. An interpretation that cleared the flag would let a
-    /// weak model declare victory off a failed check.
+    /// **Re-based by REQ-617 BR-7, and the original hazard is worth recording
+    /// because it has become unreachable rather than being solved.** This test
+    /// ran a *failing* command, and its sharpest assertion was that `is_error`
+    /// survived interpretation: REQ-544 MED-4 makes the BR-6 verification gate
+    /// turn on that flag, so a failing `cargo test` that had been explained had
+    /// to still count as unverified, or a weak model could declare victory off a
+    /// failed check.
+    ///
+    /// BR-7 stops the duty running on failures at all, so no failing result can
+    /// reach interpretation and that hazard cannot occur. The fixture therefore
+    /// moves to the one trigger that remains — a **successful** command whose
+    /// output was capped — and the flag assertion is kept as a structural claim
+    /// (`refine` returns `ToolOutcome { content, ..outcome }`, so *every* other
+    /// field rides through) rather than as the specific `true` it used to pin.
+    ///
+    /// **If REQ-617 OQ-3 is ever answered by letting failures be interpreted
+    /// again, this test goes back to a failing fixture and back to asserting
+    /// `is_error` is `true`.** That sentence is the whole reason this comment
+    /// exists: the coverage was not deleted, it was parked, and it is parked
+    /// against a specific future change.
     #[tokio::test]
-    async fn an_interpreted_failure_keeps_its_output_its_error_flag_and_its_provenance() {
-        let root = repo_printing("interpret", 16);
-        let args = json!({ "command": "cat out.txt; exit 3" });
-        let route = local_route("The command exited 3 because the file check failed.");
+    async fn an_interpreted_result_keeps_its_output_its_flags_and_its_provenance() {
+        let root = repo_printing("interpret", SHELL_TRIGGER_OUTPUT_CHARS + 1_000);
+        let args = json!({ "command": "cat out.txt" });
+        let route = local_route("The file printed more than the tool could keep.");
 
         let (raw, refined) = run_and_refine(&root, &args, &route).await;
 
+        assert!(
+            !raw.is_error,
+            "non-vacuity: the fixture must be the successful-and-capped case, \
+             which is the only trigger left"
+        );
         assert_eq!(refined.duty_error, None);
+        assert_eq!(
+            refined.duty_skipped, None,
+            "the duty ran, so nothing was skipped"
+        );
         assert_eq!(
             refined.outcome.content,
             format!(
-                "[shell: The command exited 3 because the file check failed.]\n{}",
+                "[shell: The file printed more than the tool could keep.]\n{}",
                 raw.content
             ),
             "the command's own result must survive under the interpretation"
         );
-        assert!(
-            refined.outcome.is_error,
-            "an explained failure still failed"
+        assert_eq!(
+            refined.outcome.is_error, raw.is_error,
+            "interpretation must not touch the flag the verification gate reads"
+        );
+        assert_eq!(
+            refined.outcome.measured, raw.measured,
+            "nor the measurement the gate above read"
         );
         assert_eq!(
             refined.outcome.provenance,
@@ -2295,10 +2435,23 @@ search_key_ref = "env:{web_var}"
                 ToolProvenance::none(),
                 "{label}: a call that ran no command surfaced no command output"
             );
-            assert!(
-                shell_duty::worth_interpreting(raw.is_error, 1),
-                "{label}: non-vacuity — this failure would be worth interpreting if it \
-                 had said anything, so what refuses here is the missing measurement"
+            // **Non-vacuity, re-based by REQ-617 BR-7.** This used to assert
+            // `worth_interpreting(raw.is_error, 1)` — "this failure would be
+            // worth interpreting if it had said anything" — which stopped being
+            // true when BR-7 removed the failure trigger, and stopped being a
+            // *discriminator* at the same moment: under the new rule the gate
+            // would refuse this too, so the old check could no longer tell
+            // "refused for want of a measurement" from "refused for failing".
+            //
+            // `duty_skipped == None` is the sharper claim and the one the test
+            // actually makes: `refine` returned at the `measured` guard, which
+            // is *above* the gate, so no skip reason was minted at all. A build
+            // that moved the measurement guard below the gate would report
+            // `failed_exit` here and fail.
+            assert_eq!(
+                refined.duty_skipped, None,
+                "{label}: non-vacuity — `refine` must return at the `measured` \
+                 guard, above the gate, so nothing here is a *gate* decision"
             );
             assert_eq!(
                 calls.load(Ordering::SeqCst),
@@ -2327,9 +2480,23 @@ search_key_ref = "env:{web_var}"
     /// route: `test -f missing` fails with an empty body, so what a duty would
     /// be given is a command line and `(exit 1)`.
     ///
-    /// The last row is the non-vacuity, and it is the one that keeps this
-    /// honest: the *same* failing command with one line of output still fires.
-    /// What was removed is the empty case, not the failure trigger.
+    /// **Re-based by REQ-617 BR-7.** The last row used to be the non-vacuity —
+    /// *the same failing command with one line of output still fires* — and BR-7
+    /// removed the failure trigger, so it no longer does. Keeping it at zero
+    /// with the rest would leave this test unable to fail: every row would be a
+    /// silence, and a build that stopped calling the duty at all would pass.
+    ///
+    /// So the non-vacuity moves to the arm that still fires — a **successful**
+    /// command whose output was capped — and one row is added for the case the
+    /// empty-output arm now uniquely owns: a command that *succeeded* and said
+    /// nothing. That row is the only one where emptiness, rather than failure,
+    /// is what refuses.
+    ///
+    /// A note on the skip reason for the failing empty rows: they report
+    /// `failed_exit`, not an "empty" reason of their own. Both facts are true of
+    /// them and neither is misleading, and inventing a third reason to name
+    /// which guard fired first would be reporting the implementation's order
+    /// rather than the session's situation.
     #[tokio::test]
     async fn a_failure_that_captured_no_output_is_not_worth_interpreting() {
         for (label, args, expected_calls) in [
@@ -2342,6 +2509,12 @@ search_key_ref = "env:{web_var}"
             (
                 "non-zero exit, with something to read",
                 json!({ "command": "echo boom >&2; exit 3" }),
+                0,
+            ),
+            ("exit 0, silent", json!({ "command": "true" }), 0),
+            (
+                "exit 0, output over the cap — the non-vacuity",
+                json!({ "command": "head -c 20000 /dev/zero | tr '\\0' 'x'" }),
                 1,
             ),
         ] {
@@ -2349,29 +2522,14 @@ search_key_ref = "env:{web_var}"
             let (route, calls) = counting_route("Something went wrong.");
             let (raw, refined) = run_and_refine(&root, &args, &route).await;
 
-            assert!(raw.is_error, "{label}: the fixture must be a failure");
-            if label == "session root does not exist" {
-                // The missing-root arm is the context's one refusal, verbatim
-                // — the sentence `resolve`, `glob` and `grep` print too.
-                assert_eq!(
-                    raw.content,
-                    ToolContext::new(&root).root_missing_error().to_string(),
-                    "{label}"
-                );
-                assert!(
-                    raw.content.contains("does not exist"),
-                    "{label}: {}",
-                    raw.content
-                );
-            }
+            assert_eq!(
+                raw.is_error,
+                label.starts_with("timed out") || label.starts_with("non-zero"),
+                "{label}: the fixture's exit status is not what the row says"
+            );
             assert!(
                 raw.measured.is_some(),
                 "{label}: a command that reached a shell always measures"
-            );
-            assert_eq!(
-                raw.measured == Some(0),
-                expected_calls == 0,
-                "{label}: the fixture is not on the side of 'captured nothing' the row says"
             );
             assert_eq!(
                 calls.load(Ordering::SeqCst),

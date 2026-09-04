@@ -50,6 +50,7 @@ use teton_protocol::events::{
     ProvenanceClass as WireProvenanceClass,
     SessionUpdate,
     SessionUpdatePayload,
+    ShellDutySkipped,
     ToolCallRepeated,
     ToolCallStatus,
     TurnRefusedAnchorsExceedBudget,
@@ -946,6 +947,22 @@ impl SessionEvents {
     /// keeping them, so there is nothing here that could carry a path a boundary
     /// covers or a command a user would not want on the bus (REQ-611 BR-4,
     /// LESSON-513).
+    /// Announce that a tool's duty declined to run, and why (REQ-617 BR-7).
+    ///
+    /// `reason` is a stable id authored in this tree (`failed_exit`,
+    /// `under_size_trigger`) rather than a sentence, so the client renders it and
+    /// two skips announced from different places are one fact in one vocabulary.
+    /// It is `&'static str` at the source, which is what keeps a model's output
+    /// structurally unable to reach this event.
+    pub fn shell_duty_skipped(&self, reason: &'static str) {
+        self.bus.publish(
+            Some(self.session_id.clone()),
+            Event::ShellDutySkipped(ShellDutySkipped {
+                reason: reason.to_owned(),
+            }),
+        );
+    }
+
     pub fn tool_call_repeated(&self, tool: &str, count: u32) {
         self.bus.publish(
             Some(self.session_id.clone()),
@@ -1985,6 +2002,7 @@ async fn run_the_allowed_tool(
     let RefinedOutcome {
         outcome,
         duty_error,
+        duty_skipped,
     } = tools
         .refine(name, arguments, request, duties, outcome)
         .await;
@@ -1993,6 +2011,15 @@ async fn run_the_allowed_tool(
             "tetond: the `{name}` tool's duty could not be served \
                  ({error}); folded its own unrefined result instead"
         );
+    }
+    // REQ-617 BR-7. A duty that declined is not a duty that failed, and the two
+    // are announced differently: the failure goes to stderr above because it is
+    // an operator's problem, and the skip goes on the bus because it is the
+    // *session's* — a reader watching a turn wants to know why a 40 KB result
+    // came back raw. The tool named the reason; this is the layer holding the
+    // session's event sink, so this is where it is said (REQ-572 ADR-4).
+    if let Some(reason) = duty_skipped {
+        events.shell_duty_skipped(reason);
     }
 
     // REQ-544 C-1: the result's egress provenance is the files

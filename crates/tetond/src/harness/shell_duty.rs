@@ -11,25 +11,43 @@
 //! `shell` is the highest-frequency tool call in a coding session: every `ls`,
 //! every `cargo check`, every `git status`. A duty that fired on all of them
 //! would put a model call behind every command the agent runs, which is a cost
-//! nobody asked for and a latency everybody would feel. So it fires on exactly
-//! the two results a weak model cannot read for itself (BR-4b) — and, in both
-//! cases, only when the command produced output to read:
+//! nobody asked for and a latency everybody would feel.
 //!
-//! - **the command failed** — a non-zero exit, or a command that started and
-//!   then did not come back cleanly. The output is a stack trace or a compiler
-//!   wall, and what the model needs out of it is one sentence: what broke.
-//! - **the output was capped** — the raw stdout+stderr ran past
-//!   [`SHELL_TRIGGER_OUTPUT_CHARS`], so the tool threw the rest away and what
-//!   entered context is a fragment of a thing. Interpretation is the only way to
-//!   recover what the fragment was part of.
+//! **Since REQ-617 BR-7 it fires on exactly one case**: a command that
+//! **succeeded** and whose raw stdout+stderr ran past
+//! [`SHELL_TRIGGER_OUTPUT_CHARS`], so the tool threw the rest away and what
+//! entered context is a fragment of a thing. Interpretation is the only way to
+//! recover what the fragment was part of.
 //!
-//! **A call that never reached a shell is not in either set.** A missing
-//! `command` argument or an unreachable session root produces a fixed harness
-//! sentence and no command line at all; those arms measure nothing
+//! ### The case that was removed, and what removing it cost
+//!
+//! Until REQ-617 there were **two** triggers, and the other one was named first
+//! here: *the command failed — the output is a stack trace or a compiler wall,
+//! and what the model needs out of it is one sentence: what broke.* That
+//! trigger is gone. A failed command now returns raw, whatever its size, and
+//! emits `shell_duty_skipped { reason: failed_exit }`.
+//!
+//! The trigger was removed because of what it did on the *small* end. A failed
+//! `cd /teton-code` — exit 1, eleven words of stderr — bought a model call whose
+//! answer began *"The command failed because the directory /teton-code does not
+//! exist on the system. The agent needs to either create this directory
+//! first…"*. The paraphrase was waste; the instruction was worse, and the model
+//! acted on it. [`shell_prompt`] no longer asks for it.
+//!
+//! The honest accounting is that BR-7 fixed a *size* problem with a *failure*
+//! rule, and the compiler wall went with it: a `cargo build` that fails with
+//! 40 KB of output is now uninterpreted, while the same command succeeding with
+//! 40 KB is not. REQ-617 OQ-3 is where that trade is revisited. It is written
+//! down here because a reader arriving at this module with REQ-561 in mind will
+//! otherwise assume the primary case still exists.
+//!
+//! **A call that never reached a shell is in neither set.** A missing `command`
+//! argument or an unreachable session root produces a fixed harness sentence and
+//! no command line at all; those arms measure nothing
 //! ([`ToolOutcome::measured`](super::tools::ToolOutcome)) and
-//! [`tools::shell`](super::tools::shell)'s `refine` returns before this
-//! module is consulted. Neither is a result with **no captured output**, for the
-//! same reason one step later — see [`worth_interpreting`].
+//! [`tools::shell`](super::tools::shell)'s `refine` returns before this module
+//! is consulted. Neither is a result with **no captured output**, for the same
+//! reason one step later — see [`worth_interpreting`].
 //!
 //! A short successful command is returned **verbatim, with no model call at
 //! all**. That negative case is the cost argument, and it is asserted by call
@@ -202,12 +220,51 @@ const SHELL_OUTPUT_PROMPT_MAX_BYTES: usize = 12_288;
 /// The gate costs nothing real: a command that failed with something to say has
 /// something to say, and the size arm is unaffected, since output past the cap
 /// is output.
+/// ## A failed command is never interpreted (REQ-617 BR-7)
+///
+/// This used to read `failed || raw > TRIGGER`, and the failure arm was the
+/// *primary* one — see the module doc, rewritten alongside this change.
+///
+/// **What went wrong.** A `cd /teton-code` that failed with one line of stderr
+/// (`No such file or directory`) came back prefixed *"[shell: The command failed
+/// because the directory /teton-code does not exist on the system. The agent
+/// needs to either create this directory first…]"*. Two defects in one result:
+/// a model call bought to paraphrase eleven legible words, and — worse — an
+/// instruction the harness never authorized. The model's next act was to try
+/// `shell: /init`.
+///
+/// The second defect is fixed in [`shell_prompt`], which no longer asks what the
+/// agent should do next. This gate fixes the first, and it is deliberately
+/// blunter than the defect required: BR-7 says a failed result is returned raw
+/// **whatever its size**.
+///
+/// **What that costs, stated rather than glossed.** A `cargo build` that fails
+/// with 40 KB of compiler output is now returned uninterpreted, while the same
+/// command *succeeding* with 40 KB is interpreted. That is REQ-561's headline
+/// case, deleted. The observed defect was about *size* — one line of stderr —
+/// and a size-only gate would have fixed it while keeping the compiler wall.
+/// REQ-617 chose the stricter rule and recorded the trade as its OQ-3; do not
+/// quietly widen this back without going through that question.
 #[must_use]
 pub const fn worth_interpreting(failed: bool, raw_output_chars: usize) -> bool {
     if raw_output_chars == 0 {
         return false;
     }
-    failed || raw_output_chars > SHELL_TRIGGER_OUTPUT_CHARS
+    !failed && raw_output_chars > SHELL_TRIGGER_OUTPUT_CHARS
+}
+
+/// Why [`worth_interpreting`] said no — the stable reason id a skip is announced
+/// under (REQ-617 BR-7).
+///
+/// Only meaningful when `worth_interpreting` returned `false` **and** there was
+/// output to read; a result the tool never measured does not reach this.
+#[must_use]
+pub const fn skip_reason(failed: bool) -> &'static str {
+    if failed {
+        "failed_exit"
+    } else {
+        "under_size_trigger"
+    }
 }
 
 /// The duty prompt: what was run, what came back, and what to answer with.
@@ -221,8 +278,8 @@ pub fn shell_prompt(command: &str, output: &str) -> String {
     let mut prompt = String::new();
     prompt.push_str(
         "Below is one shell command an agent ran in a repository, and the output it \
-         produced. Say what happened: whether it succeeded, what failed if anything, and \
-         what that means for what the agent should do next. ",
+         produced. Describe what the output shows. Do not tell the agent what to do \
+         next. ",
     );
     prompt.push_str(SHELL_OUTPUT_CONTRACT);
     prompt.push_str("\n\nCommand: ");
@@ -231,6 +288,43 @@ pub fn shell_prompt(command: &str, output: &str) -> String {
     prompt.push_str(&truncate_middle(output, SHELL_OUTPUT_PROMPT_MAX_BYTES));
     prompt
 }
+
+/// The command/output pairs REQ-617 AC-8 is checked against.
+///
+/// Two are the transcript's own — the failing `cd` whose one-line stderr was
+/// paraphrased into an instruction, and a compiler wall — and one is the
+/// ordinary capped success that is now the duty's only trigger. Real shapes
+/// rather than invented ones, because the property under test is what a model
+/// does with *this* prompt over *this* kind of material.
+///
+/// `pub` so the live check below can be run from outside this module on a
+/// machine that has the local model.
+#[cfg(test)]
+pub(crate) const REFERENCE_FIXTURES: &[(&str, &str)] = &[
+    (
+        "cd /teton-code",
+        "$ cd /teton-code\n(exit 1)\n[stderr] cd: /teton-code: No such file or directory\n",
+    ),
+    (
+        "cargo build",
+        "$ cargo build\n(exit 101)\n[stderr] error[E0308]: mismatched types\n  --> src/lib.rs:42:9\n   |\n42 |     let x: u32 = \"s\";\n   |            ---   ^^^ expected `u32`, found `&str`\n",
+    ),
+    (
+        "cargo test",
+        "$ cargo test\n(exit 0)\ntest result: ok. 4325 passed; 0 failed\n",
+    ),
+];
+
+/// The imperative forms AC-8 forbids in the duty's answer.
+///
+/// `the agent` is in the list and is the most useful member: the duty's answer
+/// is read *by* the agent, so a sentence that addresses it in the third person
+/// is one that has stopped describing the output and started issuing
+/// instructions. It is what the 2026-09-04 answer did — *"The agent needs to
+/// either create this directory first…"* — and it is the form a paraphrase is
+/// least likely to reach by accident.
+#[cfg(test)]
+pub(crate) const FORBIDDEN_IMPERATIVES: &[&str] = &["should", "needs to", "must", "the agent"];
 
 /// Interpret `output` through the resolved `shell` route.
 ///
@@ -304,11 +398,18 @@ mod tests {
 
     // -- the trigger (BR-4b, ADR-11) -----------------------------------------
 
-    /// **The trigger, stated once.** Both arms, and — the load-bearing half —
-    /// the case that costs nothing: a command that succeeded and stayed under
-    /// the cap.
+    /// **The trigger, stated once — one arm since REQ-617 BR-7.**
+    ///
+    /// This test used to assert `worth_interpreting(true, …)` on both sizes: a
+    /// failed command was the *primary* trigger. BR-7 removed it, so the two
+    /// lines that asserted it are now inverted rather than deleted — a removed
+    /// assertion says nothing, and an inverted one says the rule changed and
+    /// which way.
+    ///
+    /// The load-bearing half is unchanged and is the cost argument: a command
+    /// that succeeded and stayed under the cap buys nothing.
     #[test]
-    fn only_a_failure_or_a_capped_output_is_worth_interpreting() {
+    fn only_a_capped_output_of_a_successful_command_is_worth_interpreting() {
         assert!(
             !worth_interpreting(false, 12),
             "a short successful command must cost nothing"
@@ -317,9 +418,129 @@ mod tests {
             !worth_interpreting(false, SHELL_TRIGGER_OUTPUT_CHARS),
             "output that exactly fills the cap lost nothing, so it buys nothing"
         );
-        assert!(worth_interpreting(false, SHELL_TRIGGER_OUTPUT_CHARS + 1));
-        assert!(worth_interpreting(true, 12));
-        assert!(worth_interpreting(true, SHELL_TRIGGER_OUTPUT_CHARS + 1));
+        assert!(
+            worth_interpreting(false, SHELL_TRIGGER_OUTPUT_CHARS + 1),
+            "the one remaining trigger: a successful command whose output was cut"
+        );
+
+        // REQ-617 BR-7, and the pair is deliberate: neither size of failure is
+        // interpreted. The small one is the defect that prompted the rule (a
+        // one-line stderr paraphrased into an instruction); the large one is
+        // what the rule costs (a failing `cargo build`'s compiler wall, which
+        // REQ-561 existed to explain). Both are asserted so a reader sees the
+        // rule and its price in one place.
+        assert!(
+            !worth_interpreting(true, 12),
+            "a failed command with a line of stderr is legible as it stands"
+        );
+        assert!(
+            !worth_interpreting(true, SHELL_TRIGGER_OUTPUT_CHARS + 1),
+            "a failed command with a capped compiler wall is ALSO not \
+             interpreted — this is what BR-7 costs, and REQ-617 OQ-3 is where \
+             it is revisited. If this line is ever flipped back, flip the \
+             module doc and the OQ with it."
+        );
+    }
+
+    /// **AC-8, the half CI can run: the prompt does not authorize an
+    /// instruction.**
+    ///
+    /// AC-8 as written asserts on the duty's *answer* — that it contains none of
+    /// `should`, `needs to`, `must`, `the agent` on the reference fixtures. That
+    /// needs the shipped local model: a scripted engine's answer is whatever the
+    /// script says, so asserting the absence of imperatives in it would be
+    /// asserting a property of the fixture rather than of the product
+    /// (LESSON-569 — pick the double by what property you are asserting).
+    ///
+    /// So the blocking half is the **input** the answer comes from, which is
+    /// deterministic and is where the defect actually was. The 2026-09-04 answer
+    /// said *"The agent needs to either create this directory first…"* because
+    /// the prompt asked for *"what that means for what the agent should do
+    /// next"*. The harness authorized the imperative and was then surprised by
+    /// it (LESSON-570). This asserts the authorization is gone and the
+    /// prohibition is present, on every reference fixture.
+    ///
+    /// The live half — the answer itself, three of three on the shipped model —
+    /// is recorded in the REQ's verification notes as deferred to a machine with
+    /// weights, alongside AC-1(b). [`REFERENCE_FIXTURES`] and
+    /// [`FORBIDDEN_IMPERATIVES`] are `pub(crate)` so that check has the same
+    /// material to run against.
+    ///
+    /// # Mutations (both run, both red)
+    ///
+    /// 1. **Reverting [`shell_prompt`] to its pre-REQ-617 sentence** fails at
+    ///    the first fixture, on the *asks-for-none* assertion — the revert
+    ///    removes the prohibition as well as restoring the clause, so that is
+    ///    the assertion that reports first.
+    /// 2. **Appending `Also say what that means for what the agent should do
+    ///    next.` while keeping the prohibition** fails on the *AUTHORIZED*
+    ///    assertion, naming the fixture. This is the sharper of the two and the
+    ///    one worth having: it is the shape a well-meaning later edit would
+    ///    take, and mutation 1 alone would not have proved this assertion
+    ///    fires.
+    ///
+    /// Both fail at the first fixture rather than "at least one" — the prompt is
+    /// built identically for each, so the loop reports the first and stops.
+    /// Recorded as the observed behaviour rather than rounded to AC-8's wording.
+    #[test]
+    fn the_duty_prompt_forbids_an_instruction_and_asks_for_none() {
+        assert!(
+            !REFERENCE_FIXTURES.is_empty(),
+            "non-vacuity: an empty fixture set satisfies any absence claim"
+        );
+        for (command, output) in REFERENCE_FIXTURES {
+            let prompt = shell_prompt(command, output);
+            assert!(
+                prompt.contains("Describe what the output shows."),
+                "`{command}`: the prompt must say what it wants — a prohibition \
+                 with nothing in its place leaves a small model to guess"
+            );
+            assert!(
+                prompt.contains("Do not tell the agent what to do next."),
+                "`{command}`: the prohibition is missing, so nothing stops the \
+                 answer inventing an instruction (REQ-617 BR-7)"
+            );
+            assert!(
+                !prompt.contains("what the agent should do next"),
+                "`{command}`: the clause that AUTHORIZED the invented \
+                 instruction is back in the prompt. This is the exact sentence \
+                 that produced `The agent needs to either create this directory \
+                 first…` on a one-line stderr.\nprompt: {prompt}"
+            );
+        }
+    }
+
+    /// The forbidden list is not empty and names the form the defect took.
+    ///
+    /// Trivial, and it is the guard on the guard: a live check run against an
+    /// empty [`FORBIDDEN_IMPERATIVES`] would pass on any answer at all, and the
+    /// live check is the half no CI run will catch.
+    #[test]
+    fn the_forbidden_imperatives_include_the_form_the_defect_took() {
+        assert!(FORBIDDEN_IMPERATIVES.contains(&"the agent"));
+        assert!(FORBIDDEN_IMPERATIVES.contains(&"needs to"));
+        assert_eq!(FORBIDDEN_IMPERATIVES.len(), 4);
+
+        // And the recorded defect really does trip the list, so the list is
+        // known to be capable of catching the thing it was written for rather
+        // than merely plausible.
+        let recorded = "The command failed because the directory /teton-code does not \
+                        exist on the system. The agent needs to either create this \
+                        directory first.";
+        assert!(
+            FORBIDDEN_IMPERATIVES
+                .iter()
+                .any(|form| recorded.contains(form)),
+            "the 2026-09-04 answer must be caught by this list, or the list is \
+             guarding a different defect than the one it names"
+        );
+    }
+
+    /// The skip reason tells the two silences apart (REQ-617 BR-7).
+    #[test]
+    fn the_skip_reason_distinguishes_a_failure_from_a_short_result() {
+        assert_eq!(skip_reason(true), "failed_exit");
+        assert_eq!(skip_reason(false), "under_size_trigger");
     }
 
     /// The trigger is the tool's own cap, not a number beside it.
@@ -568,8 +789,14 @@ mod tests {
             .await
             .expect("with no boundary configured the duty sends");
         assert_eq!(said, "The tests failed to compile.");
+        // The needle moved with the sentence (REQ-617 BR-7): `Say what
+        // happened … and what that means for what the agent should do next` is
+        // the clause that authorized the invented instruction, so it is gone.
+        // Re-pointed rather than deleted — a needle deleted because the sentence
+        // it named changed leaves the "did the prompt reach the transport"
+        // question unasked.
         assert!(
-            wire(&sent).contains("Say what happened"),
+            wire(&sent).contains("Describe what the output shows"),
             "the duty prompt never reached the transport"
         );
     }

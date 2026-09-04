@@ -1,7 +1,7 @@
 ---
 id: TASK-005
 title: "The shell duty never interprets a failed command, and its prompt stops authorizing instructions"
-status: draft
+status: complete
 parent: REQ-617
 created: 2026-09-04
 updated: 2026-09-04

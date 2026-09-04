@@ -174,7 +174,14 @@ fn a_tainted_sessions_duties_never_reach_the_provider_they_are_bound_to() {
             "Rerouted locally; done.",
             "Let me look for the functions.\n{\"tool\": \"grep\", \"arguments\": {\"pattern\": \"fn \"}}",
             "Found them: {{LAST_TOOL_RESULT}}",
-            "Now check the build.\n{\"tool\": \"shell\", \"arguments\": {\"command\": \"ls /nonexistent-teton-path\"}}",
+            // REQ-617 BR-7 re-based this command. It was `ls
+            // /nonexistent-teton-path` — a *failure*, which used to be the
+            // `shell` duty's primary trigger and no longer fires it at all. A
+            // command that succeeds and prints past the tool's 8,000-character
+            // cap is the one trigger that remains, so it is what this turn runs.
+            // Left as a failure, the assertion below would have gone red on a
+            // duty that was correctly never asked to run.
+            "Now check the build.\n{\"tool\": \"shell\", \"arguments\": {\"command\": \"head -c 20000 /dev/zero | tr '\\\\0' 'x'\"}}",
             "Checked: {{LAST_TOOL_RESULT}}",
         ]
         .join("\n---\n"),
@@ -221,8 +228,9 @@ fn a_tainted_sessions_duties_never_reach_the_provider_they_are_bound_to() {
     );
     client.drain_events(Duration::from_millis(300));
 
-    // Turn 3: a failing command, so the `shell` duty fires too.
-    let third = client.prompt(&tainted, "Now check whether the build directory exists.");
+    // Turn 3: a command whose output overruns the tool's cap, so the `shell`
+    // duty fires too (REQ-617 BR-7 — a failure would not).
+    let third = client.prompt(&tainted, "Now print a lot of output.");
     assert_eq!(
         third["result"]["stop_reason"].as_str(),
         Some("end_turn"),
