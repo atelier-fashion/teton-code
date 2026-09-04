@@ -2,8 +2,8 @@
   "req": "REQ-616",
   "branch": "feat/REQ-616-local-engine-full-trained-window",
   "startedAt": "2026-09-04T19:34:00Z",
-  "completed": false,
-  "currentPhase": 7,
+  "completed": true,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
@@ -11,7 +11,9 @@
     3,
     4,
     5,
-    6
+    6,
+    7,
+    8
   ],
   "phaseHistory": [
     {
@@ -54,6 +56,12 @@
       "name": "Create PR",
       "completedAt": "2026-09-04T21:14:43Z",
       "note": "draft #290 flipped to ready; footprint block preserved"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup and Merge",
+      "completedAt": "2026-09-04T21:35:30Z",
+      "note": "PR #290 squash-merged as 394ce23; all 8 required checks green; worktree torn down"
     }
   ],
   "integrationBranch": "main",
@@ -66,10 +74,11 @@
       "touched": true,
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/290",
       "prNumber": 290,
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null,
-      "prCreatedAt": "2026-09-04T19:34:14Z"
+      "prCreatedAt": "2026-09-04T19:34:14Z",
+      "mergeCommit": "394ce23"
     }
   },
   "mergeOrder": [
