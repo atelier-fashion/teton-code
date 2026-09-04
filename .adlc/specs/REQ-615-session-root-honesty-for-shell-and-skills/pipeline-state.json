@@ -3,10 +3,25 @@
   "branch": "feat/REQ-615-session-root-honesty",
   "startedAt": "2026-09-04T00:00:00Z",
   "completed": false,
-  "currentPhase": 0,
-  "completedPhases": [],
+  "currentPhase": 2,
+  "completedPhases": [
+    0,
+    1
+  ],
   "integrationBranch": "main",
-  "phaseHistory": [],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree + Preflight",
+      "completedAt": "2026-09-04T19:34:08.663788Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-09-04T19:37:00.021477Z",
+      "result": "approved after 1 fix loop: 5 blockers, 2 warnings resolved"
+    }
+  ],
   "repos": {
     "teton-code": {
       "primary": true,
@@ -14,14 +29,17 @@
       "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-615",
       "branch": "feat/REQ-615-session-root-honesty",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/289",
+      "prNumber": 289,
       "merged": false,
       "snapshotBranch": null,
-      "snapshotPR": null
+      "snapshotPR": null,
+      "prCreatedAt": "2026-09-04T19:34:08.663684Z"
     }
   },
-  "mergeOrder": ["teton-code"],
+  "mergeOrder": [
+    "teton-code"
+  ],
   "phase4": {
     "currentTask": null,
     "completedTasks": [],
