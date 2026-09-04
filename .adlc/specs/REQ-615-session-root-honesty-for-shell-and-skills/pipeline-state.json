@@ -3,10 +3,12 @@
   "branch": "feat/REQ-615-session-root-honesty",
   "startedAt": "2026-09-04T00:00:00Z",
   "completed": false,
-  "currentPhase": 2,
+  "currentPhase": 4,
   "completedPhases": [
     0,
-    1
+    1,
+    2,
+    3
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -20,6 +22,18 @@
       "name": "Validate Spec",
       "completedAt": "2026-09-04T19:37:00.021477Z",
       "result": "approved after 1 fix loop: 5 blockers, 2 warnings resolved"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Tasks",
+      "completedAt": "2026-09-04T19:44:24.231974Z",
+      "result": "8 ADRs, 9 tasks"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-09-04T19:44:24.231974Z",
+      "result": "approved; advisory: AC-1 live-trial unmapped (no automatable artifact)"
     }
   ],
   "repos": {
