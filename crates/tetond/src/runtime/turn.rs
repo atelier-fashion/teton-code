@@ -3379,7 +3379,14 @@ impl DaemonRuntime {
             gate,
             invoker,
         } = tctx;
-        let mut tools = ToolRegistry::with_builtins();
+        // REQ-615 BR-4: the two write-capable built-ins report a refused write
+        // to the session that made it. Same emitter shape the projects tool
+        // takes below, carrying the sink so "an emitter without a sink is a
+        // test fixture" stays a rule with no exceptions (REQ-611).
+        let mut tools = ToolRegistry::with_builtins_reporting(Some(
+            SessionEvents::new(Arc::clone(events), session_id.clone())
+                .with_sink(self.transcript()),
+        ));
         if !self.mcp_servers.is_empty() {
             if let Ok(transport) = HttpTransport::new() {
                 let egress =

@@ -1,7 +1,7 @@
 ---
 id: TASK-004
 title: "The edit tool refuses a write under a non-project root"
-status: draft
+status: complete
 parent: REQ-615
 created: 2026-09-04
 updated: 2026-09-04

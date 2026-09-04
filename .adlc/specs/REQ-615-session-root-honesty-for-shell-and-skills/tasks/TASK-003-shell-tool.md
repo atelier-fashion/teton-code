@@ -1,7 +1,7 @@
 ---
 id: TASK-003
 title: "The shell tool states the cwd contract, notes a cd, and refuses a write"
-status: draft
+status: complete
 parent: REQ-615
 created: 2026-09-04
 updated: 2026-09-04

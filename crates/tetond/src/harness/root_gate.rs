@@ -216,6 +216,30 @@ pub(crate) fn split_top_level_or(command: &str) -> Option<(&str, &str)> {
     Some((primary.trim(), rest[2..].trim()))
 }
 
+/// The remedy every BR-4 refusal names, and the payload field the event
+/// carries — one spelling, so the sentence the model reads and the record a
+/// client renders cannot come to disagree.
+pub(crate) const WRITE_REMEDY: &str = "/cd <name>";
+
+/// The sentence a refused write gets (BR-4).
+///
+/// Composed **here**, at one site, rather than at each tool: the tools differ
+/// in what they were about to do and not in why they may not, and a message
+/// composed at each point of detection is how two surfaces come to word one
+/// rule two ways (architecture.md, LESSON-557).
+#[must_use]
+pub(crate) fn write_refusal(root_display: &str, kind: RootKind) -> String {
+    let place = match kind {
+        RootKind::FilesystemRoot => "the filesystem root",
+        _ => "your home folder",
+    };
+    format!(
+        "refused: this session's root is {root_display} ({place}), not a project, \
+         so nothing may be created here. Ask the user to run `{WRITE_REMEDY}` — \
+         only they can move the root."
+    )
+}
+
 /// BR-2's note for `command`, or `None` when it named no `cd` — or named one
 /// whose target *is* the session root.
 ///

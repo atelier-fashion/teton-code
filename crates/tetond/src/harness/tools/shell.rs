@@ -97,6 +97,7 @@ use super::{
     opt_str_arg, opt_u64_arg, str_arg, RefinedOutcome, Tool, ToolContext, ToolDuties, ToolOutcome,
 };
 use crate::harness::digest::tool_result_provenance;
+use crate::harness::root_gate;
 use crate::harness::shell_duty;
 
 /// The sentence appended to a timeout from a `home`/`filesystem_root` context
@@ -131,12 +132,18 @@ pub(crate) const MAX_OUTPUT_CHARS: usize = 8_000;
 pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
 /// Runs shell commands under a timeout, cwd jail, and composed environment.
-#[derive(Debug, Clone, Copy)]
+///
+/// No longer `Copy` since REQ-615: it carries an optional event emitter for
+/// BR-4's refusal record, following `ProjectsTool`'s shape exactly — optional
+/// because a tool built for a unit test has no bus, and a missing bus must mean
+/// "no record" rather than a panic.
 pub struct ShellTool {
     /// Timeout applied when the call does not specify one.
     default_timeout_ms: u64,
     /// Hard ceiling on any requested timeout.
     max_timeout_ms: u64,
+    /// Where REQ-615 BR-4's refusal record is published, when there is one.
+    events: Option<crate::harness::turn_loop::SessionEvents>,
 }
 
 impl Default for ShellTool {
@@ -144,6 +151,7 @@ impl Default for ShellTool {
         Self {
             default_timeout_ms: DEFAULT_TIMEOUT_MS,
             max_timeout_ms: 120_000,
+            events: None,
         }
     }
 }
@@ -156,7 +164,18 @@ impl ShellTool {
         Self {
             default_timeout_ms,
             max_timeout_ms,
+            events: None,
         }
+    }
+
+    /// The same tool reporting REQ-615 BR-4 refusals to `events`.
+    #[must_use]
+    pub fn with_events(
+        mut self,
+        events: Option<crate::harness::turn_loop::SessionEvents>,
+    ) -> Self {
+        self.events = events;
+        self
     }
 }
 
@@ -167,9 +186,19 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
+        // REQ-615 BR-1. The cwd sentence is **verbatim** and pinned by a
+        // prompt-margin test: LESSON-570's rule is that a prompt sentence must
+        // be true after the REQ ships, and this one is made true by the fresh
+        // child `run_bounded` spawns for every call. It lives beside the tool
+        // rather than only in the environment block because a small model
+        // transfers data reliably and a fact three paragraphs away unreliably
+        // (LESSON-532) — and because the fact the block states is exactly what
+        // a `cd … && pwd` result appears to contradict.
         "Run a shell command in the session root under a timeout. Use it to \
          verify changes (build, test, grep). Secrets in the environment are \
-         removed."
+         removed. Each command starts in the session root; `cd` inside a \
+         command does not carry to the next one. Only the user can move the \
+         root, with `/cd <path>` — say so instead of trying."
     }
 
     fn input_schema(&self) -> Value {
@@ -210,6 +239,33 @@ impl Tool for ShellTool {
             Err(_) => return ctx.root_missing_error().into(),
         };
 
+        // REQ-615 BR-4, and deliberately **here**: after the root is known and
+        // before `run_bounded` is reached, so a refused command has spawned no
+        // child at all. AC-3 asserts that by inspecting the artifact the
+        // command would have created, not by reading this error (LESSON-519).
+        //
+        // Like the two arms above it, the refusal carries no provenance and no
+        // measurement: nothing ran, so no bytes came off this machine and the
+        // `shell` duty must not be handed a harness sentence to interpret.
+        if root_gate::write_gate(&command, ctx.root_kind())
+            == root_gate::WriteVerdict::RefusedNonProject
+        {
+            if let Some(events) = self.events.as_ref() {
+                events.write_refused_non_project(
+                    teton_protocol::events::WriteRefusedNonProject {
+                        tool: "shell".to_owned(),
+                        root_display: ctx.root_display().to_owned(),
+                        root_kind: ctx.root_kind(),
+                        remedy: root_gate::WRITE_REMEDY.to_owned(),
+                    },
+                );
+            }
+            return ToolOutcome::error(root_gate::write_refusal(
+                ctx.root_display(),
+                ctx.root_kind(),
+            ));
+        }
+
         let timeout_ms = opt_u64_arg(args, "timeout_ms")
             .unwrap_or(self.default_timeout_ms)
             .min(self.max_timeout_ms);
@@ -238,8 +294,20 @@ impl Tool for ShellTool {
                 stdout,
                 stderr,
                 withheld,
-            } => render_output(&command, status, &stdout, &stderr, &withheld)
-                .with_unknown_provenance(),
+            } => render_output(
+                &command,
+                status,
+                &stdout,
+                &stderr,
+                &withheld,
+                root_gate::cd_note(
+                    &command,
+                    &root,
+                    ctx.root_display(),
+                    crate::session_root::home().as_deref(),
+                ),
+            )
+            .with_unknown_provenance(),
             // The third arm with no measurement and no provenance: nothing ran,
             // so nothing this machine holds is in the answer. The runner has
             // already phrased the reason.
@@ -774,6 +842,7 @@ fn render_output(
     stdout: &[u8],
     stderr: &[u8],
     withheld: &[&'static crate::child_env::WithheldVar],
+    cwd_note: Option<String>,
 ) -> ToolOutcome {
     let mut merged = String::new();
     let stdout = String::from_utf8_lossy(stdout);
@@ -814,8 +883,19 @@ fn render_output(
     } else {
         withheld_advisory(command, withheld)
     };
+    // REQ-615 BR-2. Beside the withheld advisory and for its reasons: it is
+    // harness-authored, it sits ahead of the body so command output cannot
+    // push it out, and it is **outside** `cap_output` so it does not count
+    // toward `raw_output_chars` — the length the `shell` duty's size trigger
+    // is decided on (REQ-561 ADR-5). A command that says `cd` must not become
+    // a command worth a model call just by saying it.
+    //
+    // Unlike the advisory, this is emitted whatever the exit status: a `cd`
+    // that failed still ran in the root, and the model that read `(exit 1)`
+    // needs the same fact as the one that read `(exit 0)`.
     let content = format!(
-        "{status_line}{}{body}",
+        "{status_line}{}{}{body}",
+        cwd_note.as_deref().unwrap_or_default(),
         advisory.as_deref().unwrap_or_default()
     );
 
@@ -856,6 +936,160 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// **REQ-615 BR-1 / AC-2: the description states the cwd contract.**
+    ///
+    /// Verbatim, because LESSON-570's rule is that a prompt sentence must be
+    /// true after the REQ ships and this one is the fact the whole REQ turns
+    /// on. The three clauses are asserted separately so a partial deletion is
+    /// named rather than reported as one opaque mismatch.
+    ///
+    /// Mutation: drop any clause from `ShellTool::description` — that row goes
+    /// red.
+    #[test]
+    fn the_description_states_the_cwd_contract() {
+        let docs = ShellTool::default().description().to_owned();
+        for (needle, fact) in [
+            (
+                "Each command starts in the session root",
+                "where a command begins",
+            ),
+            (
+                "`cd` inside a command does not carry to the next one",
+                "that the cwd does not persist",
+            ),
+            (
+                "Only the user can move the root, with `/cd <path>`",
+                "who may move it, and how",
+            ),
+            (
+                "say so instead of trying",
+                "the ending the model is given instead",
+            ),
+        ] {
+            assert!(
+                docs.contains(needle),
+                "the shell tool no longer states {fact} (`{needle}`), which is the \
+                 fact a `cd … && pwd` result appears to contradict:\n{docs}"
+            );
+        }
+    }
+
+    /// **REQ-615 BR-2 / AC-2: a `cd`-bearing command carries the cwd note, and
+    /// a command without one does not.**
+    ///
+    /// The benign half is the point. The note is on every `shell` result whose
+    /// command said `cd`, so a rule that fired on everything would put a line
+    /// on every tool result in every session.
+    ///
+    /// Mutation: return `Some(..)` unconditionally from `root_gate::cd_note` —
+    /// the `ls` row goes red. Drop the `cwd_note` argument from the format —
+    /// the `cd` row goes red.
+    #[test]
+    fn a_cd_bearing_command_carries_the_cwd_note() {
+        let root = temp_root("cdnote");
+        let ctx = ToolContext::new(&root);
+        let display = ctx.root_display().to_owned();
+
+        let noted = ShellTool::default().run(
+            &ctx,
+            &json!({ "command": "cd /tmp && pwd" }),
+        );
+        assert!(
+            noted.content.contains(&format!(
+                "[ran in {display}; the next command starts there again]"
+            )),
+            "a command that said `cd` must say where it actually ran:\n{}",
+            noted.content
+        );
+
+        let quiet = ShellTool::default().run(&ctx, &json!({ "command": "ls" }));
+        assert!(
+            !quiet.content.contains("the next command starts there again"),
+            "a command that said no `cd` earns no note:\n{}",
+            quiet.content
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **REQ-615 BR-2: the note is outside the cap and outside the duty's size
+    /// trigger.**
+    ///
+    /// `measured` is the length the command *actually produced*, and it is what
+    /// `shell_duty::worth_interpreting` decides on (REQ-561 ADR-5). A note
+    /// counted into it would make a command worth a model call just by saying
+    /// `cd` — a harness sentence buying inference, which is the exact shape
+    /// REQ-561's verify refused.
+    ///
+    /// Mutation: fold the note into `merged` before `cap_output` — the
+    /// `assert_eq!` on the two measurements goes red.
+    #[test]
+    fn the_cwd_note_is_outside_the_cap_and_the_duty_trigger() {
+        let root = temp_root("cdmeasure");
+        let ctx = ToolContext::new(&root);
+
+        let with_cd = ShellTool::default().run(&ctx, &json!({ "command": "cd . ; echo hello" }));
+        let without = ShellTool::default().run(&ctx, &json!({ "command": "echo hello" }));
+        assert_eq!(
+            with_cd.measured, without.measured,
+            "the note must not change the length the duty's trigger reads:\n{}\n{}",
+            with_cd.content, without.content
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **REQ-615 BR-4 / AC-3: a write at a home root is refused before any
+    /// child spawns — asserted by inspecting the artifact.**
+    ///
+    /// LESSON-519's rule, and AC-3's own instruction: the error text is what a
+    /// broken gate would also produce if it refused *after* spawning. The
+    /// directory the command would have created is the only witness that
+    /// nothing ran.
+    ///
+    /// The benign half runs the same `mkdir` from a `plain` root, where BR-4's
+    /// carve-out says it must still work — a gate that refused there would
+    /// break REQ-613's `TETON.md` write.
+    ///
+    /// Mutation: move the gate below `run_bounded`, or add `RootKind::Plain` to
+    /// `gates_writes` — the corresponding half goes red.
+    #[test]
+    fn a_write_at_a_home_root_is_refused_before_any_child_spawns() {
+        let root = temp_root("writegate");
+        let home = ToolContext::new(&root).with_root_kind(RootKind::Home);
+
+        let refused = ShellTool::default().run(
+            &home,
+            &json!({ "command": "mkdir -p .adlc/context" }),
+        );
+        assert!(refused.is_error, "{}", refused.content);
+        assert!(
+            !root.join(".adlc").exists(),
+            "the refusal must happen before the child, so `.adlc` cannot exist"
+        );
+        assert!(
+            refused.content.contains("/cd <name>"),
+            "the refusal names the remedy:\n{}",
+            refused.content
+        );
+        assert!(
+            refused.provenance == crate::harness::context::ToolProvenance::none()
+                && refused.measured.is_none(),
+            "nothing ran, so nothing came off this machine and the duty must \
+             not see it: {refused:?}"
+        );
+
+        let plain = ToolContext::new(&root).with_root_kind(RootKind::Plain);
+        let allowed = ShellTool::default().run(
+            &plain,
+            &json!({ "command": "mkdir -p scaffold/here" }),
+        );
+        assert!(!allowed.is_error, "{}", allowed.content);
+        assert!(
+            root.join("scaffold/here").exists(),
+            "a plain root is where a project is scaffolded (BR-4's carve-out)"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

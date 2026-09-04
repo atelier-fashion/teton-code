@@ -692,6 +692,12 @@ pub struct TurnOutcome {
 /// write in-process (LESSON-513). So they reach the sink from here, the type
 /// that already owns "this is session S's news", by the three `pub` methods
 /// below. They **publish nothing**.
+///
+/// `Clone` since REQ-615, because the two write-capable tools each hold one and
+/// the registry builds both from a single emitter. Cloning grants nothing new:
+/// all three fields are handles, and the runtime already constructs several
+/// independent emitters for one session.
+#[derive(Clone)]
 pub struct SessionEvents {
     bus: Arc<EventBus>,
     session_id: SessionId,
@@ -835,6 +841,21 @@ impl SessionEvents {
     pub fn project_match(&self, matched: teton_protocol::events::ProjectMatch) {
         self.bus
             .publish(Some(self.session_id.clone()), Event::ProjectMatch(matched));
+    }
+
+    /// Publish REQ-615 BR-4's refusal record.
+    ///
+    /// A narrow typed emitter for [`Self::project_match`]'s reason: session
+    /// attribution stays owned by this type, so no caller can report a refusal
+    /// against a session that did not make it.
+    pub fn write_refused_non_project(
+        &self,
+        refused: teton_protocol::events::WriteRefusedNonProject,
+    ) {
+        self.bus.publish(
+            Some(self.session_id.clone()),
+            Event::WriteRefusedNonProject(refused),
+        );
     }
 
     /// Announce that this turn ran out of `capability` (REQ-572 ADR-4).
