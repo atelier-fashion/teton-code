@@ -1,11 +1,11 @@
 ---
 id: TASK-388
 title: "Acceptance: egress capture for excluded evidence, the walk and routing matrices, and the end-to-end legs"
-status: draft
+status: complete
 parent: REQ-613
 repo: teton-code
 created: 2026-09-03
-updated: 2026-09-03
+updated: 2026-09-04
 dependencies: [TASK-386, TASK-387]
 ---
 
