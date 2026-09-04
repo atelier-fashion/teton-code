@@ -27,7 +27,7 @@ use crate::harness::context::{
 use crate::harness::reply::prose_before_tool_call;
 use crate::harness::turn_loop::{append_repo_context, HarnessConfig};
 use crate::repo_context::RepoContextBlock;
-use crate::runtime::{context_is_sensitive, taint_pin_line, SessionTaint, TAINT_BY_CONTEXT};
+use crate::runtime::{context_taint_cause, taint_pin_line, SessionTaint, TAINT_BY_CONTEXT};
 use crate::sessions::SessionRegistry;
 
 /// One turn's [`ContextManager`], plus the promise to write what it holds back
@@ -515,8 +515,15 @@ impl CarriedTurn {
         // runs from `Drop`, and a panic raised inside a drop that is itself
         // unwinding aborts the daemon. A poisoned taint mutex and a closed
         // stderr are both survivable; neither is worth the whole process.
-        if context_is_sensitive(&ctx, &self.boundaries) && self.taint.try_mark(&self.session_id) {
-            let _ = writeln!(std::io::stderr(), "{}", taint_pin_line(TAINT_BY_CONTEXT));
+        // REQ-614: the cause travels with the decision. `context_taint_cause`
+        // is the same derivation `context_taint_cause` is now the `is_some()`
+        // of, so this seam cannot disagree with the egress sink about why a
+        // session was pinned — and a `shell` result of unknown reach records
+        // `unknown_shell`, the one cause `/shell allow` can lift.
+        if let Some(cause) = context_taint_cause(&ctx, &self.boundaries) {
+            if self.taint.try_mark(&self.session_id, cause) {
+                let _ = writeln!(std::io::stderr(), "{}", taint_pin_line(TAINT_BY_CONTEXT));
+            }
         }
         // BR-4, at the seam that makes it an invariant of the store rather than
         // of the last writer. Unconditional and ahead of the trim, for the same

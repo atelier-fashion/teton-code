@@ -294,6 +294,14 @@ impl Tool for ShellTool {
             shell_provenance::VerdictKind::Rooted => {
                 ToolProvenance::Sources(verdict.sources.clone())
             }
+            // An **in-root** boundary path carries its own minted id, so the
+            // result reports it as a source and egress blocks naming the actual
+            // file — a `read` of `.env` and a `cat .env` produce the same
+            // `privacy_block`. The sentinel variant is for the out-of-root case
+            // alone, where no id exists for a glob to match (ADR-614-3).
+            shell_provenance::VerdictKind::BoundaryTouch if !verdict.sources.is_empty() => {
+                ToolProvenance::Sources(verdict.sources.clone())
+            }
             shell_provenance::VerdictKind::BoundaryTouch => ToolProvenance::BoundaryTouch,
             shell_provenance::VerdictKind::Unknown => ToolProvenance::Unknown,
         };
@@ -1234,11 +1242,24 @@ mod tests {
         let ctx = project_ctx(&root);
         let opaque = ShellTool::default().run(&ctx, &json!({ "command": "echo $(ls)" }));
         assert_eq!(opaque.provenance, ToolProvenance::Unknown);
+        // An **in-root** boundary path rides the existing machinery: the result
+        // names the real file, and egress blocks on the glob exactly as it does
+        // for a `read` of it. `ToolProvenance::BoundaryTouch` is reserved for
+        // the out-of-root case, where no id exists for a glob to match.
         let boundary = ShellTool::default().run(&ctx, &json!({ "command": "cat .env" }));
-        assert_eq!(boundary.provenance, ToolProvenance::BoundaryTouch);
-        // And both fail closed identically at egress (ADR-614-3).
+        let ToolProvenance::Sources(ids) = &boundary.provenance else {
+            panic!(
+                "expected Sources for an in-root boundary, got {:?}",
+                boundary.provenance
+            );
+        };
+        assert_eq!(
+            ids.iter().map(|i| i.as_str()).collect::<Vec<_>>(),
+            vec![".env"]
+        );
+        // Both fail closed at egress; the unknown one names no path at all.
         assert!(crate::harness::digest::tool_result_provenance(&opaque.provenance).is_unknown());
-        assert!(crate::harness::digest::tool_result_provenance(&boundary.provenance).is_unknown());
+        assert!(!crate::harness::digest::tool_result_provenance(&boundary.provenance).is_empty());
         std::fs::remove_dir_all(&root).ok();
     }
 

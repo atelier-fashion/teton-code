@@ -951,7 +951,13 @@ pub fn context_provenance(ctx: &ContextManager) -> Provenance {
             dropped.sources().clone(),
         )));
     }
-    if dropped.is_unknown() {
+    // REQ-614: the more specific reading first, so a forgotten boundary touch
+    // keeps its permanence. `is_boundary_touch` implies `is_unknown`, and both
+    // map to a blocking provenance — only the reported path differs, and that
+    // path is what decides whether `/shell allow` can lift the pin.
+    if dropped.is_boundary_touch() {
+        prov.merge(&tool_result_provenance(&ToolProvenance::BoundaryTouch));
+    } else if dropped.is_unknown() {
         prov.merge(&tool_result_provenance(&ToolProvenance::Unknown));
     }
     prov

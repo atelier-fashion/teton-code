@@ -42,6 +42,23 @@ pub const UNKNOWN_PROVENANCE_PATH: &str = "<unknown-provenance>";
 /// instead, sanitized, where it is labelled as the untrusted claim it is.
 pub const MALFORMED_PROVENANCE_PATH: &str = "<malformed-provenance>";
 
+/// The sentinel "path" reported when a `shell` command named a file that
+/// matches a `local-only` boundary but lies **outside** the session root
+/// (REQ-614 AC-5).
+///
+/// A third sentinel rather than reuse of [`UNKNOWN_PROVENANCE_PATH`], because
+/// the two mean different things to the *pin*: an unknown-provenance block
+/// taints the session liftably (`/shell allow`), and a boundary touch taints it
+/// permanently. Folding them would make `~/.ssh/config` liftable, which BR-3
+/// forbids.
+///
+/// It is a sentinel rather than the real path for the reason the other two are:
+/// `PrivacyBlock::path` is consumed as a repo-relative path, and an absolute
+/// path outside the root is not one — and printing the user's home directory
+/// layout into an event is a disclosure the block does not need to make. The
+/// *class* is what the user needs, and the remedy sentence says the rest.
+pub const BOUNDARY_TOUCH_PATH: &str = "<boundary-touch>";
+
 /// Byte cap on the source text carried by a `provenance_rejected` event.
 ///
 /// A source is chosen by whoever asserted it — a remote MCP server can send
@@ -121,6 +138,14 @@ pub struct Provenance {
     sources: BTreeSet<ProvenanceId>,
     /// Some contributing content had indeterminate origin: block fail-closed.
     unknown: bool,
+    /// Some contributing content named a boundary file the source set cannot
+    /// hold — a path outside the session root, which mints no `ProvenanceId`
+    /// for a glob to match (REQ-614, LESSON-623).
+    ///
+    /// Blocks exactly as [`Self::unknown`] does; the bit exists so the block
+    /// reports [`BOUNDARY_TOUCH_PATH`] instead, which is what tells the taint
+    /// machinery the pin is permanent rather than liftable.
+    boundary_touch: bool,
 }
 
 impl Provenance {
@@ -132,6 +157,7 @@ impl Provenance {
         Self {
             sources: BTreeSet::new(),
             unknown: false,
+            boundary_touch: false,
         }
     }
 
@@ -143,6 +169,7 @@ impl Provenance {
         Self {
             sources,
             unknown: false,
+            boundary_touch: false,
         }
     }
 
@@ -156,7 +183,29 @@ impl Provenance {
         Self {
             sources: BTreeSet::new(),
             unknown: true,
+            boundary_touch: false,
         }
+    }
+
+    /// Provenance for content a `shell` command derived from a boundary file
+    /// **outside** the session root (REQ-614 AC-5).
+    ///
+    /// Also unknown — the daemon cannot say what else the command read — so it
+    /// fail-closes on the same arm. What the extra bit buys is the pin's cause.
+    #[must_use]
+    pub fn boundary_touch() -> Self {
+        Self {
+            sources: BTreeSet::new(),
+            unknown: true,
+            boundary_touch: true,
+        }
+    }
+
+    /// Whether some contributing content touched a boundary the source set
+    /// cannot name.
+    #[must_use]
+    pub fn is_boundary_touch(&self) -> bool {
+        self.boundary_touch
     }
 
     /// Mark this provenance as carrying content of indeterminate origin.
@@ -213,6 +262,9 @@ impl Provenance {
             self.sources.insert(s.clone());
         }
         self.unknown |= other.unknown;
+        // Monotonic for the same reason `unknown` is: a union that folded a
+        // boundary-touching contributor is boundary-touching.
+        self.boundary_touch |= other.boundary_touch;
     }
 
     /// Consume two provenances into their union.

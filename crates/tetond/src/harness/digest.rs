@@ -109,7 +109,8 @@ pub fn tool_result_provenance(provenance: &ToolProvenance) -> Provenance {
         // liftable), never in what egress does with the block — which is what
         // makes BR-2's "the narrowing removes nothing from the existing
         // refusal" true by construction rather than by argument.
-        ToolProvenance::Unknown | ToolProvenance::BoundaryTouch => Provenance::unknown(),
+        ToolProvenance::Unknown => Provenance::unknown(),
+        ToolProvenance::BoundaryTouch => Provenance::boundary_touch(),
     }
 }
 

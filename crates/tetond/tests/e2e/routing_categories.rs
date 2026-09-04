@@ -844,7 +844,7 @@ fn a_tainted_session_is_served_on_device_and_never_reaches_the_tiers_fallback() 
     // shape the local-first pitch invites.
     config.push_str(&tier_block_with_fallback("think", "local", "backup"));
     // A boundary must exist for the taint backstop to arm at all
-    // (`context_is_sensitive` returns false with none configured) — which is
+    // (`context_taint_cause` returns false with none configured) — which is
     // itself worth knowing: there is no state in which a session is tainted by
     // unknown provenance and egress would have let that same content through.
     config.push_str("[[boundaries]]\npath_glob = \"secrets/**\"\nmode = \"local-only\"\n\n");

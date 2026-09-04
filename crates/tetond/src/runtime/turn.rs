@@ -1652,7 +1652,28 @@ impl DaemonRuntime {
                 // Read as one value rather than asked twice — a block with no
                 // detail is not a block (see `HarnessError::privacy_block_detail`).
                 if let Some(detail) = err.privacy_block_detail() {
-                    if taints_the_session(detail) && self.session_taint.mark(tctx.core.session_id) {
+                    // REQ-614: a **backstop** cause, and permanent on purpose.
+                    // The egress sink has already marked this session with the
+                    // cause read off the block's path — it runs at the choke
+                    // point, inside the transport call whose error this arm is
+                    // handling — and `mark` keeps the first cause. So this value
+                    // is only reachable if that ordering ever stopped holding,
+                    // and the fail-closed direction there is a pin the user
+                    // cannot lift rather than one they can lift wrongly.
+                    // `BlockDetail` is `Copy` and carries no path, so the
+                    // unknown/boundary distinction is not available here at all
+                    // (conventions.md: a refusal message cannot ride a `Copy`
+                    // enum). AC-3's end-to-end lift test is what would catch a
+                    // regression in the ordering.
+                    let backstop = match detail {
+                        BlockDetail::Redaction => TaintCause::RedactionFinding,
+                        BlockDetail::Boundary | BlockDetail::ScanUnavailable => {
+                            TaintCause::BoundaryHit
+                        }
+                    };
+                    if taints_the_session(detail)
+                        && self.session_taint.mark(tctx.core.session_id, backstop)
+                    {
                         eprintln!("{}", taint_pin_line(taint_detail_word(detail)));
                     }
                     if !self.engine.present() {
@@ -3389,8 +3410,13 @@ impl DaemonRuntime {
         core_phase: Option<CorePhase>,
         prompt: &str,
     ) -> crate::router::Route {
-        if self.session_taint.is_tainted(session_id) {
-            return router.resolve_local_pin(taint_pin_reason("this turn"));
+        // REQ-614 ADR-614-4: `RoutePin`, not the raw taint bit. The lift is
+        // honored here and at the six duty routes by the predicate rather than
+        // by a conjunction repeated seven times.
+        if let Some(cause) = self.route_pin().cause(session_id) {
+            if self.route_pin().pins(session_id) {
+                return router.resolve_local_pin(taint_pin_reason_for("this turn", cause));
+            }
         }
 
         match mode {

@@ -119,6 +119,11 @@ pub(crate) struct Verdict {
     pub(crate) sources: BTreeSet<ProvenanceId>,
     /// Why this verdict was reached. `&'static str`, so it cannot carry command
     /// text or file content (see the module docs).
+    ///
+    /// Read by this module's tests today; TASK-396 renders it into the standing
+    /// pin line, which is the only reason it is a sentence rather than a bare
+    /// discriminant. The allow goes with that wiring.
+    #[allow(dead_code)]
     pub(crate) reason: &'static str,
 }
 
@@ -126,14 +131,6 @@ impl Verdict {
     fn unknown(reason: &'static str) -> Self {
         Self {
             kind: VerdictKind::Unknown,
-            sources: BTreeSet::new(),
-            reason,
-        }
-    }
-
-    fn boundary(reason: &'static str) -> Self {
-        Self {
-            kind: VerdictKind::BoundaryTouch,
             sources: BTreeSet::new(),
             reason,
         }
@@ -301,7 +298,7 @@ fn classify_with_budget(
     let matcher = match BoundaryMatcher::new(boundaries) {
         Ok(m) => m,
         // A boundary set that does not compile is the fail-closed case
-        // `context_is_sensitive` already treats as sensitive.
+        // `context_taint_cause` already treats as sensitive.
         Err(_) => return Verdict::unknown("the configured boundary set does not compile"),
     };
 
@@ -328,7 +325,11 @@ fn classify_with_budget(
                 // names a protected file and does something opaque must pin
                 // permanently rather than liftably.
                 if saw_boundary {
-                    return Verdict::boundary("a path argument matches a privacy boundary");
+                    return Verdict {
+                        kind: VerdictKind::BoundaryTouch,
+                        sources,
+                        reason: "a path argument matches a privacy boundary",
+                    };
                 }
                 return Verdict::unknown(reason);
             }
@@ -336,7 +337,15 @@ fn classify_with_budget(
     }
 
     if saw_boundary {
-        return Verdict::boundary("a path argument matches a privacy boundary");
+        return Verdict {
+            kind: VerdictKind::BoundaryTouch,
+            // Non-empty when the boundary path was **in-root**: the caller maps
+            // that to `Sources`, so the block names the file. Empty for an
+            // out-of-root touch, which is what `ToolProvenance::BoundaryTouch`
+            // is for.
+            sources,
+            reason: "a path argument matches a privacy boundary",
+        };
     }
     Verdict {
         kind: VerdictKind::Rooted,
@@ -454,6 +463,14 @@ fn classify_segment(
             Resolved::InsideRoot(abs, id) => {
                 if matcher.match_path(id.as_str()).is_some() {
                     saw_boundary = true;
+                    // Keep the id. An **in-root** boundary path mints a real
+                    // `ProvenanceId`, so the tool reports it as `Sources` and
+                    // egress blocks naming the actual file — exactly what a
+                    // `read` of it does, with no new machinery and a better
+                    // event than a sentinel. `ToolProvenance::BoundaryTouch`
+                    // exists only for the out-of-root case, where there is no
+                    // id for a glob to match (ADR-614-3, LESSON-623).
+                    sources.insert(id);
                     continue;
                 }
                 if abs.is_dir() {

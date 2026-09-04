@@ -53,8 +53,12 @@ impl DaemonRuntime {
     /// sits **behind** the literal, not in front of it.
     pub(super) fn digest_route(&self, dctx: DutyContext<'_>) -> DutyRoute {
         let (router, session_id) = (dctx.core.router, dctx.core.session_id);
-        let route = if self.session_taint.is_tainted(session_id) {
-            router.resolve_local_pin(taint_pin_reason("the `digest` duty"))
+        let route = if self.route_pin().pins(session_id) {
+            router.resolve_local_pin(taint_pin_reason_for_session(
+                self,
+                session_id,
+                "the `digest` duty",
+            ))
         } else {
             router.resolve(Category::Digest)
         };
@@ -77,8 +81,12 @@ impl DaemonRuntime {
     /// the turn.
     pub(super) fn triage_route(&self, dctx: DutyContext<'_>) -> DutyRoute {
         let (router, session_id) = (dctx.core.router, dctx.core.session_id);
-        let route = if self.session_taint.is_tainted(session_id) {
-            router.resolve_local_pin(taint_pin_reason("the `triage` duty"))
+        let route = if self.route_pin().pins(session_id) {
+            router.resolve_local_pin(taint_pin_reason_for_session(
+                self,
+                session_id,
+                "the `triage` duty",
+            ))
         } else {
             router.resolve(Category::Triage)
         };
@@ -101,8 +109,12 @@ impl DaemonRuntime {
     /// see [`crate::harness::shell_duty`].
     pub(super) fn shell_route(&self, dctx: DutyContext<'_>) -> DutyRoute {
         let (router, session_id) = (dctx.core.router, dctx.core.session_id);
-        let route = if self.session_taint.is_tainted(session_id) {
-            router.resolve_local_pin(taint_pin_reason("the `shell` duty"))
+        let route = if self.route_pin().pins(session_id) {
+            router.resolve_local_pin(taint_pin_reason_for_session(
+                self,
+                session_id,
+                "the `shell` duty",
+            ))
         } else {
             router.resolve(Category::Shell)
         };
@@ -128,8 +140,12 @@ impl DaemonRuntime {
     /// metered by the shared seam like any other duty.
     pub(super) fn title_route(&self, dctx: DutyContext<'_>) -> DutyRoute {
         let (router, session_id) = (dctx.core.router, dctx.core.session_id);
-        let route = if self.session_taint.is_tainted(session_id) {
-            router.resolve_local_pin(taint_pin_reason("the `title` duty"))
+        let route = if self.route_pin().pins(session_id) {
+            router.resolve_local_pin(taint_pin_reason_for_session(
+                self,
+                session_id,
+                "the `title` duty",
+            ))
         } else {
             router.resolve(Category::Title)
         };
@@ -153,8 +169,12 @@ impl DaemonRuntime {
     /// not at all, while the turn proceeds either way.
     pub(super) fn compact_route(&self, dctx: DutyContext<'_>) -> DutyRoute {
         let (router, session_id) = (dctx.core.router, dctx.core.session_id);
-        let route = if self.session_taint.is_tainted(session_id) {
-            router.resolve_local_pin(taint_pin_reason("the `compact` duty"))
+        let route = if self.route_pin().pins(session_id) {
+            router.resolve_local_pin(taint_pin_reason_for_session(
+                self,
+                session_id,
+                "the `compact` duty",
+            ))
         } else {
             router.resolve(Category::Compact)
         };
@@ -205,8 +225,12 @@ impl DaemonRuntime {
     /// for the name).
     pub(super) fn draft_route(&self, dctx: DutyContext<'_>) -> DraftPlan {
         let (router, session_id) = (dctx.core.router, dctx.core.session_id);
-        let route = if self.session_taint.is_tainted(session_id) {
-            router.resolve_local_pin(taint_pin_reason("the `draft` duty"))
+        let route = if self.route_pin().pins(session_id) {
+            router.resolve_local_pin(taint_pin_reason_for_session(
+                self,
+                session_id,
+                "the `draft` duty",
+            ))
         } else {
             router.resolve(Category::Draft)
         };
@@ -820,7 +844,7 @@ mod dispatch {
     /// site degrades by its own means, and the turn completes. Today the
     /// session is tainted anyway — but only *incidentally*, because the
     /// content that got the duty refused is still in `ctx` when the turn
-    /// ends and `context_is_sensitive` reads it there. That cover depends on
+    /// ends and `context_taint_cause` reads it there. That cover depends on
     /// truncation and compaction not having dropped it, which both are
     /// entitled to do. This makes it direct.
     ///
@@ -1330,7 +1354,9 @@ mod dispatch {
         let runtime = runtime(config(), &engine, true);
         let router = router_for(&runtime);
         let session = SessionId::from("tainted");
-        runtime.session_taint.mark(&session);
+        runtime
+            .session_taint
+            .mark(&session, TaintCause::BoundaryHit);
 
         let route = runtime
             .dispatch_route(
@@ -1403,7 +1429,9 @@ mod dispatch {
             let runtime = runtime(config.clone(), &engine, true);
             let router = router_for(&runtime);
             let session = SessionId::from("tainted");
-            runtime.session_taint.mark(&session);
+            runtime
+                .session_taint
+                .mark(&session, TaintCause::BoundaryHit);
 
             let route = runtime
                 .dispatch_route(&router, &session, SessionMode::Freeform, None, "anything")
@@ -1549,7 +1577,9 @@ mod dispatch {
                 Some("frontier")
             );
 
-            runtime.session_taint.mark(&session);
+            runtime
+                .session_taint
+                .mark(&session, TaintCause::BoundaryHit);
             assert_eq!(
                 digest_for(&runtime, &session).provider(),
                 Some(LOCAL_PROVIDER_ID),
@@ -1817,7 +1847,9 @@ mod dispatch {
                 Some("frontier")
             );
 
-            runtime.session_taint.mark(&session);
+            runtime
+                .session_taint
+                .mark(&session, TaintCause::BoundaryHit);
             assert_eq!(
                 triage_for(&runtime, &session).provider(),
                 Some(LOCAL_PROVIDER_ID),
@@ -1933,7 +1965,9 @@ mod dispatch {
                 Some("cheap")
             );
 
-            runtime.session_taint.mark(&session);
+            runtime
+                .session_taint
+                .mark(&session, TaintCause::BoundaryHit);
             assert_eq!(
                 shell_for(&runtime, &session).provider(),
                 Some(LOCAL_PROVIDER_ID),
@@ -2316,7 +2350,9 @@ mod dispatch {
                 Some("frontier")
             );
 
-            runtime.session_taint.mark(&session);
+            runtime
+                .session_taint
+                .mark(&session, TaintCause::BoundaryHit);
             let route = title_for(&runtime, &session);
             assert_eq!(
                 route.provider(),
@@ -2899,7 +2935,9 @@ mod dispatch {
                 Some("frontier")
             );
 
-            runtime.session_taint.mark(&session);
+            runtime
+                .session_taint
+                .mark(&session, TaintCause::BoundaryHit);
             assert_eq!(
                 compact_for(&runtime, &bus, &session).provider(),
                 LOCAL_PROVIDER_ID.into(),
@@ -3206,7 +3244,9 @@ mod dispatch {
             let runtime = runtime(opted_in(reflex_bound_to("frontier")), &engine, true);
             let clean = SessionId::from("clean");
             let tainted = SessionId::from("tainted");
-            runtime.session_taint.mark(&tainted);
+            runtime
+                .session_taint
+                .mark(&tainted, TaintCause::BoundaryHit);
 
             let config = runtime.config.lock().expect("config mutex").clone();
             let router = build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
@@ -4199,7 +4239,7 @@ mod dispatch {
         /// Same runtime shape as the test above, same entry point; what
         /// changes is that an engine is loaded (so the scan runs) and the
         /// prompt carries a pattern-shaped credential (so it finds one).
-        /// The config declares no boundaries, so `context_is_sensitive`
+        /// The config declares no boundaries, so `context_taint_cause`
         /// cannot be what marked it.
         #[tokio::test]
         async fn a_redaction_block_does_pin_the_session() {
@@ -4216,7 +4256,7 @@ mod dispatch {
                     .expect("config mutex")
                     .boundaries
                     .is_empty(),
-                "no boundaries, so `context_is_sensitive` cannot be what pins"
+                "no boundaries, so `context_taint_cause` cannot be what pins"
             );
             let events = Arc::new(EventBus::new());
             let sessions = SessionRegistry::new();

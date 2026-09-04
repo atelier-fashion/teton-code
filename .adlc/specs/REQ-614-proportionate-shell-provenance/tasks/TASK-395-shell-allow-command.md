@@ -29,6 +29,8 @@ nothing but a user typing it can invoke it.
 - [ ] AC-7: `/shell allow` appearing inside a skill body, a `TETON.md`, or a tool result is inert — the session stays pinned and `all_shell_overrides()` is **empty**. Assert the absence, not the remedy (LESSON-550)
 - [ ] The handler reaches `ShellTaintOverride::lift` from the one call site the private setter permits; a `skill` tool call named `shell allow` finds no such tool
 
+- [ ] The `#[allow(dead_code)]` on `ShellTaintOverride::lift` (added in TASK-392, naming this task) is **removed** — the RPC handler is its production caller
+
 ## Verification
 
 | rule | kind | artifact | benign_path |

@@ -716,7 +716,7 @@ struct SessionProbe {
     turn_blocked: bool,
     privacy_blocks: usize,
     /// The commit pinned the session to the local tier (REQ-544 C-2, evaluated
-    /// by `runtime::context_is_sensitive` inside [`CarriedTurn`]).
+    /// by `runtime::context_taint_cause` inside [`CarriedTurn`]).
     pinned: bool,
     /// A later **model-composed** `web_fetch` in the same session, and the
     /// lookup transport's call count once it has been answered.
@@ -742,7 +742,7 @@ async fn probe_spelling(repo: &std::path::Path, path_arg: &str) -> (SessionProbe
         .session_id;
     let taint = Arc::new(SessionTaint::new());
 
-    // The real commit protocol. `runtime::context_is_sensitive` is crate-private
+    // The real commit protocol. `runtime::context_taint_cause` is crate-private
     // and `CarriedTurn` is the only path to it an integration test has — which
     // is also the only path production has.
     let mut turn = CarriedTurn::begin(
@@ -882,7 +882,7 @@ fn assert_no_boundary_bytes(captured: &[Vec<u8>]) {
 /// This test verifies that *existing* behavior is now **reached**; it adds no
 /// new behavior. The local-tier pin and the model-composed web refusal it
 /// asserts were both delivered by **BUG-156** (resolved), and REQ-571 does not
-/// touch either: `context_is_sensitive` and the lookup taint gate are unchanged.
+/// touch either: `context_taint_cause` and the lookup taint gate are unchanged.
 /// What changed is that this spelling gets there. Before TASK-119 the `read`
 /// tagged the result with `/abs/root/secrets/prod.env` verbatim, `secrets/**`
 /// matched nothing, and every assertion below was false for this spelling while

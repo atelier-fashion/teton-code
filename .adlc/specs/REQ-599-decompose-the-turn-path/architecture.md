@@ -251,8 +251,8 @@ table, which do not move.
 | `turn.rs` | 3,705 | **REQ-600.** `run_prompt_turn` and the fifteen methods only it reaches — the god-impl slice REQ-599 deferred as its step 8 |
 | `engine.rs` | 1,351 | probe, installer, engine loaders, `EngineSlot`, `StagedEngines` |
 | `config_document.rs` | 888 | rendering and persisting the config document |
-| `duty.rs` | 632 | the five `*_route` resolvers, `resolve_duty`, `spawn_title_session`, `RedactionGateImpl` |
-| `taint.rs` | 535 | `SessionTaint`, the lookup seam, `TaintingPrivacySink` |
+| `duty.rs` | 721 | the five `*_route` resolvers, `resolve_duty`, `spawn_title_session`, `RedactionGateImpl` |
+| `taint.rs` | 752 | `SessionTaint` and its `TaintCause`, `WebTaintOverride` / `ShellTaintOverride`, `RoutePin`, the lookup seam, `TaintingPrivacySink` |
 | `views.rs` | 574 | `config/get`'s snapshot and the web-setup views |
 | `session.rs` | 478 | **REQ-603.** `session/clear`, `session/set_cwd`, and the root a session stands on — the slice REQ-599 planned as its step 7 and deferred |
 | `provider.rs` | 410 | transport, credentials, connection probe |

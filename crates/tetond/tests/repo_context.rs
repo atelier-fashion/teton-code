@@ -500,7 +500,7 @@ impl Harness {
         let files = CountingFiles::new();
         // The shipped boundary set is off: none of its thirteen globs names
         // `TETON.md`, but a `read` tool result under a non-empty set is judged
-        // by `context_is_sensitive` on every turn, and a runtime with no local
+        // by `context_taint_cause` on every turn, and a runtime with no local
         // tier answers a pin with a refusal. The one test whose subject *is* a
         // boundary declares its own row (`with_boundary`).
         let runtime = Arc::new(

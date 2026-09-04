@@ -32,6 +32,8 @@ for a liftable pin.
 - [ ] `teton doctor` and `/doctor` show, for a live session, whether it is pinned, the cause, and whether a lift exists (AC-10)
 - [ ] Benign path: an unpinned session prints no standing line and its doctor output says not pinned
 
+- [ ] The `#[allow(dead_code)]` on `shell_provenance::Verdict::reason` (added in TASK-392, naming this task) is **removed** — the standing pin line renders it
+
 ## Verification
 
 | rule | kind | artifact | benign_path |

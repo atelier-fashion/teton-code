@@ -1,7 +1,7 @@
 ---
 id: TASK-392
 title: "Taint gains a cause, the lift gains a type, and the route predicate is composed once"
-status: draft
+status: complete
 parent: REQ-614
 created: 2026-09-04
 updated: 2026-09-04

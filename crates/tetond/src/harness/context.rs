@@ -315,6 +315,14 @@ pub struct DroppedProvenance {
     /// carries the same pair, and collapsing them here would drop the named
     /// files from a context that also holds a `shell` result.
     unknown: bool,
+    /// Whether any forgotten block carried [`ToolProvenance::BoundaryTouch`].
+    ///
+    /// Beside `unknown` for the same reason `unknown` is beside `sources`: a
+    /// boundary touch is also unknown, and folding the two would downgrade a
+    /// **permanent** pin to a liftable one the moment the block that caused it
+    /// was compacted away. A multi-seam invariant needs the fact at every seam;
+    /// carried state sheds it silently on the round trip (LESSON-501/502).
+    boundary_touch: bool,
 }
 
 impl DroppedProvenance {
@@ -337,12 +345,14 @@ impl DroppedProvenance {
         match provenance {
             Provenance::Tool { provenance, .. } => match provenance {
                 ToolProvenance::Sources(paths) => self.sources.extend(paths.iter().cloned()),
-                // REQ-614: a boundary touch folds exactly as an unknown does.
-                // The accumulator's job is "may this leave the machine", and the
-                // answer is no for both; which of them *pinned* the session, and
-                // whether that pin lifts, is decided at the tool seam and lives
-                // on `SessionTaint`, not here.
-                ToolProvenance::Unknown | ToolProvenance::BoundaryTouch => self.unknown = true,
+                // REQ-614: both block, so both set `unknown` — but a boundary
+                // touch additionally records *why*, because the pin it produces
+                // is permanent and an unknown's is liftable.
+                ToolProvenance::Unknown => self.unknown = true,
+                ToolProvenance::BoundaryTouch => {
+                    self.unknown = true;
+                    self.boundary_touch = true;
+                }
             },
             Provenance::User { sources, unknown } => {
                 self.sources.extend(sources.iter().cloned());
@@ -357,6 +367,7 @@ impl DroppedProvenance {
     pub fn merge(&mut self, other: &Self) {
         self.sources.extend(other.sources.iter().cloned());
         self.unknown |= other.unknown;
+        self.boundary_touch |= other.boundary_touch;
     }
 
     /// The identities forgotten blocks touched.
@@ -369,6 +380,13 @@ impl DroppedProvenance {
     #[must_use]
     pub fn is_unknown(&self) -> bool {
         self.unknown
+    }
+
+    /// Whether a forgotten block named a boundary file outside the session root
+    /// (REQ-614). Implies [`Self::is_unknown`].
+    #[must_use]
+    pub fn is_boundary_touch(&self) -> bool {
+        self.boundary_touch
     }
 
     /// Whether anything with egress provenance has been forgotten at all.
@@ -2230,14 +2248,21 @@ impl ContextManager {
         }
         let mut sources = BTreeSet::new();
         let mut unknown = false;
+        let mut boundary_touch = false;
         for block in &self.blocks {
             match &block.provenance {
                 Provenance::Tool { provenance, .. } => match provenance {
                     ToolProvenance::Sources(paths) => sources.extend(paths.iter().cloned()),
                     // REQ-614, same reading as `absorb` above: a summary that
                     // folded a boundary-touching block must be at least as
-                    // restrictive as the block was.
-                    ToolProvenance::Unknown | ToolProvenance::BoundaryTouch => unknown = true,
+                    // restrictive as the block was — and must stay *permanent*,
+                    // or compaction would quietly make a `~/.ssh/config` pin
+                    // liftable.
+                    ToolProvenance::Unknown => unknown = true,
+                    ToolProvenance::BoundaryTouch => {
+                        unknown = true;
+                        boundary_touch = true;
+                    }
                 },
                 // **The fourth seam** (REQ-585 verify). ADR-9 named three places
                 // that had to learn a user block can carry file provenance —
@@ -2292,7 +2317,9 @@ impl ContextManager {
             ),
             provenance: Provenance::Tool {
                 tool: COMPACT_SUMMARY_TOOL.to_owned(),
-                provenance: if unknown {
+                provenance: if boundary_touch {
+                    ToolProvenance::BoundaryTouch
+                } else if unknown {
                     ToolProvenance::Unknown
                 } else {
                     ToolProvenance::Sources(sources)

@@ -249,7 +249,9 @@ use config_document::*;
 use duty::*;
 pub use engine::test_seams_enabled;
 pub(crate) use engine::*;
-pub use taint::{SessionTaint, SessionTaintView, WebTaintOverride};
+pub use taint::{
+    RoutePin, SessionTaint, SessionTaintView, ShellTaintOverride, TaintCause, WebTaintOverride,
+};
 pub use views::BoundaryPosture;
 
 /// Separator between reply blocks in a `TETON_LOCAL_SCRIPT` file.
@@ -2205,6 +2207,11 @@ pub struct DaemonRuntime {
     /// the turn is running on, while the `web/override` RPC writes it from the
     /// server's reader loop.
     web_override: Arc<WebTaintOverride>,
+    /// Per-session lift of a **liftable** taint pin — `/shell allow` (REQ-614).
+    ///
+    /// Beside `web_override` rather than folded into it: the two lift different
+    /// restrictions and a single flag would let one command undo the other's.
+    shell_override: Arc<ShellTaintOverride>,
     /// Per-session sets of the URLs the **user** pasted (REQ-563 BR-3).
     ///
     /// Session-scoped and in memory only, like the permission grants and the
@@ -2381,6 +2388,7 @@ impl DaemonRuntime {
             effort_refusals: Arc::new(EffortRefusals::new()),
             window_rejections: Arc::new(ObservedWindowRejections::new()),
             web_override: Arc::new(WebTaintOverride::new()),
+            shell_override: Arc::new(ShellTaintOverride::new()),
             session_user_urls: Mutex::new(HashMap::new()),
             session_gates: Mutex::new(HashMap::new()),
             // A minimal runtime has no state directory. It also has an empty
@@ -2493,7 +2501,7 @@ impl DaemonRuntime {
     /// a test whose subject is **not** privacy.
     ///
     /// It exists because the default set has a second-order reach that is easy
-    /// to mistake for a broken harness. `context_is_sensitive` short-circuits on
+    /// to mistake for a broken harness. `context_taint_cause` short-circuits on
     /// an empty boundary list; with the builtin set always present that
     /// short-circuit is gone, so REQ-585's *unpinnable* provenance — a user
     /// skill outside the session root, or any content a skill's command
@@ -2741,6 +2749,7 @@ impl DaemonRuntime {
             effort_refusals: Arc::new(EffortRefusals::new()),
             window_rejections: Arc::new(ObservedWindowRejections::new()),
             web_override: Arc::new(WebTaintOverride::new()),
+            shell_override: Arc::new(ShellTaintOverride::new()),
             session_user_urls: Mutex::new(HashMap::new()),
             session_gates: Mutex::new(HashMap::new()),
             data_dir: base_dir.to_path_buf(),
@@ -4160,6 +4169,20 @@ impl DaemonRuntime {
     /// through [`Self::web_override`], which is what makes "a model cannot lift
     /// its own restriction" a fact about the type system rather than a rule.
     #[must_use]
+    /// The one predicate every route asks about taint (REQ-614 ADR-614-4).
+    ///
+    /// Composed here rather than at each call site so the lift is honored by
+    /// construction at all seven of them.
+    pub fn route_pin(&self) -> RoutePin {
+        RoutePin::new(self.session_taint.clone(), self.shell_override.clone())
+    }
+
+    /// The lift set, for the `shell/override` handler and `/doctor`.
+    #[must_use]
+    pub fn shell_override(&self) -> Arc<ShellTaintOverride> {
+        self.shell_override.clone()
+    }
+
     pub fn session_taint(&self) -> Arc<SessionTaint> {
         Arc::clone(&self.session_taint)
     }
@@ -6994,7 +7017,7 @@ fn unserved_turn_sentence(route: &crate::router::Route, classified: RpcError) ->
 ///
 /// It used to read *"session previously touched local-only content"*, which was
 /// true when [`SessionTaint`] had one source. It now has four: a turn whose
-/// context intersects a boundary ([`context_is_sensitive`]), a turn refused at
+/// context intersects a boundary ([`context_taint_cause`]), a turn refused at
 /// the choke point, a **duty** refused there, and an **MCP tool call** refused
 /// by the redaction scan ([`TaintingPrivacySink`] for the last two) — and the
 /// last three include REQ-562's redaction blocks, where no boundary was touched
@@ -7007,11 +7030,47 @@ fn unserved_turn_sentence(route: &crate::router::Route, classified: RpcError) ->
 /// sentence could name it exactly, is a per-session reason store bought for one
 /// clause; this is the smaller honest change, and the block that caused the
 /// taint already reported itself precisely on its own surfaces.
-fn taint_pin_reason(what: &str) -> String {
-    format!(
-        "an earlier privacy decision in this session; {what} is pinned to the local tier \
-         (BR-1 backstop)"
+/// [`taint_pin_reason_for`] with the cause looked up from the runtime — the
+/// spelling the seven pinned-route sites share (REQ-614 BR-4, ADR-614-4).
+///
+/// A session reaching a pinned route always has a cause; `BoundaryHit` is the
+/// fail-closed reading if it somehow does not, because a sentence that offered
+/// `/shell allow` for a pin that will not lift is worse than one that offers
+/// nothing.
+fn taint_pin_reason_for_session(
+    runtime: &DaemonRuntime,
+    session_id: &SessionId,
+    what: &str,
+) -> String {
+    taint_pin_reason_for(
+        what,
+        runtime
+            .route_pin()
+            .cause(session_id)
+            .unwrap_or(TaintCause::BoundaryHit),
     )
+}
+
+/// The same reason, naming the **cause** and — when one exists — the remedy
+/// (REQ-614 BR-4).
+///
+/// One composer with two arms rather than two sentences in two places, which is
+/// what keeps the liftable arm from inheriting the permanent arm's claim as the
+/// wording drifts (LESSON-557).
+fn taint_pin_reason_for(what: &str, cause: TaintCause) -> String {
+    if cause.liftable() {
+        format!(
+            "pinned to the local tier because a shell result of unknown reach entered this \
+             session's context; {what} is served locally. `/shell allow` lifts it if you know \
+             the command touched no protected file"
+        )
+    } else {
+        format!(
+            "an earlier privacy decision in this session ({}); {what} is pinned to the local \
+             tier for the rest of the session and no command lifts it",
+            cause.as_str()
+        )
+    }
 }
 
 /// What refused this turn at the egress choke point, as a clause the three
@@ -7025,7 +7084,7 @@ fn taint_pin_reason(what: &str) -> String {
 /// places for the scan-unavailable wording to drift into claiming a finding,
 /// which is exactly the untruth BR-3 forbids. The cause is worded **once**,
 /// here, and the situation is what varies — the same shape, and for the same
-/// reason, as [`taint_pin_reason`] directly above.
+/// reason, as [`taint_pin_reason_for`] directly above.
 ///
 /// ## The rule these clauses exist to keep
 ///
@@ -7824,7 +7883,7 @@ fn expansion_provenance(sources: &BTreeSet<ProvenanceId>, unknown: bool) -> Prov
 /// the others would withhold.
 ///
 /// An uncompilable set reads **nothing** and makes nothing resident, which is
-/// the direction [`context_is_sensitive`] already fails in (`Err(_) => true`).
+/// the direction [`context_taint_cause`] already fails in (`Err(_) => true`).
 /// The state is `Absent` rather than a withheld one because the daemon has not
 /// opened a file and cannot name which of the two candidates is there — and
 /// `Config::validate` refuses an invalid glob at load and at `config/set`, so
@@ -8055,17 +8114,43 @@ fn repo_context_reason(state: &RepoContextState) -> Option<String> {
 /// With no boundaries configured, nothing is sensitive — there is nothing to
 /// protect. Boundaries that fail to compile fail-closed (treated as sensitive),
 /// the same posture the egress choke point takes.
-pub(crate) fn context_is_sensitive(ctx: &ContextManager, boundaries: &[PrivacyBoundary]) -> bool {
+///
+/// **Was `context_taint_cause`**, which answered the same question with a
+/// `bool`. REQ-614 needs the *cause* — one of them is liftable — and keeping
+/// both would have been two derivations that could disagree about the same
+/// context. The predicate is now `context_taint_cause(..).is_some()`, written
+/// at the one call site that wants it.
+///
+/// The cause comes from the blocked violation's **path**, exactly as the egress
+/// sink's `cause_of` reads it, because that is the only place the
+/// unknown/boundary distinction survives inspection.
+pub(crate) fn context_taint_cause(
+    ctx: &ContextManager,
+    boundaries: &[PrivacyBoundary],
+) -> Option<TaintCause> {
+    use crate::egress::provenance::{MALFORMED_PROVENANCE_PATH, UNKNOWN_PROVENANCE_PATH};
+    use crate::egress::Inspection;
     if boundaries.is_empty() {
-        return false;
+        return None;
     }
     let provenance = context_provenance(ctx);
     if provenance.is_empty() {
-        return false;
+        return None;
     }
-    match BoundaryMatcher::new(boundaries) {
-        Ok(matcher) => inspect(&provenance, &matcher, PrivacyAction::ReroutedToLocal).is_blocked(),
-        Err(_) => true,
+    let matcher = match BoundaryMatcher::new(boundaries) {
+        Ok(matcher) => matcher,
+        // A boundary set that does not compile is the fail-closed case, and
+        // "malformed" is the honest cause: nothing was matched, so no boundary
+        // is known to have been crossed — and it must not be liftable.
+        Err(_) => return Some(TaintCause::MalformedProvenance),
+    };
+    match inspect(&provenance, &matcher, PrivacyAction::ReroutedToLocal) {
+        Inspection::Allowed => None,
+        Inspection::Blocked(violation) => Some(match violation.path.as_str() {
+            UNKNOWN_PROVENANCE_PATH => TaintCause::UnknownShell,
+            MALFORMED_PROVENANCE_PATH => TaintCause::MalformedProvenance,
+            _ => TaintCause::BoundaryHit,
+        }),
     }
 }
 
@@ -10076,8 +10161,27 @@ provider_id = "on-device"
     /// daemon stayed local has to work out whether they mean the same thing.
     #[test]
     fn both_taint_pin_sentences_share_one_cause_and_name_their_own_subject() {
-        let turn = taint_pin_reason("this turn");
-        let duty = taint_pin_reason("the `digest` duty");
+        // REQ-614: the composer now takes the cause, and the sentence differs by
+        // it — a liftable pin names its remedy, a permanent one says no command
+        // lifts it. The property this test has always guarded is unchanged:
+        // both call sites go through ONE composer, and only the subject differs.
+        let turn = taint_pin_reason_for("this turn", TaintCause::BoundaryHit);
+        let duty = taint_pin_reason_for("the `digest` duty", TaintCause::BoundaryHit);
+
+        // The two arms must not be confusable, and neither may make the other's
+        // claim: a permanent pin that offered `/shell allow` would send the user
+        // to a command that refuses them, and a liftable pin that said "for the
+        // rest of the session" would be false.
+        let liftable = taint_pin_reason_for("this turn", TaintCause::UnknownShell);
+        assert!(liftable.contains("/shell allow"), "{liftable}");
+        assert!(
+            !liftable.contains("rest of the session"),
+            "a liftable pin must not claim permanence: {liftable}"
+        );
+        assert!(
+            !turn.contains("/shell allow"),
+            "a permanent pin must not offer a remedy that refuses it: {turn}"
+        );
 
         // The shared half: the cause, and the rule it comes from.
         for sentence in [&turn, &duty] {
@@ -10089,7 +10193,6 @@ provider_id = "on-device"
                 sentence.contains("pinned to the local tier"),
                 "and what was done about it: {sentence}"
             );
-            assert!(sentence.contains("BR-1 backstop"), "{sentence}");
             // **REQ-562: and it must not name a cause it cannot know.** The pin
             // is now reachable from a redaction block, where no `local-only`
             // file was read and no boundary was crossed. The wording this
@@ -10109,7 +10212,7 @@ provider_id = "on-device"
         assert_ne!(turn, duty);
 
         // The TURN call site, through the real function. Asserting only that
-        // `taint_pin_reason` returns a good sentence says nothing about whether
+        // `taint_pin_reason_for` returns a good sentence says nothing about whether
         // anyone calls it, so re-inlining a literal in `dispatch_route` would
         // leave a helper-only test green.
         let engine = crate::classify::test_support::CountingEngine::answering("edit");
@@ -10133,7 +10236,9 @@ provider_id = "on-device"
         let config = runtime.config.lock().expect("config mutex").clone();
         let router = build_router(&config, true, &BTreeMap::new());
         let session = SessionId::from("tainted");
-        runtime.session_taint.mark(&session);
+        runtime
+            .session_taint
+            .mark(&session, TaintCause::BoundaryHit);
 
         let turn_route = futures::executor::block_on(runtime.dispatch_route(
             &router,
@@ -10736,8 +10841,8 @@ provider_id = "on-device"
         let taint = SessionTaint::new();
         let s = SessionId::from("s1");
         assert!(!taint.is_tainted(&s));
-        taint.mark(&s);
-        taint.mark(&s); // idempotent
+        taint.mark(&s, TaintCause::BoundaryHit);
+        taint.mark(&s, TaintCause::BoundaryHit); // idempotent
         assert!(taint.is_tainted(&s));
         assert!(!taint.is_tainted(&SessionId::from("other")));
     }
@@ -10766,13 +10871,16 @@ provider_id = "on-device"
     fn a_session_announces_its_pin_once_and_the_line_names_the_cause_only() {
         let taint = SessionTaint::new();
         let s = SessionId::from("s1");
-        assert!(taint.mark(&s), "the first mark is the transition");
         assert!(
-            !taint.mark(&s),
+            taint.mark(&s, TaintCause::BoundaryHit),
+            "the first mark is the transition"
+        );
+        assert!(
+            !taint.mark(&s, TaintCause::BoundaryHit),
             "a re-mark owes no second line: one pin, one announcement"
         );
         assert!(
-            taint.mark(&SessionId::from("other")),
+            taint.mark(&SessionId::from("other"), TaintCause::BoundaryHit),
             "and the announcement is per session, not per daemon"
         );
 
@@ -10814,20 +10922,20 @@ provider_id = "on-device"
         // A read of a boundary file taints (REQ-544 C-2).
         let mut ctx = ContextManager::new("sys", 10_000);
         ctx.push_tool_result("read", Some(fixture_id("secrets/prod.env")), "API_KEY=1");
-        assert!(context_is_sensitive(&ctx, &boundaries));
+        assert!(context_taint_cause(&ctx, &boundaries).is_some());
 
         // An unknown-provenance shell result taints even with no boundary path.
         let mut ctx_shell = ContextManager::new("sys", 10_000);
         ctx_shell.push_tool_result_prov("shell", ToolProvenance::Unknown, "cmd output");
-        assert!(context_is_sensitive(&ctx_shell, &boundaries));
+        assert!(context_taint_cause(&ctx_shell, &boundaries).is_some());
 
         // A public-only context does not taint.
         let mut ctx_public = ContextManager::new("sys", 10_000);
         ctx_public.push_tool_result("read", Some(fixture_id("src/lib.rs")), "code");
-        assert!(!context_is_sensitive(&ctx_public, &boundaries));
+        assert!(!context_taint_cause(&ctx_public, &boundaries).is_some());
 
         // With no boundaries configured, nothing is sensitive.
-        assert!(!context_is_sensitive(&ctx, &[]));
+        assert!(!context_taint_cause(&ctx, &[]).is_some());
     }
 
     // --- REQ-544 M-3: endpoint-bound credential injection ------------------
@@ -11832,7 +11940,9 @@ provider_id = "on-device"
             assert!(set.changed);
 
             // A `shell` result of unknown provenance taints the session.
-            runtime.session_taint.mark(&session);
+            runtime
+                .session_taint
+                .mark(&session, TaintCause::BoundaryHit);
             assert!(runtime.session_taint.is_tainted(&session));
 
             let config = runtime.config.lock().expect("config mutex").clone();
@@ -11841,9 +11951,12 @@ provider_id = "on-device"
                 .dispatch_route(&router, &session, SessionMode::Freeform, None, "anything")
                 .await;
 
+            // REQ-614: the expected sentence now carries the pin's cause. The
+            // claim is unchanged — `full` does not unpin a tainted session — and
+            // the fixture taints with `BoundaryHit`, so this is the permanent arm.
             assert_eq!(
                 route.reason,
-                taint_pin_reason("this turn"),
+                taint_pin_reason_for("this turn", TaintCause::BoundaryHit),
                 "a tainted session must still be pinned to the local tier at `full` — \
              the permission level governs which tools may run, never what leaves \
              the machine (REQ-560 BR-3)"
@@ -11865,7 +11978,7 @@ provider_id = "on-device"
                 .await;
             assert_ne!(
                 clean_route.reason,
-                taint_pin_reason("this turn"),
+                taint_pin_reason_for("this turn", TaintCause::BoundaryHit),
                 "an untainted session must not be pinned, or this test proves nothing"
             );
         }
@@ -17830,7 +17943,9 @@ provider_id = \"deepseek\"
                 "the fixture must start clean, or the assertion after the clear \
                  is about a pin that was always there"
             );
-            runtime.session_taint.mark(&session_id);
+            runtime
+                .session_taint
+                .mark(&session_id, TaintCause::BoundaryHit);
 
             // …and a grant the user gave once, for the session. Earned through a
             // real prompt, which is the non-vacuity leg: the gate demonstrably
