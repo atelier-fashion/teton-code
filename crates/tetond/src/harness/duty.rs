@@ -452,7 +452,7 @@ pub const DUTY_REQUEST_BYTES_PER_TOKEN: usize = 2;
 /// answer it with a 400 rather than with a shorter completion. 4,096 is at or
 /// under every supported provider's cap and still well above what any duty
 /// realistically writes.
-const DUTY_MAX_TOKENS_REQUEST: u32 = 4_096;
+pub(crate) const DUTY_MAX_TOKENS_REQUEST: u32 = 4_096;
 
 /// How long a single duty call may take before the harness stops waiting.
 ///

@@ -140,7 +140,12 @@ pub(crate) const REDACT_PROMPT_BUDGET_BYTES: usize =
 /// budget is clamped to what the scan can actually read.
 #[must_use]
 pub(crate) const fn redact_prompt_budget_bytes(n_ctx: u32) -> usize {
-    (n_ctx as usize - REDACT_DUTY.max_tokens() as usize) * DUTY_BYTES_PER_TOKEN
+    // Saturating, for the reason `compact_prompt_budget_bytes` is: `n_ctx` is a
+    // runtime value since REQ-616, and a window below the duty's generation
+    // reservation underflowed.
+    (n_ctx as usize)
+        .saturating_sub(REDACT_DUTY.max_tokens() as usize)
+        .saturating_mul(DUTY_BYTES_PER_TOKEN)
 }
 
 /// The largest payload the redactor will hand to a **single** model call, in

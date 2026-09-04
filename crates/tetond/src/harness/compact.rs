@@ -224,8 +224,16 @@ pub const COMPACT_PROMPT_BUDGET_BYTES: usize =
 /// local window exactly as the redact chain does.
 #[must_use]
 pub const fn compact_prompt_budget_bytes(n_ctx: u32) -> usize {
-    (n_ctx as usize - COMPACT_DUTY.max_tokens() as usize) * DUTY_REQUEST_BYTES_PER_TOKEN
-        - CHATML_DUTY_ENVELOPE_BYTES
+    // Saturating, because `n_ctx` is a **runtime** value since REQ-616 and both
+    // subtractions underflow below it: `COMPACT_DUTY.max_tokens()` is 4,096, so
+    // a window under that wrapped to an enormous budget in release and panicked
+    // in debug. Reachable through `[inference] n_ctx`, which is also refused
+    // below the floor now — this is the second of the two guards, and it is the
+    // one that holds if a future caller finds another way in.
+    (n_ctx as usize)
+        .saturating_sub(COMPACT_DUTY.max_tokens() as usize)
+        .saturating_mul(DUTY_REQUEST_BYTES_PER_TOKEN)
+        .saturating_sub(CHATML_DUTY_ENVELOPE_BYTES)
 }
 
 /// The compact duty's output contract, verbatim: the last sentence of the

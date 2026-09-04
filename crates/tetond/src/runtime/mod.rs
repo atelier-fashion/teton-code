@@ -8163,6 +8163,30 @@ fn refuse_unusable_inference(
             ));
         }
     }
+    // A window that cannot hold the daemon's own duties is not a small window,
+    // it is an unusable one. Below `DUTY_MAX_TOKENS_REQUEST` every duty's prompt
+    // budget is zero (they reserve that many tokens for their own reply), so the
+    // redact scan, the compactor and the summarizer each get nothing to work
+    // with — and until this check existed, `compact_prompt_budget_bytes` reached
+    // its subtraction with a smaller number and wrapped.
+    //
+    // The floor is arithmetic rather than taste: it is the largest generation
+    // reservation any duty asks for, read from the constant rather than
+    // restated, so a duty that raises its reservation raises this with it.
+    if let Some(requested) = n_ctx {
+        let floor = crate::harness::duty::DUTY_MAX_TOKENS_REQUEST;
+        if requested <= floor {
+            return Err(RpcError::new(
+                error_code::CONFIG_REJECTED,
+                format!(
+                    "`[inference] n_ctx = {requested}` is below the {floor} tokens the daemon's \
+                     own duties reserve for their replies, so the redact scan, the compactor and \
+                     the summarizer would each have no prompt budget at all. Set it above \
+                     {floor}. Nothing was changed."
+                ),
+            ));
+        }
+    }
     let (Some(requested), Some(trained)) = (n_ctx, trained_window) else {
         return Ok(());
     };
@@ -8556,13 +8580,78 @@ mod inference_config_tests {
         assert!(refuse_unusable_inference(None, None, Some(TRAINED)).is_ok());
     }
 
+    /// A window below the daemon's own duty reservations is refused, and the two
+    /// window-derived byte budgets are **total** even if it were not.
+    ///
+    /// # The defect this pair of guards closes (found in Phase 5 review)
+    ///
+    /// `[inference] n_ctx` had no lower bound. `n_ctx = 512` passed validation
+    /// (512 ≤ 262,144), `fit_window` returned `Fits { n_ctx: 512 }`, and
+    /// `compact_prompt_budget_bytes(512)` then computed `512 − 4_096` — which
+    /// panicked in debug and **wrapped to an enormous budget in release**. The
+    /// release behaviour is the dangerous one: a compactor believing it had
+    /// 18 exabytes of prompt budget would have sent the engine everything.
+    ///
+    /// Two guards, deliberately, because they fail differently. The refusal is
+    /// the one a user sees and the one that keeps the value out; the saturating
+    /// arithmetic is what holds if some future caller reaches those functions by
+    /// another route (a `model/set` path, a test fixture, a default that
+    /// changes). A single guard here would have been the "one enforcement point
+    /// for an invariant with several" shape `conventions.md` warns about.
+    #[test]
+    fn a_window_below_the_duty_reservations_is_refused() {
+        let floor = crate::harness::duty::DUTY_MAX_TOKENS_REQUEST;
+        for tiny in [1u32, 512, floor - 1, floor] {
+            let err = refuse_unusable_inference(Some(tiny), None, Some(TRAINED))
+                .expect_err("a window below the duty reservations must be refused");
+            let msg = err.to_string();
+            assert!(msg.contains(&floor.to_string()), "names the floor: {msg}");
+            assert!(msg.contains("Nothing was changed"), "{msg}");
+        }
+
+        // Benign path: one token above the floor is accepted. The boundary is
+        // asserted from both sides so an off-by-one cannot hide.
+        assert!(refuse_unusable_inference(Some(floor + 1), None, Some(TRAINED)).is_ok());
+        assert!(refuse_unusable_inference(Some(65_536), None, Some(TRAINED)).is_ok());
+    }
+
+    /// The window-derived byte budgets are **total**: no window, however small,
+    /// makes them wrap or panic.
+    ///
+    /// Mutation: restore either `saturating_sub` to a plain `-` and this panics
+    /// in debug — which is how the defect was found.
+    #[test]
+    fn window_derived_budgets_are_total_at_every_window() {
+        for n_ctx in [0u32, 1, 512, 4_095, 4_096, 4_097, 32_768, 262_144, u32::MAX] {
+            let compact = crate::harness::compact::compact_prompt_budget_bytes(n_ctx);
+            let redact = crate::egress::redact::redact_prompt_budget_bytes(n_ctx);
+            // Saturating, not wrapping: a tiny window yields a tiny budget, and
+            // never an enormous one.
+            if n_ctx <= 4_096 {
+                assert_eq!(
+                    compact, 0,
+                    "a window at or below the reservation buys nothing"
+                );
+            }
+            assert!(
+                compact < usize::MAX / 2 && redact < usize::MAX / 2,
+                "n_ctx={n_ctx} wrapped: compact={compact}, redact={redact}"
+            );
+        }
+    }
+
     /// An unknown ceiling defers rather than guessing, in **both** directions:
     /// it does not refuse a legal window on the daemon's ignorance, and it does
     /// not invent a figure to compare against (REQ-557 ADR-D).
     #[test]
     fn an_unknown_trained_window_defers_to_the_load_path() {
         assert!(refuse_unusable_inference(Some(300_000), None, None).is_ok());
-        assert!(refuse_unusable_inference(Some(1_024), None, None).is_ok());
+        assert!(refuse_unusable_inference(Some(65_536), None, None).is_ok());
+        // The duty floor is **not** deferred, though: it is a property of the
+        // daemon's own duties rather than of the model, so it applies whether or
+        // not a trained window is known. The two checks are independent and
+        // this asserts that they are.
+        assert!(refuse_unusable_inference(Some(1_024), None, None).is_err());
     }
 
     /// The KV spelling is validated against the one authority, and the refusal
