@@ -1282,8 +1282,16 @@ fn slash_verbose_toggles_the_route_notice_around_real_turns() {
         .find(|line| line.contains("route ["))
         .unwrap_or_else(|| panic!("the verbose segment has no route line:\n{loud}"));
     assert!(
-        route.contains(" · budget ") && route.contains(" words / "),
+        route.contains("; budget ") && route.contains(" words / "),
         "the budget rides the route line, in both currencies; line: {route:?}"
+    );
+    // REQ-616 BR-6: with the engine's window in front of it. No engine is
+    // loaded in this fixture, so the window is the no-engine default — which is
+    // exactly the compatibility property ADR-616-1 rests on.
+    assert!(
+        route.contains(" · window 32,768 tokens; budget "),
+        "the route line names the engine's window before the budget derived \
+         from it; line: {route:?}"
     );
     assert!(
         route.ends_with("(bound: local engine)"),
@@ -2315,9 +2323,19 @@ fn a_cap_below_the_window_is_the_bound_a_verbose_turn_names() {
          rather than naming the window; line: {route:?}"
     );
     assert!(
-        route.contains(" · budget ") && route.contains(" words / "),
+        route.contains("; budget ") && route.contains(" words / "),
         "BR-9: the budget is printed in both currencies — the byte guard is what binds on a \
          remote route, so the word figure alone would overstate what fits; line: {route:?}"
+    );
+    // REQ-616 BR-6/AC-2: and the **window** it was derived from comes first, in
+    // the provider's own tokens. This route is capped, so the window named is
+    // the cap (40,000) rather than the declaration it was cut from — the cap is
+    // a window ceiling and the pair is recomputed from it.
+    assert!(
+        route.contains(" · window 40,000 tokens; budget "),
+        "the window this route ran under is named before the budget derived from \
+         it, so 25,984 words cannot read as a shrunken window (LESSON-446); \
+         line: {route:?}"
     );
 }
 

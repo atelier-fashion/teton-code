@@ -1699,6 +1699,48 @@ fn sentence_tail(caller: SkillCaller, bound: BudgetBound, sentence: &SkillSenten
 /// `bound_clause` — one vocabulary for one fact, even though the sentence around
 /// it differs. (Only the wording: the *fact* has one home, in [`derive`], and
 /// nothing here compares a pair against a floor of its own.)
+/// BR-6's sentence: the window first, in the route's own tokens, then the
+/// budget with its currency named.
+///
+/// # Why the window has to be said out loud (LESSON-446)
+///
+/// The two figures are in different currencies and the second is smaller, so a
+/// surface printing only the budget reads as though the window shrank. On
+/// `kimi-k3` a declared 1,000,000-token window derives a 665,984-**word**
+/// budget, and a user who declared 1,000,000 and is shown 665,984 has no way to
+/// tell whether the daemon capped them, lost a third of their window, or is
+/// simply counting something else. It is counting something else, and this
+/// sentence says which: `≈1,000,000 tokens at 3/2`.
+///
+/// A window of `0` means none is known (the `DefaultUnknown` arm), and the
+/// clause is omitted rather than printing `window 0 tokens` — an unknown window
+/// is *stated* as unknown by the bound, not rendered as a zero (REQ-586).
+///
+/// Composed **here**, beside the derivation, and read by every surface: the
+/// figures are the router's and a client re-deriving them is the second source
+/// BR-8 forbids (`conventions.md`: compose the sentence where the facts are).
+#[must_use]
+pub fn window_sentence(budget: &RouteBudget) -> String {
+    if budget.window_tokens == 0 {
+        return format!(
+            "budget {} words / {}",
+            thousands(budget.budget_tokens as u64),
+            bytes_figure(budget.budget_bytes as u64),
+        );
+    }
+    format!(
+        "window {} tokens; budget {} words / {} (≈{} tokens at {}/{})",
+        thousands(u64::from(budget.window_tokens)),
+        thousands(budget.budget_tokens as u64),
+        bytes_figure(budget.budget_bytes as u64),
+        thousands(
+            (budget.budget_tokens * REMOTE_TOKENS_PER_WORD_NUM / REMOTE_TOKENS_PER_WORD_DEN) as u64
+        ),
+        REMOTE_TOKENS_PER_WORD_NUM,
+        REMOTE_TOKENS_PER_WORD_DEN,
+    )
+}
+
 fn bound_clause(budget: &RouteBudget, provider_id: Option<&str>) -> String {
     let mut clause = format!("bound: {}", budget.bound.words());
     if budget.floored {
@@ -1708,14 +1750,21 @@ fn bound_clause(budget: &RouteBudget, provider_id: Option<&str>) -> String {
         );
     }
     if budget.bound == BudgetBound::LocalEngine {
-        // REQ-590 AC-16: the two numbers, read from the constants the
-        // derivation reads, never restated. A reservation that moved and a
+        // REQ-590 AC-16: the two numbers, read from what the derivation
+        // actually used, never restated. A reservation that moved and a
         // sentence that did not would be the LESSON-491 shape this REQ spent
         // three ADRs on.
+        //
+        // REQ-616: the window is read from **this budget** rather than from
+        // `LOCAL_ENGINE_N_CTX_DEFAULT`. It stopped being a constant when the
+        // engine started choosing it, and a sentence still quoting the default
+        // would tell a user serving 262,144 tokens that their window is 32,768
+        // — the same class of defect, one field over, and this time the
+        // sentence would be confidently wrong rather than merely stale.
         clause.push_str(&format!(
             " — both halves come from the engine's {}-token window, less the {} reserved for \
              the reply",
-            thousands(u64::from(LOCAL_ENGINE_N_CTX_DEFAULT)),
+            thousands(u64::from(budget.window_tokens)),
             thousands(u64::from(LOCAL_GENERATION_RESERVATION)),
         ));
     }
@@ -8003,5 +8052,118 @@ mod tests {
             question.contains("The durable fix is to"),
             "the fix is still stated: {question}"
         );
+    }
+}
+
+#[cfg(test)]
+mod window_sentence_tests {
+    use super::*;
+
+    /// A declared-window route. Local to this module: the `tests` module's own
+    /// `remote` is private to it, and a helper reached across module walls is a
+    /// helper that gets changed for one caller and silently moves the other.
+    fn remote<'a>(window: u32, cap: u32, redact_scan: bool) -> BudgetInputs<'a> {
+        BudgetInputs {
+            window,
+            cap,
+            reservation: LOCAL_GENERATION_RESERVATION,
+            is_local: false,
+            redact_scan,
+            provider_id: Some("kimi"),
+            local_window: 0,
+        }
+    }
+
+    /// BR-6 / AC-2: the sentence names both currencies, and they are visibly
+    /// different numbers.
+    ///
+    /// This is the LESSON-446 claim discharged as a string: a reader sees the
+    /// window they declared, the budget they get, and the ratio between them,
+    /// so none of the three has to be inferred from the others.
+    ///
+    /// Mutation: drop the `window …` clause and the first assertion fails; drop
+    /// the `≈… at 3/2` tail and the third does.
+    #[test]
+    fn window_sentence_names_both_currencies() {
+        let kimi = derive(BudgetInputs {
+            window: 1_000_000,
+            cap: 0,
+            reservation: LOCAL_GENERATION_RESERVATION,
+            is_local: false,
+            redact_scan: false,
+            provider_id: Some("kimi"),
+            local_window: 0,
+        });
+        let sentence = window_sentence(&kimi);
+        assert!(
+            sentence.starts_with("window 1,000,000 tokens; "),
+            "the window comes first, in the provider's own tokens: {sentence}"
+        );
+        assert!(
+            sentence.contains("budget 665,984 words"),
+            "the derived word budget is named: {sentence}"
+        );
+        assert!(
+            sentence.contains("(≈998,976 tokens at 3/2)"),
+            "the conversion back to tokens is stated, so 665,984 cannot read as a \
+             shrunken window: {sentence}"
+        );
+    }
+
+    /// The local route gets the same shape, so a user comparing the two routes
+    /// is comparing like with like.
+    #[test]
+    fn the_local_route_uses_the_same_shape() {
+        let local = derive(BudgetInputs::local_at(262_144));
+        let sentence = window_sentence(&local);
+        assert!(sentence.starts_with("window 262,144 tokens; "));
+        assert!(sentence.contains("budget 174,080 words"));
+    }
+
+    /// An unknown window omits the clause rather than printing `window 0` — the
+    /// benign path, and the one where a naive implementation says something
+    /// false.
+    #[test]
+    fn an_unknown_window_says_nothing_rather_than_zero() {
+        let unknown = derive(remote(0, 0, false));
+        assert_eq!(unknown.bound, BudgetBound::DefaultUnknown);
+        let sentence = window_sentence(&unknown);
+        assert!(
+            !sentence.contains("window"),
+            "an unknown window is stated by the bound, not rendered as a zero: {sentence}"
+        );
+        assert!(sentence.starts_with("budget 4,096 words"));
+    }
+
+    /// A capped route reports the cap as its window, and the sentence therefore
+    /// describes the budget the turn actually runs under rather than the
+    /// declaration it was cut from.
+    #[test]
+    fn a_capped_route_describes_the_cap() {
+        let capped = derive(remote(1_000_000, 40_000, false));
+        let sentence = window_sentence(&capped);
+        assert!(sentence.starts_with("window 40,000 tokens; "));
+        assert!(!sentence.contains("1,000,000"));
+    }
+
+    /// BR-6's other half: the local `bound` clause reads **this route's**
+    /// window, not the build's default constant.
+    ///
+    /// Mutation: point the clause back at `LOCAL_ENGINE_N_CTX_DEFAULT` and the
+    /// 262,144 case fails, reporting 32,768 — a sentence that is confidently
+    /// wrong rather than merely stale.
+    #[test]
+    fn the_local_bound_clause_quotes_the_loaded_window() {
+        let loaded = derive(BudgetInputs::local_at(262_144));
+        let clause = bound_clause(&loaded, None);
+        assert!(
+            clause.contains("262,144-token window"),
+            "the clause must quote the window this route ran under: {clause}"
+        );
+        assert!(!clause.contains("32,768"));
+
+        // Benign path: with no engine loaded it still quotes the default.
+        let unloaded = derive(BudgetInputs::local());
+        assert!(bound_clause(&unloaded, None).contains("32,768-token window"));
     }
 }

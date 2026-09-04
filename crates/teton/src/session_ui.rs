@@ -675,6 +675,30 @@ pub fn render_event(
             );
             EventOutcome::Rendered
         }
+        // REQ-616 BR-9. **Not** verbose-gated: the whole point is that a user
+        // staring at a silent terminal for two minutes learns the turn is
+        // working. It is emitted only above the old window's worth of prompt,
+        // so an ordinary turn never reaches this arm.
+        Event::PrefillProgress(p) => {
+            // `checked_div` rather than a guarded `/`: a prefill of zero total
+            // tokens is degenerate, and 0% is the honest reading of it.
+            let pct = p
+                .tokens_done
+                .saturating_mul(100)
+                .checked_div(p.tokens_total)
+                .unwrap_or(0);
+            surface.line(
+                LineKind::Info,
+                &format!(
+                    "reading context: {}% ({} of {} tokens, {:.0}/s)",
+                    pct,
+                    thousands(u64::from(p.tokens_done)),
+                    thousands(u64::from(p.tokens_total)),
+                    p.tokens_per_second,
+                ),
+            );
+            EventOutcome::Rendered
+        }
         Event::PhaseTransition(pt) => {
             surface.line(LineKind::Notice, &format_phase(pt));
             EventOutcome::Rendered
@@ -4205,7 +4229,11 @@ fn budget_clause(rd: &RouteDecided) -> Option<String> {
     let bound = rd.bound?;
     Some(format!(
         " · {}",
-        budget_figures(
+        budget_figures_with_window(
+            // REQ-616 BR-6: the route's own window, read off the event rather
+            // than re-derived. `None` from a daemon predating the field, and the
+            // clause renders exactly as it did before.
+            rd.window_tokens,
             tokens,
             bytes,
             bound,
@@ -4574,8 +4602,34 @@ fn figure_pair(tokens: u64, bytes: u64) -> String {
 /// rendering of a fact this surface was not sent; the daemon's own sentence,
 /// which holds the whole `RouteBudget`, is where a floored budget gets said.
 fn budget_figures(tokens: u64, bytes: u64, bound: BudgetBound, floored: bool) -> String {
+    budget_figures_with_window(None, tokens, bytes, bound, floored)
+}
+
+/// [`budget_figures`] with the route's window in front of it (REQ-616 BR-6).
+///
+/// The window and the budget are different currencies and the budget is the
+/// smaller number, so a line printing only the budget reads as though the window
+/// shrank — a user who declared 1,000,000 tokens and is shown `budget 665,984
+/// words` cannot tell whether they were capped (LESSON-446). Naming the window
+/// first, in the unit they declared it in, removes the question.
+///
+/// `None` omits the clause: a daemon predating REQ-616 sends no window, and an
+/// unknown window is stated by the bound rather than rendered as a zero
+/// (REQ-586). That is also what keeps this additive — an old frame renders
+/// exactly as it did before.
+fn budget_figures_with_window(
+    window: Option<u32>,
+    tokens: u64,
+    bytes: u64,
+    bound: BudgetBound,
+    floored: bool,
+) -> String {
+    let head = match window {
+        Some(w) if w > 0 => format!("window {} tokens; ", thousands(u64::from(w))),
+        _ => String::new(),
+    };
     format!(
-        "budget {} {}",
+        "{head}budget {} {}",
         figure_pair(tokens, bytes),
         bound_clause(bound, floored)
     )
@@ -13084,6 +13138,72 @@ mod repo_context_generation_tests {
             state.repo_context_state,
             Some(RepoContextStateKind::Loaded),
             "a repository with notes must not be told an offer is coming"
+        );
+    }
+}
+
+#[cfg(test)]
+mod window_clause_client_tests {
+    use super::*;
+    use teton_protocol::ProviderId;
+
+    fn route_with(window: Option<u32>) -> RouteDecided {
+        RouteDecided {
+            category: None,
+            tier: None,
+            phase: None,
+            provider_id: ProviderId::from("kimi"),
+            model: Some("kimi-k3".to_owned()),
+            reason: "a reason.".to_owned(),
+            effort: None,
+            window_tokens: window,
+            budget_tokens: Some(665_984),
+            budget_bytes: Some(1_997_952),
+            bound: Some(BudgetBound::Window),
+            bound_floored: None,
+            spend_ceiling_micro_cents: None,
+            repo_context_cap: None,
+        }
+    }
+
+    /// AC-2: the route line names the window in the provider's own tokens
+    /// before the derived word budget, so 1,000,000 does not read as 665,984.
+    ///
+    /// Mutation: pass `None` for the window (or drop the head clause) and the
+    /// first assertion fails.
+    #[test]
+    fn the_route_line_names_the_window_before_the_budget() {
+        let clause = budget_clause(&route_with(Some(1_000_000))).expect("a budget is stamped");
+        assert!(
+            clause.contains("window 1,000,000 tokens; budget 665,984 words"),
+            "the window comes first, in tokens: {clause}"
+        );
+    }
+
+    /// A daemon predating the field renders exactly as it did before — which is
+    /// what makes the field additive rather than a wire break.
+    #[test]
+    fn a_frame_without_a_window_renders_as_it_always_did() {
+        let clause = budget_clause(&route_with(None)).expect("a budget is stamped");
+        // Asserted on the *prefix*, not on the absence of the word: this route's
+        // bound is literally named `window`, so `!contains("window")` would be
+        // testing the bound's spelling rather than the clause's shape.
+        assert!(
+            clause.starts_with(" · budget 665,984 words"),
+            "no window on the frame means the line starts at the budget: {clause}"
+        );
+        assert!(!clause.contains("window 665,984"), "{clause}");
+    }
+
+    /// A zero window is "unknown", not "a window of zero" — the benign path
+    /// where a naive implementation prints something false.
+    #[test]
+    fn a_zero_window_is_omitted_rather_than_printed() {
+        let clause = budget_clause(&route_with(Some(0))).expect("a budget is stamped");
+        assert!(!clause.contains("window 0"), "{clause}");
+        assert!(
+            clause.starts_with(" · budget 665,984 words"),
+            "a zero window is omitted, leaving the pre-REQ-616 line: {clause}"
         );
     }
 }

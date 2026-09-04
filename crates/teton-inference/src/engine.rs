@@ -1477,3 +1477,67 @@ mod tests {
         assert_eq!(completion.text, "ok");
     }
 }
+
+#[cfg(test)]
+mod resident_window_tests {
+    /// BR-9's first clause: the persistent context REQ-564 keeps across turns is
+    /// allocated at the **fitted** window, not at a constant.
+    ///
+    /// # Why this is a source check rather than a behavioural one
+    ///
+    /// `new_context` is behind the `llama` feature and needs real weights, so no
+    /// test in this repository can call it. What *can* be checked is that the
+    /// three call sites hand it the `n_ctx` the worker was started with rather
+    /// than a literal — which is the whole of the property, since the worker's
+    /// `n_ctx` is the fitted window by construction (`LlamaEngine::load` takes
+    /// it as a parameter).
+    ///
+    /// Bounded to this file and keyed on the hazard — a numeric literal reaching
+    /// `new_context` — per conventions.md's rules for source-scanning checks.
+    ///
+    /// **Mutation run.** Changing any `new_context(model, backend, n_ctx, kv)`
+    /// to `new_context(model, backend, 32_768, kv)` fails this test (1
+    /// assertion).
+    #[test]
+    fn resident_context_uses_the_fitted_window() {
+        let source = include_str!("engine.rs");
+        // Cut at the first column-0 `#[cfg(test)]` so this check does not match
+        // its own text (conventions.md).
+        let production = source
+            .find("\n#[cfg(test)]\n")
+            .map_or(source, |end| &source[..end]);
+        assert!(
+            production.len() > 10_000,
+            "vacuity floor: the production slice is {} bytes, so this check is \
+             scanning nothing",
+            production.len()
+        );
+
+        let calls: Vec<&str> = production
+            .match_indices("new_context(")
+            .map(|(at, _)| {
+                let rest = &production[at..];
+                let end = rest.find(')').map_or(rest.len(), |e| e + 1);
+                &rest[..end]
+            })
+            .collect();
+        assert!(
+            calls.len() >= 3,
+            "vacuity floor: expected at least three `new_context(` call sites \
+             (the definition and its two callers), found {}",
+            calls.len()
+        );
+
+        for call in &calls {
+            // The definition itself names the parameter type; the callers name
+            // the variable. Neither may name a number.
+            assert!(
+                !call.chars().any(|c| c.is_ascii_digit()),
+                "a `new_context` call passes a literal window: {call:?}. The resident \
+                 context must be sized from the window the engine was loaded with, or a \
+                 262,144-token engine will serve its prefix cache from a 32,768-token \
+                 context (REQ-616 BR-9)."
+            );
+        }
+    }
+}

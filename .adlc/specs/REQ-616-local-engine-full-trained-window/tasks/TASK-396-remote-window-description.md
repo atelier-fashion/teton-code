@@ -1,7 +1,7 @@
 ---
 id: TASK-396
 title: "Print the window beside the budget, with the currency named, on every surface"
-status: draft
+status: complete
 parent: REQ-616
 created: 2026-09-04
 updated: 2026-09-04

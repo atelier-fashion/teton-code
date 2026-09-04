@@ -8096,3 +8096,62 @@ mod tests {
         assert_eq!(latest_request(&ctx), "second");
     }
 }
+
+#[cfg(test)]
+mod prefill_deadline_tests {
+    /// BR-9's third clause: the 120 s duty deadline does not apply to an
+    /// agent-turn prefill.
+    ///
+    /// # This asserts a property the tree already has, and that is the point
+    ///
+    /// REQ-616 did not have to *change* anything here: `DUTY_DEADLINE` is
+    /// applied inside `DutyRoute::perform` and the redact scan's own wrapper,
+    /// and neither is on the agent-turn path. But "already true" and "will stay
+    /// true" are different claims, and a 262,144-token prefill takes long enough
+    /// that someone reaching for a timeout would reasonably reach for this one.
+    /// So the property gets a guard rather than a note.
+    ///
+    /// Keyed on the **hazard** — the deadline constant appearing anywhere in the
+    /// turn path's production source — rather than on any particular remedy
+    /// (conventions.md, REQ-600: assert on the hazard, not the remedy).
+    ///
+    /// **Mutation run.** Adding `let _ = crate::harness::duty::DUTY_DEADLINE;`
+    /// anywhere in this module's production source fails this test with the
+    /// file named (1 assertion).
+    #[test]
+    fn the_duty_deadline_does_not_reach_the_agent_turn_path() {
+        let turn_path = [
+            "harness/turn_loop.rs",
+            "runtime/turn.rs",
+            "harness/context.rs",
+        ];
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        for name in turn_path {
+            let path = crate::call_sites::scan::daemon_src().join(name);
+            let source = crate::call_sites::scan::production_source(&path);
+            assert!(
+                source.len() > 1_000,
+                "vacuity floor: {name} read as {} bytes of production source, so this \
+                 check is scanning nothing and would agree with any tree",
+                source.len()
+            );
+            scanned += 1;
+            if source.contains("DUTY_DEADLINE") {
+                offenders.push(name);
+            }
+        }
+        assert_eq!(
+            scanned,
+            turn_path.len(),
+            "vacuity floor: every file on the turn path must actually be scanned"
+        );
+        assert!(
+            offenders.is_empty(),
+            "the duty deadline reached the agent-turn path in {offenders:?}. A 262,144-token \
+             prefill runs for a minute or two, and bounding it at the duty's 120 s would kill \
+             exactly the turns REQ-616 exists to make possible (BR-9). If a turn-path timeout \
+             is genuinely wanted, it needs its own constant and its own decision."
+        );
+    }
+}

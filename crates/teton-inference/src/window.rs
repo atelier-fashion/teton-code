@@ -729,3 +729,207 @@ mod tests {
         }
     }
 }
+
+/// Progress reporting for a long prefill (REQ-616 BR-9, AC-9).
+///
+/// A cold 262,144-token prefill on Apple Silicon runs for a minute or two, and
+/// a turn that prints nothing for two minutes is indistinguishable from a hung
+/// one. This decides *when* to say something; the caller does the saying.
+///
+/// **Pure, and outside the `llama` feature gate**, like [`crate::window`]: the
+/// prefill loop that drives it is FFI and never compiles in CI, so a policy
+/// living inside that loop would be a policy no test could reach. The clock is
+/// a parameter for the same reason — a cadence asserted against a real
+/// `Instant::now()` is a flaky test, and one asserted against a supplied one is
+/// a claim about the rule.
+pub mod prefill {
+    use std::time::{Duration, Instant};
+
+    /// Below this many prompt tokens, a prefill reports nothing.
+    ///
+    /// It is the *old* window, and deliberately: a prefill that would have fit
+    /// in the pre-REQ-616 engine is not a long one, and reporting on it would
+    /// turn every ordinary turn into a progress bar. Above it, the prefill is
+    /// doing something the previous release could not do at all, which is
+    /// exactly when a user needs telling that it is working.
+    pub const PREFILL_PROGRESS_THRESHOLD_TOKENS: u32 = 32_768;
+
+    /// At most one report per second (the spec's "at most once per second").
+    pub const PREFILL_PROGRESS_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
+    /// One progress report.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct PrefillProgress {
+        /// Prompt tokens decoded so far.
+        pub tokens_done: u32,
+        /// Prompt tokens in total.
+        pub tokens_total: u32,
+        /// Throughput since the prefill started.
+        pub tokens_per_second: f32,
+    }
+
+    /// Decides whether this moment in a prefill earns a report.
+    ///
+    /// Rate-limited rather than sampled every N tokens: what a user is waiting
+    /// on is *wall-clock*, and a token-count cadence produces a burst on a fast
+    /// machine and silence on a slow one — the two cases where the cadence
+    /// matters most, and it gets both backwards.
+    #[derive(Debug)]
+    pub struct PrefillReporter {
+        total: u32,
+        started: Instant,
+        last: Option<Instant>,
+        emitted: u32,
+    }
+
+    impl PrefillReporter {
+        /// A reporter for a prefill of `total` prompt tokens, started at
+        /// `started`.
+        #[must_use]
+        pub fn new(total: u32, started: Instant) -> Self {
+            Self {
+                total,
+                started,
+                last: None,
+                emitted: 0,
+            }
+        }
+
+        /// Whether this prefill reports at all.
+        #[must_use]
+        pub fn reports(&self) -> bool {
+            self.total > PREFILL_PROGRESS_THRESHOLD_TOKENS
+        }
+
+        /// How many reports have been emitted.
+        #[must_use]
+        pub fn emitted(&self) -> u32 {
+            self.emitted
+        }
+
+        /// The report this moment earns, if any.
+        ///
+        /// The **first** report is not rate-limited against `started`: a long
+        /// prefill should say something as soon as it knows it is long, rather
+        /// than staying silent for the first second of a two-minute wait.
+        /// Subsequent ones are spaced by [`PREFILL_PROGRESS_MIN_INTERVAL`].
+        pub fn tick(&mut self, tokens_done: u32, now: Instant) -> Option<PrefillProgress> {
+            if !self.reports() {
+                return None;
+            }
+            if let Some(last) = self.last {
+                if now.duration_since(last) < PREFILL_PROGRESS_MIN_INTERVAL {
+                    return None;
+                }
+            }
+            self.last = Some(now);
+            self.emitted += 1;
+            let elapsed = now.duration_since(self.started).as_secs_f32();
+            Some(PrefillProgress {
+                tokens_done,
+                tokens_total: self.total,
+                // A zero elapsed would divide by zero; the honest throughput
+                // before any time has passed is unknown, and 0.0 says "not yet
+                // measurable" rather than reporting an infinity.
+                tokens_per_second: if elapsed > 0.0 {
+                    tokens_done as f32 / elapsed
+                } else {
+                    0.0
+                },
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// AC-9: a 100,000-token prefill reports at least once.
+        ///
+        /// Mutation: raise the threshold above 100,000 and this fails.
+        #[test]
+        fn a_long_prefill_reports_at_least_once() {
+            let t0 = Instant::now();
+            let mut r = PrefillReporter::new(100_000, t0);
+            assert!(r.reports());
+            assert!(r.tick(1_000, t0).is_some(), "the first report is prompt");
+            assert_eq!(r.emitted(), 1);
+        }
+
+        /// The benign path, and the one that keeps ordinary turns quiet: a
+        /// prefill at or below the old window reports nothing at all.
+        ///
+        /// A detector validated only where it fires ships broken (LESSON-440),
+        /// and here "fires on every turn" is the failure users would actually
+        /// notice.
+        #[test]
+        fn a_short_prefill_reports_nothing() {
+            let t0 = Instant::now();
+            for total in [0u32, 1, 4_096, PREFILL_PROGRESS_THRESHOLD_TOKENS] {
+                let mut r = PrefillReporter::new(total, t0);
+                assert!(!r.reports(), "{total} must not report");
+                assert!(r.tick(total, t0 + Duration::from_secs(10)).is_none());
+                assert_eq!(r.emitted(), 0);
+            }
+            // One token past the threshold does report — the boundary is
+            // asserted from both sides so an off-by-one cannot hide.
+            let over = PrefillReporter::new(PREFILL_PROGRESS_THRESHOLD_TOKENS + 1, t0);
+            assert!(over.reports());
+        }
+
+        /// The cadence is a real bound: a fast prefill does not produce a burst.
+        ///
+        /// This is the assertion the spec's "at most once per second" earns.
+        /// Mutation: drop the `last` check and 100 ticks produce 100 reports.
+        #[test]
+        fn a_fast_prefill_does_not_burst() {
+            let t0 = Instant::now();
+            let mut r = PrefillReporter::new(262_144, t0);
+            // A hundred ticks inside one second.
+            for i in 0..100u32 {
+                r.tick(i * 100, t0 + Duration::from_millis(u64::from(i) * 9));
+            }
+            assert_eq!(
+                r.emitted(),
+                1,
+                "a hundred ticks inside one second must produce one report"
+            );
+
+            // Crossing the interval earns exactly one more.
+            r.tick(50_000, t0 + Duration::from_millis(1_500));
+            assert_eq!(r.emitted(), 2);
+            r.tick(60_000, t0 + Duration::from_millis(1_900));
+            assert_eq!(r.emitted(), 2, "still inside the interval");
+            r.tick(70_000, t0 + Duration::from_millis(2_600));
+            assert_eq!(r.emitted(), 3);
+        }
+
+        /// The payload carries what a waiting user needs, and the throughput is
+        /// measured from the start rather than from the last report.
+        #[test]
+        fn the_report_carries_progress_and_throughput() {
+            let t0 = Instant::now();
+            let mut r = PrefillReporter::new(200_000, t0);
+            let p = r
+                .tick(50_000, t0 + Duration::from_secs(2))
+                .expect("a long prefill reports");
+            assert_eq!(p.tokens_done, 50_000);
+            assert_eq!(p.tokens_total, 200_000);
+            assert!(
+                (p.tokens_per_second - 25_000.0).abs() < 1.0,
+                "50,000 tokens in 2 s is 25,000/s, got {}",
+                p.tokens_per_second
+            );
+        }
+
+        /// Zero elapsed time reports zero throughput rather than an infinity.
+        #[test]
+        fn zero_elapsed_does_not_divide_by_zero() {
+            let t0 = Instant::now();
+            let mut r = PrefillReporter::new(100_000, t0);
+            let p = r.tick(0, t0).expect("reports");
+            assert!(p.tokens_per_second.is_finite());
+            assert_eq!(p.tokens_per_second, 0.0);
+        }
+    }
+}

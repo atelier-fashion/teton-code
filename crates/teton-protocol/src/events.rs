@@ -162,6 +162,8 @@ pub enum Event {
     /// The local engine could not be loaded at any window worth serving, and no
     /// override said to try anyway (REQ-616 BR-4).
     LocalWindowRefused(LocalWindowRefused),
+    /// A long local prefill is making progress (REQ-616 BR-9).
+    PrefillProgress(PrefillProgress),
     /// The daemon proposes a local model and awaits an answer (REQ-547 BR-1).
     ModelSelectionProposed(ModelSelectionProposed),
     /// A model-selection decision was recorded (REQ-547 BR-4/BR-10).
@@ -276,6 +278,7 @@ impl Event {
             Event::ModelLifecycle(_) => "model_lifecycle",
             Event::LocalWindowDecided(_) => "local_window_decided",
             Event::LocalWindowRefused(_) => "local_window_refused",
+            Event::PrefillProgress(_) => "prefill_progress",
             Event::ModelSelectionProposed(_) => "model_selection_proposed",
             Event::ModelSelectionDecided(_) => "model_selection_decided",
             Event::PermissionRequest(_) => "permission_request",
@@ -9413,4 +9416,21 @@ pub struct LocalWindowRefused {
     pub shortfall_bytes: u64,
     /// The remedies, named rather than implied.
     pub remedies: Vec<String>,
+}
+
+/// A long local prefill is making progress (REQ-616 BR-9, AC-9).
+///
+/// A cold 262,144-token prefill runs for a minute or two on Apple Silicon, and a
+/// turn that prints nothing for that long is indistinguishable from a hung one.
+/// Emitted only above `teton_inference::window::prefill`'s threshold — the
+/// pre-REQ-616 window — so an ordinary turn stays quiet: a progress bar on every
+/// turn is noise, and noise is what makes a real one easy to miss.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PrefillProgress {
+    /// Prompt tokens decoded so far.
+    pub tokens_done: u32,
+    /// Prompt tokens in total.
+    pub tokens_total: u32,
+    /// Throughput since the prefill started.
+    pub tokens_per_second: f32,
 }

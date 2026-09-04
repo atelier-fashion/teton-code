@@ -1,7 +1,7 @@
 ---
 id: TASK-397
 title: "Size the prefix cache to the new window and emit prefill_progress"
-status: draft
+status: complete
 parent: REQ-616
 created: 2026-09-04
 updated: 2026-09-04
