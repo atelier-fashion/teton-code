@@ -2923,9 +2923,15 @@ impl DaemonRuntime {
             budget.budget_tokens,
             budget.budget_bytes,
         );
-        if measured.fits {
+        // REQ-618 BR-4: two questions reach this offer now, and the second one
+        // is about a body that *fits*. `Measured::of` is the one place the
+        // second is decided, so this path and `skill_fit`'s cannot disagree
+        // about where the room line sits.
+        let measured = Measured::of(measured, skill.text.len(), budget);
+        if measured.admits() {
             return SkillStageVerdict::Fits;
         }
+        let room = measured.room;
 
         // **One question per expansion, not one per stage.** BR-8's two stages
         // are two questions only when the fold between them changed something:
@@ -2959,7 +2965,7 @@ impl DaemonRuntime {
             // BR-7c: the shipped catalog's figure or nothing. Keyed off the
             // route's **model**, never its provider id — ids are the user's
             // namespace (ADR-6).
-            proposed_window(route.model.as_deref(), inputs, measured),
+            proposed_window(route.model.as_deref(), inputs, measured.fit),
             // ADR-12's payload for the `LocalEngine` row: which tier a
             // `BindTierRemote` remedy would rebind, read off the resolution the
             // route was built from rather than re-resolved.
@@ -2988,6 +2994,24 @@ impl DaemonRuntime {
             PriorWindowRejection::None
         };
 
+        // REQ-618 BR-4: when the question is the *room* one, it is announced by
+        // name before the over-budget offer's own event. Two events rather than
+        // a flag on one, because a client rendering "over budget" for a body
+        // that fits would be telling the user the wrong thing about their own
+        // route — and the remedies differ.
+        if let Room::TooLittle { percent } = room {
+            events.publish(
+                Some(session_id.clone()),
+                Event::SkillRefusedNoRoom(SkillRefusedNoRoom {
+                    skill: skill.name.clone(),
+                    body_bytes: skill.text.len() as u64,
+                    budget_bytes: budget.budget_bytes as u64,
+                    room_percent: percent as u64,
+                    provider_id: budget.provider_id.clone(),
+                }),
+            );
+        }
+
         // Published when the offer is **raised**, not when it is answered: that
         // is what makes "asked and declined" distinguishable from "nobody could
         // be reached", which is REQ-585 AC-9's distinction and the reason
@@ -2998,8 +3022,8 @@ impl DaemonRuntime {
                 skill: skill.name.clone(),
                 source: skill.source,
                 stage: wire_skill_stage(stage),
-                measured_tokens: measured.tokens as u64,
-                measured_bytes: measured.bytes as u64,
+                measured_tokens: measured.fit.tokens as u64,
+                measured_bytes: measured.fit.bytes as u64,
                 budget_tokens: budget.budget_tokens as u64,
                 budget_bytes: budget.budget_bytes as u64,
                 bound: budget.bound,
@@ -3021,7 +3045,7 @@ impl DaemonRuntime {
         // acceptable is an option a human can select that writes nothing, and
         // [`RemedyPlan`]'s doc records why that is the same defect
         // `enable_permanent` shipped once already.
-        let plan = plan_over_budget_remedy(config, router, &offer.remedy, measured);
+        let plan = plan_over_budget_remedy(config, router, &offer.remedy, measured.fit);
 
         // **The plan is the fact, and it is told to the offer once** (ADR-1).
         //
@@ -3069,8 +3093,8 @@ impl DaemonRuntime {
                     skill: skill.name.clone(),
                     source: skill.source,
                     stage: wire_skill_stage(stage),
-                    measured_tokens: measured.tokens as u64,
-                    measured_bytes: measured.bytes as u64,
+                    measured_tokens: measured.fit.tokens as u64,
+                    measured_bytes: measured.fit.bytes as u64,
                     budget_tokens: budget.budget_tokens as u64,
                     budget_bytes: budget.budget_bytes as u64,
                     bound: budget.bound,
@@ -3121,8 +3145,8 @@ impl DaemonRuntime {
                     stage: wire_skill_stage(stage),
                     // BR-1's "whole" is these numbers: what goes out is what was
                     // measured, and nothing on this path shortens it.
-                    measured_tokens: measured.tokens as u64,
-                    measured_bytes: measured.bytes as u64,
+                    measured_tokens: measured.fit.tokens as u64,
+                    measured_bytes: measured.fit.bytes as u64,
                     budget_tokens: budget.budget_tokens as u64,
                     budget_bytes: budget.budget_bytes as u64,
                     // What the user was told before they answered.

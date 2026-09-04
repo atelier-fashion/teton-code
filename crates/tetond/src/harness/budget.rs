@@ -1195,6 +1195,21 @@ pub enum SkillFit {
         /// which stage refused, and — through [`SkillCaller`] — who asked.
         message: String,
     },
+    /// The expansion **fits** the route's budget and still takes more than
+    /// [`ROOM_FRACTION_PERCENT`] of it, so the turn would have nowhere to work
+    /// (REQ-618 BR-4).
+    ///
+    /// A third variant rather than a flag on [`Self::TooLarge`], because the
+    /// two are different answers with different remedies and the surfaces have
+    /// to tell them apart: a typed caller is *offered* this one (BR-4 routes it
+    /// through REQ-589's question), and the model path renders it as a refusal
+    /// like any other.
+    NoRoom {
+        /// The expansion's size, for the event the surface publishes.
+        body_bytes: usize,
+        /// The sentence, composed through the same composer as the other two.
+        message: String,
+    },
 }
 
 impl SkillFit {
@@ -1228,7 +1243,24 @@ impl SkillFit {
     pub fn into_tool_refusal(self) -> Option<String> {
         match self {
             SkillFit::Fits => None,
-            SkillFit::TooLarge { message } => Some(message),
+            // REQ-618 BR-4: the model path renders both refusals the same way.
+            // The *offer* is the typed caller's alone (REQ-589 BR-2) — there is
+            // no human inside a tool call to answer per-invocation — so the
+            // model is told what happened and why, and nothing is asked.
+            SkillFit::TooLarge { message } | SkillFit::NoRoom { message, .. } => Some(message),
+        }
+    }
+
+    /// The reason id this verdict is recorded under (REQ-618 BR-4).
+    ///
+    /// `None` for [`Self::Fits`], which is not a refusal and has nothing to
+    /// record.
+    #[must_use]
+    pub const fn reason(&self) -> Option<&'static str> {
+        match self {
+            SkillFit::Fits => None,
+            SkillFit::TooLarge { .. } => Some(OVER_BUDGET_REASON),
+            SkillFit::NoRoom { .. } => Some(NO_ROOM_REASON),
         }
     }
 }
@@ -1352,19 +1384,55 @@ pub fn skill_fit(
         budget.budget_tokens,
         budget.budget_bytes,
     );
-    if fit.fits {
+    verdict(
+        caller,
+        stage,
+        skill,
+        fit,
+        budget,
+        provider_id,
+        expansion.len(),
+    )
+}
+
+/// The three-way verdict both entry points share (REQ-618 BR-4).
+///
+/// One function so `skill_fit` and `skill_append_fit` cannot come to disagree
+/// about where the room line is — the failure REQ-587 ADR-2 already had to fix
+/// once for the budget itself.
+///
+/// The order matters: **over budget beats no room.** A body that does not fit at
+/// all is refused as not fitting, because that is the true and more useful
+/// sentence; the room question is only interesting about a body that *would*
+/// have been admitted.
+fn verdict(
+    caller: SkillCaller,
+    stage: SkillStage,
+    skill: &str,
+    fit: Fit,
+    budget: &RouteBudget,
+    provider_id: Option<&str>,
+    body_bytes: usize,
+) -> SkillFit {
+    let measured = Measured::of(fit, body_bytes, budget);
+    if measured.admits() {
         return SkillFit::Fits;
     }
-    SkillFit::TooLarge {
-        message: skill_refusal(
-            caller,
-            stage,
-            skill,
-            fit,
-            budget,
-            provider_id,
-            &SkillSentence::Refused,
-        ),
+    let message = skill_refusal(
+        caller,
+        stage,
+        skill,
+        measured,
+        budget,
+        provider_id,
+        &SkillSentence::Refused,
+    );
+    match measured.room {
+        Room::Enough => SkillFit::TooLarge { message },
+        Room::TooLittle { .. } => SkillFit::NoRoom {
+            body_bytes,
+            message,
+        },
     }
 }
 
@@ -1382,6 +1450,57 @@ pub fn skill_fit(
 ///
 /// [`SkillInvoked::refused`]: teton_protocol::events::SkillInvoked::refused
 pub const OVER_BUDGET_REASON: &str = "over_budget";
+
+/// The reason id a `fits_without_room` refusal carries (REQ-618 BR-4).
+///
+/// Its own token beside [`OVER_BUDGET_REASON`], because the two are different
+/// facts with different remedies: one says the body will not fit at all, the
+/// other that it fits and leaves the turn nothing to work with. A session line
+/// that called them both `over_budget` would send a user looking for a bigger
+/// window when what they need is a smaller skill — or the other way round.
+pub const NO_ROOM_REASON: &str = "no_room";
+
+/// The share of a route's byte budget one skill body may take before the turn
+/// has no room left to work in (REQ-618 BR-4).
+///
+/// # Why a fraction at all, when the body already fits
+///
+/// A body inside the budget can still be most of it. The 2026-09-04 session in
+/// REQ-618's Description is the worked example: a 25 KB body plus its ethos
+/// include came to 38% of a 21,162-token budget *before a single tool result*,
+/// and twenty-six tool calls later the model no longer held the skill's
+/// instructions or the user's intent. Nothing was over budget at any point; the
+/// turn simply had nowhere to put its work.
+///
+/// # The number
+///
+/// Percent rather than a float, because every other budget arithmetic in this
+/// module is integer and a lone `f64` here would be the one place a rounding
+/// question could arise. 25 is the spec's proposed value and it is a starting
+/// point, not a derivation — which is the honest description of it and the
+/// reason it is a named constant with this paragraph attached rather than a
+/// literal at the comparison.
+///
+/// # What it bites on
+///
+/// A route's byte budget times this fraction. On REQ-616's 262,144-token local
+/// window that is ~130 KB and no ordinary skill body comes near it; on the
+/// 32,768-token window it is ~15.5 KB, which a large skill body *does* exceed —
+/// so on a machine that has not yet moved to the larger window, a big skill is
+/// offered rather than expanded. That is the designed behaviour (BR-4 routes it
+/// through REQ-589's offer, so the user may proceed once) and it is also the
+/// interaction to watch: see ASSUME-039.
+pub const ROOM_FRACTION_PERCENT: usize = 25;
+
+/// Whether a body of `body_bytes` leaves the turn too little of `budget_bytes`
+/// to work in (REQ-618 BR-4).
+///
+/// Integer arithmetic, and multiplication before division so a small budget
+/// does not round its own ceiling to zero.
+#[must_use]
+pub const fn leaves_no_room(body_bytes: usize, budget_bytes: usize) -> bool {
+    body_bytes > budget_bytes.saturating_mul(ROOM_FRACTION_PERCENT) / 100
+}
 
 /// Measure one expansion **appended mid-loop** against the route's stamped
 /// budget and, if it does not fit, compose the refusal (REQ-587 BR-7, ADR-2).
@@ -1427,20 +1546,15 @@ pub fn skill_append_fit(
         budget.budget_tokens,
         budget.budget_bytes,
     );
-    if fit.fits {
-        return SkillFit::Fits;
-    }
-    SkillFit::TooLarge {
-        message: skill_refusal(
-            caller,
-            stage,
-            skill,
-            fit,
-            budget,
-            provider_id,
-            &SkillSentence::Refused,
-        ),
-    }
+    verdict(
+        caller,
+        stage,
+        skill,
+        fit,
+        budget,
+        provider_id,
+        expansion.len(),
+    )
 }
 
 /// Whether this exact skill on this exact route has already been rejected **at
@@ -1569,23 +1683,102 @@ fn skill_refusal(
     caller: SkillCaller,
     stage: SkillStage,
     skill: &str,
-    fit: Fit,
+    measured: Measured,
     budget: &RouteBudget,
     provider_id: Option<&str>,
     sentence: &SkillSentence<'_>,
 ) -> String {
+    let Measured { fit, room } = measured;
     format!(
-        "{} does not fit this route's context budget: {} about {} words / {}, and the budget is \
-         {} words / {} ({}). {}",
+        "{} {}: {} about {} words / {}, and the budget is {} words / {} ({}){}. {}",
         subject_of(caller, skill, sentence),
+        // REQ-618 BR-4: the *verb* is the one thing the room case cannot borrow
+        // from the over-budget case, because "does not fit" would be false of a
+        // body that fits. Everything after it — the stage clause, both figure
+        // pairs, the spoken bound — is the same fact composed once, which is
+        // what keeps the two sentences from quoting different numbers for one
+        // measurement (REQ-589 BR-5's rule, one arm wider).
+        match room {
+            Room::Enough => "does not fit this route's context budget",
+            Room::TooLittle { .. } => {
+                "fits this route's context budget but would leave the turn no room to work"
+            }
+        },
         stage.measured_clause(),
         thousands(fit.tokens as u64),
         bytes_figure(fit.bytes as u64),
         thousands(budget.budget_tokens as u64),
         bytes_figure(budget.budget_bytes as u64),
         bound_clause(budget, provider_id),
+        match room {
+            Room::Enough => String::new(),
+            Room::TooLittle { percent } =>
+                format!(", of which a skill body may take at most {percent}%"),
+        },
         sentence_tail(caller, budget.bound, sentence),
     )
+}
+
+/// What the estimator found about one candidate expansion: the pair, and
+/// whether the pair leaves the turn anywhere to work (REQ-618 BR-4).
+///
+/// A named bundle rather than a seventh and eighth parameter, because that is
+/// this codebase's rule for a parameter cluster and `suppression_ratchet`
+/// enforces it — and because the two really are one fact. A caller that had the
+/// [`Fit`] without the [`Room`] verdict would be holding half a measurement and
+/// could compose a sentence with the wrong verb in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Measured {
+    /// The pair, verbatim from the estimator.
+    pub fit: Fit,
+    /// Whether the body leaves the turn room to work.
+    pub room: Room,
+}
+
+impl Measured {
+    /// Measure `body_bytes` against `budget`, given the pair the estimator
+    /// already produced — the one place the room question is decided.
+    #[must_use]
+    pub fn of(fit: Fit, body_bytes: usize, budget: &RouteBudget) -> Self {
+        Self {
+            fit,
+            // Over budget beats no room: "it does not fit" is the truer and more
+            // useful sentence about a body that does not, and the room question
+            // is only interesting about one that would have been admitted.
+            room: if fit.fits && leaves_no_room(body_bytes, budget.budget_bytes) {
+                Room::TooLittle {
+                    percent: ROOM_FRACTION_PERCENT,
+                }
+            } else {
+                Room::Enough
+            },
+        }
+    }
+
+    /// Whether this measurement admits the expansion.
+    #[must_use]
+    pub const fn admits(&self) -> bool {
+        self.fit.fits && matches!(self.room, Room::Enough)
+    }
+}
+
+/// Whether a measurement that *fits* still leaves the turn room to work
+/// (REQ-618 BR-4).
+///
+/// A two-variant enum rather than an `Option<usize>` at the composer's argument
+/// list, where a bare `None` names nothing — the same reason
+/// [`PriorWindowRejection`] is not a `bool`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Room {
+    /// Either the body is inside the fraction, or it does not fit at all — in
+    /// which case the room question does not arise and the sentence says so.
+    Enough,
+    /// The body fits the budget and takes more than `percent` of it.
+    TooLittle {
+        /// [`ROOM_FRACTION_PERCENT`], carried so the sentence names the number
+        /// the decision was taken on rather than re-reading the constant.
+        percent: usize,
+    },
 }
 
 /// The half of BR-5's sentence that is **not** the same fact for all three
@@ -2838,8 +3031,10 @@ pub struct OverBudgetOffer {
     /// mapping between them is explicit at the surface that publishes
     /// (ADR-13).
     pub stage: SkillStage,
-    /// The pair the estimator produced, verbatim.
-    pub measured: Fit,
+    /// The pair the estimator produced, verbatim — and, beside it, whether the
+    /// body leaves the turn room to work (REQ-618 BR-4), which is what decides
+    /// *which* question this offer is asking.
+    pub measured: Measured,
     /// The pair the router stamped for this route, verbatim — and with it the
     /// bound, the floor fact, the window's label and the provider id, each of
     /// which the offer's sentences quote.
@@ -2920,7 +3115,7 @@ impl OverBudgetOffer {
     pub fn new(
         skill: &str,
         stage: SkillStage,
-        measured: Fit,
+        measured: Measured,
         budget: &RouteBudget,
         window: u32,
         proposal: Option<ProposedWindow>,
@@ -2931,7 +3126,7 @@ impl OverBudgetOffer {
             skill: skill.to_owned(),
             stage,
             measured,
-            window_verdict: window_verdict(budget.bound, window, measured),
+            window_verdict: window_verdict(budget.bound, window, measured.fit),
             // BR-7's own answer, which is the widest this can ever be. The
             // applying surface narrows it with
             // [`OverBudgetOffer::withhold_remedy`] once it knows whether it
@@ -3012,6 +3207,7 @@ impl OverBudgetOffer {
     #[cfg(test)]
     const fn overrun_tokens(&self) -> usize {
         self.measured
+            .fit
             .tokens
             .saturating_sub(self.budget.budget_tokens)
     }
@@ -3020,7 +3216,10 @@ impl OverBudgetOffer {
     /// [`OverBudgetOffer::overrun_tokens`], including why it is test-only.
     #[cfg(test)]
     const fn overrun_bytes(&self) -> usize {
-        self.measured.bytes.saturating_sub(self.budget.budget_bytes)
+        self.measured
+            .fit
+            .bytes
+            .saturating_sub(self.budget.budget_bytes)
     }
 
     /// **BR-3's question** — what was measured, what the route allows, what the
@@ -4558,7 +4757,10 @@ mod tests {
                 SkillCaller::Model,
                 SkillStage::Body,
                 "architect",
-                fit,
+                Measured {
+                    fit,
+                    room: Room::Enough,
+                },
                 &budget,
                 budget.provider_id.as_deref(),
                 &SkillSentence::Refused,
@@ -4567,7 +4769,10 @@ mod tests {
                 SkillCaller::Model,
                 SkillStage::Body,
                 "architect",
-                fit,
+                Measured {
+                    fit,
+                    room: Room::Enough,
+                },
                 &budget,
                 parsed,
                 &SkillSentence::Refused,
@@ -5314,7 +5519,7 @@ mod tests {
             budget,
             provider_id,
         ) {
-            SkillFit::TooLarge { message } => message,
+            SkillFit::TooLarge { message } | SkillFit::NoRoom { message, .. } => message,
             SkillFit::Fits => {
                 panic!("`/{skill}` was admitted on a route this test needs it refused on")
             }
@@ -5352,6 +5557,23 @@ mod tests {
         let status = corpus_body(STATUS_BODY_BYTES);
         let proceed = corpus_body(PROCEED_BODY_BYTES);
 
+        // **REQ-618 BR-4 changed two of these rows, and the change is measured
+        // rather than predicted.** The room fraction is 25% of the route's byte
+        // budget, and the real `/proceed` body is 51,037 bytes:
+        //
+        // | route | budget bytes | 25% of it | `/proceed` | verdict |
+        // |---|---|---|---|---|
+        // | local (32,768-token window) | 63,488 | 15,872 | 51,037 | **no room** |
+        // | `max_context = 128000` | 253,952 | 63,488 | 51,037 | fits |
+        //
+        // So on today's local window the largest shipped body is *offered*
+        // rather than expanded — the user answers REQ-589's question once per
+        // invocation and it proceeds. That is BR-4 working as written, and it is
+        // also the interaction to watch: REQ-616 raises the local window to
+        // 262,144 tokens, at which 25% is ~130 KB and no body in this corpus
+        // comes near it. See ASSUME-039, which records both figures the spec's
+        // own assumption got wrong — the largest body is 51 KB, not 25 KB, and
+        // the window it is measured against today is 32,768, not 262,144.
         let rows: &[(&str, RouteBudget, &str, &String, bool)] = &[
             (
                 "local tier",
@@ -5361,11 +5583,12 @@ mod tests {
                 true,
             ),
             (
+                // REQ-618 BR-4: fits the budget, takes 80% of it.
                 "local tier",
                 derive(BudgetInputs::local()),
                 "proceed",
                 &proceed,
-                true,
+                false,
             ),
             (
                 "max_context = 128000",
@@ -5668,8 +5891,14 @@ mod tests {
         // toolkit — see the note above. The measured `/status` figures
         // ([`STATUS_BODY_BYTES`], [`STATUS_DYNAMIC_OUTPUT_BYTES`]) are still
         // what `the_ac16_route_shapes_admit_and_refuse_the_real_corpus` runs.
-        let status = corpus_body(35_000);
-        let with_output = format!("{status}\n{}", corpus_body(9_000));
+        // Sized against REQ-618 BR-4's fraction as well as the budget: the body
+        // has to be admitted at Stage A for the *stage* to be what Stage B's
+        // message names, and a body over a quarter of the budget is refused at
+        // Stage A now, for a different and truer reason. 12 KB is under the
+        // 12.5 KB quarter of this route's 50 KB; the dynamic output then takes
+        // the pair past the budget itself.
+        let status = corpus_body(12_000);
+        let with_output = format!("{status}\n{}", corpus_body(40_000));
 
         // Non-vacuity, and BR-8(d)'s whole point: Stage A admits this body, so
         // the user is asked for consent and the commands run.
@@ -5692,21 +5921,31 @@ mod tests {
         // stages. Asserted rather than asserted-about, so a floor that came
         // back down — or a `/status` that grew — is a red test telling whoever
         // reads it to put the measured fixture back.
-        assert_eq!(
-            skill_fit(
-                SkillCaller::User,
-                SkillStage::WithDynamicContext,
-                "status",
-                &system,
-                &format!(
-                    "{}\n{}",
-                    corpus_body(STATUS_BODY_BYTES),
-                    corpus_body(STATUS_DYNAMIC_OUTPUT_BYTES)
+        assert!(
+            !matches!(
+                skill_fit(
+                    SkillCaller::User,
+                    SkillStage::WithDynamicContext,
+                    "status",
+                    &system,
+                    &format!(
+                        "{}\n{}",
+                        corpus_body(STATUS_BODY_BYTES),
+                        corpus_body(STATUS_DYNAMIC_OUTPUT_BYTES)
+                    ),
+                    &budget,
+                    Some("ollama")
                 ),
-                &budget,
-                Some("ollama")
+                SkillFit::TooLarge { .. }
             ),
-            SkillFit::Fits,
+            // Not `== Fits`, since REQ-618. The guard's claim is that the live
+            // corpus does not **split the two stages** on this route, and
+            // splitting is what `TooLarge` at Stage B would mean. BR-4 added a
+            // third answer — the live `/status` body is 12,786 B against this
+            // route's 12,500 B quarter, so it is `NoRoom` — which refuses at
+            // *both* stages for one reason and is therefore not a split either.
+            // Asserting `Fits` would tie a guard about stage-splitting to a
+            // fraction it has nothing to do with.
             "the live corpus splits the two stages on this route again — put \
              `STATUS_BODY_BYTES` / `STATUS_DYNAMIC_OUTPUT_BYTES` back as this \
              test's fixture and delete the synthetic one"
@@ -5830,6 +6069,7 @@ mod tests {
     fn message_of(fit: SkillFit) -> String {
         match fit {
             SkillFit::TooLarge { message } => message,
+            SkillFit::NoRoom { message, .. } => message,
             SkillFit::Fits => {
                 panic!("this route admitted an expansion the test needs it to refuse")
             }
@@ -6003,17 +6243,20 @@ mod tests {
             repo_context_cap: 0,
         };
 
-        assert_eq!(
-            skill_fit(
-                SkillCaller::User,
-                SkillStage::Body,
-                "status",
+        // Non-vacuity, on the **estimator** rather than on the verdict. This
+        // budget is sized to hold the body *exactly*, so the body is 100% of it
+        // and REQ-618 BR-4's room fraction necessarily refuses it — which is
+        // correct and is not what this test is about. What it is about is that
+        // the two estimators charge different things, and that is checkable
+        // directly.
+        assert!(
+            ContextManager::would_seed_fit(
                 SYSTEM,
                 &body,
-                &stamped,
-                None
-            ),
-            SkillFit::Fits,
+                stamped.budget_tokens,
+                stamped.budget_bytes
+            )
+            .fits,
             "non-vacuity: this body fits this route as a seed"
         );
 
@@ -6059,11 +6302,20 @@ mod tests {
     /// `fits` is what the pressure path would have said; [`proposed_window`]
     /// does not read it, and the rows below set it honestly so the two callers
     /// this function has — a refusal and a pre-flight — are both represented.
-    const fn measured(tokens: usize, bytes: usize, fits: bool) -> Fit {
-        Fit {
-            tokens,
-            bytes,
-            fits,
+    /// A [`Measured`] for the offer fixtures.
+    ///
+    /// Returns the bundle rather than the bare [`Fit`] since REQ-618, because
+    /// that is what `OverBudgetOffer::new` takes now. `Room::Enough` on every
+    /// one of these: they are all fixtures about a body that does not *fit*,
+    /// which is the case where the room question does not arise.
+    const fn measured(tokens: usize, bytes: usize, fits: bool) -> Measured {
+        Measured {
+            fit: Fit {
+                tokens,
+                bytes,
+                fits,
+            },
+            room: Room::Enough,
         }
     }
 
@@ -6090,7 +6342,7 @@ mod tests {
         let proposal = proposed_window(
             Some("kimi-k3"),
             remote(0, 0, false),
-            measured(100_000, 400_000, false),
+            measured(100_000, 400_000, false).fit,
         )
         .expect("Moonshot's window clears a skill this size");
         assert_eq!(
@@ -6121,7 +6373,7 @@ mod tests {
         ] {
             for route in [remote(0, 0, false), remote(128_000, 0, false)] {
                 assert_eq!(
-                    proposed_window(Some(model), route, measured(1, 1, false)),
+                    proposed_window(Some(model), route, measured(1, 1, false).fit),
                     None,
                     "`{model}` matches no shipped recipe, so there is no published window to \
                      propose (BR-7c, AC-21)"
@@ -6135,7 +6387,7 @@ mod tests {
     #[test]
     fn a_route_with_no_model_proposes_nothing() {
         assert_eq!(
-            proposed_window(None, remote(0, 0, false), measured(1, 1, false)),
+            proposed_window(None, remote(0, 0, false), measured(1, 1, false).fit),
             None
         );
     }
@@ -6186,7 +6438,7 @@ mod tests {
         for model in &asked {
             for route in routes {
                 for fit in measurements {
-                    let Some(proposal) = proposed_window(Some(model), route, fit) else {
+                    let Some(proposal) = proposed_window(Some(model), route, fit.fit) else {
                         continue;
                     };
                     proposals += 1;
@@ -6239,12 +6491,12 @@ mod tests {
         );
 
         assert_eq!(
-            proposed_window(Some("llama3.2"), route, measured(5_000, 40_000, false)),
+            proposed_window(Some("llama3.2"), route, measured(5_000, 40_000, false).fit),
             None,
             "a window whose budget cannot hold the expansion that refused is not a remedy"
         );
         assert_eq!(
-            proposed_window(Some("llama3.2"), route, measured(0, 0, true)),
+            proposed_window(Some("llama3.2"), route, measured(0, 0, true).fit),
             None,
             "even with nothing to clear, a window that derives a floored budget is a \
              declaration that would not be in force — proposing it writes a smaller ceiling \
@@ -6272,7 +6524,7 @@ mod tests {
 
         let inside = measured(derived.budget_tokens, derived.budget_bytes, false);
         assert_eq!(
-            proposed_window(Some("grok-4.6"), route, inside)
+            proposed_window(Some("grok-4.6"), route, inside.fit)
                 .expect("a measurement exactly at the derived budget clears it")
                 .tokens,
             window
@@ -6283,7 +6535,7 @@ mod tests {
             measured(derived.budget_tokens, derived.budget_bytes + 1, false),
         ] {
             assert_eq!(
-                proposed_window(Some("grok-4.6"), route, over),
+                proposed_window(Some("grok-4.6"), route, over.fit),
                 None,
                 "one currency over is over: an offer whose remedy leaves the user at the same \
                  wall next turn has spent their consent on nothing"
@@ -6316,7 +6568,7 @@ mod tests {
         let fit = measured(100_000, 400_000, false);
 
         assert_eq!(
-            proposed_window(Some("kimi-k3"), route("openai"), fit)
+            proposed_window(Some("kimi-k3"), route("openai"), fit.fit)
                 .expect("a recognized model")
                 .tokens,
             kimi_window,
@@ -6324,7 +6576,7 @@ mod tests {
              user called the row"
         );
         assert_eq!(
-            proposed_window(Some("gpt-5.6"), route("kimi"), fit)
+            proposed_window(Some("gpt-5.6"), route("kimi"), fit.fit)
                 .expect("a recognized model")
                 .tokens,
             openai_window
@@ -6332,7 +6584,7 @@ mod tests {
         // And a row named after a vendor it is not serving gets no window from
         // that vendor: `work-model` is an ordinary registration.
         assert_eq!(
-            proposed_window(Some("kimi-k3"), route("work-model"), fit)
+            proposed_window(Some("kimi-k3"), route("work-model"), fit.fit)
                 .expect("a recognized model")
                 .tokens,
             kimi_window
@@ -6352,9 +6604,13 @@ mod tests {
     fn a_local_route_is_offered_the_window_of_the_provider_it_would_bind_to() {
         let busts_the_local_pair = measured(LOCAL_BUDGET_TOKENS + 1, LOCAL_BUDGET_BYTES + 1, false);
         assert_eq!(
-            proposed_window(Some("kimi-k3"), BudgetInputs::local(), busts_the_local_pair)
-                .expect("the tier would be bound to a remote provider, and that route has a window")
-                .tokens,
+            proposed_window(
+                Some("kimi-k3"),
+                BudgetInputs::local(),
+                busts_the_local_pair.fit
+            )
+            .expect("the tier would be bound to a remote provider, and that route has a window")
+            .tokens,
             shipped_window("kimi-k3")
         );
     }
@@ -6377,7 +6633,8 @@ mod tests {
                 remote(200_000, 40_000, true),
             ] {
                 for fit in [measured(0, 0, true), measured(50_000, 200_000, false)] {
-                    let Some(proposal) = proposed_window(Some(&recipe.example_model), route, fit)
+                    let Some(proposal) =
+                        proposed_window(Some(&recipe.example_model), route, fit.fit)
                     else {
                         continue;
                     };
@@ -6414,7 +6671,7 @@ mod tests {
             proposed_window(
                 Some("kimi-k3"),
                 scanned,
-                measured(1_000, REDACT_SCANNABLE_CONTEXT_BYTES + 1, false)
+                measured(1_000, REDACT_SCANNABLE_CONTEXT_BYTES + 1, false).fit
             ),
             None,
             "no window raises the scannable byte bound, so proposing one for a byte-bound \
@@ -6424,7 +6681,7 @@ mod tests {
             proposed_window(
                 Some("kimi-k3"),
                 scanned,
-                measured(100_000, REDACT_SCANNABLE_CONTEXT_BYTES, false)
+                measured(100_000, REDACT_SCANNABLE_CONTEXT_BYTES, false).fit
             )
             .expect("the words half is what a bigger window buys, and it clears")
             .tokens,
@@ -6462,7 +6719,7 @@ mod tests {
             &str,
             BudgetInputs<'_>,
             BudgetBound,
-            Fit,
+            Measured,
             WindowVerdict,
             RemedyKind,
         )] = &[
@@ -6558,7 +6815,7 @@ mod tests {
                  it now asserts is about a different cell"
             );
             assert!(
-                fit.tokens > budget.budget_tokens || fit.bytes > budget.budget_bytes,
+                fit.fit.tokens > budget.budget_tokens || fit.fit.bytes > budget.budget_bytes,
                 "{name}: a measurement that fits is never offered about, so this row would \
                  assert nothing"
             );
@@ -6578,7 +6835,7 @@ mod tests {
             // what `window_verdict` says and does not decide again.
             assert_eq!(
                 offer.window_verdict,
-                window_verdict(budget.bound, inputs.window, *fit),
+                window_verdict(budget.bound, inputs.window, fit.fit),
                 "{name}: the offer and the classifier disagree"
             );
             // BR-3: every one of them is a question. There is no arm that
@@ -6731,7 +6988,7 @@ mod tests {
         // has not been consulted about it at all.
         let just_over = measured(budget.budget_tokens + 1, 0, false);
         assert_eq!(
-            window_verdict(budget.bound, inputs.window, just_over),
+            window_verdict(budget.bound, inputs.window, just_over.fit),
             WindowVerdict::FitsWindow,
             "the reservation is a policy margin, not the provider's limit"
         );
@@ -6740,11 +6997,11 @@ mod tests {
         let at_the_window = measured(85_333, 0, false);
         let past_the_window = measured(85_334, 0, false);
         assert_eq!(
-            window_verdict(budget.bound, inputs.window, at_the_window),
+            window_verdict(budget.bound, inputs.window, at_the_window.fit),
             WindowVerdict::FitsWindow
         );
         assert_eq!(
-            window_verdict(budget.bound, inputs.window, past_the_window),
+            window_verdict(budget.bound, inputs.window, past_the_window.fit),
             WindowVerdict::ExceedsWindow
         );
 
@@ -6752,7 +7009,7 @@ mod tests {
         // decides: a byte-heavy expansion with almost no words exceeds the same
         // window (256,002 / 2 = 128,001).
         assert_eq!(
-            window_verdict(budget.bound, inputs.window, measured(1, 256_002, false)),
+            window_verdict(budget.bound, inputs.window, measured(1, 256_002, false).fit),
             WindowVerdict::ExceedsWindow,
             "the pair bounds provider tokens in both currencies, so either can be the one that \
              blows the window"
@@ -6847,13 +7104,13 @@ mod tests {
     /// vacuity, in the other axis).
     fn offer_over(
         inputs: BudgetInputs<'_>,
-        fit: Fit,
+        fit: Measured,
         proposal: Option<ProposedWindow>,
         tier: Option<Tier>,
     ) -> OverBudgetOffer {
         let budget = derive(inputs);
         assert!(
-            fit.tokens > budget.budget_tokens || fit.bytes > budget.budget_bytes,
+            fit.fit.tokens > budget.budget_tokens || fit.fit.bytes > budget.budget_bytes,
             "a measurement that fits is never offered about, so this fixture would assert nothing"
         );
         OverBudgetOffer::new(
@@ -6874,7 +7131,7 @@ mod tests {
         proposed_window(
             Some("kimi-k3"),
             remote(0, 0, false),
-            measured(100_000, 400_000, false),
+            measured(100_000, 400_000, false).fit,
         )
         .expect("Moonshot's window clears a skill this size")
     }
@@ -7059,7 +7316,7 @@ mod tests {
     /// rather than read as thorough.
     #[test]
     fn each_window_verdict_pins_its_own_wording() {
-        let rows: &[(&str, BudgetInputs<'_>, Fit, WindowVerdict)] = &[
+        let rows: &[(&str, BudgetInputs<'_>, Measured, WindowVerdict)] = &[
             (
                 "the local engine has no window fact",
                 BudgetInputs::local(),
@@ -7159,7 +7416,7 @@ mod tests {
     /// sentence is not simply pasted onto every `FitsWindow` route.
     #[test]
     fn a_fits_window_offer_never_promises_the_reply_will_fit() {
-        let rows: &[(&str, BudgetInputs<'_>, Fit)] = &[
+        let rows: &[(&str, BudgetInputs<'_>, Measured)] = &[
             (
                 "window",
                 remote(128_000, 0, false),
@@ -7489,7 +7746,7 @@ mod tests {
     /// stated, with the one-time override presented alone.
     #[test]
     fn a_redact_scan_offer_implies_no_durable_fix() {
-        let rows: &[(&str, Fit, WindowVerdict)] = &[
+        let rows: &[(&str, Measured, WindowVerdict)] = &[
             (
                 "inside the window",
                 measured(1_000, REDACT_SCANNABLE_CONTEXT_BYTES + 20_000, false),
@@ -7554,7 +7811,7 @@ mod tests {
     /// asserted present.
     #[test]
     fn every_option_label_names_its_write_or_says_it_writes_nothing() {
-        let rows: &[(&str, BudgetInputs<'_>, Fit, Option<Tier>, &str)] = &[
+        let rows: &[(&str, BudgetInputs<'_>, Measured, Option<Tier>, &str)] = &[
             (
                 "declare a window",
                 remote(0, 0, false),
@@ -7954,11 +8211,12 @@ mod tests {
         // this write could do resolves it.
         let hopeless = measured(200_000, 900_000, false);
         assert!(
-            hopeless.tokens > stamped.budget_tokens || hopeless.bytes > stamped.budget_bytes,
+            hopeless.fit.tokens > stamped.budget_tokens
+                || hopeless.fit.bytes > stamped.budget_bytes,
             "non-vacuity: the row must actually be over budget"
         );
         assert!(
-            !clearing_the_cap_clears(capped, hopeless),
+            !clearing_the_cap_clears(capped, hopeless.fit),
             "a spend ceiling deleted for a refusal that stands anyway"
         );
 
@@ -7966,11 +8224,12 @@ mod tests {
         // what the remedy exists for.
         let resolvable = measured(40_000, 60_000, false);
         assert!(
-            resolvable.tokens > stamped.budget_tokens || resolvable.bytes > stamped.budget_bytes,
+            resolvable.fit.tokens > stamped.budget_tokens
+                || resolvable.fit.bytes > stamped.budget_bytes,
             "non-vacuity: the row must actually be over budget"
         );
         assert!(
-            clearing_the_cap_clears(capped, resolvable),
+            clearing_the_cap_clears(capped, resolvable.fit),
             "the predicate rejects the case BR-7 wrote the remedy for"
         );
 
@@ -7984,13 +8243,13 @@ mod tests {
             derive(BudgetInputs { cap: 0, ..tiny }).floored,
             "the fixture must be the floored case, or this row asserts nothing"
         );
-        assert!(!clearing_the_cap_clears(tiny, measured(1, 1, false)));
+        assert!(!clearing_the_cap_clears(tiny, measured(1, 1, false).fit));
 
         // A route with no cap at all: there is no ceiling to remove, so
         // removing it clears nothing.
         assert!(!clearing_the_cap_clears(
             remote(200_000, 0, false),
-            hopeless
+            hopeless.fit
         ));
     }
 
@@ -8052,6 +8311,176 @@ mod tests {
             question.contains("The durable fix is to"),
             "the fix is still stated: {question}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // REQ-618 BR-4 — a body that fits and leaves no room
+    // ---------------------------------------------------------------------
+
+    /// **BR-4.** The third verdict, and the two it sits between.
+    ///
+    /// Three rows on one route, so the only thing that varies is the body's
+    /// size: comfortably inside the fraction, over it but inside the budget,
+    /// and over the budget itself. The middle row is the new one, and the two
+    /// either side are what make it a *third* answer rather than a rewording of
+    /// one of them.
+    ///
+    /// # Benign path
+    ///
+    /// The first row. A body at a fifth of the byte budget expands with no
+    /// verdict, no sentence and no event — which is the state every skill on a
+    /// REQ-616-sized window is in.
+    #[test]
+    fn a_body_over_the_room_fraction_fits_without_room() {
+        let system = "HEAD";
+        let budget = derive(remote(128_000, 0, false));
+        let ceiling = budget.budget_bytes * ROOM_FRACTION_PERCENT / 100;
+
+        let verdict_for = |bytes: usize| {
+            skill_fit(
+                SkillCaller::User,
+                SkillStage::Body,
+                "status",
+                system,
+                &"x".repeat(bytes),
+                &budget,
+                Some("kimi"),
+            )
+        };
+
+        // Benign: a fifth of the budget expands untouched.
+        assert_eq!(verdict_for(ceiling / 2), SkillFit::Fits);
+        // Exactly at the ceiling is still admitted — the predicate is `>`, so
+        // the fraction is a share a body may take, not one it must stay under.
+        assert_eq!(verdict_for(ceiling), SkillFit::Fits);
+
+        // One byte past it is the new verdict.
+        let no_room = verdict_for(ceiling + 1);
+        let SkillFit::NoRoom {
+            body_bytes,
+            message,
+        } = &no_room
+        else {
+            panic!("a body past the fraction must be `NoRoom`: {no_room:?}");
+        };
+        assert_eq!(*body_bytes, ceiling + 1);
+        assert_eq!(no_room.reason(), Some(NO_ROOM_REASON));
+        // The sentence says it *fits*, names the fraction, and keeps every
+        // figure the over-budget sentence carries — one composer, one arm wider.
+        assert!(
+            message.contains("fits this route's context budget but would leave the turn no room"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "a skill body may take at most {ROOM_FRACTION_PERCENT}%"
+            )),
+            "{message}"
+        );
+        assert!(message.contains("`/status`"), "{message}");
+
+        // And a body over the budget is still the *other* refusal, with the
+        // other reason id: over budget beats no room, because "it does not fit"
+        // is the truer sentence about a body that does not.
+        let too_large = verdict_for(budget.budget_bytes * 2);
+        assert!(
+            matches!(too_large, SkillFit::TooLarge { .. }),
+            "{too_large:?}"
+        );
+        assert_eq!(too_large.reason(), Some(OVER_BUDGET_REASON));
+        let SkillFit::TooLarge { message } = &too_large else {
+            unreachable!()
+        };
+        assert!(
+            message.contains("does not fit this route's context budget"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("no room"),
+            "the two sentences must not blur into one: {message}"
+        );
+    }
+
+    /// **BR-4's arithmetic is one function, and both entry points run it.**
+    ///
+    /// `skill_fit` measures a seed and `skill_append_fit` an append, and before
+    /// REQ-618 each composed its own refusal from its own `Fit`. The room line
+    /// is a third thing they could have come to disagree about, so it lives in
+    /// [`Measured::of`] and both go through it. Asserted by giving them the same
+    /// body on the same route and requiring the same verdict.
+    #[test]
+    fn both_entry_points_draw_the_room_line_in_one_place() {
+        let system = "HEAD";
+        let budget = derive(remote(128_000, 0, false));
+        let body = "x".repeat(budget.budget_bytes * ROOM_FRACTION_PERCENT / 100 + 1);
+
+        let seed = skill_fit(
+            SkillCaller::User,
+            SkillStage::Body,
+            "status",
+            system,
+            &body,
+            &budget,
+            Some("kimi"),
+        );
+        let append = skill_append_fit(
+            SkillCaller::Model,
+            SkillStage::Body,
+            "status",
+            system,
+            "the turn's request",
+            &body,
+            &budget,
+            Some("kimi"),
+        );
+        assert_eq!(seed.reason(), Some(NO_ROOM_REASON), "{seed:?}");
+        assert_eq!(append.reason(), Some(NO_ROOM_REASON), "{append:?}");
+        // The model path renders it as a tool result like any other refusal —
+        // the offer is the typed caller's alone (REQ-589 BR-2).
+        assert!(append.into_tool_refusal().is_some());
+    }
+
+    /// **The room ceiling and the `digest` threshold, measured against each
+    /// other.**
+    ///
+    /// On every route this daemon derives today **except the very largest**, the
+    /// digest threshold is the higher of the two — so a body big enough to be
+    /// digested is already big enough to leave the turn no room, and BR-4's
+    /// refusal pre-empts REQ-587 BR-7's bypass rather than sitting beside it.
+    ///
+    /// The exception is where the finding gets interesting. `digest_threshold_bytes`
+    /// is capped, so past about a 350k-token window it stops rising while the
+    /// room ceiling keeps going — and the two rules come apart again. That is
+    /// the shape of the answer to the open question this REQ leaves: the overlap
+    /// is a property of *small* routes, which is exactly where BR-4 was written
+    /// to bite.
+    ///
+    /// Recorded as a test rather than a comment because it is the thing a change
+    /// to either constant moves, and because "which of the two is higher here"
+    /// is not something a reader can work out from either constant alone. See
+    /// ASSUME-039.
+    #[test]
+    fn the_room_ceiling_and_the_digest_threshold_are_pinned_against_each_other() {
+        // `true` = the digest threshold is the higher, so BR-4 pre-empts the
+        // bypass on that route.
+        let rows: &[(&str, BudgetInputs<'_>, bool)] = &[
+            ("local", BudgetInputs::local(), true),
+            ("no declared window", remote(0, 0, false), true),
+            ("max_context = 128000", remote(128_000, 0, false), true),
+            ("max_context = 1000000", remote(1_000_000, 0, false), false),
+        ];
+        for (name, inputs, digest_is_higher) in rows {
+            let budget = derive(*inputs);
+            let ceiling = budget.budget_bytes * ROOM_FRACTION_PERCENT / 100;
+            assert_eq!(
+                ceiling < budget.digest_threshold_bytes,
+                *digest_is_higher,
+                "{name}: room ceiling {ceiling} B against digest threshold {} B. \
+                 The relationship between these two moved — read this test's doc \
+                 before changing either constant",
+                budget.digest_threshold_bytes
+            );
+        }
     }
 }
 

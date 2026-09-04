@@ -1945,7 +1945,10 @@ fn the_window_written_to_disk_is_the_one_the_offer_named_with_its_date() {
     let offer = OverBudgetOffer::new(
         "analyze",
         SkillStage::Body,
-        measured,
+        budget::Measured {
+            fit: measured,
+            room: budget::Room::Enough,
+        },
         &budget,
         inputs.window,
         Some(proposal.clone()),

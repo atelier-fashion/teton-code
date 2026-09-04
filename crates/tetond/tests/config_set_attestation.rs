@@ -433,7 +433,10 @@ fn a_window_bound_offer() -> OverBudgetOffer {
     OverBudgetOffer::new(
         "analyze",
         SkillStage::Body,
-        measured,
+        budget::Measured {
+            fit: measured,
+            room: budget::Room::Enough,
+        },
         &budget,
         WINDOW,
         budget::proposed_window(Some("kimi-k3"), inputs, measured),

@@ -8333,7 +8333,21 @@ mod tests {
         );
         RouteBudget {
             budget_tokens: snug.tokens,
-            budget_bytes: snug.bytes,
+            // **Snug in words, roomy in bytes** (REQ-618 BR-4).
+            //
+            // These fixtures probe the *band* between an expansion that fits
+            // and one that does not, one notice wide. A budget snug in **both**
+            // currencies would put the body at essentially 100% of the byte
+            // half, and BR-4's room fraction refuses a body over a quarter of it
+            // — so every one of them would come back `NoRoom` and none would
+            // reach the band it exists to measure.
+            //
+            // The band is the same claim in either currency: the notice is prose
+            // and adds words as surely as it adds bytes. So the word half stays
+            // snug and does the refusing, and the byte half is set to four times
+            // the body — exactly the room ceiling, which `leaves_no_room`
+            // admits — so the room question cannot answer for the band question.
+            budget_bytes: snug.bytes.max(body.len().saturating_mul(4)),
             ..HarnessConfig::default().budget
         }
     }

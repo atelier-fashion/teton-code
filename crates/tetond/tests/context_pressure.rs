@@ -1044,11 +1044,17 @@ fn a_skill_that_fits_a_declared_window_reaches_the_provider_whole_and_clamps_not
         MockResponse::ok(openai_turn("Done.", None, 10, 5)),
     );
     let ws = workspace_with_big_skill("skillfit-128k");
+    // 400,000 rather than 128,000 since REQ-618. The claim is "a skill inside
+    // its route's budget runs", and BR-4 narrowed what "inside" means: a body
+    // may take at most a quarter of the byte budget. The 90 KB fixture is 35% of
+    // a 128k route's 254 KB half and would now be *offered* rather than run,
+    // which would be this test measuring the room fraction instead of the fit.
+    // A 400k window puts the same body at 11%.
     let mut config = remote_provider_block_with_window(
         "frontier",
         &provider.openai_endpoint(),
         "claude-opus-4",
-        128_000,
+        400_000,
     );
     config.push_str("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n");
     config.push_str(&all_tiers("frontier"));
