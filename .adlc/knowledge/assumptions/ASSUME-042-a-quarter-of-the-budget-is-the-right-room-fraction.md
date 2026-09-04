@@ -1,5 +1,5 @@
 ---
-id: ASSUME-039
+id: ASSUME-042
 title: "A quarter of the byte budget is the right ceiling for one skill body"
 status: unresolved
 req: REQ-618
@@ -8,6 +8,14 @@ resolved:
 ---
 
 ## Assumption
+
+> **Renumbered from ASSUME-042.** REQ-615 and this REQ ran concurrently in one
+> sprint and both allocated 039; REQ-615's `the-write-gate-is-a-guard-rail-not-a-sandbox`
+> merged first, and REQ-616 then took 040 and 041. The id was re-checked against
+> the remote at branch-creation time, which is before the colliding allocation
+> existed — the same window BUG-210 records. PR #292's body and commit messages
+> still say ASSUME-042; this file and every code reference say 042.
+
 
 `ROOM_FRACTION_PERCENT = 25` — REQ-618 BR-4's rule that a skill body taking more
 than a quarter of the route's byte budget is refused with the arithmetic, even

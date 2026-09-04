@@ -597,6 +597,47 @@
   privacy-blocked draft fails the duty without degrading provider health (REQ-613
   ADR-4, REQ-558 ADR-A/ADR-D, REQ-561, LESSON-456).
 
+- **The content a turn may not forget is a flag the harness sets, and it is
+  re-stated at every seam rather than carried** (REQ-618). Compaction and
+  truncation chose by recency and size, so the oldest block in a turn — the
+  user's prompt, or on a `/skill` turn the expansion that *is* the prompt — was
+  the first thing a pressured session forgot. `ContextBlock.anchor` is now a
+  required field with no `Default`, so a new push path that forgets to say what
+  it is anchoring is a compile error rather than a review catch, and
+  `ContextManager::restate_anchors` is the only writer of anything but
+  `Anchor::None`. Its inputs are role, provenance and position — never block
+  text, which is what makes "nothing in the content can request an anchor"
+  structural instead of a sanitizer, and a source-region check keeps that true
+  against the next author. The set is decided from scratch at each seam that
+  seeds or re-shapes a manager (`CarriedTurn::begin`'s replay and seed, the
+  model-expansion admit), because an anchor is a fact about *this* turn's
+  relationship to a block and a flag that survived a carry unchanged would leave
+  a context with nothing droppable — LESSON-501's rule and `system_sources`'
+  precedent, applied to a second fact. Three consumers bind: the drop loop skips
+  anchors (and still exempts the step in progress), the in-place clamp refuses an
+  anchored last block, and the `compact` duty is given a protected-index *set*
+  beside its droppable count, because the anchors are not a prefix and a count
+  can only express a prefix. When the anchors alone will not fit, the turn is
+  **refused** with the arithmetic rather than answered from a shortened question
+  — a fourth typed outcome with both halves, `failure_class() -> None` and its
+  own arm on the turn path (REQ-618 ADR-618-1/2/4, LESSON-501, LESSON-557,
+  LESSON-568).
+
+- **A new fraction of a budget pre-empts every rule keyed on a larger fraction of
+  it** (REQ-618, LESSON-639). BR-4's room ceiling — a skill body may take at most
+  a quarter of the byte budget — sits *below* `digest_threshold_bytes`, which is
+  about 37 % of the same number until its absolute cap. So a body large enough to
+  be digested is already large enough to be refused for no room, and REQ-587
+  BR-7's fold-whole bypass stopped being observable on any route below roughly a
+  350k-token window; REQ-587's dynamic-output Stage-B refusal became unreachable
+  outright, because a body inside the quarter plus the 8,000-character output cap
+  cannot exceed a budget that floors at 50,000. Neither was named by the spec and
+  neither is visible in a diff showing only the new constant. The order is
+  therefore pinned by a test that walks four routes and records which of the two
+  is higher on each — including the route where the digest cap flips it — rather
+  than by a single inequality that a change to either constant would slide past.
+  ASSUME-042 holds the open question about the fraction's value.
+
 ## ADRs
 
 ### ADR-001: Daemon and CLI in Rust (2026-07-17)
