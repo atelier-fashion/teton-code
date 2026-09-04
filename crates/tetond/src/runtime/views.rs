@@ -788,7 +788,7 @@ mod tests {
 
     /// ADR-A + AC-12, on the projection a client actually reads.
     ///
-    /// The snapshot carries one row per category — all eleven — with the ones
+    /// The snapshot carries one row per category — all twelve — with the ones
     /// that no model call reaches marked, and the BR-9 judgment default beside
     /// them. Both are things `teton policy show` renders and nothing else
     /// computes.
@@ -804,14 +804,16 @@ mod tests {
             a_transcript_dir(),
         );
 
-        assert_eq!(snap.routing.len(), 11, "every category gets a row");
+        // REQ-613 TASK-381: twelve since `draft` joined them.
+        assert_eq!(snap.routing.len(), 12, "every category gets a row");
         let unreached: Vec<&str> = snap
             .routing
             .iter()
             .filter(|r| !r.reached)
             .map(|r| r.category.as_str())
             .collect();
-        // Empty since REQ-562 TASK-070 wired `redact`, the last of the eleven.
+        // Empty since REQ-562 TASK-070 wired `redact`, and still empty after
+        // REQ-613 added `draft` with its duty in the same change.
         // Stated as the census rather than dropped: the loop below is the
         // invariant (every row agrees with `has_call_site`), and this line is
         // what makes a *change* to the set show up as a diff a reviewer reads.

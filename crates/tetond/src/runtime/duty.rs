@@ -19,6 +19,11 @@
 
 use super::*;
 
+// REQ-613 TASK-381: named here rather than added to `runtime`'s own harness
+// import, so the twelfth duty costs this module one line and the module above it
+// none.
+use crate::harness::DRAFT_DUTY;
+
 impl DaemonRuntime {
     /// Resolve the `digest` category for this turn (REQ-558 BR-1, BR-2, BR-7).
     ///
@@ -154,6 +159,46 @@ impl DaemonRuntime {
             router.resolve(Category::Compact)
         };
         self.resolve_duty(COMPACT_DUTY, &route, dctx)
+    }
+
+    /// Resolve the `draft` category for this session (REQ-613 TASK-381, ADR-4).
+    ///
+    /// The same two layers, in the same order, for the same reasons as
+    /// [`Self::digest_route`] — session taint first, then the one resolver — and
+    /// the same reason for existing separately at all: the line naming the
+    /// category is what [`crate::call_sites`]'s derived-marker test reads out of
+    /// the daemon's own source, so it cannot be folded into a helper taking a
+    /// category *variable* without making that scan blind (ADR-3).
+    ///
+    /// `draft` is the one `think` duty. Everything else the harness does on its
+    /// own behalf is `reflex`, `scan` or `build`, because it happens on every
+    /// turn and its cost multiplies; this one happens **once per repository**
+    /// and its answer is read at the start of every session afterwards, which
+    /// inverts the arithmetic (REQ-613 OQ-2). A user who disagrees writes
+    /// `teton policy set-category draft local` and the resolver answers
+    /// differently — no branch here, which is what keeps the policy row the only
+    /// thing that decides.
+    ///
+    /// What it sends is **repository file content**: a listing, a README, a
+    /// manifest. The taint arm above is the session-wide backstop; the
+    /// per-evidence exclusion BR-4 requires happens where the evidence is
+    /// gathered, before a prompt exists, and the remainder is judged at the
+    /// egress choke point by the provenance of the files it came from — so a
+    /// covered file cannot reach the call even on an untainted session.
+    ///
+    /// Visibility: `pub` rather than `pub(super)`, unlike its five siblings,
+    /// because its call site is not in [`crate::runtime`] at all — the
+    /// generation pipeline lives in [`crate::repo_context`] (REQ-613 ADR-6),
+    /// which is the only module that knows the evidence was gathered and the
+    /// offer accepted.
+    pub fn draft_route(&self, dctx: DutyContext<'_>) -> DutyRoute {
+        let (router, session_id) = (dctx.core.router, dctx.core.session_id);
+        let route = if self.session_taint.is_tainted(session_id) {
+            router.resolve_local_pin(taint_pin_reason("the `draft` duty"))
+        } else {
+            router.resolve(Category::Draft)
+        };
+        self.resolve_duty(DRAFT_DUTY, &route, dctx)
     }
 
     /// Name this session after `prompt`, at most once for its whole life

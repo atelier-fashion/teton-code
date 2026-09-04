@@ -1123,13 +1123,18 @@ mod tests {
     /// and no duty module carrying any of the seam's concerns — which is
     /// unchanged by how many entries it has. (`redact`'s call site is not in the
     /// harness at all: it is the egress choke point, REQ-562 ADR-1.)
-    const DUTY_MODULES: [&str; 6] = [
+    const DUTY_MODULES: [&str; 7] = [
         "harness/digest.rs",
         "harness/triage.rs",
         "harness/shell_duty.rs",
         "harness/title.rs",
         "harness/compact.rs",
         "harness/redact.rs",
+        // REQ-613 TASK-381: Draft arm. The seventh duty module, held to the same
+        // "declares a `DutyKind` and none of the seam's concerns" rule as the
+        // six above — without this row its `DutyKind::new(` would make the
+        // one-per-module count disagree with the list.
+        "harness/draft.rs",
     ];
 
     /// The one place in the daemon that maps text to a routing-category *name*,
@@ -1773,7 +1778,12 @@ mod tests {
     /// surface. Only `teton_core`'s `Category` — imported here and, in
     /// `router.rs`, aliased `CoreCategory` — can reach a router.
     fn names_a_duty_category(line: &str) -> bool {
-        const DUTIES: [&str; 6] = ["Digest", "Triage", "Shell", "Title", "Compact", "Redact"];
+        // REQ-613 TASK-381: Draft arm — the twelfth category is a duty category
+        // like the six above, so AC-10's "named, never computed" scan must cover
+        // it too.
+        const DUTIES: [&str; 7] = [
+            "Digest", "Triage", "Shell", "Title", "Compact", "Redact", "Draft",
+        ];
         const ROUTING_TYPE: [&str; 2] = ["Category", "CoreCategory"];
         line.match_indices("Category::").any(|(at, _)| {
             let qualifier: String = line[..at + "Category".len()]

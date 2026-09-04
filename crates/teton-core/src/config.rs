@@ -4627,8 +4627,11 @@ provider_id = "on-device"
             "the opt-in must not have materialized a category override"
         );
 
-        // The pin as a type: nine bindable categories, none of them `redact`.
-        assert_eq!(ConfigurableCategory::ALL.len(), 9);
+        // The pin as a type: ten bindable categories, none of them `redact`.
+        // The census is stated rather than derived so that *adding* one shows up
+        // as a diff a reviewer reads — REQ-613 TASK-381's `draft` is the tenth,
+        // and this line is where it had to be admitted.
+        assert_eq!(ConfigurableCategory::ALL.len(), 10);
         for c in ConfigurableCategory::ALL {
             assert_ne!(Category::from(c), Category::Redact, "{c} maps to redact");
         }

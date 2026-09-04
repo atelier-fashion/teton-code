@@ -265,7 +265,13 @@ pub(crate) fn strip_for_prompt(text: &str) -> Cow<'_, str> {
 /// and a single-line `TETON.md` is a file a repository plausibly writes; losing
 /// all of it to a rule about newlines would be a worse answer than losing its
 /// tail to the rule about bytes.
-fn truncate_at_line_boundary(text: &str, cap: usize) -> &str {
+///
+/// `pub(crate)` since REQ-613 TASK-381: the draft duty bounds a *model answer*
+/// to the same cap, at a line boundary, for the same reason — and the one thing
+/// worse than a second cap would be a second cutter that rounds differently
+/// (LESSON-456). It is the one cutter; `harness::draft::bound_answer` is its
+/// second caller.
+pub(crate) fn truncate_at_line_boundary(text: &str, cap: usize) -> &str {
     if text.len() <= cap {
         return text;
     }

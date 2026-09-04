@@ -87,6 +87,13 @@ pub const fn has_call_site(category: Category) -> bool {
         // until then — egress refused by provenance and nothing else, because a
         // regex pass with no model behind it is not a call site.
         Category::Redact => true,
+        // REQ-613 TASK-381: Draft arm. The twelfth, and the second whose call
+        // site is outside the harness: `harness/draft.rs` owns the duty, its
+        // ceiling and its prompt, and the resolver in `crate::runtime` names the
+        // category — which is the literal this module's derived-marker test
+        // reads out of the daemon's source. The pipeline that performs it lands
+        // in `crate::repo_context` (REQ-613 ADR-6).
+        Category::Draft => true,
     }
 }
 

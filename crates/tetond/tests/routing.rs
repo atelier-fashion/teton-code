@@ -30,7 +30,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 
 use teton_core::category::{
-    category_for_phase, Category, CategoryTable, JudgmentCategory, Tier, TierBinding,
+    category_for_phase, BindingSource, Category, CategoryOverride, CategoryTable,
+    ConfigurableCategory, JudgmentCategory, Tier, TierBinding,
 };
 use teton_core::entities::{BoundaryMode, PrivacyBoundary};
 use teton_core::phase::Phase as CorePhase;
@@ -816,4 +817,133 @@ async fn routed_remote_call_produces_cost_record_and_passes_boundary_inspection(
         events.iter().any(|e| e.event_name() == "route_decided"),
         "the routed call emitted route_decided"
     );
+}
+
+// --------------------------------------------------------------------------
+// 7. `draft` follows `think` by default and a policy row moves it (REQ-613
+//    BR-4, AC-14)
+// --------------------------------------------------------------------------
+
+/// **AC-14.** The repository-notes draft is a routed model call like any other:
+/// it inherits whatever `think` names, a `[[categories]] name = "draft"` row
+/// overrides that, and a machine with no remote provider drafts on the local
+/// tier — with the resolver naming the tier in every case, because the header
+/// ADR-5 writes into the generated file says which tier wrote it.
+///
+/// Driven through the router rather than through a `DaemonRuntime` for the
+/// reason every test in this file is: what AC-14 claims is a *routing* fact, and
+/// the router is where the decision is made. The daemon-side half — that the
+/// draft duty asks this question at all — is the derived call-site marker in
+/// `tetond::call_sites`.
+///
+/// # Mutations
+///
+/// Binding `Category::Draft` to `Tier::Scan` in `teton_core` sends the first
+/// case to the `scan` provider and fails it; dropping `Draft` from
+/// `ConfigurableCategory` makes the override unrepresentable and fails to
+/// compile; making the resolver ignore per-category overrides for it leaves the
+/// second case on `anthropic`.
+#[tokio::test]
+async fn draft_routes_to_the_think_binding_by_default_and_to_local_when_set() {
+    // 1. The default. `think` is bound to a frontier provider, and `draft`
+    //    inherits it because a file written once and read on every later turn is
+    //    the one place the expensive model is the cheap choice (REQ-613 OQ-2).
+    let router = structured_router();
+    let route = router.resolve(Category::Draft);
+    assert_eq!(
+        route.provider_id.as_ref().expect("draft resolves").0,
+        "anthropic",
+        "draft must follow the `think` binding: {}",
+        route.reason
+    );
+    assert_eq!(route.model.as_deref(), Some("claude-opus-4"));
+    let resolution = router.resolution_for(Category::Draft);
+    assert_eq!(resolution.tier, Tier::Think);
+    assert_eq!(resolution.source, BindingSource::TierInheritance);
+    assert!(
+        route.reason.contains("draft"),
+        "the reason names the category: {}",
+        route.reason
+    );
+    // And it is not `design`'s decision borrowed: the two share a tier, and a
+    // row below moves one without the other.
+    assert_eq!(
+        router.resolve(Category::Design).provider_id,
+        route.provider_id
+    );
+
+    // 2. `teton policy set-category draft local` — a `[[categories]]` row like
+    //    any other, and the resolver says the override is what fired.
+    let local_draft = Router::new(
+        CategoryTable::new()
+            .with_local_provider("local")
+            .with_tier(tier(Tier::Think, "anthropic", None))
+            .with_override(CategoryOverride {
+                name: ConfigurableCategory::Draft,
+                provider_id: "local".to_owned(),
+                fallback_id: None,
+            }),
+        Some("anthropic".to_owned()),
+    )
+    .with_provider(
+        "anthropic",
+        ProviderKind::Anthropic,
+        "claude-opus-4",
+        native(),
+        ProviderHealth::Healthy,
+    )
+    .with_provider(
+        "local",
+        ProviderKind::Local,
+        "qwen",
+        native(),
+        ProviderHealth::Healthy,
+    );
+    let route = local_draft.resolve(Category::Draft);
+    assert_eq!(
+        route.provider_id.as_ref().expect("draft resolves").0,
+        "local",
+        "the policy row must move the draft: {}",
+        route.reason
+    );
+    let resolution = local_draft.resolution_for(Category::Draft);
+    assert_eq!(resolution.source, BindingSource::Override);
+    assert_eq!(
+        resolution.tier,
+        Tier::Think,
+        "the tier is a compile-time property; the row moves the provider, not the tier"
+    );
+    // The row is per category: `design` still goes where `think` says.
+    assert_eq!(
+        local_draft
+            .resolve(Category::Design)
+            .provider_id
+            .expect("design resolves")
+            .0,
+        "anthropic"
+    );
+
+    // 3. No remote provider at all. The draft is served locally and the tier is
+    //    still `think`, which is what ADR-5's header line reports.
+    let offline = Router::new(
+        CategoryTable::new()
+            .with_local_provider("local")
+            .with_tier(tier(Tier::Think, "local", None)),
+        None,
+    )
+    .with_provider(
+        "local",
+        ProviderKind::Local,
+        "qwen",
+        native(),
+        ProviderHealth::Healthy,
+    );
+    let route = offline.resolve(Category::Draft);
+    assert_eq!(
+        route.provider_id.as_ref().expect("draft resolves").0,
+        "local",
+        "with nothing remote the draft is written on the local tier: {}",
+        route.reason
+    );
+    assert_eq!(offline.resolution_for(Category::Draft).tier, Tier::Think);
 }

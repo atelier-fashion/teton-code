@@ -5395,6 +5395,11 @@ mod tests {
                     BindingSource::Override,
                     true,
                 ),
+                // REQ-613: the twelfth, sharing `think` with the three above.
+                // Present here because `policy show` is the surface a user
+                // checks before writing `policy set-category draft local`, and a
+                // row the table never rendered is a knob they cannot find.
+                row(Category::Draft, Tier::Think, "anthropic", Inherit, true),
             ],
             judgment_default: Some(Category::Edit),
             privacy: Vec::new(),
@@ -5464,6 +5469,9 @@ mod tests {
         for reached in [
             "route", "digest", "edit", "design", "debug", "review", "triage", "shell", "title",
             "compact",
+            // REQ-613 TASK-381: the twelfth, reached the moment its duty
+            // landed.
+            "draft",
         ] {
             let line = category_row(&rendered, reached);
             assert!(
@@ -5471,6 +5479,23 @@ mod tests {
                 "{reached} is reached and must not be marked: {line}"
             );
         }
+
+        // REQ-613 AC-14, on the surface a user reads before writing
+        // `policy set-category draft local`: the twelfth category has a row, and
+        // the row names the tier it follows and the provider that tier resolved
+        // to. `category_row` above already panics on a missing row; this is the
+        // half that says the row is *informative* rather than merely present.
+        let draft = category_row(&rendered, "draft");
+        assert!(draft.contains("think"), "the draft row names its tier: {draft}");
+        assert!(
+            draft.contains("→ anthropic"),
+            "the draft row names the provider its tier resolved to: {draft}"
+        );
+        assert!(
+            draft.contains("via its tier"),
+            "the draft row says the binding came from `think`, not from a row of \
+             its own: {draft}"
+        );
 
         // BR-6 / AC-11: the "where did this binding come from" column is the
         // resolver's `source`, and nothing else.
@@ -5515,7 +5540,7 @@ mod tests {
         assert!(rendered.contains("inherits default_provider"), "{rendered}");
     }
 
-    /// AC-16 / BR-11: every one of the eleven rows names the content class it
+    /// AC-16 / BR-11: every one of the twelve rows names the content class it
     /// transmits, and `triage` and `compact` name **different** ones despite
     /// sharing the `scan` tier.
     ///
@@ -5535,10 +5560,11 @@ mod tests {
         render_policy(&snapshot, &mut surface);
         let rendered = surface.lines_of(LineKind::Info).join("\n");
 
+        // REQ-613 TASK-381: twelve since `draft` joined them.
         assert_eq!(
             snapshot.routing.len(),
-            11,
-            "AC-16 is about all eleven categories, so the fixture must carry all eleven"
+            12,
+            "AC-16 is about every category, so the fixture must carry them all"
         );
         for row in &snapshot.routing {
             let name = row.category.as_str();
