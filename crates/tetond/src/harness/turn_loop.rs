@@ -82,12 +82,13 @@ use super::repeat::{RepeatLedger, Verdict as RepeatVerdict};
 use super::reply::{append_tool_call, StreamGate};
 use super::shell_duty::SHELL_DUTY;
 use super::tools::docs::bounded_topic_echo;
-use super::tools::skill::{SkillTool, SKILL_TOOL_NAME};
+use super::tools::skill::{self, SkillTool, SKILL_TOOL_NAME};
 use super::tools::{
     RefinedOutcome, ResultDisposition, ToolContext, ToolDuties, ToolOutcome, ToolRegistry,
     DOCS_TOOL_NAME, PROJECTS_TOOL_NAME, WEB_TOOL_NAME,
 };
 use super::triage::TRIAGE_DUTY;
+use teton_protocol::events::BudgetBound;
 
 /// Tools that count as a verification step after an edit.
 const VERIFY_TOOLS: &[&str] = &["shell", "read", "grep"];
@@ -1776,6 +1777,28 @@ async fn run_the_allowed_tool(
     // the same types the five-field destructure produced (`&str` and
     // `&serde_json::Value`) so the body below is untouched.
     let (name, arguments) = (call.name.as_str(), &call.arguments);
+    // ── REQ-617 BR-8: the `skill` cap is a route property ─
+    //
+    // Put the route's cap in force before anything reads it.
+    // Here rather than at construction for the same reason
+    // Stage A's budget is read here: `build_tools` runs
+    // before the route is settled, and the route can be
+    // swapped mid-turn by the privacy pin or a provider
+    // fallback. `config.budget` is the live value, so a turn
+    // that falls back from remote to local gets three for
+    // the calls that follow rather than the twelve it
+    // started with (REQ-586 ADR-3's rule: a fact that
+    // changes on a reroute is re-derived and re-applied
+    // before the next model call).
+    //
+    // Idempotent, and set on every iteration rather than
+    // once, because "every iteration" is what makes the
+    // reroute case work without a second code path.
+    if let Some(tool) = skill_tool(tools) {
+        tool.turn_state().set_cap(skill::per_turn_invocation_cap(
+            config.budget.bound == BudgetBound::LocalEngine,
+        ));
+    }
     // ── REQ-587 BR-7 / ADR-2: Stage A ────────────────────
     //
     // **Here, and not in the tool.** `build_tools` runs

@@ -1,7 +1,7 @@
 ---
 id: TASK-006
 title: "The per-turn skill invocation cap becomes a route property: 12 remote, 3 local"
-status: draft
+status: complete
 parent: REQ-617
 created: 2026-09-04
 updated: 2026-09-04
