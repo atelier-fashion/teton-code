@@ -52,8 +52,14 @@ async fn a_templated_turn_yields_one_well_formed_tool_call() {
         std::env::var("TETON_TEST_GGUF").expect("set TETON_TEST_GGUF to a local GGUF model file");
     // Offload everything to the GPU (the Metal fast path on Apple Silicon), as
     // the real loader does on a GPU-classed machine.
-    let engine = LlamaEngine::load("template-smoke", Path::new(&path), u32::MAX, SMOKE_N_CTX)
-        .expect("load GGUF");
+    let engine = LlamaEngine::load(
+        "template-smoke",
+        Path::new(&path),
+        u32::MAX,
+        SMOKE_N_CTX,
+        teton_inference::KvCacheType::F16,
+    )
+    .expect("load GGUF");
 
     // BR-1: the catalog family embeds a ChatML template, and the engine must
     // recognize it. If this fails, the turn below would silently run on the flat

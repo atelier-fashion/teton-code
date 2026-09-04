@@ -2635,6 +2635,7 @@ impl DaemonRuntime {
                 scripted_engine,
                 catalog.clone(),
                 config.inference.clone(),
+                Arc::clone(events),
             )
         });
         let weights_loader_present = engine_loader.is_some();

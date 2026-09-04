@@ -682,6 +682,13 @@ pub struct EngineLoadReport {
     /// and is the only place that knows whether this load was committed or
     /// abandoned.
     pub window: Option<(u32, String)>,
+    /// `local_window_decided` for this load (REQ-616 BR-3), for the gate to
+    /// publish once it commits.
+    ///
+    /// Carried rather than published by the loader for the same reason
+    /// [`Self::window`] is: a superseded or duty-failed load must not announce a
+    /// window nothing is serving. `None` from a loader that sizes no context.
+    pub window_event: Option<Event>,
 }
 
 /// Loads a local inference engine from installed weights and reports how it
@@ -1602,6 +1609,12 @@ impl ModelConsentGate {
                         // a status line, not a turn.
                         if let Some((n_ctx, ref kv)) = report.window {
                             let _ = self.store.record_window(kv, n_ctx);
+                        }
+                        // BR-3: and announce the window, on the same terms —
+                        // after the commit, so the event describes an engine
+                        // that is genuinely serving.
+                        if let Some(event) = report.window_event.clone() {
+                            self.events.publish(None, event);
                         }
                         self.events.publish(
                             None,

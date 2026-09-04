@@ -817,6 +817,7 @@ pub(super) fn build_engine_loader(
     scripted_engine: bool,
     catalog: teton_inference::Catalog,
     inference: teton_core::config::InferenceConfig,
+    events: Arc<crate::broadcast::EventBus>,
 ) -> Option<Arc<dyn crate::model_consent::LocalEngineLoader>> {
     if scripted_engine {
         return None;
@@ -831,6 +832,7 @@ pub(super) fn build_engine_loader(
         ram_bytes: profile.ram_bytes,
         catalog,
         inference,
+        events,
     }))
 }
 
@@ -844,6 +846,7 @@ pub(super) fn build_engine_loader(
     _scripted_engine: bool,
     _catalog: teton_inference::Catalog,
     _inference: teton_core::config::InferenceConfig,
+    _events: Arc<crate::broadcast::EventBus>,
 ) -> Option<Arc<dyn crate::model_consent::LocalEngineLoader>> {
     None
 }
@@ -903,6 +906,7 @@ impl crate::model_consent::LocalEngineLoader for FakeEngineLoader {
             // The fake loader sizes no context: it exists to drive the gate's
             // stage/commit path, not to allocate one.
             window: None,
+            window_event: None,
         })
     }
 
@@ -1228,6 +1232,13 @@ pub(super) struct LlamaEngineLoader {
     catalog: teton_inference::Catalog,
     /// The user's `[inference]` overrides.
     inference: teton_core::config::InferenceConfig,
+    /// Where `local_window_refused` goes (REQ-616 BR-4).
+    ///
+    /// The *decided* event rides the load report so the gate can withhold it
+    /// from a superseded load. A refusal has no report — it returns `Err` — and
+    /// there is nothing to withhold: the load did not happen and the user needs
+    /// the arithmetic. So it is published here, directly.
+    events: Arc<crate::broadcast::EventBus>,
 }
 
 /// Strip any rendering of `path` out of a third-party error message (BR-11).
@@ -1262,11 +1273,19 @@ impl crate::model_consent::LocalEngineLoader for LlamaEngineLoader {
         //
         // A model the catalog states no trained window for falls back to the
         // default rather than to a guess (REQ-557 ADR-D).
-        let (n_ctx, kv) = match self
+        let fitted = self
             .catalog
             .get(model_name)
-            .and_then(|entry| decide_local_window(entry, self.ram_bytes, &self.inference))
-        {
+            .and_then(|entry| decide_local_window(entry, self.ram_bytes, &self.inference));
+        // BR-3: the event the gate publishes if this load commits. Built here,
+        // where the decision is, so the announcement and the allocation cannot
+        // describe different windows. `kv_cost_estimated` is true because the
+        // decision was made from the measured fallback -- metadata is not
+        // readable until the weights are mapped (LESSON-456: say so).
+        let decided_event = fitted.as_ref().map(|(decision, trained, admissible)| {
+            window_event(decision, *trained, *admissible, true)
+        });
+        let (n_ctx, kv) = match fitted {
             Some((WindowDecision::Fits { n_ctx, kv, .. }, _, _)) => (n_ctx, kv),
             Some((
                 WindowDecision::Refused {
@@ -1276,7 +1295,13 @@ impl crate::model_consent::LocalEngineLoader for LlamaEngineLoader {
                 _,
             )) => {
                 // BR-4: refused loudly, and it does not load. The remedies are
-                // the same list the event carries.
+                // the same list the event carries. Published directly rather
+                // than carried on a report, because a refusal returns `Err` and
+                // has none -- and there is nothing to withhold, since the load
+                // did not happen.
+                if let Some(event) = decided_event {
+                    self.events.publish(None, event);
+                }
                 return Err(format!(
                     "{model_name} needs about {:.1} GiB more RAM than this machine allows the \
                      daemon to use, so no context worth serving fits. Remedies: {}.",
@@ -1292,6 +1317,9 @@ impl crate::model_consent::LocalEngineLoader for LlamaEngineLoader {
                 _,
                 _,
             )) => {
+                if let Some(event) = decided_event {
+                    self.events.publish(None, event);
+                }
                 return Err(format!(
                     "`[inference] n_ctx = {requested}` exceeds {model_name}'s trained window \
                      (n_ctx_train = {n_ctx_train}). The engine applies no RoPE or YaRN scaling, \
@@ -1362,6 +1390,7 @@ impl crate::model_consent::LocalEngineLoader for LlamaEngineLoader {
             // REQ-616 AC-11: what this load actually allocated, for the gate to
             // record once it commits.
             window: Some((n_ctx, kv.as_str().to_owned())),
+            window_event: decided_event,
         })
     }
 

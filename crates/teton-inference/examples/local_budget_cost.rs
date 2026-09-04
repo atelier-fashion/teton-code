@@ -269,7 +269,16 @@ fn resolve_route(&self, session: &SessionId, hint: Option<&RouteHint>) -> RouteD
         let load_start = Instant::now();
         // `u32::MAX` layers = the Metal fast path, matching what
         // `LlamaEngineLoader` requests on Apple Silicon (`runtime.rs`).
-        let engine = LlamaEngine::load("local-budget-cost", &path, u32::MAX, N_CTX)?;
+        let engine = LlamaEngine::load(
+            "local-budget-cost",
+            &path,
+            u32::MAX,
+            N_CTX,
+            // REQ-616: this example measures the budget at the *default*
+            // window, so it loads at the default KV type too. A real load picks
+            // both from `fit_window`.
+            teton_inference::KvCacheType::F16,
+        )?;
         println!("model loaded in {} ms", load_start.elapsed().as_millis());
         println!("model_id: {}", engine.model_id());
         println!();
