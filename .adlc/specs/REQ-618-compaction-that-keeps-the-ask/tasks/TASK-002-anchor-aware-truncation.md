@@ -1,7 +1,7 @@
 ---
 id: TASK-002
 title: "The deterministic drop and the in-place clamp both stop at an anchor"
-status: draft
+status: complete
 parent: REQ-618
 created: 2026-09-04
 updated: 2026-09-04
@@ -21,18 +21,18 @@ last block, and add the two readers BR-1's refusal will need.
 
 ## Acceptance Criteria
 
-- [ ] The drop loop removes the oldest **non-anchored** block each iteration and
+- [x] The drop loop removes the oldest **non-anchored** block each iteration and
       stops when only anchors remain, leaving `over_budget: true` rather than
       dropping one.
-- [ ] The in-place clamp is skipped when the last block is anchored; the context
+- [x] The in-place clamp is skipped when the last block is anchored; the context
       is left over budget and says so.
-- [ ] `anchor_bytes()` sums the anchored blocks plus the system prompt;
+- [x] `anchor_bytes()` sums the anchored blocks plus the system prompt;
       `anchors_fit()` compares it against both budgets.
-- [ ] `PressureReport.anchors_intact` is `true` on every path this method can
+- [x] `PressureReport.anchors_intact` is `true` on every path this method can
       take — by construction, and asserted rather than assumed (BR-1's witness).
-- [ ] Inversion recorded: remove the anchor guard from the drop loop, confirm the
+- [x] Inversion recorded: remove the anchor guard from the drop loop, confirm the
       new tests go red, write the count in the test's doc comment.
-- [ ] `cargo test --workspace --no-fail-fast` green.
+- [x] `cargo test --workspace --no-fail-fast` green.
 
 ## Verification
 

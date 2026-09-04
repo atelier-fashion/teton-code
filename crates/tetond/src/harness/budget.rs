@@ -1497,6 +1497,35 @@ pub const ROOM_FRACTION_PERCENT: usize = 25;
 ///
 /// Integer arithmetic, and multiplication before division so a small budget
 /// does not round its own ceiling to zero.
+///
+/// # The byte half alone, and why that is not LESSON-565's mistake
+///
+/// Every other budget check in this module is a conjunction over both
+/// currencies, and LESSON-565 is about exactly the failure of reasoning about
+/// one half of one. This one is deliberately byte-only, and the arithmetic is
+/// the argument rather than the convention.
+///
+/// At the derived pair's own density — `budget_bytes = budget_tokens × 3` — the
+/// two ceilings are the same line: a body at a quarter of the bytes is a body at
+/// a quarter of the words. They separate only for content whose density differs
+/// from the derivation's, and they separate in opposite directions:
+///
+/// * **Denser than 3 B/word** (minified source, base64, CJK): the byte ceiling
+///   binds first, which is the direction that matters. This is the content that
+///   fills a window fastest and the reason `truncate_to_budget` and
+///   `under_compaction_pressure` measure bytes at all.
+/// * **Sparser than 3 B/word** (a body of very short tokens): a body inside the
+///   byte ceiling can reach roughly 37 % of the *word* budget before the byte
+///   ceiling stops it. That is more of the turn than the fraction nominally
+///   allows — and it is the lenient direction, on the content class that
+///   consumes the fewest real BPE tokens per byte.
+///
+/// A word twin would tighten the sparse case and change nothing about the dense
+/// one. It is not added here because BR-4 states the rule in bytes, the REQ's
+/// own motivating measurement is in bytes, and adding a second conjunct to a
+/// rule whose value is still under review (see [`ROOM_FRACTION_PERCENT`] and
+/// ASSUME-039) would make it harder to move, not easier. The crossover is
+/// written down so the next reader does not have to derive it (LESSON-565).
 #[must_use]
 pub const fn leaves_no_room(body_bytes: usize, budget_bytes: usize) -> bool {
     body_bytes > budget_bytes.saturating_mul(ROOM_FRACTION_PERCENT) / 100

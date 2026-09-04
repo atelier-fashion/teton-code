@@ -3110,6 +3110,16 @@ pub enum ProvenanceClass {
     Unrecognized,
 }
 
+/// How many dropped-block rows a [`ContextCompacted`] record lists before it
+/// starts counting instead (REQ-618 BR-5).
+///
+/// Sized so the list cannot be what pushes the record past the transcript's
+/// 65,536-byte default: 128 rows at roughly 60 bytes of JSON each is under 8 KB,
+/// an order of magnitude of headroom. A drop of more than 128 blocks in one gate
+/// is a carried conversation meeting a much smaller route, and what a reader
+/// needs from it is the totals and the shape — both of which survive the cap.
+pub const COMPACTED_BLOCKS_LISTED: usize = 128;
+
 /// One block a compaction let go — its kind, what it derived from, and how big
 /// it was. Never its content (REQ-618 BR-5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3163,8 +3173,24 @@ pub struct ContextCompacted {
     /// Bytes of the anchor set, which is a subset of [`Self::kept_bytes`] —
     /// reported separately so a reader can see the ask was among what stayed.
     pub anchor_bytes: u64,
-    /// The blocks that went, without their content.
+    /// The blocks that went, without their content — at most
+    /// [`COMPACTED_BLOCKS_LISTED`] of them.
     pub dropped_blocks: Vec<CompactedBlock>,
+    /// How many more went than this list names (REQ-618 BR-5).
+    ///
+    /// The spec's assumption is that this record fits the transcript's
+    /// `max_record_bytes` (65,536) "because it carries counts and kinds, not
+    /// content". That is true of each row and was not yet true of the list: a
+    /// gate clearing a long carried conversation drops as many rows as it drops
+    /// blocks, and an unbounded list is an unbounded record however small its
+    /// elements are. The cap makes the assumption hold by construction, and this
+    /// field is what keeps the *count* honest once the list stops being the
+    /// count — a truncated list with no remainder would understate what was
+    /// forgotten, which is the one thing this record exists to state.
+    ///
+    /// `0` on every record that fits, which is nearly all of them.
+    #[serde(default)]
+    pub dropped_blocks_omitted: u64,
     /// The provider the `compact` duty ran on. `None` on the mechanical
     /// fallback, which ran on nothing.
     ///
@@ -5845,6 +5871,69 @@ mod tests {
         );
 
         assert_eq!(Event::ContextPressure(pressure).name(), "context_pressure");
+    }
+
+    /// **REQ-618 BR-5/BR-4/BR-1.** The three new events round-trip under their
+    /// wire names, and the enum's `name()` arm agrees with the tag `serde`
+    /// writes — two spellings of one fact, which is how one of them drifts.
+    #[test]
+    fn the_req_618_events_round_trip_under_their_wire_names() {
+        let compacted = ContextCompacted {
+            kept_bytes: 1_000,
+            dropped_bytes: 0,
+            summarized_bytes: 3_000,
+            anchor_bytes: 400,
+            dropped_blocks: vec![CompactedBlock {
+                kind: CompactedBlockKind::Tool,
+                provenance_class: ProvenanceClass::Unknown,
+                bytes: 1_500,
+            }],
+            dropped_blocks_omitted: 0,
+            provider_id: Some("local".to_owned()),
+            fallback: false,
+        };
+        let wire = envelope_wire(Event::ContextCompacted(compacted.clone()));
+        assert_eq!(wire["event"], "context_compacted", "{wire}");
+        assert_eq!(wire["summarized_bytes"], 3_000);
+        assert_eq!(wire["dropped_blocks"][0]["kind"], "tool");
+        assert_eq!(wire["dropped_blocks"][0]["provenance_class"], "unknown");
+        assert_eq!(
+            Event::ContextCompacted(compacted).name(),
+            "context_compacted"
+        );
+
+        let no_room = SkillRefusedNoRoom {
+            skill: "analyze".to_owned(),
+            body_bytes: 25_000,
+            budget_bytes: 63_488,
+            room_percent: 25,
+            provider_id: None,
+        };
+        let wire = envelope_wire(Event::SkillRefusedNoRoom(no_room.clone()));
+        assert_eq!(wire["event"], "skill_refused_no_room", "{wire}");
+        assert_eq!(wire["room_percent"], 25);
+        assert_eq!(
+            Event::SkillRefusedNoRoom(no_room).name(),
+            "skill_refused_no_room"
+        );
+
+        let refused = TurnRefusedAnchorsExceedBudget {
+            anchor_bytes: 300_288,
+            budget_bytes: 253_952,
+            anchor_tokens: 75_004,
+            budget_tokens: 84_650,
+            anchor_kinds: vec!["user_ask".to_owned()],
+        };
+        let wire = envelope_wire(Event::TurnRefusedAnchorsExceedBudget(refused.clone()));
+        assert_eq!(
+            wire["event"], "turn_refused_anchors_exceed_budget",
+            "{wire}"
+        );
+        assert_eq!(wire["anchor_kinds"][0], "user_ask");
+        assert_eq!(
+            Event::TurnRefusedAnchorsExceedBudget(refused).name(),
+            "turn_refused_anchors_exceed_budget"
+        );
 
         // The elision of the newest user block — the case that is additionally
         // a turn notice — and the refit, which may have dropped nothing.

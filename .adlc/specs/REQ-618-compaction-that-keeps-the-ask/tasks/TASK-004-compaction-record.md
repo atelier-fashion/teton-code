@@ -1,7 +1,7 @@
 ---
 id: TASK-004
 title: "CompactionRecord: what a compaction kept, dropped and summarized, and what it derived from"
-status: draft
+status: complete
 parent: REQ-618
 created: 2026-09-04
 updated: 2026-09-04
@@ -21,21 +21,21 @@ The summary's opening line is reworded here too.
 
 ## Acceptance Criteria
 
-- [ ] `ProvenanceClass` is `Unknown` / `Rooted` / `None`, derived from `Provenance`
+- [x] `ProvenanceClass` is `Unknown` / `Rooted` / `None`, derived from `Provenance`
       alone; the doc names why `boundary` is absent (ADR-618-3).
-- [ ] `CompactionRecord` carries `kept_bytes`, `dropped_bytes`, `summarized_bytes`,
+- [x] `CompactionRecord` carries `kept_bytes`, `dropped_bytes`, `summarized_bytes`,
       `anchor_bytes`, `dropped_blocks: Vec<(BlockRole, ProvenanceClass, usize)>`
       with **no content**, and `fallback: bool`.
-- [ ] `kept + dropped + summarized == pre-compaction Σ text.len()` and
+- [x] `kept + dropped + summarized == pre-compaction Σ text.len()` and
       `anchor_bytes <= kept_bytes`, both asserted (AC-4) against terms defined as
       in ADR-618-5 — the summary block's own bytes are in none of the three.
-- [ ] The summary block opens with
+- [x] The summary block opens with
       `[summary of <n> earlier blocks, <bytes> bytes; the user's prompts are kept verbatim below]`,
       outside the untrusted envelope (BR-6).
-- [ ] A compaction over an `unknown`-provenance block yields an `unknown` summary
+- [x] A compaction over an `unknown`-provenance block yields an `unknown` summary
       and the record's class says so (BR-7); a summary derived from it is refused
       at remote egress with `privacy_block.path == "<unknown-provenance>"` (AC-9).
-- [ ] `cargo test --workspace --no-fail-fast` green.
+- [x] `cargo test --workspace --no-fail-fast` green.
 
 ## Verification
 

@@ -1,7 +1,7 @@
 ---
 id: TASK-005
 title: "Three new events and one new field on context_pressure"
-status: draft
+status: complete
 parent: REQ-618
 created: 2026-09-04
 updated: 2026-09-04
@@ -21,19 +21,19 @@ something to publish.
 
 ## Acceptance Criteria
 
-- [ ] `context_compacted` carries the `CompactionRecord` fields, the route
+- [x] `context_compacted` carries the `CompactionRecord` fields, the route
       `(provider_id, model)` as `route_decided` already reports it, and `fallback`.
-- [ ] `skill_refused_no_room` carries `skill`, `body_bytes`, `budget_bytes`,
+- [x] `skill_refused_no_room` carries `skill`, `body_bytes`, `budget_bytes`,
       `room_fraction`, `route` and the remedy sentence.
-- [ ] `turn_refused_anchors_exceed_budget` carries `anchor_bytes`, `budget_bytes`
+- [x] `turn_refused_anchors_exceed_budget` carries `anchor_bytes`, `budget_bytes`
       and the anchor kinds.
-- [ ] `ContextPressure.anchors_intact` is `#[serde(default)]` so a frame from a
+- [x] `ContextPressure.anchors_intact` is `#[serde(default)]` so a frame from a
       daemon predating the field means what that daemon could report — the
       posture `bound_floored` already takes.
-- [ ] Each event round-trips under its wire name and each renders one CLI line;
+- [x] Each event round-trips under its wire name and each renders one CLI line;
       the `Event::name()` match stays exhaustive (a missing arm is a compile
       error).
-- [ ] `cargo test --workspace --no-fail-fast` green.
+- [x] `cargo test --workspace --no-fail-fast` green.
 
 ## Verification
 

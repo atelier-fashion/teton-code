@@ -1,7 +1,7 @@
 ---
 id: TASK-001
 title: "Anchor on ContextBlock, assigned by one walk and re-stated at every seeding seam"
-status: draft
+status: complete
 parent: REQ-618
 created: 2026-09-04
 updated: 2026-09-04
@@ -26,20 +26,20 @@ harness-only.
 
 ## Acceptance Criteria
 
-- [ ] `Anchor` has exactly three variants and no `Default`; every `ContextBlock`
+- [x] `Anchor` has exactly three variants and no `Default`; every `ContextBlock`
       literal in the workspace states one, so a new push path that forgets is a
       compile error.
-- [ ] `restate_anchors` assigns `UserAsk` to the newest two **prompt** blocks
+- [x] `restate_anchors` assigns `UserAsk` to the newest two **prompt** blocks
       (`BlockRole::User` + `Provenance::User{..}`), keeps `SkillBody` only on a
       block newer than the newest prompt block, and `None` to everything else.
-- [ ] `CarriedTurn::begin` re-states after `replay` and `push_user_from`, so a
+- [x] `CarriedTurn::begin` re-states after `replay` and `push_user_from`, so a
       block anchored two prompts ago is `None` on the third (BR-8).
-- [ ] A tool result whose text contains `anchor: user_ask` is pushed with
+- [x] A tool result whose text contains `anchor: user_ask` is pushed with
       `Anchor::None` (AC-6) — asserted on the pushed block, not on a sanitizer.
-- [ ] A source-scanning region check fails if any `anchor:` initializer outside
+- [x] A source-scanning region check fails if any `anchor:` initializer outside
       `harness/context.rs` names anything but `Anchor::None`, and the check's own
       inversion is recorded in its doc comment.
-- [ ] `cargo test --workspace --no-fail-fast` green; no `FAILED` in output.
+- [x] `cargo test --workspace --no-fail-fast` green; no `FAILED` in output.
 
 ## Verification
 

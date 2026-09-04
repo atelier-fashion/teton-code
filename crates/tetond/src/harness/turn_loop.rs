@@ -41,7 +41,7 @@ use teton_inference::{ChatFormat, Engine, EngineError, GenParams};
 use teton_protocol::events::{
     CapabilityDeadEnd, CompactedBlock, CompactedBlockKind, ContextCompacted, ContextPressure,
     ContextPressureKind, Event, PrefixCache, ProvenanceClass as WireProvenanceClass, SessionUpdate,
-    SessionUpdatePayload, ToolCallStatus, TurnRefusedAnchorsExceedBudget,
+    SessionUpdatePayload, ToolCallStatus, TurnRefusedAnchorsExceedBudget, COMPACTED_BLOCKS_LISTED,
 };
 use teton_protocol::methods::{SessionRoot, StopReason};
 use teton_protocol::{ProviderId, SessionId};
@@ -996,9 +996,15 @@ impl SessionEvents {
                 dropped_bytes: record.dropped_bytes as u64,
                 summarized_bytes: record.summarized_bytes as u64,
                 anchor_bytes: record.anchor_bytes as u64,
+                dropped_blocks_omitted: record
+                    .dropped_blocks
+                    .len()
+                    .saturating_sub(COMPACTED_BLOCKS_LISTED)
+                    as u64,
                 dropped_blocks: record
                     .dropped_blocks
                     .iter()
+                    .take(COMPACTED_BLOCKS_LISTED)
                     .map(|&(role, class, bytes)| CompactedBlock {
                         kind: match role {
                             BlockRole::User => CompactedBlockKind::User,

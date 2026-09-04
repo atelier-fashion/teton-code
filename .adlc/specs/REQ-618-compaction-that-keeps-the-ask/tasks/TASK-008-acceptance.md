@@ -1,7 +1,7 @@
 ---
 id: TASK-008
 title: "Acceptance: the ask survives, across one compaction and across two prompts"
-status: draft
+status: complete
 parent: REQ-618
 created: 2026-09-04
 updated: 2026-09-04
@@ -19,22 +19,22 @@ than a unit, including the reconstruction of the 2026-09-04 transcript's shape.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: a stub engine at 21,162 tokens, a 25 KB body admitted through BR-4's
+- [x] AC-1: a stub engine at 21,162 tokens, a 25 KB body admitted through BR-4's
       `proceed once`, then 40 KB of tool results; after the compaction the prompt
       block and the body are **byte-identical** to what was pushed and every
       dropped block is a tool result — read from `into_retained`, not inferred
       from an error (LESSON-519).
-- [ ] AC-7: across two prompts with a compaction between them, the second
+- [x] AC-7: across two prompts with a compaction between them, the second
       prompt's request body contains the first prompt's text verbatim; on the
       third it may be summarized.
-- [ ] AC-8: a **reconstruction** of the transcript's third and fourth prompts at
+- [x] AC-8: a **reconstruction** of the transcript's third and fourth prompts at
       the original 21,162-token budget — the `/analyze` prompt line and *"where
       are the results?"* both appear verbatim in the fourth prompt's request
       body. The test's doc comment states it reconstructs rather than replays,
       and why (ADR-618-8).
-- [ ] Each assertion is shown to be able to fail: revert the anchor guard, record
+- [x] Each assertion is shown to be able to fail: revert the anchor guard, record
       how many of these go red in the suite's doc comment.
-- [ ] `cargo test --workspace --no-fail-fast` green.
+- [x] `cargo test --workspace --no-fail-fast` green.
 
 ## Verification
 

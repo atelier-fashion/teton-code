@@ -1,7 +1,7 @@
 ---
 id: TASK-006
 title: "The turn loop publishes every compaction and refuses a turn its anchors cannot fit"
-status: draft
+status: complete
 parent: REQ-618
 created: 2026-09-04
 updated: 2026-09-04
@@ -22,20 +22,20 @@ refusal at the last point where "nothing was sent" is still true.
 
 ## Acceptance Criteria
 
-- [ ] One `context_compacted` per compaction, on both the duty path and the
+- [x] One `context_compacted` per compaction, on both the duty path and the
       mechanical fallback; the fallback's carries `fallback: true` and its
       anchors are still intact (AC-5).
-- [ ] A turn whose anchors alone exceed either budget publishes
+- [x] A turn whose anchors alone exceed either budget publishes
       `turn_refused_anchors_exceed_budget` naming both figures and ends **before**
       `ctx.prepare` — no provider is reached, asserted by an egress-capture test
       showing zero requests (AC-2).
-- [ ] The refusal is a typed outcome with both halves: `failure_class() -> None`
+- [x] The refusal is a typed outcome with both halves: `failure_class() -> None`
       and its own arm on the turn path, so the retry/fallback machinery does not
       act on it and the user is not told "provider failed unrecoverably".
-- [ ] A model-invoked `skill` expansion is pushed with `Anchor::SkillBody`.
-- [ ] Benign path: an ordinary pressured turn whose anchors fit is unaffected —
+- [x] A model-invoked `skill` expansion is pushed with `Anchor::SkillBody`.
+- [x] Benign path: an ordinary pressured turn whose anchors fit is unaffected —
       it compacts, publishes, and reaches the model exactly as today.
-- [ ] `cargo test --workspace --no-fail-fast` green.
+- [x] `cargo test --workspace --no-fail-fast` green.
 
 ## Verification
 

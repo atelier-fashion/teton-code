@@ -1,7 +1,7 @@
 ---
 id: TASK-003
 title: "The compact duty is never offered an anchor, and an answer naming one is rejected whole"
-status: draft
+status: complete
 parent: REQ-618
 created: 2026-09-04
 updated: 2026-09-04
@@ -22,15 +22,15 @@ step-in-progress is already marked, and reject any answer that names one.
 
 ## Acceptance Criteria
 
-- [ ] `compact_offer` renders an anchored block with a note in the same shape as
+- [x] `compact_offer` renders an anchored block with a note in the same shape as
       `PROTECTED_BLOCK_NOTE`, naming why it cannot be forgotten.
-- [ ] `read_compaction` rejects an answer naming any protected index, returning a
+- [x] `read_compaction` rejects an answer naming any protected index, returning a
       degraded reason — never a partial application (REQ-561 BR-4 unchanged).
-- [ ] A duty answer naming only droppable indices still applies, so the change
+- [x] A duty answer naming only droppable indices still applies, so the change
       protects without retiring compaction (benign path).
-- [ ] Inversion recorded: drop the protected set from `read_compaction`, confirm
+- [x] Inversion recorded: drop the protected set from `read_compaction`, confirm
       the rejection test goes red.
-- [ ] `cargo test --workspace --no-fail-fast` green.
+- [x] `cargo test --workspace --no-fail-fast` green.
 
 ## Verification
 

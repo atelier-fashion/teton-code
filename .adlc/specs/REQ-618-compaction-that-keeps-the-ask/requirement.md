@@ -1,7 +1,7 @@
 ---
 id: REQ-618
 title: "Compaction that keeps the ask — the user's prompt and the active skill body survive every compaction, a skill body that cannot fit the route is refused with its size, and every compaction is a transcript record"
-status: approved
+status: complete
 deployable: true
 created: 2026-09-04
 updated: 2026-09-04
@@ -77,26 +77,26 @@ turn.
 
 ## Business Rules
 
-- [ ] BR-1: **The ask is an anchor.** The current turn's user prompt block and the previous turn's user prompt block carry `anchor: user_ask`. A compaction that would need to summarize or drop them is not performed; instead the oldest non-anchor blocks are dropped until the budget fits, and if it still does not, the turn is refused with `turn_refused_anchors_exceed_budget` (REQ-586: nothing is clamped in silence).
-- [ ] BR-2: **The active skill body is an anchor for its turn.** A skill expansion carries `anchor: skill_body` for the turn in which it was expanded; on the next prompt turn it is an ordinary block. A model-invoked skill (REQ-587) anchors the same way; two anchored bodies in one turn are refused at the second expansion with the arithmetic (this is the case BR-4 governs).
-- [ ] BR-3: **Anchors are harness-assigned and provenance-carrying.** The anchor flag is set from the block's kind at push time; nothing in the block's text can request it (LESSON-624: markers in content are content). An anchored block keeps its provenance and is inspected at egress like any other; an anchor never exempts a block from a `local-only` refusal.
-- [ ] BR-4: **A skill that fits the budget but leaves no room is refused with numbers.** `SkillFitVerdict` is computed before expansion: `fits_without_room` when the body exceeds `room_fraction` of the route's byte budget. The refusal is typed, names the body size, the budget, the fraction and the remedy, and goes through REQ-589's offer so the user may proceed once. On a route at REQ-616's local window the shipped ADLC bodies all fit; the rule exists for the routes that are not there.
-- [ ] BR-5: **Every compaction is a transcript record.** `context_compacted` is published on the bus and therefore reaches the transcript tap; it carries the byte totals, the dropped block list without content, and the route. The mechanical-truncation fallback emits the same record with `fallback: true` (LESSON-447: degrade loudly, never fold silently).
-- [ ] BR-6: **The compaction summary says what it replaced.** The summary block the `compact` duty produces opens with a harness-authored line: *"[summary of <n> earlier blocks, <bytes> bytes, from turns <a>–<b>; the user's prompts are kept verbatim below]"*. The line is outside the untrusted frame, so the model can distinguish a summary from a tool result (LESSON-500: what the cache holds is not what context holds; the model must be told the same).
-- [ ] BR-7: **A summary of unknown or boundary provenance keeps it.** Unchanged from today, restated because BR-5's `provenance_class` field makes it visible: a compaction over an `unknown` block yields an `unknown` summary (REQ-544 C-2).
-- [ ] BR-8: **`RetainedContext` carries anchors across prompts.** REQ-567's carry keeps the previous turn's `user_ask` anchor so the next prompt's model sees the last thing the user asked even after a compaction between the two prompts; the anchor lapses one turn later (two prompts back is ordinary history).
+- [x] BR-1: **The ask is an anchor.** The current turn's user prompt block and the previous turn's user prompt block carry `anchor: user_ask`. A compaction that would need to summarize or drop them is not performed; instead the oldest non-anchor blocks are dropped until the budget fits, and if it still does not, the turn is refused with `turn_refused_anchors_exceed_budget` (REQ-586: nothing is clamped in silence).
+- [x] BR-2: **The active skill body is an anchor for its turn.** A skill expansion carries `anchor: skill_body` for the turn in which it was expanded; on the next prompt turn it is an ordinary block. A model-invoked skill (REQ-587) anchors the same way; two anchored bodies in one turn are refused at the second expansion with the arithmetic (this is the case BR-4 governs).
+- [x] BR-3: **Anchors are harness-assigned and provenance-carrying.** The anchor flag is set from the block's kind at push time; nothing in the block's text can request it (LESSON-624: markers in content are content). An anchored block keeps its provenance and is inspected at egress like any other; an anchor never exempts a block from a `local-only` refusal.
+- [x] BR-4: **A skill that fits the budget but leaves no room is refused with numbers.** `SkillFitVerdict` is computed before expansion: `fits_without_room` when the body exceeds `room_fraction` of the route's byte budget. The refusal is typed, names the body size, the budget, the fraction and the remedy, and goes through REQ-589's offer so the user may proceed once. On a route at REQ-616's local window the shipped ADLC bodies all fit; the rule exists for the routes that are not there.
+- [x] BR-5: **Every compaction is a transcript record.** `context_compacted` is published on the bus and therefore reaches the transcript tap; it carries the byte totals, the dropped block list without content, and the route. The mechanical-truncation fallback emits the same record with `fallback: true` (LESSON-447: degrade loudly, never fold silently).
+- [x] BR-6: **The compaction summary says what it replaced.** The summary block the `compact` duty produces opens with a harness-authored line: *"[summary of <n> earlier blocks, <bytes> bytes, from turns <a>–<b>; the user's prompts are kept verbatim below]"*. The line is outside the untrusted frame, so the model can distinguish a summary from a tool result (LESSON-500: what the cache holds is not what context holds; the model must be told the same).
+- [x] BR-7: **A summary of unknown or boundary provenance keeps it.** Unchanged from today, restated because BR-5's `provenance_class` field makes it visible: a compaction over an `unknown` block yields an `unknown` summary (REQ-544 C-2).
+- [x] BR-8: **`RetainedContext` carries anchors across prompts.** REQ-567's carry keeps the previous turn's `user_ask` anchor so the next prompt's model sees the last thing the user asked even after a compaction between the two prompts; the anchor lapses one turn later (two prompts back is ordinary history).
 
 ## Acceptance Criteria
 
-- [ ] AC-1: With a stub engine sized at 21,162 tokens, a turn that expands a 25 KB skill body — over `room_fraction` at that budget, so admitted through BR-4's offer with `proceed once` — and then receives 40 KB of tool results triggers compaction; after it, the user's prompt block and the skill body are byte-identical to what was pushed, and the dropped blocks are all tool results (`inspect, don't infer` — the retained context is read from `into_retained`, LESSON-519).
-- [ ] AC-2: A turn whose anchors alone exceed the budget is refused with `turn_refused_anchors_exceed_budget` naming both figures; nothing is sent to the model.
-- [ ] AC-3: A skill body at 30 % of a route's byte budget (with `room_fraction = 0.25`) yields `skill_refused_no_room` and REQ-589's offer; `proceed once` expands it and anchors it; `decline` ends the turn with no model call.
-- [ ] AC-4: The transcript of AC-1's session contains one `context_compacted` record per compaction, each with `kept_bytes + dropped_bytes + summarized_bytes` equal to the pre-compaction total and `anchor_bytes ≤ kept_bytes`.
-- [ ] AC-5: When the `compact` duty's engine fails, the mechanical fallback emits `context_compacted { fallback: true }` and the anchors are still intact.
-- [ ] AC-6: A tool result whose text contains `anchor: user_ask` or a `[summary of …]` line is pushed with `anchor: none` and inside the untrusted frame (LESSON-550: assert the absence of the effect, not the presence of the sanitizer).
-- [ ] AC-7: Across two prompts with a compaction between them, the second prompt's request body contains the first prompt's text verbatim; on the third prompt it may be summarized.
-- [ ] AC-8: The 2026-09-04 transcript's third and fourth prompts replayed against a stub model with the original 21,162-token budget: the fourth prompt's request body contains the `/analyze` prompt line and the user's *"where are the results?"* verbatim.
-- [ ] AC-9: A summary block derived from an `unknown` provenance block is refused at remote egress; `privacy_block.path` is `<unknown-provenance>`.
+- [x] AC-1: With a stub engine sized at 21,162 tokens, a turn that expands a 25 KB skill body — over `room_fraction` at that budget, so admitted through BR-4's offer with `proceed once` — and then receives 40 KB of tool results triggers compaction; after it, the user's prompt block and the skill body are byte-identical to what was pushed, and the dropped blocks are all tool results (`inspect, don't infer` — the retained context is read from `into_retained`, LESSON-519).
+- [x] AC-2: A turn whose anchors alone exceed the budget is refused with `turn_refused_anchors_exceed_budget` naming both figures; nothing is sent to the model.
+- [x] AC-3: A skill body at 30 % of a route's byte budget (with `room_fraction = 0.25`) yields `skill_refused_no_room` and REQ-589's offer; `proceed once` expands it and anchors it; `decline` ends the turn with no model call.
+- [x] AC-4: The transcript of AC-1's session contains one `context_compacted` record per compaction, each with `kept_bytes + dropped_bytes + summarized_bytes` equal to the pre-compaction total and `anchor_bytes ≤ kept_bytes`.
+- [x] AC-5: When the `compact` duty's engine fails, the mechanical fallback emits `context_compacted { fallback: true }` and the anchors are still intact.
+- [x] AC-6: A tool result whose text contains `anchor: user_ask` or a `[summary of …]` line is pushed with `anchor: none` and inside the untrusted frame (LESSON-550: assert the absence of the effect, not the presence of the sanitizer).
+- [x] AC-7: Across two prompts with a compaction between them, the second prompt's request body contains the first prompt's text verbatim; on the third prompt it may be summarized.
+- [x] AC-8: The 2026-09-04 transcript's third and fourth prompts replayed against a stub model with the original 21,162-token budget: the fourth prompt's request body contains the `/analyze` prompt line and the user's *"where are the results?"* verbatim.
+- [x] AC-9: A summary block derived from an `unknown` provenance block is refused at remote egress; `privacy_block.path` is `<unknown-provenance>`.
 
 ## External Dependencies
 
@@ -109,7 +109,7 @@ turn.
 
 ## Open Questions
 
-- [ ] OQ-1: Should the `repo_context` block (`TETON.md`, REQ-612) be an anchor? Recommended: yes — it is resident data the user asked for, and it is already capped at 8 KiB.
+- [x] OQ-1 (**answered — ADR-618-1**): yes in spirit, and already true in fact, so no variant was added. `truncate_to_budget` removes `self.blocks[0]` and never touches `self.system`, and REQ-612 ADR-2 put `TETON.md` in the system prompt precisely to keep it out of that order — so the notes are un-droppable by construction, which is stronger than a flag. Shipping `repo_context` and `system` anchor variants would have been two variants nothing can assign. Original text: Should the `repo_context` block (`TETON.md`, REQ-612) be an anchor? Recommended: yes — it is resident data the user asked for, and it is already capped at 8 KiB.
 - [ ] OQ-2: Should a compaction ever be triggered *between* prompts (idle compaction) rather than only when a turn needs room? Out of scope here; noted for REQ-567's successor.
 
 ## Out of Scope

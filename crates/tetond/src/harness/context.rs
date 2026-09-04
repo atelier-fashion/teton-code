@@ -1701,6 +1701,17 @@ impl ContextManager {
     /// with [`Self::estimated_tokens`] is what stops the check and the budget
     /// from being computed two different ways.
     fn tokens_of(&self, blocks: &[ContextBlock]) -> usize {
+        self.tokens_over(blocks.iter())
+    }
+
+    /// [`Self::tokens_of`] over any block sequence, without needing a slice.
+    ///
+    /// The anchor readers measure a *subset* of the block list, and a slice
+    /// would mean cloning up to three blocks — one of which can be a 25 KB
+    /// skill body — on every call. [`Self::anchors_fit`] runs at the top of
+    /// every loop iteration, so that clone would be paid once per tool result
+    /// for the length of every pressured turn.
+    fn tokens_over<'a>(&self, blocks: impl Iterator<Item = &'a ContextBlock>) -> usize {
         let mut n = approx_tokens(&self.system);
         for b in blocks {
             n += approx_tokens(&b.text);
@@ -1736,6 +1747,31 @@ impl ContextManager {
         self.system.len()
             + blocks
                 .iter()
+                .map(|b| b.text.len() + RENDER_OVERHEAD_RESERVE_BYTES)
+                .sum::<usize>()
+            + fixed
+    }
+
+    /// [`Self::bytes_of`] over any block sequence — the byte twin of
+    /// [`Self::tokens_over`], and for the same reason.
+    ///
+    /// The `fixed` term is duplicated rather than factored out with
+    /// `bytes_of` because factoring it would mean a third function whose only
+    /// job is to be called by two others; the two lines that matter are the
+    /// same two lines, and a test pins that they agree.
+    fn bytes_over<'a>(
+        &self,
+        blocks: impl Iterator<Item = &'a ContextBlock>,
+        truncated: bool,
+    ) -> usize {
+        let fixed = RENDER_OVERHEAD_RESERVE_BYTES
+            + if truncated {
+                TRUNCATION_NOTE_BYTES + CONTINUATION_USER_TURN.len()
+            } else {
+                0
+            };
+        self.system.len()
+            + blocks
                 .map(|b| b.text.len() + RENDER_OVERHEAD_RESERVE_BYTES)
                 .sum::<usize>()
             + fixed
@@ -2446,6 +2482,21 @@ impl ContextManager {
     /// The anchor set's shape — how many blocks and how many bytes of text —
     /// which is everything [`Self::truncate_to_budget`] could change about it
     /// (REQ-618 BR-1).
+    ///
+    /// # Not [`Self::anchor_bytes`], and the difference matters
+    ///
+    /// This sums raw `text.len()`; `anchor_bytes` measures through
+    /// [`Self::bytes_over`], which adds the system prompt and the per-block
+    /// render reserve. Two different numbers for two different questions: this
+    /// one is a *fingerprint*, compared only against itself before and after the
+    /// gate, where every constant term would cancel anyway; `anchor_bytes` is a
+    /// figure a refusal prints and a budget is compared against, so it has to be
+    /// what the provider would actually be handed.
+    ///
+    /// Using either one for the other's job would be wrong in a way nothing
+    /// would catch: a fingerprint carrying the system prompt still detects a
+    /// dropped anchor, and a refusal quoting raw text lengths would understate
+    /// the turn by the render overhead and refuse a byte late.
     fn anchor_shape(&self) -> (usize, usize) {
         self.anchors()
             .fold((0, 0), |(n, bytes), b| (n + 1, bytes + b.text.len()))
@@ -2465,8 +2516,7 @@ impl ContextManager {
     /// `prepare` appends is a cost this measurement owes.
     #[must_use]
     pub fn anchor_bytes(&self) -> usize {
-        let anchors: Vec<ContextBlock> = self.anchors().cloned().collect();
-        self.bytes_of(&anchors, true)
+        self.bytes_over(self.anchors(), true)
     }
 
     /// Whether the anchor set alone fits both budgets (REQ-618 BR-1, AC-2).
@@ -2500,15 +2550,12 @@ impl ContextManager {
     /// what [`Self::anchors_fit`] compares (REQ-618 BR-1).
     #[must_use]
     pub fn anchor_tokens(&self) -> usize {
-        let anchors: Vec<ContextBlock> = self.anchors().cloned().collect();
-        self.tokens_of(&anchors)
+        self.tokens_over(self.anchors())
     }
 
     #[must_use]
     pub fn anchors_fit(&self) -> bool {
-        let anchors: Vec<ContextBlock> = self.anchors().cloned().collect();
-        self.bytes_of(&anchors, true) <= self.budget_bytes
-            && self.tokens_of(&anchors) <= self.budget_tokens
+        self.anchor_bytes() <= self.budget_bytes && self.anchor_tokens() <= self.budget_tokens
     }
 
     /// The kinds in the anchor set, deduplicated and in a stable order — what
@@ -6363,5 +6410,37 @@ mod tests {
         // And it names no turn range, because this daemon has no turn ordinals
         // to name (ADR-618-7).
         assert!(!summary[..line_end].contains("turns "), "{summary}");
+    }
+
+    /// **The two estimator spellings agree.** `bytes_of` takes a slice and
+    /// `bytes_over` an iterator, and the `fixed` term is written out in both —
+    /// which is one duplication, and this is what stops it becoming two
+    /// answers. Same for the word pair.
+    #[test]
+    fn the_slice_and_iterator_estimators_agree() {
+        let mut ctx = ContextManager::new("a system prompt of some length", 1_000);
+        ctx.push_user("the question");
+        ctx.push_tool_result("read", None, "x".repeat(4_000));
+        ctx.push_model("an answer");
+        let blocks = ctx.blocks().to_vec();
+
+        for truncated in [false, true] {
+            assert_eq!(
+                ctx.bytes_of(&blocks, truncated),
+                ctx.bytes_over(blocks.iter(), truncated),
+                "truncated = {truncated}"
+            );
+        }
+        assert_eq!(ctx.tokens_of(&blocks), ctx.tokens_over(blocks.iter()));
+
+        // And over a *subset*, which is the case the iterator spelling exists
+        // for: the anchors are never a slice of the block list.
+        let anchors: Vec<ContextBlock> = ctx.anchors().cloned().collect();
+        assert_eq!(
+            ctx.bytes_of(&anchors, true),
+            ctx.anchor_bytes(),
+            "the anchor reader and the slice estimator must agree"
+        );
+        assert_eq!(ctx.tokens_of(&anchors), ctx.anchor_tokens());
     }
 }
