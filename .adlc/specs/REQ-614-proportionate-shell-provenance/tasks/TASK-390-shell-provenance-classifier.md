@@ -71,3 +71,13 @@ where every token was understood (ADR-614-1).
 - Show each test can fail: invert the verdict default and count what goes
   red; record the number in the module's doc comment (conventions.md,
   LESSON-569).
+- **Match against every row of `effective_boundaries()`, with no
+  `BoundaryMode` branch.** The spec says "a `local-only` boundary glob", and
+  `LocalOnly` is the only mode in use — `RedactThenRemote` is declared
+  post-MVP and unimplemented. `BoundaryMatcher::match_path` does not branch
+  on mode and neither does the egress inspector; matching all rows is both
+  consistent with them and the fail-closed direction. A mode branch here
+  would be a second opinion about a question the matcher already answers.
+- The subtree scan takes its budget from the `WalkPolicy` already on
+  `ToolContext` (`walk`, tools/mod.rs:167) — passed in as a parameter, so the
+  module stays pure policy and testable without a context.

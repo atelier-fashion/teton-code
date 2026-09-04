@@ -3,11 +3,12 @@
   "branch": "feat/REQ-614-proportionate-shell-provenance",
   "startedAt": "2026-09-04T00:00:00Z",
   "completed": false,
-  "currentPhase": 3,
+  "currentPhase": 4,
   "completedPhases": [
     0,
     1,
-    2
+    2,
+    3
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -27,6 +28,12 @@
       "name": "Architect & Tasks",
       "completedAt": "2026-09-04T19:43:51.206718Z",
       "result": "7 ADRs, 8 tasks (TASK-390..397), OQ-1/2/3 resolved, footprint published to PR #288"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-09-04T19:45:12.068846Z",
+      "result": "APPROVED; fixed TASK-397 dep count (4->3), added boundary-mode and project-root fixture notes. Obligation coverage 10/10 BR, 12/12 AC; benign paths present for all 4 detection-shaped BRs. Vacuous-run gate deferred to the real cargo test run in Phase 4/5."
     }
   ],
   "repos": {

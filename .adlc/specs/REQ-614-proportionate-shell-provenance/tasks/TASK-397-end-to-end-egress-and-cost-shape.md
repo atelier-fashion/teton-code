@@ -5,7 +5,7 @@ status: draft
 parent: REQ-614
 created: 2026-09-04
 updated: 2026-09-04
-dependencies: [TASK-391, TASK-392, TASK-395, TASK-396]
+dependencies: [TASK-391, TASK-395, TASK-396]
 ---
 
 ## Description
@@ -57,3 +57,10 @@ claim.
   look local (LESSON-550).
 - Rebuild binaries before any end-to-end run: a stale binary passing an e2e
   assertion is a false green this repo has paid for before.
+- **The fixture root must be a project** (a VCS directory or a top-level
+  build manifest). ADR-614-2 makes `rooted` require `RootKind::Project`, so a
+  bare `mktemp -d` root classifies every command `unknown` and AC-12 fails
+  for a reason that has nothing to do with the classifier. Plant the marker.
+- `TASK-392` is a transitive dependency through both `TASK-395` and
+  `TASK-396`; it is not listed separately to keep the direct dependency count
+  at three.
