@@ -1764,6 +1764,20 @@ fn route_for(bound: BudgetBound, verdict: WindowVerdict) -> (Fixture, Option<Moc
             // route to (12,650, 50,000), and a body inside the old band was no
             // longer over budget at all, so the cell stopped producing an offer.
             // 30,000 is the narrowest round window that is **not** floored.
+            //
+            // The body was 51,700 bytes until REQ-615, which added 278 bytes to
+            // the resident system prompt (176 for the `shell` tool's cwd
+            // sentence, 102 because BR-3's dictation made the worst-case
+            // environment-block row the home one). That pushed `measured` from
+            // 59,779 to 60,057 — 57 bytes past `window × 2` — and the cell
+            // reported `ExceedsWindow`.
+            //
+            // **Re-centred rather than nudged.** The framing overhead between
+            // the body and `measured` is 8,357 bytes, so the band admits a body
+            // in (49,595, 51,643]; 50,600 sits near its middle with ~1 KiB of
+            // clearance on each side, where 51,700 had 221 bytes above it. Two
+            // REQs in a row have moved this cell by growing the prompt, and the
+            // next one should not have to.
             let provider = vendor();
             let fx = Fixture::new(Spec::new(
                 "v6wfit",
@@ -1773,7 +1787,7 @@ fn route_for(bound: BudgetBound, verdict: WindowVerdict) -> (Fixture, Option<Moc
                     Some(30_000),
                     None,
                 ),
-                sized_body(10_000, 51_700),
+                sized_body(10_000, 50_600),
             ));
             (fx, Some(provider))
         }

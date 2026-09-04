@@ -70,14 +70,12 @@ impl Tool for EditTool {
             == crate::harness::root_gate::WriteVerdict::RefusedNonProject
         {
             if let Some(events) = self.events.as_ref() {
-                events.write_refused_non_project(
-                    teton_protocol::events::WriteRefusedNonProject {
-                        tool: "edit".to_owned(),
-                        root_display: ctx.root_display().to_owned(),
-                        root_kind: ctx.root_kind(),
-                        remedy: crate::harness::root_gate::WRITE_REMEDY.to_owned(),
-                    },
-                );
+                events.write_refused_non_project(teton_protocol::events::WriteRefusedNonProject {
+                    tool: "edit".to_owned(),
+                    root_display: ctx.root_display().to_owned(),
+                    root_kind: ctx.root_kind(),
+                    remedy: crate::harness::root_gate::WRITE_REMEDY.to_owned(),
+                });
             }
             return ToolOutcome::error(crate::harness::root_gate::write_refusal(
                 ctx.root_display(),
@@ -434,7 +432,11 @@ mod tests {
                 &json!({ "path": "TETON.md", "old_string": "before", "new_string": "after" }),
             );
             assert!(!out.is_error, "{kind:?}: {}", out.content);
-            assert_eq!(std::fs::read_to_string(&file).unwrap(), "after\n", "{kind:?}");
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                "after\n",
+                "{kind:?}"
+            );
         }
         std::fs::remove_dir_all(&root).ok();
     }

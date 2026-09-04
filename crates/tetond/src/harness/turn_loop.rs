@@ -2797,6 +2797,7 @@ const NON_PROJECT_DICTATION: &str = " This is not a project. Do not create files
 /// differ in which fields exist at all — a non-project root carries no name and
 /// no branch, and giving it one to make a single worst case would measure a
 /// line the block can never emit.
+#[cfg(test)]
 fn worst_case_non_project_root() -> SessionRoot {
     use teton_protocol::methods::RootKind;
 
@@ -2954,6 +2955,7 @@ fn byte_bounded_root(root: &SessionRoot) -> SessionRoot {
 /// what keeps that a **measurement** rather than an arithmetic restatement free
 /// to drift from the sweeps: one derivation, now shared by the clause and the
 /// two ceiling sweeps that already read it.
+#[cfg(test)]
 pub(crate) fn worst_case_session_root() -> SessionRoot {
     // REQ-615: the largest row is no longer always the project one. BR-3's
     // dictation rides the non-project branch and is longer than the name and
@@ -6481,14 +6483,12 @@ mod tests {
             }
         }
 
-        for (kind, display) in [(RootKind::Plain, "~/scratch")] {
-            let block = environment_block(&row(kind, display));
-            assert!(
-                !block.contains("This is not a project."),
-                "a {kind:?} root is where a project gets scaffolded — REQ-613's \
-                 TETON.md write lands here (BR-4's carve-out):\n{block}"
-            );
-        }
+        let plain = environment_block(&row(RootKind::Plain, "~/scratch"));
+        assert!(
+            !plain.contains("This is not a project."),
+            "a plain root is where a project gets scaffolded — REQ-613's \
+             TETON.md write lands here (BR-4's carve-out):\n{plain}"
+        );
     }
 
     /// **REQ-615 BR-9: a project root's block is what REQ-583 rendered.**
@@ -7082,11 +7082,17 @@ mod tests {
         let project_worst = worst_case_project_root();
         assert_eq!(project_worst.display.chars().count(), DISPLAY_MAX_CHARS);
         assert_eq!(
-            project_worst.project_name.as_deref().map(|n| n.chars().count()),
+            project_worst
+                .project_name
+                .as_deref()
+                .map(|n| n.chars().count()),
             Some(NAME_MAX_CHARS)
         );
         assert_eq!(
-            project_worst.vcs_branch.as_deref().map(|b| b.chars().count()),
+            project_worst
+                .vcs_branch
+                .as_deref()
+                .map(|b| b.chars().count()),
             Some(NAME_MAX_CHARS)
         );
         let worst = worst_case_session_root();

@@ -1741,15 +1741,13 @@ impl SkillTool {
             };
             self.gate.events().publish(
                 Some(self.gate.session_id().clone()),
-                Event::SkillRefusedNeedsProject(
-                    teton_protocol::events::SkillRefusedNeedsProject {
-                        skill: skill.name.clone(),
-                        source: skill.source,
-                        root_display: ctx.root_display().to_owned(),
-                        root_kind: ctx.root_kind(),
-                        known_projects: ctx.known_projects().to_vec(),
-                    },
-                ),
+                Event::SkillRefusedNeedsProject(teton_protocol::events::SkillRefusedNeedsProject {
+                    skill: skill.name.clone(),
+                    source: skill.source,
+                    root_display: ctx.root_display().to_owned(),
+                    root_kind: ctx.root_kind(),
+                    known_projects: ctx.known_projects().to_vec(),
+                }),
             );
             return self.refuse(ctx, args, refusal);
         }
@@ -1930,13 +1928,11 @@ impl SkillTool {
             ) {
                 self.gate.events().publish(
                     Some(self.gate.session_id().clone()),
-                    Event::SkillPreambleFallback(
-                        teton_protocol::events::SkillPreambleFallback {
-                            skill: skill.name.clone(),
-                            command_index: index,
-                            root_display: ctx.root_display().to_owned(),
-                        },
-                    ),
+                    Event::SkillPreambleFallback(teton_protocol::events::SkillPreambleFallback {
+                        skill: skill.name.clone(),
+                        command_index: index,
+                        root_display: ctx.root_display().to_owned(),
+                    }),
                 );
             }
         }

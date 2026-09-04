@@ -2341,6 +2341,15 @@ mod tests {
     /// 931-byte cut it makes to every scanned route's budget — is
     /// `egress::redact`'s twin of this paragraph.
     ///
+    /// **Recorded headroom at REQ-615:** margin **502**, down 278 from
+    /// REQ-612's 780, with `REDACT_BODY_OVERHEAD_BYTES` unmoved at 23 KiB and
+    /// the floor unmoved at 48. Both shapes pay the same 278: **176** for BR-1's
+    /// cwd contract in the `shell` tool's description, and **102** because
+    /// BR-3's dictated ending made `worst_case_session_root` the *home* row
+    /// rather than the project row (203 → 305 bytes). This shape stays the
+    /// looser of the two by the same 47 B it always has. The full account is
+    /// `egress::redact`'s twin of this paragraph.
+    ///
     /// **This sweep now registers a `skill` tool too**, at that worst-case
     /// roster, for the reason ADR-9 gives: `SkillTool` is registered per turn
     /// from the session's registry, so neither sweep sees it unless it is put

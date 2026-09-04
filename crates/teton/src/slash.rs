@@ -3610,7 +3610,12 @@ mod tests {
     /// the whitespace check (`cdto /x` starts matching). Either goes red.
     #[test]
     fn the_cd_hint_matches_a_bare_cd_and_nothing_else() {
-        for line in ["cd", "cd /teton-code", "cd ~/GitHub/teton-code", "  cd /x  "] {
+        for line in [
+            "cd",
+            "cd /teton-code",
+            "cd ~/GitHub/teton-code",
+            "  cd /x  ",
+        ] {
             assert!(
                 cd_as_prompt_hint(line).is_some(),
                 "`{line}` is a `cd` and should be offered as `/cd`"
@@ -3658,7 +3663,10 @@ mod tests {
         );
         // And a bare `cd` line is not a command — the hint is the loop's, and
         // the classifier keeps knowing nothing about how a line arrived.
-        assert!(matches!(classify("cd /teton-code", &empty), Input::Prompt(_)));
+        assert!(matches!(
+            classify("cd /teton-code", &empty),
+            Input::Prompt(_)
+        ));
     }
     use super::*;
     use crate::prompt::ScriptedPrompter;

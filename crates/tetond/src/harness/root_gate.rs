@@ -127,21 +127,19 @@ fn names_a_write_verb(command: &str) -> bool {
     }
     // The two-word forms. Segment-wise for the same reason: `cd x && git init`
     // is a `git init`.
-    command
-        .split(['|', ';', '&', '(', '\n'])
-        .any(|segment| {
-            let mut words = segment.split_whitespace();
-            let Some(program) = words.next() else {
-                return false;
-            };
-            let program = program.rsplit('/').next().unwrap_or(program);
-            let Some(argument) = words.next() else {
-                return false;
-            };
-            WRITE_SUBCOMMANDS
-                .iter()
-                .any(|(verb, sub)| *verb == program && *sub == argument)
-        })
+    command.split(['|', ';', '&', '(', '\n']).any(|segment| {
+        let mut words = segment.split_whitespace();
+        let Some(program) = words.next() else {
+            return false;
+        };
+        let program = program.rsplit('/').next().unwrap_or(program);
+        let Some(argument) = words.next() else {
+            return false;
+        };
+        WRITE_SUBCOMMANDS
+            .iter()
+            .any(|(verb, sub)| *verb == program && *sub == argument)
+    })
 }
 
 /// Trigger (b): a `>`, `>>` or `>|` at top level — outside single quotes,
@@ -318,7 +316,8 @@ fn target_is_the_root(target: &str, root: &Path, home: Option<&Path>) -> bool {
         return if rest.is_empty() {
             home == root
         } else {
-            rest.strip_prefix('/').is_some_and(|rest| home.join(rest) == root)
+            rest.strip_prefix('/')
+                .is_some_and(|rest| home.join(rest) == root)
         };
     }
     Path::new(target) == root
@@ -347,10 +346,16 @@ mod tests {
     fn the_write_gate_refuses_both_triggers_and_nothing_benign() {
         let refused = [
             ("mkdir -p .adlc/context", "the 2026-09-04 command itself"),
-            ("cd ~ && mkdir foo", "a write past a cd, in command position"),
+            (
+                "cd ~ && mkdir foo",
+                "a write past a cd, in command position",
+            ),
             ("rm -rf build", "a removal"),
             ("git init", "the two-word form"),
-            ("echo hi > notes.md", "a redirection, whose first verb is echo"),
+            (
+                "echo hi > notes.md",
+                "a redirection, whose first verb is echo",
+            ),
             ("cat a >> b", "an appending redirection"),
             ("/bin/touch x", "a path-qualified verb"),
         ];
@@ -369,7 +374,10 @@ mod tests {
             ("git log --oneline -5", "likewise"),
             ("echo \"2 > 1\"", "a redirection character inside quotes"),
             ("echo 'a > b'", "and inside single quotes"),
-            ("grep -rn mkdir src", "a write verb as an argument, not in command position"),
+            (
+                "grep -rn mkdir src",
+                "a write verb as an argument, not in command position",
+            ),
             ("echo 'mkdir x'", "a write verb inside a string"),
         ];
         for (command, why) in allowed {
@@ -445,15 +453,24 @@ mod tests {
         assert!(note("FOO=1 cd /tmp").is_some(), "past an env assignment");
 
         assert!(note("ls -la").is_none(), "no cd, no note");
-        assert!(note("echo 'cd /tmp'").is_none(), "a cd inside a string is not a cd");
-        assert!(note("cdto /tmp").is_none(), "a program merely starting with cd");
+        assert!(
+            note("echo 'cd /tmp'").is_none(),
+            "a cd inside a string is not a cd"
+        );
+        assert!(
+            note("cdto /tmp").is_none(),
+            "a program merely starting with cd"
+        );
         assert!(note("cd .").is_none(), "the root itself");
         assert!(note("cd ~").is_none(), "the root itself, spelled home");
         assert!(
             note("cd /Users/dev").is_none(),
             "the root itself, spelled absolutely"
         );
-        assert!(note("cd").is_none(), "a bare cd at a home root goes nowhere");
+        assert!(
+            note("cd").is_none(),
+            "a bare cd at a home root goes nowhere"
+        );
 
         let elsewhere = PathBuf::from("/Users/dev/GitHub/teton-code");
         assert!(
@@ -505,8 +522,16 @@ mod tests {
             "the remainder is handed to the shell whole"
         );
         assert_eq!(split_top_level_or("echo \"a || b\""), None, "inside quotes");
-        assert_eq!(split_top_level_or("echo 'a || b'"), None, "and single quotes");
-        assert_eq!(split_top_level_or("a | b"), None, "a pipe is not a separator");
+        assert_eq!(
+            split_top_level_or("echo 'a || b'"),
+            None,
+            "and single quotes"
+        );
+        assert_eq!(
+            split_top_level_or("a | b"),
+            None,
+            "a pipe is not a separator"
+        );
         // Two *non-adjacent* bars, which is what actually exercises the
         // adjacency test: with one bar `windows(2)` is empty and the check
         // cannot be observed at all. Dropping `pair[1] == pair[0] + 1` splits

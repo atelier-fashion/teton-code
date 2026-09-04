@@ -1362,8 +1362,7 @@ impl DaemonRuntime {
                 tctx.core.events,
                 tctx.core.session_id,
                 tctx.gate,
-                &probed.path,
-                &probed.view.display,
+                probed,
                 tctx.invoker,
                 skill,
             )
@@ -2576,6 +2575,44 @@ impl DaemonRuntime {
         })
     }
 
+    /// REQ-615 BR-6: publish one `skill_preamble_fallback` per preamble whose
+    /// primary exited non-zero.
+    ///
+    /// Free and silent in the common case — an expansion whose commands all
+    /// succeeded (or that has none) iterates a short slice and publishes nothing.
+    ///
+    /// The record carries **no output**: the bytes reach the model on the
+    /// expansion, framed, and the bus fans out to every attached client and every
+    /// declared monitor (REQ-611 BR-4).
+    fn publish_preamble_fallbacks(
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+        skill: &str,
+        outcomes: &[crate::skills::DynamicOutcome],
+        root_display: &str,
+    ) {
+        for (index, outcome) in outcomes.iter().enumerate() {
+            if matches!(
+                outcome,
+                crate::skills::DynamicOutcome::Ran {
+                    fell_back: true,
+                    ..
+                }
+            ) {
+                events.publish(
+                    Some(session_id.clone()),
+                    teton_protocol::events::Event::SkillPreambleFallback(
+                        teton_protocol::events::SkillPreambleFallback {
+                            skill: skill.to_owned(),
+                            command_index: index,
+                            root_display: root_display.to_owned(),
+                        },
+                    ),
+                );
+            }
+        }
+    }
+
     /// Ask once, run in document order, fold the outcomes back into the
     /// expansion, and publish the invocation's record (REQ-585 BR-6, BR-12;
     /// ADR-7, ADR-14, ADR-15).
@@ -2617,55 +2654,20 @@ impl DaemonRuntime {
     /// [`crate::skills::run_all`] is `run_bounded`'s second caller, not
     /// `ShellTool::run`'s — so `Tool::refine`, which fires the `shell` duty and
     /// *is* a model call, is not on this path (ADR-14).
-/// REQ-615 BR-6: publish one `skill_preamble_fallback` per preamble whose
-/// primary exited non-zero.
-///
-/// Free and silent in the common case — an expansion whose commands all
-/// succeeded (or that has none) iterates a short slice and publishes nothing.
-///
-/// The record carries **no output**: the bytes reach the model on the
-/// expansion, framed, and the bus fans out to every attached client and every
-/// declared monitor (REQ-611 BR-4).
-fn publish_preamble_fallbacks(
-    events: &Arc<EventBus>,
-    session_id: &SessionId,
-    skill: &str,
-    outcomes: &[crate::skills::DynamicOutcome],
-    root_display: &str,
-) {
-    for (index, outcome) in outcomes.iter().enumerate() {
-        if matches!(
-            outcome,
-            crate::skills::DynamicOutcome::Ran {
-                fell_back: true,
-                ..
-            }
-        ) {
-            events.publish(
-                Some(session_id.clone()),
-                teton_protocol::events::Event::SkillPreambleFallback(
-                    teton_protocol::events::SkillPreambleFallback {
-                        skill: skill.to_owned(),
-                        command_index: index,
-                        root_display: root_display.to_owned(),
-                    },
-                ),
-            );
-        }
-    }
-}
 
     async fn settle_dynamic_context(
         self: &Arc<Self>,
         events: &Arc<EventBus>,
         session_id: &SessionId,
         gate: &PermissionGate,
-        root: &Path,
-        // REQ-615 BR-6: the fold's fallback line names the root the primary
-        // failed in. The probe's display, from the same `ProbedRoot` the jail
-        // and the environment block are built from, so the three spell it one
-        // way (REQ-583 ADR-2).
-        root_display: &str,
+        // The turn's one probe, taken whole rather than as a path and a display
+        // side by side (REQ-615). Two consumers here — the jail the commands run
+        // in (`probed.path`) and the root BR-6's fallback line names
+        // (`probed.view.display`) — and passing the probe rather than its parts
+        // is what keeps them one reading, as well as what keeps this signature
+        // inside the argument bound the suppression ratchet enforces: a path and
+        // its display are an unnamed cluster, and `ProbedRoot` is its name.
+        probed: &ProbedRoot,
         invoker: Option<ConnectionId>,
         skill: &mut SkillTurn,
     ) {
@@ -2716,7 +2718,7 @@ fn publish_preamble_fallbacks(
             // (REQ-596: an allowlist, not a scrub), PATH floor, process group
             // and deadline (ADR-14).
             None if !commands.is_empty() => {
-                let root = root.to_path_buf();
+                let root = probed.path.clone();
                 let to_run = commands.clone();
                 let timeout_ms = self.skill_command_timeout_ms;
                 // On the blocking pool: `run_bounded` waits on a child process
@@ -2748,7 +2750,7 @@ fn publish_preamble_fallbacks(
         // is what entitles Stage B's sentence to say the body itself already
         // fit.
         let frame = expansion.user_frame();
-        skill.text = expansion.fold(&frame, &outcomes, root_display);
+        skill.text = expansion.fold(&frame, &outcomes, &probed.view.display);
         // REQ-615 BR-6: one notice per preamble whose primary failed. Published
         // here, where the outcomes are, rather than inside the fold — the fold
         // is pure and composes text, and a publisher inside it would make a
@@ -2758,7 +2760,7 @@ fn publish_preamble_fallbacks(
             session_id,
             &skill.name,
             &outcomes,
-            root_display,
+            &probed.view.display,
         );
 
         // BR-7: anything that came from a command carries what `shell` output
@@ -3450,8 +3452,7 @@ fn publish_preamble_fallbacks(
         // takes below, carrying the sink so "an emitter without a sink is a
         // test fixture" stays a rule with no exceptions (REQ-611).
         let mut tools = ToolRegistry::with_builtins_reporting(Some(
-            SessionEvents::new(Arc::clone(events), session_id.clone())
-                .with_sink(self.transcript()),
+            SessionEvents::new(Arc::clone(events), session_id.clone()).with_sink(self.transcript()),
         ));
         if !self.mcp_servers.is_empty() {
             if let Ok(transport) = HttpTransport::new() {

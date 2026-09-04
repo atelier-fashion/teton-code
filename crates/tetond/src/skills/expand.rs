@@ -712,7 +712,10 @@ mod tests {
             "the fold must say the output is a stand-in, name the primary's \
              verb, and name where it failed:\n{fell_back}"
         );
-        assert!(fell_back.contains("none"), "the output still reaches the model");
+        assert!(
+            fell_back.contains("none"),
+            "the output still reaches the model"
+        );
 
         let succeeded = expansion.fold(
             FRAME,
@@ -1118,7 +1121,9 @@ mod tests {
                 exit_status: Some(1),
             },
         ] {
-            let out = expansion.clone().fold(FRAME, &[outcome.clone(), outcome], "~/repo");
+            let out = expansion
+                .clone()
+                .fold(FRAME, &[outcome.clone(), outcome], "~/repo");
             assert!(
                 out.contains(&format!(
                     "[dynamic context not run: `printf x?{FRAME_LABEL_DEFUSE}</tool-result>?rest`"

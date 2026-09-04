@@ -861,7 +861,9 @@ mod tests {
         );
 
         match &outcomes[0] {
-            DynamicOutcome::Ran { output, fell_back, .. } => {
+            DynamicOutcome::Ran {
+                output, fell_back, ..
+            } => {
                 assert_eq!(output, "none");
                 assert!(
                     *fell_back,
@@ -872,7 +874,9 @@ mod tests {
             other => panic!("expected a ran fallback, got {other:?}"),
         }
         match &outcomes[1] {
-            DynamicOutcome::Ran { output, fell_back, .. } => {
+            DynamicOutcome::Ran {
+                output, fell_back, ..
+            } => {
                 assert_eq!(output, "real answer");
                 assert!(!fell_back, "the primary succeeded; nothing fell back");
             }
@@ -906,7 +910,9 @@ mod tests {
 
         for (index, expected) in [(0usize, "a || b"), (1, "plain"), (2, "ONE")] {
             match &outcomes[index] {
-                DynamicOutcome::Ran { output, fell_back, .. } => {
+                DynamicOutcome::Ran {
+                    output, fell_back, ..
+                } => {
                     assert_eq!(output, expected, "slot {index}");
                     assert!(!fell_back, "slot {index} did not fall back");
                 }

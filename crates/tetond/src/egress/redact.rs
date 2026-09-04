@@ -417,6 +417,23 @@ pub(crate) const REDACT_ESCAPING_DIVISOR: usize = 10;
 /// by `the_overhead_raise_restates_the_chunk_count_and_the_scannable_bound`,
 /// which is where the next raise has to come back and say what it did.
 ///
+/// **REQ-615 spent 278 bytes of margin and did NOT move this constant.** Two
+/// sentences, measured rather than added up:
+///
+/// * **176 bytes** — BR-1's cwd contract in the `shell` tool's description
+///   (*"Each command starts in the session root; `cd` inside a command does not
+///   carry to the next one. Only the user can move the root, with `/cd <path>`
+///   — say so instead of trying."*). A tool description is a production input to
+///   this overhead, which is why it lands here rather than nowhere.
+/// * **102 bytes** — BR-3's dictated ending for a non-project root. It reaches
+///   the sweeps indirectly: `worst_case_session_root` is now the **home** row
+///   rather than the project row, and that row went 203 → 305 bytes.
+///
+/// The margin absorbed both (733 → 455, and 780 → 502 on the web shape), which
+/// is the outcome the REQ's architecture asked for: raising this constant is a
+/// whole-KiB move with a scannable-bound consequence, and it belongs to a REQ
+/// that means to make it rather than to one that needed two sentences.
+///
 /// `pub(crate)` because the *other* prompt shape has to clear it too and cannot
 /// be built from here: with `[web] tier` above `off` the system prompt carries
 /// the web tool's docs instead of REQ-563's BR-6 opt-in clause, and building
@@ -470,7 +487,8 @@ pub(crate) const MIN_PROMPT_HEADROOM_BYTES: usize = 48;
 /// edit that cost 20 of them was a fifth of what was left and had to announce
 /// itself.
 ///
-/// REQ-612's raise leaves **733** and therefore 685 of usable room, which is
+/// REQ-615 leaves **455**, and therefore 407 of usable room. REQ-612's raise had
+/// left **733** and therefore 685, which was
 /// the loosest this has been since the pin was written — an artefact of the
 /// overhead moving in whole KiB while the prompt moves in sentences, not a
 /// decision to relax. The pin earns its keep at any margin for the *other*
@@ -484,7 +502,7 @@ pub(crate) const MIN_PROMPT_HEADROOM_BYTES: usize = 48;
 /// last time. Add a ledger line to [`REDACT_BODY_OVERHEAD_BYTES`] saying which
 /// REQ spent the bytes, then move this number in the same diff.
 #[cfg(test)]
-pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 733;
+pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 455;
 
 /// The same pin for the **web-enabled** prompt shape measured by
 /// `harness::tools::web::tests::the_web_tool_docs_clear_the_outbound_body_overhead`.
@@ -496,7 +514,7 @@ pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 733;
 /// holds the budget vocabulary, so the two shapes cannot come to disagree about
 /// which constant they are measuring against.
 #[cfg(test)]
-pub(crate) const RECORDED_WEB_PROMPT_MARGIN_BYTES: usize = 780;
+pub(crate) const RECORDED_WEB_PROMPT_MARGIN_BYTES: usize = 502;
 
 /// How many per-chunk windows the total cap is worth — the multiple that turns
 /// [`REDACT_CHUNK_MAX_BYTES`] into [`REDACT_INPUT_MAX_BYTES`].

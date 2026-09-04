@@ -1,7 +1,7 @@
 ---
 id: TASK-009
 title: "Measure the composed prompt, re-pin the margins, and replay the transcript"
-status: draft
+status: complete
 parent: REQ-615
 created: 2026-09-04
 updated: 2026-09-04

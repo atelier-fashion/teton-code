@@ -170,10 +170,7 @@ impl ShellTool {
 
     /// The same tool reporting REQ-615 BR-4 refusals to `events`.
     #[must_use]
-    pub fn with_events(
-        mut self,
-        events: Option<crate::harness::turn_loop::SessionEvents>,
-    ) -> Self {
+    pub fn with_events(mut self, events: Option<crate::harness::turn_loop::SessionEvents>) -> Self {
         self.events = events;
         self
     }
@@ -251,14 +248,12 @@ impl Tool for ShellTool {
             == root_gate::WriteVerdict::RefusedNonProject
         {
             if let Some(events) = self.events.as_ref() {
-                events.write_refused_non_project(
-                    teton_protocol::events::WriteRefusedNonProject {
-                        tool: "shell".to_owned(),
-                        root_display: ctx.root_display().to_owned(),
-                        root_kind: ctx.root_kind(),
-                        remedy: root_gate::WRITE_REMEDY.to_owned(),
-                    },
-                );
+                events.write_refused_non_project(teton_protocol::events::WriteRefusedNonProject {
+                    tool: "shell".to_owned(),
+                    root_display: ctx.root_display().to_owned(),
+                    root_kind: ctx.root_kind(),
+                    remedy: root_gate::WRITE_REMEDY.to_owned(),
+                });
             }
             return ToolOutcome::error(root_gate::write_refusal(
                 ctx.root_display(),
@@ -992,10 +987,7 @@ mod tests {
         let ctx = ToolContext::new(&root);
         let display = ctx.root_display().to_owned();
 
-        let noted = ShellTool::default().run(
-            &ctx,
-            &json!({ "command": "cd /tmp && pwd" }),
-        );
+        let noted = ShellTool::default().run(&ctx, &json!({ "command": "cd /tmp && pwd" }));
         assert!(
             noted.content.contains(&format!(
                 "[ran in {display}; the next command starts there again]"
@@ -1006,7 +998,9 @@ mod tests {
 
         let quiet = ShellTool::default().run(&ctx, &json!({ "command": "ls" }));
         assert!(
-            !quiet.content.contains("the next command starts there again"),
+            !quiet
+                .content
+                .contains("the next command starts there again"),
             "a command that said no `cd` earns no note:\n{}",
             quiet.content
         );
@@ -1058,10 +1052,8 @@ mod tests {
         let root = temp_root("writegate");
         let home = ToolContext::new(&root).with_root_kind(RootKind::Home);
 
-        let refused = ShellTool::default().run(
-            &home,
-            &json!({ "command": "mkdir -p .adlc/context" }),
-        );
+        let refused =
+            ShellTool::default().run(&home, &json!({ "command": "mkdir -p .adlc/context" }));
         assert!(refused.is_error, "{}", refused.content);
         assert!(
             !root.join(".adlc").exists(),
@@ -1080,10 +1072,8 @@ mod tests {
         );
 
         let plain = ToolContext::new(&root).with_root_kind(RootKind::Plain);
-        let allowed = ShellTool::default().run(
-            &plain,
-            &json!({ "command": "mkdir -p scaffold/here" }),
-        );
+        let allowed =
+            ShellTool::default().run(&plain, &json!({ "command": "mkdir -p scaffold/here" }));
         assert!(!allowed.is_error, "{}", allowed.content);
         assert!(
             root.join("scaffold/here").exists(),
