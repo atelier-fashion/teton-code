@@ -115,8 +115,8 @@ pub use completion::{
     TurnDecision,
 };
 pub use context::{
-    Anchor, CompactionOutcome, ContextBlock, ContextManager, NoopProvenanceHook, Provenance,
-    ProvenanceHook, RecordingProvenanceHook, ToolProvenance,
+    Anchor, CompactionOutcome, CompactionRecord, ContextBlock, ContextManager, NoopProvenanceHook,
+    Provenance, ProvenanceClass, ProvenanceHook, RecordingProvenanceHook, ToolProvenance,
 };
 pub use digest::DIGEST_DUTY;
 pub use draft::DRAFT_DUTY;

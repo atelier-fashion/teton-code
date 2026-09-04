@@ -5204,9 +5204,12 @@ mod tests {
             elided_bytes,
             newest_user_elided: false,
             over_budget,
-            // A hand-built report for the kind classifier, which does not read
-            // this field; the real one comes from `truncate_to_budget`.
+            // A hand-built report for the kind classifier, which reads none of
+            // these; the real one comes from `truncate_to_budget`.
             anchors_intact: true,
+            dropped: Vec::new(),
+            kept_bytes: 0,
+            anchor_bytes: 0,
         };
         // The three that fit.
         assert_eq!(
