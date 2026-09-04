@@ -7306,6 +7306,9 @@ mod context_render_tests {
         // file size, so it reports none.
         let symlinked = SessionContextResult {
             state: RepoContextStateKind::Unreadable,
+            // REQ-613 TASK-380: additive fields; TASK-387 owns rendering them.
+            origin: None,
+            generation: None,
             source: Some(RepoContextSource::TetonMd),
             file: Some("TETON.md".to_owned()),
             bytes_on_disk: None,
@@ -7326,6 +7329,8 @@ mod context_render_tests {
         // withholding legible rather than mysterious.
         let covered = SessionContextResult {
             state: RepoContextStateKind::WithheldBoundary,
+            origin: None,
+            generation: None,
             source: Some(RepoContextSource::TetonMd),
             file: Some("TETON.md".to_owned()),
             bytes_on_disk: Some(2_048),
@@ -7341,6 +7346,8 @@ mod context_render_tests {
         // And the ordinary truncated case still reads as one sentence.
         let truncated = SessionContextResult {
             state: RepoContextStateKind::Truncated,
+            origin: None,
+            generation: None,
             source: Some(RepoContextSource::TetonMd),
             file: Some("TETON.md".to_owned()),
             bytes_on_disk: Some(6_000),

@@ -1498,6 +1498,9 @@ mod tests {
                 state: teton_protocol::methods::RepoContextStateKind::Truncated,
                 source: Some(teton_protocol::methods::RepoContextSource::TetonMd),
                 file: Some("TETON.md".to_owned()),
+                // REQ-613 TASK-380: additive fields; TASK-387 owns rendering them.
+                origin: None,
+                generation: None,
                 bytes_on_disk: Some(9_412),
                 resident_bytes: 8_192,
                 cap: 8_192,

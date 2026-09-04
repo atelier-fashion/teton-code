@@ -796,6 +796,23 @@ pub fn render_event(
             }
             EventOutcome::Rendered
         }
+        // REQ-613 minimal arm; TASK-387 owns the full rendering.
+        Event::RepoContextGeneration(generation) => {
+            let outcome = match generation.outcome {
+                events::GenerationOutcome::Offered => "offered",
+                events::GenerationOutcome::Declined => "declined",
+                events::GenerationOutcome::RefusedUnattended => "refused (not a terminal)",
+                events::GenerationOutcome::DeniedLevel => "not offered at this level",
+                events::GenerationOutcome::Suppressed => "suppressed",
+                events::GenerationOutcome::Walking => "reading the repository",
+                events::GenerationOutcome::Drafted => "drafted",
+                events::GenerationOutcome::Written => "written",
+                events::GenerationOutcome::Replaced => "replaced",
+                events::GenerationOutcome::Failed => "failed",
+            };
+            surface.line(LineKind::Notice, &format!("repo notes: {outcome}"));
+            EventOutcome::Rendered
+        }
         Event::PrefixCache(cache) => {
             // Diagnostic chrome, not news: prefix reuse is a pure latency
             // optimization and BR-1 makes it unobservable in output, so a user
@@ -3164,6 +3181,17 @@ pub(crate) fn consent_gate(subject: Option<&PermissionSubject>, typed_input: boo
                 ConsentGate::RefuseNoTerminal
             }
         }
+        // REQ-613 minimal arm; TASK-387 owns the full rendering. The row itself
+        // is BR-2's: this build can draw the question, so at a terminal it is
+        // asked, and on a pipe it is refused **without reading a line** — the
+        // session then proceeds cold.
+        Some(PermissionSubject::RepoContextGeneration { .. }) => {
+            if typed_input {
+                ConsentGate::Answerable
+            } else {
+                ConsentGate::RefuseNoTerminal
+            }
+        }
     }
 }
 
@@ -3615,6 +3643,23 @@ fn render_consent_subject(subject: Option<&PermissionSubject>, surface: &mut dyn
                 surface.line(LineKind::Prompt, WINDOW_VERDICT_HEDGE);
             }
         }
+        // REQ-613 minimal arm; TASK-387 owns the full rendering. Every field is
+        // bound rather than wildcarded, on this function's own rule: a new field
+        // must be a compile error at the surface that has to decide what to do
+        // with it.
+        Some(PermissionSubject::RepoContextGeneration {
+            root,
+            path,
+            replace,
+        }) => {
+            surface.line(
+                LineKind::Prompt,
+                &format!(
+                    "  Teton would {verb} `{path}` in {root}",
+                    verb = if *replace { "replace" } else { "write" },
+                ),
+            );
+        }
     }
 }
 
@@ -3821,6 +3866,13 @@ fn refusal_line(req: &PermissionRequest, reason: RefusalReason) -> String {
         // request is known by.
         Some(PermissionSubject::ProjectSkillTrust { root, .. }) => {
             format!("running `{root}`'s skills as instructions")
+        }
+        // REQ-613 minimal arm; TASK-387 owns the full rendering. Named from the
+        // subject like the three rows above it: the key spells
+        // `repo_context:generate:~/dev/teton`, which names the same root in the
+        // vocabulary of a log rather than of a question.
+        Some(PermissionSubject::RepoContextGeneration { root, path, .. }) => {
+            format!("writing `{path}` in {root}")
         }
         _ => format!("`{}`", req.tool_name),
     };
@@ -12032,6 +12084,8 @@ mod repo_context_tests {
     fn state_event(state: K) -> events::RepoContextState {
         events::RepoContextState {
             state,
+            // REQ-613 TASK-380: additive field; TASK-387 owns any rendering of it.
+            origin: None,
             // The daemon's own rule: `absent` and `withheld_off` opened no file
             // and so cannot name one (BR-2's "off means unopened"). A fixture
             // that handed a source to those two would let the renderer print a

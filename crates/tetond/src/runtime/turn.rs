@@ -3121,7 +3121,10 @@ impl DaemonRuntime {
                 | ConfigUpdate::SetPrivacyBoundary(_)
                 | ConfigUpdate::SetEffort(_)
                 | ConfigUpdate::SetTranscriptEnabled { .. }
-                | ConfigUpdate::SetRepoContextEnabled { .. } => None,
+                | ConfigUpdate::SetRepoContextEnabled { .. }
+                // REQ-613 TASK-380: names no provider, so it restates no
+                // registration.
+                | ConfigUpdate::SetRepoContextGenerate { .. } => None,
             };
             self.apply_config_update_guarded(update, |config| {
                 if let Some(restates) = &restates {

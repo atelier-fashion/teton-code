@@ -99,7 +99,9 @@ use teton_core::category::{
     category_for_phase, BindingSource as CoreBindingSource, Category, CategoryOverride,
     CategoryResolution, CategoryTable, ConfigurableCategory, Tier, TierBinding,
 };
-use teton_core::config::{Config, LocalModelConfig, RoutingMigration, WebConfig, WebTier};
+use teton_core::config::{
+    Config, GenerateMode, LocalModelConfig, RoutingMigration, WebConfig, WebTier,
+};
 use teton_core::config_doc::document_is_effectively_empty;
 use teton_core::entities::{
     BoundaryMode, BoundaryOrigin, ModelProvider, PrivacyBoundary, ProviderCapabilities,
@@ -135,10 +137,10 @@ use teton_protocol::methods::{
     ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig,
     ProviderHealth as WireProviderHealth, ProviderSetupCandidate, ProviderSetupCommitResult,
     ProviderSetupPlanResult, ProviderSetupPreviewResult, ProviderTestOutcome, ProviderTestResult,
-    RepoContextStateKind, SessionClearParams, SessionClearResult, SessionContextParams,
-    SessionContextResult, SessionPermissionsParams, SessionPermissionsResult, SessionSetCwdParams,
-    SessionSetCwdResult, SessionTranscriptParams, SessionTranscriptResult, SkillInvocation,
-    TierBinding as WireTierBinding, TierBindingConfig, TierRouteView, TierSummary,
+    RepoContextGenerateMode, RepoContextStateKind, SessionClearParams, SessionClearResult,
+    SessionContextParams, SessionContextResult, SessionPermissionsParams, SessionPermissionsResult,
+    SessionSetCwdParams, SessionSetCwdResult, SessionTranscriptParams, SessionTranscriptResult,
+    SkillInvocation, TierBinding as WireTierBinding, TierBindingConfig, TierRouteView, TierSummary,
     TranscriptAction, WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams,
     WebRefreshResult, WebSetupCommitParams, WebSetupCommitResult, WebSetupPlanResult,
     WebSetupPreviewParams, WebSetupPreviewResult, WebTableSummary, WebTotalsView,
@@ -4217,6 +4219,12 @@ impl DaemonRuntime {
             ContextAction::On => Some(true),
             ContextAction::Off => Some(false),
             ContextAction::Status => None,
+            // REQ-613 minimal arm; TASK-386 owns running the pipeline from
+            // here. It flips no switch — `init` writes a file, it does not move
+            // this session's on/off state — so until that lands it answers with
+            // the state as it stands, which is `Status`'s row and the one
+            // reading that cannot claim something happened.
+            ContextAction::Init { force: _ } => None,
         } {
             sessions.set_context_switch(&params.session_id, enabled);
             // The root, probed now rather than remembered: REQ-583 ADR-1's one
@@ -7456,6 +7464,10 @@ impl RepoContextFigures {
         teton_protocol::events::RepoContextState {
             state: self.state,
             source: state.source(),
+            // REQ-613 TASK-380: additive field, `None` until TASK-386 wires the
+            // origin through. Absent means *not known*, which is the honest
+            // reading while nothing here can tell the two apart.
+            origin: None,
             bytes_on_disk: self.bytes_on_disk,
             resident_bytes: self.resident_bytes,
             truncated: self.truncated,
@@ -7517,6 +7529,12 @@ fn repo_context_result(state: &RepoContextState, cap: usize) -> SessionContextRe
         file: state
             .source()
             .map(|source| bounded_field(crate::repo_context::file_name(source), NAME_MAX_CHARS)),
+        // REQ-613 TASK-380: additive fields. `origin` is `None` until TASK-386
+        // wires it through; `generation` stays `None` on this path by design —
+        // it reports what the *calling* action's pipeline did, and none of
+        // `on`/`off`/`status` runs one.
+        origin: None,
+        generation: None,
         bytes_on_disk: figures.bytes_on_disk,
         resident_bytes: figures.resident_bytes,
         cap: cap as u64,
@@ -7593,7 +7611,10 @@ fn reject_unusable_binding(config: &Config, update: &ConfigUpdate) -> Result<(),
         | ConfigUpdate::SetPrivacyBoundary(_)
         | ConfigUpdate::SetEffort(_)
         | ConfigUpdate::SetTranscriptEnabled { .. }
-        | ConfigUpdate::SetRepoContextEnabled { .. } => {
+        | ConfigUpdate::SetRepoContextEnabled { .. }
+        // REQ-613 TASK-380: names no provider, so there is no binding to
+        // reject — `SetEffort`'s row, one variant over.
+        | ConfigUpdate::SetRepoContextGenerate { .. } => {
             return Ok(());
         }
     };
@@ -7633,6 +7654,19 @@ fn apply_update(config: &mut Config, update: ConfigUpdate) {
         // behaviour that reads it; this arm exists so the variant TASK-370
         // added compiles at every exhaustive match.
         ConfigUpdate::SetRepoContextEnabled { enabled } => config.context.repo_file = enabled,
+        // REQ-613 BR-10 / ADR-7: the durable `[context] generate` posture,
+        // through the same write path as the two switches above it. This is the
+        // one place the wire enum and the config enum are mapped onto each
+        // other — an exhaustive `match` rather than a `From`, so a fourth
+        // posture added to either is a compile error here rather than a value
+        // silently reinterpreted at the boundary.
+        ConfigUpdate::SetRepoContextGenerate { mode } => {
+            config.context.generate = match mode {
+                RepoContextGenerateMode::Ask => GenerateMode::Ask,
+                RepoContextGenerateMode::Always => GenerateMode::Always,
+                RepoContextGenerateMode::Never => GenerateMode::Never,
+            };
+        }
         ConfigUpdate::RegisterProvider(pc) => {
             let id = pc.id.0;
             // BUG-155: re-registering an existing id keeps the capability
@@ -7869,6 +7903,8 @@ fn to_core_configurable_category(category: ProtoConfigurableCategory) -> Configu
         ProtoConfigurableCategory::Design => ConfigurableCategory::Design,
         ProtoConfigurableCategory::Debug => ConfigurableCategory::Debug,
         ProtoConfigurableCategory::Review => ConfigurableCategory::Review,
+        // REQ-613 TASK-381: Draft arm.
+        ProtoConfigurableCategory::Draft => ConfigurableCategory::Draft,
     }
 }
 

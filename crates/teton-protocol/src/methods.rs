@@ -656,13 +656,77 @@ pub fn is_project_acknowledgment_key(key: &str) -> bool {
     !root.is_empty() && TRUST_DOORS.iter().any(|&d| trust_door_segment(d) == door)
 }
 
+/// The prefix every repository-notes **generation** key starts with (REQ-613
+/// BR-2, architecture ADR-2).
+///
+/// Deliberately not `skill:` and not `project_skill_trust:`: a third question
+/// gets a third family, on [`project_skill_trust_key`]'s rule that the key
+/// encodes the question (LESSON-495). `PermissionGate::authorize_skill`'s
+/// `debug_assert` on its own family is what that rule buys, and widening either
+/// existing prefix would let one answer settle two different acts.
+pub const REPO_CONTEXT_GENERATE_KEY_PREFIX: &str = "repo_context:generate:";
+
+/// The permission key the offer to write `TETON.md` is remembered under:
+/// `repo_context:generate:<root>` (REQ-613 BR-2, architecture ADR-2).
+///
+/// **One spelling, minted here, because two stores compare it.** The daemon's
+/// gate remembers a "for this session" answer under this string and drops it on
+/// `/cd`; the CLI's `SessionGrants` memoizes the same answer under the same
+/// string and consults its memo *before* drawing any prompt. That is ASSUME-017
+/// exactly — a decision with two stores needs one spelling and one invalidation
+/// rule, both above both crates — which is why this function sits beside
+/// [`skill_permission_key`] and [`project_skill_trust_key`] rather than being
+/// written out in each.
+///
+/// # The root is the durable one, and it is not truncated
+///
+/// `root` is the canonical resolution REQ-591 BR-4 uses for trust rows, **not**
+/// the home-relative display the prompt shows. Two spellings of one directory
+/// therefore share one answer and two directories never do (LESSON-495), which
+/// is the whole reason the key and the display are minted separately —
+/// [`crate::events::PermissionSubject::RepoContextGeneration::root`] is bounded
+/// precisely *because* it is not this string.
+///
+/// Nothing here truncates, for [`project_skill_trust_key`]'s reason: a key is
+/// compared and not read, so two long roots sharing a prefix collapsing onto one
+/// string would let consent for one repository authorize a write into another.
+/// There is no door segment, unlike the acknowledgment key: this question has
+/// exactly one door (the daemon raises it; no tool reaches it), so a segment
+/// would be a constant.
+#[must_use]
+pub fn repo_context_generate_key(root: &str) -> String {
+    format!("{REPO_CONTEXT_GENERATE_KEY_PREFIX}{root}")
+}
+
+/// True when `key` is a repository-notes **generation** key (REQ-613 BR-2).
+///
+/// Two things must hold, and the second is the one that earns a predicate rather
+/// than a bare `starts_with` at each call site: the family prefix, and a
+/// **non-empty** root after it. A bare `repo_context:generate:` names no
+/// repository, and a grant under it would be an answer to nothing — the rule
+/// [`is_project_acknowledgment_key`] already applies to a bare
+/// `project_skill_trust:user:`, reached there through a `debug_assert` that a
+/// release build does not have.
+#[must_use]
+pub fn is_repo_context_generate_key(key: &str) -> bool {
+    key.strip_prefix(REPO_CONTEXT_GENERATE_KEY_PREFIX)
+        .is_some_and(|root| !root.is_empty())
+}
+
 /// True when a session root move invalidates `key` — **the** invalidation rule,
 /// spelled once above both crates (ASSUME-017).
 ///
-/// Two families expire on `/cd`, and no others: a project skill's
-/// dynamic-context grant ([`is_project_skill_key`]) and the project-skill
-/// acknowledgment ([`is_project_acknowledgment_key`]). A user skill's grant
-/// survives, because its file is the same file whatever the session root is.
+/// Three families expire on `/cd`, and no others: a project skill's
+/// dynamic-context grant ([`is_project_skill_key`]), the project-skill
+/// acknowledgment ([`is_project_acknowledgment_key`]) and the repository-notes
+/// generation offer ([`is_repo_context_generate_key`], REQ-613 ADR-2). A user
+/// skill's grant survives, because its file is the same file whatever the
+/// session root is.
+///
+/// The third disjunct is what lets REQ-613 add a root-scoped consent with **no
+/// new code at either store**: `PermissionGate::drop_project_skill_grants` and
+/// the CLI's `SessionGrants::forget_root_scoped_grants` both read this one
+/// predicate, so a `/cd` expires the new family the moment it is named here.
 ///
 /// **Why this is a function and not a `starts_with` at each call site.** The
 /// daemon drops its grants when the root moves; the client drops its
@@ -674,7 +738,9 @@ pub fn is_project_acknowledgment_key(key: &str) -> bool {
 /// invalidation rule, and the rule belongs above both.
 #[must_use]
 pub fn expires_on_session_root_change(key: &str) -> bool {
-    is_project_skill_key(key) || is_project_acknowledgment_key(key)
+    is_project_skill_key(key)
+        || is_project_acknowledgment_key(key)
+        || is_repo_context_generate_key(key)
 }
 
 /// `serde`'s `default` for a flag whose **absence means yes**.
@@ -1675,6 +1741,20 @@ impl ContentClass {
             Category::Edit | Category::Design | Category::Debug | Category::Review => {
                 ContentClass::TurnContext
             }
+            // REQ-613 TASK-381: Draft arm. Writes `TETON.md` from a listing of
+            // the repository plus the first bytes of its own documents and
+            // manifests — file content, gathered off the tree rather than found
+            // by a search.
+            //
+            // It shares `triage`'s class rather than getting a new one, and the
+            // one place the shared sentence is *inexact* is worth naming: it
+            // reads "file content and your request", and this prompt carries no
+            // user request at all — the evidence is all it sends. That is an
+            // overstatement, which on a disclosure surface is the safe
+            // direction; an understatement would not be. A `RepositoryFiles`
+            // class of its own is the honest fix and is a protocol addition
+            // this task does not own.
+            Category::Draft => ContentClass::FileContent,
         }
     }
 
@@ -2181,6 +2261,75 @@ pub enum ConfigUpdate {
         /// block (BR-2's "off means unopened").
         enabled: bool,
     },
+    /// Set the posture for **offering to write** a missing notes file, for every
+    /// future session (REQ-613 BR-10, architecture ADR-7) — the `[context]
+    /// generate` key in `config.toml`.
+    ///
+    /// The twin of [`Self::SetRepoContextEnabled`] one variant up, and the
+    /// second half of the `[context]` table: `repo_file` decides whether a file
+    /// that *exists* is read, `generate` decides whether Teton offers to write
+    /// one that does not. `teton context generate ask|always|never` writes it
+    /// through `config/set`, inheriting that method's gates whole
+    /// (`refuse_daemon_wide` and `refuse_unattested_commitment` both run before
+    /// this is deserialized) rather than needing a method and a gate of its own.
+    ///
+    /// # A struct variant, and here the newtype spelling fails *worse* than it
+    /// does above
+    ///
+    /// [`Self::SetTranscriptEnabled`] and [`Self::SetRepoContextEnabled`] are
+    /// struct variants because a tagged newtype variant carrying a **boolean**
+    /// cannot serialize at all: it fails loudly at runtime with `cannot
+    /// serialize tagged newtype variant ... containing a boolean`. A unit-only
+    /// enum is not a boolean, and the failure is quieter — which is why this
+    /// paragraph exists rather than pointing at the sibling.
+    ///
+    /// `SetRepoContextGenerate(RepoContextGenerateMode)` **does** serialize.
+    /// Observed, not reasoned: it produces
+    /// `{"op":"set_repo_context_generate","never":null}` — the value becomes a
+    /// *key name*, there is no `mode` member at all, and the round trip is
+    /// symmetric, so `round_trip` passes on it. A daemon reading that frame
+    /// finds no mode and answers `INVALID_PARAMS`, and nothing in this crate
+    /// would have said why. The struct spelling gives the flat
+    /// `{"op":"set_repo_context_generate","mode":"never"}`, and
+    /// `config_set_round_trips_each_update_variant` asserts that object
+    /// explicitly for exactly this reason: symmetry is not enough to catch it.
+    SetRepoContextGenerate {
+        /// The posture every future session starts from.
+        mode: RepoContextGenerateMode,
+    },
+}
+
+/// The three postures `[context] generate` can hold (REQ-613 System Model,
+/// BR-10).
+///
+/// # Why the wire spells this enum twice
+///
+/// `teton-core`'s `config::GenerateMode` is the *configuration* type and this is
+/// the *wire* type, and they are two declarations of one closed set on purpose:
+/// `teton-protocol` is a pure leaf that `teton-core` depends on and which "must
+/// never depend back" (`teton-core`'s own manifest). [`ConfigurableCategory`] is
+/// the shipped precedent — it exists in both crates for exactly this reason —
+/// and the daemon's `apply_update` is the one place the two are mapped onto each
+/// other, so a value added to one and not the other is a non-exhaustive `match`
+/// there rather than a silent reinterpretation here.
+///
+/// A **closed** enum, for [`RepoContextStateKind`]'s reason and with a write at
+/// the end of it: `always` writes a file into a repository with no prompt, and a
+/// mode this build cannot read must be `INVALID_PARAMS` rather than a guess at
+/// which of the three the user meant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoContextGenerateMode {
+    /// Offer once per session per root, and write only if a human says yes
+    /// (BR-1). The shipped default.
+    Ask,
+    /// Write without the prompt at every level but `plan` — the unattended
+    /// opt-in (BR-2). It answers the question the prompt would have asked; it
+    /// does not bypass the level table.
+    Always,
+    /// Never offer: no prompt, no walk, no model call (BR-1). `/context init`
+    /// still works, because that is the user's own explicit act (BR-8).
+    Never,
 }
 
 /// Apply a configuration mutation.
@@ -2600,15 +2749,25 @@ pub struct SessionContextParams {
     pub action: ContextAction,
 }
 
-/// The three things `/context` can ask of a session.
+/// The four things `/context` can ask of a session.
 ///
 /// A **closed** enum with no catch-all and no `Default`, for
 /// [`TranscriptAction`]'s reason: an action this build cannot read is a
 /// deserialization error the daemon returns as
 /// [`crate::jsonrpc::error_code::INVALID_PARAMS`], never a silent reading of one
-/// of these three. There is no safe default — one value puts a repository file
-/// into every turn of this session's system prompt and another keeps it out, so
-/// guessing is the one thing a daemon must not do with an unreadable verb.
+/// of these four. There is no safe default — one value puts a repository file
+/// into every turn of this session's system prompt, another keeps it out, and
+/// [`Self::Init`] *writes a file*, so guessing is the one thing a daemon must
+/// not do with an unreadable verb.
+///
+/// REQ-613 added the fourth as a **struct** variant, which changes the wire for
+/// that value alone: the three unit variants still serialize as the bare strings
+/// `"on"`, `"off"` and `"status"`, and `Init` serializes as
+/// `{"init":{"force":false}}`. That asymmetry is serde's externally-tagged
+/// spelling and is pinned by
+/// `session_context_params_and_result_round_trip_and_do_not_end_a_turn`, because
+/// a client that hard-coded `"init"` as a string would send an action this
+/// daemon refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextAction {
@@ -2625,6 +2784,68 @@ pub enum ContextAction {
     /// Change nothing — answer with the state as it stands. The bare `/context`
     /// line, which BR-2 requires to work on a pipe as well as a TTY.
     Status,
+    /// Write the repository's notes file now, on the user's explicit say-so
+    /// (REQ-613 BR-8, architecture ADR-1/ADR-7).
+    ///
+    /// The **same** code path the first-turn offer takes, with two flags — which
+    /// is what makes AC-8's "the same bytes come out of both doors" true by
+    /// construction rather than by test (ADR-6). It still goes through the gate
+    /// (BR-2): explicit is not the same as consented, and a `plan` session is
+    /// still refused.
+    ///
+    /// Unlike the offer, this ignores `[context] generate = never`: that setting
+    /// suppresses the *offer*, and a user who typed `/context init` has said the
+    /// thing the setting exists to stop Teton assuming (BR-8).
+    ///
+    /// **It still does not end a turn**, and the row in
+    /// `only_the_prompt_method_ends_a_turn` is deliberately unchanged.
+    /// `ENDS_TURN` is not about whether a model was called — it is about whether
+    /// an *assistant reply streamed to this
+    /// client*, because a client that treats a method as a turn clears its
+    /// markdown fence (REQ-592 BR-6). This spends a model call whose answer goes
+    /// into a file, streams nothing, and can be typed while a reply from another
+    /// client is still arriving; a `true` here would cut that reply's fence.
+    Init {
+        /// Replace an existing notes file instead of refusing to clobber it
+        /// (`--force`, BR-8).
+        ///
+        /// A flag on the action rather than a fifth verb, because it is the same
+        /// act with a different answer to one question — and that question is
+        /// asked, since it rides
+        /// [`crate::events::PermissionSubject::RepoContextGeneration::replace`]
+        /// into the prompt. Without it a present file makes this a no-op with
+        /// one line saying so, which is BR-6's no-clobber rule reaching the
+        /// explicit door unchanged.
+        force: bool,
+    },
+}
+
+/// Who wrote the repository notes a session is carrying (REQ-613 System Model).
+///
+/// Carried by **both** halves of the feature —
+/// [`SessionContextResult::origin`]'s routed answer and
+/// [`crate::events::RepoContextState::origin`]'s broadcast news — for
+/// [`RepoContextStateKind`]'s reason: one enum spells the answer once, so
+/// `/context` and the event line cannot come to disagree about who wrote a file.
+///
+/// **The loader learns nothing else from it.** Nothing about reading, bounding
+/// or making the file resident branches on this value; it exists so a surface
+/// can say which of the two a file is, and so a file Teton drafted is never
+/// silently presented as one a human wrote.
+///
+/// A **closed** two-value enum for [`RepoContextSource`]'s reason: the value
+/// reaches a rendered line, and a third origin this build cannot read must be a
+/// deserialization error rather than a guess at one of these two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoContextOrigin {
+    /// A human wrote it. Every file predating REQ-613, and every file a user
+    /// edits afterwards — Teton does not re-mark a file it once generated.
+    Authored,
+    /// Teton drafted and wrote it (BR-6). The header line BR-6 prepends says so
+    /// inside the file as well, so the fact survives a copy that loses this
+    /// field.
+    Generated,
 }
 
 /// What a session's repository notes are doing, in one word (REQ-612 System
@@ -2736,6 +2957,31 @@ pub struct SessionContextResult {
     /// is the first question either of those states raises.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    /// Who wrote the file, when there is one to attribute (REQ-613 System
+    /// Model).
+    ///
+    /// **Additive, and absent means "not known"** rather than
+    /// [`RepoContextOrigin::Authored`] — a daemon predating REQ-613 emits no
+    /// key, and reading its silence as an authorship claim would put a fact on
+    /// the `/context` line that nothing asserted. Absent wherever [`Self::file`]
+    /// is, for the same reason: a state that opened nothing has nobody to name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<RepoContextOrigin>,
+    /// What the generation pipeline did on **this call**, when this call ran it
+    /// (REQ-613 BR-8).
+    ///
+    /// Populated for [`ContextAction::Init`] — which is the routed half of
+    /// `/context init`, the answer the typing user gets while every attached
+    /// client gets [`crate::events::RepoContextGeneration`] — and absent for
+    /// `on`, `off` and `status`, which run no pipeline. It is deliberately
+    /// **not** a memory of an earlier outcome in this session: an `Init` that
+    /// declined and a `status` afterwards are different questions, and a status
+    /// row restating a stale decline would be reporting something this call did
+    /// not do.
+    ///
+    /// Additive in both directions, like [`Self::origin`] beside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<crate::events::GenerationOutcome>,
     /// The file's size on disk, in bytes — **absent when the daemon does not
     /// know one**.
     ///
@@ -5089,6 +5335,20 @@ mod tests {
             // gates.
             ConfigUpdate::SetRepoContextEnabled { enabled: true },
             ConfigUpdate::SetRepoContextEnabled { enabled: false },
+            // REQ-613 BR-10 / ADR-7: the durable generation posture, the second
+            // half of the `[context]` table and behind the same `config/set`
+            // gates. All three values, because each is a different standing
+            // answer to "may Teton write a file here" and a round trip that
+            // dropped the payload would still read as a legal update.
+            ConfigUpdate::SetRepoContextGenerate {
+                mode: RepoContextGenerateMode::Ask,
+            },
+            ConfigUpdate::SetRepoContextGenerate {
+                mode: RepoContextGenerateMode::Always,
+            },
+            ConfigUpdate::SetRepoContextGenerate {
+                mode: RepoContextGenerateMode::Never,
+            },
         ] {
             round_trip(&ConfigSetParams { update });
         }
@@ -5129,6 +5389,47 @@ mod tests {
         assert!(
             wire["update"].as_object().is_some_and(|o| o.len() == 2),
             "the update carries its tag and its value and nothing else: {wire}"
+        );
+        // REQ-613's twin of the two assertions above, and the one row where
+        // `round_trip`'s symmetry is provably not enough. **Mutation, run and
+        // observed:** reverting to `SetRepoContextGenerate(RepoContextGenerateMode)`
+        // compiles, passes `cargo check`, and *serializes* — unlike the boolean
+        // newtypes above, which fail outright — producing
+        // `{"op":"set_repo_context_generate","never":null}`, where the value is
+        // the key name and no `mode` member exists. The loop above stays green
+        // on it; this assertion reds with `left: Null, right: "never"`. A daemon
+        // would answer `INVALID_PARAMS` to that frame. Restored after observing.
+        let wire = serde_json::to_value(ConfigSetParams {
+            update: ConfigUpdate::SetRepoContextGenerate {
+                mode: RepoContextGenerateMode::Never,
+            },
+        })
+        .expect("the update must serialize at all — see the comment above");
+        assert_eq!(wire["update"]["op"], "set_repo_context_generate", "{wire}");
+        assert_eq!(
+            wire["update"]["mode"], "never",
+            "the three postures travel under the System Model's spelling: {wire}"
+        );
+        assert!(
+            wire["update"].as_object().is_some_and(|o| o.len() == 2),
+            "the update carries its tag and its value and nothing else: {wire}"
+        );
+        for (mode, spelling) in [
+            (RepoContextGenerateMode::Ask, "ask"),
+            (RepoContextGenerateMode::Always, "always"),
+            (RepoContextGenerateMode::Never, "never"),
+        ] {
+            round_trip(&mode);
+            assert_eq!(
+                serde_json::to_value(mode).expect("serializes"),
+                spelling,
+                "{mode:?}"
+            );
+        }
+        assert!(
+            serde_json::from_str::<RepoContextGenerateMode>(r#""sometimes""#).is_err(),
+            "a mode this build cannot read must not become one it acts on — \
+             `always` writes a file into a repository with no prompt"
         );
 
         round_trip(&ConfigSetResult {
@@ -5736,6 +6037,126 @@ mod tests {
         )));
         assert!(!expires_on_session_root_change("shell"));
         assert!(!expires_on_session_root_change("web_search"));
+        // REQ-613 ADR-2: and the third family now expires with the root too.
+        // Asserted from *this* test as well as from its own, because this is the
+        // test that enumerates what a `/cd` throws away — a family added to
+        // `expires_on_session_root_change` and not named here would leave the
+        // enumeration silently incomplete.
+        assert!(expires_on_session_root_change(&repo_context_generate_key(
+            "~/dev/teton"
+        )));
+    }
+
+    /// REQ-613 BR-2 / ADR-2: the generation key is its **own** family, it
+    /// matches exactly the spelling it mints, and one predicate decides what a
+    /// `/cd` expires.
+    ///
+    /// The claims are here together because they are one claim about a string
+    /// that two stores compare — the daemon's gate and the CLI's
+    /// `SessionGrants` memo. ASSUME-017 is what happens when the rule is written
+    /// out twice: the daemon expired its grants, the client's memo did not, and
+    /// the client auto-answered the new root's question with the old root's
+    /// answer before a human saw anything. Here the auto-answered question
+    /// authorizes a **file write** into a repository nobody was asked about,
+    /// which is why the predicate is pinned rather than trusted.
+    ///
+    /// **Shown to fail** (conventions: show the test can fail before trusting
+    /// that it passed). Three mutations, each the regression it guards, each
+    /// restored after observing:
+    ///
+    /// - dropping the `!root.is_empty()` leg of
+    ///   [`is_repo_context_generate_key`] — red here on the bare-prefix rows,
+    ///   which is a grant remembered under a key naming no repository;
+    /// - relaxing the predicate to `key.contains("generate")` — red here on the
+    ///   `skill:project:generate` row, which is one family answering another's
+    ///   question;
+    /// - removing the third disjunct from [`expires_on_session_root_change`] —
+    ///   red here on the expiry assertions **and** in
+    ///   `the_acknowledgment_key_is_its_own_family_and_expires_with_the_root`,
+    ///   which is the ASSUME-017 failure itself: two stores, one of them still
+    ///   holding a "yes, write it" answered about the repository before this
+    ///   one.
+    #[test]
+    fn the_generation_key_predicate_matches_only_its_own_spelling() {
+        let key = repo_context_generate_key("~/dev/teton");
+        assert_eq!(key, "repo_context:generate:~/dev/teton");
+        assert!(is_repo_context_generate_key(&key));
+
+        // Two roots, two keys — never one. The root is not truncated on its way
+        // into a key, because a key is compared and not read: two long roots
+        // sharing a prefix collapsing onto one string would let consent to write
+        // into one repository authorize a write into another.
+        let long_a = format!("~/dev/{}/alpha", "nested/".repeat(40));
+        let long_b = format!("~/dev/{}/beta", "nested/".repeat(40));
+        assert_ne!(
+            repo_context_generate_key(&long_a),
+            repo_context_generate_key(&long_b)
+        );
+        assert!(repo_context_generate_key(&long_a).ends_with("/alpha"));
+        assert!(is_repo_context_generate_key(&repo_context_generate_key(
+            &long_a
+        )));
+
+        // Not any other family's key, in either direction. The daemon's
+        // `is_skill_permission_key` matches on the `skill:<source>:` prefixes
+        // and `authorize_skill` `debug_assert!`s its key is one, which is why
+        // ADR-2 opens a fourth door instead of widening a guard.
+        assert!(!key.starts_with("skill:"), "{key}");
+        assert!(!is_project_skill_key(&key), "{key}");
+        assert!(!is_project_acknowledgment_key(&key), "{key}");
+        for foreign in [
+            skill_permission_key(SkillSource::Project, "deploy"),
+            skill_permission_key(SkillSource::Project, "generate"),
+            skill_permission_key(SkillSource::User, "status"),
+            project_skill_trust_key(crate::events::InvokedBy::User, "~/dev/teton"),
+            "web_search".to_owned(),
+            "web_fetch".to_owned(),
+            "shell".to_owned(),
+            "edit".to_owned(),
+        ] {
+            assert!(
+                !is_repo_context_generate_key(&foreign),
+                "`{foreign}` is another question, and this predicate answered it"
+            );
+        }
+
+        // A bare prefix names no repository, and a grant under it would be an
+        // answer to nothing — the rule `is_project_acknowledgment_key` already
+        // applies to a bare `project_skill_trust:user:`.
+        for near_miss in [
+            REPO_CONTEXT_GENERATE_KEY_PREFIX,
+            "repo_context:generate",
+            "repo_context:~/dev/teton",
+            "repo_context_generate:~/dev/teton",
+            "generate:~/dev/teton",
+            " repo_context:generate:~/dev/teton",
+        ] {
+            assert!(
+                !is_repo_context_generate_key(near_miss),
+                "`{near_miss}` names no question this daemon can have asked"
+            );
+        }
+
+        // ASSUME-017's rule: one invalidation predicate above both stores, and
+        // this family is in it. A `/cd` to another repository must not carry a
+        // "yes, write it" answered about the one before.
+        assert!(expires_on_session_root_change(&key));
+        assert!(expires_on_session_root_change(&repo_context_generate_key(
+            &long_b
+        )));
+        // Non-vacuity from the other side: the predicate still says no to the
+        // one grant a root move keeps, so the assertions above are reached by
+        // the family rather than by a predicate that returns `true`.
+        assert!(!expires_on_session_root_change(&skill_permission_key(
+            SkillSource::User,
+            "status"
+        )));
+
+        // The key rides exactly as the caller spelled it. The caller passes the
+        // **durable** root (ADR-2), never the bounded display the prompt shows —
+        // and a home-relative spelling stays home-relative, since an
+        // unrecognizing client renders this key on its refusal line.
+        assert!(!key.contains("/Users/"));
     }
 
     /// REQ-585's additivity for `PromptTurnParams.skill`, both directions —
@@ -7074,6 +7495,13 @@ mod tests {
     /// boolean`. That is exactly the runtime failure the struct variant exists
     /// to avoid, observed rather than quoted from the sibling doc. Restored
     /// after observing.
+    ///
+    /// **REQ-613's mutation, on the fourth action.** `#[serde(default)]` on
+    /// [`ContextAction::Init::force`] — red here on the `{"init":{}}` leg. A
+    /// defaulted `force` is a client's *omission* silently answering the
+    /// question the prompt has to put to a human (BR-8: overwrite and create are
+    /// different questions), which is the one thing a missing key must not do.
+    /// Restored after observing.
     #[test]
     fn session_context_params_and_result_round_trip_and_do_not_end_a_turn() {
         assert_eq!(SessionContextParams::METHOD, "session/context");
@@ -7100,6 +7528,66 @@ mod tests {
             assert_eq!(wire["session_id"], "s1", "{wire}");
             assert_eq!(wire["action"], spelling, "{wire}");
         }
+
+        // REQ-613 BR-8: the fourth verb, and the one that writes. It is a
+        // **struct** variant, so it does not spell as a bare string like the
+        // three above — asserted rather than left to `round_trip`, because a
+        // client that hard-coded `"action":"init"` would send an action this
+        // daemon refuses and the symmetry of a round trip would never notice.
+        for force in [false, true] {
+            let params = SessionContextParams {
+                session_id: SessionId::from("s1"),
+                action: ContextAction::Init { force },
+            };
+            round_trip(&params);
+            let wire = serde_json::to_value(&params).expect("serializes");
+            assert_eq!(wire["action"]["init"]["force"], force, "{wire}");
+            assert!(
+                wire["action"].as_object().is_some_and(|o| o.len() == 1),
+                "the action carries its one variant and nothing else: {wire}"
+            );
+        }
+        // And `force` is not optional on the way in: `--force` asks a different
+        // question from the ordinary offer — it rides the *prompt* — so a frame
+        // that leaves it out must be an error rather than a defaulted `false`
+        // nobody chose.
+        assert!(
+            serde_json::from_str::<SessionContextParams>(
+                r#"{"session_id":"s1","action":{"init":{}}}"#
+            )
+            .is_err(),
+            "an init with no `force` must not default into one"
+        );
+        assert!(serde_json::from_str::<SessionContextParams>(
+            r#"{"session_id":"s1","action":{"init":{"force":true}}}"#
+        )
+        .is_ok());
+        // The bare string a client might guess at is *not* this action, which is
+        // the near miss the struct variant creates and the one worth pinning.
+        assert!(
+            serde_json::from_str::<SessionContextParams>(r#"{"session_id":"s1","action":"init"}"#)
+                .is_err(),
+            "`init` as a bare string is not the fourth action"
+        );
+
+        // REQ-613: the origin enum, both values, under the System Model's
+        // spelling. It reaches a rendered line on both halves of the wire, so
+        // the two spellings are asserted rather than inferred.
+        for (origin, spelling) in [
+            (RepoContextOrigin::Authored, "authored"),
+            (RepoContextOrigin::Generated, "generated"),
+        ] {
+            round_trip(&origin);
+            assert_eq!(
+                serde_json::to_value(origin).expect("serializes"),
+                spelling,
+                "{origin:?}"
+            );
+        }
+        assert!(
+            serde_json::from_str::<RepoContextOrigin>(r#""vibes""#).is_err(),
+            "a third origin must not deserialize to one of the two this build renders"
+        );
 
         // Every state, under the System Model's spelling, and no two alike.
         let spellings: Vec<String> = [
@@ -7140,6 +7628,9 @@ mod tests {
             state: RepoContextStateKind::Truncated,
             source: Some(RepoContextSource::TetonMd),
             file: Some("TETON.md".to_owned()),
+            // REQ-613: a human wrote this one, and no pipeline ran on this call.
+            origin: Some(RepoContextOrigin::Authored),
+            generation: None,
             bytes_on_disk: Some(40_000),
             resident_bytes: 8_100,
             cap: 8_192,
@@ -7165,6 +7656,8 @@ mod tests {
             state: RepoContextStateKind::Loaded,
             source: Some(RepoContextSource::AgentsMd),
             file: Some("AGENTS.md".to_owned()),
+            origin: Some(RepoContextOrigin::Authored),
+            generation: None,
             bytes_on_disk: Some(3_000),
             resident_bytes: 3_000,
             cap: 4_096,
@@ -7187,6 +7680,10 @@ mod tests {
                 state,
                 source: None,
                 file: None,
+                // Nothing was opened, so there is nobody to attribute it to —
+                // the rule `source` and `file` follow one line up.
+                origin: None,
+                generation: None,
                 // A state that opened nothing has no size to report, and the
                 // `Option` is what says so — see the assertion below.
                 bytes_on_disk: None,
@@ -7244,6 +7741,8 @@ mod tests {
                 state,
                 source: Some(RepoContextSource::TetonMd),
                 file: Some("TETON.md".to_owned()),
+                origin: Some(RepoContextOrigin::Authored),
+                generation: None,
                 bytes_on_disk: Some(2_048),
                 resident_bytes: 0,
                 cap: 8_192,
@@ -7324,6 +7823,113 @@ mod tests {
         let shipped =
             serde_json::to_string(&ConfigUpdate::SetTranscriptEnabled { enabled: true }).unwrap();
         assert!(serde_json::from_str::<UpdateAsShippedBeforeReq612>(&shipped).is_ok());
+    }
+
+    /// REQ-613's additivity for [`SessionContextResult::origin`] and
+    /// [`SessionContextResult::generation`], both directions — the four legs
+    /// `permission_request_subject_is_additive_in_both_directions` established,
+    /// re-applied rather than assumed inherited.
+    ///
+    /// The non-vacuity leg is the one that earns its place: a fixture that never
+    /// populated either field would satisfy the old-reader leg by writing
+    /// nothing at all, and the test would pass while the fields were absent from
+    /// the wire entirely.
+    ///
+    /// **Shown to fail.** Two mutations, each run separately and restored after
+    /// observing: downgrading [`SessionContextResult::origin`]'s
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]` to a bare
+    /// `#[serde(default)]`, and the same on
+    /// [`SessionContextResult::generation`]. Both are red on the "emits no key"
+    /// leg, because a daemon that has nothing to say would start writing `null`
+    /// where an older daemon wrote nothing — and `null` is what a client would
+    /// then have to tell apart from an absent key to know whether it was told
+    /// anything.
+    #[test]
+    fn session_context_result_origin_and_generation_are_additive_in_both_directions() {
+        // A pre-REQ-613 answer: neither key — absent, not an error.
+        let older: SessionContextResult = serde_json::from_str(
+            r#"{"state":"loaded","source":"teton_md","file":"TETON.md","bytes_on_disk":3120,
+                "resident_bytes":3120,"cap":8192,"truncated":false}"#,
+        )
+        .expect("an answer from a daemon predating the fields must still parse");
+        assert_eq!(
+            older.origin, None,
+            "absent means `not known`, never a claim that a human wrote it"
+        );
+        assert_eq!(older.generation, None);
+        assert_eq!(older.state, RepoContextStateKind::Loaded);
+
+        // And a daemon with nothing to say emits no keys at all, rather than
+        // `null` — the same wire an older daemon writes.
+        let wire = serde_json::to_value(&older).expect("serializes");
+        assert!(wire.get("origin").is_none(), "{wire}");
+        assert!(wire.get("generation").is_none(), "{wire}");
+
+        // Non-vacuity, and the shape `/context init` actually answers with:
+        // Teton wrote the file on this call, and says which of the ten stages
+        // it reached.
+        let generated = SessionContextResult {
+            state: RepoContextStateKind::Loaded,
+            source: Some(RepoContextSource::TetonMd),
+            file: Some("TETON.md".to_owned()),
+            origin: Some(RepoContextOrigin::Generated),
+            generation: Some(crate::events::GenerationOutcome::Written),
+            bytes_on_disk: Some(2_400),
+            resident_bytes: 2_400,
+            cap: 8_192,
+            truncated: false,
+        };
+        round_trip(&generated);
+        let wire = serde_json::to_value(&generated).expect("serializes");
+        assert_eq!(wire["origin"], "generated", "{wire}");
+        assert_eq!(wire["generation"], "written", "{wire}");
+
+        // The other direction: a reader built before the fields still reads a
+        // frame that carries them.
+        #[derive(Debug, Deserialize)]
+        struct ResultAsShippedBeforeReq613 {
+            state: RepoContextStateKind,
+            file: Option<String>,
+            resident_bytes: u64,
+            cap: u64,
+        }
+        let json = serde_json::to_string(&generated).expect("serializes");
+        assert!(
+            json.contains(r#""origin":"generated""#) && json.contains(r#""generation":"written""#),
+            "the fixture must actually carry the new keys: {json}"
+        );
+        let old: ResultAsShippedBeforeReq613 =
+            serde_json::from_str(&json).expect("a client predating the fields still reads it");
+        assert_eq!(old.state, RepoContextStateKind::Loaded);
+        assert_eq!(old.file.as_deref(), Some("TETON.md"));
+        assert_eq!(old.resident_bytes, 2_400);
+        assert_eq!(old.cap, 8_192);
+
+        // `ConfigUpdate`'s half, the same shape REQ-612's own test asserts one
+        // variant earlier: a new CLI sending `set_repo_context_generate` to a
+        // daemon predating the variant gets `INVALID_PARAMS` rather than silence
+        // — the failure mode worth having, since the alternative is a user told
+        // their config was saved when nothing was written.
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "op", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum UpdateAsShippedBeforeReq613 {
+            SetTranscriptEnabled { enabled: bool },
+            SetRepoContextEnabled { enabled: bool },
+        }
+        let wire = serde_json::to_string(&ConfigUpdate::SetRepoContextGenerate {
+            mode: RepoContextGenerateMode::Always,
+        })
+        .expect("serializes");
+        assert!(
+            serde_json::from_str::<UpdateAsShippedBeforeReq613>(&wire).is_err(),
+            "a daemon predating the variant must refuse it rather than accept a \
+             write it cannot perform: {wire}"
+        );
+        // Non-vacuity: that same reader still reads the variant it shipped with.
+        let shipped =
+            serde_json::to_string(&ConfigUpdate::SetRepoContextEnabled { enabled: false }).unwrap();
+        assert!(serde_json::from_str::<UpdateAsShippedBeforeReq613>(&shipped).is_ok());
     }
 
     /// REQ-589 ASSUME-B: the over-budget offer ships **without** widening

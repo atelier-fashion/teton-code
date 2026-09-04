@@ -1,7 +1,7 @@
 ---
 id: TASK-380
 title: "Protocol: the generation subject, the generation event, `Init { force }`, and the shared key predicate"
-status: draft
+status: complete
 parent: REQ-613
 repo: teton-code
 created: 2026-09-03
