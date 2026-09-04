@@ -510,6 +510,19 @@ pub(crate) const REDACT_ESCAPING_DIVISOR: usize = 10;
 /// case rather than to shorten a third prompt: two REQs in one sprint have now
 /// paid for the ceiling's stability with their own words.
 ///
+/// **ASSUME-044's resolution spends 7 bytes and does NOT move this constant.**
+/// ` /shell` joins the roster between `/web` and `/provider`: REQ-614 merged
+/// `/shell allow` after the roster above had collapsed to families, and it was
+/// the first command in a family the resident list did not carry. Nothing
+/// noticed, because REQ-617's two guards pin the roster to the CLI table and
+/// the docs page to the roster, and neither reads this sentence. Measured, not
+/// added up: 112 → **105** on this shape and 159 → **152** on the web-enabled
+/// twin, the gap still 47. 57 bytes of usable room remain above the floor.
+/// What the 7 bought is the guard that was missing —
+/// `harness::turn_loop::tests::the_resident_prompt_names_every_command_family_the_roster_carries`
+/// pins the family clause to `SESSION_COMMANDS` in both directions, so the next
+/// new family is a red test rather than a silence.
+///
 /// `pub(crate)` because the *other* prompt shape has to clear it too and cannot
 /// be built from here: with `[web] tier` above `off` the system prompt carries
 /// the web tool's docs instead of REQ-563's BR-6 opt-in clause, and building
@@ -574,13 +587,17 @@ pub(crate) const MIN_PROMPT_HEADROOM_BYTES: usize = 48;
 /// is doing the floor's job a sentence early, which is the posture a REQ that
 /// wants room should read as "make the ceiling case".
 ///
+/// ASSUME-044's resolution leaves **105**, 57 usable: seven bytes for `/shell`
+/// in the guide's command roster, the family REQ-614 added after that roster
+/// was cut to families. The ledger line is on [`REDACT_BODY_OVERHEAD_BYTES`].
+///
 /// # Updating it
 ///
 /// Re-measure, do not reason — that correction is what reasoning about it cost
 /// last time. Add a ledger line to [`REDACT_BODY_OVERHEAD_BYTES`] saying which
 /// REQ spent the bytes, then move this number in the same diff.
 #[cfg(test)]
-pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 112;
+pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 105;
 
 /// The same pin for the **web-enabled** prompt shape measured by
 /// `harness::tools::web::tests::the_web_tool_docs_clear_the_outbound_body_overhead`.
@@ -592,7 +609,7 @@ pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 112;
 /// holds the budget vocabulary, so the two shapes cannot come to disagree about
 /// which constant they are measuring against.
 #[cfg(test)]
-pub(crate) const RECORDED_WEB_PROMPT_MARGIN_BYTES: usize = 159;
+pub(crate) const RECORDED_WEB_PROMPT_MARGIN_BYTES: usize = 152;
 
 /// The gap between the two recorded margins, pinned (REQ-617).
 ///
@@ -2610,6 +2627,14 @@ mod tests {
     /// the 8 the cap names, is on [`REDACT_BODY_OVERHEAD_BYTES`]. The frame's
     /// 340 was 331 until this REQ's verify pass qualified the truncation
     /// marker with "at least"; both margins moved by those nine bytes.
+    ///
+    /// **Recorded headroom at ASSUME-044's resolution (REQ-614):** margin **105**,
+    /// down 7 from the 112 REQ-617 left, with the overhead unmoved at 23 KiB and
+    /// the floor unmoved at 48. Both shapes pay the same 7: `/shell` joins the
+    /// guide's command roster, the family REQ-614 merged after that roster was
+    /// cut to families and the first one it did not name. The opted-in twin is
+    /// **152**, the same 47 bytes looser it always is. The account, and the
+    /// guard the bytes bought, is on [`REDACT_BODY_OVERHEAD_BYTES`].
     ///
     /// **Mutations run for REQ-612.** Dropping `repo_context` from the config
     /// rows below → red at the block self-check, naming the reason (the sweep

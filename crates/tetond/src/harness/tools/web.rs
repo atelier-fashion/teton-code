@@ -2374,6 +2374,15 @@ mod tests {
     /// count, the total cap and every scanned route's budget — is
     /// `egress::redact`'s twin of this paragraph.
     ///
+    /// **Recorded headroom at ASSUME-044's resolution (REQ-614):** margin
+    /// **152**, down 7 from the 159 REQ-617 left, with
+    /// `REDACT_BODY_OVERHEAD_BYTES` unmoved at 23 KiB and the floor unmoved at
+    /// 48. Both shapes pay the same 7: `/shell` joins the guide's command
+    /// roster, the family REQ-614 merged after that roster was cut to families
+    /// and the first one it did not name. This shape stays the looser of the
+    /// two by the same 47 B it always has. The account, and the guard the bytes
+    /// bought, is `egress::redact`'s twin of this paragraph.
+    ///
     /// **Mutation run for REQ-612:** dropping `repo_context` from the config
     /// rows below turns this red at the block self-check, naming the reason,
     /// rather than quietly re-pinning the margin of a prompt no session with a

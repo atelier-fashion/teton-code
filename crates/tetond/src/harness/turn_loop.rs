@@ -6223,6 +6223,172 @@ mod tests {
         }
     }
 
+    /// Families deliberately kept **out** of the resident prompt's command
+    /// list, each with the reason beside it.
+    ///
+    /// This is the one route past
+    /// `the_resident_prompt_names_every_command_family_the_roster_carries` in
+    /// the roster→prompt direction. A family named here still has to exist in
+    /// `SESSION_COMMANDS` (the test refuses a stale entry), still has to be on
+    /// the `teton_docs commands` page (`harness::tools::docs` pins that), and
+    /// is simply not spent on in the prompt margin. It is empty because the
+    /// first candidate, `shell`, resolved the other way (ASSUME-044): BR-7's
+    /// pin announcement reaches the *user* at pin time, but the model is what
+    /// the user asks "why is my session pinned?" afterwards, and nothing else
+    /// resident — not the `shell` tool's description, not the guide — names
+    /// the remedy. The list exists so that the next family somebody wants to
+    /// keep out is a reviewed entry with a sentence of justification rather
+    /// than a silence nobody sees.
+    const FAMILIES_KEPT_OUT_OF_THE_RESIDENT_PROMPT: &[&str] = &[];
+
+    /// **Every command family the roster carries is on the resident list, and
+    /// nothing else is** — the third guard in REQ-617's chain, added to
+    /// resolve ASSUME-044.
+    ///
+    /// REQ-617 pinned the roster to the CLI dispatch table
+    /// (`teton::slash::tests::the_protocol_roster_and_the_command_table_are_the_same_set`)
+    /// and the `teton_docs commands` page to the roster
+    /// (`harness::tools::docs::tests::the_commands_topic_names_every_registered_command`),
+    /// and left the resident prompt's family clause tied to nothing. REQ-614
+    /// then merged `/shell allow`, the first command in a family the clause did
+    /// not name, and both guards stayed green — both were satisfied by the
+    /// roster row and the `commands.md` line the rebase added. The omission was
+    /// silent by construction. This is the guard that was missing.
+    ///
+    /// # What is compared
+    ///
+    /// A *family* is the first word of a `SessionCommand` name: `web setup`,
+    /// `web allow` and `web refresh` are one family, `/web`, which is the unit
+    /// the clause has named since the roster collapsed 29 names to 17 families
+    /// to fit the margin (ASSUME-043). Both directions matter and fail
+    /// differently. A family in the roster and not in the clause is a command
+    /// the model never learns exists unless it happens to open the docs page,
+    /// which is REQ-617's originating defect. A family in the clause and not in
+    /// the roster is one the model names with confidence and the session
+    /// answers "unknown command" to. Order is pinned too, for the reason
+    /// `the_roster_is_in_the_same_order_as_help` gives: the clause and `/help`
+    /// are both lists a human reads.
+    ///
+    /// # Why the extraction is scoped to the sentence
+    ///
+    /// The guide also carries provider endpoint paths (`/v1/messages`,
+    /// `/chat/completions`) and a `/search?format=json` suffix, so a slash-token
+    /// scan over the whole file is not a parser for this clause. The families
+    /// are read from between `The built-in commands are ` and the `;` that
+    /// closes the list on the same line, and each token is checked to be a bare
+    /// `/word` — so a sub-command creeping back into the resident list, or a
+    /// re-wording that moves the list, fails here naming the frame rather than
+    /// passing on a lucky substring.
+    ///
+    /// # Mutations run
+    ///
+    /// Dropping `/shell` from the clause → red under `in the roster, absent from
+    /// the resident prompt`. Adding `/bogus` → red under the other heading.
+    /// Swapping `/web` and `/shell` → red on order. Each was run and reverted.
+    #[test]
+    fn the_resident_prompt_names_every_command_family_the_roster_carries() {
+        use std::collections::BTreeSet;
+
+        const OPEN: &str = "The built-in commands are ";
+        let line = SELF_CONFIG_GUIDE
+            .lines()
+            .find(|line| line.contains(OPEN))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no line of self_config.md opens the command list with `{OPEN}`. If the \
+                     sentence was re-worded, move this anchor with it — the extraction is \
+                     scoped to the sentence because the guide also carries endpoint paths."
+                )
+            });
+        let after = &line[line.find(OPEN).expect("found above") + OPEN.len()..];
+        let list = after
+            .split(';')
+            .next()
+            .expect("split yields at least one piece");
+        assert!(
+            after.contains(';'),
+            "the command list is not closed by `;` on its line, so its end cannot be \
+             found. Keep the closing anchor, or move it with the sentence.\nline: {line}"
+        );
+
+        let mut clause: Vec<&str> = Vec::new();
+        for token in list.split_whitespace() {
+            let family = token.strip_prefix('/').unwrap_or_else(|| {
+                panic!(
+                    "`{token}` in the resident command list does not start with `/`. The \
+                     list is bare `/family` tokens and nothing else; effects and \
+                     sub-commands belong to `teton_docs commands`.\nlist: {list}"
+                )
+            });
+            assert!(
+                !family.is_empty() && family.chars().all(|c| c.is_ascii_lowercase()),
+                "`{token}` in the resident command list is not a one-word lowercase \
+                 family. Sub-commands (`/model set`) and punctuation belong to \
+                 `teton_docs commands`, not here.\nlist: {list}"
+            );
+            clause.push(family);
+        }
+
+        let mut families: Vec<&str> = Vec::new();
+        for command in teton_protocol::commands::SESSION_COMMANDS {
+            let family = command
+                .name
+                .split_whitespace()
+                .next()
+                .expect("a command name has a first word");
+            if !families.contains(&family) {
+                families.push(family);
+            }
+        }
+        for kept_out in FAMILIES_KEPT_OUT_OF_THE_RESIDENT_PROMPT {
+            assert!(
+                families.contains(kept_out),
+                "`{kept_out}` is listed as kept out of the resident prompt but is not a \
+                 family in SESSION_COMMANDS. Remove the stale entry."
+            );
+        }
+        let expected: Vec<&str> = families
+            .iter()
+            .copied()
+            .filter(|family| !FAMILIES_KEPT_OUT_OF_THE_RESIDENT_PROMPT.contains(family))
+            .collect();
+
+        let in_clause: BTreeSet<&str> = clause.iter().copied().collect();
+        let in_roster: BTreeSet<&str> = expected.iter().copied().collect();
+        let missing_from_prompt: Vec<&str> = in_roster.difference(&in_clause).copied().collect();
+        let missing_from_roster: Vec<&str> = in_clause.difference(&in_roster).copied().collect();
+        assert!(
+            missing_from_prompt.is_empty() && missing_from_roster.is_empty(),
+            "the resident prompt's command families and the protocol roster have drifted.\n\
+             \n\
+             in the roster, absent from the resident prompt: {missing_from_prompt:?}\n\
+             \x20     the model never learns these commands exist unless it opens\n\
+             \x20     `teton_docs commands` unprompted (REQ-617's defect, ASSUME-044's\n\
+             \x20     shape). Add `/<family>` to the command sentence in\n\
+             \x20     crates/tetond/src/harness/self_config.md, re-measure both prompt\n\
+             \x20     margins, and add a ledger line — or, if the family is deliberately\n\
+             \x20     kept out, add it to FAMILIES_KEPT_OUT_OF_THE_RESIDENT_PROMPT with\n\
+             \x20     the reason.\n\
+             \n\
+             in the resident prompt, absent from the roster: {missing_from_roster:?}\n\
+             \x20     the model will name these and the session will answer\n\
+             \x20     \"unknown command\". Remove them from the sentence, or add the\n\
+             \x20     rows to crates/teton-protocol/src/commands.rs.\n\
+             \n\
+             list: {list}"
+        );
+        assert_eq!(
+            clause.len(),
+            in_clause.len(),
+            "a family appears twice in the resident command list.\nlist: {list}"
+        );
+        assert_eq!(
+            clause, expected,
+            "the resident command list is out of `/help` order. Reorder the sentence in \
+             crates/tetond/src/harness/self_config.md to match SESSION_COMMANDS."
+        );
+    }
+
     /// **REQ-592 AC-1 / BR-1: the prompt says where its words land, and says it
     /// once.**
     ///

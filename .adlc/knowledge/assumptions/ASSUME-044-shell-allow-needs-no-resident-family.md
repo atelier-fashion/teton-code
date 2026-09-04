@@ -1,9 +1,10 @@
 ---
 id: ASSUME-044
 title: "`/shell allow` does not need a slot in the resident prompt's command-family list"
-status: unresolved
+status: invalidated
 req: REQ-614
 created: 2026-09-04
+resolved: 2026-09-04
 ---
 
 ## Assumption
@@ -46,10 +47,38 @@ which is why it is recorded here rather than settled during a rebase.
 
 ## Resolution
 
-Unresolved. Deliberately not decided inside REQ-614's Phase-7 rebase: the
-merge was scoped to composing four REQs, and adding a family to the resident
-prompt is a new behavioral choice rather than a composition of existing ones.
-Resolve by either adding `/shell` to `self_config.md` (7 bytes, fits) or
-recording that the announcement path is sufficient — and in **either** case
-adding the missing guard, so the next command in a new family is a decision
-somebody makes rather than one nobody sees.
+**Invalidated.** `/shell` is on the resident list, between `/web` and
+`/provider` in `/help` order, and the missing guard is in place.
+
+The deciding fact is what the model has to answer from *after* the pin line
+has scrolled past. BR-7's announcement is the user's path and it is a good one,
+but it fires once, at pin time, and it is not addressed to the model. When the
+user later asks "why is my session on the local model?", the model's resident
+sources are the guide and the tool descriptions — and the `shell` tool's
+description (checked: REQ-615's cwd contract and REQ-614's provenance duty,
+nothing about the pin or its remedy) does not name `/shell allow` either.
+`teton_docs commands` does, but a model only opens that page for a command it
+already suspects exists, which is the exact circularity REQ-617 was opened to
+break. Seven bytes is a cheap price for closing it, and the margin can pay:
+re-measured, not reasoned, both pins moved by exactly 7 — **112 → 105** and
+**159 → 152**, the gap still 47, 57 bytes of usable room above the 48-byte
+floor. `REDACT_BODY_OVERHEAD_BYTES` is unmoved; the ledger line is on it.
+
+The guard is
+`harness::turn_loop::tests::the_resident_prompt_names_every_command_family_the_roster_carries`.
+It reads the families out of the command sentence itself — between `The
+built-in commands are ` and the `;` that closes the list, because the guide
+also carries `/v1/messages`-shaped endpoint paths and a whole-file slash scan is
+not a parser for this clause — and holds them equal to the distinct first words
+of `SESSION_COMMANDS`, in both directions and in `/help` order. A
+`FAMILIES_KEPT_OUT_OF_THE_RESIDENT_PROMPT` list beside it is the one route for
+a family deliberately left off the prompt; it is empty, and an entry has to
+name a family that exists. Mutations run: dropping `/shell` → red naming it
+under "in the roster, absent from the resident prompt"; adding `/bogus` → red
+under the other heading; swapping two families → red on order.
+
+What this does not decide: whether BR-7's line should *also* be surfaced to the
+model as a turn-level fact (a pinned session's routing is state the model
+cannot read from any file, like every other switch the guide describes). That
+is a separate REQ's question. This one only closes the gap where a command the
+session accepts was invisible to the model by construction.
