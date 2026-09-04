@@ -3,10 +3,25 @@
   "branch": "feat/REQ-614-proportionate-shell-provenance",
   "startedAt": "2026-09-04T00:00:00Z",
   "completed": false,
-  "currentPhase": 0,
-  "completedPhases": [],
+  "currentPhase": 2,
+  "completedPhases": [
+    0,
+    1
+  ],
   "integrationBranch": "main",
-  "phaseHistory": [],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree + Preflight",
+      "completedAt": "2026-09-04T19:34:01.479126Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-09-04T19:37:10.718425Z",
+      "result": "approved with 4 in-place fixes (BR-1(d) truncated-scan verdict, BR-5 typed-only precedent, session_pinned.budget_tokens, AC-4 named command)"
+    }
+  ],
   "repos": {
     "teton-code": {
       "primary": true,
@@ -14,14 +29,16 @@
       "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-614",
       "branch": "feat/REQ-614-proportionate-shell-provenance",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/288",
+      "prNumber": 288,
       "merged": false,
       "snapshotBranch": null,
       "snapshotPR": null
     }
   },
-  "mergeOrder": ["teton-code"],
+  "mergeOrder": [
+    "teton-code"
+  ],
   "phase4": {
     "currentTask": null,
     "completedTasks": [],
