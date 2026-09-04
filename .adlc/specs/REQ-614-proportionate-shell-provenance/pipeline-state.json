@@ -89,5 +89,33 @@
     "failedTasks": []
   },
   "conflictsResolved": [],
-  "notes": []
+  "notes": [
+    "Phases 0-6 complete; PR #288 is OPEN and review-ready with the full body and the adlc-footprint block. Phase 7 halted: the PR is CONFLICTING against origin/main, which is also why GitHub started no CI run for the tip (no checks run on an unmergeable head). The last CI run on this branch, commit 6c71c2c, was green.",
+    "Local verification on the pre-rebase tree: 4,348 workspace tests pass and clippy is clean under -D warnings.",
+    "Not resolved by the runner by design: partials/conflict-bound.sh returned rc=1 with three offenders, so BUG-207's bounded keep-both path does not apply. No conflictsResolved entry is appended, per the rule that a conflict which halted and was never resumed is recorded in blockers only."
+  ],
+  "blockers": [
+    {
+      "blockedBy": "manual",
+      "resolvedBlocker": "REQ-615, REQ-616",
+      "conflictFiles": [
+        "crates/teton-protocol/src/events.rs",
+        "crates/teton/src/session_ui.rs",
+        "crates/tetond/src/harness/tools/mod.rs",
+        "crates/tetond/src/harness/tools/shell.rs",
+        "crates/tetond/src/runtime/turn.rs",
+        "crates/tetond/tests/runtime_visibility.rs"
+      ],
+      "appendOnlyOffenders": [
+        "crates/tetond/src/harness/tools/shell.rs",
+        "crates/tetond/src/runtime/turn.rs",
+        "crates/tetond/tests/runtime_visibility.rs"
+      ],
+      "unblockCondition": "Manual rebase onto origin/main. REQ-615 and REQ-616 have already merged, so this is not a wait-for-merge hold (REQ-485 OQ-6 sentinel). `partials/conflict-bound.sh` classified the conflict as NOT append-only: three files carry modified lines, so BUG-207's bounded keep-both path does not apply and the runner must not resolve it unattended.",
+      "detail": "The load-bearing hunk is crates/tetond/src/harness/tools/shell.rs ~L343: REQ-615 added a `cd_note(...)` argument to `render_output` and kept `.with_unknown_provenance()`; REQ-614 changed that same call to `.with_provenance(provenance.clone())`. The intended resolution is REQ-615's new signature AND REQ-614's provenance, but composing two edits to one line is a judgement, not a keep-both append. REQ-615 also rewrote the shell tool description and added root-gating for writes, which interacts with REQ-614's ADR-614-2 (a `rooted` verdict requires RootKind::Project) and should be reviewed together. runtime_visibility.rs conflicts on the CRATE_WIDE/PUBLIC allowlists both REQs edited.",
+      "holdState": "needs-manual-rebase",
+      "rebaseAttempts": 1,
+      "detectedAt": "2026-09-04T22:01:03.881718Z"
+    }
+  ]
 }
