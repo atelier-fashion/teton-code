@@ -1040,6 +1040,61 @@ fn default_repo_file() -> bool {
     true
 }
 
+/// The default `[context] generate` — **ask** (REQ-613 BR-1/BR-10).
+///
+/// The named sibling of [`default_repo_file`] directly above, so a reader
+/// auditing what an absent `[context]` table means finds both of this table's
+/// defaults in one place rather than one here and one in an enum attribute.
+///
+/// It **delegates** rather than restating `Ask`, and that is the whole of its
+/// contract. `default_repo_file` exists to *outrank* a type default that is the
+/// wrong answer (`bool::default()` is `false`); here the type default is ours to
+/// define and is already right, so a second spelling of `Ask` would be a second
+/// opinion that could drift. Every path — the field's
+/// `#[serde(default = "default_generate")]`, [`ContextConfig::default`], and
+/// `GenerateMode::default()` itself — therefore resolves through the one
+/// `#[default]` attribute on [`GenerateMode::Ask`], which is where the shipped
+/// posture is stated once and where a mutation of it goes red everywhere.
+fn default_generate() -> GenerateMode {
+    GenerateMode::default()
+}
+
+/// When the daemon may generate a missing `TETON.md` for a repository (the
+/// `[context] generate` key, REQ-613 BR-1/BR-10).
+///
+/// This is the **durable posture**, not a grant: `always` says "this machine
+/// does not want to be asked", never "generation is happening now". Every
+/// generation still runs the permission level's own rules — `plan` refuses
+/// whatever this says (ADR-2) — so the setting can only ever make the daemon ask
+/// *less*, and never make it write where the level would not.
+///
+/// # Why three values and not a bool
+///
+/// The two switches a bool could carry ("offer" / "do not offer") leave the
+/// automation case with no spelling: an unattended session — piped stdin, no
+/// terminal — cannot answer a prompt, so under `ask` it never writes, and BR-10
+/// requires exactly one durable way to say "write without asking me". Folding
+/// that into `true` would make one key mean two things depending on whether a
+/// terminal happens to be attached, which is the shape REQ-558 spent an ADR
+/// removing. [`Self::Always`] is therefore an automation opt-in with the same
+/// character as `[skills] trusted_project_roots`, and the docs say so beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerateMode {
+    /// Offer through the permission gate, once per repository per session — the
+    /// shipped default. An unattended session cannot answer, so it writes
+    /// nothing and blocks on nothing (BR-10).
+    #[default]
+    Ask,
+    /// Generate without a prompt, in whichever project the session was launched
+    /// in (OQ-1). The unattended spelling, and the only one.
+    Always,
+    /// Never offer. `/context init` and `teton context init` still generate,
+    /// because those are the user's explicit act rather than the daemon's offer
+    /// (BR-8) — this key suppresses the *offer*, not the feature.
+    Never,
+}
+
 /// Repository context notes (the `[context]` table, REQ-612).
 ///
 /// **On by default** (BR-2), which is the opposite posture from
@@ -1073,12 +1128,33 @@ pub struct ContextConfig {
     /// the shipped default is on.
     #[serde(default = "default_repo_file")]
     pub repo_file: bool,
+
+    /// Whether a session may generate this file when the repository has none
+    /// (REQ-613 BR-1).
+    ///
+    /// **Defaults to [`GenerateMode::Ask`]**. Serialized unconditionally within
+    /// the table, like [`Self::repo_file`] beside it, though the reason is the
+    /// weaker one: an absent `generate` reads as `ask`, which *is* the shipped
+    /// posture, so nothing is misread. What a `skip_serializing_if` would buy is
+    /// one fewer line in a table the user has already departed the default in,
+    /// and what it would cost is a table whose two switches follow different
+    /// rules — a reader who finds `repo_file` stated and `generate` missing has
+    /// to know which absence means what. The table is already conditional as a
+    /// whole ([`Self::is_unset`] on `Config::context`), which is where the "do
+    /// not write a table nobody asked for" rule actually lives.
+    ///
+    /// This is the durable default only. Whether *this* session offers is also
+    /// decided by the permission level and by what the session already asked,
+    /// and neither is a config key.
+    #[serde(default = "default_generate")]
+    pub generate: GenerateMode,
 }
 
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
             repo_file: default_repo_file(),
+            generate: default_generate(),
         }
     }
 }
@@ -1090,7 +1166,19 @@ impl ContextConfig {
     ///
     /// Note which way round this reads: an *unset* `[context]` is one with the
     /// feature **on**, because on is the default. The table reaches a user's
-    /// file only when they turned the notes off.
+    /// file only when they turned the notes off — or, since REQ-613, when they
+    /// moved [`Self::generate`] off `ask`.
+    ///
+    /// # The LESSON-587 audit for `generate` (REQ-613)
+    ///
+    /// This is the **only** predicate in the tree that branches on a
+    /// `[context]` field holding its default, so it is the whole audit surface
+    /// LESSON-587 asks for. Adding a second field to a whole-struct equality can
+    /// only move configs from "unset" to "set" — never the other way — so the
+    /// one rule behind it (do not write a table the user never named) fires
+    /// strictly less often than before, and no dormant branch is switched on for
+    /// everybody at once. Nothing anywhere asks "is `generate` at its default?"
+    /// as a proxy for a decision; the daemon matches on the mode's three values.
     #[must_use]
     pub fn is_unset(&self) -> bool {
         *self == Self::default()
@@ -1194,9 +1282,11 @@ pub struct Config {
     /// reads the repository's notes file at the session root into the system
     /// prompt. Absent means `repo_file = true` — the notes are on, because a
     /// file written to be read is no use behind an opt-in (BR-2) — and `false`
-    /// means the file is never opened at all. See [`ContextConfig`]. Declared
-    /// here among the tables, before the array-of-table fields, for the
-    /// TOML-ordering reason above.
+    /// means the file is never opened at all. It also carries REQ-613's
+    /// `generate` posture — whether a session may *write* that file when the
+    /// repository has none — whose absence means [`GenerateMode::Ask`]. See
+    /// [`ContextConfig`]. Declared here among the tables, before the
+    /// array-of-table fields, for the TOML-ordering reason above.
     #[serde(default, skip_serializing_if = "ContextConfig::is_unset")]
     pub context: ContextConfig,
     /// Registered providers.
@@ -5038,6 +5128,149 @@ provider_id = "on-device"
         assert!(
             !written.contains("[context]"),
             "an unset table was written into the user's config: {written}"
+        );
+    }
+
+    // ---- REQ-613: `[context] generate` (BR-10) ------------------------------
+
+    /// **REQ-613 BR-10 / TASK-379.** The generation posture defaults to `ask`
+    /// from every direction a config can arrive, all three spellings parse, and
+    /// a fourth is refused *structurally* with the three named.
+    ///
+    /// The three default arrivals are the three serde paths
+    /// [`context_table_defaults_repo_file_to_true`] separates for `repo_file`,
+    /// and for the same reason: a schema that gets the absent table right and
+    /// the named-but-empty one wrong is exactly what a default this durable has
+    /// to rule out. Here every one of those paths resolves to the single
+    /// `#[default]` attribute on [`GenerateMode::Ask`] — see
+    /// [`default_generate`] for why the free function delegates instead of
+    /// restating it — so the legs are testing the paths rather than testing
+    /// three copies of a constant for agreement.
+    ///
+    /// The refusal leg is the one worth writing down. `generate` is a closed
+    /// set, so a typo has to be a **load failure** and not a silent fall back to
+    /// `ask`: a user who wrote `generate = "nevr"` and got the shipped default
+    /// would be told nothing and would keep meeting the offer they turned off.
+    /// It is asserted as [`LoadError::Parse`] specifically — the value is
+    /// refused by the *shape* of the document, before any rule about the
+    /// config as a whole runs — and on the sentence naming all three
+    /// alternatives, which is what makes the refusal actionable rather than
+    /// merely correct.
+    ///
+    /// The last leg is the durable-write posture, and it is what makes
+    /// `teton context generate never` reach disk at all: a `generate` off its
+    /// default has to make [`ContextConfig::is_unset`] false, or
+    /// `Config::context`'s `skip_serializing_if` drops the whole table and the
+    /// user's setting is serialized nowhere. Its integration twin is
+    /// `tetond/tests/config_preservation.rs::set_repo_context_generate_writes_the_key_and_a_refused_write_leaves_the_bytes_identical`.
+    ///
+    /// **Mutations** (LESSON-441), all four run 2026-09-03 and restored:
+    /// 1. `#[default]` moved from `GenerateMode::Ask` to `Never` — every
+    ///    default-arrival leg goes red on the first one (`empty document: the
+    ///    shipped posture is 'ask'`), which is the whole posture in one place;
+    /// 2. `#[serde(default = "default_generate")]` on `ContextConfig::generate`
+    ///    replaced by a bare `#[serde(default)]` — **green**, measured rather
+    ///    than assumed, and the reason is the point: unlike `repo_file`, whose
+    ///    field-level default resolves to the *wrong* `bool::default()`, both
+    ///    spellings here resolve to `GenerateMode::default()`. The named
+    ///    function is a reading convenience, so no leg can distinguish it, and
+    ///    the mutation with teeth for this default is 1;
+    /// 3. `skip_serializing_if = "ContextConfig::is_unset"` dropped from
+    ///    `Config::context` — the last leg goes red (`generate` invented a table
+    ///    the user never named), which is the half that keeps the new field out
+    ///    of an untouched config;
+    /// 4. `#[serde(rename_all = "snake_case")]` dropped from `GenerateMode` —
+    ///    all three spelling legs go red on `unknown variant`, and the refusal
+    ///    leg goes red too because the sentence then names `Ask`, `Always`,
+    ///    `Never` rather than the spellings a user writes.
+    #[test]
+    fn context_generate_defaults_to_ask_and_names_its_three_values() {
+        // The three arrivals of the default. The last is the trap: naming the
+        // table for `repo_file`'s sake must not decide `generate` too.
+        for (label, document) in [
+            ("empty document", ""),
+            ("an unrelated table", "[privacy]\nredact = true\n"),
+            ("the table named, the key omitted", "[context]\n"),
+            ("the neighbouring key set", "[context]\nrepo_file = false\n"),
+        ] {
+            let cfg = Config::load(document).expect("must load");
+            assert_eq!(
+                cfg.context.generate,
+                GenerateMode::Ask,
+                "{label}: the shipped posture is `ask`"
+            );
+        }
+        assert_eq!(
+            Config::default().context.generate,
+            GenerateMode::Ask,
+            "the in-memory default disagrees with the parsed one"
+        );
+        assert_eq!(
+            Config::load("[context]\n").expect("must load").context,
+            ContextConfig::default(),
+            "naming the table with no keys is not a third state"
+        );
+
+        // All three spellings, and the snake_case wire they are written in.
+        for (spelling, mode) in [
+            ("ask", GenerateMode::Ask),
+            ("always", GenerateMode::Always),
+            ("never", GenerateMode::Never),
+        ] {
+            let cfg = Config::load(&format!("[context]\ngenerate = \"{spelling}\"\n"))
+                .unwrap_or_else(|err| panic!("`{spelling}` must parse: {err}"));
+            assert_eq!(cfg.context.generate, mode, "`{spelling}` read as {mode:?}");
+            cfg.validate()
+                .expect("the key is structural only — nothing to refuse");
+        }
+
+        // A fourth value is refused by the document's shape, with the three
+        // alternatives in the sentence.
+        let err = Config::load("[context]\ngenerate = \"nevr\"\n")
+            .expect_err("an unknown mode must not fall back to the default");
+        assert!(
+            matches!(err, LoadError::Parse(_)),
+            "a closed set is a structural rule, not a validation one: {err:?}"
+        );
+        let message = err.to_string();
+        for named in ["ask", "always", "never"] {
+            assert!(
+                message.contains(named),
+                "the refusal must name `{named}` as an alternative: {message}"
+            );
+        }
+
+        // The durable-write posture: a `generate` off its default is what makes
+        // the table reach the user's file at all, and it round-trips.
+        let never = Config::load("[context]\ngenerate = \"never\"\n").expect("must load");
+        assert!(
+            !never.context.is_unset(),
+            "a set `generate` must make the table non-default, or \
+             `skip_serializing_if` drops it and the setting is written nowhere"
+        );
+        assert!(
+            never.context.repo_file,
+            "and it must not disturb the neighbouring switch"
+        );
+        let written = never.to_toml().expect("serialize");
+        assert!(
+            written.contains("[context]")
+                && written.contains("generate = \"never\"")
+                && written.contains("repo_file = true"),
+            "an emitted table states both switches: {written}"
+        );
+        assert_eq!(
+            Config::from_toml(&written).expect("deserialize").context,
+            never.context,
+            "the table must round-trip; toml was:\n{written}"
+        );
+
+        // And the new field does not make an untouched config grow the table.
+        let untouched = Config::load("[privacy]\nredact = true\n").expect("must load");
+        let written = untouched.to_toml().expect("serialize");
+        assert!(
+            !written.contains("[context]"),
+            "`generate` invented a table the user never named: {written}"
         );
     }
 

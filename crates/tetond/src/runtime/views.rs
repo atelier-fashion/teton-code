@@ -760,6 +760,10 @@ mod tests {
         let flipped = Config {
             context: teton_core::config::ContextConfig {
                 repo_file: !absent.context.repo_file,
+                // The one key this projection is about; every other field of
+                // the table (REQ-613's `generate`) keeps its default, so a
+                // later one cannot break this fixture.
+                ..teton_core::config::ContextConfig::default()
             },
             ..Config::default()
         };
