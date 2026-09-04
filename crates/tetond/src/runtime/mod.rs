@@ -20124,6 +20124,7 @@ provider_id = \"deepseek\"
                 is_local: false,
                 redact_scan: false,
                 provider_id: Some("kimi"),
+                local_window: 0,
             })
         }
 
@@ -20441,6 +20442,7 @@ provider_id = \"deepseek\"
                 is_local: false,
                 redact_scan: false,
                 provider_id: Some("kimi"),
+                local_window: 0,
             });
             assert_eq!(floored.bound, teton_protocol::events::BudgetBound::UserCap);
             publish_commit_pressure(&events, &dropped, &floored);
@@ -23693,6 +23695,7 @@ provider_id = \"deepseek\"
                 is_local: false,
                 redact_scan: false,
                 provider_id: Some("kimi"),
+                local_window: 0,
             }))
         }
 

@@ -1,7 +1,7 @@
 ---
 id: TASK-392
 title: "Thread the runtime window into the budget derivation"
-status: draft
+status: complete
 parent: REQ-616
 created: 2026-09-04
 updated: 2026-09-04

@@ -492,6 +492,22 @@ pub struct RouteDecided {
     /// (BR-6).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub effort: Option<ResolvedEffort>,
+    /// The **window** this route's budget was derived from, in the route's own
+    /// tokens (REQ-616 BR-6): the provider's declared `max_context` (or the
+    /// user's cap, when that is smaller), or the local engine's `n_ctx`.
+    ///
+    /// Carried beside [`Self::budget_tokens`] rather than left to be inferred
+    /// from it, because the two are different currencies. A provider declaring
+    /// 1,000,000 tokens derives a 665,984-**word** budget, and a surface that
+    /// prints only the second reads as though the window shrank by a third —
+    /// the confusion LESSON-446 records.
+    ///
+    /// `Option` for **wire additivity only**, exactly as [`Self::effort`]: a
+    /// daemon that has this field always populates it, and a frame from a
+    /// daemon predating it reads `None`. Moves neither
+    /// [`crate::PROTOCOL_VERSION`] nor [`crate::PROTOCOL_VERSION_MIN`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub window_tokens: Option<u32>,
     /// The word budget this route attempt's context was fitted to (REQ-586
     /// BR-8) — the `HarnessConfig` pair's token half, as the router derived it
     /// for this attempt, never recomputed by a surface.
@@ -4340,6 +4356,7 @@ mod tests {
             model: Some("opus".to_owned()),
             reason: "architecture phase routes to the frontier tier".to_owned(),
             effort: Some(ResolvedEffort::effort(crate::effort::EffortLevel::Xhigh)),
+            window_tokens: None,
             budget_tokens: Some(132_650),
             budget_bytes: Some(397_952),
             bound: Some(BudgetBound::Window),
@@ -4378,6 +4395,7 @@ mod tests {
                     model: None,
                     reason: "r".to_owned(),
                     effort: None,
+                    window_tokens: None,
                     budget_tokens: None,
                     budget_bytes: None,
                     bound: None,
@@ -5692,6 +5710,7 @@ mod tests {
             model: None,
             reason: "r".to_owned(),
             effort: None,
+            window_tokens: None,
             budget_tokens: Some(6_250),
             budget_bytes: Some(50_000),
             bound: Some(BudgetBound::UserCap),
@@ -5837,6 +5856,7 @@ mod tests {
             model: Some("deepseek-coder".to_owned()),
             reason: "implement phase routes to the configured cheap tier".to_owned(),
             effort: Some(ResolvedEffort::effort(crate::effort::EffortLevel::High)),
+            window_tokens: None,
             budget_tokens: None,
             budget_bytes: None,
             bound: None,
@@ -5863,6 +5883,7 @@ mod tests {
                 model: Some("deepseek-coder".to_owned()),
                 reason: "implement phase routes to the configured cheap tier".to_owned(),
                 effort: Some(ResolvedEffort::effort(crate::effort::EffortLevel::High)),
+                window_tokens: None,
                 budget_tokens: Some(84_650),
                 budget_bytes: Some(253_952),
                 bound: Some(bound),
@@ -5921,6 +5942,7 @@ mod tests {
             model: Some("kimi-k3".to_owned()),
             reason: "implement routes to the cheap tier".to_owned(),
             effort: Some(ResolvedEffort::effort(crate::effort::EffortLevel::High)),
+            window_tokens: None,
             budget_tokens: Some(84_650),
             budget_bytes: Some(253_952),
             bound: Some(BudgetBound::UserCap),
@@ -7092,6 +7114,7 @@ mod tests {
             effort: Some(ResolvedEffort::omit(
                 crate::effort::EffortOmission::ShapeNone,
             )),
+            window_tokens: None,
             budget_tokens: None,
             budget_bytes: None,
             bound: None,

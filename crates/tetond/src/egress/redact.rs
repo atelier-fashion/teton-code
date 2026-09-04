@@ -98,7 +98,7 @@ use crate::harness::redact::{
     REDACT_DEFUSE_GROWTH_DIVISOR, REDACT_DUTY, REDACT_PROMPT_OVERHEAD_BYTES,
 };
 use crate::harness::render::CHATML_DUTY_ENVELOPE_BYTES;
-use crate::runtime::LOCAL_ENGINE_N_CTX;
+use crate::runtime::LOCAL_ENGINE_N_CTX_DEFAULT;
 
 /// Bytes the duty seam assumes per BPE token, sizing a prompt against a context
 /// window.
@@ -130,8 +130,9 @@ const DUTY_BYTES_PER_TOKEN: usize = DUTY_REQUEST_BYTES_PER_TOKEN;
 ///
 /// This is the budget the **rendered** prompt has to fit, which is what
 /// [`crate::harness::redact::scan`] measures against before it calls the model.
-pub(crate) const REDACT_PROMPT_BUDGET_BYTES: usize =
-    (LOCAL_ENGINE_N_CTX as usize - REDACT_DUTY.max_tokens() as usize) * DUTY_BYTES_PER_TOKEN;
+pub(crate) const REDACT_PROMPT_BUDGET_BYTES: usize = (LOCAL_ENGINE_N_CTX_DEFAULT as usize
+    - REDACT_DUTY.max_tokens() as usize)
+    * DUTY_BYTES_PER_TOKEN;
 
 /// The largest payload the redactor will hand to a **single** model call, in
 /// bytes (ADR-6, BR-7).
@@ -141,7 +142,7 @@ pub(crate) const REDACT_PROMPT_BUDGET_BYTES: usize =
 /// to be two independently chosen numbers:
 ///
 /// ```text
-///   engine window            32,768 tokens   (LOCAL_ENGINE_N_CTX)
+///   engine window            32,768 tokens   (LOCAL_ENGINE_N_CTX_DEFAULT)
 ///   − the duty's generation   1,024 tokens   (REDACT_DUTY.max_tokens())
 ///   = prompt budget          31,744 tokens
 ///   × 2 bytes/token          63,488 bytes    (the seam's convention — an
@@ -2112,7 +2113,7 @@ mod tests {
     fn a_chunk_at_the_per_chunk_cap_still_fits_the_engines_window() {
         use crate::harness::redact::{redact_prompt, rendered_prompt_bytes};
 
-        let budget = (LOCAL_ENGINE_N_CTX as usize - REDACT_DUTY.max_tokens() as usize)
+        let budget = (LOCAL_ENGINE_N_CTX_DEFAULT as usize - REDACT_DUTY.max_tokens() as usize)
             * DUTY_BYTES_PER_TOKEN;
         assert_eq!(
             REDACT_PROMPT_BUDGET_BYTES, budget,

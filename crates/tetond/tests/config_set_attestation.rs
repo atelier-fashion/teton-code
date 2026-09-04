@@ -417,6 +417,7 @@ fn a_window_bound_offer() -> OverBudgetOffer {
         is_local: false,
         redact_scan: false,
         provider_id: Some("kimi"),
+        local_window: 0,
     };
     let budget = budget::derive(inputs);
     assert_eq!(

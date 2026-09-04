@@ -5066,6 +5066,9 @@ impl StampedRoutes {
         };
         let budget_bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
         let budget = RouteBudget {
+            // Absent on a daemon predating REQ-616; zero reads as "no window
+            // reported", which is exactly what such a frame carried.
+            window_tokens: decided.window_tokens.unwrap_or(0),
             budget_tokens: usize::try_from(tokens).unwrap_or(usize::MAX),
             budget_bytes,
             bound,
@@ -11878,6 +11881,7 @@ mod tests {
             is_local: false,
             redact_scan: false,
             provider_id: Some("kimi"),
+            local_window: 0,
         });
         let decided = RouteDecided {
             category: None,
@@ -11887,6 +11891,7 @@ mod tests {
             model: Some("kimi-k2".to_owned()),
             reason: "a fixture".to_owned(),
             effort: None,
+            window_tokens: None,
             budget_tokens: Some(derived.budget_tokens as u64),
             budget_bytes: Some(derived.budget_bytes as u64),
             bound: Some(derived.bound),
@@ -12106,6 +12111,7 @@ mod tests {
 
         for missing in [
             RouteDecided {
+                window_tokens: None,
                 budget_tokens: None,
                 ..full.clone()
             },

@@ -325,6 +325,12 @@ impl Route {
             // separately. Always `Some(..)` on a route the router built: the
             // budget is a property of the attempt, and `None` on this wire now
             // means "a daemon that predates REQ-586".
+            // REQ-616 BR-6: the same projection, one field earlier — the
+            // window the pair was derived from, so a surface can print both
+            // and neither has to be inferred from the other. `0` on the
+            // `DefaultUnknown` arm means no window is known, and is reported as
+            // `None` rather than as a window of zero.
+            window_tokens: (self.budget.window_tokens > 0).then_some(self.budget.window_tokens),
             budget_tokens: Some(self.budget.budget_tokens as u64),
             budget_bytes: Some(self.budget.budget_bytes as u64),
             bound: Some(self.budget.bound),
@@ -443,6 +449,16 @@ pub struct Router {
     /// from the same `config.privacy.redact` the gate consults, so the bound
     /// and the gate cannot disagree.
     redact_scan: bool,
+    /// The window the local engine is actually serving, in engine tokens; `0`
+    /// = no engine loaded, so `LOCAL_ENGINE_N_CTX_DEFAULT` applies (REQ-616
+    /// BR-1).
+    ///
+    /// A routing input for the same reason [`Self::redact_scan`] is: the local
+    /// route's budget is derived from it, and a router that did not know it
+    /// would derive the budget of a window the engine is not serving. Fed by
+    /// [`Router::with_local_window`] when the daemon loads an engine; zero
+    /// until then, which is every default build and all of CI.
+    local_window: u32,
 }
 
 impl Router {
@@ -467,6 +483,9 @@ impl Router {
             // opt-in, and a router that assumed the scan were on would hold
             // every remote route to the scannable bound nothing asked for.
             redact_scan: false,
+            // Zero until an engine loads: the local route derives from
+            // `LOCAL_ENGINE_N_CTX_DEFAULT` in the meantime (REQ-616 ADR-616-1).
+            local_window: 0,
         }
     }
 
@@ -637,13 +656,31 @@ impl Router {
                     is_local: false,
                     redact_scan: self.redact_scan,
                     provider_id: Some(id),
+                    // A remote route: `is_local` is false, so the local arm is
+                    // not taken and this field is not read.
+                    local_window: 0,
                 }
             }
             // The local tier and the unresolvable route: no declared window, no
             // cap, and the engine's own `n_ctx` — not a provider declaration —
-            // is what the default pair is sized against (OQ-3).
-            _ => BudgetInputs::local(),
+            // is what the default pair is sized against (OQ-3). Since REQ-616
+            // that `n_ctx` is what the engine actually loaded with rather than
+            // a constant, so it travels here; `0` means no engine is loaded and
+            // the default window applies.
+            _ => BudgetInputs::local_at(self.local_window),
         }
+    }
+
+    /// Record the window the local engine loaded with (REQ-616 BR-1).
+    ///
+    /// Called by the daemon after a successful load. Until then the router
+    /// carries `0` and the local route derives from
+    /// `LOCAL_ENGINE_N_CTX_DEFAULT`, which is the shape every default build and
+    /// every CI run sees.
+    #[must_use]
+    pub fn with_local_window(mut self, n_ctx: u32) -> Self {
+        self.local_window = n_ctx;
+        self
     }
 
     /// Set the category a freeform judgment turn falls back to (BR-9). Read from
@@ -2736,12 +2773,32 @@ mod tests {
     /// moved no derived figure; it added a column, and this table is what says
     /// the column is the same on all five bounds. A row that stops reaching the
     /// cap is a route below 32 KB of bytes, which is news.
+    ///
+    /// **REQ-616 prepended a column, and moved no figure.** `window_tokens` is
+    /// the window each row's pair was derived from, reported beside the pair
+    /// instead of left to be inferred from it (BR-6, LESSON-446). Every other
+    /// number in all five rows is byte-identical to the line above, and that is
+    /// the claim ADR-616-1 rests on: the local window became a **runtime** fact,
+    /// but its no-engine default is still 32,768, so a build that loads no
+    /// engine — the `MockEngine` path, and all of CI including this test —
+    /// derives exactly what it derived before. A row whose *pair* moves here
+    /// means the loaded-window path leaked into the default, which is the one
+    /// regression this change could plausibly cause.
+    ///
+    /// The new column's own values are worth reading. `local_engine` reports
+    /// 32,768, the default, because no engine is loaded. The three declared
+    /// routes report their provider's window — except `user_cap`, which reports
+    /// the **cap** (40,000) rather than the declaration, because a cap is a
+    /// window ceiling and the pair is recomputed from the smaller of the two,
+    /// so the cap *is* the window this route ran under. And `default_unknown`
+    /// reports `0`, which is how "no window is known" gets said rather than
+    /// guessed (REQ-586: an unknown window is stated).
     const BUDGET_FOR_GOLDEN: [&str; 5] = [
-        "local_engine: RouteBudget { budget_tokens: 21162, budget_bytes: 63488, bound: LocalEngine, window_label: \"the local context window\", digest_threshold_tokens: 7749, digest_threshold_bytes: 23250, floored: false, provider_id: None, repo_context_cap: 8192 }",
-        "default_unknown: RouteBudget { budget_tokens: 4096, budget_bytes: 32768, bound: DefaultUnknown, window_label: \"silent's context window\", digest_threshold_tokens: 1500, digest_threshold_bytes: 12000, floored: false, provider_id: Some(\"silent\"), repo_context_cap: 8192 }",
-        "window: RouteBudget { budget_tokens: 84650, budget_bytes: 253952, bound: Window, window_label: \"wide's context window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 93000, floored: false, provider_id: Some(\"wide\"), repo_context_cap: 8192 }",
-        "user_cap: RouteBudget { budget_tokens: 25984, budget_bytes: 77952, bound: UserCap, window_label: \"capped's context window\", digest_threshold_tokens: 9515, digest_threshold_bytes: 28546, floored: false, provider_id: Some(\"capped\"), repo_context_cap: 8192 }",
-        "redact_scan: RouteBudget { budget_tokens: 84650, budget_bytes: 184265, bound: RedactScan, window_label: \"the redact-scannable window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 67479, floored: false, provider_id: Some(\"wide\"), repo_context_cap: 8192 }",
+        "local_engine: RouteBudget { window_tokens: 32768, budget_tokens: 21162, budget_bytes: 63488, bound: LocalEngine, window_label: \"the local context window\", digest_threshold_tokens: 7749, digest_threshold_bytes: 23250, floored: false, provider_id: None, repo_context_cap: 8192 }",
+        "default_unknown: RouteBudget { window_tokens: 0, budget_tokens: 4096, budget_bytes: 32768, bound: DefaultUnknown, window_label: \"silent's context window\", digest_threshold_tokens: 1500, digest_threshold_bytes: 12000, floored: false, provider_id: Some(\"silent\"), repo_context_cap: 8192 }",
+        "window: RouteBudget { window_tokens: 128000, budget_tokens: 84650, budget_bytes: 253952, bound: Window, window_label: \"wide's context window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 93000, floored: false, provider_id: Some(\"wide\"), repo_context_cap: 8192 }",
+        "user_cap: RouteBudget { window_tokens: 40000, budget_tokens: 25984, budget_bytes: 77952, bound: UserCap, window_label: \"capped's context window\", digest_threshold_tokens: 9515, digest_threshold_bytes: 28546, floored: false, provider_id: Some(\"capped\"), repo_context_cap: 8192 }",
+        "redact_scan: RouteBudget { window_tokens: 128000, budget_tokens: 84650, budget_bytes: 184265, bound: RedactScan, window_label: \"the redact-scannable window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 67479, floored: false, provider_id: Some(\"wide\"), repo_context_cap: 8192 }",
     ];
 
     /// **REQ-589 TASK-259.** What the accessor is *for*: the provider's declared

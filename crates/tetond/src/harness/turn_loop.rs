@@ -389,7 +389,7 @@ pub struct HarnessConfig {
     /// provenance since REQ-590** — read `derive`'s local arm rather than
     /// trusting this summary.
     ///
-    /// Both halves are window-derived: `LOCAL_ENGINE_N_CTX` less
+    /// Both halves are window-derived: `LOCAL_ENGINE_N_CTX_DEFAULT` less
     /// `LOCAL_GENERATION_RESERVATION`, then the 3/2 rule for words and the
     /// 2 B/token floor for bytes — 21,162 words / 63,488 bytes on the
     /// 32,768-token window.

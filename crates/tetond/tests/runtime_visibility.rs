@@ -16,9 +16,9 @@
 //!
 //! The bare-name search counted **prose** — `startup_lifecycle`, `seam_policy`,
 //! `cause_taints_the_session`, `derive_provider_setup` and
-//! `LOCAL_ENGINE_N_CTX` appear outside the tree only inside doc comments like
+//! `LOCAL_ENGINE_N_CTX_DEFAULT` appear outside the tree only inside doc comments like
 //! `// see \`runtime::startup_lifecycle\``. The qualified-path rule fixed that
-//! and broke differently: it missed `LOCAL_ENGINE_N_CTX`, imported on its own
+//! and broke differently: it missed `LOCAL_ENGINE_N_CTX_DEFAULT`, imported on its own
 //! line rather than in a group.
 //!
 //! So this file does **not** re-implement the decision. It pins the *result*,
@@ -95,7 +95,7 @@ const MUST_BE_PRESENT: &[&str] = &[
 ///
 /// | item | reached from |
 /// |---|---|
-/// | `LOCAL_ENGINE_N_CTX` | `egress/redact.rs`, `harness/budget.rs`, `harness/compact.rs` |
+/// | `LOCAL_ENGINE_N_CTX_DEFAULT` | `egress/redact.rs`, `harness/budget.rs`, `harness/compact.rs` |
 /// | `TAINT_BY_CONTEXT`, `taint_pin_line` | `carry.rs` |
 /// | `endpoint_query_names_a_credential` | `provider_recipes.rs`, `web_setup_catalog.rs` |
 ///
@@ -103,7 +103,7 @@ const MUST_BE_PRESENT: &[&str] = &[
 /// docs. Nothing outside `runtime/` names it, and the accessor that appeared to
 /// require it did not need crate reach either.
 const CRATE_WIDE: &[&str] = &[
-    "LOCAL_ENGINE_N_CTX",
+    "LOCAL_ENGINE_N_CTX_DEFAULT",
     "TAINT_BY_CONTEXT",
     "endpoint_query_names_a_credential",
     "taint_pin_line",
@@ -261,7 +261,7 @@ fn declared_with(line: &str, vis: &str) -> Option<String> {
     let rest = line.trim_start().strip_prefix(vis)?;
     // `async` is a modifier; `const` is BOTH a modifier (`const fn`) and an item
     // kind (`const NAME: T`). Getting that wrong is what made the first draft of
-    // this parser miss `LOCAL_ENGINE_N_CTX` and `TAINT_BY_CONTEXT` — the same
+    // this parser miss `LOCAL_ENGINE_N_CTX_DEFAULT` and `TAINT_BY_CONTEXT` — the same
     // two-meanings-one-keyword slip that produced an earlier wrong count.
     let rest = rest.strip_prefix("async ").unwrap_or(rest);
     let after = if let Some(r) = rest.strip_prefix("const ") {
@@ -354,7 +354,7 @@ fn declared_pub_crate() -> BTreeSet<String> {
 /// | 3 | narrow `taint_pin_line` to `pub(super)` in source, keep it in `CRATE_WIDE` | **does not compile** — `carry.rs` needs it. The lower bound is unreachable this way; the compiler refuses first |
 /// | 4 | add `"an_item_that_does_not_exist"` to `CRATE_WIDE` | `expected to be crate-visible but is not: ["an_item_that_does_not_exist"]` — the lower bound, finally observed |
 /// | 5 | point the walk at `src/projects` | the **presence** floor: `did not find \`config_document.rs\`` |
-/// | 6 | make the parser stop recognising `const` | `expected to be crate-visible but is not: ["LOCAL_ENGINE_N_CTX", "TAINT_BY_CONTEXT"]` |
+/// | 6 | make the parser stop recognising `const` | `expected to be crate-visible but is not: ["LOCAL_ENGINE_N_CTX_DEFAULT", "TAINT_BY_CONTEXT"]` |
 ///
 /// **Mutation 4 also caught a defect in the floor written above it.** The
 /// declaration floor was first expressed as `found.len() >= CRATE_WIDE.len()`.
@@ -538,8 +538,8 @@ fn only_a_declaration_counts_never_a_mention() {
             "taint_pin_line",
         ),
         (
-            "pub(crate) const LOCAL_ENGINE_N_CTX: u32 = 32_768;",
-            "LOCAL_ENGINE_N_CTX",
+            "pub(crate) const LOCAL_ENGINE_N_CTX_DEFAULT: u32 = 32_768;",
+            "LOCAL_ENGINE_N_CTX_DEFAULT",
         ),
         (
             "    pub(crate) struct RenderedProviderSetup {",

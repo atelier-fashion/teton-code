@@ -746,6 +746,7 @@ mod tests {
             is_local: false,
             redact_scan: false,
             provider_id: Some("kimi"),
+            local_window: 0,
         });
         assert_ne!(
             rerouted.budget_bytes, config.budget.budget_bytes,

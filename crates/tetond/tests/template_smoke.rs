@@ -41,7 +41,7 @@ use tetond::harness::{
 };
 
 /// The generation window the daemon loads the local tier with
-/// (`runtime::LOCAL_ENGINE_N_CTX`), mirrored here so the smoke runs the same
+/// (`runtime::LOCAL_ENGINE_N_CTX_DEFAULT`), mirrored here so the smoke runs the same
 /// shape production does.
 const SMOKE_N_CTX: u32 = 32_768;
 

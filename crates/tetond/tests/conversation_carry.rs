@@ -1387,6 +1387,7 @@ async fn a_conversation_assembled_on_a_128k_route_survives_a_local_turns_smaller
         is_local: false,
         redact_scan: false,
         provider_id: Some("kimi"),
+        local_window: 0,
     });
     assert_eq!(remote_budget.bound, BudgetBound::Window);
     // `without_digest` **after** `with_route_budget`: the latter sets both
@@ -1862,6 +1863,7 @@ async fn a_reroute_to_a_floored_route_re_renders_the_notes_and_keeps_the_users_m
             is_local: false,
             redact_scan: false,
             provider_id: Some("tiny"),
+            local_window: 0,
         });
         assert!(
             budget.floored,
@@ -1980,6 +1982,7 @@ async fn a_reroute_to_a_floored_route_re_renders_the_notes_and_keeps_the_users_m
         is_local: false,
         redact_scan: false,
         provider_id: Some("kimi"),
+        local_window: 0,
     });
     assert_ne!(
         wide.budget_bytes, local_budget.budget_bytes,

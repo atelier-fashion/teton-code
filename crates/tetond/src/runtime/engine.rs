@@ -1021,7 +1021,28 @@ pub(super) fn fake_engine_loader(
 /// passed the cap and then failed as an opaque engine error, blocking with
 /// the wrong reason. One number, one place; the scan's total cap
 /// (`REDACT_INPUT_MAX_BYTES`) is in turn a stated multiple of the chunk cap.
-pub(crate) const LOCAL_ENGINE_N_CTX: u32 = 32_768;
+/// ## Why this is a *default* since REQ-616 (ADR-616-1)
+///
+/// The name gained its suffix when the local window became a runtime fact. The
+/// constant used to do two jobs, and only the first was about a real engine:
+/// the `n_ctx` handed to `LlamaEngine::load`, and the compile-time basis for
+/// the two derived byte caps and [`derive`](crate::harness::budget::derive)'s
+/// local arm — the second evaluated in **every** build, including every CI
+/// build, none of which compile llama.cpp.
+///
+/// Deleting the constant in favour of a runtime lookup would have left that
+/// second job with no value to compute from in exactly the builds that do all
+/// the testing, and every assertion derived from it either rewritten or
+/// vacuous (LESSON-569, LESSON-598). So it keeps the second job and says what
+/// it now is: the window used when **no real engine is loaded**, which is the
+/// `MockEngine` path and all of CI. A loaded engine's window travels as
+/// `BudgetInputs::local_window`.
+///
+/// The property that follows is the one that made REQ-616 tractable in a single
+/// pass: **CI's window is still 32,768, so every existing assertion on
+/// 21,162 / 63,488 / 184,265 keeps its number**, and the 262,144 path is
+/// exercised by tests that pass an explicit window.
+pub(crate) const LOCAL_ENGINE_N_CTX_DEFAULT: u32 = 32_768;
 
 /// The real weights loader: llama.cpp behind the [`Engine`] trait (AC-2).
 ///
@@ -1065,13 +1086,13 @@ impl crate::model_consent::LocalEngineLoader for LlamaEngineLoader {
             GpuClass::AppleSilicon | GpuClass::Cuda => u32::MAX,
             GpuClass::Cpu => 0,
         };
-        let engine =
-            LlamaEngine::load(model_name, &path, gpu_layers, LOCAL_ENGINE_N_CTX).map_err(|e| {
-                format!(
-                    "{model_name}'s weights could not be loaded: {}",
-                    without_path(&e.to_string(), &path)
-                )
-            })?;
+        let engine = LlamaEngine::load(model_name, &path, gpu_layers, LOCAL_ENGINE_N_CTX_DEFAULT)
+            .map_err(|e| {
+            format!(
+                "{model_name}'s weights could not be loaded: {}",
+                without_path(&e.to_string(), &path)
+            )
+        })?;
 
         let benchmark = run_benchmark(&engine, &default_prompts(), &GenParams::default())
             .map_err(|e| format!("{model_name} loaded but failed its benchmark: {e}"))?;

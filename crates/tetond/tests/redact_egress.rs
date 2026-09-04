@@ -1097,6 +1097,7 @@ async fn a_redact_scanned_128k_route_assembles_a_body_the_scan_reads_whole_and_f
         is_local: false,
         redact_scan,
         provider_id: Some("frontier"),
+        local_window: 0,
     };
     let scanned = derive(inputs(true));
     let unscanned = derive(inputs(false));
@@ -1784,6 +1785,7 @@ async fn the_resident_notes_block_is_inside_the_scanned_body_at_the_raised_bound
         is_local: false,
         redact_scan: true,
         provider_id: Some("frontier"),
+        local_window: 0,
     });
     assert_eq!(
         scanned.budget_bytes, REDACT_SCANNABLE_CONTEXT_BYTES,
