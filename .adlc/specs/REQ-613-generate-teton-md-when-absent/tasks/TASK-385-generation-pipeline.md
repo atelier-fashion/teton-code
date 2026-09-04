@@ -1,7 +1,7 @@
 ---
 id: TASK-385
 title: "The pipeline: gather → draft → bound → write → load, with typed failure and one event stream"
-status: draft
+status: complete
 parent: REQ-613
 repo: teton-code
 created: 2026-09-03
@@ -27,17 +27,17 @@ BR-7, BR-9.
 
 ## Acceptance Criteria
 
-- [ ] BR-7: after a successful run the loader's state is `Loaded` with `origin: Generated` and
+- [x] BR-7: after a successful run the loader's state is `Loaded` with `origin: Generated` and
       the block bytes equal the file's rendered block.
-- [ ] BR-5: exactly one `CostRecord` with `category == Some(Draft)` and the serving provider.
-- [ ] BR-9: a duty error, a privacy block, an over-window answer, and a write error each yield
+- [x] BR-5: exactly one `CostRecord` with `category == Some(Draft)` and the serving provider.
+- [x] BR-9: a duty error, a privacy block, an over-window answer, and a write error each yield
       `Failed` with the stage named, no file on disk, and the provider's health unchanged;
       a walk-budget stop with a usable tree is **not** a failure.
-- [ ] BR-4: the duty receives `Provenance` equal to the evidence's `Sources` (fake duty records
+- [x] BR-4: the duty receives `Provenance` equal to the evidence's `Sources` (fake duty records
       it); `excluded` rides the `drafted` event.
-- [ ] Both doors: `run` with `force` replaces; without it an existing file is `Failed {
+- [x] Both doors: `run` with `force` replaces; without it an existing file is `Failed {
       AlreadyExists }` and nothing changes.
-- [ ] `cargo test -p tetond --test repo_context_generation --no-fail-fast` green; every
+- [x] `cargo test -p tetond --test repo_context_generation --no-fail-fast` green; every
       Verification row below resolves to a real, executed case.
 
 ## Verification

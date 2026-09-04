@@ -49,6 +49,7 @@
 
 use teton_protocol::Category;
 
+use crate::repo_context::evidence::{Evidence, EvidenceClass};
 use crate::repo_context::render::{strip_for_prompt, truncate_at_line_boundary};
 use crate::repo_context::REPO_CONTEXT_MAX_BYTES;
 
@@ -216,6 +217,114 @@ pub fn build_prompt(inputs: &DraftInputs<'_>) -> String {
     push_members(&mut prompt, "Documents", inputs.documents);
     push_members(&mut prompt, "Entry points", inputs.entry_points);
     prompt
+}
+
+/// [`build_prompt`] over the gatherer's own [`Evidence`] — the bridge between
+/// TASK-382's output and TASK-381's input (REQ-613 ADR-6).
+///
+/// The pipeline holds an `Evidence` and this module wants a [`DraftInputs`], and
+/// the two were built by different tasks against different shapes on purpose:
+/// [`DraftInputs`] is a borrowed projection with no gatherer type in it, which is
+/// what let the prompt be written and tested before a walker existed. This is
+/// where the two meet, and it lives here rather than at the call site so that the
+/// projection sits beside the prompt it feeds: what the prompt renders and what
+/// is handed to it are then one edit apart.
+///
+/// # It reads the assembled body back, and that is a stated cost
+///
+/// [`Evidence::body`] is one string — the gatherer assembled it under a byte
+/// budget it could only enforce by measuring the finished text — so recovering
+/// the four sections means reading its own headings back out. The alternative
+/// considered and rejected was passing the whole body as `tree` with no
+/// documents: it costs no parse, and it makes the prompt say "Documents: none
+/// were found" over a body that holds a README, which is precisely the false
+/// statement [`push_members`]'s empty case exists to avoid making.
+///
+/// The parse is anchored on [`EvidenceClass::heading`] and the `### ` member
+/// delimiter [`crate::repo_context::evidence`] writes, so a heading changed there
+/// and not here shows up as an empty section rather than as a silently mangled
+/// one — and `the_bridge_recovers_every_class_the_gatherer_assembled` fails.
+///
+/// # The tree's own omissions are already in its text
+///
+/// A walk that stopped and a tree cut at a depth are written *into* the tree
+/// section by the gatherer, inside the bytes it measured, so they reach the model
+/// whatever this does. What [`DraftInputs::cut`] carries is the other kind of
+/// omission — the byte budget ending the assembly in a *later* class, which
+/// nothing else states.
+#[must_use]
+pub fn build_prompt_from_evidence(evidence: &Evidence) -> String {
+    let mut tree = String::new();
+    let mut documents: Vec<(String, String)> = Vec::new();
+    let mut entry_points: Vec<(String, String)> = Vec::new();
+    for (class, section) in sections(&evidence.body) {
+        match class {
+            EvidenceClass::Tree => tree = section,
+            EvidenceClass::EntryPoints => entry_points.extend(members(&section)),
+            // Two classes, one group: the prompt's "Documents" block is prose and
+            // manifests alike — everything that is a *file the repository wrote*
+            // rather than the listing or an entry point's header.
+            EvidenceClass::Manifests | EvidenceClass::Readme => documents.extend(members(&section)),
+        }
+    }
+    let cut = evidence
+        .cut
+        .filter(|cut| cut.class != EvidenceClass::Tree)
+        .map(|cut| {
+            format!(
+                "(the evidence ran out of room at the {}; nothing below it is shown)",
+                cut.class.label()
+            )
+        });
+    build_prompt(&DraftInputs {
+        tree: &tree,
+        documents: &documents,
+        entry_points: &entry_points,
+        cut,
+    })
+}
+
+/// The assembled body's `## ` sections, in the order it wrote them.
+///
+/// A line that is exactly one class's heading opens that class; every other line
+/// belongs to whichever class is open. Text before the first heading — which the
+/// gatherer never writes — is dropped rather than guessed at.
+fn sections(body: &str) -> Vec<(EvidenceClass, String)> {
+    let mut out: Vec<(EvidenceClass, String)> = Vec::new();
+    for line in body.lines() {
+        if let Some(class) = EvidenceClass::PRIORITY
+            .into_iter()
+            .find(|class| class.heading() == line)
+        {
+            out.push((class, String::new()));
+            continue;
+        }
+        if let Some((_, section)) = out.last_mut() {
+            section.push_str(line);
+            section.push('\n');
+        }
+    }
+    out
+}
+
+/// One section's `### <path>` members as `(name, contents)`.
+///
+/// The same rule one level down, and the same treatment of anything before the
+/// first delimiter: a section with no member — the tree, or a class the budget
+/// emptied — yields none.
+fn members(section: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in section.lines() {
+        if let Some(name) = line.strip_prefix("### ") {
+            out.push((name.to_owned(), String::new()));
+            continue;
+        }
+        if let Some((_, body)) = out.last_mut() {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    out
 }
 
 /// Render one labelled group of evidence members, or a line saying there were
@@ -498,6 +607,113 @@ mod tests {
         );
         // A tree with no trailing newline does not run into the next label.
         assert!(prompt.contains("crates/\n"), "{prompt}");
+    }
+
+    /// **The bridge recovers every class the gatherer assembled, and states the
+    /// cut the tree's own text does not** (REQ-613 TASK-385).
+    ///
+    /// The body below is the shape `evidence::Assembly` writes — the four `## `
+    /// headings, `### <path>` members under each, and the tree's own parenthesis
+    /// for a stop or a depth cut. What the assertion pins is that a manifest
+    /// arrives as a *document* and a `main.rs` as an *entry point*, because the
+    /// failure this catches is the quiet one: a projection that folded them
+    /// together would still produce a prompt, and the prompt would tell the model
+    /// no entry points were found in a repository that has one.
+    ///
+    /// **Mutations** (LESSON-441), both run 2026-09-03 and restored:
+    /// 1. routing `EvidenceClass::EntryPoints` into `documents` — the entry-point
+    ///    assertion fails and the "none were found" line appears;
+    /// 2. dropping the `class != Tree` filter on the cut — the tree's depth cut
+    ///    is stated twice, once by the gatherer and once by the bridge, and the
+    ///    last assertion here fails.
+    #[test]
+    fn the_bridge_recovers_every_class_the_gatherer_assembled() {
+        let body = "\
+## Tree
+(tree cut at depth 2; deeper directories are not listed)
+./ (3 files)
+crates/
+
+## Manifests
+### Cargo.toml
+[workspace]
+
+### .github/workflows
+ci.yml, release.yml
+
+## README
+### README.md
+# Teton
+
+## Entry points
+### crates/tetond/src/main.rs
+fn main() {}
+";
+        let evidence = Evidence {
+            body: body.to_owned(),
+            cut: Some(crate::repo_context::evidence::Cut {
+                class: EvidenceClass::Tree,
+                depth: Some(2),
+            }),
+            ..Evidence::empty()
+        };
+        let prompt = build_prompt_from_evidence(&evidence);
+
+        // The tree keeps its own notice and its listing, and nothing else.
+        assert!(
+            prompt.contains("(tree cut at depth 2; deeper directories are not listed)"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("Repository listing:\ncrates/") || prompt.contains("./ (3 files)"));
+        // Manifests and README are one group; each member keeps its own name.
+        for member in ["Cargo.toml", ".github/workflows", "README.md"] {
+            assert!(prompt.contains(&format!("--- {member} ---")), "{prompt}");
+        }
+        assert!(prompt.contains("[workspace]"), "{prompt}");
+        assert!(prompt.contains("ci.yml, release.yml"), "{prompt}");
+        // The entry point is an entry point, not a document.
+        assert!(
+            prompt.contains("Entry points:\n\n--- crates/tetond/src/main.rs ---"),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("Entry points: none were found."),
+            "{prompt}"
+        );
+        // The tree's cut is already in the tree's text; the bridge does not say
+        // it a second time.
+        assert!(
+            !prompt.contains("the evidence ran out of room"),
+            "a tree cut is the gatherer's to state: {prompt}"
+        );
+
+        // A cut in a *later* class is nowhere in the body, so the bridge is the
+        // only thing that can say it.
+        let evidence = Evidence {
+            body: body.to_owned(),
+            cut: Some(crate::repo_context::evidence::Cut {
+                class: EvidenceClass::EntryPoints,
+                depth: None,
+            }),
+            ..Evidence::empty()
+        };
+        assert!(build_prompt_from_evidence(&evidence).contains(
+            "(the evidence ran out of room at the entry points; nothing below it is shown)"
+        ));
+    }
+
+    /// An empty body yields an empty projection rather than a panic or a section
+    /// full of the wrong text — the shape [`crate::repo_context::generate`]
+    /// refuses to draft from, asserted here so the refusal is the *caller's*
+    /// decision and not an accident of this function.
+    #[test]
+    fn an_empty_body_projects_to_nothing() {
+        let prompt = build_prompt_from_evidence(&Evidence::empty());
+        assert!(prompt.contains("Documents: none were found."), "{prompt}");
+        assert!(
+            prompt.contains("Entry points: none were found."),
+            "{prompt}"
+        );
     }
 
     /// The duty declares the category it routes on and the ceiling it is bound

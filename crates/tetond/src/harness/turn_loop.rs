@@ -914,6 +914,21 @@ impl SessionEvents {
             .publish(Some(self.session_id.clone()), Event::RepoContextState(news));
     }
 
+    /// Publish one stage of the generation pipeline (REQ-613 BR-2, ADR-6).
+    ///
+    /// Here for [`Self::repo_context_state`]'s reason, and one more: the pipeline
+    /// in [`crate::repo_context::generate`] publishes from **five** places over
+    /// one run, and a bus handle passed down beside a session id would be two
+    /// spellings of "session S's news" for those five to disagree about. It takes
+    /// the whole payload because the pipeline is what knows the stage; this only
+    /// puts it on the bus for the right session.
+    pub fn repo_context_generation(&self, news: teton_protocol::events::RepoContextGeneration) {
+        self.bus.publish(
+            Some(self.session_id.clone()),
+            Event::RepoContextGeneration(news),
+        );
+    }
+
     fn agent_message(&self, text: &str) {
         self.emit(SessionUpdatePayload::AgentMessageChunk {
             text: text.to_owned(),

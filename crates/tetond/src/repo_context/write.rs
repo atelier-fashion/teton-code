@@ -237,7 +237,15 @@ fn fill(path: &Path, mut file: File, body: &str) -> Result<Written, WriteFailure
 /// is said out loud. A file left behind is the one outcome AC-9 rules out, and
 /// silence about it would leave a partial `TETON.md` for the next session's
 /// loader with nothing in the log to explain it.
-fn remove(path: &Path) {
+///
+/// `pub(crate)` since REQ-613 TASK-385: the pipeline has one failure this module
+/// cannot see — a file this module wrote whole and successfully, which REQ-612's
+/// loader then refuses to read back (ADR-6's last stage). AC-9's rule is about
+/// the *file*, not about which function was holding it when the run failed, so
+/// the pipeline unlinks through this one rather than spelling a second
+/// `remove_file` whose `NotFound` tolerance and whose complaint could drift from
+/// these.
+pub(crate) fn remove(path: &Path) {
     if let Err(error) = std::fs::remove_file(path) {
         if error.kind() != std::io::ErrorKind::NotFound {
             eprintln!(
