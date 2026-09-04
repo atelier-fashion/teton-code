@@ -552,6 +552,51 @@
   scan calls (up to five) instead of onto context (REQ-612 ADR-1/ADR-4/ADR-5,
   LESSON-477, LESSON-543, LESSON-593, LESSON-597).
 
+- **A repository-touching act with no human typing a name gets its own gate
+  entry point, keyed by the durable root** (REQ-613). Writing a missing
+  `TETON.md` is a *daemon* act rather than a tool call, so no tool name is on
+  screen to key it by: widening `PermissionGate::authorize` would have filed the
+  question under some tool's name and let a remembered answer about a tool call
+  settle a write into the user's working tree. `authorize_repo_context_generation`
+  is therefore the fourth door beside `authorize_skill` and
+  `authorize_project_skill_trust`, and its key is
+  `repo_context:generate:<durable root>` — minted from the canonical resolution,
+  never from the home-relative display the prompt shows, so two spellings of one
+  directory share one answer and two directories never do (LESSON-495). The key
+  is **taken as a parameter and checked** rather than derived, so the caller's
+  key and the gate's are provably one string; a root that will not canonicalise
+  mints no key at all, and the offer is suppressed rather than asked under a name
+  that names nothing. Expiry lives one layer above both stores: the family
+  predicate joins `expires_on_session_root_change` in `teton-protocol`, which the
+  daemon's grant sweep and the CLI's `SessionGrants` memo both read, so `/cd`
+  forgets the grant at both with no new code at either — ASSUME-017's rule, that
+  a security decision with two stores needs one invalidation predicate above
+  them. Whether the question is *write* or *replace* rides the subject, because
+  `--force` asks a materially different thing and the human has to see which one
+  is on screen. The level table is the level's own — `guarded`/`edits` ask,
+  `plan` denies, `full` allows — with `plan` decided *before* the gate, LESSON-524
+  inverted: do not draw a prompt for an act the level will refuse (REQ-613 ADR-2,
+  REQ-587 BR-4, REQ-591 BR-1, LESSON-495, LESSON-524, ASSUME-017).
+
+- **A model call made once per repository defaults to the deep-reasoning tier**
+  (REQ-613). Every other harness-known duty is sized to be cheap because it runs
+  again on every turn; the `TETON.md` draft inverts that arithmetic — it is
+  written once and then read at the start of every session afterwards, so a good
+  draft amortizes over every future turn while a bad one is re-read forever.
+  `digest` was the obvious host and the wrong one: its local pin is right for
+  digests and would have dragged this down with it (OQ-2). So `Category::Draft`
+  is a twelfth category, `HarnessKnown`, bound to `Think` at compile time the way
+  `Design`, `Debug` and `Review` are, and moved by an ordinary policy row
+  (`/policy set-category draft local`) for a user who wants it local — the
+  default is a **product posture stated in the enum**, not a routing accident,
+  and the header line records which tier actually served the draft so a machine
+  with no remote provider still says what wrote its file. Nothing else about the
+  duty is `draft`-specific: one resolver names the category, `Duty::perform`
+  carries it, egress scopes it over the evidence's `ToolProvenance::Sources`, the
+  output ceiling is *read* from REQ-612's cap rather than restated, and a
+  privacy-blocked draft fails the duty without degrading provider health (REQ-613
+  ADR-4, REQ-558 ADR-A/ADR-D, REQ-561, LESSON-456).
+
 ## ADRs
 
 ### ADR-001: Daemon and CLI in Rust (2026-07-17)

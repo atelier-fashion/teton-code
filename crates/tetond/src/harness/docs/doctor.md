@@ -63,10 +63,19 @@ asking to open a transcript gets a refusal, not a file.
 
 ## The repository notes
 
-`context:` names the session root's `TETON.md` (or `AGENTS.md`) and its state.
-Doctor advises on two: a file **cut to the cap**, whose tail never reaches the
-model, and one a **privacy boundary covers**, which is never loaded. Topic
-`context`.
+`context:` names the session root's `TETON.md` (or `AGENTS.md`), its state, and
+the durable `[context] generate` posture. Doctor advises on two states of the
+file: one **cut to the cap**, whose tail never reaches the model, and one a
+**privacy boundary covers**, which is never loaded.
+
+Two more advisories are about the posture rather than the file. `generate =
+always` is a standing permission to write into a working tree — an unattended
+session on this machine writes `TETON.md` into whichever project it lands in,
+without asking, at every level but `plan` — so doctor names it wherever it is
+set. `generate = never` at a root with no notes is the opposite report: no offer
+will be raised here, and `/context init` is the only door left. Neither is a
+fault and neither moves the exit status; both are things you meant once and may
+not mean now. Topic `context`.
 
 ## Where config lives
 

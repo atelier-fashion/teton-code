@@ -1,7 +1,7 @@
 ---
 id: TASK-389
 title: "Docs: the offer and setting in the `context` topic, README, the dogfood runbook, and architecture patterns"
-status: draft
+status: complete
 parent: REQ-613
 repo: teton-code
 created: 2026-09-03
@@ -30,10 +30,13 @@ the two patterns.
 
 ## Acceptance Criteria
 
-- [ ] AC-12: `every_topic_serves_its_whole_bundled_body` green with the grown topic and its
-      byte ceiling checked first; the README rows are found by `cli_rows.rs`.
-- [ ] The runbook leg exists with prompt, rubric and `OUTSTANDING`.
-- [ ] `TOPIC_INDEX` byte-identical.
+- [x] AC-12: `every_topic_serves_its_whole_bundled_body` green with the grown topic and its
+      byte ceiling checked first (13,071 bytes against the 50,000-byte `MAX_TOPIC_BYTES`); the
+      README rows are found by `cli_rows.rs` — the `/context init [--force]` row parses to
+      `context init` and is the one row `slash::COMMANDS` does not yet carry, which TASK-387
+      adds. That single assertion is red on purpose until it lands; every other row resolves.
+- [x] The runbook leg exists with prompt, rubric and `OUTSTANDING`.
+- [x] `TOPIC_INDEX` byte-identical — no topic was added or renamed.
 
 ## Verification
 
@@ -46,3 +49,17 @@ the two patterns.
 
 AC-13 is a by-hand dogfood and carries no obligation row on purpose; the runbook cell is where
 its result lands and `/wrapup` reads it.
+
+## Implementation Notes
+
+Written against the landed tier-0/1 commits (TASK-379 through TASK-385) for every fact the
+surfaces state: the `[context] generate` values and the `ask` default, the ten
+`GenerationOutcome` wire words, `ContextAction::Init { force }`, the `repo_context:generate:<root>`
+key and its level table, the two evidence tables with their 16 KiB / 4 KiB ceilings and the
+100,000-entry / 10-second walk budget, `Category::Draft` bound to `Think` with
+`/policy set-category draft <tier>`, the `generated_header` golden and mode `0644`, and the four
+failure stages. TASK-386 had **not** landed at commit time, so the state names, the first-turn
+seam and the `Init` refusal are written to the spec's BR-1/BR-8 and ADR-1/ADR-6 wording; the
+CLI surfaces TASK-387 owns (the `/context init` row, `teton context generate <mode>`, the banner
+clause, the two doctor advisories in `doctor.md`) are documented ahead of that commit by design —
+the README check is the coordination.
