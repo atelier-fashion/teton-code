@@ -187,6 +187,11 @@ pub enum Event {
     WebConsentDecided(WebConsentDecided),
     /// The user lifted this session's web taint restriction (REQ-563 BR-13).
     WebTaintOverridden(WebTaintOverridden),
+    /// The taint backstop pinned this session to the local tier for the first
+    /// time (REQ-614 BR-7).
+    SessionPinned(SessionPinned),
+    /// The user lifted an `unknown_shell` pin with `/shell allow` (REQ-614).
+    SessionPinLifted(SessionPinLifted),
     /// A local agent turn hit, missed, or evicted the KV prefix cache
     /// (REQ-564). Every ending is a [`PrefixCacheOutcome`] on this one variant.
     PrefixCache(PrefixCache),
@@ -309,6 +314,8 @@ impl Event {
             Event::WebLookup(_) => "web_lookup",
             Event::WebConsentDecided(_) => "web_consent_decided",
             Event::WebTaintOverridden(_) => "web_taint_overridden",
+            Event::SessionPinned(_) => "session_pinned",
+            Event::SessionPinLifted(_) => "session_pin_lifted",
             Event::PrefixCache(_) => "prefix_cache",
             Event::ContextCleared(_) => "context_cleared",
             Event::AttachConsentRequested(_) => "attach_consent_requested",
@@ -2276,6 +2283,68 @@ pub struct WebTaintOverridden {
     /// this list stays absent, and [`WebTier::Off`] never appears here —
     /// "restored to nothing" is an empty list.
     pub tiers_restored: Vec<WebTier>,
+}
+
+// ---------------------------------------------------------------------------
+// session_pinned / session_pin_lifted (REQ-614)
+// ---------------------------------------------------------------------------
+
+/// The remedy a pinned session offers, or its absence (REQ-614 BR-7).
+///
+/// A typed absence rather than an empty string: "there is no remedy" and "the
+/// remedy is the empty command" must not share a representation, because the
+/// client renders one as *no remedy: a protected file was read* and the other
+/// would be a blank instruction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "command")]
+pub enum PinRemedy {
+    /// The exact command the user types to lift the pin.
+    Command(String),
+    /// No command lifts this pin — a `local-only` file was read.
+    None,
+}
+
+/// The session was pinned to the local tier (REQ-614 BR-7).
+///
+/// Published on the **transition only**, so a session pinned by a boundary read
+/// and then again by an opaque `shell` produces one record. The client prints
+/// one standing line from it whether or not `/verbose` is on: a durable,
+/// session-wide consequence that nothing says out loud is one the user
+/// discovers as "why is this suddenly slower" — which is precisely what
+/// happened on 2026-09-04.
+///
+/// The session is named by [`EventEnvelope::session_id`], not by a field here,
+/// for the reason [`WebTaintOverridden`] documents: [`Event`] is internally
+/// tagged and flattened, so a `session_id` field would emit the key twice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPinned {
+    /// Why the session was pinned — the wire spelling of the daemon's
+    /// `TaintCause` (`boundary_hit`, `unknown_shell`, `malformed_provenance`,
+    /// `mcp_untrusted`, `redaction_finding`).
+    pub cause: String,
+    /// Whether any command can lift this pin. True for `unknown_shell` alone.
+    pub liftable: bool,
+    /// The command that lifts it, or [`PinRemedy::None`].
+    pub remedy: PinRemedy,
+    /// The token budget of the tier now serving this session.
+    ///
+    /// **The local tier's own configured budget — a static fact of the tier,
+    /// not a per-route derivation.** The pin fires at the egress sink and at
+    /// the carried turn's commit, both before the next turn's route is decided,
+    /// so a per-route figure does not exist yet at this point. The number is
+    /// here because it is the half of the consequence a user can act on: the
+    /// 2026-09-04 session went from 665,984 tokens to 21,162 and nothing said so.
+    pub budget_tokens: Option<u64>,
+}
+
+/// The user lifted an `unknown_shell` pin (REQ-614 BR-5).
+///
+/// Published on the transition only; a second `/shell allow` in a lifted
+/// session is acknowledged and publishes nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPinLifted {
+    /// How many turns ran pinned before the lift — what the pin actually cost.
+    pub turns_pinned: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -9913,6 +9982,70 @@ impl ShellDutySkipped {
     pub fn under_size_trigger() -> Self {
         Self {
             reason: "under_size_trigger".to_owned(),
+        }
+    }
+}
+
+/// REQ-614 TASK-393 — the pin's wire vocabulary.
+#[cfg(test)]
+mod session_pin_events {
+    use super::*;
+
+    /// BR-7: the event carries everything the standing line needs, and the
+    /// remedy's absence is typed rather than an empty string.
+    #[test]
+    fn session_pinned_carries_cause_liftable_remedy_and_budget() {
+        let liftable = SessionPinned {
+            cause: "unknown_shell".to_owned(),
+            liftable: true,
+            remedy: PinRemedy::Command("/shell allow".to_owned()),
+            budget_tokens: Some(21_162),
+        };
+        let permanent = SessionPinned {
+            cause: "boundary_hit".to_owned(),
+            liftable: false,
+            remedy: PinRemedy::None,
+            budget_tokens: Some(21_162),
+        };
+        // The pair a client must be able to tell apart: one offers a command,
+        // the other says there is none. An empty-string remedy would render as
+        // a blank instruction, which is why `PinRemedy` is an enum.
+        assert!(matches!(liftable.remedy, PinRemedy::Command(ref c) if c == "/shell allow"));
+        assert!(matches!(permanent.remedy, PinRemedy::None));
+        assert!(liftable.liftable && !permanent.liftable);
+    }
+
+    /// AC-11's wire half: both records round-trip, and their event names are the
+    /// ones the transcript and the ordering assertion look for.
+    #[test]
+    fn the_two_new_events_round_trip() {
+        for (event, name) in [
+            (
+                Event::SessionPinned(SessionPinned {
+                    cause: "unknown_shell".to_owned(),
+                    liftable: true,
+                    remedy: PinRemedy::Command("/shell allow".to_owned()),
+                    budget_tokens: Some(21_162),
+                }),
+                "session_pinned",
+            ),
+            (
+                Event::SessionPinLifted(SessionPinLifted { turns_pinned: 65 }),
+                "session_pin_lifted",
+            ),
+        ] {
+            assert_eq!(event.name(), name);
+            let json = serde_json::to_string(&event).expect("serializes");
+            let back: Event = serde_json::from_str(&json).expect("round-trips");
+            assert_eq!(back.name(), name);
+            // Internally tagged and flattened: the payload must not carry a
+            // `session_id` of its own — the envelope names the session, and a
+            // second key would emit twice and fail to deserialize (the shape
+            // `WebTaintOverridden` documents).
+            assert!(
+                !json.contains("session_id"),
+                "the payload must not name the session: {json}"
+            );
         }
     }
 }

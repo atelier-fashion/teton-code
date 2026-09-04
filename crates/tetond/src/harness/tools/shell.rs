@@ -325,10 +325,10 @@ impl Tool for ShellTool {
                 stdout,
                 stderr,
                 withheld,
-            // REQ-615's cd note and REQ-614's computed verdict compose on one
-            // call: the note is what the *user* is told about a `cd` that did
-            // not persist, the provenance is what *egress* is told about what
-            // the command could have read. Two different readers, one result.
+                // REQ-615's cd note and REQ-614's computed verdict compose on one
+                // call: the note is what the *user* is told about a `cd` that did
+                // not persist, the provenance is what *egress* is told about what
+                // the command could have read. Two different readers, one result.
             } => render_output(
                 &command,
                 status,

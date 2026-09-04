@@ -1,7 +1,7 @@
 ---
 id: TASK-393
 title: "Protocol — session_pinned, session_pin_lifted, and the shell/override method"
-status: draft
+status: complete
 parent: REQ-614
 created: 2026-09-04
 updated: 2026-09-04

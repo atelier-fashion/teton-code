@@ -2610,6 +2610,46 @@ impl RpcMethod for WebOverrideParams {
     type Result = WebOverrideResult;
 }
 
+/// Lift this session's `unknown_shell` pin — `/shell allow` (REQ-614 BR-5).
+///
+/// User-only by construction, exactly as [`WebOverrideParams`] is: the lift
+/// arrives as a client RPC and tool dispatch has no path to one, so a
+/// model-issued lift is unrepresentable rather than rejected at runtime. The
+/// daemon-side setter (`ShellTaintOverride::lift`) is `pub(super)`, which is
+/// the compile-time half of the same guarantee.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellOverrideParams {
+    /// The session whose pin is lifted.
+    pub session_id: SessionId,
+}
+
+/// Result of [`ShellOverrideParams`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellOverrideResult {
+    /// Whether a **liftable** pin was in force when the lift arrived.
+    ///
+    /// The three states a client must be able to tell apart are: the pin was
+    /// lifted now; the session was pinned by something no command lifts; and
+    /// the session was not pinned at all. This field plus [`Self::cause`]
+    /// carries all three, and confirming a lift that never happened is the
+    /// failure the pair exists to prevent (the argument
+    /// [`WebOverrideResult::was_restricted`] already makes).
+    pub was_pinned: bool,
+    /// Whether this call was the pinned->lifted **transition**.
+    ///
+    /// A second `/shell allow` in a lifted session is acknowledged, writes no
+    /// ledger row and publishes no event (BR-5), and this is how the handler
+    /// and the client both know that.
+    pub lifted_now: bool,
+    /// The pin's cause, when there was one — so a refusal can name it.
+    pub cause: Option<String>,
+}
+
+impl RpcMethod for ShellOverrideParams {
+    const METHOD: &'static str = "shell/override";
+    type Result = ShellOverrideResult;
+}
+
 /// Read or set a session's permission level (REQ-560, ADR-D).
 ///
 /// One method for both because they are one question asked two ways, and because
@@ -5696,6 +5736,7 @@ mod tests {
         assert_eq!(ModelSetParams::METHOD, "model/set");
         assert_eq!(ModelStatusParams::METHOD, "model/status");
         assert_eq!(WebOverrideParams::METHOD, "web/override");
+        assert_eq!(ShellOverrideParams::METHOD, "shell/override");
         assert_eq!(SessionPermissionsParams::METHOD, "session/permissions");
         assert_eq!(WebRefreshParams::METHOD, "web/refresh");
         assert_eq!(WebSetupPlanParams::METHOD, "web/setup_plan");

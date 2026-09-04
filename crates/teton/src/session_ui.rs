@@ -31,16 +31,16 @@ use teton_protocol::events::{
     ConsentScope, ContextCompacted, ContextPressure, ContextPressureKind, DaemonClientAttach,
     DaemonLifetimeStage, DynamicOutcome, DynamicOutcomeView, Event, EventEnvelope, EvictionReason,
     FailureClass, ModelLifecycle, ModelSelectionProposed, NotRunReason, PermissionOption,
-    PermissionOptionKind, PermissionRequest, PermissionSubject, PhaseTransition, PrefixCache,
-    PrefixCacheMiss, PrefixCacheOutcome, PrivacyAction, PrivacyBlock, ProvenanceRejected,
-    ProvenanceRejection, ProviderDegraded, ProviderSetupCompleted, ProviderSetupRejected,
-    ProviderTested, RemedyKind, RouteDecided, SessionGrantMinted, SessionUpdatePayload,
-    ShellDutySkipped, SkillInvoked, SkillOverBudgetAccepted, SkillOverBudgetOffered,
-    SkillOverBudgetRemedyApplied, SkillRefusedNoRoom, SkillStage, TierWarming, ToolCallRepeated,
-    ToolCallStatus, TurnQueued, TurnRefusedAnchorsExceedBudget, UnboundedRootWarning,
-    WebCapabilityState, WebConsentDecided, WebConsentScope, WebLookup, WebLookupKind,
-    WebLookupOutcome, WebSetupCompleted, WebSetupRejected, WebTier, WindowVerdict,
-    OPTION_ID_ENABLE_PERMANENT,
+    PermissionOptionKind, PermissionRequest, PermissionSubject, PhaseTransition, PinRemedy,
+    PrefixCache, PrefixCacheMiss, PrefixCacheOutcome, PrivacyAction, PrivacyBlock,
+    ProvenanceRejected, ProvenanceRejection, ProviderDegraded, ProviderSetupCompleted,
+    ProviderSetupRejected, ProviderTested, RemedyKind, RouteDecided, SessionGrantMinted,
+    SessionPinLifted, SessionPinned, SessionUpdatePayload, ShellDutySkipped, SkillInvoked,
+    SkillOverBudgetAccepted, SkillOverBudgetOffered, SkillOverBudgetRemedyApplied,
+    SkillRefusedNoRoom, SkillStage, TierWarming, ToolCallRepeated, ToolCallStatus, TurnQueued,
+    TurnRefusedAnchorsExceedBudget, UnboundedRootWarning, WebCapabilityState, WebConsentDecided,
+    WebConsentScope, WebLookup, WebLookupKind, WebLookupOutcome, WebSetupCompleted,
+    WebSetupRejected, WebTier, WindowVerdict, OPTION_ID_ENABLE_PERMANENT,
 };
 use teton_protocol::methods::{
     AttachConsentOutcome, AttachConsentParams, PermissionOutcome, PermissionRespondParams,
@@ -138,6 +138,13 @@ pub struct SessionState {
     /// in-session `/verbose` command toggles it mid-session (REQ-555 BR-5).
     /// Session-scoped either way — nothing here is persisted.
     pub verbose: bool,
+    /// The cause pinning this session to the local tier, or `None` (REQ-614).
+    ///
+    /// Held so `/doctor` can answer "is this session pinned, and why" without a
+    /// round trip, and so the standing line prints once: the daemon already
+    /// publishes `session_pinned` on the transition only, and this mirrors that
+    /// rather than re-deriving it.
+    pub pinned: Option<String>,
     /// The local tier's loading indicator (REQ-556).
     ///
     /// It lives in session state, beside `cost`, for the same reason `cost`
@@ -800,6 +807,29 @@ pub fn render_event(
             // Never verbose-gated: a consent decision is the user's own answer
             // coming back, and the persistent one changed a file on disk.
             surface.line(LineKind::Notice, &format_web_consent(decided));
+            EventOutcome::Rendered
+        }
+        // REQ-614 BR-7. **Never verbose-gated**, and that is the whole point of
+        // the event: on 2026-09-04 a session was pinned to the local tier by its
+        // first shell command and the user never found out. `/verbose` was off,
+        // and neither `privacy_block` nor the reroute renders as a standing
+        // notice — so 65 model calls ran on a 21,162-token local tier while the
+        // user waited for the 665,984-token remote one they had configured.
+        //
+        // The daemon publishes this on the **transition only**, so a session
+        // pinned twice prints one line.
+        Event::SessionPinned(pinned) => {
+            state.pinned = Some(pinned.cause.clone());
+            surface.line(LineKind::Notice, &format_session_pinned(pinned));
+            EventOutcome::Rendered
+        }
+        // Not verbose-gated either, for the reason `context_cleared` is not: the
+        // lift changes where every later turn runs, and a second attached client
+        // that did not type `/shell allow` would otherwise watch the session
+        // change tier in silence.
+        Event::SessionPinLifted(lifted) => {
+            state.pinned = None;
+            surface.line(LineKind::Notice, &format_session_pin_lifted(lifted));
             EventOutcome::Rendered
         }
         Event::WebTaintOverridden(overridden) => {
@@ -2742,6 +2772,38 @@ fn format_web_consent(decided: &WebConsentDecided) -> String {
 }
 
 /// The notice a `web_taint_overridden` draws.
+/// The standing line a pinned session prints once (REQ-614 BR-7).
+///
+/// Three facts, in the order a reader needs them: what happened, what it costs,
+/// and what to do about it. The remedy is a typed absence rather than an empty
+/// string, so "no command lifts this" is a sentence the user gets rather than a
+/// blank where one should be.
+fn format_session_pinned(pinned: &SessionPinned) -> String {
+    let budget = match pinned.budget_tokens {
+        Some(tokens) => format!(" (context budget {tokens} tokens)"),
+        None => String::new(),
+    };
+    let remedy = match &pinned.remedy {
+        PinRemedy::Command(cmd) => {
+            format!("`{cmd}` lifts it if you know the command touched no protected file.")
+        }
+        PinRemedy::None => "No remedy: a protected file was read.".to_owned(),
+    };
+    format!(
+        "privacy — this session is pinned to the local tier{budget}; cause: {}. {remedy}",
+        pinned.cause
+    )
+}
+
+/// The counterpart line when `/shell allow` lifts a pin.
+fn format_session_pin_lifted(lifted: &SessionPinLifted) -> String {
+    format!(
+        "privacy — local-tier pin lifted for this session after {} pinned turn(s); \
+         routing resumes by category.",
+        lifted.turns_pinned
+    )
+}
+
 fn format_web_taint_overridden(tiers: &[WebTier]) -> String {
     if tiers.is_empty() {
         return "web taint restriction lifted for this session; no tiers were granted to \
