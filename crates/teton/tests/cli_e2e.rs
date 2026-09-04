@@ -7528,19 +7528,36 @@ fn a_model_invocation_echoes_its_line_and_a_refused_one_says_so_instead() {
         "nobody typed `/small`; a model invocation must not render as the \
          user's own line; output:\n{stdout}"
     );
-    // The `12` is `tetond::harness::tools::skill::PER_TURN_INVOCATION_CAP`,
-    // spelled rather than read: the `teton` crate cannot depend on `tetond`, and
-    // a whole-CLI test reads the daemon's ceiling off the wire like any client.
-    // The literal is therefore correct and brittle in the same breath, so the
-    // message names the constant that moved rather than leaving a reader to
-    // wonder where `12` came from.
+    // **REQ-617 BR-8 / AC-9, the local half — and this is the only place in the
+    // tree that reaches it.**
+    //
+    // The `3` was `12` until REQ-617 made the cap a route property. This
+    // session runs on the **local engine** (the `/verbose` route line above says
+    // `bound: local engine`), so the cap in force is
+    // `LOCAL_PER_TURN_INVOCATION_CAP`, not the remote constant.
+    //
+    // That makes this assertion worth more than it was. `skill.rs`'s unit tests
+    // pin the derivation and `skill_tool_loop.rs` pins the remote path
+    // end-to-end, but neither can reach a genuinely local `RouteBudget` — an
+    // integration test cannot install a local engine, which is the wall
+    // `skill_tool_loop.rs`'s own header records. A whole-CLI e2e can, because it
+    // starts a daemon with the stand-in engine. So **this line is the evidence
+    // that the loop reads the route at all**: a build that set the cap from the
+    // constant regardless of route renders `1 of 12` here and nowhere else.
+    //
+    // Still spelled rather than read — the `teton` crate cannot depend on
+    // `tetond`, and a whole-CLI test reads the daemon's ceiling off the wire
+    // like any client. Correct and brittle in the same breath, so the message
+    // names the constant that moved.
     assert!(
-        stdout.contains("  invocation 1 of 12 this turn"),
+        stdout.contains("  invocation 1 of 3 this turn"),
         "`/verbose` shows the turn's count against the cap for a model \
-         invocation — the `12` here is `PER_TURN_INVOCATION_CAP` \
-         (`tetond::harness::tools::skill`), spelled because this crate cannot \
-         depend on that one; if that constant moved, this literal follows it. \
-         output:\n{stdout}"
+         invocation. The `3` here is \
+         `tetond::harness::tools::skill::LOCAL_PER_TURN_INVOCATION_CAP` — this \
+         session routes to the local engine, so the local cap is what applies \
+         (REQ-617 BR-8). Seeing `1 of 12` means the loop is reading the \
+         constant rather than the route; seeing some other number means the \
+         constant moved and this literal follows it. output:\n{stdout}"
     );
     // AC-10's `tool_call` title: `skill <name>`, so the status line says which
     // skill the model reached for rather than only that *something* did.

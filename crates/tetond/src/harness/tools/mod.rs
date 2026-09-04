@@ -929,6 +929,25 @@ pub struct RefinedOutcome {
     /// when the duty served, and `None` when the tool has no duty or did not
     /// need one.
     pub duty_error: Option<String>,
+    /// Why the tool's duty **declined to run at all**, when it did (REQ-617
+    /// BR-7).
+    ///
+    /// Distinct from [`Self::duty_error`], and the distinction is the point: a
+    /// duty that *failed* and a duty that was never *worth making* leave the
+    /// same unrefined result behind and have opposite causes. The first is a
+    /// degradation to report; the second is the cost gate working. Collapsing
+    /// them would make "the duty is skipped on a failed command" (BR-7)
+    /// indistinguishable from "the duty broke" in every log and every event.
+    ///
+    /// A stable reason id, not a sentence: the client renders it, so a skip
+    /// announced here and one announced anywhere else are the same fact in the
+    /// same vocabulary rather than two phrasings a UI has to reconcile
+    /// (`CapabilityDeadEnd`'s rule, REQ-572 ADR-4).
+    ///
+    /// `&'static str` rather than `String` because every reason is authored in
+    /// this tree. A tool cannot mint one from a model's output, which is what
+    /// keeps this field off the disclosure surface an event otherwise is.
+    pub duty_skipped: Option<&'static str>,
 }
 
 impl RefinedOutcome {
@@ -938,6 +957,18 @@ impl RefinedOutcome {
         Self {
             outcome,
             duty_error: None,
+            duty_skipped: None,
+        }
+    }
+
+    /// `outcome` as it stands, because the duty was not worth making — carrying
+    /// the reason so the caller can announce it (REQ-617 BR-7).
+    #[must_use]
+    pub fn skipped(outcome: ToolOutcome, reason: &'static str) -> Self {
+        Self {
+            outcome,
+            duty_error: None,
+            duty_skipped: Some(reason),
         }
     }
 
@@ -948,6 +979,7 @@ impl RefinedOutcome {
         Self {
             outcome,
             duty_error: Some(error.into()),
+            duty_skipped: None,
         }
     }
 }

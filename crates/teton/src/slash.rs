@@ -3983,6 +3983,95 @@ mod tests {
         assert_eq!(exit_args, quit_args, "neither spelling takes an argument");
     }
 
+    /// **The roster and the table are the same set, in both directions**
+    /// (REQ-617 BR-1, AC-2, ADR-1).
+    ///
+    /// `teton_protocol::commands::SESSION_COMMANDS` is what the daemon renders
+    /// into the system prompt and into `teton_docs commands`; [`COMMANDS`] is
+    /// what this session actually dispatches. This test block is the only place
+    /// in the tree that can see both, so the guard has to live here.
+    ///
+    /// # Why equality and not containment
+    ///
+    /// The two directions fail differently and both are real:
+    ///
+    /// - a `CommandSpec` with no `SessionCommand` is a command the model never
+    ///   learns exists — the exact defect REQ-617 was opened for, where a model
+    ///   asked "is transcript on?" searched the repository for seven tool calls
+    ///   because nothing in its prompt named `/transcript`;
+    /// - a `SessionCommand` with no `CommandSpec` is worse: the model names a
+    ///   command with confidence, the user types it, and the session answers
+    ///   "unknown command".
+    ///
+    /// A subset assertion in either direction leaves the other open, which is the
+    /// shape BUG-149 took — an input tag with no output marker, invisible to a
+    /// one-directional guard until a human noticed.
+    ///
+    /// # Mutation
+    ///
+    /// Deleting any `SESSION_COMMANDS` row goes red naming it under `in the
+    /// table, absent from the roster`; adding a row for a command that does not
+    /// exist goes red under the other heading. Both were run.
+    #[test]
+    fn the_protocol_roster_and_the_command_table_are_the_same_set() {
+        use std::collections::BTreeSet;
+
+        let table: BTreeSet<&str> = COMMANDS.iter().map(|spec| spec.name).collect();
+        let roster: BTreeSet<&str> = teton_protocol::commands::SESSION_COMMANDS
+            .iter()
+            .map(|c| c.name)
+            .collect();
+
+        let missing_from_roster: Vec<&str> = table.difference(&roster).copied().collect();
+        let missing_from_table: Vec<&str> = roster.difference(&table).copied().collect();
+
+        assert!(
+            missing_from_roster.is_empty() && missing_from_table.is_empty(),
+            "the session command table and the protocol roster have drifted.\n\
+             \n\
+             in the table, absent from the roster: {missing_from_roster:?}\n\
+             \x20     the model will never learn these commands exist. Add a row\n\
+             \x20     to crates/teton-protocol/src/commands.rs.\n\
+             \n\
+             in the roster, absent from the table: {missing_from_table:?}\n\
+             \x20     the model will name these and the session will answer\n\
+             \x20     \"unknown command\". Remove the row from\n\
+             \x20     crates/teton-protocol/src/commands.rs, or add the\n\
+             \x20     CommandSpec here.\n\
+             \n\
+             Adding a command is a two-sided change, by design (REQ-617 ADR-1)."
+        );
+
+        // Same set *and* same length — the sets above would agree if one side
+        // carried a duplicate. `commands.rs` has its own uniqueness test; this is
+        // the half of it that is about this table.
+        assert_eq!(
+            table.len(),
+            COMMANDS.len(),
+            "a command name appears twice in COMMANDS"
+        );
+    }
+
+    /// **Order matches too**, which equality above does not check.
+    ///
+    /// Both are rendered as lists a human reads — `/help` from one, the
+    /// `teton_docs commands` page from the other — and two orderings of the same
+    /// 29 names is the kind of difference nobody notices and everybody has to
+    /// reconcile by hand when they do.
+    #[test]
+    fn the_roster_is_in_the_same_order_as_help() {
+        let table: Vec<&str> = COMMANDS.iter().map(|spec| spec.name).collect();
+        let roster: Vec<&str> = teton_protocol::commands::SESSION_COMMANDS
+            .iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(
+            roster, table,
+            "the roster is out of `/help` order. Reorder \
+             crates/teton-protocol/src/commands.rs to match COMMANDS."
+        );
+    }
+
     // The loop above proves every row in the table is reachable — and stays
     // green if a row is *deleted*. This is the other half of that invariant
     // (LESSON-479): the commands this REQ promises are in the table at all.

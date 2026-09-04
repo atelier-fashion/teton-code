@@ -140,7 +140,7 @@ impl Duty {
             // Reverses the three matches offered below, so "the duty took
             // effect" is observable as a different ordering.
             Duty::Triage => "3 2 1",
-            Duty::Shell => "the build failed on a type mismatch in src/lib.rs.",
+            Duty::Shell => "the suite ran 4325 tests and the output was cut short.",
             Duty::Title => "Retry the download client",
             Duty::Compact => "FORGET: 1 2\nSUMMARY: the agent read three files.",
         }
@@ -157,7 +157,7 @@ impl Duty {
         match self {
             Duty::Digest => "three functions",
             Duty::Triage => "[triage: 3 of 3 matches",
-            Duty::Shell => "type mismatch in src/lib.rs",
+            Duty::Shell => "4325 tests and the output was cut short",
             Duty::Title => "Retry the download client",
             Duty::Compact => "the agent read three files",
         }
@@ -376,12 +376,23 @@ fn matches(tainted: bool) -> Vec<String> {
     }
 }
 
-/// The failed command `shell` is offered. `shell` output is always
+/// The command `shell` is offered. `shell` output is always
 /// [`ToolProvenance::Unknown`], so it has only ever one provenance — the
 /// `tainted` axis does not apply to it, and the refusal comes from the boundary
 /// being configured at all (ADR-5 note in `harness::shell_duty`).
-const FAILED_COMMAND: &str =
-    "$ cargo build\n(exit 101)\n[stderr] error[E0308]: mismatched types at src/lib.rs:12";
+///
+/// **Re-based by REQ-617 BR-7.** It was a *failed* `cargo build`, and a failed
+/// command no longer reaches the duty at all — every row of this matrix would
+/// have collapsed to "the duty never ran", which the `took_effect` guard
+/// correctly refused to accept as a pass. It is now the one trigger that
+/// remains: a **successful** command whose output ran past the tool's cap.
+///
+/// The 101 in the old fixture was doing two jobs and only one of them survives.
+/// It made the command fail (gone), and it gave `effect_marker` something
+/// specific to look for in the duty's answer (kept — the answer below still
+/// names a fact only an interpretation would state).
+const CAPPED_COMMAND: &str =
+    "$ cargo test\n(exit 0)\nrunning 4325 tests\ntest harness::budget::fits ... ok";
 
 /// A conversation over its byte budget, with a real choice in it.
 fn pressured(tainted: bool) -> ContextManager {
@@ -504,19 +515,26 @@ async fn exercise(duty: Duty, route: &DutyRoute, tainted: bool) -> Observed {
         Duty::Shell => {
             // `measuring` is how `run` says a command actually ran: the duty is
             // for command output, and a call that never spawned one has none to
-            // interpret (REQ-561 verify). The length is the failed command's own
-            // output, which is well under the cap — the `is_error` arm is what
-            // fires here.
-            let outcome = ToolOutcome::error(FAILED_COMMAND)
+            // interpret (REQ-561 verify).
+            //
+            // **REQ-617 BR-7**: the two facts below are now both load-bearing.
+            // `ok` rather than `error`, because a failure is never interpreted;
+            // and a measured length far past the cap, because a capped
+            // successful output is the only thing that reaches the duty. Change
+            // either and every row here becomes a silence.
+            let outcome = ToolOutcome::ok(CAPPED_COMMAND)
                 .with_unknown_provenance()
-                .measuring(FAILED_COMMAND.chars().count());
-            let refined =
-                refine("shell", json!({ "command": "cargo build" }), route, outcome).await;
+                .measuring(100_000);
+            let refined = refine("shell", json!({ "command": "cargo test" }), route, outcome).await;
             Observed {
-                // Both halves: the output survives, and a command that failed
-                // still reads as failed after being explained (REQ-544 MED-4).
-                invariant: refined.outcome.content.contains(FAILED_COMMAND)
-                    && refined.outcome.is_error,
+                // The output survives under whatever the duty added, and the
+                // flag the verification gate reads is untouched. It used to
+                // assert `is_error` was still *true* after an explanation
+                // (REQ-544 MED-4); that hazard is unreachable now that failures
+                // are not explained, so the claim is the flag's *preservation*
+                // rather than its value.
+                invariant: refined.outcome.content.contains(CAPPED_COMMAND)
+                    && !refined.outcome.is_error,
                 took_effect: refined.outcome.content.contains(duty.effect_marker()),
                 degraded: refined.duty_error,
                 delivered: refined.outcome.content,

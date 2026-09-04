@@ -16126,6 +16126,33 @@ provider_id = \"deepseek\"
     /// daemon answers from a file without reporting what it read. The
     /// protocol-level leg of the acceptance matrix is TASK-096's.
     mod conversation_carry {
+        /// Events published on the turn path that post-date the REQ-598 and
+        /// REQ-604 goldens' capture commit, and are therefore absent from both
+        /// fixture files through no fault of the turn path (REQ-617).
+        ///
+        /// Excluded from **both** sides of every comparison below, like every
+        /// other normalization rule here, so nothing it hides on the live side
+        /// is hidden only there.
+        ///
+        /// Distinct from the detached-entry exclusion, and the difference
+        /// matters: a detached entry is excluded because its *position* races,
+        /// while one of these is excluded because the golden was captured at a
+        /// commit where the event did not exist. Writing the line into the
+        /// fixture by hand would claim a capture that never happened — the
+        /// oracle-computed-by-the-subject those headers exist to refuse
+        /// (LESSON-569).
+        ///
+        /// `shell_duty_skipped` fires on essentially every `shell` call: its
+        /// common arm, `under_size_trigger`, is a short successful command,
+        /// which is most of what a session runs. So this is not a rare addition
+        /// tolerated as noise — it is a real narrowing, and a bounded one. The
+        /// event's presence, absence and reason are pinned by the tests that own
+        /// it (`harness::tools::shell`, `runtime::duty::dispatch::shell`); what
+        /// is given up here is only its *position* in these two sequences.
+        ///
+        /// Adding an entry to this list is therefore a decision, not a fix.
+        const POST_CAPTURE_EVENTS: &[&str] = &["shell_duty_skipped"];
+
         use super::*;
         use crate::carry::CarriedTurn;
         use crate::harness::context::{BlockRole, Provenance as CtxProvenance, ToolProvenance};
@@ -18568,7 +18595,9 @@ provider_id = \"deepseek\"
             fn drain_names(sub: &mut crate::broadcast::Subscription) -> Vec<String> {
                 let mut raw: Vec<String> = Vec::new();
                 while let Some(env) = sub.try_recv() {
-                    if is_detached_route(&env) {
+                    if is_detached_route(&env)
+                        || super::POST_CAPTURE_EVENTS.contains(&env.event_name())
+                    {
                         continue;
                     }
                     raw.push(env.event_name().to_owned());
@@ -19757,10 +19786,29 @@ provider_id = \"deepseek\"
             /// `session_update`s lets them merge. That is deliberate: it is the
             /// starved-runner arrival LESSON-591 describes, and no collapse rule
             /// applied afterwards could reach it.
+            ///
+            /// # Post-capture events (REQ-617)
+            ///
+            /// [`POST_CAPTURE_EVENTS`] is dropped on both sides for a different
+            /// reason, and it is worth keeping the two exclusions distinct. A
+            /// detached entry is excluded because its *position* races. A
+            /// post-capture entry is excluded because the golden was captured at
+            /// `17c39ec` and the event did not exist there — so the fixture
+            /// cannot record it, and writing the line in by hand would claim a
+            /// capture that never happened, which is precisely the
+            /// oracle-computed-by-the-subject the header refuses.
+            ///
+            /// This is a real narrowing of what the golden pins, and it is
+            /// bounded: the excluded event's own presence, absence and reason
+            /// are pinned by the tests that own it (`shell_duty_skipped` by
+            /// `harness::tools::shell` and `runtime::duty::dispatch::shell`).
+            /// What is given up is only its *position in this sequence*.
             fn normalize(entries: &[Entry]) -> Vec<String> {
                 let mut out: Vec<String> = Vec::new();
                 for entry in entries {
-                    if entry.is_detached() {
+                    if entry.is_detached()
+                        || super::POST_CAPTURE_EVENTS.contains(&entry.name.as_str())
+                    {
                         continue;
                     }
                     if entry.name == CHUNKED && out.last().map(String::as_str) == Some(CHUNKED) {

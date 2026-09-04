@@ -2036,14 +2036,23 @@ mod dispatch {
         /// **AC-2 / BR-2 for `shell`, both halves against one route**
         /// (LESSON-485).
         ///
-        /// The command's exit status is the only difference between the two
-        /// calls. The failing one reaches the duty, so the route announces;
-        /// the succeeding one — a short, successful command, which is most
-        /// of what a session runs — returns before the duty is touched, so
-        /// it announces nothing. Split apart, the negative half would be
-        /// satisfied by an emitter that never emits and the positive by one
-        /// that emits at resolution; only the pair pins "announced iff
-        /// performed".
+        /// The two calls differ in exactly one respect and the positive half
+        /// reaches the duty while the negative half does not. Split apart, the
+        /// negative half would be satisfied by an emitter that never emits and
+        /// the positive by one that emits at resolution; only the pair pins
+        /// "announced iff performed".
+        ///
+        /// **REQ-617 BR-7 changed which difference that is.** The pair used to
+        /// be the same command succeeding and failing, because a failure was the
+        /// duty's primary trigger. It no longer is: a failed command is never
+        /// interpreted, whatever its size. So the discriminator is now **size** —
+        /// a short successful command against one whose output ran past the
+        /// tool's cap — which is the only trigger left.
+        ///
+        /// A third call is added below, and it is the one that would have been
+        /// missed: the *failing* command that used to be the positive half must
+        /// now announce **nothing**. Without it, reverting BR-7 would leave this
+        /// test green.
         ///
         /// The route comes from `shell_route` rather than from a
         /// hand-assembled announcement, so the four fields asserted below
@@ -2087,9 +2096,11 @@ mod dispatch {
                 "a duty that never ran announces a routed model call that never happened"
             );
 
-            // Performed: the command failed, so reading it unaided is the
-            // hard part.
-            let refined = run_and_refine(&root, "echo hi; exit 3", &route).await;
+            // Performed: the command succeeded and its output ran past the
+            // tool's cap, so what entered context is a fragment of a thing and
+            // reading it unaided is the hard part. The one trigger left.
+            let refined =
+                run_and_refine(&root, "head -c 20000 /dev/zero | tr '\\0' 'x'", &route).await;
             assert_eq!(refined.duty_error, None, "the fixture must reach the duty");
             assert_eq!(engine.calls(), 1);
             assert_announced_route(
@@ -2097,6 +2108,28 @@ mod dispatch {
                 ProtoCategory::Shell,
                 ProtoTier::Build,
                 LOCAL_PROVIDER_ID,
+            );
+
+            // REQ-617 BR-7: and the command that used to be the positive half
+            // announces nothing now. Placed after the positive call on purpose —
+            // the engine's counter is cumulative, so "still 1" is a stronger
+            // statement here than "still 0" would have been before it.
+            let refined = run_and_refine(&root, "echo hi; exit 3", &route).await;
+            assert_eq!(refined.duty_error, None);
+            assert_eq!(
+                refined.duty_skipped,
+                Some("failed_exit"),
+                "a failed command must be skipped, and must say that is why"
+            );
+            assert_eq!(
+                engine.calls(),
+                1,
+                "a failed command must buy no model call (BR-7) — this is the \
+                 assertion that goes red if the failure trigger comes back"
+            );
+            assert!(
+                announced(&mut sub).is_empty(),
+                "nor announce a routed model call it did not make"
             );
 
             let _ = std::fs::remove_dir_all(&root);

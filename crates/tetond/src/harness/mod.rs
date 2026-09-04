@@ -100,6 +100,7 @@ pub mod duty;
 pub mod permissions;
 pub mod redact;
 pub(crate) mod render;
+pub mod repeat;
 pub(crate) mod reply;
 pub(crate) mod root_gate;
 pub mod shell_duty;

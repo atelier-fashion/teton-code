@@ -1,7 +1,7 @@
 ---
 id: REQ-617
 title: "The model knows the session's own commands and stops repeating itself — built-in command awareness in the prompt and docs, a repeated-identical-call refusal for every tool, and an honest shell-duty note"
-status: draft
+status: complete
 deployable: true
 created: 2026-09-04
 updated: 2026-09-04
@@ -87,7 +87,7 @@ LESSON-532, LESSON-570).
 
 - [ ] BR-1: **The self-config guide carries the session command roster.** One line per built-in command with its effect and the marker `(user runs this)`, generated from the same table the CLI registers commands from, within a pinned byte ceiling paid for by a reviewed prompt-margin move (REQ-612's rule; BUG-193: pin the margin with `assert_eq!`). The roster sentence ends: *"You cannot run any of these. Name the one the user should type, then stop."*
 - [ ] BR-2: **`teton_docs` gains the two missing topics and completes two existing ones.** New: `commands` (the roster with the shell twins) and `transcript` (the two switches and their lifetimes, the directory, that the model's tools cannot read it). Completed: `context` must name `/context on|off|init` and `[context] repo_file`; `skills` must name the four load globs and that `skill` is the only way the model runs one. The topic index in the tool description is updated in the same change (the existing test pins index and topics to one spelling). Each topic is bundled in the binary, never read from the repo (REQ-572 BR: enablement text ships bundled).
-- [ ] BR-3: **The dictated ending for a session-state question.** When the user asks whether a session switch is on (`transcript`, `context`, `verbose`, `effort`, `permissions`), the guide dictates the reply shape: name the command, say the model cannot run it, call no tool. Pinned by a live trial on the shipped local model, three of three (REQ-572's standard; LESSON-532: the guarantee lives where a test can pin it — here the guide's sentence and the trial).
+- [ ] BR-3: **The dictated ending for a session-state question, with a deterministic backstop.** When the user asks whether a session switch is on (`transcript`, `context`, `verbose`, `effort`, `permissions`), the guide dictates the reply shape: name the command, say the model cannot run it, call no tool. **Corrected at validation (2026-09-04):** the guide's sentence is the *data* half and is the reliable half — LESSON-532 measured that facts placed in context cross perfectly. The *directive* half does not: three rounds of moving, dictating and isolating exactly such a sentence scored 0/3, and an AC resting on it alone would be an AC the project's own evidence predicts will fail. So the guarantee moves to where a test can pin it, reusing REQ-579 ADR-9's shipped shape (`session_ui.rs`'s hand-off nudge): when a reply to a session-state question **does not** name the command — or names it while also reciting a way to discover the state that the model cannot use (a config-file read, a repository search) — the harness appends one deterministic `>>` line naming the command and saying only the user can run it. The nudge is keyed on the model's own text, matched backtick-agnostically on both halves like its predecessor, and is what AC-1's CI-testable half asserts; the live trial corroborates it and does not carry it.
 - [ ] BR-4: **A repeated identical call is refused by the harness.** Per BR-table above: the second identical read-only call, or the third identical write-capable call, in one prompt turn is refused before dispatch with a typed tool result: *"repeated: this exact call already ran in this turn and returned <n> bytes; the result is above. Change the arguments or finish."* `tool_call_repeated` is emitted; the refusal costs no tool execution and no duty call.
 - [ ] BR-5: **A refused repeat is not a lost call.** The refusal text rides outside the untrusted frame, on the result the model receives, in the same slot BUG-147's dropped-calls notice uses, so the model can tell a refusal from a loss (REQ-587 AC on `refused: repeated` extends to every tool).
 - [ ] BR-6: **The repeat ledger is per turn and identical means identical.** The fingerprint is the canonical JSON of the arguments; `ls -la` and `ls -la .` are different calls. A new prompt turn starts an empty ledger. A `shell` whose output changed between calls is not exempt: the rule is about the call, and the model that wants fresh output can change the command (`ls -la; date`).
@@ -96,16 +96,18 @@ LESSON-532, LESSON-570).
 
 ## Acceptance Criteria
 
-- [ ] AC-1: Prompt *"is transcript on?"* on the shipped local model: three of three trials reply naming `/transcript`, say the model cannot run it, and call no tool. The same for *"what skills do you have?"* naming `/help` or calling `skill` with no name — either is accepted; a repository search is a failure.
+- [ ] AC-1 (a), **CI-testable, blocking**: against the scripted stand-in, a reply to *"is transcript on?"* that omits `/transcript`, and one that names it while also reciting a config-file read, both earn BR-3's deterministic `>>` line naming `/transcript` and saying only the user runs it; a reply that names `/transcript` and nothing else earns no line (the dormancy half). The same three cases for *"what skills do you have?"* against `/help`. Both halves read the same backtick-stripped text.
+- [ ] AC-1 (b), **live trial, recorded not blocking**: prompt *"is transcript on?"* on the shipped local model, three of three trials reply naming `/transcript`, say the model cannot run it, and call no tool; the same for *"what skills do you have?"* naming `/help` or calling `skill` with no name — either is accepted; a repository search is a failure. **Corrected at validation (2026-09-04):** this needs the `llama` feature and several GB of downloaded weights, neither of which is present in an unattended pipeline, so it is recorded in the REQ's verification notes as deferred-to-a-machine-with-weights, exactly as REQ-616 AC-12 is. It corroborates AC-1 (a); it does not gate the merge, because a criterion nothing in CI can run gates nothing.
 - [ ] AC-2: `teton_docs commands` lists every built-in `/` command with its `teton` twin where one exists; a test enumerates the CLI's command table and asserts every registered name appears, so a new command cannot be added without its docs line.
 - [ ] AC-3: A prompt-margin test pins the self-config guide's byte length after the roster is added, with `assert_eq!` against a recorded constant (BUG-193).
 - [ ] AC-4: In one turn against a stub model that emits `shell: ls -la` five times, the harness dispatches once, refuses four times with `tool_call_repeated`, and the four refusals carry the BR-4 sentence; `cost.db` shows no duty call for the refusals.
 - [ ] AC-5: Two identical `edit` calls dispatch twice; the third is refused. Two identical `read` calls: the second is refused. `ls -la` then `ls -la .`: both dispatch.
 - [ ] AC-6: A new prompt turn after a refusal dispatches the same call again (ledger cleared).
-- [ ] AC-7: `shell: cd /nonexistent && pwd` returns exit 1, the raw stderr, the `ERROR:` line, and no `[shell: …]` interpretation; `shell_duty_skipped { reason: failed_exit }` is emitted. A successful 40 KB `cargo test` output is still interpreted.
-- [ ] AC-8: The duty's output on the reference fixtures contains none of `should`, `needs to`, `must`, `the agent`; a mutation removing the prompt sentence fails the test on at least one fixture.
+- [ ] AC-7: `shell: cd /nonexistent && pwd` returns a non-zero exit, the raw stderr, the `ERROR:` line, and no `[shell: …]` interpretation; `shell_duty_skipped { reason: failed_exit }` is emitted. A successful 40 KB `cargo test` output is still interpreted. **Corrected at verification (2026-09-04):** the original wording pinned *exit 1* and the string `No such file or directory`, which are readings of one `/bin/sh` — a failed `cd` exits 1 under bash (macOS's) and 2 under dash (Ubuntu's), whose diagnostic reads `can't cd to /nonexistent`. Written that way the test asserted which shell the runner ships, and it went red on the Linux leg while the macOS leg passed. BR-7's claim is that the command's own failure reaches the model unedited, so the test parses the `(exit N)` marker and asserts it non-zero, and matches the `[stderr]` line on the builtin and the path — the pair every `/bin/sh` puts in it.
+- [ ] AC-8 (a), **CI-testable, blocking**: the duty **prompt** built over each reference fixture carries *"Describe what the output shows. Do not tell the agent what to do next."* and does **not** carry the clause that authorized the invented instruction (*"what that means for what the agent should do next"*). Two mutations, both run red: reverting the sentence, and appending the old clause alongside the new one. **Corrected at validation (2026-09-04):** the original wording asserts on the duty's *output*, which is model text — a scripted engine's output is whatever the script says, so asserting the absence of imperatives in it would assert a property of the fixture, not of the product (LESSON-569). The prompt is the input the output comes from, is deterministic, and is where the defect actually was (LESSON-570: the harness authorized the imperative and was then surprised by it).
+- [ ] AC-8 (b), **live check, recorded not blocking**: the duty's *answer* on the reference fixtures contains none of `should`, `needs to`, `must`, `the agent`. Deferred to a machine with the shipped local model, alongside AC-1 (b). The fixtures and the forbidden-form list are `pub(crate)` constants (`shell_duty::REFERENCE_FIXTURES`, `shell_duty::FORBIDDEN_IMPERATIVES`) precisely so this check has the same material to run against rather than a second copy of it.
 - [ ] AC-9: On the local route, a fourth `skill` invocation in one turn is refused with `cap: 3`; on a remote route the cap stays 12.
-- [ ] AC-10: The 2026-09-04 transcript's third prompt (`/analyze` at a home root) replayed against a stub model that re-emits its recorded calls completes in at most 9 dispatched tool calls instead of the recorded 26.
+- [ ] AC-10: The 2026-09-04 transcript's third prompt (`/analyze` at a home root) replayed against a stub model that re-emits its recorded calls completes in at most 9 dispatched tool calls instead of the recorded 26. **Corrected at validation (2026-09-04):** the transcript file itself is not in the repository and is not on the pipeline's machine (REQ-611 writes transcripts to the state directory, which is deliberately outside any tree a tool may read). The replay fixture is therefore **hand-authored in the test from the call multiset this REQ's own Description records** — `ls -la` ×5, `cd ~/GitHub/teton-code && pwd` ×4, `pwd` ×3, `projects` ×4, and ten further distinct calls totalling 26 — and the fixture's own total is asserted to be 26 so the baseline cannot drift from the number the AC names. Replaying a hand-authored multiset is weaker evidence than replaying the file, and the test's doc comment says so.
 
 ## External Dependencies
 
@@ -113,8 +115,23 @@ LESSON-532, LESSON-570).
 
 ## Assumptions
 
-- The CLI's command table is reachable from the daemon crate at build time (it lives in `teton-protocol` or is moved there), so BR-1's roster cannot drift from `/help`.
-- A read-only `shell` verb set (`ls`, `pwd`, `cat`, `head`, `tail`, `git status`, `git log`, `find`, `grep`, `wc`, `echo`) is a pinned table shared with REQ-615's write-verb set; unknown verbs count as write-capable (third call refused).
+- **Corrected at validation (2026-09-04).** The CLI's `COMMANDS` table cannot
+  itself move to `teton-protocol`: each `CommandSpec` carries a
+  `handler: fn(&mut Connection, &mut UiContext, &str) -> Result<CommandOutcome>`
+  and a `Mirror` into `cli_rows`, both of which name CLI types the daemon has no
+  dependency on (`teton` depends on `tetond`, not the reverse — a move would be a
+  cycle). What moves is a **derived roster** — `(name, effect, user_only)` triples
+  with no function pointers — living in `teton-protocol` and consumed by *both*
+  the CLI's table and the daemon's guide/docs generator, so BR-1's roster still
+  cannot drift from `/help`. The drift guard is a CLI-side test asserting the
+  table's names and the roster's names are the same set (AC-2's enumeration),
+  because only the CLI can see both.
+- A read-only `shell` verb set (`ls`, `pwd`, `cat`, `head`, `tail`, `git status`, `git log`, `find`, `grep`, `wc`, `echo`) is a pinned table shared with REQ-615's write-verb set; unknown verbs count as write-capable (third call refused). REQ-615 runs concurrently; whichever REQ lands first owns the table and the other consumes it.
+- **The resident prompt has 733 bytes of margin and 685 of usable room**
+  (`RECORDED_PROMPT_MARGIN_BYTES` 733, `MIN_PROMPT_HEADROOM_BYTES` 48). A
+  29-command roster carrying a full effect clause per line does not fit; BR-1's
+  "pinned byte ceiling" is therefore a real design constraint the architecture
+  resolves, not a formality. REQ-615 spends from the same margin concurrently.
 
 ## Open Questions
 

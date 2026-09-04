@@ -1,0 +1,125 @@
+{
+  "req": "REQ-617",
+  "branch": "feat/REQ-617-session-self-awareness-and-loop-guards",
+  "startedAt": "2026-09-04T19:34:15.216475Z",
+  "completed": false,
+  "currentPhase": 7,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "integrationBranch": "main",
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree + Preflight",
+      "completedAt": "2026-09-04T19:34:15.216475Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-09-04T19:37:51.067726Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Tasks",
+      "completedAt": "2026-09-04T19:43:16.382223Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture",
+      "completedAt": "2026-09-04T19:43:16.382223Z"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-09-04T21:01:45.114403Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify",
+      "completedAt": "2026-09-04T21:07:37.149201Z"
+    },
+    {
+      "phase": 6,
+      "name": "Create PR",
+      "completedAt": "2026-09-04T21:08:41.405958Z"
+    }
+  ],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-617",
+      "branch": "feat/REQ-617-session-self-awareness-and-loop-guards",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/291",
+      "prNumber": 291,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-001",
+      "TASK-002",
+      "TASK-003",
+      "TASK-004",
+      "TASK-005",
+      "TASK-006",
+      "TASK-007",
+      "TASK-008"
+    ],
+    "failedTasks": []
+  },
+  "conflictsResolved": [
+    {
+      "phase": 7,
+      "files": [
+        "crates/tetond/src/egress/redact.rs",
+        "crates/tetond/tests/skill_over_budget_offer.rs",
+        "crates/teton-protocol/src/events.rs",
+        "crates/teton/src/session_ui.rs",
+        "crates/tetond/src/harness/turn_loop.rs"
+      ],
+      "resolvedBy": "user",
+      "strategy": "manual, per an explicit product decision. The user chose option 1 of the two the blocker recorded: shorten REQ-617's own prompt addition rather than raise REDACT_BODY_OVERHEAD_BYTES and re-derive the redact constants. redact.rs: both ledger paragraphs kept (REQ-615's and REQ-617's), REQ-615's structural work (LOCAL_ENGINE_N_CTX_DEFAULT, the const fns) taken whole, and the guide's command roster cut by 197 bytes -- 29 names collapsed to 17 families with `teton_docs commands` carrying sub-commands and effects, BR-3's ending stripped of the parenthetical that re-listed five switches the roster already names, /help /cd /transcript /context kept spelled out. Both recorded margin pins then re-measured from the failing assert_eq!, not reasoned: 455 -> 112 and 502 -> 159, gap still 47. skill_over_budget_offer.rs: the Window/FitsWindow window re-tuned empirically by sweeping it, 31,000 -> 32,000 (REQ-615's re-centred 50,600 body kept). events.rs: append-only on both sides, both kept. session_ui.rs and turn_loop.rs: import lists unioned.",
+      "verified": true,
+      "verifiedHow": "cargo test -p tetond --lib the_total_cap_clears_the_harness_context_budget_with_margin and the_web_tool_docs_clear_the_outbound_body_overhead both green at the re-measured pins with the RECORDED_MARGIN_GAP_BYTES const-assert holding; the whole skill_over_budget_offer suite green (15/15) with the band's edges probed either side (29,600 fails ExceedsWindow, 150,000 fails no-offer); then cargo test --workspace --no-fail-fast and cargo clippy --workspace --all-targets -- -D warnings.",
+      "resolvedAt": "2026-09-04T22:45:00Z",
+      "note": "Rebase onto origin/main at 8280202, which carried REQ-615 (#289), REQ-616 (#290) and REQ-618 (#292) -- two more than the blocker was recorded against. The blocker's own arithmetic (818 bytes against 733, needing ~133 of relief) was derived; the measured deficit at the rebased tip was 85 bytes over the ceiling, and the 197-byte cut leaves 112 of margin against the 48-byte floor."
+    }
+  ],
+  "notes": [
+    "Phases 0-6 complete. PR #291 is OPEN and review-ready with a full body.",
+    "Workspace suite was green at 4,336 passed / 0 failed and clippy clean on 295c082, the branch tip, before origin/main moved.",
+    "CI has NOT run on the tip: GitHub does not compute checks for a PR whose merge commit is unresolvable, and the PR reads CONFLICTING/DIRTY since REQ-615 merged. CI was green on 5f3d4e5, two commits earlier.",
+    "Halted at Phase 7 per BUG-207: the trial merge returns rc=1 and adlc_conflict_append_only names two modified-line offenders, so the bounded keep-both path does not apply. Nothing was resolved and nothing was pushed; the merge was aborted and the worktree is clean at 295c082.",
+    "conflictsResolved is deliberately empty: a conflict occurred and was NOT resolved, which blockers records and conflictsResolved must not."
+  ],
+  "blockers": [
+    {
+      "blockedBy": "manual",
+      "resolvedBlocker": "REQ-615",
+      "conflictFiles": [
+        "crates/tetond/src/egress/redact.rs",
+        "crates/tetond/tests/skill_over_budget_offer.rs",
+        "crates/teton-protocol/src/events.rs"
+      ],
+      "unblockCondition": "REQ-615 merged to main while REQ-617 was in Phase 5-6. Rebase onto origin/main and resolve. Two of the three conflicts are NOT append-point collisions (partials/conflict-bound.sh returns rc=1, naming redact.rs and skill_over_budget_offer.rs), so BUG-207's bounded keep-both path does not apply and the runner halted rather than resolving. (1) redact.rs is the real decision: REQ-615 spent 278 bytes of the prompt margin (733 -> 455) and REQ-617 spent 540 (733 -> 193). Together that is 818 against 733, with a 48-byte floor -- the combined prompt does NOT fit inside REDACT_BODY_OVERHEAD_BYTES (23 KiB) and needs about 133 bytes of relief. That arithmetic is DERIVED, not measured; the constant's own doc says re-measure rather than reason, so whoever resolves must take the figure the failing assertion reports. Two options: shorten one of the two prompt additions (REQ-617's command roster is the more compressible -- the 29 names could drop to families), or raise REDACT_BODY_OVERHEAD_BYTES to 24 KiB and re-derive REDACT_TOTAL_CAP_CHUNKS, REDACT_INPUT_MAX_BYTES, REDACT_SCANNABLE_CONTEXT_BYTES and REDACT_MAX_CHUNKS, adding a ledger line. The RECORDED_MARGIN_GAP_BYTES const-assert REQ-617 added will refuse a resolution that moves one margin and not the other. (2) skill_over_budget_offer.rs is downstream of (1): REQ-617 moved the Window/FitsWindow cell's declared window 30,000 -> 31,000 because its own prompt growth flipped the verdict. The band is ~1,000 tokens wide, so the combined growth will need it moved again -- re-tune empirically after (1) is settled, and see that fixture's own comment for the durable fix. (3) events.rs IS append-only (both REQs added event variants) and keep-both resolves it.",
+      "holdState": "needs-manual-rebase",
+      "rebaseAttempts": 0,
+      "detectedAt": "2026-09-04T21:22:26.680363Z"
+    }
+  ]
+}

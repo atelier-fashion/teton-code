@@ -457,8 +457,17 @@ async fn a_compaction_of_a_boundary_bearing_conversation_is_refused_whole() {
 /// refusal a property of the boundary rather than of the fixture.
 #[tokio::test]
 async fn a_shell_duty_sends_only_on_a_machine_with_no_boundary_configured() {
-    const FAILED: &str = "$ cargo build\n(exit 101)\n[stderr] error[E0308]: mismatched types";
-    const REPLY: &str = "the build failed on a type mismatch.";
+    // **Re-based by REQ-617 BR-7.** This fixture was a *failed* `cargo build`,
+    // which no longer reaches the duty at all — the boundary claim below would
+    // have been satisfied by a duty that never ran, on both halves. It is now
+    // the one trigger that remains: a **successful** command whose output ran
+    // past the tool's cap, so the fragment in context needs explaining.
+    //
+    // The subject is unchanged. The two halves still differ only in whether a
+    // boundary is configured, which is what makes the refusal a property of the
+    // boundary rather than of the fixture.
+    const CAPPED: &str = "$ cargo test\n(exit 0)\nrunning 4325 tests\n… output was cut";
+    const REPLY: &str = "the suite ran and its output was too long to keep.";
 
     async fn interpret(route: &DutyRoute) -> tetond::harness::RefinedOutcome {
         let registry = ToolRegistry::with_builtins();
@@ -475,9 +484,12 @@ async fn a_shell_duty_sends_only_on_a_machine_with_no_boundary_configured() {
                 &duties,
                 // `measuring` says a command really ran: the `shell` duty fires
                 // only on results a spawned command produced (REQ-561 verify).
-                ToolOutcome::error(FAILED)
+                // A *successful* outcome measuring far past the tool's cap:
+                // `is_error` false is now load-bearing, since BR-7 skips the
+                // duty on any failure whatever its size.
+                ToolOutcome::ok(CAPPED)
                     .with_unknown_provenance()
-                    .measuring(FAILED.chars().count()),
+                    .measuring(100_000),
             )
             .await
     }
@@ -488,7 +500,7 @@ async fn a_shell_duty_sends_only_on_a_machine_with_no_boundary_configured() {
     let served = interpret(&open_route).await;
     assert_eq!(served.duty_error, None);
     assert!(
-        served.outcome.content.contains("[shell: the build failed"),
+        served.outcome.content.contains("[shell: the suite ran"),
         "{}",
         served.outcome.content
     );
@@ -508,7 +520,7 @@ async fn a_shell_duty_sends_only_on_a_machine_with_no_boundary_configured() {
         refused.duty_error
     );
     assert_eq!(
-        refused.outcome.content, FAILED,
+        refused.outcome.content, CAPPED,
         "the tool's own result must ride through unchanged (BR-3)"
     );
     assert!(

@@ -23,7 +23,10 @@
 //!   every client must agree on.
 //! - [`weights`] — the shared on-disk weights directory/filename convention (a
 //!   path is never sent over the wire, but both sides derive the same one).
+//! - [`commands`] — the session's built-in command roster, so the daemon can
+//!   state in the prompt what only the CLI's dispatch table knows (REQ-617).
 
+pub mod commands;
 pub mod effort;
 pub mod events;
 pub mod handshake;

@@ -108,6 +108,41 @@ pub const SKILL_TOOL_NAME: &str = "skill";
 /// property of that machine (LESSON-540).
 pub const PER_TURN_INVOCATION_CAP: usize = 12;
 
+/// The same cap on the **local** route: **3** (REQ-617 BR-8).
+///
+/// Twelve is sized to what one `/proceed` prompt can name on a frontier model
+/// with room to spare. The local tier is a different machine entirely: a small
+/// model re-expanding a 16 KB skill body twelve times would spend the whole
+/// window on twelve copies of one document, and it is exactly the model that
+/// loops (LESSON-532 — presence in context buys retrieval, not compliance).
+///
+/// Three, not one: a genuine chain is short here — read a skill, act, read the
+/// next — and the repeat rule in [`super::super::repeat`] already refuses the
+/// *identical* re-expansion, so what this bounds is a run of **different**
+/// skills. Two would refuse `/validate` → `/architect` → `/validate`, which is
+/// a real sequence.
+///
+/// REQ-616 raises the local window to 262,144, and this rule still holds against
+/// it: the cost being bounded is the model's attention, not only its bytes.
+pub const LOCAL_PER_TURN_INVOCATION_CAP: usize = 3;
+
+/// The per-turn `skill` cap for a route (REQ-617 BR-8).
+///
+/// A **route property**, derived where the route is known, rather than a
+/// constant read wherever it is needed — the shape REQ-586 ADR-1 established
+/// for the context budget and effort. The loop holds the live `RouteBudget` on
+/// every iteration and re-derives after a mid-turn reroute, so a turn that
+/// falls back from remote to local gets the local cap for the calls that follow
+/// rather than the one it started with.
+#[must_use]
+pub const fn per_turn_invocation_cap(local: bool) -> usize {
+    if local {
+        LOCAL_PER_TURN_INVOCATION_CAP
+    } else {
+        PER_TURN_INVOCATION_CAP
+    }
+}
+
 /// The byte ceiling on the roster carried in [`Tool::description`] (BR-2).
 ///
 /// Resident prompt bytes on every turn on every tier, so it is a *byte* cap and
@@ -919,8 +954,12 @@ pub fn call_name(args: &Value) -> Option<String> {
 pub enum CallVerdict {
     /// Within the cap; carry on.
     Proceed,
-    /// Past [`PER_TURN_INVOCATION_CAP`] (BR-6a).
-    PerTurnCap,
+    /// Past the cap in force, carrying it (BR-6a; REQ-617 BR-8).
+    ///
+    /// The figure travels with the verdict because the cap is a route property
+    /// since REQ-617 — three on the local route, twelve remote — and the
+    /// refusal has to name the one that actually applied.
+    PerTurnCap { cap: usize },
 }
 
 /// The `skill` tool's per-turn bookkeeping (BR-6).
@@ -928,7 +967,7 @@ pub enum CallVerdict {
 /// Interior state, but per-**prompt** by construction rather than by a reset
 /// anyone has to remember: `build_tools` rebuilds the registry — and therefore
 /// this tool — every turn.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TurnState {
     /// Calls made this turn, refusals included (BR-6a).
     calls: usize,
@@ -938,6 +977,16 @@ pub struct TurnState {
     /// nothing, so retrying the same name after a refusal — after the user
     /// acknowledges the project root, say — is not a repeat.
     last_expansion: Option<(String, String)>,
+    /// The cap in force for this turn (REQ-617 BR-8).
+    ///
+    /// Defaults to the remote figure, and the default is the safe direction: a
+    /// caller that forgets to set it gets the *looser* cap, which is the
+    /// behaviour every build before REQ-617 had. A default of 3 would silently
+    /// tighten every path that has not been taught to set it.
+    ///
+    /// Set by the loop from the route's own budget, and re-set on a mid-turn
+    /// reroute, because the route can change under a turn (REQ-586 ADR-3).
+    cap: usize,
     /// Every `(name, text)` the **loop** folded into this turn, in order
     /// (REQ-587 BR-7, TASK-218).
     ///
@@ -951,7 +1000,38 @@ pub struct TurnState {
     committed: Vec<(String, String)>,
 }
 
+impl Default for TurnState {
+    /// Every field empty **except** the cap, which starts at the remote figure.
+    ///
+    /// Hand-written rather than derived precisely because of that one field:
+    /// `usize::default()` is `0`, and a cap of zero refuses the first call of
+    /// every turn on every route. A derive here would be a silent kill switch.
+    fn default() -> Self {
+        Self {
+            calls: 0,
+            last_expansion: None,
+            cap: PER_TURN_INVOCATION_CAP,
+            committed: Vec::new(),
+        }
+    }
+}
+
 impl TurnState {
+    /// Put this turn's cap in force (REQ-617 BR-8).
+    ///
+    /// Idempotent and safe to call on every iteration, which is how the loop
+    /// calls it: the route is re-read each time round, so a reroute mid-turn
+    /// moves the cap with it.
+    pub fn set_cap(&mut self, cap: usize) {
+        self.cap = cap;
+    }
+
+    /// The cap in force, for the refusal that has to name it.
+    #[must_use]
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
     /// Count this call and say whether the cap admits it.
     ///
     /// Counting **first**, and counting refusals too, is BR-6a: a refusal that
@@ -960,7 +1040,7 @@ impl TurnState {
         let over_cap = self.cap_would_refuse();
         self.count();
         if over_cap {
-            CallVerdict::PerTurnCap
+            CallVerdict::PerTurnCap { cap: self.cap }
         } else {
             CallVerdict::Proceed
         }
@@ -975,7 +1055,7 @@ impl TurnState {
     /// actually hit was the ceiling.
     #[must_use]
     pub fn cap_would_refuse(&self) -> bool {
-        self.calls >= PER_TURN_INVOCATION_CAP
+        self.calls >= self.cap
     }
 
     /// Count a call the **loop** refused (REQ-587 BR-6a, ADR-2).
@@ -1101,8 +1181,15 @@ pub enum Refusal {
     NotModelInvocable { name: String, user_invocable: bool },
     /// A built-in command owns the name (BR-1's third shadowing case).
     ReservedName { name: String },
-    /// Past the per-turn cap (BR-6a).
-    PerTurnCap,
+    /// Past the per-turn cap (BR-6a), carrying the cap that **applied**
+    /// (REQ-617 BR-8).
+    ///
+    /// The figure rides the variant rather than being read from
+    /// [`PER_TURN_INVOCATION_CAP`] at render time, because since REQ-617 the cap
+    /// is a route property: on the local route it is three, and a refusal
+    /// rendered from the constant would tell a model it had made twelve calls
+    /// when it had made three. A sentence the model then relays to the user.
+    PerTurnCap { cap: usize },
     /// The same `(name, args)` expanded back to back (BR-6b).
     Repeated { name: String },
     /// The call's own arguments were not usable.
@@ -1132,7 +1219,7 @@ impl Refusal {
             Self::UnknownSkill { .. } => "unknown_skill",
             Self::NotModelInvocable { .. } => "not_model_invocable",
             Self::ReservedName { .. } => "reserved_name",
-            Self::PerTurnCap => "per_turn_cap",
+            Self::PerTurnCap { .. } => "per_turn_cap",
             Self::Repeated { .. } => "repeated",
             Self::InvalidArguments { .. } => "invalid_arguments",
             Self::ProjectNotAcknowledged { .. } => "project_not_acknowledged",
@@ -1170,8 +1257,8 @@ impl Refusal {
                 "{reason}: `{name}` is a built-in command only the user runs, so no skill \
                  dispatches under it. Say so and continue."
             ),
-            Self::PerTurnCap => format!(
-                "{reason}: this turn has already made {PER_TURN_INVOCATION_CAP} `skill` \
+            Self::PerTurnCap { cap } => format!(
+                "{reason}: this turn has already made {cap} `skill` \
                  calls, which is the per-turn cap. Finish with what you hold, or ask the \
                  user to continue in a new prompt — the count resets with each prompt."
             ),
@@ -1333,8 +1420,14 @@ fn registered_row<'a>(registry: &'a SkillRegistry, name: &str) -> Option<&'a Ski
 /// is refused by it, so `12 of 12` is the true reading of what the turn spent;
 /// the counter's own question ([`TurnState::cap_would_refuse`]) is `>=`, so
 /// clamping the display cannot move which call gets refused.
-fn published_count(calls: usize) -> u32 {
-    calls.min(PER_TURN_INVOCATION_CAP) as u32
+///
+/// **REQ-617 BR-8 made `cap` a parameter.** It read
+/// [`PER_TURN_INVOCATION_CAP`] directly, which was correct while there was one
+/// cap; with a route-dependent one it would clamp a local turn's count against
+/// the remote ceiling and render `3 of 12`. Taking it as an argument is what
+/// makes the caller pass the *same* value it publishes as `cap`.
+fn published_count(calls: usize, cap: usize) -> u32 {
+    calls.min(cap) as u32
 }
 
 /// What a closed acknowledgment door reads as in the model's sentence.
@@ -1689,8 +1782,8 @@ impl SkillTool {
         // BR-9's `/verbose` count. The binding is what makes the guard drop
         // before the arm runs.
         let verdict = self.turn_state().admit();
-        if let CallVerdict::PerTurnCap = verdict {
-            return self.refuse(ctx, args, Refusal::PerTurnCap);
+        if let CallVerdict::PerTurnCap { cap } = verdict {
+            return self.refuse(ctx, args, Refusal::PerTurnCap { cap });
         }
 
         let call = match Call::parse(args) {
@@ -2048,9 +2141,19 @@ impl SkillTool {
                 // path, because the cap bounds the model's invocations within
                 // one prompt turn and a typed `/name` spends none of it. The
                 // count already includes this call: `admit` counts first.
-                turn_invocations: Some(TurnInvocations {
-                    count: published_count(self.turn_state().calls()),
-                    cap: PER_TURN_INVOCATION_CAP as u32,
+                // REQ-617 BR-8: both figures come off the cap **in force**,
+                // read once so the count and the ceiling it is clamped against
+                // cannot be two different numbers. Publishing the constant here
+                // while the local route enforced three would render
+                // `invocation 3 of 12` on the surface that exists to tell a user
+                // what their turn spent.
+                turn_invocations: Some({
+                    let state = self.turn_state();
+                    let cap = state.cap();
+                    TurnInvocations {
+                        count: published_count(state.calls(), cap),
+                        cap: cap as u32,
+                    }
                 }),
                 // BR-9's other half. Without it a refused call and a skill with
                 // no dynamic context are the same bytes — same name, same size,
@@ -3343,17 +3446,20 @@ mod tests {
     /// clamping the display cannot move which call gets refused.
     #[test]
     fn the_published_count_never_exceeds_the_cap_it_is_rendered_against() {
-        assert_eq!(published_count(0), 0);
-        assert_eq!(published_count(1), 1);
-        assert_eq!(
-            published_count(PER_TURN_INVOCATION_CAP),
-            PER_TURN_INVOCATION_CAP as u32
-        );
-        assert_eq!(
-            published_count(PER_TURN_INVOCATION_CAP + 2),
-            PER_TURN_INVOCATION_CAP as u32,
-            "past the cap every call is refused by it, so the cap is what the turn spent"
-        );
+        // REQ-617 BR-8: the ceiling is a parameter now, so the clamp is
+        // asserted against *both* caps. Against the remote one only, a build
+        // that clamped to the constant regardless of route would pass.
+        for cap in [PER_TURN_INVOCATION_CAP, LOCAL_PER_TURN_INVOCATION_CAP] {
+            assert_eq!(published_count(0, cap), 0);
+            assert_eq!(published_count(1, cap), 1);
+            assert_eq!(published_count(cap, cap), cap as u32);
+            assert_eq!(
+                published_count(cap + 2, cap),
+                cap as u32,
+                "past the cap every call is refused by it, so the cap is what \
+                 the turn spent (cap {cap})"
+            );
+        }
 
         // And the counter itself still counts, because BR-6a's bound needs it.
         let mut state = TurnState::default();
@@ -3378,7 +3484,9 @@ mod tests {
         }
         assert_eq!(
             state.admit(),
-            CallVerdict::PerTurnCap,
+            CallVerdict::PerTurnCap {
+                cap: PER_TURN_INVOCATION_CAP
+            },
             "the call past the cap is refused, and it still counted"
         );
         assert_eq!(state.calls(), PER_TURN_INVOCATION_CAP + 1);
@@ -3409,6 +3517,108 @@ mod tests {
         assert!(
             !state.is_repeat("alpha", "x"),
             "BR-6b is a *back-to-back* rule: another tool call in between clears it"
+        );
+    }
+
+    /// **REQ-617 BR-8 / AC-9: the cap is a route property.**
+    ///
+    /// Three claims, and the third is the one worth the test.
+    ///
+    /// 1. The derivation: three local, twelve remote.
+    /// 2. The default is the **remote** figure, so a caller that never sets it
+    ///    behaves as every build before REQ-617 did. A hand-written `Default`
+    ///    guards this because `usize::default()` is `0` and a cap of zero
+    ///    refuses the first call of every turn — a derive here would be a silent
+    ///    kill switch, which is why the derive was removed.
+    /// 3. The **benign path**: the remote cap must not drop. A rule that
+    ///    tightened every route would pass any local-only assertion and would be
+    ///    a global regression wearing a route's name.
+    ///
+    /// # What this cannot reach, and where that half lives
+    ///
+    /// The route-to-cap wiring in `run_the_allowed_tool` reads
+    /// `config.budget.bound == BudgetBound::LocalEngine`, and reaching a
+    /// genuinely local `RouteBudget` needs a loaded local engine — the same wall
+    /// `skill_tool_loop.rs`'s header records for AC-8's local leg, and an
+    /// integration test cannot install one. So the *derivation* is pinned here
+    /// and the *remote* end-to-end path is pinned by
+    /// `skill_tool_loop.rs::the_thirteenth_call_of_a_turn_is_refused_by_the_cap…`,
+    /// which would fail if the loop set three.
+    ///
+    /// **The live local route is covered after all, and by exactly one test**:
+    /// `crates/teton/tests/cli_e2e.rs::a_model_invocation_echoes_its_line_…`
+    /// starts a whole daemon with the stand-in engine, so its session really
+    /// does route local and `/verbose` really does print `invocation 1 of 3`.
+    /// Mutation run: replacing the loop's
+    /// `config.budget.bound == BudgetBound::LocalEngine` with a literal `false`
+    /// turns that test red and nothing else in the suite. It is the only place
+    /// that reads the route end to end, which is worth knowing before anyone
+    /// deletes it as a slow e2e.
+    #[test]
+    fn the_per_turn_cap_is_three_on_the_local_route_and_twelve_remote() {
+        assert_eq!(per_turn_invocation_cap(true), LOCAL_PER_TURN_INVOCATION_CAP);
+        assert_eq!(per_turn_invocation_cap(true), 3);
+        assert_eq!(per_turn_invocation_cap(false), PER_TURN_INVOCATION_CAP);
+        assert_eq!(
+            per_turn_invocation_cap(false),
+            12,
+            "the benign path: the remote cap must NOT drop. A change that \
+             tightened both routes would satisfy every local assertion above \
+             and be a global regression wearing a route's name."
+        );
+
+        assert_eq!(
+            TurnState::default().cap(),
+            PER_TURN_INVOCATION_CAP,
+            "an unset cap is the LOOSER one. `usize::default()` is 0, which \
+             refuses the first call of every turn on every route — that is why \
+             `Default` is hand-written here rather than derived."
+        );
+    }
+
+    /// **AC-9: on the local route the fourth call is refused, with `cap: 3`.**
+    ///
+    /// Driven through `TurnState` rather than through a route, for the reason
+    /// the test above records. What it does pin is everything downstream of the
+    /// cap being set: which call is refused, and that the refusal carries the
+    /// figure that actually applied rather than the constant.
+    ///
+    /// That second half is the defect this would catch. A refusal rendered from
+    /// `PER_TURN_INVOCATION_CAP` would tell a model on the local route that it
+    /// had made twelve calls when it had made three — and the model relays that
+    /// sentence to the user.
+    #[test]
+    fn the_local_route_refuses_the_fourth_call_and_names_three() {
+        let mut state = TurnState::default();
+        state.set_cap(per_turn_invocation_cap(true));
+
+        for call in 1..=LOCAL_PER_TURN_INVOCATION_CAP {
+            assert_eq!(state.admit(), CallVerdict::Proceed, "call {call}");
+        }
+        assert_eq!(
+            state.admit(),
+            CallVerdict::PerTurnCap { cap: 3 },
+            "the fourth call is refused, carrying the cap that applied"
+        );
+
+        let message = Refusal::PerTurnCap { cap: 3 }.message(&SkillRegistry::default());
+        assert!(
+            message.contains("already made 3 `skill` calls"),
+            "the refusal must name the cap in force, not the constant: {message}"
+        );
+        assert!(
+            !message.contains("12"),
+            "a local refusal that says 12 is a sentence the model relays to the \
+             user about a turn that never happened: {message}"
+        );
+
+        // And the published figures agree with each other. `3 of 3`, never
+        // `3 of 12`.
+        assert_eq!(published_count(state.calls(), 3), 3);
+        assert_eq!(
+            published_count(9, 3),
+            3,
+            "the display clamps at the cap in force"
         );
     }
 
