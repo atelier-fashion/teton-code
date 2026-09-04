@@ -1489,7 +1489,7 @@ pub const NO_ROOM_REASON: &str = "no_room";
 /// so on a machine that has not yet moved to the larger window, a big skill is
 /// offered rather than expanded. That is the designed behaviour (BR-4 routes it
 /// through REQ-589's offer, so the user may proceed once) and it is also the
-/// interaction to watch: see ASSUME-039.
+/// interaction to watch: see ASSUME-042.
 pub const ROOM_FRACTION_PERCENT: usize = 25;
 
 /// Whether a body of `body_bytes` leaves the turn too little of `budget_bytes`
@@ -1524,7 +1524,7 @@ pub const ROOM_FRACTION_PERCENT: usize = 25;
 /// one. It is not added here because BR-4 states the rule in bytes, the REQ's
 /// own motivating measurement is in bytes, and adding a second conjunct to a
 /// rule whose value is still under review (see [`ROOM_FRACTION_PERCENT`] and
-/// ASSUME-039) would make it harder to move, not easier. The crossover is
+/// ASSUME-042) would make it harder to move, not easier. The crossover is
 /// written down so the next reader does not have to derive it (LESSON-565).
 #[must_use]
 pub const fn leaves_no_room(body_bytes: usize, budget_bytes: usize) -> bool {
@@ -5600,7 +5600,7 @@ mod tests {
         // invocation and it proceeds. That is BR-4 working as written, and it is
         // also the interaction to watch: REQ-616 raises the local window to
         // 262,144 tokens, at which 25% is ~130 KB and no body in this corpus
-        // comes near it. See ASSUME-039, which records both figures the spec's
+        // comes near it. See ASSUME-042, which records both figures the spec's
         // own assumption got wrong — the largest body is 51 KB, not 25 KB, and
         // the window it is measured against today is 32,768, not 262,144.
         let rows: &[(&str, RouteBudget, &str, &String, bool)] = &[
@@ -8487,7 +8487,7 @@ mod tests {
     /// Recorded as a test rather than a comment because it is the thing a change
     /// to either constant moves, and because "which of the two is higher here"
     /// is not something a reader can work out from either constant alone. See
-    /// ASSUME-039.
+    /// ASSUME-042.
     #[test]
     fn the_room_ceiling_and_the_digest_threshold_are_pinned_against_each_other() {
         // `true` = the digest threshold is the higher, so BR-4 pre-empts the

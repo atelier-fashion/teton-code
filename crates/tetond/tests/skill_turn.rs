@@ -3647,7 +3647,7 @@ async fn an_expansion_past_the_digest_threshold_is_folded_whole_where_an_ordinar
     //
     // Whether BR-4's fraction should sit above the digest threshold's — so that
     // the two rules stop pre-empting each other — is the open question this REQ
-    // leaves; see the PR body and ASSUME-039.
+    // leaves; see the PR body and ASSUME-042.
     const BODY_BYTES: usize = 100_000;
     let body = format!("{}\nLAST-STEP-OF-THE-PROCEDURE\n", filler(BODY_BYTES));
     model_invocable_skill(&repo, "wide", &body);

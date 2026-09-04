@@ -636,7 +636,7 @@
   therefore pinned by a test that walks four routes and records which of the two
   is higher on each — including the route where the digest cap flips it — rather
   than by a single inequality that a change to either constant would slide past.
-  ASSUME-039 holds the open question about the fraction's value.
+  ASSUME-042 holds the open question about the fraction's value.
 
 ## ADRs
 

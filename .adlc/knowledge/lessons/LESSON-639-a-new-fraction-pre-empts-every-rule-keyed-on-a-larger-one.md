@@ -59,7 +59,7 @@ digest threshold's absolute cap makes the order flip.
 
 ## Related
 
-- REQ-618 BR-4, ASSUME-039 — the fraction, and the open question about its value.
+- REQ-618 BR-4, ASSUME-042 — the fraction, and the open question about its value.
 - REQ-587 BR-7 — the digest bypass this pre-empts.
 - LESSON-565 — the sibling failure in a conjunction: reasoning about one half of
   a two-currency guard. This is the same blind spot across *rules* rather than
