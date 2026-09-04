@@ -70,7 +70,7 @@ use teton_protocol::events::{
     Event, InvokedBy, NotRunReason, ProjectSkillTrustEntry, SkillInvoked, SkillRefused,
     TurnInvocations,
 };
-use teton_protocol::methods::project_skill_trust_key;
+use teton_protocol::methods::{project_skill_trust_key, RootKind};
 use tokio::runtime::Handle;
 
 use super::super::context::ToolProvenance;
@@ -1109,6 +1109,19 @@ pub enum Refusal {
     InvalidArguments { detail: String },
     /// The user has not acknowledged this repository's skills (BR-4).
     ProjectNotAcknowledged { name: String, door: NotRunReason },
+    /// The skill declares that it needs a project and the session root is not
+    /// one (REQ-615 BR-5).
+    ///
+    /// Carries the projects roster **by value** rather than reading it at
+    /// render time, so the sentence the model reads and the
+    /// `skill_refused_needs_project` record a client renders are built from
+    /// one list and cannot come to name different projects.
+    NeedsProject {
+        name: String,
+        root_display: String,
+        root_kind: RootKind,
+        known_projects: Vec<String>,
+    },
 }
 
 impl Refusal {
@@ -1123,6 +1136,7 @@ impl Refusal {
             Self::Repeated { .. } => "repeated",
             Self::InvalidArguments { .. } => "invalid_arguments",
             Self::ProjectNotAcknowledged { .. } => "project_not_acknowledged",
+            Self::NeedsProject { .. } => "needs_project",
         }
     }
 
@@ -1176,6 +1190,37 @@ impl Refusal {
                  `full` permission level; a user-level skill needs neither.",
                 door_words(*door)
             ),
+            Self::NeedsProject {
+                name,
+                root_display,
+                root_kind,
+                known_projects,
+            } => {
+                let place = if *root_kind == RootKind::FilesystemRoot {
+                    "the filesystem root"
+                } else {
+                    "your home folder"
+                };
+                let projects = if known_projects.is_empty() {
+                    "This machine knows of no projects yet; the `projects` tool \
+                     lists what it can find."
+                        .to_owned()
+                } else {
+                    format!(
+                        "The user can move there with one of: {}.",
+                        known_projects
+                            .iter()
+                            .map(|p| format!("`/cd {p}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                format!(
+                    "{reason}: `{name}` needs a project, and this session's root is \
+                     {root_display} ({place}). Nothing was run and nothing was read. \
+                     {projects} You cannot run `/cd` yourself — ask."
+                )
+            }
         }
     }
 
@@ -1677,6 +1722,36 @@ impl SkillTool {
         let repeat = self.turn_state().is_repeat(&name, &call.args);
         if repeat {
             return self.refuse(ctx, args, Refusal::Repeated { name });
+        }
+
+        // REQ-615 BR-5, and the position is the rule. **After** resolution,
+        // because a file has to be known before its preamble can be scanned;
+        // **before** the acknowledgment and the expander, because "no model
+        // turn is spent on the body" is a property of never reaching them —
+        // no expansion to budget, no dynamic command to consent to, no fold.
+        //
+        // Only `home` and `filesystem_root` refuse (OQ-2, resolved). A `plain`
+        // root may be a project-to-be and `/init` must run there.
+        if crate::harness::root_gate::gates_writes(ctx.root_kind()) && skill.needs_project() {
+            let refusal = Refusal::NeedsProject {
+                name: name.clone(),
+                root_display: ctx.root_display().to_owned(),
+                root_kind: ctx.root_kind(),
+                known_projects: ctx.known_projects().to_vec(),
+            };
+            self.gate.events().publish(
+                Some(self.gate.session_id().clone()),
+                Event::SkillRefusedNeedsProject(
+                    teton_protocol::events::SkillRefusedNeedsProject {
+                        skill: skill.name.clone(),
+                        source: skill.source,
+                        root_display: ctx.root_display().to_owned(),
+                        root_kind: ctx.root_kind(),
+                        known_projects: ctx.known_projects().to_vec(),
+                    },
+                ),
+            );
+            return self.refuse(ctx, args, refusal);
         }
 
         // BR-4: repository content reaching the model labelled *instructions*
@@ -2211,6 +2286,143 @@ mod tests {
         match name {
             Some(name) => json!({ "name": name, "args": args }),
             None => json!({}),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-615 BR-5 — the project gate
+    // -----------------------------------------------------------------------
+
+    /// **REQ-615 BR-5 / AC-4: a skill that needs a project is refused at a home
+    /// root, and one that does not is untouched.**
+    ///
+    /// Both declarations are exercised: the frontmatter `requires: project` and
+    /// the `.adlc/` preamble token the shipped ADLC skills are recognised by.
+    /// The benign row is a skill that declares neither — it must still expand
+    /// from `~`, or the gate would have taken every skill away from a home
+    /// session rather than the ones that need a repository.
+    ///
+    /// Mutation: drop the `gates_writes` guard (every skill is refused, the
+    /// benign row goes red); drop `requires_project` from `needs_project` (the
+    /// frontmatter row goes red); drop the `.adlc/` check (the preamble row).
+    #[tokio::test]
+    async fn a_project_needing_skill_is_refused_at_a_home_root() {
+        let fx = Fixture::new();
+        fx.user("declares", "requires: project\n", "Body.\n");
+        fx.user("adlc", "", "!`cat .adlc/context/architecture.md`\nBody.\n");
+        fx.user("plainskill", "", "Just prose, no commands.\n");
+        let tool = tool(fx.registry());
+        let home = fx.ctx().with_root_kind(RootKind::Home);
+
+        for name in ["declares", "adlc"] {
+            let out = tool.invoke(&home, &call(Some(name), "")).await;
+            assert!(out.is_error, "{name}: {}", out.content);
+            assert!(
+                out.content.contains("needs_project"),
+                "{name} must be refused with the stable reason id:\n{}",
+                out.content
+            );
+            assert!(
+                out.content.contains("You cannot run `/cd` yourself"),
+                "{name}'s refusal names who can move the root:\n{}",
+                out.content
+            );
+        }
+
+        let benign = tool.invoke(&home, &call(Some("plainskill"), "")).await;
+        assert!(
+            !benign.is_error,
+            "a skill that needs no project must still expand from a home root:\n{}",
+            benign.content
+        );
+    }
+
+    /// **REQ-615 BR-5: the `.adlc/` token is read out of commands, never out of
+    /// prose.**
+    ///
+    /// The distinction the scanner exists for. A substring search over the body
+    /// would gate every skill that *documents* `.adlc/` — this repository's own
+    /// do — and there would be no way to tell that from a real preamble.
+    ///
+    /// Mutation: replace `dynamic::scan` with `self.body.contains(".adlc/")` —
+    /// the prose row goes red.
+    #[tokio::test]
+    async fn the_adlc_token_is_read_from_commands_not_from_prose() {
+        let fx = Fixture::new();
+        fx.user(
+            "documents",
+            "",
+            "This skill explains the .adlc/ layout in prose.\nNo commands here.\n",
+        );
+        fx.user("runs", "", "!`ls .adlc/specs`\nBody.\n");
+        let tool = tool(fx.registry());
+        let home = fx.ctx().with_root_kind(RootKind::Home);
+
+        let prose = tool.invoke(&home, &call(Some("documents"), "")).await;
+        assert!(
+            !prose.is_error,
+            "a skill that only mentions .adlc/ in prose runs no command and \
+             needs no project:\n{}",
+            prose.content
+        );
+        let command = tool.invoke(&home, &call(Some("runs"), "")).await;
+        assert!(command.is_error, "{}", command.content);
+    }
+
+    /// **REQ-615 BR-5 / AC-4: the refusal runs no preamble command.**
+    ///
+    /// Asserted by inspecting the artifact the preamble would have created, not
+    /// by reading the refusal (LESSON-519). Running the preamble to decide
+    /// whether the preamble may run is the harm itself: it is how `/analyze`
+    /// came to `cat` in a home folder, and a marker file is the only witness
+    /// that it did not happen here.
+    ///
+    /// Mutation: move the gate below `expand_and_fold` — the marker exists and
+    /// this goes red.
+    #[tokio::test]
+    async fn the_refusal_runs_no_preamble_command() {
+        let fx = Fixture::new();
+        let marker = fx.repo().join("preamble-ran");
+        fx.user(
+            "sideeffect",
+            "requires: project\n",
+            &format!("!`touch {} && cat .adlc/x`\nBody.\n", marker.display()),
+        );
+        let tool = addressed_tool(fx.registry(), PermissionPolicy::Allow);
+        let home = fx.ctx().with_root_kind(RootKind::Home);
+
+        let out = tool.invoke(&home, &call(Some("sideeffect"), "")).await;
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            !marker.exists(),
+            "the gate must return before any preamble command is spawned — \
+             running one to find out whether it may run is the harm itself"
+        );
+    }
+
+    /// **REQ-615 BR-9 / OQ-2: a plain root still expands a `.adlc/` skill.**
+    ///
+    /// The benign path that resolves OQ-2. A `plain` folder may be a
+    /// project-to-be, and `/init` — whose whole job is creating `.adlc/` — must
+    /// run there. Gating it would make the one skill that fixes a non-project
+    /// root unreachable from a non-project root.
+    ///
+    /// Mutation: gate on anything other than `gates_writes` (e.g. "not a
+    /// project") — this goes red.
+    #[tokio::test]
+    async fn a_plain_root_still_expands_a_dot_adlc_skill() {
+        let fx = Fixture::new();
+        fx.user("initlike", "", "!`ls .adlc/specs 2>/dev/null`\nBody.\n");
+        let tool = addressed_tool(fx.registry(), PermissionPolicy::Allow);
+
+        for kind in [RootKind::Plain, RootKind::Project] {
+            let ctx = fx.ctx().with_root_kind(kind);
+            let out = tool.invoke(&ctx, &call(Some("initlike"), "")).await;
+            assert!(
+                !out.content.contains("needs_project"),
+                "a {kind:?} root must not refuse a .adlc/ skill:\n{}",
+                out.content
+            );
         }
     }
 

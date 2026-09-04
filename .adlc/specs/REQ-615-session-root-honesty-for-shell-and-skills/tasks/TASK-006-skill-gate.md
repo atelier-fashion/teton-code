@@ -1,7 +1,7 @@
 ---
 id: TASK-006
 title: "A skill that needs a project is refused outside one, not expanded"
-status: draft
+status: complete
 parent: REQ-615
 created: 2026-09-04
 updated: 2026-09-04

@@ -997,8 +997,34 @@ impl DaemonRuntime {
         // writes next, and last week's file is still on disk after
         // `/transcript off`. Nothing here reads `transcript.enabled`, and that
         // is the point.
+        // REQ-584 BR-7's ranked, bounded names, derived **once** here and read
+        // by two consumers: the prompt's known-projects clause (below) and
+        // REQ-615's refusals, which name the same projects to the same model in
+        // the same turn. Two readings of one snapshot would be one answer only
+        // by accident (ADR-5, the shape the root probe itself established).
+        //
+        // **Reads the stored snapshot only — it never scans** (BR-3): this runs
+        // on every turn, and a turn that did not ask for projects must not pay
+        // for a directory walk, let alone raise the macOS Documents dialog.
+        let known_projects: Vec<String> =
+            if probed.view.kind == teton_protocol::methods::RootKind::Project {
+                Vec::new()
+            } else {
+                self.projects
+                    .snapshot()
+                    .rank(None)
+                    .iter()
+                    .map(|p| {
+                        teton_core::session_root::bounded_field(
+                            &p.name,
+                            teton_core::session_root::NAME_MAX_CHARS,
+                        )
+                    })
+                    .collect()
+            };
         let tool_ctx = ToolContext::for_root(probed)
-            .with_denied_prefix(effective_transcript_dir(&config.transcript));
+            .with_denied_prefix(effective_transcript_dir(&config.transcript))
+            .with_known_projects(known_projects.clone());
         // REQ-611 BR-4: the turn's streaming surface also carries the sink, so
         // the tool input and the tool result — neither of which the bus has ever
         // carried — reach the transcript in-process from the two points in the
@@ -1025,22 +1051,7 @@ impl DaemonRuntime {
         // **Reads the stored snapshot only — it never scans** (BR-3): this runs
         // on every turn, and a turn that did not ask for projects must not pay
         // for a directory walk, let alone raise the macOS Documents dialog.
-        route.harness.known_projects =
-            if probed.view.kind == teton_protocol::methods::RootKind::Project {
-                Vec::new()
-            } else {
-                self.projects
-                    .snapshot()
-                    .rank(None)
-                    .iter()
-                    .map(|p| {
-                        teton_core::session_root::bounded_field(
-                            &p.name,
-                            teton_core::session_root::NAME_MAX_CHARS,
-                        )
-                    })
-                    .collect()
-            };
+        route.harness.known_projects = known_projects;
         // REQ-612 BR-6 / ADR-3: the repository's notes, re-checked **here** —
         // the one place per turn that has already re-derived the root, after
         // `session_root_for` and before the prompt is built. Never mid-turn: the

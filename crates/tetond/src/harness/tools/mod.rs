@@ -175,6 +175,13 @@ pub struct ToolContext {
     /// [`denied_prefix_forms`] derives for it, so the list is longer than the
     /// set of directories it came from.
     denied_prefixes: Vec<PathBuf>,
+    /// The projects this machine knows about, ranked and already bounded by the
+    /// caller (REQ-615 ADR-5).
+    ///
+    /// Empty on every context that was not given one, which is the honest value
+    /// for a context nobody handed projects to — and what keeps every existing
+    /// `for_root` call site compiling unchanged.
+    known_projects: Vec<String>,
 }
 
 impl ToolContext {
@@ -195,6 +202,7 @@ impl ToolContext {
             kind: RootKind::Plain,
             walk: walk::WalkPolicy::default(),
             denied_prefixes: Vec::new(),
+            known_projects: Vec::new(),
         }
     }
 
@@ -213,6 +221,7 @@ impl ToolContext {
             kind: probed.view.kind,
             walk: walk::WalkPolicy::default(),
             denied_prefixes: Vec::new(),
+            known_projects: Vec::new(),
         }
     }
 
@@ -258,6 +267,24 @@ impl ToolContext {
         self.denied_prefixes.extend(denied_prefix_forms(dir));
         self.walk = self.walk.with_denied_prefix(dir);
         self
+    }
+
+    /// The same context carrying the machine's ranked, bounded project names
+    /// (REQ-615 ADR-5).
+    ///
+    /// Fed from the **same expression** that feeds the prompt's known-projects
+    /// clause, so the environment block and a REQ-615 refusal name one list —
+    /// the one-reading-two-consumers shape the root probe itself established.
+    #[must_use]
+    pub fn with_known_projects(mut self, names: Vec<String>) -> Self {
+        self.known_projects = names;
+        self
+    }
+
+    /// The project names a REQ-615 refusal may list.
+    #[must_use]
+    pub fn known_projects(&self) -> &[String] {
+        &self.known_projects
     }
 
     /// The walk policy every walker under this context reads (ADR-3, BR-11).

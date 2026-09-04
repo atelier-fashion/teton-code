@@ -691,6 +691,7 @@ mod tests {
             // An ordinary row: the expander is reached the same way whoever
             // invoked it, and BR-3's flags are decided before it is asked.
             model_invocable: true,
+            requires_project: false,
             user_invocable: true,
             ignored_keys: Vec::new(),
             name_note: None,

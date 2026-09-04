@@ -99,6 +99,19 @@ pub struct Parsed {
     /// or read a value that is not a boolean literal at all, which is the safe
     /// reading (see the module doc's table).
     pub model_invocable: bool,
+    /// Whether this skill declares that it needs a project root (REQ-615
+    /// BR-5), via `requires: project`.
+    ///
+    /// The forward path. The shipped ADLC skills carry no such key, so the
+    /// gate also reads a `.adlc/` token out of their `!cmd` preambles — that
+    /// is the compatibility path, and it lives in the gate rather than here
+    /// because it is a property of the *body*, not of the frontmatter.
+    ///
+    /// Any value other than the literal `project` leaves this `false` and names
+    /// the key as ignored. The safe reading is the *unchanged* one: a typo must
+    /// not take a working skill away from the person who wrote it, which is the
+    /// same direction `user-invocable` chooses.
+    pub requires_project: bool,
     /// Whether the user may dispatch this skill by typing `/name` (REQ-587
     /// BR-3).
     ///
@@ -136,6 +149,9 @@ impl Default for Parsed {
             description: None,
             argument_hint: None,
             model_invocable: true,
+            // REQ-615 BR-5: a file that declares nothing needs nothing. The
+            // gate's compatibility path reads the body, not this.
+            requires_project: false,
             user_invocable: true,
             ignored_keys: Vec::new(),
             body: String::new(),
@@ -183,6 +199,7 @@ pub fn parse(text: &str) -> Result<Parsed, Malformed> {
     let mut parsed = Parsed::default();
     let mut seen_model_flag = false;
     let mut seen_user_flag = false;
+    let mut seen_requires = false;
     // The opening delimiter was line 1, so the block's first line is line 2 —
     // the numbers a user reads off their editor's gutter.
     for (line_number, line) in (2..).zip(lines) {
@@ -247,6 +264,16 @@ pub fn parse(text: &str) -> Result<Parsed, Malformed> {
                             false
                         }
                     };
+                }
+            }
+            "requires" => {
+                if !seen_requires {
+                    seen_requires = true;
+                    if value.trim() == "project" {
+                        parsed.requires_project = true;
+                    } else {
+                        name_ignored(&mut parsed.ignored_keys, key);
+                    }
                 }
             }
             "user-invocable" => {
