@@ -13854,3 +13854,124 @@ mod window_clause_client_tests {
         );
     }
 }
+
+/// REQ-614 TASK-396 — the standing pin line the user actually sees.
+#[cfg(test)]
+mod session_pin_render {
+    use super::*;
+    use crate::render::RecordingSurface;
+    use teton_protocol::events::{PinRemedy, SessionPinLifted, SessionPinned};
+
+    fn envelope(event: Event) -> EventEnvelope {
+        EventEnvelope::new(1, Some(SessionId::from("s1")), event)
+    }
+
+    fn pinned(cause: &str, liftable: bool, remedy: PinRemedy) -> Event {
+        Event::SessionPinned(SessionPinned {
+            cause: cause.to_owned(),
+            liftable,
+            remedy,
+            budget_tokens: Some(21_162),
+        })
+    }
+
+    /// BR-7. **Verbose off**, and the line still prints.
+    ///
+    /// This is the whole point of the REQ's announcement half: on 2026-09-04
+    /// `/verbose` was off, the client rendered neither `privacy_block` nor the
+    /// reroute as a standing notice, and the user watched 65 turns run on a
+    /// 21,162-token tier without being told why.
+    ///
+    /// **Mutation**: wrap the `SessionPinned` arm in `if state.verbose` and this
+    /// goes red.
+    #[test]
+    fn the_pin_line_prints_once_with_verbose_off() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.verbose = false;
+
+        render_event(
+            &envelope(pinned(
+                "unknown_shell",
+                true,
+                PinRemedy::Command("/shell allow".to_owned()),
+            )),
+            &mut surface,
+            &mut state,
+        );
+
+        assert!(
+            surface.any_line_contains(LineKind::Notice, "pinned to the local tier"),
+            "the pin must be announced with verbose off"
+        );
+        assert!(surface.any_line_contains(LineKind::Notice, "unknown_shell"));
+        assert!(surface.any_line_contains(LineKind::Notice, "/shell allow"));
+        assert!(
+            surface.any_line_contains(LineKind::Notice, "21162"),
+            "the line names the budget the session dropped to"
+        );
+        assert_eq!(state.pinned.as_deref(), Some("unknown_shell"));
+    }
+
+    /// The permanent arm must not offer a remedy that would refuse the user,
+    /// and must say plainly that none exists.
+    #[test]
+    fn a_permanent_pin_says_there_is_no_remedy() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        render_event(
+            &envelope(pinned("boundary_hit", false, PinRemedy::None)),
+            &mut surface,
+            &mut state,
+        );
+        assert!(surface.any_line_contains(LineKind::Notice, "No remedy"));
+        assert!(surface.any_line_contains(LineKind::Notice, "protected file was read"));
+        assert!(
+            !surface.any_line_contains(LineKind::Notice, "/shell allow"),
+            "a permanent pin must not name a command that refuses it"
+        );
+    }
+
+    /// The lift's counterpart line, and the state it clears — so a later
+    /// `/doctor` does not report a pin that is gone.
+    #[test]
+    fn a_lift_prints_its_own_line_and_clears_the_state() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.pinned = Some("unknown_shell".to_owned());
+        render_event(
+            &envelope(Event::SessionPinLifted(SessionPinLifted {
+                turns_pinned: 65,
+            })),
+            &mut surface,
+            &mut state,
+        );
+        assert!(surface.any_line_contains(LineKind::Notice, "pin lifted"));
+        assert!(
+            surface.any_line_contains(LineKind::Notice, "65"),
+            "the line says what the pin cost"
+        );
+        assert!(state.pinned.is_none());
+    }
+
+    /// The benign path: a session that was never pinned prints no standing line.
+    /// Without this the assertions above would pass for a renderer that
+    /// announced on every event.
+    #[test]
+    fn an_unpinned_session_prints_no_standing_line() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        render_event(
+            &envelope(Event::ContextCleared(
+                teton_protocol::events::ContextCleared { blocks_dropped: 0 },
+            )),
+            &mut surface,
+            &mut state,
+        );
+        assert!(
+            !surface.any_line_contains(LineKind::Notice, "pinned to the local tier"),
+            "nothing but a pin announces a pin"
+        );
+        assert!(state.pinned.is_none());
+    }
+}

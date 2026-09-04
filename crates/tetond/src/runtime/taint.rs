@@ -534,6 +534,12 @@ pub(super) struct TaintingPrivacySink {
     pub(super) taint: Arc<SessionTaint>,
     /// Which causes pin, for the choke point this sink was built for.
     pub(super) taints: CauseGate,
+    /// The local tier's configured token budget, for `session_pinned` (REQ-614).
+    ///
+    /// A static fact of the tier, not a per-route derivation: this sink fires
+    /// before the next turn's route is decided, so no per-route figure exists
+    /// yet — respected by not pretending to have one here.
+    pub(super) local_budget_tokens: Option<u64>,
 }
 
 /// Which block causes pin their session — a rule a [`TaintingPrivacySink`] is
@@ -548,7 +554,16 @@ impl TaintingPrivacySink {
             events,
             taint,
             taints: cause_taints_the_session,
+            local_budget_tokens: None,
         }
+    }
+
+    /// The same sink, told the local tier's token budget so `session_pinned`
+    /// can state what the session dropped to (REQ-614 BR-7).
+    #[must_use]
+    pub(super) fn with_local_budget(mut self, tokens: Option<u64>) -> Self {
+        self.local_budget_tokens = tokens;
+        self
     }
 
     /// The sink for the **MCP** choke point: [`mcp_cause_taints_the_session`],
@@ -559,6 +574,7 @@ impl TaintingPrivacySink {
             events,
             taint,
             taints: mcp_cause_taints_the_session,
+            local_budget_tokens: None,
         }
     }
 }
@@ -571,8 +587,18 @@ impl crate::egress::PrivacyEventSink for TaintingPrivacySink {
     ) {
         if let Some(session_id) = &session_id {
             // One line per session, on the transition only — `mark` reports it.
-            if (self.taints)(&block.cause) && self.taint.mark(session_id, cause_of(&block)) {
-                eprintln!("{}", taint_pin_line(taint_cause_word(&block.cause)));
+            let cause = cause_of(&block);
+            if (self.taints)(&block.cause) && self.taint.mark(session_id, cause) {
+                eprintln!("{}", taint_pin_line(cause));
+                // REQ-614 BR-7. The stderr line above is the **daemon's** log,
+                // which the user does not read — that is exactly why the
+                // 2026-09-04 session was pinned for 65 turns with nobody the
+                // wiser. The event is what reaches the client, which renders it
+                // as a standing line whether or not `/verbose` is on.
+                self.events.publish(
+                    Some(session_id.clone()),
+                    Event::SessionPinned(session_pinned_payload(cause, self.local_budget_tokens)),
+                );
             }
         }
         self.events.privacy_block(session_id, block);
@@ -710,43 +736,58 @@ fn cause_of(block: &teton_protocol::events::PrivacyBlock) -> TaintCause {
     }
 }
 
-/// A `local-only` boundary was crossed — REQ-544 C-2's original cause.
-pub(super) const TAINT_BY_BOUNDARY: &str = "a `local-only` privacy boundary was crossed";
-/// The redaction scan found something in an outbound payload (REQ-562).
-pub(super) const TAINT_BY_REDACTION: &str =
-    "the redaction scan found sensitive content in an outbound payload";
-/// This turn's assembled context carried boundary or unknown-provenance content.
-pub(crate) const TAINT_BY_CONTEXT: &str = "this turn read boundary or unknown-provenance content";
-/// Unreachable: [`cause_taints_the_session`] and [`mcp_cause_taints_the_session`]
-/// both answer `false` for `ScanUnavailable`, so no announcement is ever minted
-/// for it. Present so the maps below are total, and worded so that a future
-/// change which *does* pin on it produces a puzzling line rather than a panic in
-/// the daemon.
-pub(super) const TAINT_BY_UNSTATED_CAUSE: &str = "a blocked outbound payload";
-
-pub(crate) fn taint_pin_line(cause: &'static str) -> String {
-    format!(
-        "tetond: privacy — this session is pinned to the local tier for the rest of its life \
-         ({cause}); remote providers will not be used in it again."
-    )
-}
-
-/// The class word a [`BlockCause`] announces its pin with.
-pub(super) fn taint_cause_word(cause: &BlockCause) -> &'static str {
-    match cause {
-        BlockCause::Boundary => TAINT_BY_BOUNDARY,
-        BlockCause::Redaction { .. } => TAINT_BY_REDACTION,
-        BlockCause::ScanUnavailable => TAINT_BY_UNSTATED_CAUSE,
+/// The daemon's own stderr line when a session is pinned.
+///
+/// **This is the daemon's log, not the user's notice** — which is exactly why
+/// the 2026-09-04 session ran 65 pinned turns with nobody the wiser. BR-7's
+/// user-facing line is the client's render of `session_pinned`.
+///
+/// REQ-614 replaced the three `TAINT_BY_*` word constants and the two maps that
+/// selected between them (`taint_cause_word`, `taint_detail_word`) with
+/// `TaintCause::as_str`. Three vocabularies for one fact is three places for
+/// the wording to drift; the cause is now the vocabulary.
+pub(crate) fn taint_pin_line(cause: TaintCause) -> String {
+    // REQ-614: two arms, because the old sentence — "for the rest of its life
+    // … remote providers will not be used in it again" — became **false** the
+    // moment one cause gained a lift. One composer with a `liftable` branch
+    // rather than two sentences in two places, which is what keeps the liftable
+    // arm from inheriting the permanent arm's claim as the wording drifts
+    // (LESSON-557).
+    if cause.liftable() {
+        format!(
+            "tetond: privacy — this session is pinned to the local tier because a shell \
+             result of unknown reach entered its context ({}); `/shell allow` lifts it if \
+             you know the command touched no protected file.",
+            cause.as_str()
+        )
+    } else {
+        format!(
+            "tetond: privacy — this session is pinned to the local tier for the rest of its \
+             life ({}); remote providers will not be used in it again.",
+            cause.as_str()
+        )
     }
 }
 
-/// The same word, from the turn path's [`BlockDetail`] vocabulary — the second
-/// spelling [`taints_the_session`] already exists in, for the same reason.
-pub(super) fn taint_detail_word(detail: BlockDetail) -> &'static str {
-    match detail {
-        BlockDetail::Boundary => TAINT_BY_BOUNDARY,
-        BlockDetail::Redaction => TAINT_BY_REDACTION,
-        BlockDetail::ScanUnavailable => TAINT_BY_UNSTATED_CAUSE,
+/// The `session_pinned` payload for a cause (REQ-614 BR-7).
+///
+/// One composer, so the event's `liftable` flag and its `remedy` cannot
+/// disagree with each other or with [`taint_pin_line`]: all three read
+/// `TaintCause::liftable`.
+pub(super) fn session_pinned_payload(
+    cause: TaintCause,
+    budget_tokens: Option<u64>,
+) -> teton_protocol::events::SessionPinned {
+    use teton_protocol::events::{PinRemedy, SessionPinned};
+    SessionPinned {
+        cause: cause.as_str().to_owned(),
+        liftable: cause.liftable(),
+        remedy: if cause.liftable() {
+            PinRemedy::Command("/shell allow".to_owned())
+        } else {
+            PinRemedy::None
+        },
+        budget_tokens,
     }
 }
 

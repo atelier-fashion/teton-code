@@ -120,10 +120,10 @@ pub(crate) struct Verdict {
     /// Why this verdict was reached. `&'static str`, so it cannot carry command
     /// text or file content (see the module docs).
     ///
-    /// Read by this module's tests today; TASK-396 renders it into the standing
-    /// pin line, which is the only reason it is a sentence rather than a bare
-    /// discriminant. The allow goes with that wiring.
-    #[allow(dead_code)]
+    /// Rendered on the daemon's stderr by `ShellTool::run` for any non-`Rooted`
+    /// verdict — the answer to "why did *that* command pin my session". It is a
+    /// sentence rather than a bare discriminant for that reason, and a
+    /// `&'static str` so logging it cannot leak what the command said.
     pub(crate) reason: &'static str,
 }
 

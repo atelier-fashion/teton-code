@@ -118,6 +118,18 @@ pub struct UiContext<'a> {
     pub skills: crate::slash::SkillSnapshot,
 }
 
+impl UiContext<'_> {
+    /// The cause pinning this session to the local tier, or `None` (REQ-614).
+    ///
+    /// Read from the session state the event stream folds into, so `/doctor`
+    /// answers from what the client was actually told rather than by asking the
+    /// daemon a second time — one fact, one source.
+    #[must_use]
+    pub fn pinned_cause(&self) -> Option<&str> {
+        self.state.pinned.as_deref()
+    }
+}
+
 /// The snapshot one `skills/list` reply becomes (REQ-585 ADR-2).
 ///
 /// Pure, and split out of [`Connection::refresh_skills`] for exactly one

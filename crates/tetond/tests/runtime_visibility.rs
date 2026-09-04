@@ -96,15 +96,19 @@ const MUST_BE_PRESENT: &[&str] = &[
 /// | item | reached from |
 /// |---|---|
 /// | `LOCAL_ENGINE_N_CTX_DEFAULT` | `egress/redact.rs`, `harness/budget.rs`, `harness/compact.rs` |
-/// | `TAINT_BY_CONTEXT`, `taint_pin_line` | `carry.rs` |
+/// | `taint_pin_line` | `carry.rs` |
 /// | `endpoint_query_names_a_credential` | `provider_recipes.rs`, `web_setup_catalog.rs` |
 ///
 /// `RenderedProviderSetup` was on this list and is not any more: see the module
 /// docs. Nothing outside `runtime/` names it, and the accessor that appeared to
 /// require it did not need crate reach either.
+/// `TAINT_BY_CONTEXT` was on this list until REQ-614 **deleted the constant**.
+/// It was one of three `TAINT_BY_*` words that `taint_pin_line` selected
+/// between; the cause is now the vocabulary (`TaintCause::as_str`), so there is
+/// one spelling instead of three that could drift. A narrowing would need a
+/// reason recorded here — a removal needs the item to be gone, and it is.
 const CRATE_WIDE: &[&str] = &[
     "LOCAL_ENGINE_N_CTX_DEFAULT",
-    "TAINT_BY_CONTEXT",
     "endpoint_query_names_a_credential",
     "taint_pin_line",
 ];

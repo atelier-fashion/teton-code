@@ -290,6 +290,21 @@ impl Tool for ShellTool {
             ctx.denied_prefixes().to_vec(),
             &command,
         );
+        // REQ-614: the classifier's content-free reason on the daemon's own
+        // stderr, for the case a user asks *why* a command they thought was
+        // harmless pinned their session. `&'static str` from a closed set, so
+        // this cannot print command text or file content (shell_provenance's
+        // module docs) — which is the only reason it is safe to log at all.
+        if verdict.kind != shell_provenance::VerdictKind::Rooted {
+            eprintln!(
+                "tetond: shell provenance — {} ({})",
+                match verdict.kind {
+                    shell_provenance::VerdictKind::BoundaryTouch => "boundary touch",
+                    _ => "unknown reach",
+                },
+                verdict.reason
+            );
+        }
         let provenance = match verdict.kind {
             shell_provenance::VerdictKind::Rooted => {
                 ToolProvenance::Sources(verdict.sources.clone())

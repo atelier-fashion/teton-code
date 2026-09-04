@@ -1,7 +1,7 @@
 ---
 id: TASK-396
 title: "The standing pin line and the doctor surfaces — the user finds out the session was pinned"
-status: draft
+status: complete
 parent: REQ-614
 created: 2026-09-04
 updated: 2026-09-04

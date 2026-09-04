@@ -27,7 +27,7 @@ use crate::harness::context::{
 use crate::harness::reply::prose_before_tool_call;
 use crate::harness::turn_loop::{append_repo_context, HarnessConfig};
 use crate::repo_context::RepoContextBlock;
-use crate::runtime::{context_taint_cause, taint_pin_line, SessionTaint, TAINT_BY_CONTEXT};
+use crate::runtime::{context_taint_cause, taint_pin_line, SessionTaint};
 use crate::sessions::SessionRegistry;
 
 /// One turn's [`ContextManager`], plus the promise to write what it holds back
@@ -522,7 +522,7 @@ impl CarriedTurn {
         // `unknown_shell`, the one cause `/shell allow` can lift.
         if let Some(cause) = context_taint_cause(&ctx, &self.boundaries) {
             if self.taint.try_mark(&self.session_id, cause) {
-                let _ = writeln!(std::io::stderr(), "{}", taint_pin_line(TAINT_BY_CONTEXT));
+                let _ = writeln!(std::io::stderr(), "{}", taint_pin_line(cause));
             }
         }
         // BR-4, at the seam that makes it an invariant of the store rather than

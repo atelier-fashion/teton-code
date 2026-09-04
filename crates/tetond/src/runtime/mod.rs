@@ -10969,30 +10969,37 @@ provider_id = "on-device"
             "and the announcement is per session, not per daemon"
         );
 
-        for cause in [TAINT_BY_BOUNDARY, TAINT_BY_REDACTION, TAINT_BY_CONTEXT] {
+        // REQ-614: the three `TAINT_BY_*` word constants and the two maps that
+        // selected between them are gone; `TaintCause` is the one vocabulary,
+        // so this iterates the causes themselves.
+        for cause in [
+            TaintCause::BoundaryHit,
+            TaintCause::RedactionFinding,
+            TaintCause::MalformedProvenance,
+            TaintCause::McpUntrusted,
+        ] {
             let line = taint_pin_line(cause);
             assert!(line.starts_with("tetond: "), "{line}");
             assert!(line.contains("pinned to the local tier"), "{line}");
-            assert!(line.contains(cause), "{line}");
+            assert!(line.contains(cause.as_str()), "{line}");
             // A class, never an instance: no session id, no path, no payload.
             assert!(!line.contains("s1"), "{line}");
             assert!(!line.contains('/'), "{line}");
+            // A permanent pin must not offer a remedy that would refuse it.
+            assert!(!line.contains("shell allow"), "{line}");
         }
 
-        // Both cause vocabularies map onto the same words, so the line does not
-        // depend on which side of the `teton-providers` seam the block arrived
-        // through.
-        assert_eq!(
-            taint_cause_word(&BlockCause::Boundary),
-            taint_detail_word(BlockDetail::Boundary)
+        // The liftable arm is the exception to the `/` rule above, and
+        // deliberately so: its whole job is to name the command. Asserted
+        // separately rather than by loosening the loop, so the permanent arms
+        // keep the stronger claim.
+        let liftable = taint_pin_line(TaintCause::UnknownShell);
+        assert!(liftable.contains("/shell allow"), "{liftable}");
+        assert!(
+            !liftable.contains("rest of its life"),
+            "a liftable pin must not claim permanence: {liftable}"
         );
-        assert_eq!(
-            taint_cause_word(&BlockCause::Redaction {
-                kind: teton_protocol::events::FindingKind::Credential,
-                span: teton_protocol::events::ByteSpan { start: 0, end: 4 },
-            }),
-            taint_detail_word(BlockDetail::Redaction)
-        );
+        assert!(!liftable.contains("s1"), "{liftable}");
     }
 
     #[test]

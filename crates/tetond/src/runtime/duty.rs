@@ -516,10 +516,20 @@ impl DaemonRuntime {
         // a turn error, so nothing above would ever mark the session. Marking at
         // the choke point makes the backstop direct rather than dependent on the
         // refusing content still being in `ctx` when the turn ends.
-        let sink = Arc::new(TaintingPrivacySink::for_turn_path(
-            events.clone(),
-            Arc::clone(&self.session_taint),
-        ));
+        // REQ-614 BR-7: the sink is told the local tier's budget so a
+        // `session_pinned` event can state what the session dropped to.
+        //
+        // Through `Router::budget_for(None)` — the **sanctioned accessor** —
+        // and not `budget::derive`. The first draft called `derive` here and
+        // `no_second_derivation_grew_elsewhere_in_the_daemon` refused it, which
+        // was the right call: a second derivation is a second budget that can
+        // disagree with the route's, and REQ-586's verify pass caught exactly
+        // that shape with `/verbose` naming a budget the turn was not running
+        // under. `None` is the local tier, which is the tier a pin serves.
+        let sink = Arc::new(
+            TaintingPrivacySink::for_turn_path(events.clone(), Arc::clone(&self.session_taint))
+                .with_local_budget(Some(router.budget_for(None).budget_tokens as u64)),
+        );
         let mut egress = Egress::new(transport, config.effective_boundaries(), sink)
             .with_cost_meter(Arc::new(self.ledger.clone()))
             // REQ-588 BR-1/ADR-6: the user's ceiling, when they set one. Absent

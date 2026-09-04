@@ -1674,7 +1674,7 @@ impl DaemonRuntime {
                     if taints_the_session(detail)
                         && self.session_taint.mark(tctx.core.session_id, backstop)
                     {
-                        eprintln!("{}", taint_pin_line(taint_detail_word(detail)));
+                        eprintln!("{}", taint_pin_line(backstop));
                     }
                     if !self.engine.present() {
                         break 'turn Err(RpcError::new(
