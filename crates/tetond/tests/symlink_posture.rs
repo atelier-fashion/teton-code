@@ -243,7 +243,7 @@ fn identities(outcome: &ToolOutcome) -> Vec<String> {
             .iter()
             .map(|id| ProvenanceId::as_str(id).to_owned())
             .collect(),
-        ToolProvenance::Unknown => {
+        ToolProvenance::Unknown | ToolProvenance::UnknownWith(_) => {
             panic!("a first-party file tool must never report unknown provenance")
         }
         // REQ-614: only `shell` produces this variant, and no `shell` outcome
