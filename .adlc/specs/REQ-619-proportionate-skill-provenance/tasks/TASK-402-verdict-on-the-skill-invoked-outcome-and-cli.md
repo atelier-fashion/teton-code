@@ -1,7 +1,7 @@
 ---
 id: TASK-402
 title: "The verdict rides `skill_invoked` additively, and the CLI renders a non-rooted reason under /verbose"
-status: draft
+status: complete
 parent: REQ-619
 created: 2026-09-05
 updated: 2026-09-05
