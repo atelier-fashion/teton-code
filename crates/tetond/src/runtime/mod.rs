@@ -3424,7 +3424,6 @@ impl DaemonRuntime {
     /// answer — the rows say nothing about an unbound tier's inherited fill, a
     /// provider that is down, or a remote provider that declares no model.
     #[must_use]
-    #[must_use]
     pub fn config_snapshot(&self) -> ConfigSnapshot {
         let config = self.config.lock().expect("config mutex poisoned");
         let router = build_router(
