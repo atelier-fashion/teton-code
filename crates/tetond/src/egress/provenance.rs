@@ -213,6 +213,27 @@ impl Provenance {
         self.unknown = true;
     }
 
+    /// The same provenance with its **opacity** lifted — `unknown` cleared —
+    /// and everything else kept (BUG-215, REQ-614 BR-4).
+    ///
+    /// This is what `/shell allow` asserts: *the command whose reach the daemon
+    /// could not prove touched no protected file*. It says nothing about the
+    /// sources the daemon **did** prove, so every minted id stays and is
+    /// matched against the boundary globs exactly as before — a `cat .env`
+    /// after a lift is still a `read` of `.env`. And it says nothing about a
+    /// [`boundary_touch`](Self::boundary_touch): that verdict *named* a
+    /// protected path (out of root, so there is no id to keep), and the
+    /// sentinel's `unknown` bit is what carries it, so a lift leaves that bit
+    /// alone. Only the opacity that has no path behind it is released.
+    #[must_use]
+    pub fn with_unknown_lifted(&self) -> Self {
+        Self {
+            sources: self.sources.clone(),
+            unknown: self.unknown && self.boundary_touch,
+            boundary_touch: self.boundary_touch,
+        }
+    }
+
     /// Whether any contributing content had indeterminate origin (fail-closed).
     #[must_use]
     pub fn is_unknown(&self) -> bool {
@@ -451,6 +472,48 @@ mod tests {
         assert!(assembled_provenance(&blocks).is_empty());
     }
 
+    /// **BUG-215.** A lift releases opacity and nothing else: the sources stay,
+    /// and a boundary-touch sentinel — a *named* protected path with no id —
+    /// keeps the `unknown` bit that carries it.
+    ///
+    /// Mutation: make `with_unknown_lifted` clear `unknown` unconditionally
+    /// and the boundary-touch assertion goes red; make it drop `sources` and
+    /// the first goes red.
+    #[test]
+    fn a_lift_releases_opacity_but_keeps_sources_and_a_boundary_touch() {
+        let mut opaque_read = Provenance::tainted_by(fixture_id("src/main.rs"));
+        opaque_read.mark_unknown();
+        let lifted = opaque_read.with_unknown_lifted();
+        assert!(!lifted.is_unknown(), "the opacity is released");
+        assert!(lifted.contains("src/main.rs"), "the source is kept");
+        assert!(!lifted.is_empty(), "…so egress still inspects it");
+
+        let plain = Provenance::unknown().with_unknown_lifted();
+        assert!(!plain.is_unknown());
+        assert!(
+            plain.is_empty(),
+            "opacity with nothing behind it lifts to nothing"
+        );
+
+        let touch = Provenance::boundary_touch().with_unknown_lifted();
+        assert!(touch.is_boundary_touch(), "a boundary touch is not opacity");
+        assert!(
+            touch.is_unknown(),
+            "and keeps the bit the inspector reads first"
+        );
+        assert_eq!(
+            touch,
+            Provenance::boundary_touch(),
+            "byte-identical: nothing lifted"
+        );
+
+        let clean = Provenance::tainted_by(fixture_id("README.md"));
+        assert_eq!(
+            clean.with_unknown_lifted(),
+            clean,
+            "nothing to lift, nothing changed"
+        );
+    }
     #[test]
     fn unknown_provenance_is_not_empty_so_egress_still_inspects_it() {
         // REQ-544 C-1: content of indeterminate origin (a shell result) must be

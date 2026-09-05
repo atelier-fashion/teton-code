@@ -1663,8 +1663,21 @@ impl DaemonRuntime {
                     // `BlockDetail` is `Copy` and carries no path, so the
                     // unknown/boundary distinction is not available here at all
                     // (conventions.md: a refusal message cannot ride a `Copy`
-                    // enum). AC-3's end-to-end lift test is what would catch a
-                    // regression in the ordering.
+                    // enum).
+                    //
+                    // **That ordering did not hold until BUG-214.** The sink is
+                    // installed in `run_one_attempt`, and until 2026-09-05 that
+                    // site handed `Egress::new` the bare bus, so this arm was
+                    // the *only* marker on a prompt turn: every turn-path pin
+                    // was `boundary_hit`, and no `session_pinned` was ever
+                    // published. `taint::shell_pin::the_prompt_turn_egress_installs_the_tainting_sink`
+                    // pins the wiring; the `e2e::shell_pin_shape` suite pins
+                    // the cause and the announcement end to end.
+                    //
+                    // **`mark`, never `mark_escalating`** (BUG-215). This arm
+                    // holds no path, so its `BoundaryHit` is a guess about
+                    // the class; letting it escalate turned every liftable
+                    // pin permanent one frame after the sink recorded it.
                     let backstop = match detail {
                         BlockDetail::Redaction => TaintCause::RedactionFinding,
                         BlockDetail::Boundary | BlockDetail::ScanUnavailable => {
@@ -3879,7 +3892,28 @@ impl DaemonRuntime {
         // to this endpoint's origin — never MCP, never another provider.
         let transport = build_remote_transport(provider_cfg, &self.secret_resolver)?;
         let boundaries = config.effective_boundaries();
-        let mut egress = Egress::new(transport, boundaries, events.clone())
+        // BUG-214 / REQ-614 BR-7: the **tainting** sink, not the bare bus. This
+        // is the choke point every prompt turn's remote send goes through, and
+        // it is the only place that sees the block's *path* — which is where
+        // the `unknown_shell` / `boundary_hit` distinction lives. With the
+        // plain `EventBus` here, the sole marker on a prompt turn was the
+        // backstop arm in `run_prompt_turn`, which holds a `Copy` detail with
+        // no path and so recorded every turn-path pin as permanent and
+        // published no `session_pinned` at all — the 2026-09-05 `/analyze`
+        // session: pinned for life, `/shell allow` refused, nothing said.
+        //
+        // Built exactly as `duty.rs` builds its sink — same constructor, same
+        // budget accessor — so the two choke points cannot disagree about a
+        // cause or about what the pin dropped the session to.
+        let sink = Arc::new(
+            TaintingPrivacySink::for_turn_path(events.clone(), Arc::clone(&self.session_taint))
+                .with_local_budget(Some(router.budget_for(None).budget_tokens as u64)),
+        );
+        let mut egress = Egress::new(transport, boundaries, sink)
+            // BUG-215: the user's `/shell allow` reaches the inspection through
+            // the same `RoutePin` `dispatch_route` reads, so "routed remote"
+            // and "sent remote" cannot come apart again.
+            .with_unknown_lift(Arc::new(self.route_pin()))
             .with_cost_meter(Arc::new(self.ledger.clone()))
             // REQ-588 BR-1/ADR-6: the user's ceiling, when they set one. Absent
             // leaves the choke point exactly as it was — no check, no pricing

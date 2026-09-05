@@ -126,13 +126,65 @@ impl SessionTaint {
     /// concern (`template_fallback_line`'s shape) rather than something this
     /// type performs.
     pub fn mark(&self, session: &SessionId, cause: TaintCause) -> bool {
-        // `or_insert` and not `insert`: the first cause wins, so a session
-        // pinned permanently by a boundary read cannot be downgraded to a
-        // liftable `unknown_shell` by a later opaque command.
+        // The first cause wins, so a session pinned permanently by a boundary
+        // read cannot be downgraded to a liftable `unknown_shell` by a later
+        // opaque command — and, since BUG-215, so that a caller that **cannot
+        // see the block's path** cannot upgrade a liftable pin either. The
+        // turn loop's backstop arm marks `BoundaryHit` for every boundary
+        // block because `BlockDetail` carries no path; letting it escalate
+        // turned every liftable pin permanent one frame after the sink
+        // recorded it. Escalation is [`mark_escalating`](Self::mark_escalating)'s,
+        // for writers that read the cause off the path.
         let mut tainted = self.tainted.lock().expect("taint mutex poisoned");
-        let before = tainted.len();
-        tainted.entry(session.clone()).or_insert(cause);
-        tainted.len() != before
+        Self::record(&mut tainted, session, cause, false)
+    }
+
+    /// [`mark`](Self::mark), plus the one upgrade a path-reading writer is
+    /// entitled to make (BUG-215).
+    ///
+    /// **The permanent cause wins, whichever order the two arrive in.** A
+    /// session pinned *liftably*, lifted, and then made to read a boundary
+    /// file is **escalated** to the permanent cause, and the escalation is
+    /// reported as `true` so the caller announces it — `RoutePin::pins` reads
+    /// the cause, so the lift stops applying at the route and at egress the
+    /// moment the cause stops being liftable. Without this, a lifted
+    /// session's later `cat .env` would keep the liftable cause, the route
+    /// would keep going remote, and every turn would pay a block and a
+    /// reroute for a file that must never leave.
+    ///
+    /// Only for callers whose cause came off a block's **path** — the egress
+    /// sink's `cause_of` and the carry seam's `context_taint_cause`. A caller
+    /// holding a path-less `BlockDetail` must use [`mark`](Self::mark).
+    pub(super) fn mark_escalating(&self, session: &SessionId, cause: TaintCause) -> bool {
+        let mut tainted = self.tainted.lock().expect("taint mutex poisoned");
+        Self::record(&mut tainted, session, cause, true)
+    }
+
+    /// The one write every `mark` variant performs, so they cannot come to
+    /// answer the same transition differently.
+    ///
+    /// A re-mark with the same class — permanent over permanent, liftable
+    /// over liftable — is `false` and writes nothing, which is what keeps the
+    /// announcement to one line per transition. A permanent cause over a
+    /// liftable one is a transition only when `escalate` is set; a liftable
+    /// cause over a permanent one never is.
+    fn record(
+        tainted: &mut HashMap<SessionId, TaintCause>,
+        session: &SessionId,
+        cause: TaintCause,
+        escalate: bool,
+    ) -> bool {
+        match tainted.get(session) {
+            None => {
+                tainted.insert(session.clone(), cause);
+                true
+            }
+            Some(existing) if escalate && existing.liftable() && !cause.liftable() => {
+                tainted.insert(session.clone(), cause);
+                true
+            }
+            Some(_) => false,
+        }
     }
 
     /// The same mark, on a path that must not panic (REQ-567 verify).
@@ -159,9 +211,10 @@ impl SessionTaint {
             Ok(tainted) => tainted,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let before = tainted.len();
-        tainted.entry(session.clone()).or_insert(cause);
-        tainted.len() != before
+        // Escalating, like the sink: the carry seam's cause comes off the
+        // blocked violation's path (`context_taint_cause`), so it is entitled
+        // to the upgrade a `BlockDetail`-holding caller is not (BUG-215).
+        Self::record(&mut tainted, session, cause, true)
     }
 
     /// Whether `session` is pinned to the local tier by a prior boundary/unknown
@@ -350,6 +403,17 @@ impl RoutePin {
     #[must_use]
     pub fn is_lifted(&self, session: &SessionId) -> bool {
         self.lifted.is_lifted(session)
+    }
+}
+
+/// The choke point's read of the lift (BUG-215): the **same** predicate the
+/// route reads, negated — a session is lifted at egress exactly when
+/// [`RoutePin::pins`] stops forcing it local, and for no other reason. One
+/// composer, so the route and the inspection cannot disagree about whether a
+/// lift is in force; the 2026-09-05 probe was the two disagreeing.
+impl crate::egress::UnknownLift for RoutePin {
+    fn unknown_lifted(&self, session: &SessionId) -> bool {
+        self.cause(session).is_some() && !self.pins(session)
     }
 }
 
@@ -588,7 +652,10 @@ impl crate::egress::PrivacyEventSink for TaintingPrivacySink {
         if let Some(session_id) = &session_id {
             // One line per session, on the transition only — `mark` reports it.
             let cause = cause_of(&block);
-            if (self.taints)(&block.cause) && self.taint.mark(session_id, cause) {
+            // `mark_escalating`: this cause came off the block's path, so a
+            // boundary read in a lifted session upgrades the pin to permanent
+            // here — and is announced again below (BUG-215).
+            if (self.taints)(&block.cause) && self.taint.mark_escalating(session_id, cause) {
                 eprintln!("{}", taint_pin_line(cause));
                 // REQ-614 BR-7. The stderr line above is the **daemon's** log,
                 // which the user does not read — that is exactly why the
@@ -2202,6 +2269,85 @@ mod shell_pin {
         assert!(route.pins(&s), "still permanently pinned");
     }
 
+    /// **BUG-215.** The converse transition: a liftable pin, lifted, then a
+    /// boundary read. The permanent cause **escalates** — reported as a
+    /// transition so it is announced — and the lift stops applying, at the
+    /// route and at egress alike, because both read the cause.
+    ///
+    /// Mutation: turn the escalation arm of `SessionTaint::record` into
+    /// `Some(_) => false` and this goes red at the `mark_escalating`
+    /// assertion; drop the `escalate &&` guard and it goes red one line
+    /// earlier, at the plain `mark` — which is the turn loop's path-less
+    /// backstop, and the reason the two are different methods (the first
+    /// draft let it escalate, and every liftable pin went permanent one frame
+    /// after the sink recorded it).
+    #[test]
+    fn a_boundary_read_after_a_lift_escalates_the_pin_to_permanent() {
+        use crate::egress::UnknownLift;
+        let (taint, lifted, route) = pin();
+        let s = SessionId::from("escalates");
+        assert!(taint.mark(&s, TaintCause::UnknownShell));
+        assert!(lifted.lift(&s));
+        assert!(!route.pins(&s), "lifted: routed by category");
+        assert!(route.unknown_lifted(&s), "lifted: egress releases opacity");
+
+        assert!(
+            !taint.mark(&s, TaintCause::BoundaryHit),
+            "a path-less `mark` never escalates: the backstop arm holds no path"
+        );
+        assert_eq!(taint.cause(&s), Some(TaintCause::UnknownShell));
+        assert!(route.unknown_lifted(&s), "…so the lift still applies");
+
+        assert!(
+            taint.mark_escalating(&s, TaintCause::BoundaryHit),
+            "a permanent cause over a liftable one is a transition for a path-reading writer"
+        );
+        assert_eq!(taint.cause(&s), Some(TaintCause::BoundaryHit));
+        assert!(route.pins(&s), "the lift no longer applies to the route");
+        assert!(
+            !route.unknown_lifted(&s),
+            "…nor to the inspection: the lifted set is not consulted for a permanent cause"
+        );
+        assert!(
+            !taint.mark(&s, TaintCause::BoundaryHit),
+            "permanent over permanent is a re-mark"
+        );
+        assert!(
+            !taint.mark(&s, TaintCause::UnknownShell),
+            "and it still cannot be downgraded"
+        );
+    }
+
+    /// The egress view answers `true` only for a lifted, liftable pin — never
+    /// for an unpinned session (nothing to lift), never for a lifted-but-
+    /// permanent one (BR-3's "no lift exists for this cause").
+    #[test]
+    fn the_egress_lift_view_is_the_route_predicate_negated() {
+        use crate::egress::UnknownLift;
+        let (taint, lifted, route) = pin();
+        let clean = SessionId::from("clean");
+        assert!(!route.unknown_lifted(&clean), "unpinned: nothing to lift");
+        lifted.lift(&clean);
+        assert!(
+            !route.unknown_lifted(&clean),
+            "a lift on an unpinned session releases nothing"
+        );
+
+        let liftable = SessionId::from("liftable");
+        taint.mark(&liftable, TaintCause::UnknownShell);
+        assert!(!route.unknown_lifted(&liftable), "pinned, not yet lifted");
+        lifted.lift(&liftable);
+        assert!(route.unknown_lifted(&liftable), "pinned and lifted");
+
+        let permanent = SessionId::from("permanent");
+        taint.mark(&permanent, TaintCause::BoundaryHit);
+        lifted.lift(&permanent);
+        assert!(
+            !route.unknown_lifted(&permanent),
+            "BR-3: no lift exists for this cause"
+        );
+    }
+
     /// BR-4's remedy sentence, and the permanent arm's refusal to make it.
     #[test]
     fn an_unknown_shell_pin_names_its_remedy() {
@@ -2281,6 +2427,92 @@ mod shell_pin {
             !source.contains("pub fn lift(&self, session: &SessionId)"),
             "a `pub fn lift` is reachable from `crate::harness::tools`, where a \
              model's tool call lands"
+        );
+    }
+
+    /// **BUG-214.** Every session-scoped remote choke point is built on the
+    /// tainting sink, so the cause a pin records is read off the block's path
+    /// at the one place that has it.
+    ///
+    /// Until 2026-09-05 the prompt turn's `Egress::new` in `run_one_attempt`
+    /// took the bare `EventBus`. The bus publishes `privacy_block` and nothing
+    /// else, so the only marker on a prompt turn was the backstop arm in
+    /// `run_prompt_turn` — which holds a `Copy` `BlockDetail` with no path and
+    /// therefore recorded **every** turn-path pin as `boundary_hit`, and
+    /// published no `session_pinned`. A `/analyze` that never ran a `shell`
+    /// tool pinned a session for life, `/shell allow` was refused naming a
+    /// boundary nothing had crossed, and the client printed no pin line.
+    ///
+    /// Asserted on the source, as [`every_pinned_route_site_reads_the_composed_predicate`]
+    /// is: the property is *which sink a constructor was handed*, and no
+    /// behavioural test in this crate can hold a reference to the sink the
+    /// daemon built for a turn. `e2e::shell_pin_shape` is the behavioural half.
+    ///
+    /// Mutation record (run 2026-09-05): restoring `Egress::new(transport,
+    /// boundaries, events.clone())` at the prompt-turn site turns exactly this
+    /// test red in this module, and in the e2e binary turns
+    /// `an_opaque_shell_result_pins_with_unknown_shell_and_says_so` and
+    /// `a_typed_user_skill_pins_liftably_and_is_announced` red (no
+    /// `session_pinned` arrives) while the `Rooted` control
+    /// `a_rooted_shell_result_pins_nothing_and_the_next_send_leaves` stays
+    /// green — which is the benign path the fix must not disturb.
+    #[test]
+    fn the_prompt_turn_egress_installs_the_tainting_sink() {
+        let turn = include_str!("turn.rs");
+        let turn = &turn[..turn.find("\n#[cfg(test)]").unwrap_or(turn.len())];
+        let duty = include_str!("duty.rs");
+        let duty = &duty[..duty.find("\n#[cfg(test)]").unwrap_or(duty.len())];
+
+        // Floors (BUG-159): a corpus that stopped containing the subject would
+        // satisfy the prohibition vacuously.
+        assert!(
+            turn.contains("fn run_one_attempt("),
+            "turn.rs is not the file this scans"
+        );
+        assert!(
+            turn.contains("Egress::new(transport, boundaries, sink)"),
+            "the prompt turn no longer builds its choke point where this looks"
+        );
+
+        for (name, text) in [("turn.rs", turn), ("duty.rs", duty)] {
+            assert!(
+                !text.contains("Egress::new(transport, boundaries, events.clone())")
+                    && !text.contains(
+                        "Egress::new(transport, config.effective_boundaries(), events.clone())"
+                    ),
+                "{name} hands a session-scoped choke point the bare bus: a block \
+                 there records no cause off its path and publishes no `session_pinned`"
+            );
+            assert!(
+                text.contains("TaintingPrivacySink::for_turn_path("),
+                "{name} must build its choke point on the tainting sink"
+            );
+        }
+
+        // BUG-215: both choke points also let the user's `/shell allow` reach
+        // the inspection, through the same `RoutePin` the route reads.
+        for (name, text) in [("turn.rs", turn), ("duty.rs", duty)] {
+            assert_eq!(
+                text.matches(".with_unknown_lift(Arc::new(self.route_pin()))")
+                    .count(),
+                1,
+                "{name} must hand its choke point the route pin as the lift view, or a \
+                 lifted session is routed remote and blocked at egress on every turn"
+            );
+        }
+
+        // The two choke points read the *same* budget for `session_pinned`, so
+        // the number a pin announces cannot depend on which path pinned.
+        let budget_read = "with_local_budget(Some(router.budget_for(None).budget_tokens as u64))";
+        assert_eq!(
+            turn.matches(budget_read).count(),
+            1,
+            "the prompt-turn sink must read the local budget through `Router::budget_for(None)`"
+        );
+        assert_eq!(
+            duty.matches(budget_read).count(),
+            1,
+            "the duty sink must read the local budget through `Router::budget_for(None)`"
         );
     }
 }

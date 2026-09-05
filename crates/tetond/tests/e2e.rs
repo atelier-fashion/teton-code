@@ -40,6 +40,13 @@
 //!   permission level (AC-10's daemon half) — asserted by what a `read` under
 //!   the old and the new root hands the model, in the bytes a mock provider
 //!   received.
+//! - [`shell_pin_shape`] — REQ-614 TASK-397 / BUG-214: what a prompt-turn pin
+//!   *records and announces*. An opaque `shell` result pins with the liftable
+//!   `unknown_shell` cause, `session_pinned` precedes the pinned local route,
+//!   `/shell allow` lifts it once; a `Rooted` result pins nothing and its next
+//!   send leaves; a typed user skill pins on its first send, liftably, and says
+//!   so. All asserted on what a client received from the real daemon, because
+//!   the in-process sink tests were green while the daemon never built the sink.
 
 // The suite lives under `tests/e2e/`; `#[path]` keeps that layout while this
 // top-level file remains the integration-test binary Cargo compiles.
@@ -63,3 +70,5 @@ mod privacy_fixes;
 mod routing_categories;
 #[path = "e2e/session_root.rs"]
 mod session_root;
+#[path = "e2e/shell_pin_shape.rs"]
+mod shell_pin_shape;
