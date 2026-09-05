@@ -212,7 +212,7 @@ use crate::router::{
 use crate::selection_store::SelectionStore;
 use crate::session_root::{home, ProbedRoot};
 use crate::sessions::{validate_session_cwd, GenerationState, SessionRegistry, TurnClaimError};
-use crate::skills::dynamic::{closed_door, door_outcome, outcome_view};
+use crate::skills::dynamic::{closed_door, door_outcome, outcome_view_unclassified};
 use crate::skills::{DynamicOutcome, Expansion, Pending, SkillRegistry, SkillSource};
 // REQ-611: the sink is constructed here (`from_env`), and the two hand-offs the
 // runtime owns — a session's creation and a permission answer — are methods on
@@ -22148,7 +22148,7 @@ provider_id = \"deepseek\"
             let never_started = crate::skills::DynamicOutcome::could_not_start();
 
             // No door: consent was given and the machine could not carry it out.
-            let view = outcome_view(&command, &never_started, None);
+            let view = outcome_view_unclassified(&command, &never_started, None);
             assert!(
                 matches!(
                     view.outcome,
@@ -22164,7 +22164,7 @@ provider_id = \"deepseek\"
             // arm above is reached by the *absence* of one, not by the outcome
             // kind alone.
             let declined = crate::skills::DynamicOutcome::declined();
-            let view = outcome_view(&command, &declined, Some(NotRunReason::Declined));
+            let view = outcome_view_unclassified(&command, &declined, Some(NotRunReason::Declined));
             assert!(
                 matches!(
                     view.outcome,

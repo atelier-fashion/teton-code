@@ -79,8 +79,10 @@ use super::super::render;
 use super::{ResultDisposition, Tool, ToolContext, ToolOutcome, ToolRegistry};
 use crate::grants::ConnectionId;
 use crate::session_root::home;
-use crate::skills::dynamic::{closed_door, door_outcome, outcome_view};
-use crate::skills::{expand, run_all, Skill, SkillRegistry, SkillSource};
+use crate::skills::dynamic::{
+    closed_door, door_outcome, outcome_view_unclassified, run_all_unclassified,
+};
+use crate::skills::{expand, Skill, SkillRegistry, SkillSource};
 
 /// The name the model calls this tool by.
 ///
@@ -1996,9 +1998,11 @@ impl SkillTool {
                 // On the blocking pool: `run_all` waits on a child process for
                 // up to the deadline, per command, and a turn that parked an
                 // async worker that long would stall every other session on it.
-                tokio::task::spawn_blocking(move || run_all(&root, &to_run, timeout_ms))
-                    .await
-                    .expect("the dynamic-context runner does not panic")
+                tokio::task::spawn_blocking(move || {
+                    run_all_unclassified(&root, &to_run, timeout_ms)
+                })
+                .await
+                .expect("the dynamic-context runner does not panic")
             }
             None => Vec::new(),
             // One closed door is the same answer for every command, because the
@@ -2125,7 +2129,7 @@ impl SkillTool {
                 outcomes: commands
                     .iter()
                     .zip(outcomes.iter())
-                    .map(|(command, outcome)| outcome_view(command, outcome, door))
+                    .map(|(command, outcome)| outcome_view_unclassified(command, outcome, door))
                     .collect(),
                 invoked_by: InvokedBy::Model,
                 // The caller's reading, passed in. `expand_and_fold` asks the

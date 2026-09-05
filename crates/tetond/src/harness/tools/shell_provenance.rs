@@ -11,6 +11,16 @@
 //! answers it from the command's resolved cwd and its path arguments alone,
 //! never from the command's output and never from its exit status.
 //!
+//! # Two consumers, one grammar
+//!
+//! [`classify`] has a second caller since REQ-619: `skills::dynamic::run_all`,
+//! which runs a skill's `` !`cmd` `` preambles. It asks the same question of
+//! the same command text, with the session root as cwd, once per command and
+//! before that command spawns (ADR-619-1) — so a `cat` typed by the model
+//! through `shell` and the same `cat` written into a skill body cannot reach
+//! different answers. Nothing in the grammar below is skill-aware; the second
+//! consumer supplies the same four inputs the first one does.
+//!
 //! # The default is `Unknown`, and that is the whole design (ADR-614-1)
 //!
 //! REQ-614 BR-1(e) reads like a denylist: a set of opaque verbs (`sh -c`,
@@ -97,8 +107,13 @@ const SCAN_BUDGET: WalkBudget = WalkBudget {
 };
 
 /// What the daemon could prove about a command's reach.
+///
+/// `pub` rather than `pub(crate)` since REQ-619: `skills::dynamic::run_all` is
+/// `pub` (the `skills` module is reached from outside the harness) and returns
+/// a `PreambleRun` carrying one of these, so the type has to be as reachable as
+/// the function that hands it out. The grammar itself is unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum VerdictKind {
+pub enum VerdictKind {
     /// Every token was recognised and every path it names resolved under the
     /// session root without touching a boundary.
     Rooted,
@@ -110,13 +125,18 @@ pub(crate) enum VerdictKind {
     Unknown,
 }
 
-/// A classification of one `shell` invocation.
+/// A classification of one `shell` invocation — or, since REQ-619, of one
+/// skill preamble command.
+///
+/// `pub` for the reason [`VerdictKind`] is: it rides out of
+/// `skills::dynamic::run_all` on a `PreambleRun`.
 #[derive(Debug, Clone)]
-pub(crate) struct Verdict {
-    pub(crate) kind: VerdictKind,
+pub struct Verdict {
+    /// What was proved.
+    pub kind: VerdictKind,
     /// The repo-relative canonical ids of every path argument that resolved
     /// inside the session root. Empty for every kind but [`VerdictKind::Rooted`].
-    pub(crate) sources: BTreeSet<ProvenanceId>,
+    pub sources: BTreeSet<ProvenanceId>,
     /// Why this verdict was reached. `&'static str`, so it cannot carry command
     /// text or file content (see the module docs).
     ///
@@ -124,7 +144,7 @@ pub(crate) struct Verdict {
     /// verdict — the answer to "why did *that* command pin my session". It is a
     /// sentence rather than a bare discriminant for that reason, and a
     /// `&'static str` so logging it cannot leak what the command said.
-    pub(crate) reason: &'static str,
+    pub reason: &'static str,
 }
 
 impl Verdict {
