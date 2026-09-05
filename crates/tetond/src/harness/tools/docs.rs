@@ -646,13 +646,19 @@ mod tests {
         );
     }
 
-    /// **AC-16, fourth passage: BR-10's provenance is two rules, not one.**
+    /// **AC-16, fourth passage: two provenance rules, and REQ-619 rewrote the
+    /// second one.**
     ///
-    /// REQ-585 ADR-9 refused to widen the id minter, so a project skill and a
-    /// user skill pin a turn by different rules — and the second is stricter
-    /// than a `read` of the same bytes. The consequence for a model invocation
-    /// on a boundary-configured machine is the part BR-10 says to state plainly
-    /// rather than leave to be discovered in a runbook.
+    /// REQ-587 BR-10 shipped this passage saying a user skill is `Unknown` and
+    /// pins wherever any boundary is configured — stricter than a `read` of the
+    /// same bytes, and, once REQ-597 put thirteen builtin globs permanently in
+    /// force, a pin on every repo-rooted session on every machine (BUG-214).
+    /// REQ-619 BR-3/BR-6 retires that clause: a user skill mints a `~`-scoped
+    /// identity and is judged by the same globs as a project skill, and BR-1
+    /// gives each `` !`cmd` `` the `shell` classifier's verdict. **The needles
+    /// moved with the rule**, and the stale-claim check is the half that matters
+    /// — a topic still promising the old rule tells a model the opposite of what
+    /// this binary does.
     #[test]
     fn the_skills_topic_states_both_provenance_rules() {
         let topic = skills_topic();
@@ -661,6 +667,19 @@ mod tests {
             "the stricter unknown rule",
             "the pre-BR-10 paragraph folded both rules into one clause about a typed \
              `/name`, and said nothing about a model invocation",
+        );
+        assert_no_stale_claim(
+            &topic,
+            "block is `Unknown` and pins the turn wherever any boundary is configured",
+            "REQ-619 BR-3 gives a user skill a `~`-scoped identity, so it is judged by \
+             the globs that name it and by no others — a topic still saying otherwise \
+             tells a model its own skills always run local",
+        );
+        assert_no_stale_claim(
+            &topic,
+            "Dynamic output is `Unknown`, like all shell output",
+            "REQ-619 BR-1 classifies every preamble before it spawns, exactly as \
+             REQ-614 classifies a `shell` command",
         );
         assert_states(
             &topic,
@@ -675,15 +694,22 @@ mod tests {
         );
         assert_states(
             &topic,
-            "block is `Unknown` and pins the turn wherever any boundary is configured",
-            "rule two: a user skill has no root-relative identity, so it is `Unknown` and \
-             pins wherever any boundary is set — related to it or not (BR-10)",
+            "mints a `~`-scoped one",
+            "rule two, as REQ-619 BR-3 rewrote it: a user skill has an identity of its \
+             own scope, so it routes like a project skill and is refused only by a glob \
+             that names it",
         );
         assert_states(
             &topic,
-            "a model invocation of a `~/.claude` skill runs local",
-            "the consequence of rule two for the seventeen `~/.claude` skills, which is \
-             what a runbook would otherwise discover the hard way (BR-10)",
+            "Each `` !`cmd` `` is classified before it runs",
+            "REQ-619 BR-1: a preamble gets the `shell` grammar's verdict from the \
+             command text, before the spawn — not from whether anything spawned",
+        );
+        assert_states(
+            &topic,
+            "`/shell allow`",
+            "REQ-619 BR-8: an unprovable preamble pins liftably, and the topic names \
+             the remedy rather than leaving a user pinned with no way out (BUG-214)",
         );
     }
 

@@ -825,6 +825,7 @@ async fn the_marker_names_the_routes_window_when_the_turn_is_seeded_by_carried_t
         "review this paste".to_owned(),
         std::collections::BTreeSet::new(),
         false,
+        false,
         // No notes in this fixture, so a reroute has nothing to re-render.
         None,
     );

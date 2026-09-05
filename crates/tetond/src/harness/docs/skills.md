@@ -64,7 +64,7 @@ shown; `plan` does not run them, `full` does.
 
 Commands run in order, session root as cwd, under `shell`'s jail, timeout and
 output cap. One that did not run leaves ``[dynamic context not run: `cmd` —
-reason]``.
+reason]`` and contributes no provenance.
 
 ## Carried whole or refused
 
@@ -76,11 +76,19 @@ and the bound. The remedy is a route with a bigger window.
 ## Provenance
 
 Two rules. A **project** skill mints a root-relative source and pins the turn
-as reading it would. A **user** skill (`~/.claude/…`) has no such identity: its
-block is `Unknown` and pins the turn wherever **any** boundary is configured.
-Dynamic output is `Unknown`, like all shell output. So under a boundary a model
-invocation of a `~/.claude` skill runs local, and one over the local budget is
-refused there.
+as reading it would. A **user** skill (`~/.claude/…`) mints a `~`-scoped one —
+`~/.claude/skills/x/SKILL.md` — matched against the boundary globs the same
+way, so it routes like a project skill and is refused **naming its own file**
+under a glob covering your skills directory. Neither is stricter than a `read`
+of the same bytes.
+
+Each `` !`cmd` `` is classified before it runs, exactly as a `shell` command is:
+proved in-root, boundary-touching, or unprovable. A rooted one contributes the
+files it named; a boundary one pins the session permanently; an unprovable one
+(`sh`, an interpreter, a spelling the grammar does not model) pins it liftably —
+`/shell allow`. Output and exit status change nothing. `/verbose` prints a
+`reach:` line under each non-rooted command, so a four-command skill says which
+one pinned the session.
 
 ## Fidelity
 

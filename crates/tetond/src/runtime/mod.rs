@@ -212,8 +212,8 @@ use crate::router::{
 use crate::selection_store::SelectionStore;
 use crate::session_root::{home, ProbedRoot};
 use crate::sessions::{validate_session_cwd, GenerationState, SessionRegistry, TurnClaimError};
-use crate::skills::dynamic::{closed_door, door_outcome, outcome_view};
-use crate::skills::{DynamicOutcome, Expansion, Pending, SkillRegistry, SkillSource};
+use crate::skills::dynamic::{closed_door, door_outcome, outcome_view, preamble_verdict, Reach};
+use crate::skills::{Expansion, Pending, SkillRegistry, SkillSource};
 // REQ-611: the sink is constructed here (`from_env`), and the two hand-offs the
 // runtime owns — a session's creation and a permission answer — are methods on
 // this impl.
@@ -1406,15 +1406,45 @@ struct SkillTurn {
     /// carried rather than assumed, because that is a fact about *this* build's
     /// resolution and not a property of the field.
     user_invocable: bool,
-    /// The skill file's identity, for the seeded user block (BR-7, ADR-9). A
-    /// project skill is under the root and mints cleanly.
+    /// The skill **file's** own identity, as `skills::provenance_of` minted it
+    /// — repo-relative for a project skill, `~`-scoped for a user one (REQ-619
+    /// BR-3), and `None` for a file under neither root.
+    ///
+    /// Kept beside the three folded fields below because it is their *input*,
+    /// not a fourth answer: the preamble seam re-folds
+    /// `fold_expansion(identity, &runs)` once the commands have run, and
+    /// recovering the identity by picking a member out of `sources` would be a
+    /// second reading that stops being right the first time a rooted preamble
+    /// adds an id of its own.
+    identity: Option<ProvenanceId>,
+    /// Every identity the seeded user block may name: the file's own, plus each
+    /// rooted preamble's resolved path arguments (REQ-619 ADR-619-4). The
+    /// output of `skills::provenance::fold_expansion`, never assembled here.
     sources: BTreeSet<ProvenanceId>,
-    /// Set when the file has no root-relative identity to mint — a **user**
-    /// skill outside the session root, which `ProvenanceId::from_resolved`
-    /// refuses by design (REQ-571 ADR-B). The block then fails closed wherever a
-    /// boundary is configured, exactly as `shell` output does, which is stricter
-    /// than BR-7's letter and right in the charter's direction (ADR-9).
+    /// Set when something this expansion carries cannot be proved: the file had
+    /// no identity to mint (a daemon with no `HOME`, a skills root symlinked out
+    /// of it), or a preamble that ran was `Unknown` — an opaque verb, a
+    /// substitution, a spelling REQ-614's grammar does not model.
+    ///
+    /// The block then fails closed wherever a boundary is configured, exactly as
+    /// `shell` output does, and `/shell allow` lifts it (REQ-614 BR-5).
+    ///
+    /// **REQ-619 retired the two readings that used to set this**: a user skill
+    /// is no longer unknown for being a user skill (BR-3), and a preamble no
+    /// longer sets it merely by having spawned (BR-1/BR-2).
     unknown: bool,
+    /// Set when a preamble this expansion carries named a boundary file
+    /// **outside** the session root — a path that mints no id for `sources` to
+    /// hold, so only a bit can carry it (REQ-619 BR-2, ADR-619-2).
+    ///
+    /// Refuses the turn exactly as `unknown` does; what it adds is the pin's
+    /// cause, and so its permanence: `/shell allow` lifts an unprovable
+    /// preamble and never a boundary touch.
+    ///
+    /// Written by the preamble seam out of the same fold the two fields above
+    /// come from, so the three are one answer rather than three assignments
+    /// that agree today.
+    boundary_touch: bool,
 }
 
 /// What one of BR-8's two budget stages decided about a **typed** skill turn
@@ -2521,7 +2551,9 @@ impl DaemonRuntime {
     /// the same way here as in a config file, and using it on a test that is
     /// genuinely about egress would delete the coverage REQ-597 exists to add.
     /// The interaction itself is pinned by
-    /// `skill_turn::a_skill_that_ran_a_command_is_pinned_by_the_default_boundaries`.
+    /// `skill_turn::an_opaque_preamble_is_pinned_by_the_default_boundaries_and_a_rooted_one_is_not`
+    /// (REQ-619 renamed it: a preamble now pins for being *unprovable* rather
+    /// than for having spawned, and the test grew the leg that says so).
     #[must_use]
     pub fn with_default_boundaries_disabled(self) -> Self {
         self.config
@@ -7988,10 +8020,10 @@ fn health_record_after_failure(class: FailureClass, now: Instant) -> Option<Heal
     }
 }
 
-/// The egress [`Provenance`] of a skill expansion, from the two values
-/// [`SkillTurn`] carries (REQ-587 BR-10, ADR-8).
+/// The egress [`Provenance`] of a skill expansion, from the three values
+/// [`SkillTurn`] carries (REQ-587 BR-10, ADR-8; REQ-619 ADR-619-2).
 ///
-/// The pair — a minted id set and a fail-closed bit — is the shape
+/// The triple — a minted id set and two fail-closed bits — is the shape
 /// `ContextManager::push_user_from` takes, because that is how the *seed* block
 /// records where a turn's text came from. A **duty** does not push a block; it
 /// sends a string, and the choke point in front of it wants a `Provenance`. This
@@ -7999,17 +8031,30 @@ fn health_record_after_failure(class: FailureClass, now: Instant) -> Option<Heal
 /// describe one string two ways.
 ///
 /// A **project** skill mints one id and is compared against the boundary globs
-/// like any `read`. A **user** skill has no repo-relative identity, arrives with
-/// `unknown` set, and is refused wherever any boundary is configured — stricter
-/// than a `read` of the same bytes, which is BR-10's stated consequence and not
-/// an accident of this function.
-fn expansion_provenance(sources: &BTreeSet<ProvenanceId>, unknown: bool) -> Provenance {
+/// like any `read`. A skill file with no identity to mint arrives with `unknown`
+/// set and is refused wherever any boundary is configured.
+///
+/// `boundary_touch` is rendered through [`Provenance::boundary_touch`] rather
+/// than through a second [`Provenance::mark_unknown`], and the difference is the
+/// whole point of the bit: both refuse the send, but only the boundary form
+/// reports `<boundary-touch>` as the path, and `taint::cause_of` reads that path
+/// to decide the pin is permanent rather than liftable by `/shell allow`
+/// (REQ-614 ADR-614-3). Merged, so a skill file's own ids are still named
+/// beside it.
+fn expansion_provenance(
+    sources: &BTreeSet<ProvenanceId>,
+    unknown: bool,
+    boundary_touch: bool,
+) -> Provenance {
     let mut provenance = Provenance::empty();
     for id in sources {
         provenance.merge(&Provenance::tainted_by(id.clone()));
     }
     if unknown {
         provenance.mark_unknown();
+    }
+    if boundary_touch {
+        provenance.merge(&Provenance::boundary_touch());
     }
     provenance
 }
@@ -17525,6 +17570,7 @@ provider_id = \"deepseek\"
                     prompt.to_owned(),
                     std::collections::BTreeSet::new(),
                     false,
+                    false,
                     // No notes in this fixture, so a reroute has nothing to re-render.
                     None,
                 )
@@ -20567,6 +20613,7 @@ provider_id = \"deepseek\"
                 "the opening prompt",
                 std::collections::BTreeSet::new(),
                 false,
+                false,
                 // No notes in this fixture, so a reroute has nothing to re-render.
                 None,
             );
@@ -22140,12 +22187,32 @@ provider_id = \"deepseek\"
     /// a refusal nobody made.
     mod a_command_that_could_not_start {
         use super::*;
+        use crate::harness::tools::{Verdict, VerdictKind};
+        use crate::skills::dynamic::PreambleRun;
         use teton_protocol::events::{DynamicOutcome as WireDynamicOutcome, NotRunReason};
+
+        /// The command's outcome paired with the verdict every command carries
+        /// since REQ-619 ADR-619-1.
+        ///
+        /// The kind is `Unknown` because that is what the classifier answers
+        /// for an unrecognised verb, and it is irrelevant to this claim: the
+        /// subject is which `NotRun` **reason** the projection reports, and the
+        /// reach rides beside it additively.
+        fn run(outcome: crate::skills::DynamicOutcome) -> PreambleRun {
+            PreambleRun {
+                verdict: Verdict {
+                    kind: VerdictKind::Unknown,
+                    sources: std::collections::BTreeSet::new(),
+                    reason: "fixture",
+                },
+                outcome,
+            }
+        }
 
         #[test]
         fn is_not_a_closed_door_and_is_not_a_failure() {
             let command = crate::skills::Command::new("definitely-not-a-program");
-            let never_started = crate::skills::DynamicOutcome::could_not_start();
+            let never_started = run(crate::skills::DynamicOutcome::could_not_start());
 
             // No door: consent was given and the machine could not carry it out.
             let view = outcome_view(&command, &never_started, None);
@@ -22163,7 +22230,7 @@ provider_id = \"deepseek\"
             // The control: with a door, the door is what is reported — so the
             // arm above is reached by the *absence* of one, not by the outcome
             // kind alone.
-            let declined = crate::skills::DynamicOutcome::declined();
+            let declined = run(crate::skills::DynamicOutcome::declined());
             let view = outcome_view(&command, &declined, Some(NotRunReason::Declined));
             assert!(
                 matches!(

@@ -531,6 +531,33 @@ impl Workspace {
         std::fs::read_to_string(self.repo.join(rel)).unwrap()
     }
 
+    /// Plant a **user** skill at `<root>/home/.claude/skills/<name>/SKILL.md`
+    /// and return the fixture HOME to hand the daemon (REQ-619).
+    ///
+    /// A user skill is one discovered under the daemon's `$HOME`, on a root the
+    /// session's repository is not under, so a test that wants one has to give
+    /// the daemon a home of its own —
+    /// `Daemon::spawn(&ws, opts.env("HOME", home.display().to_string()))`. The
+    /// HOME comes back rather than being read off the workspace, because
+    /// forgetting to pass it turns every claim here into a claim about a skill
+    /// that was never discovered.
+    ///
+    /// `body` is the file's Markdown, frontmatter excluded: this writes the
+    /// `description` key (the one REQ-585 requires) and nothing else, so a body
+    /// carrying `` !`cmd` `` preambles reads exactly as an author wrote it.
+    /// Discovery runs at `session/create`, so call this **before** the session.
+    pub fn user_skill(&self, name: &str, body: &str) -> PathBuf {
+        let home = self.root.join("home");
+        let dir = home.join(".claude").join("skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\ndescription: the {name} fixture skill\n---\n\n{body}"),
+        )
+        .unwrap();
+        home
+    }
+
     /// Write a model-catalog TOML and return its path (`TETON_CATALOG`).
     pub fn write_catalog(&self, toml: &str) -> PathBuf {
         let path = self.root.join("catalog.toml");
@@ -1198,6 +1225,25 @@ impl Client {
             json!({
                 "session_id": session_id,
                 "prompt": [{ "type": "text", "text": text }],
+            }),
+        )
+    }
+
+    /// Submit a **typed skill** turn — what `/name <args>` sends — and return
+    /// the full response object (REQ-585, REQ-619).
+    ///
+    /// The prompt array is empty and the invocation rides the `skill` key: the
+    /// daemon expands the file itself, so a test that spelled the body into a
+    /// text prompt would be asserting about bytes it wrote rather than about
+    /// bytes the expander produced. `raw_arguments` is the rest of the typed
+    /// line, verbatim and unsplit — empty for a skill that takes none.
+    pub fn skill(&mut self, session_id: &str, name: &str, raw_arguments: &str) -> Value {
+        self.call(
+            "session/prompt",
+            json!({
+                "session_id": session_id,
+                "prompt": [],
+                "skill": { "name": name, "raw_arguments": raw_arguments },
             }),
         )
     }

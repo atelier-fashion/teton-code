@@ -229,6 +229,96 @@ mod tests {
         assert!(m.match_path("../secrets/x").is_none());
     }
 
+    /// **REQ-619 BR-3 / ADR-619-3 — the claim the `~` scope rests on, pinned
+    /// against the real `globset` rather than reasoned about.**
+    ///
+    /// ADR-619-3 chose the ordinary path spelling (`~/.claude/skills/x/SKILL.md`)
+    /// for a user skill's identity instead of inventing a glob language for the
+    /// user scope, and that choice is only sound if two things are true of this
+    /// matcher, neither of which is obvious by inspection:
+    ///
+    /// 1. `~` is an ordinary character to `globset`, and every builtin is
+    ///    `**/`-prefixed (matching zero or more leading directories), so a user
+    ///    who writes `**/.claude/skills/**` covers their skills directory and
+    ///    `**/.ssh/**` — a *shipped* builtin — covers `~/.ssh/config`. The
+    ///    second is REQ-619's out-of-root boundary touch: LESSON-623 says a
+    ///    glob cannot protect a path the provenance seam never names, and this
+    ///    is the other half — the seam now names it, and the glob reaches it.
+    /// 2. **None** of the thirteen `DEFAULT_BOUNDARIES` matches a user skill
+    ///    file, which is what makes AC-1 ("a user skill routes remote by
+    ///    default") true of the shipped set rather than an assumption about it.
+    ///    Asserted against `config::DEFAULT_BOUNDARIES` itself, so adding a
+    ///    fourteenth glob that happens to cover `.claude/**` fails here.
+    ///
+    /// Note the deliberate asymmetry with
+    /// `out_of_repo_paths_never_match_and_never_panic`, which lists `~/secrets/x`
+    /// among the strings that reach no *repo-relative* glob: `secrets/**` is
+    /// unanchored at the head, so it genuinely does not match `~/secrets/x`.
+    /// That test says what a repo-scope glob does with a home-scope id; this one
+    /// says a `**/`-prefixed glob is how you reach one. Both are true, and a
+    /// user who wants their skills covered writes the `**/` form.
+    ///
+    /// **Mutations run, both confirmed red and restored:**
+    /// 1. Make [`normalize`] strip a leading `~/` as it strips `./` — the home
+    ///    scope collapses into the repo scope, and the first leg goes red (the
+    ///    repo-anchored `.claude/skills/**` starts matching a user skill).
+    ///    This is the mutation that matters: it is the plausible "helpful"
+    ///    edit, and it is exactly what BR-3's disjointness forbids.
+    /// 2. Replace one shipped glob with `**/.claude/**` — the third leg goes
+    ///    red, so the "no builtin covers a user skill" claim is a live
+    ///    assertion about the constant and not a restatement of it.
+    #[test]
+    fn a_tilde_scoped_id_is_matched_by_a_user_glob_and_by_no_builtin() {
+        const USER_SKILL: &str = "~/.claude/skills/x/SKILL.md";
+        const USER_COMMAND: &str = "~/.claude/commands/x.md";
+
+        // 1. A user who wants their skills directory covered writes the
+        //    ordinary `**/`-prefixed glob, and it reaches the `~` spelling.
+        let covering = vec![boundary(".claude/skills/**", BoundaryMode::LocalOnly)];
+        assert!(
+            BoundaryMatcher::new(&covering)
+                .unwrap()
+                .match_path(USER_SKILL)
+                .is_none(),
+            "a repo-anchored glob does not reach a home-scoped id — the `**/` form is the one to write"
+        );
+        let covering = vec![boundary("**/.claude/skills/**", BoundaryMode::LocalOnly)];
+        assert!(
+            BoundaryMatcher::new(&covering)
+                .unwrap()
+                .match_path(USER_SKILL)
+                .is_some(),
+            "`**/` matches the leading `~` directory, so the ordinary spelling needs no new glob language"
+        );
+
+        // 2. And a *shipped* builtin reaches an out-of-root credential path in
+        //    the same spelling — REQ-619's boundary-touch case.
+        let ssh = vec![boundary("**/.ssh/**", BoundaryMode::LocalOnly)];
+        assert!(BoundaryMatcher::new(&ssh)
+            .unwrap()
+            .match_path("~/.ssh/config")
+            .is_some());
+
+        // 3. The default set covers no user skill, which is what AC-1 rests on.
+        let defaults: Vec<PrivacyBoundary> = crate::config::DEFAULT_BOUNDARIES
+            .iter()
+            .map(|glob| PrivacyBoundary::builtin(*glob))
+            .collect();
+        assert_eq!(defaults.len(), 13, "the shipped set is thirteen globs");
+        let m = BoundaryMatcher::new(&defaults).unwrap();
+        for path in [USER_SKILL, USER_COMMAND] {
+            assert!(
+                m.match_path(path).is_none(),
+                "no builtin may cover {path:?}, or every user skill pins every session \
+                 on every machine — the defect REQ-619 exists to end"
+            );
+        }
+        // The control that gives that teeth: the same set does cover the
+        // credential shapes, in the same `~` spelling.
+        assert!(m.match_path("~/.ssh/id_rsa").is_some());
+        assert!(m.match_path("~/.aws/credentials").is_some());
+    }
+
     #[test]
     fn leading_dot_slash_is_normalized() {
         let bs = vec![boundary("secrets/**", BoundaryMode::LocalOnly)];

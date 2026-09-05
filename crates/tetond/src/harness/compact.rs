@@ -1435,6 +1435,95 @@ mod tests {
         assert!(err.contains("privacy boundary"), "{err}");
     }
 
+    /// **REQ-619 BR-5 / ADR-619-2 — a summary of a boundary touch is a boundary
+    /// touch.**
+    ///
+    /// The seam the sibling tests above do not reach: a skill expansion whose
+    /// preamble read a boundary file **outside** the session root is replaced by
+    /// a paragraph, and the paragraph has to carry the same permanence. The
+    /// original block is gone afterwards — that is what compaction means — so if
+    /// the replacement launders the bit there is nothing left to notice, and the
+    /// pin a `cat ~/.ssh/config` earned becomes liftable by `/shell allow` on
+    /// the next turn (REQ-614 ADR-614-3).
+    ///
+    /// This is the *fourth* seam REQ-585's verify found and REQ-619 gives a
+    /// third field: `compaction_summary`'s `User` arm, which folds a block's
+    /// provenance into the summary's [`ToolProvenance`].
+    ///
+    /// No boundaries are configured on the route, deliberately: the claim is
+    /// about what the **replacement block carries**, and a route that refused
+    /// the duty would leave the mechanical drop to assert instead. The refusal
+    /// itself is the sibling test above.
+    ///
+    /// # Mutation
+    ///
+    /// Ran with `boundary_touch |= *block_boundary_touch;` deleted from
+    /// `compaction_summary`'s `User` arm: **one** red — this test on `a summary
+    /// of a boundary touch is still a boundary touch`, `left: Unknown, right:
+    /// BoundaryTouch`, with the seed and replay seam tests green. That is the
+    /// laundering this test exists for: the summary still refuses today, and
+    /// `/shell allow` would lift it tomorrow. Restored: green.
+    #[tokio::test]
+    async fn a_compaction_of_a_boundary_touched_expansion_stays_boundary_touched() {
+        let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(4_000);
+        // The expansion: a user block that names its own skill file *and*
+        // carries the out-of-root bit, so a summary that kept only the sources
+        // would look correct and be laundered.
+        ctx.push_user_from(
+            format!("audit the machine\n{}", "x".repeat(1_500)),
+            [fixture_id(".claude/skills/audit/SKILL.md")]
+                .into_iter()
+                .collect(),
+            false,
+            true,
+        );
+        ctx.push_model("y".repeat(1_500));
+        // Two later prompts: REQ-618 anchors the newest two asks, so the
+        // expansion has to be older than both to be forgettable at all.
+        ctx.push_user("and then?");
+        ctx.push_user("and now?");
+        assert!(
+            ctx.under_compaction_pressure(),
+            "non-vacuity: an unpressured context compacts nothing"
+        );
+
+        let (route, _sent) = remote_route(
+            Vec::new(),
+            "FORGET: 1 2\nSUMMARY: the agent audited the machine.",
+            1,
+        );
+        let out = ctx.compact_if_pressured(&route).await;
+        assert!(
+            out.dropped_blocks >= 1,
+            "non-vacuity: nothing was compacted ({:?})",
+            out.reason
+        );
+        assert!(
+            !ctx.blocks()
+                .iter()
+                .any(|block| block.text.starts_with("audit the machine")),
+            "non-vacuity: the expansion must be the block that went"
+        );
+
+        match &ctx.blocks()[0].provenance {
+            Provenance::Tool { provenance, .. } => assert_eq!(
+                provenance,
+                &ToolProvenance::BoundaryTouch,
+                "a summary of a boundary touch is still a boundary touch"
+            ),
+            other => panic!("the replacement must carry tool provenance, got {other:?}"),
+        }
+
+        // Read the way egress reads it: the compacted conversation still refuses
+        // to leave, and still refuses **permanently**.
+        let prov = crate::harness::completion::context_provenance(&ctx);
+        assert!(prov.is_boundary_touch(), "{prov:?}");
+        assert!(
+            prov.with_unknown_lifted().is_unknown(),
+            "compaction must not turn a permanent pin into a liftable one"
+        );
+    }
+
     /// The speaker line names the tool, so the duty can tell a file read from a
     /// user turn — which is most of what "is this still needed" depends on.
     #[test]

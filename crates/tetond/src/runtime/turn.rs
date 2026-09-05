@@ -317,6 +317,16 @@ struct ExpansionInputs<'a> {
     route: &'a crate::router::Route,
     routed_text: &'a str,
     system: &'a str,
+    /// The turn's tool jail, for the one thing the expansion stage asks of it:
+    /// the [`Reach`] its preambles are classified against (REQ-619 ADR-619-1).
+    ///
+    /// It is the **same context** the tools run under — built by
+    /// `assemble_harness` a few lines above the call site, with the transcript
+    /// directory already denied — rather than a second assembly off `config`.
+    /// A `Reach` composed beside it would classify against a denial set the
+    /// commands do not actually run under, and the two would agree only until
+    /// one of them was edited.
+    tool_ctx: &'a ToolContext,
 }
 
 /// What the routing and expansion stages produced, moved into the loop.
@@ -562,6 +572,11 @@ impl DaemonRuntime {
                     route: &route,
                     routed_text: &routed_text,
                     system: &system,
+                    // The jail this turn's tools will run under, destructured
+                    // out of `assemble_harness` above — so the preamble
+                    // classifier and the commands themselves read one context
+                    // (REQ-619 ADR-619-1).
+                    tool_ctx: &tool_ctx,
                 },
                 &mut skill_turn,
             )
@@ -1246,6 +1261,7 @@ impl DaemonRuntime {
             route,
             routed_text,
             system,
+            tool_ctx,
         } = inputs;
         // ── REQ-585 BR-8 / ADR-11: Stage A — does the BODY fit? ──────────────
         //
@@ -1339,16 +1355,17 @@ impl DaemonRuntime {
         // The values are read off the turn rather than recomputed, and they are
         // this text's provenance *at this point in the function*: the commands
         // have not run yet, so `routed_text` still carries
-        // `PENDING_PLACEHOLDER` where their output will go and no command has
-        // contributed anything for `unknown` to account for. The seam below OR's
-        // in `spawned` before the user block is seeded, which is the same rule
+        // `PENDING_PLACEHOLDER` where their output will go and no preamble has
+        // contributed a verdict for the fold to account for. The seam below
+        // **re-folds** the same identity with the runs it produced (REQ-619
+        // ADR-619-4) before the user block is seeded, which is the same rule
         // applied to a longer string — not a second reading of this one.
         if let Some(skill) = skill_turn.as_ref() {
             let _ = self.spawn_title_session(
                 tctx.core,
                 sessions,
                 routed_text,
-                expansion_provenance(&skill.sources, skill.unknown),
+                expansion_provenance(&skill.sources, skill.unknown, skill.boundary_touch),
             );
         }
 
@@ -1369,15 +1386,21 @@ impl DaemonRuntime {
         // different one.
         // ─────────────────────────────────────────────────────────────────────
         if let Some(skill) = skill_turn.as_mut() {
-            self.settle_dynamic_context(
-                tctx.core.events,
-                tctx.core.session_id,
-                tctx.gate,
-                probed,
-                tctx.invoker,
-                skill,
-            )
-            .await;
+            // REQ-619 ADR-619-1: the reach is derived **here**, from the turn's
+            // own `ToolContext` — the jail the commands are about to run in,
+            // with `effective_transcript_dir(..)` already denied and
+            // `Config::effective_boundaries()` already composed. Never from
+            // `config.boundaries` raw: that is the un-composed row set, and
+            // classifying against it would judge a command by a different
+            // boundary list than the one egress will judge its output by.
+            let reach = Reach {
+                root: tool_ctx.repo_root().to_path_buf(),
+                root_kind: tool_ctx.root_kind(),
+                boundaries: tool_ctx.boundaries().to_vec(),
+                denied_prefixes: tool_ctx.denied_prefixes().to_vec(),
+            };
+            self.settle_dynamic_context(tctx, probed, &reach, skill)
+                .await;
         }
 
         // ── REQ-585 BR-8 / ADR-11: Stage B — does it still fit with the
@@ -1523,9 +1546,14 @@ impl DaemonRuntime {
         // turn, the typed text otherwise. One block either way — `push_user_from`
         // with an empty set and `unknown: false` is byte-identical to the
         // `push_user` every typed turn has always taken.
-        let (prompt, prompt_sources, prompt_unknown) = match skill_turn {
-            Some(skill) => (skill.text, skill.sources, skill.unknown),
-            None => (prompt, BTreeSet::new(), false),
+        let (prompt, prompt_sources, prompt_unknown, prompt_boundary_touch) = match skill_turn {
+            Some(skill) => (
+                skill.text,
+                skill.sources,
+                skill.unknown,
+                skill.boundary_touch,
+            ),
+            None => (prompt, BTreeSet::new(), false, false),
         };
 
         // REQ-567 BR-1: this turn begins from what the session has already said.
@@ -1545,11 +1573,18 @@ impl DaemonRuntime {
             Arc::clone(&self.session_taint),
             config.effective_boundaries(),
             prompt,
-            // REQ-585 BR-7: a typed prompt is drawn from no file; a skill turn
-            // carries the skill file's id, or the unpinnable marker for a user
-            // skill outside the root. It is the same block either way.
+            // REQ-585 BR-7 as REQ-619 BR-3 amends it: a typed prompt is drawn
+            // from no file; a skill turn carries the fold's answer — the skill
+            // file's id in whichever of the two scopes discovery listed it
+            // under, plus every rooted preamble's sources, or the unpinnable
+            // marker for a file under neither root. It is the same block either
+            // way.
             prompt_sources,
             prompt_unknown,
+            // REQ-619 BR-2: and the out-of-root boundary bit a preamble may have
+            // set, which the seed carries for the same reason it carries the
+            // other two — the block egress inspects is this one.
+            prompt_boundary_touch,
             // REQ-612 BR-3: the two halves of this turn's prompt, so a reroute
             // re-renders the notes at the cap of the route it lands on rather
             // than carrying a block sized for the route it left.
@@ -2583,21 +2618,26 @@ impl DaemonRuntime {
         let frame = expansion.user_frame();
         let text = expansion.pending_text(&frame);
 
-        // ADR-9's id-minting gap, decided rather than papered over: a project
-        // skill is under the root and mints; a user skill at
-        // `~/.claude/skills/x/SKILL.md` in a repo-rooted session has no
-        // repo-relative identity, and the minter refuses rather than inventing
-        // one. `unknown` is what carries that refusal forward.
+        // REQ-619 BR-3/ADR-619-4: the skill file's identity, folded by the one
+        // fold both call sites use. Two scopes, one per source — a project
+        // skill mints against the session root, a user skill against the
+        // daemon's `$HOME` — and `None` is still the fail-closed answer for a
+        // file under neither (a daemon with no `HOME`, a skills directory
+        // symlinked out of the home, a file that no longer resolves).
+        //
+        // `fold_expansion(identity, &[])` rather than a hand-written match on
+        // the `Option`: no command has run yet, so the empty slice is the
+        // literal truth, and going through the fold means the "identity `None`
+        // ⇒ `unknown`" reading lives in exactly one place. The preamble seam
+        // below re-folds the same identity with the runs it produced.
         //
         // Through `skills::provenance_of`, not `ProvenanceId::from_resolved`
         // directly (REQ-587 verify): `from_resolved` takes a **canonical** path
         // and `skill.path` is the path discovery walked to the file, which a
         // symlinked-but-in-repo project root leaves non-canonical. That helper
         // is the one home for resolving both sides, and it fails closed.
-        let (sources, unknown) = match crate::skills::provenance_of(&probed.path, skill) {
-            Some(id) => (BTreeSet::from([id]), false),
-            None => (BTreeSet::new(), true),
-        };
+        let identity = crate::skills::provenance_of(&probed.path, skill);
+        let seeded = crate::skills::provenance::fold_expansion(identity.clone(), &[]);
 
         Ok(SkillTurn {
             name: skill.name.clone(),
@@ -2635,8 +2675,14 @@ impl DaemonRuntime {
             body_bytes: skill.body.len() as u64,
             ignored_keys: skill.ignored_keys.clone(),
             name_note: skill.name_note.clone(),
-            sources,
-            unknown,
+            identity,
+            sources: seeded.sources,
+            unknown: seeded.unknown,
+            // REQ-619 ADR-619-2: nothing has run yet, so nothing has touched a
+            // boundary — which is what the fold answers for an empty run list,
+            // rather than a literal written beside it. The preamble seam
+            // re-folds all three fields from the same identity.
+            boundary_touch: seeded.boundary_touch,
         })
     }
 
@@ -2721,20 +2767,30 @@ impl DaemonRuntime {
     /// *is* a model call, is not on this path (ADR-14).
     async fn settle_dynamic_context(
         self: &Arc<Self>,
-        events: &Arc<EventBus>,
-        session_id: &SessionId,
-        gate: &PermissionGate,
+        // The turn's four universal facts plus the gate and the invoker, as one
+        // value. REQ-619 gave this seam a fifth input (`reach`) and the bundle
+        // is what keeps it inside the argument bound the suppression ratchet
+        // enforces — `events`, `session_id`, `gate` and `invoker` are all on
+        // the context this stage was already handed by its caller, so passing
+        // them separately was four readings of one value.
+        tctx: TurnContext<'_>,
         // The turn's one probe, taken whole rather than as a path and a display
-        // side by side (REQ-615). Two consumers here — the jail the commands run
-        // in (`probed.path`) and the root BR-6's fallback line names
-        // (`probed.view.display`) — and passing the probe rather than its parts
-        // is what keeps them one reading, as well as what keeps this signature
-        // inside the argument bound the suppression ratchet enforces: a path and
-        // its display are an unnamed cluster, and `ProbedRoot` is its name.
+        // side by side (REQ-615). One consumer left here — the root BR-6's
+        // fallback line names (`probed.view.display`) — since the jail root the
+        // commands run in now comes off `reach`, which is where the classifier
+        // reads it too.
         probed: &ProbedRoot,
-        invoker: Option<ConnectionId>,
+        // How far these preambles are allowed to reach (REQ-619 ADR-619-1),
+        // built by the caller from the turn's `ToolContext`. It carries the
+        // commands' cwd as well as the boundary set, so the path the classifier
+        // resolves against and the path `run_bounded` chdirs to are one value.
+        reach: &crate::skills::dynamic::Reach,
         skill: &mut SkillTurn,
     ) {
+        let events = tctx.core.events;
+        let session_id = tctx.core.session_id;
+        let gate = tctx.gate;
+        let invoker = tctx.invoker;
         // Taken, not borrowed: `fold` consumes, so this value can be spent once
         // and the type says so (see [`SkillTurn::expansion`]). It is `Some` on
         // every path into this function, which runs once per turn.
@@ -2776,13 +2832,14 @@ impl DaemonRuntime {
             closed_door(consent)
         };
 
-        let outcomes = match door {
+        let runs: Vec<crate::skills::dynamic::PreambleRun> = match door {
             // Consent given. Sequential, in document order, with the session
             // root as cwd and the `shell` tool's jail, composed environment
             // (REQ-596: an allowlist, not a scrub), PATH floor, process group
-            // and deadline (ADR-14).
+            // and deadline (ADR-14) — and each command classified against
+            // `reach` **before** it spawns (REQ-619 BR-1).
             None if !commands.is_empty() => {
-                let root = probed.path.clone();
+                let reach = reach.clone();
                 let to_run = commands.clone();
                 let timeout_ms = self.skill_command_timeout_ms;
                 // On the blocking pool: `run_bounded` waits on a child process
@@ -2792,7 +2849,7 @@ impl DaemonRuntime {
                 // would — which is the only way this join can fail, since a
                 // `spawn_blocking` task is never cancelled.
                 tokio::task::spawn_blocking(move || {
-                    crate::skills::run_all(&root, &to_run, timeout_ms)
+                    crate::skills::dynamic::run_all(&reach, &to_run, timeout_ms)
                 })
                 .await
                 .expect("the dynamic-context runner does not panic")
@@ -2800,8 +2857,23 @@ impl DaemonRuntime {
             None => Vec::new(),
             // A closed door is the same answer for every command of the
             // invocation, because the question was asked once about all of them.
-            Some(reason) => vec![door_outcome(reason); commands.len()],
+            //
+            // Classified anyway (REQ-619 BR-1): a verdict is a fact about the
+            // command *text*, so a command the door left unrun still has one,
+            // and the outcome view below has a run to project rather than a
+            // half-record. The fold ignores it — BR-2's "a command that did not
+            // run contributes nothing" — which is a decision made once, in
+            // `fold_expansion`, rather than by omitting the classification here.
+            Some(reason) => commands
+                .iter()
+                .map(|command| crate::skills::dynamic::PreambleRun {
+                    verdict: preamble_verdict(reach, command),
+                    outcome: door_outcome(reason),
+                })
+                .collect(),
         };
+        let outcomes: Vec<crate::skills::DynamicOutcome> =
+            runs.iter().map(|run| run.outcome.clone()).collect();
 
         // The fold is where the output becomes prompt text: a ran slot enters
         // inside `frame_untrusted_builtin("skill:<name>", …)` — the same
@@ -2827,20 +2899,25 @@ impl DaemonRuntime {
             &probed.view.display,
         );
 
-        // BR-7: anything that came from a command carries what `shell` output
-        // carries — nothing that can be pinned. On a boundary-configured machine
-        // that fails closed, so an invocation that **spawned** any command pins
-        // its turn to the local tier, exactly as a `shell` result does. Recorded
-        // on the block the seed below builds, which is what egress inspects.
+        // REQ-619 BR-1/BR-2: the expansion's provenance, folded from the skill
+        // file's identity and the verdict each preamble was given before it
+        // spawned. **Recomputed, not OR'd**: `fold_expansion` takes the
+        // identity, so writing all three fields from one call is what keeps
+        // them one answer — a merge into the seeded values would leave the
+        // seam able to add a bit but never to take one away.
         //
-        // `spawned`, not `did_run`: a command that ran and exited non-zero, or
-        // timed out, produces no output but still reports a *value the command
-        // chose*, and `fold` writes that value into the prompt (`exited 2`).
-        // Asking about output left a side channel that pinned nothing — one bit
-        // per command about a boundary-protected file, in a turn free to route
-        // remote. `ShellTool::run` tags every spawned arm the same way, and the
-        // claim above is parity with it.
-        skill.unknown |= outcomes.iter().any(DynamicOutcome::spawned);
+        // This replaces `skill.unknown |= outcomes.iter().any(spawned)`, which
+        // marked the whole expansion unpinnable the moment any command reached
+        // a process. That rule was parity with the `shell` tool as it stood
+        // before REQ-614; the `shell` tool has had a classifier since, and this
+        // is the skill path being moved onto it. The exit-code side channel
+        // REQ-585's verify closed stays closed by the *verdict* — a
+        // content-reading verb on a boundary path is `BoundaryTouch` before it
+        // spawns — rather than by asking whether anything printed.
+        let folded = crate::skills::provenance::fold_expansion(skill.identity.clone(), &runs);
+        skill.sources = folded.sources;
+        skill.unknown = folded.unknown;
+        skill.boundary_touch = folded.boundary_touch;
 
         events.publish(
             Some(session_id.clone()),
@@ -2853,8 +2930,8 @@ impl DaemonRuntime {
                 name_note: skill.name_note.clone(),
                 outcomes: commands
                     .iter()
-                    .zip(outcomes.iter())
-                    .map(|(command, outcome)| outcome_view(command, outcome, door))
+                    .zip(runs.iter())
+                    .map(|(command, run)| outcome_view(command, run, door))
                     .collect(),
                 // A literal, and it stays one: the only path that reaches here
                 // is REQ-585's user-typed `/name` expansion. A model-issued

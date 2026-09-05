@@ -25,7 +25,7 @@
 //! | BR-4: the engine is handed the expansion that was measured | [`the_engine_is_handed_the_expansion_the_budget_measured`] |
 //! | ADR-3: the naming attempt reads the expansion, not `""` | [`a_skill_turn_spends_the_naming_attempt_on_the_expansion_not_on_an_empty_string`] |
 //! | BR-7: a project skill's expansion is pinned to its file | [`a_project_skills_expansion_is_pinned_to_the_file_it_came_from`] |
-//! | ADR-9: a user skill outside the root is `unknown` | [`a_user_skill_outside_the_root_seeds_a_block_that_says_it_cannot_be_pinned`] |
+//! | **REQ-619 BR-3: a user skill carries a `~`-scoped identity** (retiring ADR-9's `unknown`) | [`a_user_skill_outside_the_root_seeds_a_block_with_its_home_scoped_identity`] |
 //! | AC-13: frontmatter cannot escalate spend | [`frontmatter_asking_for_opus_at_max_effort_with_bash_star_changes_nothing`] |
 //! | ADR-3: `prompt` and `skill` are exclusive; both-empty still runs | [`a_request_carrying_both_prompt_and_skill_is_invalid_params`] |
 //! | AC-8: one consent lists every command, in order | [`one_consent_asks_about_every_command_of_the_invocation_and_never_one_per_command`] |
@@ -37,7 +37,10 @@
 //! | BR-6: document order, session root as cwd | [`the_commands_run_sequentially_in_document_order_with_the_session_root_as_cwd`] |
 //! | AC-10: failure and deadline legs still produce a turn | [`a_failing_command_leaves_a_failed_placeholder_and_the_turn_still_runs`], [`a_command_past_the_deadline_leaves_a_timed_out_placeholder_and_the_turn_still_runs`] |
 //! | AC-12: ran output is framed and its forged close defused | [`ran_output_enters_inside_the_untrusted_envelope_with_its_markers_neutralized`] |
-//! | BR-7/AC-11b: a command that ran pins the turn local | [`an_invocation_that_ran_a_command_seeds_a_block_that_cannot_be_pinned`] |
+//! | **REQ-619 BR-1/BR-2: the preamble's *verdict* decides, not the spawn** (retiring BR-7/AC-11b) | [`a_rooted_preamble_pins_the_expansion_to_its_sources_and_an_opaque_one_marks_it_unknown`], [`an_opaque_preamble_is_pinned_by_the_default_boundaries_and_a_rooted_one_is_not`] |
+//! | **REQ-619 BR-2/AC-6: a boundary-naming preamble is refused whatever it exits** | [`a_boundary_naming_preamble_is_refused_whatever_it_exits`], [`an_out_of_root_boundary_preamble_pins_on_the_boundary_touch_sentinel`] |
+//! | **REQ-619 BR-8: a pinned skill turn is announced through the existing sink** | [`a_pinned_skill_turn_is_announced_through_the_existing_sink`] |
+//! | **REQ-619 BR-1: no production provenance reads `spawned`** (LESSON-550) | [`no_production_provenance_reads_spawned_any_more`] |
 //! | BR-12/ADR-15: the event, from the value the daemon emitted | [`the_invocation_event_carries_what_the_daemon_read_off_the_file`], [`a_skill_with_no_dynamic_context_asks_nothing_and_still_echoes_its_invocation`] |
 //! | BR-1/BUG-187: neither source reaches the wire absolute | [`the_invocation_event_carries_what_the_daemon_read_off_the_file`] |
 //! | BR-1/ADR-2: the relative spelling is bounded too | [`a_relative_path_past_the_display_ceiling_is_still_elided_on_the_wire`] |
@@ -65,7 +68,7 @@
 //! | Stage B's refusal raised after `CarriedTurn::begin` | [`the_two_refusals_bracket_the_consent_seam_and_precede_the_seed`] |
 //! | Stage A moved below the TASK-205 consent seam | [`the_two_refusals_bracket_the_consent_seam_and_precede_the_seed`] |
 //! | the expansion built *after* routing and naming | [`the_expansion_is_built_before_either_reader_of_the_prompt_text`], [`a_skill_turn_spends_the_naming_attempt_on_the_expansion_not_on_an_empty_string`], and `runtime::tests::skill_turn_readers` |
-//! | the seeded block's provenance dropped | [`a_project_skills_expansion_is_pinned_to_the_file_it_came_from`], [`a_user_skill_outside_the_root_seeds_a_block_that_says_it_cannot_be_pinned`] |
+//! | the seeded block's provenance dropped | [`a_project_skills_expansion_is_pinned_to_the_file_it_came_from`], [`a_user_skill_outside_the_root_seeds_a_block_with_its_home_scoped_identity`] |
 //! | the daemon trusting the client's name | [`an_unknown_skill_name_is_refused_by_the_daemon_not_only_by_the_client`] |
 //! | the `digest` duty reaching the turn path | [`the_digest_duty_has_one_production_call_site_and_the_turn_path_is_not_it`] |
 //! | asking per command instead of per invocation | [`one_consent_asks_about_every_command_of_the_invocation_and_never_one_per_command`] |
@@ -74,7 +77,9 @@
 //! | skipping the untrusted-content frame around ran output | [`ran_output_enters_inside_the_untrusted_envelope_with_its_markers_neutralized`], [`at_full_the_commands_run_with_no_prompt_at_all`] |
 //! | running the commands out of document order | [`the_commands_run_sequentially_in_document_order_with_the_session_root_as_cwd`] |
 //! | running them anywhere but the session root | [`the_commands_run_sequentially_in_document_order_with_the_session_root_as_cwd`] |
-//! | dropping the `Unknown` provenance dynamic output earns | [`an_invocation_that_ran_a_command_seeds_a_block_that_cannot_be_pinned`] |
+//! | **restoring `skill.unknown \|= any(spawned)`** (REQ-619 retires it) | [`a_rooted_preamble_pins_the_expansion_to_its_sources_and_an_opaque_one_marks_it_unknown`], [`an_opaque_preamble_is_pinned_by_the_default_boundaries_and_a_rooted_one_is_not`], [`no_production_provenance_reads_spawned_any_more`] |
+//! | the typed seam ignoring the fold's `boundary_touch` | [`an_out_of_root_boundary_preamble_pins_on_the_boundary_touch_sentinel`] |
+//! | folding an `Unknown` verdict to nothing | [`a_pinned_skill_turn_is_announced_through_the_existing_sink`] |
 //! | spelling a project skill's path with the home rule alone (BUG-187) | [`the_invocation_event_carries_what_the_daemon_read_off_the_file`] |
 //! | dropping `bounded_field` from the emitted `path_display` | [`a_relative_path_past_the_display_ceiling_is_still_elided_on_the_wire`] |
 //! | publishing `skill_invoked` **after** Stage B | [`the_invocation_event_is_published_before_the_stage_b_refusal_not_after`] |
@@ -169,8 +174,8 @@ use teton_protocol::events::{
 };
 use teton_protocol::jsonrpc::error_code;
 use teton_protocol::methods::{
-    ConfigUpdate, PermissionOutcome, ProviderConfig, RefusalReason, SessionPermissionsParams,
-    SessionSetCwdParams, SkillInvocation, SkillSource, TierBindingConfig,
+    ConfigUpdate, PermissionOutcome, PrivacyBoundaryConfig, ProviderConfig, RefusalReason,
+    SessionPermissionsParams, SessionSetCwdParams, SkillInvocation, SkillSource, TierBindingConfig,
 };
 use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::{
@@ -511,6 +516,34 @@ impl Harness {
     /// for the interaction the opt-out above would otherwise hide.
     fn with_default_boundaries(window: u32) -> Self {
         Self::assembled(Some(window), DaemonRuntime::minimal())
+    }
+
+    /// [`Self::with_window`] carrying exactly **one** user boundary and none of
+    /// the shipped ones (REQ-619 TASK-401).
+    ///
+    /// The instrument REQ-619's fold needs and neither constructor above
+    /// provides. `with_window` leaves the boundary set *empty*, and an empty
+    /// set is answered by `shell_provenance::classify` on its first line —
+    /// every verdict is `Unknown`, which is the pre-REQ-614 answer BR-9 keeps
+    /// and is therefore useless for asserting that a `cat` of an in-root file
+    /// is `rooted`. `with_default_boundaries` classifies, but its thirteen
+    /// globs are the ones a fixture cannot name a file against without
+    /// planting a credential-shaped file for real.
+    ///
+    /// One row, installed through `config/set`'s own path exactly as the
+    /// providers above are, so the set under test is the one
+    /// `Config::effective_boundaries` composes rather than a second assembly.
+    fn with_boundary(window: u32, glob: &str) -> Self {
+        let harness = Self::assembled(Some(window), Self::not_about_privacy());
+        harness
+            .runtime
+            .apply_config_update(ConfigUpdate::SetPrivacyBoundary(PrivacyBoundaryConfig {
+                path_glob: glob.to_owned(),
+                mode: teton_protocol::PrivacyMode::LocalOnly,
+                origin: teton_protocol::methods::BoundaryOriginConfig::User,
+            }))
+            .expect("installing a privacy boundary");
+        harness
     }
 
     /// A runtime whose provider declares **no** window, so `budget::derive`
@@ -1016,6 +1049,34 @@ async fn drain(sub: &mut tetond::broadcast::Subscription) -> Vec<Event> {
         out.push(env.event);
     }
     out
+}
+
+/// Every `privacy_block` in a drained batch (REQ-619 TASK-401).
+///
+/// The refusal sentence a turn returns is content-free by design — it names the
+/// *cause* and never the file — so the path a boundary matched is only readable
+/// from the event the egress sink publishes. That is also the surface a user
+/// actually sees, which is why the REQ-619 claims about *which* file was named
+/// are made here rather than against `RpcError::message`.
+fn privacy_blocks(published: &[Event]) -> Vec<teton_protocol::events::PrivacyBlock> {
+    published
+        .iter()
+        .filter_map(|event| match event {
+            Event::PrivacyBlock(block) => Some(block.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every `session_pinned` in a drained batch (REQ-619 BR-8).
+fn session_pins(published: &[Event]) -> Vec<teton_protocol::events::SessionPinned> {
+    published
+        .iter()
+        .filter_map(|event| match event {
+            Event::SessionPinned(pinned) => Some(pinned.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1577,7 +1638,11 @@ async fn a_project_skills_expansion_is_pinned_to_the_file_it_came_from() {
     let expected = ProvenanceId::from_resolved(&root, &root.join(".claude/skills/pinme/SKILL.md"))
         .expect("a project skill is under the root and mints");
     match &user.provenance {
-        Provenance::User { sources, unknown } => {
+        Provenance::User {
+            sources,
+            unknown,
+            boundary_touch,
+        } => {
             assert_eq!(
                 sources,
                 &BTreeSet::from([expected]),
@@ -1588,24 +1653,40 @@ async fn a_project_skills_expansion_is_pinned_to_the_file_it_came_from() {
                 !unknown,
                 "a project skill mints, so nothing about it is unpinnable"
             );
+            // REQ-619 ADR-619-2: this skill has no preambles, so nothing it
+            // carries could have named a path outside the root.
+            assert!(!boundary_touch, "a preamble-free skill touches no boundary");
         }
         other => panic!("a prompt turn seeds a user block: {other:?}"),
     }
 }
 
-/// **ADR-9's id-minting gap, decided rather than papered over.** A user skill at
-/// `~/.claude/skills/x/SKILL.md` in a repo-rooted session has no repo-relative
-/// identity, and `ProvenanceId::from_resolved` refuses rather than inventing one
-/// (REQ-571 ADR-B). Its block therefore says `unknown`, which fails closed
-/// wherever a boundary is configured — stricter than BR-7's letter and right in
-/// the charter's direction: the alternative is a file outside the root silently
-/// counting as unpinnable-but-fine.
+/// **REQ-619 BR-3 — a user skill carries a `~`-scoped identity, and this test is
+/// the flip of the rule it used to assert.**
+///
+/// It was `a_user_skill_outside_the_root_seeds_a_block_that_says_it_cannot_be_pinned`,
+/// and it asserted REQ-585 ADR-9's decided gap: `~/.claude/skills/x/SKILL.md` has
+/// no repo-relative spelling, `ProvenanceId::from_resolved` refused to invent
+/// one, and the block therefore said `unknown` — which failed closed wherever
+/// any boundary was configured. With REQ-597's thirteen builtins always on, that
+/// made **every** user-authored skill pin **every** repo-rooted session (BUG-214)
+/// over a file that matched no glob and read nothing. The minter was not widened
+/// (BR-4): the user scope got a root of its own, the daemon's `$HOME`, and
+/// discovery mints against it because discovery is where the file was listed.
 ///
 /// The project twin above is the control: same runtime, same turn path, and the
-/// difference is only where the file lives.
+/// difference is only where the file lives — and now the difference shows up as
+/// the *scope* of the id rather than as the presence of one.
+///
+/// **Mutation (run, red, reverted):** make `skills::provenance_of` answer
+/// `None` for `SkillSource::User` again — the pre-REQ-619 reading — so the fold
+/// sets `unknown` and mints nothing. The `sources` equality and the `!unknown`
+/// leg both go red. **3 red**: this test, and `skill_boundary.rs`'s
+/// `a_user_skill_leaves_under_a_boundary_it_never_touched_and_is_refused_by_one_that_names_it`
+/// and `a_user_skill_reaches_the_provider_when_no_boundary_is_configured`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_user_skill_outside_the_root_seeds_a_block_that_says_it_cannot_be_pinned() {
-    let repo = Tree::new("unpinnable");
+async fn a_user_skill_outside_the_root_seeds_a_block_with_its_home_scoped_identity() {
+    let repo = Tree::new("homeident");
     let h = Harness::with_window(128_000);
     let session = h.session_at(repo.path());
 
@@ -1620,16 +1701,26 @@ async fn a_user_skill_outside_the_root_seeds_a_block_that_says_it_cannot_be_pinn
         .find(|block| block.role == BlockRole::User)
         .expect("the turn seeded a user block");
     match &user.provenance {
-        Provenance::User { sources, unknown } => {
-            assert!(
-                sources.is_empty(),
-                "nothing under `~` has a repo-relative identity to mint: {sources:?}"
+        Provenance::User {
+            sources,
+            unknown,
+            boundary_touch,
+        } => {
+            assert_eq!(
+                sources.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+                vec!["~/.claude/skills/homeonly/SKILL.md"],
+                "the user scope's spelling is what a boundary glob is matched \
+                 against and what a `privacy_block` line would name: {sources:?}"
             );
             assert!(
-                unknown,
-                "an unmintable file must set `unknown`, or the turn silently \
-                 counts as drawn from nothing at all"
+                !unknown,
+                "a user skill that minted is not unprovable — leaving `unknown` \
+                 set would pin every repo-rooted session on every machine \
+                 shipping the builtin globs (BUG-214)"
             );
+            // REQ-619 ADR-619-2: an identity is not a boundary touch, and only
+            // the second is permanent.
+            assert!(!boundary_touch, "a preamble-free skill touches no boundary");
         }
         other => panic!("a prompt turn seeds a user block: {other:?}"),
     }
@@ -2402,25 +2493,8 @@ async fn ran_output_enters_inside_the_untrusted_envelope_with_its_markers_neutra
     );
 }
 
-/// **BR-7 / AC-11(b), and the mutation of dropping it.** Dynamic-context output
-/// carries what `shell` output carries: nothing that can be pinned. The seeded
-/// block is therefore marked unpinnable whenever any command ran, which is what
-/// makes the egress inspector fail closed on a boundary-configured machine — so
-/// an invocation that ran a command pins its turn local.
-///
-/// The control is the same skill with its command **declined**, where no command
-/// runs: the block then carries only the skill file's own identity and is
-/// pinnable, which is what makes the assertion above a statement about the
-/// *output* rather than about skill turns in general.
-///
-/// The control used to run at `plan`, which closed the same door. Since REQ-589
-/// ADR-10 a typed **project** skill is acknowledged before it expands and `plan`
-/// denies that acknowledgment outright, so a `plan` leg here would be a turn
-/// that never happened rather than a turn whose command did not run — and the
-/// control has to be the same skill from the same file, or it stops controlling
-/// for the thing it is here to control for.
-/// **REQ-597: the shipped boundary set reaches the unpinnable path, and that is
-/// the consequence nobody asked for by name.**
+/// **REQ-597: the shipped boundary set reaches the unpinnable path — and
+/// REQ-619 narrowed what "unpinnable" means.**
 ///
 /// Every other harness in this file switches the default boundaries off
 /// ([`Harness::not_about_privacy`]), because otherwise their skill assertions
@@ -2429,44 +2503,59 @@ async fn ran_output_enters_inside_the_untrusted_envelope_with_its_markers_neutra
 ///
 /// The mechanism, which is second-order and easy to mistake for a broken
 /// harness: `context_taint_cause` returns `false` immediately when the boundary
-/// list is empty. Before REQ-597 a stock machine's list *was* empty, so
-/// REQ-585's `Unknown` provenance — what a skill's command output carries,
-/// having no path to mint an identity from — never reached the inspector. With
-/// the builtin set always present that short-circuit is gone, the `Unknown`
-/// block fails closed, and the turn is pinned to the local tier.
+/// list is empty. Before REQ-597 a stock machine's list *was* empty, so an
+/// `Unknown` provenance never reached the inspector. With the builtin set always
+/// present that short-circuit is gone, the `Unknown` block fails closed, and the
+/// turn is pinned to the local tier. So the reach of REQ-597 is wider than its
+/// glob list: **anything the daemon cannot pin is covered on every machine**. On
+/// a real install that is a reroute to the local tier the product ships with; on
+/// this runtime, which has no local tier, it is the refusal asserted below.
 ///
-/// So the reach of REQ-597 is wider than its glob list: it is not only that
-/// `.env` and `.ssh/` are now covered, it is that **anything the daemon cannot
-/// pin is now covered too, on every machine**. On a real install that is a
-/// reroute to the local tier the product ships with; on this runtime, which has
-/// no local tier, it is the refusal asserted below. Both are the same decision.
+/// **The flip (REQ-619 BR-1/BR-2).** This test was
+/// `a_skill_that_ran_a_command_is_pinned_by_the_default_boundaries`, and its
+/// subject was REQ-585 BR-7: `` !`echo hello` `` spawned, so the whole expansion
+/// was unpinnable and the stock machine refused the turn. The `shell` tool has
+/// classified its commands since REQ-614 and this path now does too, so `echo
+/// hello` is `rooted` **before it spawns** and the same turn goes out. What still
+/// pins is what still cannot be proved — an opaque verb — and both halves are
+/// asserted here, on one harness, because the claim is the *difference* between
+/// them and a single-legged version of this test would pass on a build that
+/// pinned everything or nothing.
 ///
-/// The control is the same skill with its command declined: no command runs, the
-/// block carries only the skill file's own pinnable identity, and the turn
-/// proceeds. Without it this would be a statement about skill turns in general
-/// rather than about *unpinnable output*.
-///
-/// **Mutation**: give the harness `with_default_boundaries_disabled()` — i.e.
-/// use `Harness::with_window` like its neighbours — and the refusal below stops
-/// happening.
+/// **Mutation (run, red, reverted):** restore
+/// `skill.unknown |= outcomes.iter().any(DynamicOutcome::spawned)` in
+/// `settle_dynamic_context` — the `rooted` leg's `expect` goes red, because the
+/// turn is refused again. **4 red** in this file: this test,
+/// [`a_rooted_preamble_pins_the_expansion_to_its_sources_and_an_opaque_one_marks_it_unknown`],
+/// [`a_boundary_naming_preamble_is_refused_whatever_it_exits`] and
+/// [`no_production_provenance_reads_spawned_any_more`].
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_skill_that_ran_a_command_is_pinned_by_the_default_boundaries() {
+async fn an_opaque_preamble_is_pinned_by_the_default_boundaries_and_a_rooted_one_is_not() {
     let repo = Tree::new("dfltbnd");
     repo.write(
         ".claude/skills/ran/SKILL.md",
         &skill_file("runs one command", "Out: !`echo hello`\n"),
     );
+    // The opaque twin. `sh` is on REQ-614's `OPAQUE` table and the body carries
+    // quotes, either of which is enough on its own — a grammar that stopped
+    // modelling one would still answer `Unknown` for the other, which is the
+    // fail-closed direction.
+    repo.write(
+        ".claude/skills/opaque/SKILL.md",
+        &skill_file("runs an opaque command", "Out: !`sh -c 'echo x'`\n"),
+    );
     // The stock posture: no user boundaries declared, and the builtin set on.
     let h = Harness::with_default_boundaries(128_000);
 
-    // The command runs, its output has no identity, and the turn cannot be
-    // served — there is no local tier here to reroute to.
-    let ran = h.session_at(repo.path());
-    h.at_level(&ran, PermissionLevel::Full);
+    // The claim: an opaque verb's reach cannot be proved, so its expansion is
+    // unpinnable and the turn cannot be served — there is no local tier here to
+    // reroute to.
+    let opaque = h.session_at(repo.path());
+    h.at_level(&opaque, PermissionLevel::Full);
     let err = h
-        .turn(&ran, "", Harness::invoke("ran", ""))
+        .turn(&opaque, "", Harness::invoke("opaque", ""))
         .await
-        .expect_err("unpinnable output under the default boundaries pins the turn");
+        .expect_err("unprovable output under the default boundaries pins the turn");
     assert!(
         err.message.contains("local-only privacy boundary"),
         "the refusal must name the boundary that caused it, not a generic \
@@ -2474,72 +2563,454 @@ async fn a_skill_that_ran_a_command_is_pinned_by_the_default_boundaries() {
         err.message
     );
 
-    // The control: the fixture client declines the command, so nothing
-    // unpinnable enters the turn and the same skill, from the same file, under
-    // the same boundaries, runs.
-    let did_not_run = h.session_at(repo.path());
-    h.turn(&did_not_run, "", Harness::invoke("ran", ""))
+    // The flip: the same machine, the same builtin globs, a command whose reach
+    // is proved before it runs — and the turn goes out. Under REQ-585 BR-7 this
+    // leg was the refusal above.
+    let rooted = h.session_at(repo.path());
+    h.at_level(&rooted, PermissionLevel::Full);
+    h.turn(&rooted, "", Harness::invoke("ran", ""))
         .await
-        .expect("a command-free expansion is pinnable and still runs");
+        .expect("a rooted preamble leaves the expansion pinnable, so the turn is served");
+
+    // The control that keeps the refusal meaning something: the fixture client
+    // declines the opaque skill's command, nothing unprovable enters the turn,
+    // and the same skill from the same file under the same boundaries runs.
+    let did_not_run = h.session_at(repo.path());
+    h.turn(&did_not_run, "", Harness::invoke("opaque", ""))
+        .await
+        .expect("a declined command contributes nothing, so the expansion is pinnable");
 }
 
+/// **REQ-619 BR-1/BR-2 — the fold, at the block, both ways at once.**
+///
+/// This test was `an_invocation_that_ran_a_command_seeds_a_block_that_cannot_be_pinned`
+/// and it asserted REQ-585 BR-7: dynamic-context output carried what `shell`
+/// output carried *before REQ-614* — nothing that could be pinned — so the block
+/// was marked unpinnable the moment any command spawned, whatever the command
+/// was. Its control was the same skill declined. Both legs survive here with
+/// their meaning changed: the discriminator is no longer "did anything run", it
+/// is **what the classifier could prove about what ran**, taken before the
+/// spawn.
+///
+/// The rooted leg is AC-3's shape (`cat README.md`, `ls -la`): the block carries
+/// the skill file's identity *and* `README.md`, so a `README.md` boundary would
+/// refuse this turn naming that file — which is what "pinned to its sources"
+/// buys over the old blanket `unknown`. The unknown leg is AC-5's (`sh -c
+/// 'echo x'`): an opaque verb, `unknown` set, and the turn refused at the choke
+/// point against the content-free sentinel — which is why that half is asserted
+/// through the `privacy_block` rather than through a committed block, since a
+/// refused turn abandons its conversation (REQ-567 D-1).
+///
+/// The boundary is `secrets/**`, which names nothing either skill touches: it is
+/// here so the classifier has a non-empty set to answer against at all
+/// (`classify` short-circuits to `Unknown` on an empty one, REQ-614 BR-9), and
+/// its irrelevance to the fixtures is what makes the rooted leg's success a
+/// statement about the *verdict* rather than about a glob that happened to miss.
+///
+/// **Mutation (run, red, reverted):** restore the `spawned` OR in
+/// `settle_dynamic_context` — the rooted leg's `!unknown` assertion and its
+/// `expect` both go red. **4 red** in this file (see
+/// [`an_opaque_preamble_is_pinned_by_the_default_boundaries_and_a_rooted_one_is_not`]
+/// for the list). Second mutation (run, red, reverted): make `fold_expansion`
+/// drop `Rooted` verdicts' sources (`VerdictKind::Rooted => {}`) — the
+/// `README.md` id disappears from the block and the `sources` equality goes red.
+/// **1 red**, this test. Third mutation (run, red, reverted): collapse the two
+/// bits at the seam (`skill.boundary_touch = folded.unknown ||
+/// folded.boundary_touch; skill.unknown = false`) — the unknown half blocks on
+/// `<boundary-touch>` and its path assertion goes red. **2 red**, this test and
+/// [`a_pinned_skill_turn_is_announced_through_the_existing_sink`].
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_invocation_that_ran_a_command_seeds_a_block_that_cannot_be_pinned() {
-    let repo = Tree::new("unpinned");
+async fn a_rooted_preamble_pins_the_expansion_to_its_sources_and_an_opaque_one_marks_it_unknown() {
+    let repo = Tree::new("foldpre");
+    repo.write("README.md", "READMEBODY\n");
     repo.write(
-        ".claude/skills/ran/SKILL.md",
-        &skill_file("runs one command", "Out: !`echo hello`\n"),
+        ".claude/skills/rooted/SKILL.md",
+        &skill_file(
+            "reads two in-root things",
+            "One: !`cat README.md`\nTwo: !`ls -la`\n",
+        ),
     );
-    let h = Harness::with_window(128_000);
+    repo.write(
+        ".claude/skills/opaque/SKILL.md",
+        &skill_file("runs an opaque command", "Out: !`sh -c 'echo x'`\n"),
+    );
+    let h = Harness::with_boundary(128_000, "secrets/**");
 
-    let ran = h.session_at(repo.path());
-    h.at_level(&ran, PermissionLevel::Full);
-    h.turn(&ran, "", Harness::invoke("ran", ""))
+    // ── the rooted half ─────────────────────────────────────────────────────
+    let rooted = h.session_at(repo.path());
+    h.at_level(&rooted, PermissionLevel::Full);
+    h.turn(&rooted, "", Harness::invoke("rooted", ""))
         .await
-        .expect("the skill runs");
-
-    // The fixture client's default answer is a decline, so this leg says no to
-    // the one command and the turn still runs (AC-8).
-    let did_not_run = h.session_at(repo.path());
-    h.turn(&did_not_run, "", Harness::invoke("ran", ""))
-        .await
-        .expect("the skill runs");
+        .expect("two rooted preambles leave the expansion pinnable");
 
     let root = h.runtime.session_root_for(Some(repo.path())).path;
-    let file = ProvenanceId::from_resolved(&root, &root.join(".claude/skills/ran/SKILL.md"))
+    let file = ProvenanceId::from_resolved(&root, &root.join(".claude/skills/rooted/SKILL.md"))
         .expect("a project skill is under the root and mints");
+    let readme = ProvenanceId::from_resolved(&root, &root.join("README.md"))
+        .expect("the file a preamble read is under the root and mints");
 
-    for (session, expect_unknown, why) in [
-        (
-            &ran,
-            true,
-            "output that came from a command has no identity to pin, exactly as \
-             `shell` output has none — so the block must fail closed",
-        ),
-        (
-            &did_not_run,
-            false,
-            "control: with no command run there is nothing unpinnable in the \
-             block, so the assertion above is about the output",
-        ),
-    ] {
-        let committed = h.sessions.conversation_snapshot(session);
-        let user = committed
-            .blocks()
-            .iter()
-            .find(|block| block.role == BlockRole::User)
-            .expect("the turn seeded a user block");
-        match &user.provenance {
-            Provenance::User { sources, unknown } => {
-                assert_eq!(*unknown, expect_unknown, "{why}");
-                assert_eq!(
-                    sources,
-                    &BTreeSet::from([file.clone()]),
-                    "the skill file's own identity travels either way (BR-7)"
-                );
-            }
-            other => panic!("a prompt turn seeds a user block: {other:?}"),
+    let committed = h.sessions.conversation_snapshot(&rooted);
+    let user = committed
+        .blocks()
+        .iter()
+        .find(|block| block.role == BlockRole::User)
+        .expect("the turn seeded a user block");
+    match &user.provenance {
+        Provenance::User {
+            sources,
+            unknown,
+            boundary_touch,
+        } => {
+            assert_eq!(
+                sources,
+                &BTreeSet::from([file, readme]),
+                "the block names the skill file **and** the file its preamble \
+                 read — a glob over either must be able to refuse this turn"
+            );
+            assert!(
+                !unknown,
+                "every preamble's reach was proved before it spawned, so nothing \
+                 about this expansion is unprovable"
+            );
+            assert!(
+                !boundary_touch,
+                "neither path matches a boundary, so nothing was touched"
+            );
         }
+        other => panic!("a prompt turn seeds a user block: {other:?}"),
+    }
+
+    // ── the unknown half ────────────────────────────────────────────────────
+    //
+    // A refused turn abandons its conversation, so the claim is made at the
+    // choke point that refused it: the sentinel is what `unknown` becomes at
+    // egress, and it names no path because there is none to name.
+    let opaque = h.session_at(repo.path());
+    h.at_level(&opaque, PermissionLevel::Full);
+    let mut sub = h.events.subscribe(256);
+    h.turn(&opaque, "", Harness::invoke("opaque", ""))
+        .await
+        .expect_err("an opaque preamble is unprovable, so the turn cannot be served");
+    let blocked = privacy_blocks(&drain(&mut sub).await);
+    assert_eq!(blocked.len(), 1, "exactly one privacy_block: {blocked:?}");
+    assert_eq!(
+        blocked[0].path,
+        tetond::egress::provenance::UNKNOWN_PROVENANCE_PATH,
+        "an unprovable expansion is refused against the content-free sentinel, \
+         never against a path it does not have"
+    );
+}
+
+/// **REQ-619 BR-2 / AC-6 — the exit-code side channel, closed by the verdict.**
+///
+/// `` !`grep -q MARKER secrets/prod.env && exit 1 || exit 2` `` is REQ-585's
+/// verify writing one bit about a guarded file into the prompt through the
+/// *exit status*, which the fold renders as `exited 1` or `exited 2`. Nothing
+/// downstream can tell the two apart from the outside, which is why the answer
+/// cannot be "did it print anything": a content-reading verb given a boundary
+/// path is `boundary_touch` **before it spawns**, so the turn is refused
+/// whatever the command chose to exit with.
+///
+/// The refusal names `secrets/prod.env` and not a sentinel: the path is in-root,
+/// so it mints an id, the glob matches it, and the `privacy_block` a user reads
+/// is the one a `read` of that file would have produced (ADR-619-4).
+///
+/// The marker lives **only** in the guarded file (LESSON-624), so a leg that
+/// found it anywhere else would be finding it because it leaked.
+///
+/// **Mutation (run, red, reverted):** make the fold read the outcome instead of
+/// the verdict — `did_spawn` answering `false` for `DynamicOutcome::Failed`, so
+/// a command that chose a non-zero exit contributes nothing. The turn is served
+/// and the `expect_err` goes red. **2 red**: this test and `provenance_egress.rs`'s
+/// `a_model_invocation_whose_opaque_command_failed_still_pins_and_a_rooted_one_does_not`.
+/// Second mutation (run, red, reverted): drop the `BoundaryTouch`-with-sources
+/// arm from `fold_expansion` so an in-root boundary path sets only the bit — the
+/// block is refused against `<boundary-touch>` and the path assertion goes red.
+/// **1 red**, this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_boundary_naming_preamble_is_refused_whatever_it_exits() {
+    const MARKER: &str = "SKILLTURN-BOUNDARY-LEAK-MARKER";
+
+    let repo = Tree::new("bndpre");
+    repo.write("secrets/prod.env", &format!("API_KEY={MARKER}\n"));
+    repo.write(
+        ".claude/skills/peek/SKILL.md",
+        &skill_file(
+            "reads a guarded file and reports one bit",
+            "Bit: !`grep -q MARKER secrets/prod.env && exit 1 || exit 2`\n",
+        ),
+    );
+    let h = Harness::with_boundary(128_000, "secrets/**");
+
+    let session = h.session_at(repo.path());
+    h.at_level(&session, PermissionLevel::Full);
+    let mut sub = h.events.subscribe(256);
+    let err = h
+        .turn(&session, "", Harness::invoke("peek", ""))
+        .await
+        .expect_err("a preamble naming a boundary file pins the turn");
+    assert!(
+        err.message.contains("local-only privacy boundary"),
+        "the refusal must name the boundary that caused it: {:?}",
+        err.message
+    );
+
+    let blocked = privacy_blocks(&drain(&mut sub).await);
+    assert_eq!(blocked.len(), 1, "exactly one privacy_block: {blocked:?}");
+    assert_eq!(
+        blocked[0].path, "secrets/prod.env",
+        "an in-root boundary path mints, so the block names the file exactly as \
+         a `read` of it would — a sentinel here would tell the user nothing \
+         about which file to look at"
+    );
+
+    // Non-vacuity, and the leak claim: nothing left the machine at all.
+    assert!(
+        h.vendor.sent().is_empty(),
+        "the turn carrying the expansion reached the provider: {:?}",
+        h.vendor.sent()
+    );
+    assert!(
+        !h.vendor.sent().join("\n").contains(MARKER),
+        "the guarded file's bytes reached the wire"
+    );
+}
+
+/// **REQ-619 ADR-619-2 — the out-of-root half, which only a bit can carry.**
+///
+/// `` !`cat ~/.ssh/config` `` names a file that mints **no** `ProvenanceId`:
+/// there is no root to make it relative to, so `sources` cannot hold it and a
+/// glob has nothing to match through the ordinary identity seam (LESSON-623).
+/// The classifier still recognises it — the boundary globs are matched against
+/// the resolved absolute path with its leading `/` stripped, which is what lets
+/// `**/.ssh/**` reach it — and what the fold has to carry forward is a
+/// **`boundary_touch` bit**, not `unknown`.
+///
+/// The distinction has no effect on *this* turn (both refuse), which is exactly
+/// why it needs its own test: the difference is in the **pin**. `boundary_touch`
+/// reaches egress as `<boundary-touch>`, and `taint::cause_of` reads that path
+/// to hold the pin permanently; folding it into `unknown` would make
+/// `~/.ssh/config` liftable by `/shell allow` (REQ-614 ADR-614-3, BUG-215).
+///
+/// Its twin above is the in-root case, where the path *does* mint and the block
+/// names the actual file — so the two together pin both arms of ADR-619-4's
+/// `BoundaryTouch` row.
+///
+/// **Mutation (run, red, reverted):** make the typed seam ignore the fold's
+/// `boundary_touch` (`skill.boundary_touch = false`) — the turn is still refused
+/// (the expansion is not `unknown`, but nothing else pins it), the
+/// `privacy_block` never fires, and this test goes red. **1 red**, this test —
+/// which is what makes it the one that guards that field on this path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_out_of_root_boundary_preamble_pins_on_the_boundary_touch_sentinel() {
+    let repo = Tree::new("outroot");
+    // Under the **fixture** home this binary points `HOME` at, so `~` resolves
+    // to a directory this test owns and no real key material is involved.
+    let ssh = fixture_home().join(".ssh");
+    std::fs::create_dir_all(&ssh).unwrap();
+    std::fs::write(
+        ssh.join("config"),
+        "Host fixture
+  User nobody
+",
+    )
+    .unwrap();
+    repo.write(
+        ".claude/skills/reachout/SKILL.md",
+        &skill_file(
+            "reads a file outside the root",
+            "Out: !`cat ~/.ssh/config`
+",
+        ),
+    );
+    // One of the thirteen builtins, declared here as the session's only row so
+    // the claim is about this glob and not about whichever builtin fired.
+    let h = Harness::with_boundary(128_000, "**/.ssh/**");
+
+    let session = h.session_at(repo.path());
+    h.at_level(&session, PermissionLevel::Full);
+    let mut sub = h.events.subscribe(256);
+    h.turn(&session, "", Harness::invoke("reachout", ""))
+        .await
+        .expect_err("a preamble naming an out-of-root boundary file pins the turn");
+
+    let blocked = privacy_blocks(&drain(&mut sub).await);
+    assert_eq!(blocked.len(), 1, "exactly one privacy_block: {blocked:?}");
+    assert_eq!(
+        blocked[0].path,
+        tetond::egress::provenance::BOUNDARY_TOUCH_PATH,
+        "an out-of-root boundary path must be distinguishable from a plain \
+         unknown, or `/shell allow` would lift a pin that must not lift"
+    );
+    assert!(
+        h.vendor.sent().is_empty(),
+        "the turn carrying the expansion reached the provider: {:?}",
+        h.vendor.sent()
+    );
+}
+
+/// **REQ-619 BR-8 — a pinned skill turn is announced as a pinned shell turn is,
+/// through the sink that already existed.**
+///
+/// This REQ adds no announcement surface. What it changes is *when* the
+/// announcement fires: BUG-214's `/analyze` session was pinned for life with
+/// nothing said, and its fix routed the prompt turn's choke point through
+/// `TaintingPrivacySink::for_turn_path` — the only place that sees the block's
+/// **path**, which is where the `unknown_shell` / `boundary_hit` distinction
+/// lives. So this test asserts the pair: the cause recorded is `unknown_shell`
+/// (an opaque preamble, not a boundary), the pin is liftable, and the remedy
+/// named is `/shell allow`.
+///
+/// Its twin is `a_boundary_naming_preamble_is_refused_whatever_it_exits` above,
+/// whose path is a real file and whose cause is therefore permanent — the two
+/// together are what stop the fold from collapsing `unknown` and
+/// `boundary_touch` into one bit (ADR-619-2).
+///
+/// **Mutation (run, red, reverted):** publish through the bare `EventBus`
+/// instead of the tainting sink in `run_one_attempt` — no `session_pinned` is
+/// published at all and the length assertion goes red. **2 red**, this test and
+/// `runtime::taint::shell_pin::the_prompt_turn_egress_installs_the_tainting_sink`.
+/// Second mutation (run, red, reverted): collapse the two bits at the seam
+/// (`skill.boundary_touch = folded.unknown || folded.boundary_touch;
+/// skill.unknown = false`) — the cause reads `boundary_hit`, `liftable` goes
+/// false, and both legs redden. **2 red**, this test and
+/// [`a_rooted_preamble_pins_the_expansion_to_its_sources_and_an_opaque_one_marks_it_unknown`].
+///
+/// A mutation that does **not** reach this test, recorded because it is the one
+/// a reader expects to: mapping `unknown` to `BoundaryTouch` inside
+/// `ExpansionProvenance::into_tool_provenance`. That function is the *model*
+/// path's half of ADR-619-4; the typed path writes the three fields onto
+/// `SkillTurn` and never goes through it, and `runtime::expansion_provenance`
+/// feeds only the naming duty. `provenance_egress.rs` is where that arm is
+/// pinned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pinned_skill_turn_is_announced_through_the_existing_sink() {
+    let repo = Tree::new("announce");
+    repo.write(
+        ".claude/skills/opaque/SKILL.md",
+        &skill_file("runs an opaque command", "Out: !`sh -c 'echo x'`\n"),
+    );
+    let h = Harness::with_boundary(128_000, "secrets/**");
+
+    let session = h.session_at(repo.path());
+    h.at_level(&session, PermissionLevel::Full);
+    let mut sub = h.events.subscribe(256);
+    h.turn(&session, "", Harness::invoke("opaque", ""))
+        .await
+        .expect_err("an opaque preamble pins the turn");
+
+    let published = drain(&mut sub).await;
+    let pins = session_pins(&published);
+    assert_eq!(pins.len(), 1, "exactly one session_pinned: {pins:?}");
+    assert_eq!(
+        pins[0].cause, "unknown_shell",
+        "an unprovable preamble is the shell cause, not a boundary hit — the two \
+         differ in whether the pin can ever be lifted"
+    );
+    assert!(
+        pins[0].liftable,
+        "an `unknown_shell` pin is the one a user can lift (REQ-614 BR-5)"
+    );
+    match &pins[0].remedy {
+        teton_protocol::events::PinRemedy::Command(command) => assert!(
+            command.contains("/shell allow"),
+            "the announcement carries the command that lifts it, or BUG-214's \
+             silence is only half fixed: {command}"
+        ),
+        other => panic!("a liftable pin names the command that lifts it: {other:?}"),
+    }
+
+    // Non-vacuity: the refusal really is the one that pinned, and it named the
+    // sentinel rather than a file.
+    let blocked = privacy_blocks(&published);
+    assert_eq!(blocked.len(), 1, "exactly one privacy_block: {blocked:?}");
+    assert_eq!(
+        blocked[0].path,
+        tetond::egress::provenance::UNKNOWN_PROVENANCE_PATH
+    );
+}
+
+/// **REQ-619 BR-1, LESSON-550 — the retired rule cannot come back by hand.**
+///
+/// `DynamicOutcome::spawned` was the predicate both provenance seams read: the
+/// typed path OR'd `outcomes.iter().any(spawned)` into `SkillTurn::unknown` and
+/// the `skill` tool matched `(source, spawned)`. Both are gone, replaced by a
+/// verdict taken before the spawn. Nothing behavioural can assert their absence
+/// — a build that *also* OR'd `spawned` back in would fail the tests above, but
+/// only for the fixtures those tests happen to carry, and a narrower
+/// reintroduction (say, only on the model path) would leave a green suite. So
+/// the absence is asserted as a fact about the source, which is what LESSON-550
+/// asks of a defect that has a name.
+///
+/// **The predicate itself is not deleted**, and this scan deliberately does not
+/// ask for that: `spawned` is still a legitimate question about an outcome —
+/// `skills::provenance`'s own `did_spawn` asks it under a different name and for
+/// a different reason (did the door let it through, not may this pin the turn),
+/// and test fixtures ask it too. What must not come back is a **production
+/// provenance decision** reading it, in the two files that make one.
+///
+/// The vacuity floor is the other half: a scan over sources that no longer
+/// mention the fold would pass by having nothing to look at, so both files are
+/// required to call `fold_expansion(`.
+///
+/// **Mutation (run, red, reverted):** add
+/// `skill.unknown |= outcomes.iter().any(DynamicOutcome::spawned);` back to
+/// `settle_dynamic_context` — this test goes red naming `runtime/turn.rs`.
+/// **4 red** in this file, this one among them. Second mutation (run, red,
+/// reverted): replace `fold_expansion(` in `harness/tools/skill.rs` with an
+/// inline `match identity` — the vacuity floor goes red naming that file.
+/// **1 red**, this test. Third mutation (run, red, reverted): restore the
+/// `(source, spawned)` match in `expand_and_fold` — this test goes red naming
+/// `harness/tools/skill.rs`. **6 red** across the workspace, this one among
+/// them.
+#[test]
+fn no_production_provenance_reads_spawned_any_more() {
+    /// The production half of one file, cut at its **test module**.
+    ///
+    /// Deliberately not [`production_source`], which cuts at the first
+    /// column-0 `#[cfg(test)]` of a file. `harness/tools/skill.rs` carries one
+    /// of those at line ~811 — a single test-only helper
+    /// (`durable_trust_root_name_by_resolving`), gated exactly so production
+    /// cannot reach it — and cutting there would leave 1,500 lines of
+    /// production code, the provenance mapping among them, outside the corpus.
+    /// A scan that silently stops before the thing it is scanning for is the
+    /// failure mode LESSON-594 names, and the vacuity floor below is what would
+    /// have caught it (and did).
+    fn production_half_of(relative: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join(relative);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        match text.find("\n#[cfg(test)]\nmod tests {") {
+            Some(at) => text[..at].to_owned(),
+            None => text,
+        }
+    }
+
+    for relative in ["runtime/turn.rs", "harness/tools/skill.rs"] {
+        let source = production_half_of(relative);
+        // Code, not prose *about* code: both files explain in comments why the
+        // rule was retired, and a scan that reddened on the explanation would
+        // make the honest thing to write the thing that fails.
+        let code: String = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for spelling in ["DynamicOutcome::spawned", ".any(DynamicOutcome::spawned)"] {
+            assert!(
+                !code.contains(spelling),
+                "`{relative}` reads `{spelling}` for provenance again; REQ-619 \
+                 BR-1 replaced that rule with a verdict taken before the spawn, \
+                 and reading both is how the two seams come to disagree"
+            );
+        }
+        assert!(
+            source.contains("fold_expansion("),
+            "vacuity floor: `{relative}` no longer calls the fold, so the \
+             absence above is the absence of a call site rather than of a rule"
+        );
     }
 }
 
@@ -4319,8 +4790,15 @@ fn no_model_call_happens_at_expansion_time() {
     );
 
     let seam = settle_dynamic_context_body();
+    // REQ-619 TASK-399 moved the spelling, not the hazard, and TASK-401 moved
+    // it back: the seam reads `skills::dynamic::run_all(` again, now with a
+    // `Reach` built from the turn's own `ToolContext`. The pin is on the
+    // **runner's name**, which every one of those spellings carries and which
+    // the `shell` tool's own path never does, so this keys on "the expansion
+    // goes through the extracted runner" rather than on the module path it is
+    // reached through (conventions.md: assert on the hazard).
     assert!(
-        seam.contains("skills::run_all("),
+        seam.contains("::run_all"),
         "the dynamic context must run through the extracted runner (ADR-14), \
          which is the caller that has no duty attached to it"
     );

@@ -18,7 +18,9 @@
 //! registry; [`frontmatter`] turns one file's bytes into a header and a body;
 //! [`expand`] turns a registry row and a typed argument string into the one
 //! [`Expansion`] a turn is composed from; [`dynamic`] holds the `` !`cmd` ``
-//! grammar and the single I/O edge that runs those commands.
+//! grammar and the single I/O edge that runs those commands; [`provenance`]
+//! folds a skill's identity and its preambles' verdicts into the one
+//! provenance both invocation paths carry (REQ-619 ADR-619-4).
 //!
 //! # Nothing here is a setting
 //!
@@ -70,6 +72,7 @@ pub mod discovery;
 pub mod dynamic;
 pub mod expand;
 pub mod frontmatter;
+pub mod provenance;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
