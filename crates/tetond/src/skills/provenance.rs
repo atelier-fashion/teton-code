@@ -64,24 +64,29 @@ impl ExpansionProvenance {
     /// This expansion as the [`ToolProvenance`] a model-invoked `skill` result
     /// is tagged with (ADR-619-4's second consumer).
     ///
-    /// The arms are `ShellTool::run`'s, in `ShellTool::run`'s order, because a
+    /// The mapping is not written here. [`ToolProvenance::from_bits`] is the one
+    /// precedence, shared with `ShellTool::run` and
+    /// `ContextManager::compaction_summary` (REQ-619 verify, M3), because a
     /// skill expansion and a `shell` result mean the same thing to egress and
-    /// two orderings of one mapping are how one of them comes to be laxer
-    /// (REQ-614 BR-10). There the in-root boundary case is a `Sources` arm
-    /// ahead of the sentinel; here [`fold_expansion`] has already folded those
-    /// ids into `sources`, so what reaches this function is the out-of-root
-    /// residue alone.
+    /// three hand-written orderings of one mapping are how one of them comes to
+    /// be laxer (REQ-614 BR-10). This function's whole job is to say that an
+    /// [`ExpansionProvenance`]'s three fields *are* those three bits.
     ///
-    /// # Why `boundary_touch` outranks `unknown`
+    /// # What the shared mapping does with them
     ///
-    /// Both refuse the send, so the choice cannot make the turn laxer — it
-    /// decides what the refusal **reports**. `ToolProvenance::BoundaryTouch`
-    /// reports `<boundary-touch>` as the path, and `taint::cause_of` reads that
-    /// path to record `boundary_hit` and hold the pin permanently; `Unknown`
-    /// reports `<unknown-provenance>`, which `/shell allow` may lift (REQ-614
-    /// ADR-614-3, BUG-215). An expansion that both read `~/.ssh/config` and ran
-    /// an opaque verb has to keep the permanent cause, so the more specific
-    /// reading goes first.
+    /// `boundary_touch` first: every arm refuses the send, so the order cannot
+    /// make a turn laxer — it decides what the refusal **reports**.
+    /// `BoundaryTouch` reports `<boundary-touch>`, which `taint::cause_of` reads
+    /// to hold the pin permanently; `Unknown` reports `<unknown-provenance>`,
+    /// which `/shell allow` may lift (REQ-614 ADR-614-3, BUG-215).
+    ///
+    /// Then the C1 arm, which is why the hand-written version had to go: an
+    /// expansion that is `unknown` **and** proved ids maps to
+    /// [`ToolProvenance::UnknownWith`], not to a bare `Unknown`. A skill whose
+    /// preambles are `` !`sh -c 'echo hi'` `` and `` !`cat secrets/prod.env` ``
+    /// folds to exactly that pair; collapsing it dropped `secrets/prod.env`, and
+    /// then `/shell allow` cleared the opacity over an **empty** source set —
+    /// a clean provenance, and the secret left the machine.
     ///
     /// `Sources` last, and it may be empty: an expansion with a minted identity
     /// and no preambles is a `read` of one file, and one with neither — a
@@ -89,13 +94,7 @@ impl ExpansionProvenance {
     /// nothing and pins nothing.
     #[must_use]
     pub fn into_tool_provenance(self) -> ToolProvenance {
-        if self.boundary_touch {
-            ToolProvenance::BoundaryTouch
-        } else if self.unknown {
-            ToolProvenance::Unknown
-        } else {
-            ToolProvenance::Sources(self.sources)
-        }
+        ToolProvenance::from_bits(self.sources, self.unknown, self.boundary_touch)
     }
 }
 
@@ -289,10 +288,12 @@ mod tests {
     ///
     /// The C2 row has its own (REQ-619 verify): drop `run.verdict.out_of_root_touch ||`
     /// from the `BoundaryTouch` arm, leaving the old `sources.is_empty()`
-    /// reading, and **exactly one** assertion in the crate goes red — this
+    /// reading, and **exactly one** assertion in the library goes red — this
     /// test's *an out-of-root touch is permanent however many in-root files
-    /// rode along*. That count is the finding: the leak had no coverage
-    /// anywhere, because every existing row names either an in-root path or no
+    /// rode along* — plus exactly one at the wire, the e2e
+    /// `a_preamble_touching_a_boundary_outside_the_root_beside_an_in_root_file_is_refused`,
+    /// which sees no `privacy_block` at all. Two, one per altitude, and neither
+    /// existed before: every other row here names either an in-root path or no
     /// path, and the bug lives only where a command names both.
     #[test]
     fn the_fold_follows_the_adr_table() {
@@ -519,21 +520,34 @@ mod tests {
 
     /// The second consumer's mapping (ADR-619-4), and its precedence.
     ///
-    /// `ShellTool::run`'s arms in `ShellTool::run`'s order: the permanent cause
-    /// first, then the liftable one, then the ids. An expansion carrying both
-    /// bits must map to `BoundaryTouch` — mapping it to `Unknown` would refuse
-    /// the same send today and make the pin liftable by `/shell allow`, which is
-    /// the whole difference the bit exists to carry.
+    /// The precedence itself belongs to [`ToolProvenance::from_bits`] and is
+    /// tested there row for row; what this test pins is that *this* consumer
+    /// still routes through it — i.e. that an expansion's three fields land in
+    /// the three parameters, in that order, with nothing re-decided on the way.
+    ///
+    /// The middle case is REQ-619 verify C1 and is the reason the hand-written
+    /// match is gone. An expansion that is `unknown` **and** names
+    /// `secrets/prod.env` used to map to a bare `Unknown`: the send was refused,
+    /// so nothing looked wrong — and then `/shell allow` lifted the opacity over
+    /// an empty source set, which is a *clean* provenance, and the secret left.
+    /// `UnknownWith` keeps the id for the glob to match after the lift.
     ///
     /// # Mutation
     ///
-    /// Ran with the first two arms swapped (`unknown` tested first): red on
-    /// `an expansion that touched a boundary keeps the permanent cause`,
-    /// `left: Unknown, right: BoundaryTouch` — the send still refused, the pin
-    /// now liftable. Restored: green.
+    /// Ran with `into_tool_provenance` reverted to the hand-written match
+    /// (`unknown → ToolProvenance::Unknown`, the leak): **two red**, this test
+    /// on `an unknown expansion still names what it proved` (`left: Unknown,
+    /// right: UnknownWith({secrets/prod.env})`) and the e2e
+    /// `a_model_invoked_skill_with_an_opaque_and_a_boundary_preamble_keeps_the_file_after_a_lift`,
+    /// which is the same bug measured at the wire. Restored: green.
+    ///
+    /// Ran again with the `sources`/`unknown` arguments to `from_bits` swapped
+    /// — which does not compile, and that is the point of routing through a
+    /// typed shared mapping rather than three hand-written matches.
     #[test]
     fn the_tool_provenance_mapping_is_the_shell_tools() {
         let sources: BTreeSet<_> = [fixture_id("README.md")].into_iter().collect();
+        let secret: BTreeSet<_> = [fixture_id("secrets/prod.env")].into_iter().collect();
 
         assert_eq!(
             ExpansionProvenance {
@@ -544,9 +558,22 @@ mod tests {
             .into_tool_provenance(),
             ToolProvenance::Sources(sources.clone())
         );
+        // C1: unknown reach that nonetheless proved a path keeps the path.
         assert_eq!(
             ExpansionProvenance {
-                sources: sources.clone(),
+                sources: secret.clone(),
+                unknown: true,
+                boundary_touch: false,
+            }
+            .into_tool_provenance(),
+            ToolProvenance::UnknownWith(secret),
+            "an unknown expansion still names what it proved"
+        );
+        // And an unknown expansion with nothing proved is still the bare
+        // sentinel — the arm above must not have swallowed this one.
+        assert_eq!(
+            ExpansionProvenance {
+                sources: BTreeSet::new(),
                 unknown: true,
                 boundary_touch: false,
             }
