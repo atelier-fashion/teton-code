@@ -200,10 +200,26 @@ grant crosses between the two: at `guarded` and `edits` the session lists every
 command of the invocation and asks once, `plan` does not run them, `full` runs
 them, and piped into a session at a level that would ask they are refused
 without a line of stdin being read. Whatever did not run leaves a placeholder
-saying so, in the prompt, where the model can see it. One consequence worth
-knowing before you configure a boundary: dynamic-context output is unattributed,
-like all shell output, so an invocation that ran one pins that turn to this
-machine.
+saying so, in the prompt, where the model can see it.
+
+A skill's file and each of its commands are judged the way everything else is.
+The file itself counts as read — a skill under `~/.claude` is weighed against
+your boundary globs exactly as one in the repository is, so a skill matching
+none of them routes wherever the turn would have routed anyway, and one under a
+glob you wrote over your skills directory is refused naming that file. Write
+that glob in the `**/…` or `~/…` spelling — `**/.claude/skills/**`,
+`~/.claude/**` — because a user skill's identity is home-scoped and a
+repo-anchored or absolute one (`.claude/skills/**`, `/Users/you/.claude/**`)
+matches nothing at all. Each
+`` !`cmd` `` is classified **before it runs**, on the same rules a `shell`
+command gets: a command whose paths are all inside the session root and touch no
+boundary is proved harmless and contributes what it read; one that names a
+protected file pins the session to this machine for good; one nothing can prove
+— `sh`, an interpreter, a line with shell syntax in it — pins it too, but you
+can lift that with `/shell allow` once you know what the command was. Output and
+exit status change none of it. `/verbose` prints a `reach:` line under each
+command that was not proved harmless, so a skill with four commands tells you
+which one pinned the session.
 
 A skill the **repository** supplies is a file you did not write, expanded into a
 turn as instructions, so the session asks once per repository whether you trust
@@ -493,7 +509,11 @@ Two promises, both made visible:
   savings vs. an all-frontier baseline (`teton cost`).
 - **Privacy boundaries** — mark paths as *local-only* and their content never
   leaves your machine. Enforced at the daemon's single egress point, verified by
-  egress-capture tests, not vibes.
+  egress-capture tests, not vibes. Anything the daemon cannot *prove* stayed
+  inside the boundary is treated as if it crossed one: a session that reads a
+  protected file is pinned to this machine for the rest of its life, and one
+  that ran a command — or a skill preamble — whose reach could not be proved is
+  pinned until you type `/shell allow`.
 
 ### Turning on web lookup
 

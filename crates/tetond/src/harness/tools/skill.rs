@@ -79,8 +79,11 @@ use super::super::render;
 use super::{ResultDisposition, Tool, ToolContext, ToolOutcome, ToolRegistry};
 use crate::grants::ConnectionId;
 use crate::session_root::home;
-use crate::skills::dynamic::{closed_door, door_outcome, outcome_view};
-use crate::skills::{expand, run_all, Skill, SkillRegistry, SkillSource};
+use crate::skills::dynamic::{
+    closed_door, door_outcome, outcome_view, preamble_verdict, run_all, PreambleReach, PreambleRun,
+};
+use crate::skills::provenance::fold_expansion;
+use crate::skills::{expand, Skill, SkillIdentity, SkillRegistry, SkillSource};
 
 /// The name the model calls this tool by.
 ///
@@ -1331,9 +1334,14 @@ impl Refusal {
     /// here clears `context_provenance` and the next remote turn takes those
     /// bytes off the machine, which is the thing BR-10 is.
     #[must_use]
-    pub fn into_outcome(self, registry: &SkillRegistry, root: &std::path::Path) -> ToolOutcome {
+    pub fn into_outcome(
+        self,
+        registry: &SkillRegistry,
+        root: &std::path::Path,
+        boundaries: &[teton_core::entities::PrivacyBoundary],
+    ) -> ToolOutcome {
         ToolOutcome::error(self.message(registry))
-            .with_provenance(roster_provenance(registry, root))
+            .with_provenance(roster_provenance(registry, root, boundaries))
             .with_disposition(ResultDisposition::UntrustedData)
     }
 }
@@ -1342,38 +1350,61 @@ impl Refusal {
 /// than out of one body: the `listed` reply and every typed refusal (ADR-8).
 ///
 /// The union of every model-invocable skill's minted identity, and
-/// [`ToolProvenance::Unknown`] the moment one row will not mint. A user skill
-/// never mints — `~/.claude/skills/…` has no root-relative identity in a
-/// repo-rooted session (REQ-585 ADR-9 refused to widen the minter) — so a
-/// session with any user skill in it renders `Unknown` here, which is the same
-/// posture that session's *expansions* get and the same one `shell` output
-/// gets.
+/// [`ToolProvenance::Unknown`] the moment one row will not mint.
+///
+/// **REQ-619 BR-3 narrowed what "will not mint" means.** A user skill used to
+/// be the ordinary way this answered `Unknown`: `~/.claude/skills/…` had no
+/// root-relative identity in a repo-rooted session, so a machine with any user
+/// skill on it rendered every roster and every refusal unpinnable — the roster
+/// half of the pin BUG-214 filed. `skills::provenance_of` now mints a
+/// `~`-scoped id for a file discovery listed under a user root, so a mixed
+/// roster is the **union** of `~`-scoped and repo-scoped ids and each is
+/// matched against the boundary globs on its own. `None` is still what a file
+/// under neither root answers, and it is still fail-closed for the whole
+/// roster: this is one result and it cannot be `Sources` for half of itself.
 ///
 /// `Sources(∅)` is deliberately unreachable from this function even for an
 /// empty roster: the tool is only registered when at least one skill is
 /// model-invocable ([`register_skill_tool`]), so every result it can produce
 /// describes at least one file.
 #[must_use]
-pub fn roster_provenance(registry: &SkillRegistry, root: &std::path::Path) -> ToolProvenance {
-    let mut ids = Vec::new();
+pub fn roster_provenance(
+    registry: &SkillRegistry,
+    root: &std::path::Path,
+    boundaries: &[teton_core::entities::PrivacyBoundary],
+) -> ToolProvenance {
+    let mut ids = std::collections::BTreeSet::new();
+    let mut unknown = false;
+    let mut boundary_touch = false;
     for skill in model_invocable(registry) {
         // Through `skills::provenance_of`, never `ProvenanceId::from_resolved`
         // directly: that is **the** mint for a skill body, and it resolves both
-        // sides. `Skill::path` is the spelling discovery walked, and a project
-        // root may be a symlink *within* the repository
-        // (`.claude/skills -> vendor/skills`), which `discover` permits — so
-        // minting off the spelling gives one file two identities and a
-        // `vendor/**` boundary matches neither.
-        match crate::skills::provenance_of(root, skill) {
-            Some(id) => ids.push(id),
-            // A user skill has no repo-relative identity, and a project skill
-            // that will not resolve is one this jail cannot name. Both are
-            // fail-closed here, which is the posture `provenance_of` documents
-            // for its `None`.
-            None => return ToolProvenance::Unknown,
+        // sides — the session root first, the daemon's `$HOME` for a user row
+        // the root does not strip (REQ-619 verify, M2). `Skill::path` is the
+        // spelling discovery walked, and a project root may be a symlink
+        // *within* the repository (`.claude/skills -> vendor/skills`), which
+        // `discover` permits — so minting off the spelling gives one file two
+        // identities and a `vendor/**` boundary matches neither.
+        match crate::skills::provenance_of(root, skill, boundaries) {
+            SkillIdentity::Minted(id) => {
+                ids.insert(id);
+            }
+            // A row whose *path* a boundary glob names though no scope mints it
+            // — a skills directory linked to `~/.ssh`, say (REQ-619 verify,
+            // M6). Permanent, and it outranks the liftable bit below.
+            SkillIdentity::BoundaryTouch => boundary_touch = true,
+            // A row this daemon cannot name at all: a project file that will
+            // not resolve, or a user file under no home it knows of (a daemon
+            // started without `HOME`, a skills directory symlinked somewhere
+            // ordinary). Fail closed, liftably.
+            SkillIdentity::Unmintable => unknown = true,
         }
     }
-    ToolProvenance::paths(ids)
+    // The **one** precedence (REQ-619 verify, M3), which also means an
+    // unnameable row no longer discards the ids of the rows beside it: a mixed
+    // roster is `UnknownWith`, so a `/shell allow` over it still has the other
+    // skill files to match globs against (C1).
+    ToolProvenance::from_bits(ids, unknown, boundary_touch)
 }
 
 /// The registry row a refusal's record describes, or `None` when nothing of
@@ -1764,7 +1795,7 @@ impl SkillTool {
                 }),
             );
         }
-        refusal.into_outcome(&self.registry, ctx.repo_root())
+        refusal.into_outcome(&self.registry, ctx.repo_root(), ctx.boundaries())
     }
 
     /// The whole orchestration, async because the consent round-trips are.
@@ -1799,7 +1830,11 @@ impl SkillTool {
             // the call touched no repo file while handing the model the text of
             // every skill file in the session (BR-10).
             return ToolOutcome::ok(render_listing(&self.registry))
-                .with_provenance(roster_provenance(&self.registry, ctx.repo_root()))
+                .with_provenance(roster_provenance(
+                    &self.registry,
+                    ctx.repo_root(),
+                    ctx.boundaries(),
+                ))
                 .with_disposition(ResultDisposition::UntrustedData);
         };
 
@@ -1988,23 +2023,68 @@ impl SkillTool {
             closed_door(consent)
         };
 
-        let outcomes = match door {
+        // REQ-619 ADR-619-1: the four values `ShellTool::run` hands the
+        // classifier, taken off the **same** `ToolContext` the commands are
+        // jailed to. One context, so the denial set the jail applies and the
+        // one the classifier applies cannot come apart — and the typed path
+        // assembles this from its own turn context in exactly this shape.
+        let reach = PreambleReach {
+            root: ctx.repo_root().to_path_buf(),
+            root_kind: ctx.root_kind(),
+            boundaries: ctx.boundaries().to_vec(),
+            denied_prefixes: ctx.denied_prefixes().to_vec(),
+        };
+        let runs: Vec<PreambleRun> = match door {
             None if !commands.is_empty() => {
-                let root = ctx.repo_root().to_path_buf();
+                let reach = reach.clone();
                 let to_run = commands.clone();
                 let timeout_ms = self.command_timeout_ms;
                 // On the blocking pool: `run_all` waits on a child process for
                 // up to the deadline, per command, and a turn that parked an
                 // async worker that long would stall every other session on it.
-                tokio::task::spawn_blocking(move || run_all(&root, &to_run, timeout_ms))
+                tokio::task::spawn_blocking(move || run_all(&reach, &to_run, timeout_ms))
                     .await
                     .expect("the dynamic-context runner does not panic")
             }
             None => Vec::new(),
             // One closed door is the same answer for every command, because the
             // question was asked once about all of them.
-            Some(reason) => vec![door_outcome(reason); commands.len()],
+            //
+            // Classified anyway (REQ-619 BR-1): the verdict is a fact about the
+            // command text, not about a process, so the record below has one
+            // for every command. The fold ignores a `NotRun`'s verdict — BR-2's
+            // "a command that did not run contributes nothing" — which is
+            // decided in `fold_expansion` and not by withholding it here.
+            //
+            // **On the blocking pool, exactly as the arm above (REQ-619 verify,
+            // M1).** No process is spawned here, which is what made an inline
+            // call look free — but `preamble_verdict` walks a subtree to decide
+            // whether a directory a command reads could hold a protected file,
+            // with a per-command budget of up to 1.5 s
+            // (`shell_provenance::subtree_is_boundary_free`), and an invocation
+            // may carry `MAX_DYNAMIC_COMMANDS` of them. A declined invocation
+            // could therefore park an async worker for tens of seconds and
+            // stall every other session on it — the same reason the
+            // consent-given arm is not inline. The door being shut changes how
+            // long the work takes, not where it belongs.
+            Some(reason) => {
+                let reach = reach.clone();
+                let to_classify = commands.clone();
+                tokio::task::spawn_blocking(move || {
+                    to_classify
+                        .iter()
+                        .map(|command| PreambleRun {
+                            verdict: preamble_verdict(&reach, command),
+                            outcome: door_outcome(reason),
+                        })
+                        .collect()
+                })
+                .await
+                .expect("the preamble classifier does not panic")
+            }
         };
+        let outcomes: Vec<crate::skills::DynamicOutcome> =
+            runs.iter().map(|run| run.outcome.clone()).collect();
 
         // REQ-615 BR-6: the model-invoked path publishes the same notice the
         // typed path does. Two call sites because the two paths reach the fold
@@ -2034,31 +2114,29 @@ impl SkillTool {
         // ADR-8: set **explicitly**, because the default is the wrong posture.
         // `ToolOutcome::ok` defaults to `Sources(∅)`, which `teton_docs` chose
         // because its bodies are compiled in; for a skill body it is fail-open —
-        // a user skill has no root-relative identity (REQ-585 ADR-9 refused to
-        // widen the minter) and would egress under any boundary.
-        let spawned = outcomes.iter().any(crate::skills::DynamicOutcome::spawned);
-        let provenance = match (skill.source, spawned) {
-            // Anything a command produced carries what `shell` output carries:
-            // nothing that can be pinned.
-            (_, true) | (SkillSource::User, _) => ToolProvenance::Unknown,
-            (SkillSource::Project, false) => {
-                // The **one** mint (`skills::provenance_of`), which the user
-                // path reaches through `accept_invocation`. It resolves the
-                // file and the root before minting, so a skills root symlinked
-                // within the repository yields the id of the real file rather
-                // than of the link — one file, one identity, whichever caller
-                // asked.
-                match crate::skills::provenance_of(ctx.repo_root(), skill) {
-                    Some(id) => ToolProvenance::path(id),
-                    // A project skill that will not mint is not a project skill
-                    // this jail can name. Fail closed rather than claim ∅.
-                    None => ToolProvenance::Unknown,
-                }
-            }
-        };
+        // an expansion that cannot be proved must say so rather than claim it
+        // touched nothing.
+        //
+        // **REQ-619 BR-6: the same fold the typed path uses, and the same
+        // mapping `ShellTool::run` gives a verdict.** What stood here was
+        // `match (skill.source, spawned)`, whose `(_, true) | (User, _) =>
+        // Unknown` arm was two retired rules in one expression: every user
+        // skill unpinnable for being a user skill (BR-3 retires it), and every
+        // invocation that reached a process unpinnable for having reached one
+        // (BR-1/BR-2 retire it). Neither the source nor the outcome is read
+        // now; the identity and the verdicts are.
+        //
+        // The **one** mint (`skills::provenance_of`), which the typed path
+        // reaches through `accept_invocation`. It resolves the file and the
+        // root before minting, so a skills root symlinked within the repository
+        // yields the id of the real file rather than of the link — one file,
+        // one identity, whichever caller asked — and it answers `~/…` for a
+        // user skill under the daemon's home.
+        let identity = crate::skills::provenance_of(ctx.repo_root(), skill, ctx.boundaries());
+        let provenance = fold_expansion(identity, &runs).into_tool_provenance();
 
         self.turn_state().note_expansion(&skill.name, arguments);
-        self.publish_invocation(skill, &display, shadows, &commands, &outcomes, door, None);
+        self.publish_invocation(skill, &display, shadows, &commands, &runs, door, None);
         ToolOutcome::ok(text)
             .with_provenance(provenance)
             .with_disposition(ResultDisposition::Expansion)
@@ -2093,7 +2171,11 @@ impl SkillTool {
         display: &str,
         shadows_user_skill: bool,
         commands: &[crate::skills::Command],
-        outcomes: &[crate::skills::DynamicOutcome],
+        // The verdict-and-outcome pairs, not bare outcomes: REQ-619 ADR-619-5
+        // puts each command's reach on this record beside its `ran` / `failed`
+        // / `timed out` fact, and the projection below is the **one**
+        // `dynamic::outcome_view` the typed path also goes through.
+        runs: &[PreambleRun],
         door: Option<NotRunReason>,
         refused: Option<&str>,
     ) {
@@ -2124,8 +2206,8 @@ impl SkillTool {
                 // (LESSON-544).
                 outcomes: commands
                     .iter()
-                    .zip(outcomes.iter())
-                    .map(|(command, outcome)| outcome_view(command, outcome, door))
+                    .zip(runs.iter())
+                    .map(|(command, run)| outcome_view(command, run, door))
                     .collect(),
                 invoked_by: InvokedBy::Model,
                 // The caller's reading, passed in. `expand_and_fold` asks the
@@ -2281,6 +2363,21 @@ mod tests {
     // fixtures — in-repo and deterministic, never a read of `~/.claude`
     // -----------------------------------------------------------------------
 
+    /// The one directory every suite that needs a real `$HOME` builds under
+    /// (REQ-619 verify, m7) — one named parent, rather than a
+    /// differently-prefixed family per suite that only its own author would
+    /// recognize.
+    const FIXTURE_HOME_PARENT: &str = ".teton-test-fixtures";
+
+    /// What a suite says when it cannot find a `$HOME` to build under. Verbatim
+    /// in `tests/provenance_egress.rs` and `tests/skill_boundary.rs` too, and a
+    /// **panic** in all three: the alternative is a test that reports success
+    /// for having asserted nothing (LESSON-594).
+    const NEEDS_A_HOME: &str =
+        "this fixture needs a real $HOME: a user skill's identity is minted \
+     against `session_root::home()`, so a run without one would be asserting \
+     about a scope that does not exist (REQ-619 BR-3)";
+
     /// A throwaway tree with a `home` and a `repo` in it (the
     /// `skills_discovery.rs` shape), removed on drop.
     ///
@@ -2343,6 +2440,65 @@ mod tests {
         fn ctx(&self) -> ToolContext {
             ToolContext::new(self.repo())
         }
+    }
+
+    /// [`Fixture::new`]'s tree, built under the daemon's **real** `$HOME`
+    /// (REQ-619 TASK-401).
+    ///
+    /// `skills::provenance_of` mints a user skill's identity against
+    /// `session_root::home()`, which reads `HOME` — process-wide state this
+    /// binary must not write to: `session_root`'s own tests read it, and a
+    /// fixture that set it would be setting it for every test running beside
+    /// this one (LESSON-540). So the way to put a file **under** the home the
+    /// daemon will actually use is to build the fixture there, in a
+    /// process-and-sequence-named directory removed on drop.
+    ///
+    /// **It panics on a process with no `HOME`** (REQ-619 verify, m7). It used
+    /// to answer `None`, and both callers met that with a bare `return` — a
+    /// test that reports success for having asserted nothing, which is exactly
+    /// the silence LESSON-594 is about. A run with no `HOME` cannot say
+    /// anything about the `~` scope, and that is worth failing over: the
+    /// message is the same sentence `provenance_egress.rs` and
+    /// `skill_boundary.rs` print, so whoever meets it once recognizes it
+    /// everywhere.
+    fn fixture_under_home() -> Fixture {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let home = crate::session_root::home().expect(NEEDS_A_HOME);
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        let root = home
+            .join(FIXTURE_HOME_PARENT)
+            .join(format!("skill-tool-{}-{seq}", std::process::id()));
+        std::fs::create_dir_all(root.join("home")).unwrap();
+        std::fs::create_dir_all(root.join("repo")).unwrap();
+        Fixture { root }
+    }
+
+    /// [`ac1_fixture`]'s rows on a tree under the real `$HOME`, so the user
+    /// rows mint (REQ-619 BR-3).
+    fn ac1_fixture_under_home() -> Fixture {
+        let fx = fixture_under_home();
+        fx.user("alpha", "description: the alpha skill\n", "Alpha body.\n");
+        fx.user("beta", "disable-model-invocation: true\n", "Beta body.\n");
+        fx.user("delta", "user-invocable: false\n", "Delta body.\n");
+        fx.project("gamma", "description: the gamma skill\n", "Gamma body.\n");
+        fx
+    }
+
+    /// The `~`-scoped id a file at `<fixture>/home/<relative>` must mint.
+    ///
+    /// Composed from the fixture's own layout rather than by calling the minter
+    /// under test: an expectation built with `from_home_resolved` would agree
+    /// with any implementation of it, including a wrong one.
+    fn home_scoped_id(fx: &Fixture, relative: &str) -> String {
+        let home = std::fs::canonicalize(crate::session_root::home().expect("a home"))
+            .expect("the home resolves");
+        let file = std::fs::canonicalize(fx.home().join(relative)).expect("the fixture file");
+        format!(
+            "~/{}",
+            file.strip_prefix(&home)
+                .expect("the fixture is built under the home")
+                .display()
+        )
     }
 
     impl Drop for Fixture {
@@ -3101,23 +3257,61 @@ mod tests {
     ///
     /// `ToolOutcome::ok` defaults to `Sources(∅)` — `teton_docs`' posture,
     /// because its bodies are compiled in. For a skill body that default is
-    /// **fail-open**: a user skill has no root-relative identity (REQ-585 ADR-9
-    /// refused to widen the minter), so `Sources(∅)` would let `~/.claude` bytes
-    /// egress under any boundary. Both rules are asserted, because they are
-    /// two rules and not one (BR-10).
+    /// **fail-open**: `Sources(∅)` means "touched no repo file", so a body read
+    /// off a disk this jail may or may not be able to name would egress under
+    /// any boundary. Both rules are asserted, because they are two rules and
+    /// not one (BR-10).
+    ///
+    /// **REQ-619 BR-3/BR-6 — the flip.** This was
+    /// `a_user_skill_is_unknown_and_a_project_skill_mints`, and its user leg
+    /// asserted `ToolProvenance::Unknown` on the grounds that
+    /// `~/.claude/skills/…` had no identity at all. It has one now — a
+    /// `~`-scoped id minted against the daemon's own `$HOME` — and the mapping
+    /// that used to answer `Unknown` for the *source* (`(SkillSource::User, _)`)
+    /// is gone with it. What is asserted here is that the two scopes produce
+    /// two ids and never one string: a user skill at `skills/x/SKILL.md` and a
+    /// project file at the same relative path must not collide, which is what
+    /// the `~` marker buys (BR-3).
+    ///
+    /// The fixture lives **under the real `$HOME`** for the reason
+    /// [`fixture_under_home`] gives: the mint reads process-wide state a unit
+    /// test may not write to.
+    ///
+    /// **Mutation, re-measured 2026-09-05 (REQ-619 verify, m8):** restore the
+    /// `(_, true) | (SkillSource::User, _) => ToolProvenance::Unknown` match in
+    /// `expand_and_fold` — the user leg's `Sources` assertion goes red. **24 red
+    /// across the workspace**, not the 6 this record claimed from before the e2e
+    /// suite existed: this test, **18 in `tests/e2e`**, 2 in
+    /// `provenance_egress.rs`, 2 in `skill_boundary.rs` and
+    /// `skill_turn.rs`'s `no_production_provenance_reads_spawned_any_more`.
+    ///
+    /// The e2e eighteen are a cascade of one leak rather than eighteen
+    /// findings: a bare `Unknown` drops the fold's ids, `/shell allow` clears
+    /// it over an empty source set, and `secrets/prod.env` leaves — after which
+    /// the suite-wide `assert_no_boundary_bytes` fails in every egress-touching
+    /// test that runs behind it (REQ-619 verify, C1).
+    ///
+    /// The roster sibling below is still **not** among them, because
+    /// `roster_provenance` never went through that match. Its own mutation is
+    /// recorded there.
     #[tokio::test]
-    async fn a_user_skill_is_unknown_and_a_project_skill_mints() {
-        let fx = ac1_fixture();
+    async fn a_user_skill_mints_a_home_scoped_id_and_a_project_skill_a_repo_scoped_one() {
+        let fx = ac1_fixture_under_home();
+        let expected = home_scoped_id(&fx, ".claude/skills/alpha/SKILL.md");
         let tool = tool(fx.registry());
         let ctx = fx.ctx();
 
         let user = tool.invoke(&ctx, &call(Some("alpha"), "")).await;
-        assert_eq!(
-            user.provenance,
-            ToolProvenance::Unknown,
-            "a `~/.claude` skill has no root-relative identity, so anything but \
-             `Unknown` lets it egress under a boundary it was never judged against"
-        );
+        match &user.provenance {
+            ToolProvenance::Sources(ids) => assert_eq!(
+                ids.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+                vec![expected.as_str()],
+                "a discovered user skill mints in the `~` scope, so a boundary \
+                 glob over the skills directory can match it and one that names \
+                 nothing it touches cannot"
+            ),
+            other => panic!("a user skill under the daemon's home mints: {other:?}"),
+        }
         assert_ne!(
             user.provenance,
             ToolProvenance::none(),
@@ -3134,9 +3328,15 @@ mod tests {
         match &project.provenance {
             ToolProvenance::Sources(ids) => {
                 assert_eq!(ids.len(), 1, "{ids:?}");
+                let id = ids.iter().next().unwrap().as_str();
                 assert!(
-                    ids.iter().next().unwrap().as_str().contains("gamma"),
+                    id.contains("gamma"),
                     "the minted id names the file the body came from: {ids:?}"
+                );
+                assert!(
+                    !id.starts_with('~'),
+                    "a project skill is repo-relative; the `~` scope is the \
+                     user root's alone, or the two could collide: {id}"
                 );
             }
             other => panic!("a project skill is under the root and mints: {other:?}"),
@@ -3206,7 +3406,7 @@ mod tests {
         }
 
         // The roster's mint, which is the same question asked of every row.
-        match roster_provenance(&registry, fx.repo().as_path()) {
+        match roster_provenance(&registry, fx.repo().as_path(), fx.ctx().boundaries()) {
             ToolProvenance::Sources(ids) => assert_eq!(
                 ids.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
                 vec![expected],
@@ -3272,23 +3472,64 @@ mod tests {
     }
 
     /// **M9's other rule: one unmintable row makes the whole roster
-    /// `Unknown`.**
+    /// `Unknown` — and REQ-619 BR-3 narrowed which rows those are.**
     ///
-    /// A user skill has no root-relative identity, and the roster is one
-    /// result: it cannot be `Sources` for half of itself. `Unknown` is the same
-    /// posture that session's expansions get, and it is stricter than a `read`
-    /// of the same bytes — which is BR-10's stated consequence, not a surprise.
+    /// This was `a_roster_holding_a_user_skill_is_unknown_because_one_row_will_not_mint`.
+    /// A user skill *was* the ordinary unmintable row: it had no root-relative
+    /// identity, so a machine with any user skill on it rendered every roster
+    /// and every refusal unpinnable, which is the roster half of BUG-214's pin.
+    /// `skills::provenance_of` now mints a `~`-scoped id for a file discovery
+    /// listed under a user root, so a mixed roster is the **union** of the two
+    /// scopes and each id is matched against the globs on its own.
+    ///
+    /// The fail-closed rule itself is untouched and is not what changed: a row
+    /// that will not mint still makes the whole result `Unknown`, because this
+    /// is one result and cannot be `Sources` for half of itself. What changed is
+    /// that "a user skill" is no longer such a row.
+    ///
+    /// Three rows, not four: `beta` carries `disable-model-invocation`, so the
+    /// roster the model sees does not name it — and asserting the count is what
+    /// keeps this a claim about the union rather than about "some ids".
+    ///
+    /// **Mutation, re-measured 2026-09-05 (REQ-619 verify, m8):** make
+    /// `roster_provenance` return `ToolProvenance::Unknown` for any
+    /// `SkillSource::User` row — the pre-REQ-619 answer — and this test goes red
+    /// on the first assertion. **1 red across the whole workspace**, this test,
+    /// which is what makes it the roster's own guard rather than a second
+    /// reading of the expansion's. The figure was already right and is one of
+    /// the four in this REQ that survived re-measurement unchanged.
     #[tokio::test]
-    async fn a_roster_holding_a_user_skill_is_unknown_because_one_row_will_not_mint() {
-        let fx = ac1_fixture();
+    async fn a_roster_holding_a_user_skill_is_the_union_of_the_two_scopes() {
+        let fx = ac1_fixture_under_home();
+        let alpha = home_scoped_id(&fx, ".claude/skills/alpha/SKILL.md");
+        let delta = home_scoped_id(&fx, ".claude/skills/delta/SKILL.md");
         let tool = tool(fx.registry());
         let listed = tool.invoke(&fx.ctx(), &call(None, "")).await;
-        assert_eq!(
+        match &listed.provenance {
+            ToolProvenance::Sources(ids) => {
+                let spelled: Vec<&str> = ids.iter().map(|id| id.as_str()).collect();
+                assert_eq!(
+                    spelled,
+                    vec![
+                        ".claude/skills/gamma/SKILL.md",
+                        alpha.as_str(),
+                        delta.as_str(),
+                    ],
+                    "the roster names every row it was read from, each in its \
+                     own scope: {}",
+                    listed.content
+                );
+            }
+            other => panic!(
+                "every row here mints, so the roster is their union: {other:?} — {}",
+                listed.content
+            ),
+        }
+        assert_ne!(
             listed.provenance,
-            ToolProvenance::Unknown,
-            "`alpha` and `delta` are `~/.claude` rows that never mint, so the reply \
-             naming them is unpinnable: {}",
-            listed.content
+            ToolProvenance::none(),
+            "`Sources(∅)` means `touched no repo file`, and this reply is every \
+             listed skill file's description"
         );
     }
 

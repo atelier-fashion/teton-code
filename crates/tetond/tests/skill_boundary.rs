@@ -8,21 +8,28 @@
 //! for bodies compiled into the binary and **fail-open** for a body read off a
 //! disk this session's jail cannot name.
 //!
-//! Two rules, asserted separately because they are two rules (BR-10):
+//! Two rules, asserted separately because they are two rules (BR-10, as
+//! **REQ-619 BR-3/BR-6 amended the second**):
 //!
 //! - a **project** skill is under the session root, mints a root-relative
 //!   identity, and pins the turn exactly as a `read` of that file would;
-//! - a **user** skill (`~/.claude/…`) has no root-relative identity at all, so
-//!   its block is `Unknown` and pins the turn wherever **any** boundary is
-//!   configured — related to the skill or not, and stricter than a `read` of the
-//!   same bytes.
+//! - a **user** skill (`~/.claude/…`) mints a `~`-scoped identity and is judged
+//!   by the same globs on the same terms: it leaves under a boundary that names
+//!   nothing it touches, and is refused **naming its own file** under one the
+//!   user wrote over their skills directory.
 //!
-//! The second is the one the default would have silently broken: under
-//! `Sources(∅)` the expansion of a `~/.claude` skill matches no glob, the next
-//! remote turn goes out, and every one of the seventeen shipped ADLC bodies
-//! leaves the machine on a boundary-configured host. So its fixture's boundary
-//! names a path the skill has **nothing to do with**, and the turn is still
-//! refused — which is only true if the block is `Unknown`.
+//! The second rule used to read *"has no root-relative identity at all, so its
+//! block is `Unknown` and pins the turn wherever any boundary is configured"*.
+//! That was REQ-587 BR-10's deliberate strictness, and with REQ-597's thirteen
+//! builtins permanently in force its consequence was that every user-authored
+//! skill pinned every repo-rooted session on every machine (BUG-214). REQ-619
+//! retired it; the tests below flipped rather than went.
+//!
+//! What has **not** changed is the reason this file exists: `ToolOutcome::ok`
+//! defaults to `Sources(∅)` — "touched no repo file" — and under that default a
+//! `~/.claude` body matches no glob at all, so the refusal half of the user rule
+//! is what catches it. The fixtures still assert both directions on the same
+//! file, because a build that answered `Sources(∅)` would pass the leave half.
 //!
 //! Each test drives the **real** OpenAI-compatible adapter through the **real**
 //! egress choke point in front of a capture transport, on `provenance_egress.rs`'s
@@ -77,6 +84,19 @@ const LISTING_MARKER: &str = "MARKER-skill-description-reached-the-model";
 
 /// The one prompt every fixture here opens with.
 const PROMPT: &str = "Run the validation skill and summarize what it says.";
+
+/// The one directory every suite that needs a real `$HOME` builds under
+/// (REQ-619 verify, m7) — one named parent, rather than a differently-prefixed
+/// family per suite that only its own author would recognize.
+const FIXTURE_HOME_PARENT: &str = ".teton-test-fixtures";
+
+/// What a suite says when it cannot find a `$HOME` to build under. Verbatim in
+/// `provenance_egress.rs` and `harness::tools::skill` too, and a **panic** in
+/// all three: the alternative is a test that reports success for having
+/// asserted nothing (LESSON-594).
+const NEEDS_A_HOME: &str = "this fixture needs a real $HOME: a user skill's identity is minted \
+     against `session_root::home()`, so a run without one would be asserting \
+     about a scope that does not exist (REQ-619 BR-3)";
 
 // ---------------------------------------------------------------------------
 // transport (the `provenance_egress.rs` shape)
@@ -157,31 +177,80 @@ fn sse_turn(text: &str, tool: Option<(&str, &str, &str)>) -> String {
 // fixture
 // ---------------------------------------------------------------------------
 
-/// A throwaway tree with a `home` (the stand-in for `~`) and a `repo`.
+/// A throwaway pair of trees: a `home` (the stand-in for `~`) and a `repo`.
 ///
 /// `home` is handed to `discover` as a **parameter**, never read from the
 /// environment: a suite that set `HOME` would be a suite whose result depends on
 /// what else is running in the same process (LESSON-540).
+///
+/// **The home half is built under the process's own `$HOME`** (REQ-619
+/// TASK-401). A user skill's identity is minted against `session_root::home()`,
+/// which reads `HOME`, and BR-3's claims here are about that id. The rule above
+/// still holds and is the reason for the placement rather than an exception to
+/// it: the way to put a fixture file *under* the home the daemon will use,
+/// without writing process-wide state every other test in this binary reads, is
+/// to build the fixture there.
+///
+/// **The repo half is not** (REQ-619 verify, m7). It used to sit beside the
+/// home under `$HOME`, on the reasoning that a project id is relative to the
+/// session root and never to the home — which is true, and is a statement about
+/// *ids* rather than about where a file holding
+/// `API_KEY=sk-live-DO-NOT-LEAK-…` belongs. Only the user skill needs the home;
+/// a repository with a planted credential in it belongs in a temp root, where a
+/// killed run leaves it somewhere the operating system clears. The guard below
+/// removes both either way.
 struct Fixture {
+    /// The home half, under the real `$HOME` because the mint reads it.
     root: PathBuf,
+    /// The repo half, under a temp root because nothing about it needs a home.
+    repo_root: PathBuf,
 }
 
 impl Fixture {
     fn new(tag: &str) -> Self {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
-        let root = PathBuf::from("/tmp").join(format!(
-            "tskbnd-{tag}-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::SeqCst)
-        ));
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|home| !home.as_os_str().is_empty())
+            .expect(NEEDS_A_HOME);
+        let root = home
+            .join(FIXTURE_HOME_PARENT)
+            .join(format!("skill-boundary-{tag}-{pid}-{seq}"));
+        let repo_root = std::env::temp_dir().join(format!("teton-skillbnd-{tag}-{pid}-{seq}"));
         std::fs::create_dir_all(root.join("home")).unwrap();
-        std::fs::create_dir_all(root.join("repo").join("secrets")).unwrap();
+        std::fs::create_dir_all(repo_root.join("repo").join("secrets")).unwrap();
         std::fs::write(
-            root.join("repo").join("secrets").join("prod.env"),
+            repo_root.join("repo").join("secrets").join("prod.env"),
             format!("{SECRET}\n"),
         )
         .unwrap();
-        Self { root }
+        Self { root, repo_root }
+    }
+
+    /// The `~`-scoped id `<home>/.claude/skills/<name>/SKILL.md` mints.
+    ///
+    /// Composed from the fixture's own layout, never by calling the minter
+    /// under test — an expectation built with `from_home_resolved` would agree
+    /// with any implementation of it, including a wrong one.
+    fn user_skill_id(&self, name: &str) -> String {
+        let home = std::fs::canonicalize(std::env::var_os("HOME").map(PathBuf::from).unwrap())
+            .expect("the home resolves");
+        let file = std::fs::canonicalize(
+            self.home()
+                .join(".claude")
+                .join("skills")
+                .join(name)
+                .join("SKILL.md"),
+        )
+        .expect("the fixture skill file");
+        format!(
+            "~/{}",
+            file.strip_prefix(&home)
+                .expect("the fixture is built under the home")
+                .display()
+        )
     }
 
     fn home(&self) -> PathBuf {
@@ -189,17 +258,23 @@ impl Fixture {
     }
 
     fn repo(&self) -> PathBuf {
-        self.root.join("repo")
+        self.repo_root.join("repo")
     }
 
     fn skill(&self, base: &Path, name: &str) {
+        self.skill_with(base, name, "");
+    }
+
+    /// [`Self::skill`] with `extra` appended to the body — a `` !`command` ``
+    /// line, for the legs whose subject is a preamble's verdict (REQ-619 BR-1).
+    fn skill_with(&self, base: &Path, name: &str, extra: &str) {
         let dir = base.join(".claude").join("skills").join(name);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("SKILL.md"),
             format!(
                 "---\nname: {name}\ndescription: {LISTING_MARKER}\n---\n\
-                 {BODY_MARKER}\nDo the thing.\n"
+                 {BODY_MARKER}\nDo the thing.\n{extra}"
             ),
         )
         .unwrap();
@@ -218,6 +293,7 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         std::fs::remove_dir_all(&self.root).ok();
+        std::fs::remove_dir_all(&self.repo_root).ok();
     }
 }
 
@@ -384,7 +460,13 @@ fn assert_the_expansion_landed(run: &Run) {
         "BR-4's instructions frame is missing from the folded block: {folded}"
     );
     assert!(
-        !folded.contains("trust=\"untrusted\""),
+        // REQ-619 TASK-401: the *envelope* the expansion itself wears, which is
+        // the head of the block. A preamble's output is spliced further down
+        // inside its own `<tool-result … trust="untrusted">` — that is REQ-585
+        // BR-6 working, not this rule failing — so the scan is bounded to the
+        // frame rather than run over the whole fold.
+        !folded[..folded.find("<tool-result").unwrap_or(folded.len())]
+            .contains("trust=\"untrusted\""),
         "an expansion must never wear the untrusted envelope — its closing sentence \
          forbids following the instructions the block *is* (BR-4): {folded}"
     );
@@ -436,46 +518,125 @@ async fn a_project_skill_mints_its_identity_and_pins_the_next_remote_turn() {
 }
 
 // ---------------------------------------------------------------------------
-// BR-10 rule two — a user skill is `Unknown` and pins under ANY boundary
+// REQ-619 BR-3/BR-6 — a user skill leaves by default and is refused by a glob
+// that names it
 // ---------------------------------------------------------------------------
 
-/// **A user skill has no root-relative identity, so it is `Unknown` and pins the
-/// turn wherever any boundary is configured — related to it or not.**
+/// **A user skill's file has an identity, and egress judges it exactly as it
+/// judges a project skill's.**
 ///
-/// This is the leg `ToolOutcome::ok`'s default would have broken silently.
-/// `Sources(∅)` matches no glob, so the expansion of a `~/.claude` body would
-/// have gone out on the very next turn on every boundary-configured machine —
-/// and the fixture is built to catch exactly that: the boundary names
-/// `secrets/**`, which the skill has **nothing to do with**, and the turn is
-/// still refused. Under the default it would not be.
+/// This was `a_user_skill_is_unknown_and_pins_under_a_boundary_it_never_touched`,
+/// and it asserted REQ-587 BR-10's second rule: `~/.claude/…` had no
+/// root-relative identity, so its expansion was `Unknown` and pinned the turn
+/// wherever **any** boundary was configured — related or not, and stricter than
+/// a `read` of the same bytes. REQ-619 BR-6 retires that clause. With REQ-597's
+/// thirteen builtins permanently in force, its consequence was that every
+/// user-authored skill pinned every repo-rooted session on every machine
+/// (BUG-214), over a file that matched no glob and read nothing.
+///
+/// Both halves are here because the rule is the *pair*: a glob that names
+/// nothing the skill touches must not refuse it, and a glob the user wrote over
+/// their own skills directory must — naming the file, which is only possible
+/// because the id exists. A build that answered `Unknown` again would pass the
+/// second half and fail the first; a build that answered `Sources(∅)` — the
+/// `ToolOutcome::ok` default this file was written to catch — would pass the
+/// first and fail the second.
+///
+/// # Mutations, re-measured (REQ-619 verify, m8)
+///
+/// The counts below were first written before the e2e suite existed, and were
+/// wrong by a factor of three by the time it did — the hazard m8 exists for. Run
+/// again on 2026-09-05 against the whole workspace, each once, after touching
+/// the mutated file so the build was not served from a stale binary.
+///
+/// **Mutation 1 — `expand_and_fold` answers `ToolProvenance::Unknown` for a
+/// `SkillSource::User` row** (the retired `(SkillSource::User, _)` arm). The
+/// leave half's `result.is_ok()` goes red. **22 red**: 1 in the library
+/// (`skill.rs`'s `a_user_skill_mints_a_home_scoped_id_and_a_project_skill_a_repo_scoped_one`),
+/// **18 in `tests/e2e`**, 1 in `provenance_egress.rs`
+/// (`a_model_invoked_user_skill_gets_the_same_provenance_as_the_typed_one`) and
+/// 2 here.
+///
+/// The e2e eighteen are not eighteen independent findings and should not be
+/// read as one: this mutation is REQ-619 verify **C1's leak by another route**
+/// — a model-invoked user skill folds to a bare `Unknown`, `/shell allow` clears
+/// it over an empty source set, and `secrets/prod.env` leaves — so
+/// `assert_no_boundary_bytes`, which is a **process-global** claim over every
+/// captured payload in that binary, fails in every egress-touching test that
+/// runs after the leak. That cascade is the honest shape of the defect and the
+/// reason the number is large.
+///
+/// **Mutation 2 — `skills::provenance_of` answers `SkillIdentity::Unmintable`
+/// for `SkillSource::User`** (the pre-REQ-619 reading; it was `None` then). The
+/// leave half reddens as above and the refused half's block path reads
+/// `<unknown-provenance>` instead of the file. **15 red**: 3 in the library, 8
+/// in `tests/e2e`, 1 in `provenance_egress.rs`, 2 here and
+/// `skill_turn.rs`'s
+/// `a_user_skill_outside_the_root_seeds_a_block_with_its_home_scoped_identity`.
+/// Fewer than mutation 1 and for a reason worth keeping: losing the *identity*
+/// pins the session, which is over-strict; losing the *mapping* drops the ids
+/// under an unknown, which leaks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_user_skill_is_unknown_and_pins_under_a_boundary_it_never_touched() {
-    let fx = Fixture::new("user");
+async fn a_user_skill_leaves_under_a_boundary_it_never_touched_and_is_refused_by_one_that_names_it()
+{
+    // ── it leaves ───────────────────────────────────────────────────────────
+    let fx = Fixture::new("userleave");
     fx.skill(&fx.home(), "validate");
 
     let run = run_skill_call(&fx, "validate", Some("secrets/**")).await;
     assert_the_expansion_landed(&run);
-
     assert!(
-        run.provenance_is_unknown,
-        "a `~/.claude` skill has no root-relative identity (REQ-585 ADR-9 refused to \
-         widen the minter), so anything but `Unknown` — `Sources(∅)` above all, which \
-         is `ToolOutcome::ok`'s default — lets it egress under any boundary it was \
-         never judged against"
+        !run.provenance_is_unknown,
+        "a discovered user skill mints a `~`-scoped id (REQ-619 BR-3), so its \
+         expansion is as pinnable as a project skill's and `Unknown` here would \
+         be the retired rule back again"
     );
+    assert_eq!(
+        run.provenance_len, 1,
+        "exactly the one file the body came from"
+    );
+    assert!(
+        run.result.is_ok(),
+        "a boundary naming nothing this skill touches must not refuse it — that \
+         refusal is the pin BUG-214 filed: {:?}",
+        run.result
+    );
+    assert!(run.blocks.is_empty(), "nothing matched, nothing blocked");
+    assert_eq!(run.calls, 2, "both turns reached the transport");
+    assert!(
+        contains_bytes(&run.captured[1], BODY_MARKER),
+        "the turn that left must really have carried the expansion, or the \
+         leave claim is about an empty payload"
+    );
+
+    // ── and it is refused by a glob that names it ───────────────────────────
+    //
+    // The user's own row over their skills directory, in the ordinary path form
+    // (REQ-619 OQ-1): `~` is an ordinary character to `globset` and every
+    // builtin is already `**/`-anchored, so no new glob language is needed for a
+    // `~`-scoped id to be matched.
+    let fx = Fixture::new("usernamed");
+    fx.skill(&fx.home(), "validate");
+    let expected = fx.user_skill_id("validate");
+
+    let run = run_skill_call(&fx, "validate", Some("**/.claude/skills/**")).await;
+    assert_the_expansion_landed(&run);
     match &run.result {
         Err(e) if e.is_privacy_blocked() => {}
-        other => panic!(
-            "a user skill's block is unpinnable and must fail closed while any \
-             boundary is set: {other:?}"
-        ),
+        other => panic!("a glob covering the skills directory must refuse it: {other:?}"),
     }
     assert_eq!(run.blocks.len(), 1, "exactly one privacy_block");
+    assert_eq!(
+        run.blocks[0].path, expected,
+        "the block names the user's own file in the `~` scope — a sentinel here \
+         would tell them nothing about which file to look at, and a \
+         repo-relative spelling would be a second id for one file"
+    );
     assert_eq!(run.calls, 1, "turn 2 must never reach the transport");
     for body in &run.captured {
         assert!(
             !contains_bytes(body, BODY_MARKER),
-            "the skill body leaked into captured egress"
+            "the skill body leaked past a boundary that names its file"
         );
     }
 }
@@ -483,8 +644,8 @@ async fn a_user_skill_is_unknown_and_pins_under_a_boundary_it_never_touched() {
 /// **The control: with no boundary configured, the same expansion reaches the
 /// provider.**
 ///
-/// Without this the two refusals above would be satisfied by a build that
-/// refused every second turn for any reason at all (LESSON-479).
+/// Without this the refusals above would be satisfied by a build that refused
+/// every second turn for any reason at all (LESSON-479).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_user_skill_reaches_the_provider_when_no_boundary_is_configured() {
     let fx = Fixture::new("control");
@@ -493,10 +654,14 @@ async fn a_user_skill_reaches_the_provider_when_no_boundary_is_configured() {
     let run = run_skill_call(&fx, "validate", None).await;
     assert_the_expansion_landed(&run);
 
+    // REQ-619 BR-3: the provenance is the same **minted id** in every session
+    // above; what differs is whether a glob exists that matches it. Before this
+    // REQ it was the same `Unknown` in every session, which is the assertion
+    // this line replaces.
     assert!(
-        run.provenance_is_unknown,
-        "the provenance is the same `Unknown` in both sessions — what differs is \
-         whether a boundary exists for it to fail closed against"
+        !run.provenance_is_unknown,
+        "the provenance is the same minted id here as under either boundary — \
+         what differs is whether a glob matches it"
     );
     assert!(
         run.result.is_ok(),
@@ -510,6 +675,105 @@ async fn a_user_skill_reaches_the_provider_when_no_boundary_is_configured() {
         "both turns reached the transport: {} requests",
         run.calls
     );
+}
+
+/// **REQ-619 BR-9 — the no-boundary machine is unchanged, preamble and all.**
+///
+/// With no boundary configured, `shell_provenance::classify` answers from its
+/// first line and every verdict is `Unknown` — so this expansion's provenance is
+/// `Unknown` too, and it is *sent*, because the choke point does not inspect
+/// when there is nothing to protect. That is the pre-REQ-614 posture REQ-614
+/// BR-9 kept and this REQ keeps: a machine that opted out of the builtins and
+/// wrote no rows of its own pays nothing for either feature.
+///
+/// The preamble is what makes the leg say something the control above does not:
+/// an opaque verb is the strictest thing the fold can produce, and it still
+/// leaves.
+///
+/// **Mutation (run, red, reverted):** drop `&& !self.boundaries.is_empty()`
+/// from `Egress::send`'s inspection guard, so a machine with no rows inspects
+/// anyway — the turn is refused and `result.is_ok()` goes red. **1 red**, this
+/// test, which is what makes it the one that holds BR-9 on this path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_no_boundary_configured_a_user_skill_with_an_opaque_preamble_is_sent() {
+    let fx = Fixture::new("nobnd");
+    fx.skill_with(&fx.home(), "validate", "Out: !`sh -c 'echo x'`\n");
+
+    let run = run_skill_call(&fx, "validate", None).await;
+    assert_the_expansion_landed(&run);
+
+    assert!(
+        run.provenance_is_unknown,
+        "with no boundary the classifier proves nothing, so the expansion is \
+         `Unknown` — and the point of this test is that `Unknown` is *sent* here"
+    );
+    assert!(
+        run.result.is_ok(),
+        "BR-9: nothing to protect, nothing inspected, nothing pinned: {:?}",
+        run.result
+    );
+    assert!(run.blocks.is_empty(), "no boundary, no privacy_block");
+    assert_eq!(run.calls, 2, "both turns reached the transport");
+}
+
+/// **REQ-619 BR-10 — a project skill still mints and still pins as a `read`
+/// would.**
+///
+/// The half this REQ does **not** move, asserted on the same instrument as the
+/// half it does, so "unchanged" is a claim rather than an omission. Two legs:
+/// under a glob covering the skills directory the turn is refused **naming the
+/// file** — the id is repo-relative, exactly what a `read` of that path would
+/// be judged on — and under a glob naming something else it leaves.
+///
+/// The sibling above is the user-scope twin, and the pair is what BR-3's
+/// "distinct scopes" means in practice: the same relative path in the two roots
+/// produces two different ids and is matched by two different globs.
+///
+/// **Mutation, re-measured 2026-09-05 (REQ-619 verify, m8):** point
+/// `provenance_of`'s `SkillSource::Project` arm at `from_home_resolved` — the
+/// refusal names a `~`-scoped path and the equality goes red. **32 red across
+/// the workspace**, not the 4-in-this-file the record used to claim: 7 in the
+/// library, 4 here, 4 in `skill_turn.rs`, 4 in `provenance_egress.rs`, 6 in
+/// `skill_over_budget_offer.rs`, 4 in `skill_over_budget_recovery.rs`, and one
+/// each in `context_pressure.rs`, `skills_discovery.rs` and `tests/e2e`.
+///
+/// That spread *is* the finding, and it is why the old figure was worth
+/// re-measuring: a project skill's id is not a fact about the boundary tests
+/// alone. Every suite that puts a project skill in a context and then asserts
+/// something about the turn — the over-budget offer's whole flow, the window
+/// arithmetic — reads it, so a scope confusion here is felt in eight files.
+/// The blast radius is the argument for the mint having exactly one home.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_project_skill_still_mints_and_still_pins_as_a_read_would() {
+    let fx = Fixture::new("projstill");
+    fx.skill(&fx.repo(), "validate");
+
+    let run = run_skill_call(&fx, "validate", Some("**/.claude/skills/**")).await;
+    assert_the_expansion_landed(&run);
+    match &run.result {
+        Err(e) if e.is_privacy_blocked() => {}
+        other => panic!("a project skill under a glob that names it must pin: {other:?}"),
+    }
+    assert_eq!(run.blocks.len(), 1, "exactly one privacy_block");
+    assert_eq!(
+        run.blocks[0].path, ".claude/skills/validate/SKILL.md",
+        "a project skill's id is repo-relative and carries no scope marker, so \
+         it can never collide with the user skill of the same relative path"
+    );
+    assert_eq!(run.calls, 1, "turn 2 must never reach the transport");
+
+    // The leave half, on the same file: a glob that names something else.
+    let fx = Fixture::new("projleave");
+    fx.skill(&fx.repo(), "validate");
+    let run = run_skill_call(&fx, "validate", Some("secrets/**")).await;
+    assert_the_expansion_landed(&run);
+    assert!(
+        run.result.is_ok(),
+        "a project skill under an unrelated boundary reaches the wire, exactly \
+         as a `read` of its file would: {:?}",
+        run.result
+    );
+    assert_eq!(run.calls, 2, "both turns reached the transport");
 }
 
 // ---------------------------------------------------------------------------

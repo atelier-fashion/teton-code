@@ -92,6 +92,27 @@ pub enum ToolProvenance {
     /// The tool's touched files cannot be determined (e.g. `shell`): fail-closed
     /// at egress whenever any boundary is configured.
     Unknown,
+    /// Unknown reach that nonetheless **proved** these identities (REQ-619
+    /// verify, C1).
+    ///
+    /// Egress treats it exactly as [`Self::Unknown`] plus the sources: the
+    /// bridge marks the provenance unknown *and* carries the ids across, so the
+    /// refusal is unchanged and the block still names what it named.
+    ///
+    /// It exists because the pair is real and the old vocabulary could not hold
+    /// it. A skill expansion with two preambles — one `sh -c` (opaque) and one
+    /// `cat secrets/prod.env` (a minted, matched id) — is both at once. Folded
+    /// into a bare `Unknown` the id was **dropped**, and dropping it is not
+    /// conservative: `/shell allow` lifts the opacity, and a lifted `Unknown`
+    /// over an empty source set is a *clean* provenance, so the secret then
+    /// left the machine. Under `UnknownWith` the lift releases the opacity and
+    /// `secrets/prod.env` is still there for the glob to match, which is the
+    /// whole of what the lift is supposed to mean (BUG-215, REQ-614 BR-4).
+    ///
+    /// Not merged into `Sources` with a flag for [`Self::BoundaryTouch`]'s
+    /// reason: a variant makes the compiler enumerate the seams that must
+    /// handle it (LESSON-501, LESSON-502).
+    UnknownWith(BTreeSet<ProvenanceId>),
     /// A path the tool named matches a `local-only` boundary glob, and the
     /// ordinary identity path cannot say so (REQ-614 ADR-614-3).
     ///
@@ -143,6 +164,52 @@ impl ToolProvenance {
     {
         ToolProvenance::Sources(paths.into_iter().collect())
     }
+
+    /// The **one** mapping from the three facts a reach classifier produces —
+    /// what it named, whether anything was unprovable, whether anything touched
+    /// a boundary it cannot name — to this vocabulary (REQ-619 verify, M3).
+    ///
+    /// Three call sites wrote this precedence by hand: `ShellTool::run` mapping
+    /// a `Verdict`, `ExpansionProvenance::into_tool_provenance` mapping a fold,
+    /// and [`ContextManager::compaction_summary`] mapping a summary's inherited
+    /// bits. Three copies of a precedence rule is how one of them comes to be
+    /// laxer than the others — REQ-614 BR-10's whole concern, one seam over —
+    /// and the C1 variant above would have had to be added to all three.
+    ///
+    /// # The order, and why it is this order
+    ///
+    /// 1. `boundary_touch` wins outright. Every arm below refuses the send too,
+    ///    so the choice cannot make a turn laxer; what it decides is what the
+    ///    refusal *reports*. `BoundaryTouch` reports `<boundary-touch>`, which
+    ///    `taint::cause_of` reads to hold the pin **permanently**, and a
+    ///    command that named a protected path must keep that cause however
+    ///    opaque the rest of it was (ADR-614-3).
+    /// 2. `unknown` with sources is [`Self::UnknownWith`] — fail-closed, and
+    ///    still naming what was proved, so a later lift has something to keep.
+    /// 3. `unknown` alone is [`Self::Unknown`].
+    /// 4. Otherwise [`Self::Sources`], which may be empty: content that names
+    ///    nothing and pins nothing.
+    ///
+    /// `sources` is carried through arms 1 and 3 by *dropping* it, which is
+    /// sound in exactly one direction: those arms refuse everything a source
+    /// set could have permitted. Arm 2 exists because arm 3 is the direction
+    /// that is **not** sound once the opacity can be lifted.
+    #[must_use]
+    pub(crate) fn from_bits(
+        sources: BTreeSet<ProvenanceId>,
+        unknown: bool,
+        boundary_touch: bool,
+    ) -> ToolProvenance {
+        if boundary_touch {
+            ToolProvenance::BoundaryTouch
+        } else if unknown && !sources.is_empty() {
+            ToolProvenance::UnknownWith(sources)
+        } else if unknown {
+            ToolProvenance::Unknown
+        } else {
+            ToolProvenance::Sources(sources)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -162,7 +229,7 @@ pub enum Provenance {
     /// with an empty set and `unknown` clear — the state every
     /// [`ContextManager::push_user`] caller is in.
     ///
-    /// # Two fields, not one
+    /// # Three fields, not one
     ///
     /// `unknown` cannot be folded into the set. The **empty set already means
     /// ordinary typed prompt text**, so an "unpinnable" sentinel living inside
@@ -170,16 +237,35 @@ pub enum Provenance {
     /// every machine that has a boundary configured. [`ToolProvenance`] and
     /// [`DroppedProvenance`] carry the same pair for the same reason: "these
     /// files" and "and something we cannot name" are both true at once.
+    ///
+    /// `boundary_touch` cannot be folded into `unknown` either (REQ-619
+    /// ADR-619-2). A preamble that read a boundary file **outside** the session
+    /// root mints no id for the set to hold (LESSON-623), so a bit is the only
+    /// carrier — and it has to reach egress as
+    /// [`BOUNDARY_TOUCH_PATH`](crate::egress::provenance::BOUNDARY_TOUCH_PATH),
+    /// because `taint::cause_of` reads the reported **path** to decide the pin
+    /// is permanent (REQ-614 ADR-614-3). Collapsed into `unknown`, a
+    /// `cat ~/.ssh/config` preamble would become liftable by `/shell allow`.
     User {
         /// Repo-relative identities the prompt text was drawn from. Empty for
         /// text the user typed.
         sources: BTreeSet<ProvenanceId>,
         /// Whether some file this text came from has **no** mintable identity —
         /// a user-scoped skill outside the session root, which
-        /// [`ProvenanceId::from_resolved`] refuses by design (REQ-571 ADR-B).
-        /// Fail-closed at egress whenever any boundary is configured, the same
-        /// posture [`ToolProvenance::Unknown`] gets.
+        /// [`ProvenanceId::from_resolved`] refuses by design (REQ-571 ADR-B) —
+        /// or some preamble command whose reach the classifier could not prove
+        /// (REQ-619 BR-2). Fail-closed at egress whenever any boundary is
+        /// configured, the same posture [`ToolProvenance::Unknown`] gets.
         unknown: bool,
+        /// Whether some preamble this text carries named a boundary file the
+        /// source set cannot hold — an out-of-root path, which mints no
+        /// `ProvenanceId` for a glob to match (REQ-619 BR-2, REQ-614 AC-5).
+        ///
+        /// Blocks exactly as `unknown` does; what the bit buys is the pin's
+        /// **cause**, and so its permanence. An *in-root* boundary path needs
+        /// nothing here: the verdict carries its minted id in `sources` and the
+        /// glob matches that.
+        boundary_touch: bool,
     },
     /// Model-generated text (assistant turn).
     Model,
@@ -205,6 +291,7 @@ impl Provenance {
         Provenance::User {
             sources: BTreeSet::new(),
             unknown: false,
+            boundary_touch: false,
         }
     }
 }
@@ -349,14 +436,32 @@ impl DroppedProvenance {
                 // touch additionally records *why*, because the pin it produces
                 // is permanent and an unknown's is liftable.
                 ToolProvenance::Unknown => self.unknown = true,
+                // REQ-619 verify, C1: both halves, because this accumulator's
+                // whole posture is that "unknown" and "these files" are true at
+                // once (see the field docs). Folding it to the bit alone would
+                // shed exactly the ids the variant exists to keep.
+                ToolProvenance::UnknownWith(paths) => {
+                    self.sources.extend(paths.iter().cloned());
+                    self.unknown = true;
+                }
                 ToolProvenance::BoundaryTouch => {
                     self.unknown = true;
                     self.boundary_touch = true;
                 }
             },
-            Provenance::User { sources, unknown } => {
+            Provenance::User {
+                sources,
+                unknown,
+                boundary_touch,
+            } => {
                 self.sources.extend(sources.iter().cloned());
-                self.unknown |= *unknown;
+                // REQ-619 ADR-619-2, the same reading the `Tool` arm above
+                // takes: a boundary touch blocks *and* records why, so it sets
+                // both bits. A forgotten skill expansion whose preamble read an
+                // out-of-root boundary file keeps its permanence — dropping the
+                // block is not a lift.
+                self.unknown |= *unknown || *boundary_touch;
+                self.boundary_touch |= *boundary_touch;
             }
             Provenance::System | Provenance::Model => {}
         }
@@ -1008,8 +1113,18 @@ impl ProvenanceClass {
             // verdict, and this manager still holds no matcher with which to
             // tell them apart. REQ-618's argument above is unchanged — the
             // boundary *verdict* is still computed where the matcher lives.
+            //
+            // REQ-619 verify, C1: `UnknownWith` joins them, and joins them
+            // *here* — ahead of the `Sources` arm — because this class is the
+            // accounting BR-7 keys on, and a block that is unknown must be
+            // counted unknown however many files it also proved. Its ids matter
+            // at egress, where the boundary globs run; they do not make the
+            // block's reach any more determined than a bare `Unknown`'s.
             Provenance::Tool {
-                provenance: ToolProvenance::Unknown | ToolProvenance::BoundaryTouch,
+                provenance:
+                    ToolProvenance::Unknown
+                    | ToolProvenance::UnknownWith(_)
+                    | ToolProvenance::BoundaryTouch,
                 ..
             } => ProvenanceClass::Unknown,
             Provenance::Tool {
@@ -1022,7 +1137,17 @@ impl ProvenanceClass {
                     ProvenanceClass::Rooted
                 }
             }
-            Provenance::User { unknown: true, .. } => ProvenanceClass::Unknown,
+            // REQ-619 ADR-619-2: a `boundary_touch` user block classes here for
+            // the reason the `BoundaryTouch` tool arm above does — the two are
+            // byte-identical to every reader downstream of the verdict, and this
+            // manager holds no matcher to tell them apart. Before the `sources`
+            // arm, so an expansion that touched an out-of-root boundary *and*
+            // named its own skill file is `Unknown`, never `Rooted`.
+            Provenance::User { unknown: true, .. }
+            | Provenance::User {
+                boundary_touch: true,
+                ..
+            } => ProvenanceClass::Unknown,
             Provenance::User { sources, .. } if !sources.is_empty() => ProvenanceClass::Rooted,
             Provenance::User { .. } | Provenance::System | Provenance::Model => {
                 ProvenanceClass::None
@@ -1207,7 +1332,7 @@ impl ContextManager {
     /// set with `unknown` clear, which is exactly the state this variant used to
     /// be. File-supplied prompt text takes [`Self::push_user_from`].
     pub fn push_user(&mut self, text: impl Into<String>) {
-        self.push_user_from(text, BTreeSet::new(), false);
+        self.push_user_from(text, BTreeSet::new(), false, false);
     }
 
     /// Append a user turn whose text was drawn from files (REQ-585 BR-7).
@@ -1218,17 +1343,21 @@ impl ContextManager {
     /// says at least one of those files has no identity to mint — a user-scoped
     /// skill outside the session root, which [`ProvenanceId::from_resolved`]
     /// refuses by design (REQ-571 ADR-B) — and fails the turn closed whenever
-    /// any boundary is configured.
+    /// any boundary is configured. `boundary_touch` says a preamble this text
+    /// carries named a boundary file **outside** the session root, which mints
+    /// no id to put in `sources` (REQ-619 BR-2): it fails the turn closed the
+    /// same way and additionally makes the pin permanent.
     ///
-    /// One entry point rather than a `push_user` followed by a fix-up: the two
-    /// facts arrive together and a caller that performed the first and forgot
-    /// the second would push an unpinned block that reads as ordinary typed
-    /// prose at the choke point.
+    /// One entry point rather than a `push_user` followed by a fix-up: the
+    /// three facts arrive together and a caller that performed the first and
+    /// forgot the rest would push an unpinned block that reads as ordinary
+    /// typed prose at the choke point.
     pub fn push_user_from(
         &mut self,
         text: impl Into<String>,
         sources: BTreeSet<ProvenanceId>,
         unknown: bool,
+        boundary_touch: bool,
     ) {
         let text = text.into();
         self.request.clone_from(&text);
@@ -1236,7 +1365,11 @@ impl ContextManager {
         self.blocks.push(ContextBlock {
             role: BlockRole::User,
             text,
-            provenance: Provenance::User { sources, unknown },
+            provenance: Provenance::User {
+                sources,
+                unknown,
+                boundary_touch,
+            },
             anchor: Anchor::None,
         });
         // The ask just moved: this block is now the current turn's, whatever was
@@ -1554,7 +1687,8 @@ impl ContextManager {
     fn carries_forward(block: &ContextBlock) -> bool {
         matches!(
             &block.provenance,
-            Provenance::User { sources, unknown } if sources.is_empty() && !unknown
+            Provenance::User { sources, unknown, boundary_touch }
+                if sources.is_empty() && !unknown && !boundary_touch
         )
     }
 
@@ -1676,8 +1810,12 @@ impl ContextManager {
                 // `push_user_from`, never `push_user`: a carried skill
                 // expansion's sources have to survive every later prompt or the
                 // pin lasts exactly one turn (REQ-585 BR-7, LESSON-501).
-                Provenance::User { sources, unknown } => {
-                    self.push_user_from(block.text, sources, unknown);
+                Provenance::User {
+                    sources,
+                    unknown,
+                    boundary_touch,
+                } => {
+                    self.push_user_from(block.text, sources, unknown, boundary_touch);
                 }
                 Provenance::Model => self.push_model(block.text),
                 Provenance::Tool { tool, provenance } => {
@@ -2218,21 +2356,22 @@ impl ContextManager {
     /// boundary-protected and a summary of an unknown-provenance `shell` result
     /// is still unknown — a summary of a secret is a secret.
     ///
-    /// ## Why `Unknown` may swallow the named sources here
+    /// ## The pair is kept, not collapsed (REQ-619 verify, C1)
     ///
-    /// [`ToolProvenance`] is one-or-the-other, so a summary of a conversation
-    /// holding both a `shell` result and a `read` of `a.rs` collapses to
-    /// `Unknown` and stops naming `a.rs`. [`DroppedProvenance`] deliberately
-    /// refuses that collapse — it keeps the pair, because it is *accumulating*
-    /// across a whole session and a set that lost its members could never get
-    /// them back. This is the opposite situation and the collapse is sound in
-    /// it: the two values meet again at one choke point
-    /// ([`context_provenance`](super::completion::context_provenance) →
-    /// `Egress`), where `Unknown` fails closed at least as hard as any path set
-    /// would — every send this block could have permitted under
-    /// `Sources({a.rs})` is refused under `Unknown`. The collapse can only ever
-    /// make this block *more* restrictive, never less, which is the only
-    /// direction a provenance may be rounded.
+    /// A summary of a conversation holding both a `shell` result and a `read`
+    /// of `a.rs` is unknown *and* derived from `a.rs`, and
+    /// [`ToolProvenance::from_bits`] now has a variant for exactly that
+    /// ([`ToolProvenance::UnknownWith`]), so both facts survive.
+    ///
+    /// This used to collapse to a bare `Unknown`, on the argument that the
+    /// collapse could only ever make the block *more* restrictive — every send
+    /// `Sources({a.rs})` would have permitted is refused under `Unknown`. That
+    /// argument holds only while the opacity is permanent. `/shell allow` lifts
+    /// it (BUG-215), and a lifted `Unknown` over an *empty* source set is a
+    /// clean provenance, so the collapse turned "unknown, and derived from
+    /// `a.rs`" into "derived from nothing" the moment a user typed the lift.
+    /// [`DroppedProvenance`] refused the collapse for a related reason and was
+    /// right first.
     fn compaction_summary(&self, compaction: &Compaction) -> Option<ContextBlock> {
         let summarized_bytes: usize = compaction
             .forget()
@@ -2259,6 +2398,14 @@ impl ContextManager {
                     // or compaction would quietly make a `~/.ssh/config` pin
                     // liftable.
                     ToolProvenance::Unknown => unknown = true,
+                    // REQ-619 verify, C1. Both halves, for `absorb`'s reason:
+                    // the collapse below is only sound because it can never be
+                    // *less* restrictive, and dropping proved ids from a value
+                    // that will later be lifted is the one way it could be.
+                    ToolProvenance::UnknownWith(paths) => {
+                        sources.extend(paths.iter().cloned());
+                        unknown = true;
+                    }
                     ToolProvenance::BoundaryTouch => {
                         unknown = true;
                         boundary_touch = true;
@@ -2280,9 +2427,15 @@ impl ContextManager {
                 Provenance::User {
                     sources: block_sources,
                     unknown: block_unknown,
+                    boundary_touch: block_boundary_touch,
                 } => {
                     sources.extend(block_sources.iter().cloned());
-                    unknown |= *block_unknown;
+                    // REQ-619 ADR-619-2, the reading the `Tool` arm above
+                    // takes: a summary of a preamble that read an out-of-root
+                    // boundary file is still a boundary touch, so compaction
+                    // cannot turn a permanent pin into a liftable one.
+                    unknown |= *block_unknown || *block_boundary_touch;
+                    boundary_touch |= *block_boundary_touch;
                 }
                 Provenance::System | Provenance::Model => {}
             }
@@ -2317,13 +2470,11 @@ impl ContextManager {
             ),
             provenance: Provenance::Tool {
                 tool: COMPACT_SUMMARY_TOOL.to_owned(),
-                provenance: if boundary_touch {
-                    ToolProvenance::BoundaryTouch
-                } else if unknown {
-                    ToolProvenance::Unknown
-                } else {
-                    ToolProvenance::Sources(sources)
-                },
+                // The shared mapping (REQ-619 verify, M3). The precedence used
+                // to be written out here, in `ShellTool::run` and in the skill
+                // fold — three copies of one rule, which is how one of them
+                // comes to disagree.
+                provenance: ToolProvenance::from_bits(sources, unknown, boundary_touch),
             },
         })
     }
@@ -5191,6 +5342,7 @@ mod tests {
             "x".repeat(1_500),
             [fixture_id("skills/heavy/SKILL.md")].into_iter().collect(),
             false,
+            false,
         );
         ctx.push_model("y".repeat(1_500));
         // Retained, and NOT in the forget set — but the duty is shown it, so its
@@ -5451,6 +5603,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             false,
+            false,
         );
         first.push_model("reading");
         first.push_tool_result("read", Some(fixture_id("src/lib.rs")), "code");
@@ -5480,6 +5633,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 unknown: false,
+                boundary_touch: false,
             },
             "a carried skill expansion must still name the file it came from"
         );
@@ -5495,6 +5649,115 @@ mod tests {
         let _ = second.assemble(&mut hook);
         assert_eq!(hook.seen.first(), Some(&Provenance::System));
         assert_eq!(&hook.seen[1..], before.as_slice());
+    }
+
+    /// **REQ-619 BR-5 / ADR-619-2 — the third field at all three seams.**
+    ///
+    /// A skill whose preamble read a boundary file **outside** the session root
+    /// mints no id for the set to hold, so the fact rides as a bit; this drives
+    /// the three seams REQ-585 ADR-9 named — the seed
+    /// ([`ContextManager::push_user_from`]), the union
+    /// ([`context_provenance`]) and replay ([`ContextManager::replay_blocks`])
+    /// — and asserts the bit at each. One test per seam is the rule
+    /// (LESSON-501, LESSON-502) and this is BR-5's; the union has its own in
+    /// `completion.rs` and compaction its own in `compact.rs`.
+    ///
+    /// The block names its own skill file **as well**, which is what makes this
+    /// more than a bit-copying test: `sources` is non-empty, so a
+    /// `ProvenanceClass::of` that read the set first would call this block
+    /// `Rooted` and a reader downstream would treat a boundary touch as a
+    /// clean, matchable read.
+    ///
+    /// # Why the lift is asserted here
+    ///
+    /// `with_unknown_lifted` is what `/shell allow` applies, and the whole
+    /// point of a bit distinct from `unknown` is that this pin survives it
+    /// (REQ-614 ADR-614-3). A fold that put the touch into `unknown` would pass
+    /// every other assertion in this test.
+    ///
+    /// # Mutation
+    ///
+    /// Ran three times, one seam each, and the **counts** are the finding
+    /// (LESSON-640). (1) `push_user_from` writing `boundary_touch: false`
+    /// instead of its argument: three red — this test at `the seed dropped the
+    /// bit`, and both sibling seam tests, because every one of them seeds
+    /// through it. (2) `context_provenance`'s `boundary_touch` arm deleted: two
+    /// red — this test at `the union dropped the bit` and `completion.rs`'s
+    /// own, the provenance coming back `unknown: false, boundary_touch: false`,
+    /// i.e. not refused at all. (3) `replay_blocks` passing `false` for the
+    /// third argument: **one** red, this test's replay assertion, with the
+    /// first two seams and both siblings green — which is the whole reason
+    /// there are three tests. Restored after each: green.
+    #[test]
+    fn a_boundary_touch_on_a_user_block_survives_seed_union_and_replay() {
+        let skill = fixture_id(".claude/skills/audit/SKILL.md");
+
+        // ── Seam 1: the seed ────────────────────────────────────────────────
+        let mut first = ContextManager::new("HEAD", 10_000);
+        first.push_user_from(
+            "audit the machine",
+            [skill.clone()].into_iter().collect(),
+            false,
+            true,
+        );
+        let seeded_provenance = first.blocks()[0].provenance.clone();
+        match &seeded_provenance {
+            Provenance::User {
+                sources,
+                unknown,
+                boundary_touch,
+            } => {
+                assert!(*boundary_touch, "the seed dropped the bit");
+                assert!(
+                    !unknown,
+                    "and it must not invent the other one: the two are separate facts"
+                );
+                assert!(sources.contains(&skill), "{sources:?}");
+            }
+            other => panic!("the seed must push a user block, got {other:?}"),
+        }
+        assert_eq!(
+            ProvenanceClass::of(&seeded_provenance),
+            ProvenanceClass::Unknown,
+            "a boundary-touched block classes Unknown however many files it names"
+        );
+
+        // ── Seam 2: the union ───────────────────────────────────────────────
+        let seeded = context_provenance(&first);
+        assert!(
+            seeded.is_boundary_touch(),
+            "the union dropped the bit: {seeded:?}"
+        );
+        assert!(
+            seeded.is_unknown(),
+            "a boundary touch fails the turn closed"
+        );
+        assert!(
+            seeded.contains(".claude/skills/audit/SKILL.md"),
+            "the ids it *could* mint are still named beside the bit"
+        );
+        assert!(
+            seeded.with_unknown_lifted().is_unknown(),
+            "`/shell allow` must not lift a pin taken on a path the daemon named"
+        );
+
+        // ── Seam 3: replay ──────────────────────────────────────────────────
+        let mut second = ContextManager::new("A DIFFERENT HEAD", 10_000);
+        second.replay_blocks(first.into_retained().into_blocks());
+        assert_eq!(
+            second.blocks()[0].provenance,
+            seeded_provenance,
+            "a carried expansion must still say it touched a boundary"
+        );
+        let replayed = context_provenance(&second);
+        assert!(
+            replayed.is_boundary_touch(),
+            "the pin lasted exactly one turn: {replayed:?}"
+        );
+        assert_eq!(
+            replayed, seeded,
+            "the choke point must see the carried conversation as it saw the live one"
+        );
     }
 
     /// A carried user block is an *earlier* turn's request, and the duties that
@@ -5793,6 +6056,7 @@ mod tests {
             format!("release checklist\n{}", "x".repeat(1_500)),
             [fixture_id(SKILL_ID)].into_iter().collect(),
             false,
+            false,
         );
         ctx.push_model("y".repeat(1_500));
         // See the sibling test: the newest two prompts are anchored, so the
@@ -5829,7 +6093,7 @@ mod tests {
     #[test]
     fn a_dropped_unpinnable_user_block_leaves_the_unknown_bit_behind() {
         let mut ctx = ContextManager::new("HEAD", 1_000_000).with_budget_bytes(2_000);
-        ctx.push_user_from("x".repeat(1_500), BTreeSet::new(), true);
+        ctx.push_user_from("x".repeat(1_500), BTreeSet::new(), true, false);
         ctx.push_model("y".repeat(1_500));
         // Two later prompts, not one: REQ-618 anchors the newest two, so a
         // block that is only one prompt old is still the ask and is not
@@ -5848,6 +6112,179 @@ mod tests {
             "a dropped unpinnable expansion stopped failing the session closed"
         );
         assert!(ctx.dropped_provenance().sources().is_empty());
+    }
+
+    /// **The third half of seam 1's arm (REQ-619 verify, M5).** A dropped user
+    /// block that carried `boundary_touch` has to leave *that* bit behind, not
+    /// merely the `unknown` it implies.
+    ///
+    /// The arm gained the line with ADR-619-2 and nothing exercised it. It is
+    /// not covered by the sibling above, because `absorb` sets `unknown` from
+    /// `*unknown || *boundary_touch` — so a build that had forgotten the
+    /// permanence entirely still fails the next send closed, and the sibling
+    /// stays green. What is lost is only visible one question deeper:
+    /// `taint::cause_of` reads `is_boundary_touch` to decide whether the pin is
+    /// `boundary_hit` (permanent) or `unknown_shell` (liftable), so compacting
+    /// the block away would silently convert a crossed boundary into something
+    /// `/shell allow` releases. Dropping a block is not a lift.
+    ///
+    /// The last two assertions are the non-vacuity half: an ordinary unknown
+    /// expansion must **not** come back boundary-touched, or this test would
+    /// pass on an accumulator that had started setting the bit for everything.
+    ///
+    /// # Mutation
+    ///
+    /// Ran with `self.boundary_touch |= *boundary_touch;` deleted from
+    /// `absorb`'s `User` arm: **one red**, this test on `a dropped boundary
+    /// touch keeps its permanence`. One — the seam has exactly this test, which
+    /// is why it is here.
+    #[test]
+    fn absorbing_a_boundary_touched_user_block_keeps_the_bit() {
+        let mut ctx = ContextManager::new("HEAD", 1_000_000).with_budget_bytes(2_000);
+        // A skill expansion whose preamble read an out-of-root boundary file:
+        // no id to name it with, so the bit is the only carrier (LESSON-623).
+        ctx.push_user_from("x".repeat(1_500), BTreeSet::new(), false, true);
+        ctx.push_model("y".repeat(1_500));
+        // Three prompts in, for the reason the sibling above spells out.
+        ctx.push_user("and now the next prompt");
+        ctx.push_user("and the one after that");
+
+        let report = ctx.truncate_to_budget();
+        assert!(
+            report.dropped_blocks >= 1,
+            "non-vacuity: the gate dropped nothing, so nothing was absorbed"
+        );
+        assert!(
+            ctx.dropped_provenance().is_boundary_touch(),
+            "a dropped boundary touch keeps its permanence: {:?}",
+            ctx.dropped_provenance()
+        );
+        assert!(
+            ctx.dropped_provenance().is_unknown(),
+            "…and it still blocks, which is the half `unknown` carries"
+        );
+
+        // Non-vacuity: an ordinary unknown expansion is not promoted to one.
+        let mut liftable = ContextManager::new("HEAD", 1_000_000).with_budget_bytes(2_000);
+        liftable.push_user_from("x".repeat(1_500), BTreeSet::new(), true, false);
+        liftable.push_model("y".repeat(1_500));
+        liftable.push_user("and now the next prompt");
+        liftable.push_user("and the one after that");
+        assert!(liftable.truncate_to_budget().dropped_blocks >= 1);
+        assert!(liftable.dropped_provenance().is_unknown());
+        assert!(
+            !liftable.dropped_provenance().is_boundary_touch(),
+            "an unprovable expansion crossed nothing, so its pin stays liftable"
+        );
+    }
+
+    /// **REQ-619 verify, M3 + C1.** The one mapping from three reach bits to
+    /// this vocabulary, row for row.
+    ///
+    /// Table-driven because it *is* a table, and because three call sites — the
+    /// `shell` tool, the skill fold, `compaction_summary` — used to spell it
+    /// out separately. A row that is not here is a row nothing checks in any of
+    /// them.
+    ///
+    /// The C1 row is the third: `unknown` with a non-empty source set is
+    /// [`ToolProvenance::UnknownWith`] and **not** a bare `Unknown`. Collapsing
+    /// it was the leak — `/shell allow` clears the opacity, and a cleared
+    /// `Unknown` over an empty set is a clean provenance, so a skill expansion
+    /// that ran `sh -c …` beside `cat secrets/prod.env` sent the secret after
+    /// the lift.
+    ///
+    /// **Mutation (run, red, reverted):** delete the `unknown && !sources.is_empty()`
+    /// arm from `from_bits`, so the pair collapses to `Unknown` as it used to,
+    /// and **exactly one** test goes red — this one, on `unknown with proved ids
+    /// keeps them`. One, because `from_bits` is the mapping and
+    /// `digest::tests::a_lift_over_an_unknown_with_sources_keeps_the_files`
+    /// guards the *consequence* from the other side: mutate the digest bridge
+    /// instead and that one reddens with `tool_provenance_maps_onto_egress_provenance`.
+    /// Both halves are needed; neither covers the other.
+    #[test]
+    fn from_bits_is_the_one_precedence_and_it_keeps_proved_ids_under_unknown() {
+        let a = fixture_id("a.rs");
+        let secret = fixture_id("secrets/prod.env");
+        let both: BTreeSet<ProvenanceId> = [a.clone(), secret.clone()].into_iter().collect();
+
+        // Row 4: nothing unprovable, nothing touched — the proportionate answer.
+        assert_eq!(
+            ToolProvenance::from_bits(both.clone(), false, false),
+            ToolProvenance::Sources(both.clone())
+        );
+        // ... and its empty case: content that names nothing and pins nothing.
+        assert_eq!(
+            ToolProvenance::from_bits(BTreeSet::new(), false, false),
+            ToolProvenance::none()
+        );
+
+        // Row 3: unknown, nothing proved.
+        assert_eq!(
+            ToolProvenance::from_bits(BTreeSet::new(), true, false),
+            ToolProvenance::Unknown
+        );
+
+        // Row 2, the C1 row: unknown **and** these files.
+        assert_eq!(
+            ToolProvenance::from_bits(both.clone(), true, false),
+            ToolProvenance::UnknownWith(both.clone()),
+            "unknown with proved ids keeps them"
+        );
+
+        // Row 1: a boundary touch outranks both, whatever else is set — its pin
+        // is permanent and every other arm refuses the send anyway.
+        for (unknown, sources) in [
+            (false, BTreeSet::new()),
+            (true, BTreeSet::new()),
+            (false, both.clone()),
+            (true, both.clone()),
+        ] {
+            assert_eq!(
+                ToolProvenance::from_bits(sources, unknown, true),
+                ToolProvenance::BoundaryTouch,
+                "boundary_touch is first (unknown={unknown})"
+            );
+        }
+    }
+
+    /// **REQ-619 verify, C1**, at the accumulator that outlives the block.
+    ///
+    /// [`DroppedProvenance`] has always refused to collapse "unknown" into
+    /// "these files" — the pair is its whole posture — so the new variant has
+    /// to arrive as both halves. A forgotten block that was unknown *and* named
+    /// `secrets/prod.env` must leave both behind, or the next turn ships a
+    /// paraphrase of the secret with nothing left to refuse it.
+    ///
+    /// **Mutation (run, red, reverted):** drop the `self.sources.extend(…)` from
+    /// `absorb`'s `UnknownWith` arm and this test goes red on its second
+    /// assertion, and nothing else.
+    #[test]
+    fn absorbing_an_unknown_with_sources_keeps_both_halves() {
+        let mut dropped = DroppedProvenance::default();
+        dropped.absorb(&Provenance::Tool {
+            tool: "skill".to_owned(),
+            provenance: ToolProvenance::UnknownWith(
+                [fixture_id("secrets/prod.env")].into_iter().collect(),
+            ),
+        });
+        assert!(dropped.is_unknown(), "the opacity outlives the block");
+        assert_eq!(
+            dropped
+                .sources()
+                .iter()
+                .map(ProvenanceId::as_str)
+                .collect::<Vec<_>>(),
+            vec!["secrets/prod.env"],
+            "and so do the files it proved"
+        );
+        // Benign twin: a bare `Unknown` still contributes only the bit.
+        let mut bare = DroppedProvenance::default();
+        bare.absorb(&Provenance::Tool {
+            tool: "shell".to_owned(),
+            provenance: ToolProvenance::Unknown,
+        });
+        assert!(bare.is_unknown());
+        assert!(bare.sources().is_empty());
     }
 
     // -- measuring a candidate turn before it is committed (BR-8, ADR-11) -----
@@ -5948,6 +6385,7 @@ mod tests {
         ctx.push_user_from(
             body.clone(),
             [fixture_id(SKILL_ID)].into_iter().collect(),
+            false,
             false,
         );
         let report = ctx.truncate_to_budget();
@@ -6185,6 +6623,7 @@ mod tests {
         ctx.push_user_from(
             body.clone(),
             [fixture_id(SKILL_ID)].into_iter().collect(),
+            false,
             false,
         );
         let report = ctx.truncate_to_budget();

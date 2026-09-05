@@ -305,21 +305,32 @@ impl Tool for ShellTool {
                 verdict.reason
             );
         }
-        let provenance = match verdict.kind {
-            shell_provenance::VerdictKind::Rooted => {
-                ToolProvenance::Sources(verdict.sources.clone())
-            }
-            // An **in-root** boundary path carries its own minted id, so the
-            // result reports it as a source and egress blocks naming the actual
-            // file — a `read` of `.env` and a `cat .env` produce the same
-            // `privacy_block`. The sentinel variant is for the out-of-root case
-            // alone, where no id exists for a glob to match (ADR-614-3).
-            shell_provenance::VerdictKind::BoundaryTouch if !verdict.sources.is_empty() => {
-                ToolProvenance::Sources(verdict.sources.clone())
-            }
-            shell_provenance::VerdictKind::BoundaryTouch => ToolProvenance::BoundaryTouch,
-            shell_provenance::VerdictKind::Unknown => ToolProvenance::Unknown,
-        };
+        // One mapping, shared with the skill fold and with compaction
+        // (`ToolProvenance::from_bits`, REQ-619 verify M3) — the arms used to be
+        // written out here, and a precedence written three times is a
+        // precedence two of the copies eventually disagree with.
+        //
+        // An **in-root** boundary path carries its own minted id, so it rides
+        // in `sources` and egress blocks naming the actual file — a `read` of
+        // `.env` and a `cat .env` produce the same `privacy_block`. The
+        // sentinel is for the out-of-root case alone, where no id exists for a
+        // glob to match (ADR-614-3), and the verdict now *says* which case it
+        // is: `out_of_root_touch`, never `sources.is_empty()`. The two agree
+        // for a command naming one path and disagree for
+        // `cat ~/.ssh/id_rsa README.md`, where the emptiness test read
+        // `{README.md}` as proof the touch was nameable and handed a private
+        // key a clean, liftable provenance (REQ-619 verify, C2).
+        //
+        // The second disjunct is belt and braces: a `BoundaryTouch` that named
+        // nothing at all is out-of-root by construction, and stays mapped to
+        // the sentinel even if a future arm forgets to set the flag.
+        let provenance = ToolProvenance::from_bits(
+            verdict.sources.clone(),
+            verdict.kind == shell_provenance::VerdictKind::Unknown,
+            verdict.out_of_root_touch
+                || (verdict.kind == shell_provenance::VerdictKind::BoundaryTouch
+                    && verdict.sources.is_empty()),
+        );
         // (The three arms that carry none — the two pre-spawn ones above and
         // the failed spawn below — surface no command output.)
         //
@@ -1276,6 +1287,88 @@ mod tests {
         assert!(crate::harness::digest::tool_result_provenance(&opaque.provenance).is_unknown());
         assert!(!crate::harness::digest::tool_result_provenance(&boundary.provenance).is_empty());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **REQ-619 verify, C2.** A command that reads an out-of-root boundary file
+    /// *and* an ordinary in-root one maps to the permanent sentinel, not to a
+    /// clean `Sources`.
+    ///
+    /// The mapping used to ask `verdict.sources.is_empty()` — "did the touch
+    /// mint an id?" — of a set that accumulates over **every** token. One
+    /// ordinary filename beside the protected one filled it, the emptiness test
+    /// answered "in-root", and `cat <somewhere>/.ssh/id_rsa README.md` came back
+    /// as `Sources({README.md})`: a liftable provenance, matched against no glob
+    /// that covers the key, for a command that read it. It now reads
+    /// `Verdict::out_of_root_touch`, which is a statement rather than a proxy.
+    ///
+    /// The boundary file is planted outside the root rather than under the real
+    /// `$HOME`, so the fixture holds on a runner with no `~/.ssh`: the builtin
+    /// `**/.ssh/**` matches the `/`-stripped absolute path either way (AC-5's
+    /// rule).
+    ///
+    /// # Benign twins
+    ///
+    /// The same command without the out-of-root token must stay `Sources`, and
+    /// an **in-root** boundary path must keep naming itself — a fix that
+    /// answered `BoundaryTouch` for every boundary would pass the first
+    /// assertion and stop every `privacy_block` from naming a file.
+    ///
+    /// **Mutation (run, red, reverted):** put the mapping back on
+    /// `verdict.sources.is_empty()` alone and this test goes red on its first
+    /// assertion.
+    #[test]
+    fn an_out_of_root_touch_beside_an_in_root_read_maps_to_the_sentinel() {
+        use crate::harness::context::ToolProvenance;
+        let root = temp_root("mixedtouch");
+        std::fs::write(root.join("README.md"), "# readme\n").unwrap();
+        let outside = std::env::temp_dir().join(format!(
+            "teton-shell-mixedtouch-{}-{}",
+            std::process::id(),
+            "keys"
+        ));
+        std::fs::create_dir_all(outside.join(".ssh")).unwrap();
+        std::fs::write(outside.join(".ssh/id_rsa"), "PRIVATE KEY\n").unwrap();
+        let key = outside.join(".ssh/id_rsa");
+        let ctx = project_ctx(&root);
+
+        let mixed = ShellTool::default().run(
+            &ctx,
+            &json!({ "command": format!("cat {} README.md", key.to_string_lossy()) }),
+        );
+        assert_eq!(
+            mixed.provenance,
+            ToolProvenance::BoundaryTouch,
+            "an out-of-root touch is permanent however many in-root files rode along"
+        );
+        assert!(
+            crate::harness::digest::tool_result_provenance(&mixed.provenance).is_boundary_touch(),
+            "and it reaches egress as the permanent cause"
+        );
+
+        // Benign twin 1: drop the protected token and the read is ordinary.
+        let plain = ShellTool::default().run(&ctx, &json!({ "command": "cat README.md" }));
+        let ToolProvenance::Sources(ids) = &plain.provenance else {
+            panic!("expected Sources, got {:?}", plain.provenance);
+        };
+        assert_eq!(
+            ids.iter().map(|i| i.as_str()).collect::<Vec<_>>(),
+            vec!["README.md"]
+        );
+
+        // Benign twin 2: an in-root boundary still names itself.
+        std::fs::write(root.join(".env"), "K=v\n").unwrap();
+        let in_root = ShellTool::default().run(&ctx, &json!({ "command": "cat .env README.md" }));
+        let ToolProvenance::Sources(ids) = &in_root.provenance else {
+            panic!("expected Sources, got {:?}", in_root.provenance);
+        };
+        assert_eq!(
+            ids.iter().map(|i| i.as_str()).collect::<Vec<_>>(),
+            vec![".env", "README.md"],
+            "an in-root boundary is named, not turned into a bare sentinel"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     /// REQ-614 BR-8 / AC-4. The 2026-09-04 session was pinned by a command that

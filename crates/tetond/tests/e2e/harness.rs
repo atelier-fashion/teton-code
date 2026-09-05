@@ -50,8 +50,25 @@ pub fn global_capture() -> &'static Mutex<Vec<Vec<u8>>> {
     CAPTURE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// The buffer, **poison-tolerant** — recovered rather than re-panicked on.
+///
+/// The first test to see a leak fails inside this lock, which poisons it for
+/// every test still to run; each of those then dies on `PoisonError` instead of
+/// on its own assertion. The result is that one real finding is reported as
+/// twenty unrelated ones, and a mutation record measured on that count says
+/// nothing about the mutation (REQ-619 verify, m8 — the counts recorded across
+/// this suite had to be re-measured, and this is what made them measurable).
+///
+/// Recovering is sound here because the data is append-only bytes with no
+/// invariant a panic could have broken mid-write: the buffer is exactly as
+/// valid after the poisoning as before it, and what the next test needs to see
+/// is *those* bytes.
+fn capture_guard() -> std::sync::MutexGuard<'static, Vec<Vec<u8>>> {
+    global_capture().lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn record_egress(body: Vec<u8>) {
-    global_capture().lock().unwrap().push(body);
+    capture_guard().push(body);
 }
 
 /// Assert the boundary secret has not appeared in any captured egress payload.
@@ -59,7 +76,7 @@ fn record_egress(body: Vec<u8>) {
 /// Called at the end of every egress-touching test, so a leak anywhere in the
 /// suite fails the run (BR-1 across the whole suite, not only AC-5).
 pub fn assert_no_boundary_bytes() {
-    let capture = global_capture().lock().unwrap();
+    let capture = capture_guard();
     // BR-1 is about the *content* of a boundary-protected file, not its path (a
     // user prompt may legitimately name the path). The sentinel and the database
     // URL are the file's content; neither may ever reach the wire.
@@ -529,6 +546,33 @@ impl Workspace {
     /// The contents of a repo file, relative to the repo root.
     pub fn read_repo_file(&self, rel: &str) -> String {
         std::fs::read_to_string(self.repo.join(rel)).unwrap()
+    }
+
+    /// Plant a **user** skill at `<root>/home/.claude/skills/<name>/SKILL.md`
+    /// and return the fixture HOME to hand the daemon (REQ-619).
+    ///
+    /// A user skill is one discovered under the daemon's `$HOME`, on a root the
+    /// session's repository is not under, so a test that wants one has to give
+    /// the daemon a home of its own —
+    /// `Daemon::spawn(&ws, opts.env("HOME", home.display().to_string()))`. The
+    /// HOME comes back rather than being read off the workspace, because
+    /// forgetting to pass it turns every claim here into a claim about a skill
+    /// that was never discovered.
+    ///
+    /// `body` is the file's Markdown, frontmatter excluded: this writes the
+    /// `description` key (the one REQ-585 requires) and nothing else, so a body
+    /// carrying `` !`cmd` `` preambles reads exactly as an author wrote it.
+    /// Discovery runs at `session/create`, so call this **before** the session.
+    pub fn user_skill(&self, name: &str, body: &str) -> PathBuf {
+        let home = self.root.join("home");
+        let dir = home.join(".claude").join("skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\ndescription: the {name} fixture skill\n---\n\n{body}"),
+        )
+        .unwrap();
+        home
     }
 
     /// Write a model-catalog TOML and return its path (`TETON_CATALOG`).
@@ -1198,6 +1242,25 @@ impl Client {
             json!({
                 "session_id": session_id,
                 "prompt": [{ "type": "text", "text": text }],
+            }),
+        )
+    }
+
+    /// Submit a **typed skill** turn — what `/name <args>` sends — and return
+    /// the full response object (REQ-585, REQ-619).
+    ///
+    /// The prompt array is empty and the invocation rides the `skill` key: the
+    /// daemon expands the file itself, so a test that spelled the body into a
+    /// text prompt would be asserting about bytes it wrote rather than about
+    /// bytes the expander produced. `raw_arguments` is the rest of the typed
+    /// line, verbatim and unsplit — empty for a skill that takes none.
+    pub fn skill(&mut self, session_id: &str, name: &str, raw_arguments: &str) -> Value {
+        self.call(
+            "session/prompt",
+            json!({
+                "session_id": session_id,
+                "prompt": [],
+                "skill": { "name": name, "raw_arguments": raw_arguments },
             }),
         )
     }

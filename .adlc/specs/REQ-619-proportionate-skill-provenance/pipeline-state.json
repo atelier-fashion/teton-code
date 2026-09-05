@@ -1,0 +1,91 @@
+{
+  "req": "REQ-619",
+  "branch": "feat/REQ-619-proportionate-skill-provenance",
+  "startedAt": "2026-09-05T16:58:44Z",
+  "completed": false,
+  "currentPhase": 7,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree",
+      "completedAt": "2026-09-05T16:58:48Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-09-05T16:59:53Z",
+      "result": "APPROVED; 0 blockers, 2 advisory warnings (named existing function in BR-4/AC-9; AC-8 fixture weight); builtin-glob assumption verified against DEFAULT_BOUNDARIES"
+    },
+    {
+      "phase": 2,
+      "name": "Architect",
+      "completedAt": "2026-09-05T17:08:05Z",
+      "result": "6 ADRs, 6 tasks (TASK-398..403), OQ-1 resolved (ordinary glob form via ~-scoped ids), OQ-2 resolved (no script reading); footprint published to PR #304"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Tasks",
+      "completedAt": "2026-09-05T17:08:34Z",
+      "result": "APPROVED; DAG valid, max 3 deps; obligation coverage 10/10 BR, 13/13 AC; benign paths on every detector-shaped BR; vacuous-run gate deferred to the cargo runs in Phase 4/5"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-09-05T19:28:25Z",
+      "result": "TASK-398..403 complete in three tiers (398+399 | 400+402 | 401 | 403); workspace 82 targets green; clippy -D warnings and fmt clean"
+    },
+    {
+      "phase": 5,
+      "name": "Verify",
+      "completedAt": "2026-09-05T23:28:37Z",
+      "result": "6 agents + delegate pre-pass: 3 Critical (C1 model-path drops sources under unknown; C2 out-of-root touch beside in-root file folds clean; C3 ReservedScope read as no-file by walker/resolver), 5 Major, 9 Minor; all fixed in two passes (A: classifier/core, B: runtime/skills/tests/docs) with recorded mutations; inspector arm order filed as BUG-216 and pinned by a test; stale mutation counts re-measured"
+    },
+    {
+      "phase": 6,
+      "name": "Create PR",
+      "completedAt": "2026-09-05T23:28:56Z",
+      "result": "PR #304 flipped from draft to ready with full body; footprint block preserved"
+    }
+  ],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-619",
+      "branch": "feat/REQ-619-proportionate-skill-provenance",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/304",
+      "prNumber": 304,
+      "prCreatedAt": "2026-09-05T16:58:47Z",
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-398",
+      "TASK-399",
+      "TASK-402",
+      "TASK-400",
+      "TASK-401",
+      "TASK-403"
+    ],
+    "failedTasks": []
+  },
+  "conflictsResolved": []
+}

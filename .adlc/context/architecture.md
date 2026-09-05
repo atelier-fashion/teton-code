@@ -395,16 +395,19 @@
 - **User-authored prompt text is a first-class provenance source** — prompt
   text carried no file provenance at all until a `/`-command's expansion had to
   pin its turn exactly as a `read` of the same file would. `Provenance::User`
-  therefore carries two fields, not one (`sources` **and** `unknown`): the empty
-  set already means *ordinary typed text*, the state every existing caller is
-  in, so it could not double as the unpinnable marker without pinning every
-  prompt on every boundary-configured machine. A file with no root-relative
-  identity — a user skill outside the session root — sets `unknown` and fails
-  closed, rather than `ProvenanceId::from_resolved` being widened to mint an id
-  it has no root for. The invariant lives at three seams (dropped-block absorb,
-  the context-provenance union, and replay) and is pinned at each, because a
-  multi-seam invariant needs a test at every seam and carried state sheds its
-  invariants silently on the round trip (REQ-585 ADR-9, LESSON-501, LESSON-502).
+  therefore carries three fields, not one (`sources`, `unknown` **and**
+  `boundary_touch`): the empty set already means *ordinary typed text*, the state
+  every existing caller is in, so it could not double as the unpinnable marker
+  without pinning every prompt on every boundary-configured machine. A skill file
+  has a `~`-scoped identity when it was discovered under a **user** root and a
+  repo-relative one when it was discovered under the project root; only a file
+  under neither sets `unknown` and fails closed. `ProvenanceId::from_resolved` is
+  still not widened — the user scope has a root of its own, the daemon's `$HOME`,
+  and only discovery may mint against it (REQ-619 BR-3/BR-4). The invariant lives
+  at three seams (dropped-block absorb, the context-provenance union, and replay)
+  and is pinned at each, because a multi-seam invariant needs a test at every seam
+  and carried state sheds its invariants silently on the round trip (REQ-585
+  ADR-9, REQ-619 ADR-619-3, LESSON-501, LESSON-502).
 - **A remembered grant is keyed by the whole question — the name *and* where it
   came from** — a permission key is what a "for this session" answer is written
   under, so it must encode everything that made the question answerable.

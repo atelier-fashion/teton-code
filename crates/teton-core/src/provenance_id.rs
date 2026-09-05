@@ -8,19 +8,51 @@
 //! compiler enforces — the channel accepts only a value that some code was in a
 //! position to establish.
 //!
-//! Two constructors, both explicit at the call site:
+//! Three constructors, all explicit at the call site:
 //!
 //! | Constructor | For | Guarantee |
 //! |---|---|---|
 //! | [`ProvenanceId::from_resolved`] | Files the daemon actually opened (`read`, `edit`, `grep`, `glob`) | Derived from the resolved path, so it names the file that was read |
+//! | [`ProvenanceId::from_home_resolved`] | Files the daemon *discovered* under the user's home (REQ-619 BR-3/BR-4: user skills) | Derived from the resolved path, so it names the file that was read |
 //! | [`ProvenanceId::claimed`] | A path *asserted* by a third party (MCP tool arguments) | Best-effort: normalized identically, but the daemon never observed it |
+//!
+//! # Two scopes, and why they cannot collide (REQ-619 ADR-619-3)
+//!
+//! An id names a file relative to a root, and there are two roots a first-party
+//! id is minted against:
+//!
+//! | Scope | Root | Spelling | Minted by |
+//! |---|---|---|---|
+//! | **repo** | the session root | `secrets/prod.env` | [`ProvenanceId::from_resolved`] |
+//! | **home** | the user's `$HOME` | `~/.claude/skills/x/SKILL.md` | [`ProvenanceId::from_home_resolved`] |
+//!
+//! The home scope's marker is a leading `~` segment, and **every other
+//! constructor reserves it**: [`ProvenanceId::from_resolved`] refuses a
+//! root-relative remainder whose first segment is `~`, and so does
+//! [`ProvenanceId::claimed`] ([`ProvenanceError::ReservedScope`]). The
+//! disjointness is a property of the *set of constructors*, not of one of them:
+//! a rule enforced on the first-party minter alone would leave the assertion
+//! path — an MCP server naming the files it touched — able to write into a
+//! scope nothing on this machine resolved (REQ-619 verify, M4). That refusal is
+//! what makes the two scopes disjoint as *strings*, which is the property BR-3
+//! asks for — a user skill at `skills/x/SKILL.md` under the home and a project
+//! file at `skills/x/SKILL.md` under the repo can never share an id, so a
+//! boundary verdict about one is never a verdict about the other. Only
+//! `from_home_resolved` produces the marker, and it produces it for a file
+//! discovery listed under the home.
+//!
+//! `~` needs no new glob language: `globset` treats it as an ordinary
+//! character, and every builtin boundary is `**/`-prefixed (which matches zero
+//! or more leading directories), so `**/.ssh/**` matches `~/.ssh/config` and a
+//! user's `**/.claude/skills/**` matches `~/.claude/skills/x/SKILL.md` —
+//! pinned by `boundary::tests::a_tilde_scoped_id_is_matched_by_a_user_glob_and_by_no_builtin`.
 //!
 //! # Canonical form
 //!
-//! An id is a non-empty, repo-root-relative, `/`-separated path with no `.`,
-//! `..`, or empty segment. Both constructors produce exactly that form or an
-//! error — never a third outcome, and in particular never a fallback to the
-//! caller's input (ADR-B).
+//! An id is a non-empty, root-relative, `/`-separated path with no `.`, `..`,
+//! or empty segment; a home-scoped id is that, prefixed with the `~` segment.
+//! Every constructor produces exactly that form or an error — never a third
+//! outcome, and in particular never a fallback to the caller's input (ADR-B).
 //!
 //! # No filesystem access
 //!
@@ -89,7 +121,42 @@ pub enum ProvenanceError {
     /// resolved path equal to the root itself. There is no file to attribute.
     #[error("provenance source is empty after normalization; there is no file to attribute")]
     Empty,
+    /// The repo-relative remainder begins with the `~` segment, which the
+    /// **home** scope owns (REQ-619 ADR-619-3).
+    ///
+    /// Raised by [`ProvenanceId::from_resolved`] for a real file at
+    /// `<session root>/~/…` — a directory literally named `~`, which a shell
+    /// creates by accident (`mkdir ~/x` inside quotes) more often than on
+    /// purpose — and by [`ProvenanceId::claimed`] for a third party that
+    /// *asserts* such a path. Minting it would produce a string
+    /// [`ProvenanceId::from_home_resolved`] can also produce, and one string
+    /// meaning two files is precisely the "one file, two identities" defect
+    /// inverted: a boundary glob written for the user's skills directory would
+    /// start matching a repository path, and vice versa.
+    ///
+    /// The refusal is checked **after** `strip_prefix`, so a path outside the
+    /// root is still [`ProvenanceError::NotUnderRoot`] — the stronger statement
+    /// keeps precedence.
+    ///
+    /// `claimed` refuses it for a sharper reason (REQ-619 verify, M4): an MCP
+    /// server names the paths it touched, and without this an assertion of
+    /// `~/.ssh/config` would mint the *home* scope's spelling from a value the
+    /// daemon never resolved — a third party writing an id into the scope
+    /// reserved for files this machine's own discovery listed.
+    #[error(
+        "provenance source '{path}' begins with the reserved '~' segment; \
+         that scope belongs to the home-relative minter"
+    )]
+    ReservedScope {
+        /// The offending remainder, in canonical form.
+        path: String,
+    },
 }
+
+/// The home scope's marker: the first segment of every id
+/// [`ProvenanceId::from_home_resolved`] mints, and the segment
+/// [`ProvenanceId::from_resolved`] refuses (REQ-619 ADR-619-3).
+const HOME_SCOPE: &str = "~";
 
 /// The repo-relative identity of a file whose content entered model context.
 ///
@@ -145,6 +212,8 @@ impl ProvenanceId {
     /// - [`ProvenanceError::Absolute`] when the remainder is still absolute
     ///   (reachable only for a degenerate empty `root`).
     /// - [`ProvenanceError::Empty`] when `resolved` *is* `root`.
+    /// - [`ProvenanceError::ReservedScope`] when the remainder's first segment
+    ///   is `~`, which the home scope owns (REQ-619 ADR-619-3).
     ///
     /// ```
     /// use std::path::Path;
@@ -159,6 +228,9 @@ impl ProvenanceId {
     ///
     /// // Outside the root there is no identity — and no fallback.
     /// assert!(ProvenanceId::from_resolved(Path::new("/repo"), Path::new("/etc/passwd")).is_err());
+    ///
+    /// // The `~` scope is the home minter's; the repo scope will not spell it.
+    /// assert!(ProvenanceId::from_resolved(Path::new("/repo"), Path::new("/repo/~/x")).is_err());
     /// ```
     pub fn from_resolved(root: &Path, resolved: &Path) -> Result<Self, ProvenanceError> {
         let rel = resolved
@@ -167,7 +239,79 @@ impl ProvenanceId {
                 root: root.to_string_lossy().into_owned(),
                 resolved: resolved.to_string_lossy().into_owned(),
             })?;
-        mint(&rel.to_string_lossy())
+        let id = mint(&rel.to_string_lossy())?;
+        // After the strip, so `NotUnderRoot` keeps precedence, and after the
+        // mint, so `./~/x` is judged in the same canonical form `~/x` is.
+        if id.first_segment() == HOME_SCOPE {
+            return Err(ProvenanceError::ReservedScope { path: id.0 });
+        }
+        Ok(id)
+    }
+
+    /// Mint the identity of a file the daemon resolved under the user's **home**
+    /// (REQ-619 BR-3/BR-4).
+    ///
+    /// `resolved` must already be canonical — see the module docs; `home` is the
+    /// canonical home directory. The id is `~/` followed by `resolved` relative
+    /// to `home`, with separators normalized to `/`.
+    ///
+    /// # What this is for, and what it is not
+    ///
+    /// It exists because a **user skill** is a file the user installed
+    /// themselves and the registry then listed, so the daemon is in a position
+    /// to say which file a block came from — the same fact that makes a project
+    /// skill's file nameable. It is **not** a widening of what may be read:
+    /// REQ-587 ADR-9 refused to invent an identity the minter has no root for,
+    /// and that refusal stands. The home scope has its own root and its own
+    /// constructor, and the tool jail is untouched — a `read` of
+    /// `~/.claude/skills/x/SKILL.md` from a repo-rooted session is refused
+    /// exactly as it was (REQ-619 AC-9). Call this only where discovery
+    /// happened.
+    ///
+    /// # Errors
+    ///
+    /// - [`ProvenanceError::NotUnderRoot`] when `resolved` is not under `home`
+    ///   — a skills directory symlinked out of the home, say. **No fallback**:
+    ///   the caller fails closed, exactly as it does for the repo scope.
+    /// - [`ProvenanceError::ParentTraversal`] when the remainder retains `..`,
+    ///   i.e. the caller skipped canonicalization.
+    /// - [`ProvenanceError::Absolute`] when the remainder is still absolute
+    ///   (reachable only for a degenerate empty `home`).
+    /// - [`ProvenanceError::Empty`] when `resolved` *is* `home`; the home
+    ///   directory itself is not a file to attribute, and `~` alone is not an
+    ///   id.
+    ///
+    /// ```
+    /// use std::path::Path;
+    /// use teton_core::ProvenanceId;
+    ///
+    /// let id = ProvenanceId::from_home_resolved(
+    ///     Path::new("/home/u"),
+    ///     Path::new("/home/u/.claude/skills/x/SKILL.md"),
+    /// )
+    /// .unwrap();
+    /// assert_eq!(id.as_str(), "~/.claude/skills/x/SKILL.md");
+    ///
+    /// // Outside the home there is no home-relative identity — and no fallback.
+    /// assert!(
+    ///     ProvenanceId::from_home_resolved(Path::new("/home/u"), Path::new("/etc/passwd")).is_err()
+    /// );
+    /// ```
+    pub fn from_home_resolved(home: &Path, resolved: &Path) -> Result<Self, ProvenanceError> {
+        let rel = resolved
+            .strip_prefix(home)
+            .map_err(|_| ProvenanceError::NotUnderRoot {
+                root: home.to_string_lossy().into_owned(),
+                resolved: resolved.to_string_lossy().into_owned(),
+            })?;
+        // Mint the remainder through the one normalizer first, so the home
+        // scope refuses every spelling the repo scope refuses and in the same
+        // words — in particular `Empty`, which is what keeps a bare `~` (the
+        // home directory itself) from becoming an id. The marker is prepended
+        // to an already-canonical value, so the result is canonical by
+        // construction rather than by a second pass.
+        let relative = mint(&rel.to_string_lossy())?;
+        Ok(ProvenanceId(format!("{HOME_SCOPE}/{}", relative.0)))
     }
 
     /// Mint an identity from a path a third party *asserted*, for MCP tool
@@ -189,10 +333,16 @@ impl ProvenanceId {
     ///
     /// # Errors
     ///
-    /// [`ProvenanceError::Absolute`], [`ProvenanceError::ParentTraversal`], or
-    /// [`ProvenanceError::Empty`], per the canonical form in the module docs.
-    /// A malformed assertion is refused here rather than silently matching no
-    /// glob later.
+    /// [`ProvenanceError::Absolute`], [`ProvenanceError::ParentTraversal`],
+    /// [`ProvenanceError::Empty`], or [`ProvenanceError::ReservedScope`], per
+    /// the canonical form in the module docs. A malformed assertion is refused
+    /// here rather than silently matching no glob later.
+    ///
+    /// `ReservedScope` is the reason this is not a bare `mint` (REQ-619 verify,
+    /// M4). The `~` scope names files the daemon's own discovery listed under
+    /// the user's home; a third party that could spell it would be asserting an
+    /// identity in a scope it has no standing in — and the caller fails closed
+    /// on the refusal exactly as it does for an absolute path.
     ///
     /// ```
     /// use teton_core::ProvenanceId;
@@ -200,9 +350,19 @@ impl ProvenanceId {
     /// assert_eq!(ProvenanceId::claimed("./secrets/prod.env").unwrap().as_str(), "secrets/prod.env");
     /// assert!(ProvenanceId::claimed("/etc/passwd").is_err());
     /// assert!(ProvenanceId::claimed("../outside").is_err());
+    /// // The home scope is not assertable.
+    /// assert!(ProvenanceId::claimed("~/.ssh/config").is_err());
+    /// // `~` anywhere else is an ordinary segment.
+    /// assert!(ProvenanceId::claimed("x/~").is_ok());
     /// ```
     pub fn claimed(source: &str) -> Result<Self, ProvenanceError> {
-        mint(source)
+        let id = mint(source)?;
+        // The same test `from_resolved` makes, on the same canonical form, for
+        // the same reason: one string may mean one file.
+        if id.first_segment() == HOME_SCOPE {
+            return Err(ProvenanceError::ReservedScope { path: id.0 });
+        }
+        Ok(id)
     }
 
     /// The canonical form: repo-root-relative, `/`-separated, no `.`/`..`
@@ -210,6 +370,15 @@ impl ProvenanceId {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The id's first `/`-separated segment — the scope test, and nothing else.
+    ///
+    /// Private, and reading a *minted* value rather than raw input: by the time
+    /// it is called the string is canonical, so "first segment" is unambiguous
+    /// (there is no leading `./` or `//` left to make it two answers).
+    fn first_segment(&self) -> &str {
+        self.0.split('/').next().unwrap_or_default()
     }
 
     /// **Test seam** (REQ-571 TASK-122). Wrap `raw` verbatim, minting nothing
@@ -491,6 +660,244 @@ mod tests {
         let asserted = ProvenanceId::claimed("./secrets//prod.env").unwrap();
         assert_eq!(observed, asserted);
         assert_eq!(asserted.as_str(), CANONICAL);
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-619 BR-3 — the home scope
+    // -----------------------------------------------------------------------
+
+    const HOME: &str = "/home/u";
+
+    /// **REQ-619 BR-3 / ADR-619-3.** A file the registry discovered under the
+    /// user's home mints `~/<home-relative>` — the spelling a user recognizes,
+    /// and one that carries no absolute home layout into an event.
+    ///
+    /// The refusals are asserted beside it because they are what makes the
+    /// constructor a *scope* rather than a string builder: a path outside the
+    /// home has no home-relative identity and gets no fallback (the ADR-B
+    /// posture `from_resolved` has), the home directory itself names no file,
+    /// and an un-canonicalized remainder is refused rather than collapsed.
+    ///
+    /// **Mutations run, all confirmed red and restored:**
+    /// 1. Prepend nothing (`Ok(relative)`) — this test goes red on the first
+    ///    assertion, and so does
+    ///    `the_repo_scope_refuses_a_leading_tilde_segment`'s disjointness half.
+    /// 2. Format the raw remainder instead of minting it
+    ///    (`format!("~/{}", rel.to_string_lossy())`) — the `Empty` leg goes
+    ///    red, because a bare `~/` becomes an id for the home directory itself.
+    /// 3. Fall back instead of refusing (`strip_prefix(home).unwrap_or(resolved)`)
+    ///    — the `NotUnderRoot` leg goes red.
+    #[test]
+    fn a_home_resolved_file_mints_a_tilde_scoped_id() {
+        let home = Path::new(HOME);
+
+        let id = ProvenanceId::from_home_resolved(
+            home,
+            &PathBuf::from(HOME).join(".claude/skills/x/SKILL.md"),
+        )
+        .unwrap();
+        assert_eq!(id.as_str(), "~/.claude/skills/x/SKILL.md");
+
+        // A `commands/` row, the other user shape, and a nested one: the
+        // separators survive, because boundary globs are separator-sensitive.
+        assert_eq!(
+            ProvenanceId::from_home_resolved(
+                home,
+                &PathBuf::from(HOME).join(".claude/commands/x.md")
+            )
+            .unwrap()
+            .as_str(),
+            "~/.claude/commands/x.md"
+        );
+
+        // Outside the home — a skills directory symlinked out of it, resolved
+        // — there is no home-relative identity, and no fallback.
+        let err =
+            ProvenanceId::from_home_resolved(home, Path::new("/elsewhere/x/SKILL.md")).unwrap_err();
+        assert!(matches!(err, ProvenanceError::NotUnderRoot { .. }), "{err}");
+
+        // A sibling sharing the prefix bytes is a different directory.
+        assert!(matches!(
+            ProvenanceId::from_home_resolved(home, Path::new("/home/u-other/x")),
+            Err(ProvenanceError::NotUnderRoot { .. })
+        ));
+
+        // The home directory itself names no file: `~` alone is not an id.
+        assert!(matches!(
+            ProvenanceId::from_home_resolved(home, home),
+            Err(ProvenanceError::Empty)
+        ));
+
+        // An un-canonicalized remainder is refused, not collapsed — the same
+        // rule the repo scope has, for the same symlink reason.
+        assert!(matches!(
+            ProvenanceId::from_home_resolved(home, &PathBuf::from(HOME).join("sub/../x")),
+            Err(ProvenanceError::ParentTraversal { .. })
+        ));
+
+        // `.` and repeated separators are elided identically to the repo scope,
+        // so one file has one home-scoped id whichever spelling reached it.
+        assert_eq!(
+            ProvenanceId::from_home_resolved(home, &PathBuf::from(HOME).join(".//a/./b.md"))
+                .unwrap()
+                .as_str(),
+            "~/a/b.md"
+        );
+    }
+
+    /// **REQ-619 BR-3 — the reservation, which is what makes the two scopes
+    /// disjoint.**
+    ///
+    /// `mint` accepted a `~` segment before this REQ; nothing minted one. Now
+    /// the home scope does, so the repo scope must stop — otherwise a
+    /// repository containing a directory literally named `~` mints a string
+    /// `from_home_resolved` also mints, and a boundary glob written for the
+    /// user's skills directory silently becomes a verdict about a repository
+    /// path (and the reverse).
+    ///
+    /// The precedence half matters as much as the refusal: the check sits
+    /// **after** `strip_prefix`, so a path outside the root is still
+    /// `NotUnderRoot` — the stronger, older statement — and a `..` remainder is
+    /// still `ParentTraversal`.
+    ///
+    /// **Mutation:** delete the `first_segment() == HOME_SCOPE` check in
+    /// `from_resolved` and this goes red on the first assertion (`/repo/~/x`
+    /// mints `~/x`) and on the disjointness assertion. Confirmed red, then
+    /// restored. Moving the check *above* the `strip_prefix` is not expressible
+    /// (there is no remainder yet), which is why the ordering is stated in the
+    /// doc rather than only asserted.
+    #[test]
+    fn the_repo_scope_refuses_a_leading_tilde_segment() {
+        let err = ProvenanceId::from_resolved(&root(), &joined("~/x")).unwrap_err();
+        assert!(
+            matches!(&err, ProvenanceError::ReservedScope { path } if path == "~/x"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("reserved '~' segment"));
+
+        // Normalization runs first, so every spelling of the reserved segment
+        // is refused, not just the bare one.
+        for spelling in ["./~/x", "~//x", "~/a/b.md", "~"] {
+            assert!(
+                matches!(
+                    ProvenanceId::from_resolved(&root(), &joined(spelling)),
+                    Err(ProvenanceError::ReservedScope { .. })
+                ),
+                "spelling {spelling:?} should be refused as the reserved scope"
+            );
+        }
+
+        // Only the **first** segment is reserved: a `~` deeper in the path is an
+        // ordinary directory name and still mints.
+        assert_eq!(
+            ProvenanceId::from_resolved(&root(), &joined("a/~/b.md"))
+                .unwrap()
+                .as_str(),
+            "a/~/b.md"
+        );
+        // And a name that merely starts with `~` is not the segment.
+        assert_eq!(
+            ProvenanceId::from_resolved(&root(), &joined("~backup/x"))
+                .unwrap()
+                .as_str(),
+            "~backup/x"
+        );
+
+        // Precedence: the older refusals still win where they apply.
+        assert!(matches!(
+            ProvenanceId::from_resolved(&root(), Path::new("/elsewhere/~/x")),
+            Err(ProvenanceError::NotUnderRoot { .. })
+        ));
+        assert!(matches!(
+            ProvenanceId::from_resolved(&root(), &joined("~/../x")),
+            Err(ProvenanceError::ParentTraversal { .. })
+        ));
+
+        // The property the reservation buys: no repo path and no home path can
+        // ever spell the same id, so one boundary verdict is about one file.
+        let home_id =
+            ProvenanceId::from_home_resolved(Path::new(HOME), &PathBuf::from(HOME).join("x"))
+                .unwrap();
+        assert_eq!(home_id.as_str(), "~/x");
+        assert!(
+            ProvenanceId::from_resolved(&root(), &joined("~/x")).is_err(),
+            "the repo scope must not be able to produce {:?}",
+            home_id.as_str()
+        );
+    }
+
+    /// REQ-619 verify, M4: the `~` reservation belongs to the **set** of
+    /// constructors, not to `from_resolved` alone.
+    ///
+    /// `claimed` is the assertion path — an MCP server naming the paths its
+    /// tool touched, under keys the daemon does not control. Left as a bare
+    /// `mint` it was the one constructor that could spell the home scope from
+    /// a value nothing on this machine resolved, so a server could assert
+    /// `~/.claude/skills/x/SKILL.md` and have its result tagged with the
+    /// identity of a file the *user* installed. The refusal is what the caller
+    /// already fails closed on (`mcp::client::collect_paths` marks the call
+    /// unknown and records a `provenance_rejected` entry), so no new handling
+    /// is needed — only the refusal itself.
+    ///
+    /// **Mutation (run, red, reverted):** restore `claimed`'s body to a bare
+    /// `mint(source)` and `cargo test -p teton-core --lib` reports **exactly
+    /// one** failure — this test, on its first assertion, where
+    /// `~/.ssh/config` mints itself — with the other 362 green. That count is
+    /// the finding: before this test the reservation had no coverage on the
+    /// assertion path at all.
+    #[test]
+    fn the_assertion_path_refuses_the_home_scope_too() {
+        let err = ProvenanceId::claimed("~/.ssh/config").unwrap_err();
+        assert!(
+            matches!(&err, ProvenanceError::ReservedScope { path } if path == "~/.ssh/config"),
+            "{err}"
+        );
+
+        // Every spelling the normalizer folds into the reserved segment, since
+        // the check reads the minted form and not the raw input.
+        for spelling in ["~/x", "./~/x", "~//x", "~"] {
+            assert!(
+                matches!(
+                    ProvenanceId::claimed(spelling),
+                    Err(ProvenanceError::ReservedScope { .. }) | Err(ProvenanceError::Empty)
+                ),
+                "claimed({spelling:?}) should be refused"
+            );
+        }
+        // `~` alone normalizes to the segment, not to nothing.
+        assert!(matches!(
+            ProvenanceId::claimed("~"),
+            Err(ProvenanceError::ReservedScope { .. })
+        ));
+
+        // Benign twin, and the half that must NOT change: only the first
+        // segment is reserved.
+        assert_eq!(ProvenanceId::claimed("x/~").unwrap().as_str(), "x/~");
+        assert_eq!(
+            ProvenanceId::claimed("a/~/b.md").unwrap().as_str(),
+            "a/~/b.md"
+        );
+        assert_eq!(
+            ProvenanceId::claimed("~backup/x").unwrap().as_str(),
+            "~backup/x"
+        );
+        assert_eq!(
+            ProvenanceId::claimed("./secrets/prod.env")
+                .unwrap()
+                .as_str(),
+            "secrets/prod.env"
+        );
+
+        // Precedence: the older refusals still win where they apply, so the new
+        // check cannot mask a traversal or an absolute path.
+        assert!(matches!(
+            ProvenanceId::claimed("~/../x"),
+            Err(ProvenanceError::ParentTraversal { .. })
+        ));
+        assert!(matches!(
+            ProvenanceId::claimed("/~/x"),
+            Err(ProvenanceError::Absolute { .. })
+        ));
     }
 
     #[test]

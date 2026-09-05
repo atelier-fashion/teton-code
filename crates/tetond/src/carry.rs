@@ -189,11 +189,14 @@ impl CarriedTurn {
     ///
     /// # The prompt's provenance rides beside its text (REQ-585 BR-7)
     ///
-    /// `prompt_sources`/`prompt_unknown` are the pair
+    /// `prompt_sources`/`prompt_unknown`/`prompt_boundary_touch` are the triple
     /// [`ContextManager::push_user_from`] takes, passed straight through. A
-    /// typed prompt passes `(BTreeSet::new(), false)` and seeds exactly the
-    /// block it always seeded; a `/skill` expansion passes the skill file's
-    /// identity, so a `local-only` boundary pins the turn as a `read` would.
+    /// typed prompt passes `(BTreeSet::new(), false, false)` and seeds exactly
+    /// the block it always seeded; a `/skill` expansion passes the skill file's
+    /// identity, so a `local-only` boundary pins the turn as a `read` would —
+    /// and, since REQ-619 BR-2, whatever its preambles' verdicts folded to: the
+    /// unprovable bit, or the out-of-root boundary bit that makes the pin
+    /// permanent.
     ///
     /// The signature changed rather than gaining an overload on purpose. A
     /// second seeding entry point is how a path nobody remembered to update
@@ -208,10 +211,10 @@ impl CarriedTurn {
     /// only symptom is the user's own message being elided out of the prompt.
     /// `None` says "this turn carries no notes", which is every fixture and
     /// every session outside a repository.
-    // The prompt's two provenance facts are passed individually because that is
-    // the shape `ContextManager::push_user_from` takes them in, and one spelling
-    // of the pair across the whole seeding path is worth more here than a
-    // wrapper type that has to be unwrapped one line later.
+    // The prompt's three provenance facts are passed individually because that
+    // is the shape `ContextManager::push_user_from` takes them in, and one
+    // spelling of the triple across the whole seeding path is worth more here
+    // than a wrapper type that has to be unwrapped one line later.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn begin(
@@ -224,6 +227,7 @@ impl CarriedTurn {
         prompt: impl Into<String>,
         prompt_sources: BTreeSet<ProvenanceId>,
         prompt_unknown: bool,
+        prompt_boundary_touch: bool,
         repo_context: Option<RepoContextCarry>,
     ) -> Self {
         // REQ-586 BR-1/BR-7: the pair AND the window it is a budget *for*, from
@@ -258,7 +262,12 @@ impl CarriedTurn {
         // (`ContextManager::restate_anchors`). What it *does* owe is the
         // ordering: the ask must be pushed after the replay, or the newest
         // prompt block is the carried one and this turn's question is history.
-        ctx.push_user_from(prompt, prompt_sources, prompt_unknown);
+        ctx.push_user_from(
+            prompt,
+            prompt_sources,
+            prompt_unknown,
+            prompt_boundary_touch,
+        );
         Self {
             ctx: Some(ctx),
             sessions: sessions.clone(),
@@ -742,6 +751,7 @@ mod tests {
                 "what does this repo build with?",
                 BTreeSet::new(),
                 false,
+                false,
                 // No notes in this fixture, so a reroute has nothing to re-render.
                 None,
             )
@@ -875,6 +885,7 @@ mod tests {
             Vec::new(),
             "do the thing",
             BTreeSet::new(),
+            false,
             false,
             // No notes in this fixture, so a reroute has nothing to re-render.
             None,
@@ -1043,6 +1054,7 @@ mod tests {
                 Vec::new(),
                 "do the thing",
                 BTreeSet::new(),
+                false,
                 false,
                 // No notes in this fixture, so a reroute has nothing to re-render.
                 None,

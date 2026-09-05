@@ -631,6 +631,7 @@ impl Carry {
             text,
             std::collections::BTreeSet::new(),
             false,
+            false,
             // No notes in this fixture, so a reroute has nothing to re-render.
             None,
         );
@@ -1882,6 +1883,7 @@ async fn a_reroute_to_a_floored_route_re_renders_the_notes_and_keeps_the_users_m
         Vec::new(),
         message.clone(),
         std::collections::BTreeSet::new(),
+        false,
         false,
         Some(RepoContextCarry {
             base_system,

@@ -110,6 +110,21 @@ pub fn tool_result_provenance(provenance: &ToolProvenance) -> Provenance {
         // makes BR-2's "the narrowing removes nothing from the existing
         // refusal" true by construction rather than by argument.
         ToolProvenance::Unknown => Provenance::unknown(),
+        // REQ-619 verify, C1: unknown **and** these ids, which is a pair the
+        // egress `Provenance` has always been able to hold — `sources` beside
+        // an `unknown` bit is its own shape. What was missing was a harness
+        // variant that could reach it. The bit refuses the send exactly as
+        // `Unknown` does; the ids are what `/shell allow` leaves behind when it
+        // clears the bit, so the glob still runs against them and a lifted
+        // opaque skill expansion that read `secrets/prod.env` is still refused.
+        ToolProvenance::UnknownWith(paths) => {
+            let mut prov = Provenance::empty();
+            for path in paths {
+                prov.merge(&Provenance::tainted_by(path.clone()));
+            }
+            prov.mark_unknown();
+            prov
+        }
         ToolProvenance::BoundaryTouch => Provenance::boundary_touch(),
     }
 }
@@ -456,6 +471,62 @@ mod tests {
         let prov = tool_result_provenance(&two);
         assert!(prov.contains("a.rs") && prov.contains("b.rs"));
         assert!(!prov.is_unknown());
+
+        // REQ-619 verify, C1: the pair crosses as a pair.
+        let mixed = ToolProvenance::UnknownWith(BTreeSet::from([fixture_id("secrets/prod.env")]));
+        let prov = tool_result_provenance(&mixed);
+        assert!(prov.is_unknown(), "the block still fails closed");
+        assert!(
+            prov.contains("secrets/prod.env"),
+            "and it still names what it proved"
+        );
+        assert!(!prov.is_boundary_touch(), "the pin stays liftable");
+    }
+
+    /// **REQ-619 verify, C1.** What the new variant buys, stated as the
+    /// consequence rather than as the mapping: after `/shell allow` the ids are
+    /// still there for the boundary globs to run against.
+    ///
+    /// This is the leak the variant closes. A model-invoked skill whose
+    /// preambles are `` !`sh -c 'echo hi'` `` (opaque) and
+    /// `` !`cat secrets/prod.env` `` (a minted, matched id) folds to *both*
+    /// facts. Mapped to a bare `Unknown` the ids were dropped, and
+    /// `Provenance::with_unknown_lifted` — which deliberately clears only the
+    /// opacity and keeps every proved source — then had nothing to keep: the
+    /// lift produced a **clean** provenance and the secret left the machine.
+    ///
+    /// The lift's own contract is unchanged and is asserted here from the other
+    /// side: it releases the opacity that has no path behind it, and the path
+    /// this one *does* have survives.
+    ///
+    /// **Mutation (run, red, reverted):** map `UnknownWith(paths)` to
+    /// `Provenance::unknown()` — the old collapse — and **two** tests go red:
+    /// this one on `the lift must not launder the file the fold proved`, and
+    /// [`tests::tool_provenance_maps_onto_egress_provenance`] on the bridge row
+    /// itself.
+    #[test]
+    fn a_lift_over_an_unknown_with_sources_keeps_the_files() {
+        let folded =
+            tool_result_provenance(&ToolProvenance::UnknownWith(BTreeSet::from([fixture_id(
+                "secrets/prod.env",
+            )])));
+        assert!(folded.is_unknown(), "before the lift it fails closed");
+
+        let lifted = folded.with_unknown_lifted();
+        assert!(!lifted.is_unknown(), "`/shell allow` releases the opacity");
+        assert!(
+            lifted.contains("secrets/prod.env"),
+            "the lift must not launder the file the fold proved"
+        );
+        assert!(
+            !lifted.is_empty(),
+            "a provenance naming a boundary file is never empty, so egress inspects it"
+        );
+
+        // The contrast that makes the assertion mean something: a bare
+        // `Unknown` has nothing to keep, and its lift is genuinely clean.
+        let bare = tool_result_provenance(&ToolProvenance::Unknown).with_unknown_lifted();
+        assert!(bare.is_empty(), "an opacity with no path behind it clears");
     }
 
     // -- the unresolved leg (LESSON-447) ------------------------------------

@@ -101,12 +101,17 @@ pub fn sanitize_reported_source(raw: &str) -> String {
 /// reachable only from `from_resolved`, i.e. a file the daemon *opened* outside
 /// the root, which the tool refuses outright rather than reporting — so it maps
 /// to the closest true statement, that the source has no repo-relative form.
+/// [`ProvenanceError::ReservedScope`] (REQ-619) has no wire twin either, and is
+/// the same statement about a file *inside* the root: a `<root>/~/…` path has
+/// no repo-relative form, because that spelling belongs to the home scope. Both
+/// therefore share `Absolute`'s wire reason rather than adding a variant to an
+/// event vocabulary no surface renders differently.
 #[must_use]
 pub fn rejection_reason(err: &ProvenanceError) -> ProvenanceRejection {
     match err {
-        ProvenanceError::Absolute { .. } | ProvenanceError::NotUnderRoot { .. } => {
-            ProvenanceRejection::Absolute
-        }
+        ProvenanceError::Absolute { .. }
+        | ProvenanceError::NotUnderRoot { .. }
+        | ProvenanceError::ReservedScope { .. } => ProvenanceRejection::Absolute,
         ProvenanceError::ParentTraversal { .. } => ProvenanceRejection::ParentTraversal,
         ProvenanceError::Empty => ProvenanceRejection::Empty,
     }
