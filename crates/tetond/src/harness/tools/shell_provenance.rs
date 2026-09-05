@@ -54,6 +54,31 @@
 //! has to keep, and a `&'static str` makes it a thing that cannot be violated
 //! without changing the type.
 //!
+//! # What the verdict says, and what it must not be inferred from
+//!
+//! REQ-619's verify found four defects that share one shape: a consumer, or an
+//! arm of this grammar, **inferring** a fact instead of reading one.
+//!
+//! - [`Verdict::sources`] was read as "the touch was in-root" by both consumers.
+//!   It is an accumulator over every token, so `cat ~/.ssh/id_rsa README.md`
+//!   filled it while touching a key outside the root. The verdict now carries
+//!   [`Verdict::out_of_root_touch`] and says so (C2).
+//! - The per-segment boundary flag was a local, so an `Unknown` returned later
+//!   in the *same* segment discarded it. It is now [`BoundaryEvidence`], shared
+//!   with the caller, and the "a boundary touch outranks an unknown" rule holds
+//!   within a segment as well as between segments (H1).
+//! - A verb's **basename** opened the permissive tables, so `bin/ls` inherited
+//!   `ls`'s reach. A verb naming a path is now `Unknown`; the basename strip
+//!   survives for the [`OPAQUE`] denylist, where it can only tighten (H2).
+//! - A mint failure was read as "this is the root" ([`resolve_token`]) and as
+//!   "nothing to see" (`walk::visit`'s skip, which
+//!   [`subtree_is_boundary_free`] concluded a clean subtree from). Both now
+//!   fail closed on anything but [`ProvenanceError::Empty`] (C3).
+//!
+//! The out-of-root arm also matches a path's `~/…` spelling when it lies under
+//! the user's home, so a boundary glob written the way REQ-619 taught the
+//! daemon to *mint* reaches a file a shell command named (m2).
+//!
 //! # Mutation record (conventions.md — show the test can fail)
 //!
 //! Inverting the fallthrough in [`classify_segment`] so an unrecognised verb
@@ -85,7 +110,7 @@ use std::time::Duration;
 
 use teton_core::boundary::BoundaryMatcher;
 use teton_core::entities::PrivacyBoundary;
-use teton_core::provenance_id::ProvenanceId;
+use teton_core::provenance_id::{ProvenanceError, ProvenanceId};
 use teton_protocol::methods::RootKind;
 
 use super::walk::{self, WalkBudget, WalkPolicy};
@@ -135,8 +160,28 @@ pub struct Verdict {
     /// What was proved.
     pub kind: VerdictKind,
     /// The repo-relative canonical ids of every path argument that resolved
-    /// inside the session root. Empty for every kind but [`VerdictKind::Rooted`].
+    /// inside the session root — including an **in-root** boundary path, which
+    /// mints and is matched by the glob that protects it.
+    ///
+    /// It is the accumulator over the whole command, so it is **not** a proxy
+    /// for "the touch was in-root": `cat ~/.ssh/id_rsa README.md` fills it with
+    /// `README.md` while touching a boundary outside the root. Read
+    /// [`Self::out_of_root_touch`] for that question (REQ-619 verify, C2).
     pub sources: BTreeSet<ProvenanceId>,
+    /// Some path argument matched a boundary glob and resolved **outside** the
+    /// session root, so no id in [`Self::sources`] names it.
+    ///
+    /// This is the fact `ToolProvenance::BoundaryTouch` exists to carry
+    /// (ADR-614-3, LESSON-623), stated explicitly rather than inferred from an
+    /// empty source set. Both consumers used to read `sources.is_empty()` as
+    /// the proxy, and the proxy is wrong for exactly one shape — a command that
+    /// names an out-of-root boundary file *and* an ordinary in-root one. That
+    /// command reported `Sources({README.md})`, a clean liftable provenance,
+    /// for a command that read a private key (REQ-619 verify, C2).
+    ///
+    /// `false` for a purely in-root touch, which needs no bit: its id is in
+    /// `sources`, the glob matches it, and egress blocks naming the file.
+    pub out_of_root_touch: bool,
     /// Why this verdict was reached. `&'static str`, so it cannot carry command
     /// text or file content (see the module docs).
     ///
@@ -152,9 +197,74 @@ impl Verdict {
         Self {
             kind: VerdictKind::Unknown,
             sources: BTreeSet::new(),
+            out_of_root_touch: false,
             reason,
         }
     }
+
+    /// A boundary touch, carrying whatever the tokens proved: the in-root ids
+    /// in `sources`, and whether any matched path lay outside the root.
+    ///
+    /// One constructor for both places a `BoundaryTouch` is returned (the
+    /// unknown-after-a-boundary arm and the end of the loop), so the two cannot
+    /// come to disagree about which evidence rides along.
+    fn boundary_touch(sources: BTreeSet<ProvenanceId>, evidence: &BoundaryEvidence) -> Self {
+        Self {
+            kind: VerdictKind::BoundaryTouch,
+            sources,
+            out_of_root_touch: evidence.out_of_root,
+            reason: "a path argument matches a privacy boundary",
+        }
+    }
+}
+
+/// What the tokens seen so far proved about a boundary — the state that used to
+/// be a bare `saw_boundary` local in each of [`classify`] and
+/// [`classify_segment`] (REQ-619 verify, C2 and H1).
+///
+/// Two changes ride on making it a value the segment classifier **shares with
+/// its caller** rather than recomputes:
+///
+/// - `out_of_root` is the evidence [`Verdict::out_of_root_touch`] carries, and
+///   it can only be observed in the token loop that matched the glob.
+/// - `any` is now set the moment a token matches, so an `Unknown` returned
+///   *later in the same segment* — a denied prefix, a dirty subtree, an
+///   unresolvable token — no longer discards it. Before, the segment-level
+///   precedence rule ("a boundary touch outranks an unknown") held between
+///   segments and silently failed within one: `cat ~/.ssh/id_rsa /tmp/x` was
+///   `Unknown`, which `/shell allow` lifts.
+///
+/// Carrying `any` across segments is deliberate and cannot loosen a verdict:
+/// the caller already answers `BoundaryTouch` for the whole command once any
+/// segment touched, so a later segment that short-circuits on it only skips
+/// work whose answer could not have changed the result.
+/// The environment one segment is classified in: the session root, the compiled
+/// glob set, the directories no tool may read, the scan budget, and the user's
+/// home.
+///
+/// One named value rather than five positional parameters, which is what
+/// `suppression_ratchet`'s rule asks for — a `too_many_arguments` suppression
+/// is an unnamed parameter cluster, and this cluster has a name: it is the four
+/// inputs `ShellTool::run` hands [`classify`], plus the home
+/// [`classify`] resolves once (REQ-619 verify, m2). Every field is read-only
+/// for the whole classification; the two values that *accumulate* travel
+/// separately, as `&mut`, so the difference is visible in the signature.
+struct Scope<'a> {
+    root: &'a Path,
+    matcher: &'a BoundaryMatcher<'a>,
+    denied_prefixes: &'a [PathBuf],
+    budget: WalkBudget,
+    /// `None` when `$HOME` is unset or unresolvable: a `~/` token is then
+    /// unresolvable and no home-relative spelling is tried.
+    home: Option<&'a Path>,
+}
+
+#[derive(Debug, Default)]
+struct BoundaryEvidence {
+    /// Some path argument matched a boundary glob.
+    any: bool,
+    /// Some path argument matched a boundary glob **outside** the session root.
+    out_of_root: bool,
 }
 
 /// Verbs that read no file at all. A timeout on one of these is still `Rooted`
@@ -272,6 +382,13 @@ pub(crate) fn classify(
         denied_prefixes,
         command,
         SCAN_BUDGET,
+        // Canonicalized once, here, because every comparison below is against a
+        // path `canonical_through_existing_ancestor` produced: on macOS a home
+        // reached through `/var` would never `strip_prefix` a resolved
+        // `/private/var/…`, and the `~/…` spelling m2 adds would silently never
+        // match. Falls back to the raw value when the home does not resolve —
+        // the `~/` expansion is no worse off than it was.
+        crate::session_root::home().map(|home| home.canonicalize().unwrap_or(home)),
     )
 }
 
@@ -286,6 +403,14 @@ pub(crate) fn classify(
 /// draft of [`tests::a_truncated_scan_is_unknown_never_rooted`] did exactly
 /// that, and deleting the `truncated_by` check left it green (LESSON-569:
 /// verify the failure *mechanism* before building a fixture around it).
+///
+/// `home` is a parameter for the same reason (REQ-619 verify, m2). The grammar
+/// needs the user's home twice — to expand a `~/` token, and to try a resolved
+/// path's home-relative spelling against the globs — and reading `$HOME` inside
+/// the grammar would make both untestable without mutating the test process's
+/// environment, which is shared by every other test in the binary.
+/// [`classify`] reads it once and hands it down, so everything below this line
+/// is a function of its arguments.
 fn classify_with_budget(
     root: &Path,
     root_kind: RootKind,
@@ -293,6 +418,7 @@ fn classify_with_budget(
     denied_prefixes: Vec<PathBuf>,
     command: &str,
     budget: WalkBudget,
+    home: Option<PathBuf>,
 ) -> Verdict {
     // BR-9, first and before anything that touches the filesystem: with no
     // boundary configured there is nothing to protect, and the verdict is the
@@ -322,54 +448,56 @@ fn classify_with_budget(
         Err(_) => return Verdict::unknown("the configured boundary set does not compile"),
     };
 
+    let scope = Scope {
+        root,
+        matcher: &matcher,
+        denied_prefixes: &denied_prefixes,
+        budget,
+        home: home.as_deref(),
+    };
     let mut sources = BTreeSet::new();
-    let mut saw_boundary = false;
+    let mut evidence = BoundaryEvidence::default();
 
     for segment in command.split(['|', ';', '&', '(', ')', '\n']) {
         if segment.trim().is_empty() {
             continue;
         }
-        match classify_segment(
-            root,
-            &matcher,
-            &denied_prefixes,
-            budget,
-            segment,
-            &mut sources,
-        ) {
+        match classify_segment(&scope, segment, &mut sources, &mut evidence) {
             SegmentVerdict::Rooted => {}
-            SegmentVerdict::BoundaryTouch => saw_boundary = true,
+            // `evidence.any` is already set by the token that matched; the arm
+            // is kept so the three outcomes stay enumerated at the caller.
+            SegmentVerdict::BoundaryTouch => evidence.any = true,
             SegmentVerdict::Unknown(reason) => {
                 // A boundary touch outranks an unknown: it is the more severe
                 // consequence (permanent, unliftable), so a command that both
                 // names a protected file and does something opaque must pin
                 // permanently rather than liftably.
-                if saw_boundary {
-                    return Verdict {
-                        kind: VerdictKind::BoundaryTouch,
-                        sources,
-                        reason: "a path argument matches a privacy boundary",
-                    };
+                //
+                // Since REQ-619's verify this also catches the case where the
+                // unknown and the boundary are in the *same* segment (H1) —
+                // `evidence` is shared with `classify_segment`, so a token that
+                // matched is remembered even when a later token in that segment
+                // returns first.
+                if evidence.any {
+                    return Verdict::boundary_touch(sources, &evidence);
                 }
                 return Verdict::unknown(reason);
             }
         }
     }
 
-    if saw_boundary {
-        return Verdict {
-            kind: VerdictKind::BoundaryTouch,
-            // Non-empty when the boundary path was **in-root**: the caller maps
-            // that to `Sources`, so the block names the file. Empty for an
-            // out-of-root touch, which is what `ToolProvenance::BoundaryTouch`
-            // is for.
-            sources,
-            reason: "a path argument matches a privacy boundary",
-        };
+    if evidence.any {
+        // `sources` holds the ids of every **in-root** path the command named,
+        // boundary or not; `evidence.out_of_root` says whether a matched path
+        // lay outside the root, where no id exists. The consumers read the flag
+        // rather than `sources.is_empty()`, which is only the same question
+        // when the command named nothing else (REQ-619 verify, C2).
+        return Verdict::boundary_touch(sources, &evidence);
     }
     Verdict {
         kind: VerdictKind::Rooted,
         sources,
+        out_of_root_touch: false,
         reason: "every path the command names resolved inside the session root",
     }
 }
@@ -386,12 +514,10 @@ enum SegmentVerdict {
 /// not recognise, every path form it cannot resolve, every scan that ran out of
 /// budget lands here.
 fn classify_segment(
-    root: &Path,
-    matcher: &BoundaryMatcher<'_>,
-    denied_prefixes: &[PathBuf],
-    budget: WalkBudget,
+    scope: &Scope<'_>,
     segment: &str,
     sources: &mut BTreeSet<ProvenanceId>,
+    evidence: &mut BoundaryEvidence,
 ) -> SegmentVerdict {
     let mut words = segment.split_whitespace();
     let Some(raw_verb) = words.next() else {
@@ -403,12 +529,30 @@ fn classify_segment(
     if segment.split_whitespace().any(|w| w.contains('=')) {
         return SegmentVerdict::Unknown("the command sets an environment variable");
     }
+    // The basename, and **only** for the denylist below. A verb naming a path
+    // is a different program from the one that name resolves to on `PATH`.
     let verb = raw_verb.rsplit('/').next().unwrap_or(raw_verb);
 
     if OPAQUE.contains(&verb) {
         return SegmentVerdict::Unknown(
             "the command runs an interpreter, build tool or network client",
         );
+    }
+
+    // REQ-619 verify, H2. Past this line the tables are **permissive** — they
+    // are what makes a command `Rooted` — and a basename may not open them.
+    // `bin/ls`, `./cat` and `tools/git` are repository-local executables whose
+    // contents this daemon has not read; matching them against `ls`, `cat` and
+    // `git` let a planted file inherit an allowlisted verb's reach, which is
+    // the "false negative costs a leak" polarity the module docs open with.
+    //
+    // The denylist keeps the basename strip on purpose: there, reading
+    // `/usr/bin/python3` as `python3` makes the answer *stricter*, and a
+    // spelling it misses lands on the fallthrough's `Unknown` anyway. Widening
+    // and narrowing are not symmetric here, so the two lookups do not share a
+    // rule.
+    if raw_verb.contains('/') {
+        return SegmentVerdict::Unknown("the command names its program by path");
     }
 
     let rest: Vec<&str> = words.collect();
@@ -452,7 +596,6 @@ fn classify_segment(
         .filter(|w| !w.starts_with('-'))
         .collect();
 
-    let mut saw_boundary = false;
     let mut saw_directory = false;
     // Whether any token named an **existing regular file**.
     //
@@ -479,7 +622,7 @@ fn classify_segment(
     let mut named_an_existing_file = false;
 
     for token in &paths {
-        let resolved = resolve_token(root, token);
+        let resolved = resolve_token(scope.root, scope.home, token);
         // REQ-611 BR-8 / ADR-7, and the regression the transcript suite caught:
         // a denied prefix is **not** a privacy boundary — it is a directory no
         // tool may read at all — so it has no glob for the matcher above to
@@ -496,7 +639,7 @@ fn classify_segment(
         | Resolved::RootItself(abs)
         | Resolved::OutsideRoot(abs) = &resolved
         {
-            if under_denied_prefix(denied_prefixes, abs) {
+            if under_denied_prefix(scope.denied_prefixes, abs) {
                 return SegmentVerdict::Unknown(
                     "a path argument is inside a directory tools may not read",
                 );
@@ -504,8 +647,10 @@ fn classify_segment(
         }
         match resolved {
             Resolved::InsideRoot(abs, id) => {
-                if matcher.match_path(id.as_str()).is_some() {
-                    saw_boundary = true;
+                if scope.matcher.match_path(id.as_str()).is_some() {
+                    // In-root: `evidence.out_of_root` stays as it is, because
+                    // this touch *is* nameable and the id below carries it.
+                    evidence.any = true;
                     // Keep the id. An **in-root** boundary path mints a real
                     // `ProvenanceId`, so the tool reports it as `Sources` and
                     // egress blocks naming the actual file — exactly what a
@@ -519,7 +664,12 @@ fn classify_segment(
                 if abs.is_dir() {
                     saw_directory = true;
                     if reads_content
-                        && !subtree_is_boundary_free(&abs, denied_prefixes, matcher, budget)
+                        && !subtree_is_boundary_free(
+                            &abs,
+                            scope.denied_prefixes,
+                            scope.matcher,
+                            scope.budget,
+                        )
                     {
                         return SegmentVerdict::Unknown(
                             "a directory the command reads could hold a protected file",
@@ -537,7 +687,12 @@ fn classify_segment(
             Resolved::RootItself(abs) => {
                 saw_directory = true;
                 if reads_content
-                    && !subtree_is_boundary_free(&abs, denied_prefixes, matcher, budget)
+                    && !subtree_is_boundary_free(
+                        &abs,
+                        scope.denied_prefixes,
+                        scope.matcher,
+                        scope.budget,
+                    )
                 {
                     return SegmentVerdict::Unknown(
                         "a directory the command reads could hold a protected file",
@@ -549,11 +704,35 @@ fn classify_segment(
                 // `ProvenanceId`, so no glob can match it through the ordinary
                 // identity path. The boundary globs are matched against the
                 // resolved absolute path with its leading `/` stripped, which is
-                // what lets `**/.ssh/**` reach `Users/x/.ssh/config` (AC-5).
+                // what lets `**/.ssh/**` reach `Users/x/.ssh/config` (AC-5) —
+                // and, when the path is under the user's home, against its
+                // `~/…` spelling as well.
+                //
+                // Two spellings because two vocabularies name the same file
+                // (REQ-619 verify, m2). The builtins are `**/`-prefixed and
+                // reach the stripped absolute form; a user glob written in the
+                // spelling REQ-619 taught the daemon to mint —
+                // `~/.claude/skills/**` — reaches only the home-relative one.
+                // Trying both can only *add* matches, and every added match is
+                // a refusal, so the direction is the safe one.
                 let spelling = abs.to_string_lossy();
                 let stripped = spelling.strip_prefix('/').unwrap_or(&spelling);
-                if matcher.match_path(stripped).is_some() {
-                    saw_boundary = true;
+                let home_spelling = scope
+                    .home
+                    .and_then(|home| abs.strip_prefix(home).ok())
+                    .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+                    .filter(|rel| !rel.is_empty())
+                    .map(|rel| format!("~/{rel}"));
+                let matched = scope.matcher.match_path(stripped).is_some()
+                    || home_spelling
+                        .as_deref()
+                        .is_some_and(|spelling| scope.matcher.match_path(spelling).is_some());
+                if matched {
+                    evidence.any = true;
+                    // The bit C2 turns on: this touch has no id, so nothing in
+                    // `sources` names it and no consumer may infer it from that
+                    // set being empty.
+                    evidence.out_of_root = true;
                 } else {
                     return SegmentVerdict::Unknown(
                         "a path argument resolves outside the session root",
@@ -566,7 +745,7 @@ fn classify_segment(
         }
     }
 
-    if saw_boundary {
+    if evidence.any {
         return SegmentVerdict::BoundaryTouch;
     }
 
@@ -578,7 +757,12 @@ fn classify_segment(
     if reads_content
         && (paths.is_empty() || !named_an_existing_file)
         && !saw_directory
-        && !subtree_is_boundary_free(root, denied_prefixes, matcher, budget)
+        && !subtree_is_boundary_free(
+            scope.root,
+            scope.denied_prefixes,
+            scope.matcher,
+            scope.budget,
+        )
     {
         return SegmentVerdict::Unknown(
             "the command reads the root and it could hold a protected file",
@@ -597,15 +781,15 @@ enum Resolved {
     Unresolvable,
 }
 
-fn resolve_token(root: &Path, token: &str) -> Resolved {
+fn resolve_token(root: &Path, home: Option<&Path>, token: &str) -> Resolved {
     let joined = if let Some(tail) = token.strip_prefix("~/") {
-        match crate::session_root::home() {
+        match home {
             Some(home) => home.join(tail),
             None => return Resolved::Unresolvable,
         }
     } else if token == "~" {
-        match crate::session_root::home() {
-            Some(home) => home,
+        match home {
+            Some(home) => home.to_path_buf(),
             None => return Resolved::Unresolvable,
         }
     } else if token.starts_with('~') {
@@ -629,7 +813,19 @@ fn resolve_token(root: &Path, token: &str) -> Resolved {
     }
     match ProvenanceId::from_resolved(&canonical_root, &checked) {
         Ok(id) => Resolved::InsideRoot(checked, id),
-        Err(_) => Resolved::RootItself(checked),
+        // `Empty` is the one refusal that means "this *is* the root" — the
+        // remainder after the strip was nothing — and that is a directory read,
+        // not a failure.
+        Err(ProvenanceError::Empty) => Resolved::RootItself(checked),
+        // Every other refusal is a path under the root that the daemon cannot
+        // name, and `Resolved::RootItself` is the wrong answer for it twice
+        // over: it claims the token is the root (so a *file* is scanned as a
+        // directory, which finds nothing) and it lands on `Rooted`.
+        // `<root>/~/.env` is the reachable case — `ProvenanceError::ReservedScope`
+        // since TASK-398 — and `cat ./~/.env` came back `Rooted` with a clean
+        // provenance (REQ-619 verify, C3). A token with no identity is exactly
+        // what `Unresolvable` is for.
+        Err(_) => Resolved::Unresolvable,
     }
 }
 
@@ -640,6 +836,15 @@ fn resolve_token(root: &Path, token: &str) -> Resolved {
 /// scan that found one. The two are not distinguished because the caller does
 /// the same thing with both, and giving them separate values would invite a
 /// later author to treat "stopped looking" as "found nothing".
+///
+/// An entry the walk could not **name** is the third member of that family
+/// (REQ-619 verify, C3). The matcher runs on a minted id, so a file with no id
+/// is a file no glob was ever run against: `<root>/~/.env` was skipped by
+/// `walk::visit`'s mint-failure arm and this function answered *boundary-free*
+/// for a tree holding a `.env`, which made `grep -r foo .` `Rooted`. It reads
+/// [`walk::WalkReport::unmintable`] and fails closed on it, exactly as it does
+/// on `truncated_by` and for the same reason: the walk did not look at that
+/// file, so nothing here may claim it is clean.
 fn subtree_is_boundary_free(
     dir: &Path,
     denied_prefixes: &[PathBuf],
@@ -664,7 +869,7 @@ fn subtree_is_boundary_free(
             ControlFlow::Continue(())
         },
     );
-    !hit && report.truncated_by.is_none()
+    !hit && report.truncated_by.is_none() && report.unmintable == 0
 }
 
 #[cfg(test)]
@@ -698,6 +903,58 @@ mod tests {
 
     fn verdict(root: &Path, command: &str) -> Verdict {
         classify(root, RootKind::Project, &builtins(), Vec::new(), command)
+    }
+
+    /// A fixture HOME holding the two files the out-of-root cases name.
+    ///
+    /// The machine's real home is not usable for these: `~/.ssh/id_rsa` may or
+    /// may not exist on the runner, and a test that skipped itself when it did
+    /// not would be a test that never ran anywhere the CI matrix cares about.
+    /// The home is a *parameter* of the classifier since this verify pass
+    /// (`classify_with_budget`'s last argument), so planting one costs nothing
+    /// and mutates no shared environment.
+    fn fixture_home(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let home = std::env::temp_dir().join(format!(
+            "teton-shellprov-home-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(home.join(".ssh/id_rsa"), "PRIVATE KEY\n").unwrap();
+        std::fs::create_dir_all(home.join(".aws")).unwrap();
+        std::fs::write(home.join(".aws/credentials"), "aws_secret=x\n").unwrap();
+        // Canonical, because the classifier compares a *canonicalized* resolved
+        // path against it and macOS's temp dir is a symlink (`/var` →
+        // `/private/var`). `classify` canonicalizes the real `$HOME` for the
+        // same reason.
+        home.canonicalize().unwrap()
+    }
+
+    /// [`classify`] against a fixture home, an explicit boundary set and an
+    /// explicit denial set — every input the grammar reads.
+    fn verdict_full(
+        root: &Path,
+        home: Option<&Path>,
+        boundaries: &[PrivacyBoundary],
+        denied: Vec<PathBuf>,
+        command: &str,
+    ) -> Verdict {
+        classify_with_budget(
+            root,
+            RootKind::Project,
+            boundaries,
+            denied,
+            command,
+            SCAN_BUDGET,
+            home.map(Path::to_path_buf),
+        )
+    }
+
+    /// [`verdict_full`] with the builtin boundaries and no denied prefix.
+    fn verdict_with_home(root: &Path, home: &Path, command: &str) -> Verdict {
+        verdict_full(root, Some(home), &builtins(), Vec::new(), command)
     }
 
     /// BR-1, benign path. The legitimate actor — the four commands AC-12 scripts
@@ -753,6 +1010,423 @@ mod tests {
             "an ordinary file must not read as a boundary touch"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **REQ-619 verify, C2.** A boundary touch outside the root stays a
+    /// boundary touch when the same command also names an ordinary in-root
+    /// file.
+    ///
+    /// `sources` is the accumulator over every token, so it is not evidence
+    /// about *where the touch was*. Both consumers read `sources.is_empty()` as
+    /// that evidence, which made `cat ~/.ssh/id_rsa README.md` report
+    /// `Sources({README.md})` — a clean, liftable provenance for a command that
+    /// read a private key. `out_of_root_touch` states the fact instead.
+    ///
+    /// Both shapes, because the two reach the flag by different routes: one
+    /// segment holding both tokens, and two segments holding one each.
+    ///
+    /// # Benign twins
+    ///
+    /// An **in-root** boundary path must NOT set the flag — its id is in
+    /// `sources`, the glob matches it, and egress names the file — and an
+    /// ordinary read must stay `Rooted` with the flag clear. A fix that set the
+    /// bit whenever a boundary was seen would pass the first half of this test
+    /// and turn every `cat .env` into an unliftable pin naming nothing.
+    ///
+    /// **Mutation (run, red, reverted):** drop `evidence.out_of_root = true`
+    /// from the `OutsideRoot` arm — the flag is then never set and the code is
+    /// back to inferring the answer — and **four** tests go red:
+    /// this one, [`tests::an_unknown_reached_after_a_boundary_token_is_a_boundary_touch`],
+    /// [`tests::an_out_of_root_path_is_matched_in_both_spellings`], and
+    /// `shell::tests::an_out_of_root_touch_beside_an_in_root_read_maps_to_the_sentinel`
+    /// at the consumer. Before this pass the same mutation reddened nothing at
+    /// all, which is the finding: the flag did not exist and the proxy it
+    /// replaces had no case that could tell them apart.
+    #[test]
+    fn a_boundary_touch_outside_the_root_beside_an_in_root_file_is_still_a_boundary_touch() {
+        let root = project_root("mixedtouch");
+        let home = fixture_home("mixedtouch");
+        std::fs::write(root.join("README.md"), "# readme\n").unwrap();
+
+        for command in [
+            "cat ~/.ssh/id_rsa README.md",
+            "cat README.md; cat ~/.aws/credentials",
+        ] {
+            let v = verdict_with_home(&root, &home, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::BoundaryTouch,
+                "{command:?} names a protected file ({})",
+                v.reason
+            );
+            assert!(
+                v.out_of_root_touch,
+                "{command:?} touched a boundary no id in `sources` can name"
+            );
+            assert_eq!(
+                v.sources
+                    .iter()
+                    .map(ProvenanceId::as_str)
+                    .collect::<Vec<_>>(),
+                vec!["README.md"],
+                "the in-root file it also read is still named"
+            );
+        }
+
+        // Benign twin 1: an in-root boundary path needs no bit.
+        std::fs::write(root.join(".env"), "API_KEY=x\n").unwrap();
+        let in_root = verdict_with_home(&root, &home, "cat .env README.md");
+        assert_eq!(in_root.kind, VerdictKind::BoundaryTouch);
+        assert!(
+            !in_root.out_of_root_touch,
+            "an in-root touch mints an id, so it is not the out-of-root case"
+        );
+        assert_eq!(
+            in_root
+                .sources
+                .iter()
+                .map(ProvenanceId::as_str)
+                .collect::<Vec<_>>(),
+            vec![".env", "README.md"]
+        );
+
+        // Benign twin 2: an ordinary read is untouched.
+        let clean = verdict_with_home(&root, &home, "cat README.md");
+        assert_eq!(clean.kind, VerdictKind::Rooted);
+        assert!(!clean.out_of_root_touch);
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// **REQ-619 verify, H1.** A token that cannot be classified does not erase
+    /// a boundary token that came before it *in the same segment*.
+    ///
+    /// The precedence rule — a boundary touch outranks an unknown, because its
+    /// pin is permanent and an unknown's is liftable — was written at the
+    /// segment loop and held only *between* segments. Inside one segment the
+    /// token loop returned `Unknown` directly, discarding the local
+    /// `saw_boundary`, so `cat ~/.ssh/id_rsa /tmp/x` was a liftable `Unknown`:
+    /// `/shell allow` then released the block over a command that had read a
+    /// private key.
+    ///
+    /// Three spellings, because there are three ways a later token returns
+    /// `Unknown`: an out-of-root path that matches nothing, a directory whose
+    /// subtree is dirty, and a path under a denied prefix.
+    ///
+    /// # Benign path — and the half that makes this non-vacuous
+    ///
+    /// Each spelling is run again *without* the boundary token. All three must
+    /// still be `Unknown`: that is what shows the second token really is the
+    /// unknown-producing one, so the first assertion is about precedence rather
+    /// than about a command that was never unknown to begin with.
+    ///
+    /// **Mutation (run, red, reverted):** restore the per-segment local — a
+    /// `saw_boundary` inside `classify_segment` in place of the caller's
+    /// `evidence.any` — and **exactly one** test goes red: this one, on the
+    /// first spelling, `left: Unknown` where a boundary touch was due. The
+    /// cross-segment rule keeps working under that mutation, which is why the
+    /// gap survived: every existing test put the two facts in two segments.
+    #[test]
+    fn an_unknown_reached_after_a_boundary_token_is_a_boundary_touch() {
+        let root = project_root("h1");
+        let home = fixture_home("h1");
+        // An out-of-root path no glob covers.
+        let elsewhere =
+            std::env::temp_dir().join(format!("teton-h1-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("notes.txt"), "x").unwrap();
+        // A directory under the root that holds a protected file.
+        std::fs::create_dir_all(root.join("dirty")).unwrap();
+        std::fs::write(root.join("dirty/.env"), "API_KEY=x\n").unwrap();
+        // A directory no tool may read at all (REQ-611 BR-8).
+        let transcripts = root.join("transcripts");
+        std::fs::create_dir_all(&transcripts).unwrap();
+        std::fs::write(transcripts.join("t.jsonl"), "{}\n").unwrap();
+
+        let tails = [
+            elsewhere.join("notes.txt").to_string_lossy().into_owned(),
+            "dirty".to_owned(),
+            "transcripts/t.jsonl".to_owned(),
+        ];
+        // Canonical, because `under_denied_prefix` compares against the
+        // canonicalized resolved path and the temp root is reached through a
+        // symlink on macOS.
+        let denied_prefix = transcripts.canonicalize().unwrap();
+        for tail in &tails {
+            let denied = vec![denied_prefix.clone()];
+            let with_boundary = verdict_full(
+                &root,
+                Some(&home),
+                &builtins(),
+                denied.clone(),
+                &format!("cat ~/.ssh/id_rsa {tail}"),
+            );
+            assert_eq!(
+                with_boundary.kind,
+                VerdictKind::BoundaryTouch,
+                "a boundary token must outrank an unknown one in its own segment \
+                 (tail {tail:?}, reason {})",
+                with_boundary.reason
+            );
+            assert!(
+                with_boundary.out_of_root_touch,
+                "and the touch was out of root (tail {tail:?})"
+            );
+
+            // Non-vacuity: the tail alone really is what produces `Unknown`.
+            let alone = verdict_full(
+                &root,
+                Some(&home),
+                &builtins(),
+                denied,
+                &format!("cat {tail}"),
+            );
+            assert_eq!(
+                alone.kind,
+                VerdictKind::Unknown,
+                "tail {tail:?} must be the unknown-producing token ({})",
+                alone.reason
+            );
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&elsewhere).ok();
+    }
+
+    /// **REQ-619 verify, H2.** A verb that names a path is never looked up in a
+    /// permissive table.
+    ///
+    /// The basename strip made `bin/ls`, `./cat` and `tools/git` inherit the
+    /// reach of `ls`, `cat` and `git` — so a repository-local executable, whose
+    /// contents this daemon has never read, ran under an allowlisted verb and
+    /// its output carried a `Rooted` provenance. The strip stays for the
+    /// **denylist** only, where reading `/usr/bin/python3` as `python3` makes
+    /// the answer stricter and a miss lands on the fallthrough anyway.
+    ///
+    /// # Benign path
+    ///
+    /// The plain spellings must keep working — this rule is about the `/`, not
+    /// about the verbs — and `/bin/sh` must keep its *interpreter* reason, so
+    /// the denylist is still consulted first.
+    ///
+    /// **Mutation (run, red, reverted):** delete the `raw_verb.contains('/')`
+    /// refusal and the three path-spelled commands come back `Rooted`;
+    /// **exactly one** test red — this one, on `bin/ls README.md`.
+    #[test]
+    fn a_verb_named_by_path_is_never_a_permissive_table_hit() {
+        let root = project_root("pathverb");
+        std::fs::write(root.join("README.md"), "# readme\n").unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(root.join("bin/ls"), "#!/bin/sh\ncat \"$@\"\n").unwrap();
+
+        for command in ["bin/ls README.md", "./cat README.md", "tools/git status"] {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Unknown,
+                "{command:?} runs a program this daemon cannot identify ({})",
+                v.reason
+            );
+            assert_eq!(v.reason, "the command names its program by path");
+        }
+
+        // The denylist still wins, and still on the basename.
+        let sh = verdict(&root, "/bin/sh -c ls");
+        assert_eq!(sh.kind, VerdictKind::Unknown);
+        assert_eq!(
+            sh.reason, "the command runs an interpreter, build tool or network client",
+            "the opaque table is consulted before the path rule"
+        );
+
+        // Benign: the plain spellings are untouched.
+        assert_eq!(verdict(&root, "ls -la").kind, VerdictKind::Rooted);
+        assert_eq!(verdict(&root, "cat README.md").kind, VerdictKind::Rooted);
+        assert_eq!(verdict(&root, "git status").kind, VerdictKind::Rooted);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **REQ-619 verify, C3 (the resolver half).** A token under the root whose
+    /// identity will not mint is unresolvable, not the root itself.
+    ///
+    /// `resolve_token` treated *every* mint failure as "this is the root", a
+    /// reading that was true when `Empty` was the only reachable error. TASK-398
+    /// added `ReservedScope`, so `<root>/~/.env` — a directory literally named
+    /// `~`, which a shell creates inside quotes — became `RootItself`: a
+    /// **file** classified as a directory read, scanned as a tree (finding
+    /// nothing, because it is not one) and answered `Rooted`.
+    ///
+    /// # Benign path
+    ///
+    /// `Empty` must keep its arm, so `cat .` — the root itself — still resolves
+    /// as a directory rather than falling to `Unknown`.
+    ///
+    /// **Mutation (run, red, reverted):** restore the blanket
+    /// `Err(_) => Resolved::RootItself(checked)` and `cat ./~/.env` comes back
+    /// `Rooted`; **exactly one** test red — this one, on its first
+    /// assertion.
+    #[test]
+    fn a_token_whose_identity_will_not_mint_is_unknown_not_rooted() {
+        let root = project_root("reservedtoken");
+        std::fs::create_dir_all(root.join("~")).unwrap();
+        std::fs::write(root.join("~/.env"), "API_KEY=x\n").unwrap();
+
+        let v = verdict(&root, "cat ./~/.env");
+        assert_eq!(
+            v.kind,
+            VerdictKind::Unknown,
+            "a path with no identity cannot be proved in-root ({})",
+            v.reason
+        );
+        assert_eq!(v.reason, "a path argument could not be resolved");
+
+        // Benign: the `Empty` arm is what the root itself needs, and it stays.
+        assert_eq!(
+            verdict(&root, "ls .").kind,
+            VerdictKind::Rooted,
+            "`.` is the root, which is a directory read and not a failure"
+        );
+        assert_eq!(verdict(&root, "cat src/main.rs").kind, VerdictKind::Rooted);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **REQ-619 verify, C3 (the walker half).** A subtree holding a file the
+    /// walk could not name is never answered boundary-free.
+    ///
+    /// The matcher runs on a minted id, so an entry with no id is an entry no
+    /// glob was ever run against. `walk::visit` skipped it silently, and this
+    /// module read "no hit" as "clean": a root holding `~/.env` answered
+    /// `Rooted` for `grep -r foo .`, and the repository's secrets left under a
+    /// clean provenance. The scan now fails closed on `WalkReport::unmintable`,
+    /// exactly as it does on a truncated walk.
+    ///
+    /// # Benign path
+    ///
+    /// The identical command in a tree with nothing unnameable must stay
+    /// `Rooted` — otherwise the fix is just "every scan fails", which passes
+    /// the first assertion and destroys the narrowing REQ-614 exists for.
+    ///
+    /// **Mutation (run, red, reverted):** drop `&& report.unmintable == 0` from
+    /// `subtree_is_boundary_free` and the dirty root answers `Rooted`;
+    /// **exactly one** test red — this one, on `grep -r foo .`. Deleting the
+    /// walker's own `unmintable` counter instead reddens **two**: this test and
+    /// `walk::tests::an_entry_whose_identity_will_not_mint_is_counted_not_silently_skipped`.
+    #[test]
+    fn a_file_the_walk_cannot_name_is_never_boundary_free() {
+        let root = project_root("unmintablescan");
+        std::fs::create_dir_all(root.join("~")).unwrap();
+        std::fs::write(root.join("~/.env"), "API_KEY=x\n").unwrap();
+
+        for command in ["grep -r foo .", "cat"] {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Unknown,
+                "{command:?} reads a tree holding a file the walk cannot name ({})",
+                v.reason
+            );
+        }
+
+        // Benign twin: a tree the walk can name entirely stays `Rooted`.
+        let clean = project_root("mintablescan");
+        for command in ["grep -r foo .", "cat"] {
+            let v = verdict(&clean, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Rooted,
+                "{command:?} over a clean tree must keep its narrow verdict ({})",
+                v.reason
+            );
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&clean).ok();
+    }
+
+    /// **REQ-619 verify, m2.** An out-of-root path is matched in **both**
+    /// spellings a boundary glob can be written in.
+    ///
+    /// A path outside the root mints no id, so the globs are matched against
+    /// the path text. There are two texts for one file: the absolute form with
+    /// its leading `/` stripped, which is what `**/`-prefixed builtins reach,
+    /// and the `~/…` form REQ-619 taught the daemon to mint for files under the
+    /// home — the spelling a user writes in `~/.claude/skills/**`, and the one
+    /// they see in a `privacy_block` line. Matching only the first left a user's
+    /// own glob unable to reach the file a shell command named.
+    ///
+    /// # Benign path, and the non-vacuity half
+    ///
+    /// The builtin spelling must keep working (first assertion), and the same
+    /// command with **no** home must stay `Unknown` — which is what shows the
+    /// home spelling is doing the matching rather than the glob happening to
+    /// reach the absolute form too.
+    ///
+    /// **Mutation (run, red, reverted):** delete the `home_spelling` disjunct
+    /// from the `OutsideRoot` arm and **exactly one** test goes red — this one,
+    /// on the first home-glob spelling — while its builtin assertion above
+    /// stays green, which is what localises the failure to the new branch.
+    #[test]
+    fn an_out_of_root_path_is_matched_in_both_spellings() {
+        use teton_core::entities::BoundaryMode;
+
+        let root = project_root("spellings");
+        let home = fixture_home("spellings");
+        std::fs::create_dir_all(home.join(".claude/skills/x")).unwrap();
+        std::fs::write(home.join(".claude/skills/x/SKILL.md"), "# skill\n").unwrap();
+        let user_glob = vec![PrivacyBoundary::user(
+            "~/.claude/skills/**",
+            BoundaryMode::LocalOnly,
+        )];
+
+        // Spelling one, the builtin's: `**/.ssh/**` over the `/`-stripped
+        // absolute path (AC-5's rule, unchanged).
+        let builtin = verdict_with_home(&root, &home, "cat ~/.ssh/id_rsa");
+        assert_eq!(
+            builtin.kind,
+            VerdictKind::BoundaryTouch,
+            "{}",
+            builtin.reason
+        );
+        assert!(builtin.out_of_root_touch);
+
+        // Spelling two, the user's: `~/.claude/skills/**` reaches the same file
+        // named either way round.
+        let skill_abs = home.join(".claude/skills/x/SKILL.md");
+        for command in [
+            "cat ~/.claude/skills/x/SKILL.md".to_owned(),
+            format!("cat {}", skill_abs.to_string_lossy()),
+        ] {
+            let v = verdict_full(&root, Some(&home), &user_glob, Vec::new(), &command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::BoundaryTouch,
+                "a user glob in the home spelling must reach {command:?} ({})",
+                v.reason
+            );
+            assert!(v.out_of_root_touch);
+        }
+
+        // Non-vacuity: with no home there is no second spelling to try, and the
+        // absolute form matches nothing.
+        let no_home = verdict_full(
+            &root,
+            None,
+            &user_glob,
+            Vec::new(),
+            &format!("cat {}", skill_abs.to_string_lossy()),
+        );
+        assert_eq!(
+            no_home.kind,
+            VerdictKind::Unknown,
+            "the `/`-stripped absolute path is not what `~/…` matches ({})",
+            no_home.reason
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&home).ok();
     }
 
     /// BR-8. Enforced by the signature: `classify` takes no exit status and no
@@ -911,6 +1585,7 @@ mod tests {
             Vec::new(),
             "grep foo clean",
             SCAN_BUDGET,
+            None,
         );
         assert_eq!(
             complete.kind,
@@ -929,6 +1604,7 @@ mod tests {
                 max_entries: 1,
                 max_wall: Duration::from_millis(1),
             },
+            None,
         );
         assert_eq!(
             starved.kind,

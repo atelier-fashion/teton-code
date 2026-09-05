@@ -124,10 +124,19 @@ fn did_spawn(outcome: &DynamicOutcome) -> bool {
 /// | `identity: Some(id)` | `sources ∪ {id}` |
 /// | `identity: None` | `unknown = true` |
 /// | `Rooted` verdict on a command that ran | `sources ∪ verdict.sources` |
-/// | `BoundaryTouch` with sources (in-root) | `sources ∪ verdict.sources` |
-/// | `BoundaryTouch` without sources (out-of-root) | `boundary_touch = true` |
+/// | `BoundaryTouch` (any) | `sources ∪ verdict.sources` |
+/// | `BoundaryTouch` with `out_of_root_touch` | `boundary_touch = true`, **and** the in-root ids still cross |
+/// | `BoundaryTouch` without sources (out-of-root, no other path named) | `boundary_touch = true` |
 /// | `Unknown` | `unknown = true` |
 /// | any verdict on a `NotRun` command | nothing |
+///
+/// The third row is REQ-619's verify (C2). The table used to key the bit on
+/// `sources` being empty, which is a *proxy* for "the touch was in-root" and is
+/// wrong for one shape: a command that names an out-of-root boundary file and
+/// an ordinary in-root one carries both, and the proxy read the ordinary file
+/// as proof the touch was nameable. `Verdict::out_of_root_touch` states it
+/// instead of inferring it, and the two are folded together rather than in
+/// exclusive arms — an in-root id is worth keeping even when the bit is set.
 ///
 /// `identity` is `None` for a skill file that will not mint — after TASK-398
 /// that is a file under neither the session root nor the home, and the answer
@@ -160,14 +169,21 @@ pub fn fold_expansion(identity: Option<ProvenanceId>, runs: &[PreambleRun]) -> E
         }
         match run.verdict.kind {
             VerdictKind::Rooted => folded.sources.extend(run.verdict.sources.iter().cloned()),
-            // The in-root case carries its own minted ids, so egress refuses
-            // naming the actual file — a `cat .env` preamble and a `read` of
-            // `.env` produce the same `privacy_block`. Only the out-of-root case
-            // has nothing to name, and that is what the bit is for (ADR-619-2).
-            VerdictKind::BoundaryTouch if !run.verdict.sources.is_empty() => {
+            // The in-root ids come across whatever else the command touched, so
+            // egress refuses naming the actual file — a `cat .env` preamble and
+            // a `read` of `.env` produce the same `privacy_block`.
+            //
+            // The bit is set from the verdict's own `out_of_root_touch`, never
+            // from `sources.is_empty()` (REQ-619 verify, C2). The two agree for
+            // a command that names one path and disagree for
+            // `` !`cat ~/.ssh/id_rsa README.md` ``, where the emptiness test
+            // read `{README.md}` as proof the touch was in-root and folded a
+            // private key into a liftable `Sources`.
+            VerdictKind::BoundaryTouch => {
                 folded.sources.extend(run.verdict.sources.iter().cloned());
+                folded.boundary_touch |=
+                    run.verdict.out_of_root_touch || run.verdict.sources.is_empty();
             }
-            VerdictKind::BoundaryTouch => folded.boundary_touch = true,
             VerdictKind::Unknown => folded.unknown = true,
         }
     }
@@ -188,6 +204,22 @@ mod tests {
         Verdict {
             kind,
             sources: sources.iter().map(|s| fixture_id(s)).collect(),
+            out_of_root_touch: false,
+            reason: "fixture",
+        }
+    }
+
+    /// A `BoundaryTouch` whose matched path lay **outside** the session root,
+    /// beside whatever in-root ids the same command named (REQ-619 verify, C2).
+    ///
+    /// The shape the old table could not express: `sources` non-empty *and* the
+    /// touch unnameable. Reading `sources.is_empty()` as "the touch was in-root"
+    /// answered `Sources({README.md})` for `` !`cat ~/.ssh/id_rsa README.md` ``.
+    fn out_of_root_touch_with(sources: &[&str]) -> Verdict {
+        Verdict {
+            kind: VerdictKind::BoundaryTouch,
+            sources: sources.iter().map(|s| fixture_id(s)).collect(),
+            out_of_root_touch: true,
             reason: "fixture",
         }
     }
@@ -254,6 +286,14 @@ mod tests {
     /// half. Restored: green. Ran again with `did_spawn` inverted: two red
     /// again. The `did_spawn` guard merely *deleted* reddens the sibling alone —
     /// which is why the sibling exists.
+    ///
+    /// The C2 row has its own (REQ-619 verify): drop `run.verdict.out_of_root_touch ||`
+    /// from the `BoundaryTouch` arm, leaving the old `sources.is_empty()`
+    /// reading, and **exactly one** assertion in the crate goes red — this
+    /// test's *an out-of-root touch is permanent however many in-root files
+    /// rode along*. That count is the finding: the leak had no coverage
+    /// anywhere, because every existing row names either an in-root path or no
+    /// path, and the bug lives only where a command names both.
     #[test]
     fn the_fold_follows_the_adr_table() {
         let skill = fixture_id(".claude/skills/release/SKILL.md");
@@ -322,6 +362,29 @@ mod tests {
         );
         assert!(out_of_root.boundary_touch, "the bit is the only carrier");
         assert_eq!(ids(&out_of_root), [".claude/skills/release/SKILL.md"]);
+
+        // Row: `BoundaryTouch` **with** sources *and* `out_of_root_touch` — the
+        // shape the `sources.is_empty()` proxy could not express (REQ-619
+        // verify, C2). `` !`cat ~/.ssh/id_rsa README.md` `` names an in-root
+        // file and touches an out-of-root boundary in one command; the fold
+        // must keep the id **and** set the bit, because the two facts are about
+        // two different files.
+        let mixed = fold_expansion(
+            Some(skill.clone()),
+            &[PreambleRun {
+                verdict: out_of_root_touch_with(&["README.md"]),
+                outcome: ran(),
+            }],
+        );
+        assert!(
+            mixed.boundary_touch,
+            "an out-of-root touch is permanent however many in-root files rode along"
+        );
+        assert_eq!(
+            ids(&mixed),
+            [".claude/skills/release/SKILL.md", "README.md"],
+            "and the in-root ids are still named"
+        );
 
         // Row: `Unknown` — an opaque verb, liftable.
         let unknown = fold_expansion(

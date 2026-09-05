@@ -22203,6 +22203,7 @@ provider_id = \"deepseek\"
                 verdict: Verdict {
                     kind: VerdictKind::Unknown,
                     sources: std::collections::BTreeSet::new(),
+                    out_of_root_touch: false,
                     reason: "fixture",
                 },
                 outcome,
