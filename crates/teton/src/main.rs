@@ -1877,11 +1877,13 @@ pub(crate) fn model_status_on(
 ) -> anyhow::Result<()> {
     let answered = conn.call(ModelStatusParams::default(), ctx)?;
     if let Some(status) = model_status_or_report(answered, ctx.surface) {
-        let base_dir = paths.socket.parent();
-        let path = match (base_dir, status.install.as_ref()) {
-            (Some(base), Some(install)) => Some(model_ui::weights_path(base, &install.model_name)),
-            _ => None,
-        };
+        // BUG-211: the weights live in the data directory, not beside the
+        // socket — derived from the same `DaemonPaths` the daemon opens them
+        // under, never sent over the wire (BR-11).
+        let path = status
+            .install
+            .as_ref()
+            .map(|install| model_ui::weights_path(&paths.data, &install.model_name));
         model_ui::render_status(&status, path.as_deref(), ctx.surface);
     }
     Ok(())
@@ -1997,6 +1999,9 @@ fn doctor_header(paths: &DaemonPaths, surface: &mut dyn Surface) {
         &format!("socket: {}", paths.socket.display()),
     );
     surface.line(LineKind::Info, &format!("lock:   {}", paths.lock.display()));
+    // BUG-211: the durable state directory — where `config.toml`, `cost.db`
+    // and the downloaded model live — which on Linux is not the socket's.
+    surface.line(LineKind::Info, &format!("data:   {}", paths.data.display()));
 }
 
 /// Everything doctor prints before it asks the daemon anything: the header and
@@ -6426,6 +6431,7 @@ mod tests {
             lock: std::path::PathBuf::from("/tmp/teton-test/teton.lock"),
             log: std::path::PathBuf::from("/tmp/teton-test/teton.log"),
             projects: std::path::PathBuf::from("/tmp/teton-test/projects.json"),
+            data: std::path::PathBuf::from("/tmp/teton-test"),
         }
     }
 
@@ -6481,15 +6487,15 @@ mod tests {
             .collect();
         assert_eq!(
             differing,
-            vec![3],
-            "only the daemon line may differ: shell {fresh_lines:?} vs session {session_lines:?}"
+            vec![4],
+            "only the daemon line (after socket, lock and data) may differ: shell {fresh_lines:?} vs session {session_lines:?}"
         );
         assert_eq!(
-            fresh_lines[3],
+            fresh_lines[4],
             "daemon: running — teton-code 0.1.20 (protocol 2)"
         );
         assert_eq!(
-            session_lines[3],
+            session_lines[4],
             "daemon: running — teton-code-test 0.1.20 (this session's connection)"
         );
         // The header is the shell's, byte for byte, on both paths — this is the

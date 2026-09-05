@@ -45,19 +45,28 @@ pub struct DaemonPaths {
     /// The known-project registry (REQ-584 BR-5, ADR-2).
     ///
     /// **Here rather than computed where it is used**, for the reason the three
-    /// paths above are here: `resolve_base_dir` is the one home for "where this
-    /// daemon keeps its things", and a second derivation could disagree with it.
-    /// It also means every test is isolated for free — the harness already sets
-    /// `XDG_RUNTIME_DIR`, so a suite can never read or clobber the real
+    /// paths above are here: one resolver is the home for "where this daemon
+    /// keeps its things", and a second derivation could disagree with it. It
+    /// also means every test is isolated for free — the harness already sets
+    /// the XDG variables, so a suite can never read or clobber the real
     /// machine's project list.
     ///
     /// Unlike the socket and lock, this one is **persistent state** rather than
-    /// runtime state. On a Linux box whose `XDG_RUNTIME_DIR` is a tmpfs the
-    /// registry is therefore forgotten on reboot. That is acceptable and not
-    /// worth a second base directory: BR-1 rebuilds it from use, and BR-3's
-    /// scan rebuilds it on demand — the registry is a cache, and losing a cache
-    /// costs one scan.
+    /// runtime state, so since BUG-211 it lives in [`Self::data`] with the
+    /// other durable stores rather than beside the socket. (REQ-584 ADR-2
+    /// accepted losing it at logout on the grounds that a registry is a cache;
+    /// that was true, and it was also the one durable store the fix would
+    /// otherwise have left behind in a directory that now holds nothing else
+    /// worth keeping.)
     pub projects: PathBuf,
+    /// The durable state directory (BUG-211): `config.toml`, `cost.db`, the
+    /// project registry, the model decision, the web cache and the downloaded
+    /// weights. [`resolve_data_dir`]'s answer — `$XDG_DATA_HOME/teton` or
+    /// `~/.local/share/teton` on Linux, `~/Library/Application Support/teton`
+    /// on macOS — never the logout-cleared runtime directory the socket lives
+    /// in. Carried here so the CLI (`teton uninstall`, `teton model status`,
+    /// the service-decline marker) derives it exactly as the daemon does.
+    pub data: PathBuf,
 }
 
 /// The known-project registry inside `base` (REQ-584 ADR-2).
@@ -79,11 +88,13 @@ pub fn daemon_paths() -> DaemonPaths {
         std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
         std::env::var_os("HOME").map(PathBuf::from),
     );
+    let data = data_dir();
     DaemonPaths {
         socket: base.join("tetond.sock"),
         lock: base.join("tetond.lock"),
         log: base.join("tetond.log"),
-        projects: projects_path(&base),
+        projects: projects_path(&data),
+        data,
     }
 }
 
@@ -182,17 +193,34 @@ mod tests {
     /// Asserted as a *relationship* to the socket rather than against a literal
     /// path — a test that re-derived the expected path would be the second
     /// derivation this field exists to prevent.
+    /// BUG-211: the registry is durable state, so it lives in the data
+    /// directory with the other durable stores — asserted as a relationship
+    /// to [`DaemonPaths::data`] rather than a literal path, for REQ-584
+    /// ADR-2's reason (a re-derived expected path is the second derivation
+    /// this field exists to prevent).
     #[test]
-    fn the_project_registry_sits_in_the_same_base_as_the_socket() {
+    fn the_project_registry_sits_in_the_data_dir_with_the_durable_stores() {
         let paths = daemon_paths();
         assert_eq!(
             paths.projects.parent(),
-            paths.socket.parent(),
-            "the registry must live beside the socket, lock and log"
+            Some(paths.data.as_path()),
+            "the registry must live in the data directory"
         );
         assert_eq!(
             paths.projects.file_name().and_then(|n| n.to_str()),
             Some("projects.json")
+        );
+    }
+
+    /// BUG-211: the CLI and the daemon derive one data directory, and it is
+    /// `data_dir()`'s — the resolver REQ-611 introduced, not the socket's.
+    #[test]
+    fn daemon_paths_carry_the_data_dir_the_resolver_names() {
+        let paths = daemon_paths();
+        assert_eq!(paths.data, data_dir());
+        assert_eq!(
+            paths.data.file_name().and_then(|n| n.to_str()),
+            Some("teton")
         );
     }
 

@@ -2237,12 +2237,14 @@ pub struct DaemonRuntime {
     /// use, in memory only, never persisted, and — like the taint flag and the
     /// URL sets — not pruned, because a `SessionId` is not reused.
     session_gates: Mutex<HashMap<SessionId, Arc<PermissionGate>>>,
-    /// The daemon's per-user state directory — where `cost.db` lives, and where
-    /// the web document cache sits beside it (REQ-563 BR-12).
+    /// The daemon's per-user **data** directory — where `cost.db` lives, and
+    /// where the web document cache sits beside it (REQ-563 BR-12). Since
+    /// BUG-211 this is `socket_path::resolve_data_dir`'s answer, never the
+    /// logout-cleared runtime directory the socket lives in.
     ///
     /// Held rather than re-derived so the two stores cannot end up in different
     /// places: there is exactly one resolution of the data dir and it is
-    /// [`Self::from_env`]'s caller's.
+    /// [`Self::from_dirs`]'s caller's.
     data_dir: PathBuf,
     /// Daemon-wide provider health, persisted across turns (REQ-544 M-5). Updated
     /// by turn outcomes and READ by [`Self::run_prompt_turn`] when it seeds the
@@ -2564,12 +2566,59 @@ impl DaemonRuntime {
     /// Build the runtime from configuration and the environment, wiring the cost
     /// ledger's event sink and the egress privacy sink to `events`.
     ///
-    /// `base_dir` is the daemon's per-user state directory (where the socket and
-    /// the persistent cost ledger live).
+    /// `base_dir` is one directory serving as both the runtime and the data
+    /// directory — the shape every in-process test builds a runtime over, and
+    /// the macOS default install, where the two resolvers agree. The daemon
+    /// binary calls [`from_dirs`](Self::from_dirs) with the two named apart.
     ///
     /// # Errors
     /// Returns an error if the cost ledger cannot be opened.
     pub fn from_env(base_dir: &Path, events: &Arc<EventBus>) -> anyhow::Result<Self> {
+        Self::from_dirs(base_dir, base_dir, events)
+    }
+
+    /// Build the runtime with the two directories named apart (BUG-211).
+    ///
+    /// `runtime_dir` is where the socket lives — `$XDG_RUNTIME_DIR/teton` on
+    /// Linux, a tmpfs the login session removes — and the **only** thing this
+    /// constructor still does with it is move durable state out of it, once.
+    /// `data_dir` is where every durable store is opened: `config.toml`
+    /// (unless `TETON_CONFIG`), `cost.db`, the project registry, the model
+    /// decision, the weights, the web cache and the transcripts.
+    ///
+    /// # Errors
+    /// Returns an error if the cost ledger cannot be opened.
+    pub fn from_dirs(
+        runtime_dir: &Path,
+        data_dir: &Path,
+        events: &Arc<EventBus>,
+    ) -> anyhow::Result<Self> {
+        // BUG-211: before anything opens, move what an older daemon left in
+        // the runtime directory. Reported line by line on the daemon's own
+        // stderr — a one-time event the user may want to know happened,
+        // especially the `KeptBoth` arm, which names a file they now have two
+        // of. A no-op when the two are the same place.
+        for outcome in crate::state_dir::migrate_durable_state(runtime_dir, data_dir) {
+            eprintln!(
+                "tetond: state — {outcome} ({} -> {}; BUG-211)",
+                runtime_dir.display(),
+                data_dir.display()
+            );
+        }
+        // The data directory exists before any store opens, owner-only. The
+        // runtime directory was always there (the login session makes it);
+        // `~/.local/share/teton` on a first run is not, and `CostLedger::open`
+        // on a missing parent falls back to an in-memory ledger *silently* —
+        // which the fresh-daemon e2e claim caught the moment the ledger moved.
+        crate::auth::secure_socket_dir(data_dir).map_err(|err| {
+            anyhow::anyhow!(
+                "could not create the data directory {}: {err}",
+                data_dir.display()
+            )
+        })?;
+        // Every store below opens under the data directory. The name is kept
+        // so the body reads as it did; the *value* is what BUG-211 changed.
+        let base_dir = data_dir;
         // --- config ---
         let config_path = std::env::var_os("TETON_CONFIG")
             .map(PathBuf::from)
@@ -2719,7 +2768,7 @@ impl DaemonRuntime {
         let transcript = TranscriptSink::spawn_with_seam(
             SinkConfig::new(
                 &config.transcript,
-                &teton_protocol::socket_path::data_dir(),
+                base_dir,
                 config.privacy.redact,
                 env!("CARGO_PKG_VERSION").to_owned(),
             ),
@@ -3358,6 +3407,13 @@ impl DaemonRuntime {
         }
     }
 
+    /// The file this runtime's config was read from and is written back to —
+    /// `TETON_CONFIG` when set, else `config.toml` under the data directory
+    /// (BUG-211). `None` only for a runtime built without one (`minimal`).
+    pub fn config_path(&self) -> Option<&Path> {
+        self.config_path.as_deref()
+    }
+
     /// A snapshot of the current configuration for `config/get`.
     ///
     /// The routing half of the snapshot is **resolved**, not merely echoed: it
@@ -3367,6 +3423,7 @@ impl DaemonRuntime {
     /// `[[categories]]` rows back would have been less code and a different
     /// answer — the rows say nothing about an unbound tier's inherited fill, a
     /// provider that is down, or a remote provider that declares no model.
+    #[must_use]
     #[must_use]
     pub fn config_snapshot(&self) -> ConfigSnapshot {
         let config = self.config.lock().expect("config mutex poisoned");
@@ -3378,7 +3435,7 @@ impl DaemonRuntime {
         // REQ-611 AC-20: composed here, from the same one-home function the sink
         // and the tool denial use, and handed to the projection rather than
         // reached for inside it (see `snapshot_from_config`).
-        let transcript_dir = turn::effective_transcript_dir(&config.transcript);
+        let transcript_dir = turn::effective_transcript_dir(&config.transcript, &self.data_dir);
         snapshot_from_config(
             &config,
             &router,

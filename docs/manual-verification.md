@@ -147,14 +147,18 @@ sent.
 The consent gate does not re-litigate a settled question (BR-10), so a stale
 decision record would skip the very prompt being verified.
 
-The daemon state directory is `$XDG_RUNTIME_DIR/teton` when `XDG_RUNTIME_DIR`
-is set, else `~/Library/Application Support/teton` on macOS, else
-`$TMPDIR/teton` (`teton-protocol/src/socket_path.rs`). Set it once for the
-commands below (macOS with no `XDG_RUNTIME_DIR` shown):
+The daemon's **data** directory — where the model decision and the weights live
+since BUG-211 — is `$XDG_DATA_HOME/teton` when `XDG_DATA_HOME` is set, else
+`~/.local/share/teton` on Linux and `~/Library/Application Support/teton` on
+macOS, else `$TMPDIR/teton` (`teton-protocol/src/socket_path.rs`;
+`teton doctor` prints it on its `data:` line). The socket, lock and log live
+in the runtime directory (`$XDG_RUNTIME_DIR/teton` when set), which on Linux is
+cleared at logout and holds nothing else. Set the data directory once for the
+commands below (macOS with no `XDG_DATA_HOME` shown):
 
 ```sh
-TETON_STATE="${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/teton}"
-TETON_STATE="${TETON_STATE:-$HOME/Library/Application Support/teton}"
+TETON_STATE="${XDG_DATA_HOME:+$XDG_DATA_HOME/teton}"
+TETON_STATE="${TETON_STATE:-$HOME/Library/Application Support/teton}"   # Linux: $HOME/.local/share/teton
 # Inspect first, then remove. These are the daemon's machine-state files.
 ls "$TETON_STATE/"
 rm -f  "$TETON_STATE/model-selection.toml"

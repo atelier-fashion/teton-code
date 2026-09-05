@@ -355,8 +355,10 @@ teton uninstall
 ```
 
 One command, the whole chain: it stops the `brew services` daemon, deletes the
-state directory (`~/Library/Application Support/teton` — the downloaded model,
-cost history, and config), removes the daemon logs and any provider keys in the
+data directory (`~/Library/Application Support/teton` on macOS,
+`~/.local/share/teton` on Linux — the downloaded model, cost history, and
+config; plus the runtime directory when it is a separate place), removes the
+daemon logs and any provider keys in the
 macOS keychain, runs `brew uninstall teton`, and removes the tap registration
 (skipped automatically if another formula from the tap is still installed). It
 shows the full plan — with the size of what it's about to delete — and asks
@@ -466,8 +468,8 @@ teton provider list
 teton doctor
 ```
 
-Config lives in `config.toml` in Teton's state directory (override with
-`TETON_CONFIG`); API keys are never stored in it.
+Config lives in `config.toml` in Teton's data directory (override with
+`TETON_CONFIG`; `teton doctor` prints the path); API keys are never stored in it.
 
 **Context budget.** Every turn is assembled to fit the route it takes. A
 provider that declares a window gets a budget derived from it — in words *and*
@@ -641,9 +643,10 @@ file that no longer parses, or that parses but fails the validation startup
 runs, stops the next daemon-side save with the reason rather than overwriting
 your work to make the save succeed.
 
-Config lives in `config.toml` in Teton's state directory
-(`$XDG_RUNTIME_DIR/teton` when that is set, else
-`~/Library/Application Support/teton` on macOS; `TETON_CONFIG` overrides both).
+Config lives in `config.toml` in Teton's data directory
+(`$XDG_DATA_HOME/teton` when that is set, else `~/.local/share/teton` on Linux
+and `~/Library/Application Support/teton` on macOS; `TETON_CONFIG` overrides
+all of them — `teton doctor` prints the directory on its `data:` line).
 Keys are never stored in it — `search_key_ref` names a keychain entry under the
 same `teton` service every Teton credential is filed under, which is why writing
 one is the CLI's job and never the daemon's.

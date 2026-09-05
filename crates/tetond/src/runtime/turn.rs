@@ -55,12 +55,14 @@ use super::*;
 /// one the sink will write to. A denial aimed at a directory nothing writes to
 /// is a denial of nothing at all.
 ///
-/// **Not `DaemonRuntime::data_dir`.** That field is the *base* directory — the
-/// socket's, which on Linux is `$XDG_RUNTIME_DIR`, a tmpfs cleared at logout.
-/// A thirty-day retention policy under a directory that does not survive a
-/// logout is a promise the daemon cannot keep, which is the whole reason ADR-4
-/// added a second resolver instead of reusing the first. Relocating `cost.db`
-/// to match is a filed follow-up (TASK-367), not a side effect of this.
+/// **From `DaemonRuntime::data_dir`, since BUG-211.** Until then that field
+/// was the *base* directory — the socket's, which on Linux is
+/// `$XDG_RUNTIME_DIR`, a tmpfs cleared at logout — so this function read the
+/// data resolver from the environment itself, and the sink, the jail and
+/// doctor could name a different directory from the one a runtime built over
+/// a scratch directory wrote to. The field is now the data directory, the
+/// sink is built from it, and this reads the same value: one resolution, held
+/// once, so the three cannot disagree.
 ///
 /// `pub(super)`, which is what `runtime_visibility.rs` requires of everything
 /// under `runtime/` that no other module needs — and it reaches `runtime/mod.rs`,
@@ -69,8 +71,9 @@ use super::*;
 /// consumer named; the ratchet is the argument, not a grep (LESSON-596).
 pub(super) fn effective_transcript_dir(
     transcript: &teton_core::config::TranscriptConfig,
+    data_dir: &Path,
 ) -> PathBuf {
-    transcript.effective_dir(&teton_protocol::socket_path::data_dir())
+    transcript.effective_dir(data_dir)
 }
 
 /// The turn's prompt as the blocks its `prompt_submitted` record carries
@@ -1030,7 +1033,7 @@ impl DaemonRuntime {
         // (`Config::effective_boundaries`, REQ-597 ADR-1) and this is a read of
         // it, not a second one.
         let tool_ctx = ToolContext::for_root(probed)
-            .with_denied_prefix(effective_transcript_dir(&config.transcript))
+            .with_denied_prefix(effective_transcript_dir(&config.transcript, &self.data_dir))
             .with_boundaries(config.effective_boundaries())
             .with_known_projects(known_projects.clone());
         // REQ-611 BR-4: the turn's streaming surface also carries the sink, so

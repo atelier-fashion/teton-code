@@ -56,9 +56,10 @@ pub fn offer_registration(
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         return false;
     }
-    let Some(state_dir) = paths.socket.parent().map(Path::to_path_buf) else {
-        return false;
-    };
+    // BUG-211: a recorded decision lives with the other durable decisions,
+    // in the data directory — not beside the socket, which Linux clears at
+    // logout (and would ask again every login).
+    let state_dir = paths.data.clone();
     if decline_marker(&state_dir).exists() {
         return false;
     }

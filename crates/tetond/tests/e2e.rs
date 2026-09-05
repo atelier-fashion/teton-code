@@ -47,6 +47,10 @@
 //!   send leaves; a typed user skill pins on its first send, liftably, and says
 //!   so. All asserted on what a client received from the real daemon, because
 //!   the in-process sink tests were green while the daemon never built the sink.
+//! - [`state_dir`] — BUG-211: the daemon keeps its durable state under
+//!   `$XDG_DATA_HOME/teton`, never beside the socket under the logout-cleared
+//!   `$XDG_RUNTIME_DIR/teton`, and a daemon that finds legacy state beside the
+//!   socket moves it once and says so on its stderr.
 
 // The suite lives under `tests/e2e/`; `#[path]` keeps that layout while this
 // top-level file remains the integration-test binary Cargo compiles.
@@ -72,3 +76,5 @@ mod routing_categories;
 mod session_root;
 #[path = "e2e/shell_pin_shape.rs"]
 mod shell_pin_shape;
+#[path = "e2e/state_dir.rs"]
+mod state_dir;
