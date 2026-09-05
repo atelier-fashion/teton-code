@@ -3,15 +3,22 @@
   "branch": "feat/REQ-619-proportionate-skill-provenance",
   "startedAt": "2026-09-05T16:58:44Z",
   "completed": false,
-  "currentPhase": 1,
+  "currentPhase": 2,
   "completedPhases": [
-    0
+    0,
+    1
   ],
   "phaseHistory": [
     {
       "phase": 0,
       "name": "Create Worktree",
       "completedAt": "2026-09-05T16:58:48Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-09-05T16:59:53Z",
+      "result": "APPROVED; 0 blockers, 2 advisory warnings (named existing function in BR-4/AC-9; AC-8 fixture weight); builtin-glob assumption verified against DEFAULT_BOUNDARIES"
     }
   ],
   "integrationBranch": "main",
