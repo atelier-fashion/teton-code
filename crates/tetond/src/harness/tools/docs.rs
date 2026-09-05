@@ -701,6 +701,17 @@ mod tests {
         );
         assert_states(
             &topic,
+            // The needle is asterisk-free on purpose: `skills_topic` strips `*`
+            // so emphasis cannot smuggle a stale claim past a check, which also
+            // means the `**/…` half of this sentence is unquotable here.
+            "or `~/…` spelling — a repo-anchored or absolute one matches nothing",
+            "REQ-619 verify m2: the identity is home-scoped, so a repo-anchored or \
+             absolute glob over a skills directory matches nothing — a topic silent \
+             about that lets a model tell a user to write the one spelling that \
+             cannot work",
+        );
+        assert_states(
+            &topic,
             "Each `` !`cmd` `` is classified before it runs",
             "REQ-619 BR-1: a preamble gets the `shell` grammar's verdict from the \
              command text, before the spawn — not from whether anything spawned",

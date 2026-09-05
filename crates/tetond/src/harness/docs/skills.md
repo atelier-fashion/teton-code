@@ -79,8 +79,10 @@ Two rules. A **project** skill mints a root-relative source and pins the turn
 as reading it would. A **user** skill (`~/.claude/…`) mints a `~`-scoped one —
 `~/.claude/skills/x/SKILL.md` — matched against the boundary globs the same
 way, so it routes like a project skill and is refused **naming its own file**
-under a glob covering your skills directory. Neither is stricter than a `read`
-of the same bytes.
+under a glob covering your skills directory. That glob only reaches it in the
+`**/…` or `~/…` spelling — a repo-anchored or absolute one matches nothing,
+because the id it is matched against starts at the home. Neither is stricter
+than a `read` of the same bytes.
 
 Each `` !`cmd` `` is classified before it runs, exactly as a `shell` command is:
 proved in-root, boundary-touching, or unprovable. A rooted one contributes the

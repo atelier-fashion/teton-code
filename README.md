@@ -206,7 +206,11 @@ A skill's file and each of its commands are judged the way everything else is.
 The file itself counts as read — a skill under `~/.claude` is weighed against
 your boundary globs exactly as one in the repository is, so a skill matching
 none of them routes wherever the turn would have routed anyway, and one under a
-glob you wrote over your skills directory is refused naming that file. Each
+glob you wrote over your skills directory is refused naming that file. Write
+that glob in the `**/…` or `~/…` spelling — `**/.claude/skills/**`,
+`~/.claude/**` — because a user skill's identity is home-scoped and a
+repo-anchored or absolute one (`.claude/skills/**`, `/Users/you/.claude/**`)
+matches nothing at all. Each
 `` !`cmd` `` is classified **before it runs**, on the same rules a `shell`
 command gets: a command whose paths are all inside the session root and touch no
 boundary is proved harmless and contributes what it read; one that names a
