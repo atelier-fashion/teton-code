@@ -1,7 +1,7 @@
 ---
 id: TASK-400
 title: "`Provenance::User` carries `boundary_touch` through the three seams, and one fold turns identity plus verdicts into a provenance"
-status: draft
+status: complete
 parent: REQ-619
 created: 2026-09-05
 updated: 2026-09-05
