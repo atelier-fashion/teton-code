@@ -3888,6 +3888,72 @@ pub struct DynamicOutcomeView {
     pub command: String,
     /// How it ended.
     pub outcome: DynamicOutcome,
+    /// How far the daemon could prove this command reached, taken **before** it
+    /// spawned (REQ-619 BR-7, ADR-619-5).
+    ///
+    /// Additive, and **absent means the daemon did not classify preambles at
+    /// all** — every build before REQ-619 — which is a different fact from
+    /// [`Reach::Unknown`], "it was classified and nothing could be proved". A
+    /// client that folded the two would report a stale daemon as a session
+    /// about to pin.
+    ///
+    /// What a client built before the field loses is one `/verbose` line
+    /// saying *which* preamble pinned the session. It is not the announcement:
+    /// that is `session_pinned`, with the `/shell allow` remedy on it, and
+    /// REQ-619 BR-8 adds no surface beside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach: Option<Reach>,
+    /// Why that reach was reached, in the classifier's own words.
+    ///
+    /// The daemon's `Verdict::reason` verbatim — a `&'static str` chosen from a
+    /// closed set, which is what makes BR-7's "the reason is content-free"
+    /// structural rather than a promise: a sentence assembled from the command
+    /// could not have been `'static`, so neither the substituted command text
+    /// nor a byte of the command's output can arrive here. The command itself
+    /// is on `command` above, bounded, exactly as it was before this REQ.
+    ///
+    /// Absent exactly when [`reach`](Self::reach) is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach_reason: Option<String>,
+}
+
+/// How far one dynamic-context command was allowed to reach (REQ-619 BR-7).
+///
+/// The `shell` tool's verdict grammar (REQ-614 BR-10), carried onto the skill
+/// record so `/verbose` can say **which** preamble pinned a session — the
+/// `session_pinned` line names the session, and a skill with four commands
+/// otherwise leaves a user to guess which of them did it.
+///
+/// Three words, and the vocabulary is closed: the daemon proved every path the
+/// command names stays inside the session root, proved one of them matches a
+/// `local-only` boundary, or proved nothing. It is **rendering only** — the
+/// pin, its recorded cause and its remedy are `session_pinned`'s, and nothing a
+/// client decides turns on this field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reach {
+    /// Every token was recognised and every path the command names resolved
+    /// under the session root without touching a boundary. Contributes its
+    /// resolved sources and pins nothing; `/verbose` says nothing about it,
+    /// because the ordinary case is not news.
+    Rooted,
+    /// A path the command names matches a `local-only` boundary glob. Pins the
+    /// session permanently — there is no lift for this one (REQ-614 BR-3).
+    BoundaryTouch,
+    /// Nothing could be proved: an opaque verb, an unparsable line, a path that
+    /// left the root. Pins the session liftably, with cause `unknown_shell`.
+    ///
+    /// Also where a `reach` word **this build does not know** lands (BUG-186).
+    /// The tolerant direction is the one the sibling `DynamicOutcome` already
+    /// takes for the same reader — the client's parse is
+    /// `serde_json::from_value(params).ok()?`, so a fourth word from a newer
+    /// daemon would otherwise cost the whole `skill_invoked` frame: no echo
+    /// line, no outcomes, and BR-12's "every invocation echoes one" quietly
+    /// false. Degrading one `/verbose` adjective is strictly better, and it
+    /// degrades toward the *cautious* word rather than toward `Rooted`. The
+    /// reason travels beside it as a string and says what actually happened.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The four ways a dynamic-context command can end (REQ-585 BR-6).
@@ -4989,6 +5055,8 @@ mod tests {
                     ignored_keys: vec!["allowed-tools".to_owned()],
                     name_note: None,
                     outcomes: vec![DynamicOutcomeView {
+                        reach: None,
+                        reach_reason: None,
                         command: "git branch --show-current".to_owned(),
                         outcome: DynamicOutcome::Ran {
                             output_bytes: 19,
@@ -6631,6 +6699,8 @@ mod tests {
             turn_invocations: None,
             refused: None,
             outcomes: vec![DynamicOutcomeView {
+                reach: None,
+                reach_reason: None,
                 command: "git status --short".to_owned(),
                 outcome: DynamicOutcome::Ran {
                     output_bytes: 41,
@@ -7455,6 +7525,8 @@ mod tests {
             refused: None,
             outcomes: vec![
                 DynamicOutcomeView {
+                    reach: None,
+                    reach_reason: None,
                     command: "cat ~/.claude/adlc/ETHOS.md".to_owned(),
                     outcome: DynamicOutcome::Ran {
                         output_bytes: 3_812,
@@ -7462,6 +7534,8 @@ mod tests {
                     },
                 },
                 DynamicOutcomeView {
+                    reach: None,
+                    reach_reason: None,
                     command: "grep -rn TODO .".to_owned(),
                     outcome: DynamicOutcome::Ran {
                         output_bytes: 8_000,
@@ -7469,18 +7543,24 @@ mod tests {
                     },
                 },
                 DynamicOutcomeView {
+                    reach: None,
+                    reach_reason: None,
                     command: "gcloud run services list".to_owned(),
                     outcome: DynamicOutcome::NotRun {
                         reason: NotRunReason::NoTerminal,
                     },
                 },
                 DynamicOutcomeView {
+                    reach: None,
+                    reach_reason: None,
                     command: "test -f .adlc/context/architecture.md".to_owned(),
                     outcome: DynamicOutcome::Failed {
                         exit_status: Some(1),
                     },
                 },
                 DynamicOutcomeView {
+                    reach: None,
+                    reach_reason: None,
                     command: "sleep 600".to_owned(),
                     outcome: DynamicOutcome::TimedOut,
                 },
@@ -7549,6 +7629,142 @@ mod tests {
         let signalled = serde_json::to_value(DynamicOutcome::Failed { exit_status: None }).unwrap();
         assert_eq!(signalled["kind"], "failed");
         assert!(signalled.get("exit_status").is_none(), "{signalled}");
+    }
+
+    /// **REQ-619 BR-7 (ADR-619-5): a command's reach rides its outcome, and it
+    /// rides it additively.**
+    ///
+    /// The convention followed here is the file's own for an optional field —
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]`, as
+    /// `SkillInvoked::name_note` and `::refused` carry — so an outcome with no
+    /// reach writes REQ-585's bytes exactly, and leg two is what says so.
+    ///
+    /// Five legs, and the last two are the ones that would otherwise rot:
+    ///
+    /// - **absent means `None`**, and `None` means *this daemon did not
+    ///   classify*, which is not [`Reach::Unknown`], *it classified and proved
+    ///   nothing*;
+    /// - **an outcome with no reach is byte-identical to a pre-REQ-619 one**,
+    ///   which is what `skip_serializing_if` buys and a bare `default` would
+    ///   lose;
+    /// - **non-vacuity**: a set reach writes both keys in `snake_case`, so the
+    ///   two legs above are reached by the value being absent rather than by
+    ///   the fields having been dropped;
+    /// - **an old client still reads the record**, fields and all — the
+    ///   additive claim in the direction nobody compiles;
+    /// - **a fourth reach word costs one adjective, not the frame** (BUG-186's
+    ///   rule, which this REQ would otherwise reopen: the client's reader is
+    ///   `from_value(params).ok()?`, and an unknown string in a non-`Option`
+    ///   position takes the whole `skill_invoked` event down).
+    ///
+    /// Mutation (run, red, reverted): dropping `skip_serializing_if` from
+    /// `reach` to a bare `#[serde(default)]` — leg two goes red on the `null`
+    /// key it then writes. **1 red**, this test. Second mutation (run, red,
+    /// reverted): removing `#[serde(other)]` from [`Reach::Unknown`] — leg five
+    /// goes red at the `expect`, the whole frame failing to parse. **1 red**,
+    /// this test.
+    #[test]
+    fn a_skill_outcome_carries_its_reach_additively() {
+        // Leg one — a record from a daemon predating the fields. Every other
+        // key is REQ-585's, because that is the record this has to keep
+        // parsing.
+        let invoked: SkillInvoked = serde_json::from_str(
+            r#"{"name":"status","source":"user","path_display":"~/.claude/skills/status/SKILL.md",
+                "body_bytes":118,"ignored_keys":[],
+                "outcomes":[{"command":"cat README.md",
+                             "outcome":{"kind":"ran","output_bytes":12,"truncated":false}}]}"#,
+        )
+        .expect("an event from a daemon predating these fields must still parse");
+        assert_eq!(
+            invoked.outcomes[0].reach, None,
+            "absent means the daemon did not classify preambles at all — not \
+             that it classified this one and proved nothing, which is \
+             Some(Unknown) and a different sentence on the surface"
+        );
+        assert_eq!(invoked.outcomes[0].reach_reason, None);
+
+        // Leg two — that record round-trips to the same bytes: no key, not a
+        // `null`. Downgrading the `skip_serializing_if` to a bare `default`
+        // fails here.
+        let wire = serde_json::to_value(&invoked.outcomes[0]).unwrap();
+        assert!(
+            wire.get("reach").is_none() && wire.get("reach_reason").is_none(),
+            "an unclassified outcome must write nothing: {wire}"
+        );
+
+        // Leg three — non-vacuity. A classified outcome carries both keys, in
+        // the wire's own spelling, and the reason is the classifier's sentence
+        // verbatim rather than anything composed from the command.
+        let classified = DynamicOutcomeView {
+            command: "cat secrets/prod.env".to_owned(),
+            outcome: DynamicOutcome::Ran {
+                output_bytes: 44,
+                truncated: false,
+            },
+            reach: Some(Reach::BoundaryTouch),
+            reach_reason: Some("a path argument matches a privacy boundary".to_owned()),
+        };
+        round_trip(&classified);
+        let wire = serde_json::to_string(&classified).unwrap();
+        assert!(wire.contains(r#""reach":"boundary_touch""#), "{wire}");
+        assert!(
+            wire.contains(r#""reach_reason":"a path argument matches a privacy boundary""#),
+            "{wire}"
+        );
+        let rooted = serde_json::to_value(DynamicOutcomeView {
+            reach: Some(Reach::Rooted),
+            ..classified.clone()
+        })
+        .unwrap();
+        assert_eq!(rooted["reach"], "rooted", "{rooted}");
+        let unproved = serde_json::to_value(DynamicOutcomeView {
+            reach: Some(Reach::Unknown),
+            ..classified.clone()
+        })
+        .unwrap();
+        assert_eq!(unproved["reach"], "unknown", "{unproved}");
+
+        // Leg four — a client built before the fields reads that record and
+        // still gets everything it knew about.
+        #[derive(Deserialize)]
+        struct PreReachOutcomeView {
+            command: String,
+            outcome: DynamicOutcome,
+        }
+        let old: PreReachOutcomeView =
+            serde_json::from_str(&wire).expect("a client predating the fields still reads it");
+        assert_eq!(old.command, "cat secrets/prod.env");
+        assert_eq!(
+            old.outcome,
+            DynamicOutcome::Ran {
+                output_bytes: 44,
+                truncated: false,
+            }
+        );
+
+        // Leg five — BUG-186's rule, which a closed `reach` vocabulary would
+        // reopen. A newer daemon's fourth word degrades to the cautious one and
+        // the event survives; the reason beside it still says what happened.
+        let newer: SkillInvoked = serde_json::from_str(
+            r#"{"name":"status","source":"user","path_display":"~/.claude/skills/status/SKILL.md",
+                "body_bytes":118,"ignored_keys":[],
+                "outcomes":[{"command":"cat README.md",
+                             "outcome":{"kind":"ran","output_bytes":12,"truncated":false},
+                             "reach":"sandboxed",
+                             "reach_reason":"the command ran in a sandbox"}]}"#,
+        )
+        .expect("a fourth reach word must cost one adjective, never the frame");
+        assert_eq!(
+            newer.outcomes[0].reach,
+            Some(Reach::Unknown),
+            "a word this build cannot name degrades toward caution, never toward Rooted"
+        );
+        assert_eq!(
+            newer.outcomes[0].reach_reason.as_deref(),
+            Some("the command ran in a sandbox"),
+            "the daemon's sentence survives the word this build lost"
+        );
+        assert_eq!(newer.name, "status", "the rest of the frame is intact");
     }
 
     /// REQ-558 AC-8: the four things a decision must name travel together, and

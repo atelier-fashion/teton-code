@@ -492,16 +492,36 @@ pub fn door_outcome(door: NotRunReason) -> DynamicOutcome {
 /// which is untrue and points a reader at the wrong fix. It is not folded into
 /// one of the consent's doors either — nobody refused it.
 /// The run — verdict and outcome — is what this projection is given, because
-/// TASK-402 puts the verdict's kind and its content-free reason on the wire
-/// beside the `ran` / `failed` / `timed out` facts (ADR-619-5, BR-7). Until
-/// then it reads the outcome only, and the verdict rides along unread.
+/// the verdict's kind and its content-free reason ride the wire beside the
+/// `ran` / `failed` / `timed out` facts (ADR-619-5, BR-7).
+///
+/// **Only the kind and the reason cross.** `Verdict::sources` stays here: it is
+/// the fold's input (ADR-619-4), not a surface's, and ids on a `/verbose` line
+/// would be a second, unasked-for disclosure of what the command read. The
+/// reason is `&'static str`, so what reaches the event cannot be assembled from
+/// the command or its output — BR-7 holds by the type, not by care here.
+///
+/// The wire [`teton_protocol::events::Reach`] is spelled in full because this
+/// module's own [`Reach`] is the classifier's *input*, four values wide; the
+/// two are one word apart and the same collision already governs
+/// [`DynamicOutcome`] below.
 #[must_use]
 pub fn outcome_view(
     command: &Command,
     run: &PreambleRun,
     door: Option<NotRunReason>,
 ) -> DynamicOutcomeView {
-    outcome_view_unclassified(command, &run.outcome, door)
+    DynamicOutcomeView {
+        reach: Some(match run.verdict.kind {
+            VerdictKind::Rooted => teton_protocol::events::Reach::Rooted,
+            VerdictKind::BoundaryTouch => teton_protocol::events::Reach::BoundaryTouch,
+            VerdictKind::Unknown => teton_protocol::events::Reach::Unknown,
+        }),
+        reach_reason: Some(run.verdict.reason.to_owned()),
+        // One projection body, reached two ways (LESSON-544): the command's
+        // bounding and the outcome's mapping are not restated here.
+        ..outcome_view_unclassified(command, &run.outcome, door)
+    }
 }
 
 /// [`outcome_view`] for a caller that still holds a bare [`DynamicOutcome`].
@@ -511,6 +531,11 @@ pub fn outcome_view(
 /// have no verdict to hand over yet; when they build a [`Reach`] and take
 /// [`PreambleRun`]s, both this and its runner sibling go. One projection body,
 /// reached two ways — never two bodies (LESSON-544).
+///
+/// Its record carries **no** reach: a caller with no verdict has nothing to
+/// say about one, and `None` on the wire is exactly "this daemon did not
+/// classify" (REQ-619 ADR-619-5). Filling it with `Rooted` to avoid an
+/// `Option` would be the one lie this shim could tell.
 #[must_use]
 pub fn outcome_view_unclassified(
     command: &Command,
@@ -518,6 +543,8 @@ pub fn outcome_view_unclassified(
     door: Option<NotRunReason>,
 ) -> DynamicOutcomeView {
     DynamicOutcomeView {
+        reach: None,
+        reach_reason: None,
         // File-supplied bytes on a surface: bounded and rendered on one line
         // here, at the same ceiling the fold's echoed placeholder uses (BR-3).
         command: teton_core::session_root::bounded_field(
@@ -1793,6 +1820,103 @@ mod tests {
             "the fixture must actually produce the marker: {:?}",
             runs[0].outcome
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **BR-7 / ADR-619-5: the wire record carries the verdict's *kind* and its
+    /// *reason*, and nothing else the classifier or the command knew.**
+    ///
+    /// The adversarial half (`benign_path: no` in spirit, though the table
+    /// lists this row as benign because the projection is the subject): a
+    /// command whose run really does hold a marker, asserted to be there before
+    /// it is asserted to be absent — the difference between a test and a
+    /// fixture with nothing to leak. The claim is made against the **serialised
+    /// event**, not against the struct's fields one at a time, because "no byte
+    /// of the output reaches the wire" is a statement about the bytes and a
+    /// per-field walk would silently stop covering a field somebody adds.
+    ///
+    /// `command` is the one place command text legitimately lives, and it is
+    /// REQ-585's field, bounded, unchanged by this REQ — so it is asserted
+    /// equal rather than merely absent. The last leg pins the shim
+    /// [`outcome_view_unclassified`]: `None` on the wire is "this daemon did
+    /// not classify", and a shim that answered `Rooted` would be the one lie in
+    /// reach of a caller with no verdict.
+    ///
+    /// Mutation (run, red, reverted): mapping `VerdictKind::Unknown` to
+    /// `Reach::Rooted` in `outcome_view` — the reach assertion goes red, and
+    /// the `/verbose` renderer would have gone silent on the one command that
+    /// pinned the session. **1 red**, this test. Second mutation (run, red,
+    /// reverted): building `reach_reason` as
+    /// `format!("{} ({})", run.verdict.reason, command.as_str())` — the
+    /// equality leg and the no-command-text leg both go red. **1 red**, this
+    /// test.
+    #[test]
+    fn outcome_view_carries_the_verdict_and_nothing_of_the_output() {
+        const MARKER: &str = "SECRET-OUTPUT-MARKER";
+
+        let root = project_root("outcome-view");
+        std::fs::write(root.join("probe.sh"), format!("printf '{MARKER}\\n'\n")).unwrap();
+        std::fs::write(root.join("notes.txt"), "ordinary\n").unwrap();
+        let opaque = Command::new("sh probe.sh");
+        let rooted = Command::new("cat notes.txt");
+
+        let runs = run_all(&test_reach(&root), std::slice::from_ref(&opaque), 10_000);
+        let run = &runs[0];
+
+        // The fixture is the one this claim needs: an *unknown* verdict beside
+        // an outcome that really is carrying the marker.
+        assert_eq!(run.verdict.kind, VerdictKind::Unknown);
+        assert!(
+            matches!(&run.outcome, DynamicOutcome::Ran { output, .. }
+                if output.contains(MARKER)),
+            "the fixture must actually have something to leak: {:?}",
+            run.outcome
+        );
+
+        let view = outcome_view(&opaque, run, None);
+        assert_eq!(
+            view.reach,
+            Some(teton_protocol::events::Reach::Unknown),
+            "the kind crosses as itself"
+        );
+        assert_eq!(
+            view.reach_reason.as_deref(),
+            Some(run.verdict.reason),
+            "the reason is the classifier's sentence verbatim, not a rewording"
+        );
+        assert_eq!(
+            view.command, "sh probe.sh",
+            "REQ-585's field is unchanged: the command text lives here, bounded, \
+             and this REQ adds no second copy of it"
+        );
+
+        // The whole record, as it reaches a client. Nothing of the output, and
+        // no second helping of the command.
+        let wire = serde_json::to_string(&view).unwrap();
+        assert!(
+            !wire.contains(MARKER),
+            "a byte of the command's output reached the event: {wire}"
+        );
+        assert_eq!(
+            wire.matches("probe.sh").count(),
+            1,
+            "the command appears once, on `command`, and nowhere else: {wire}"
+        );
+
+        // The other side of the map: an ordinary in-root read is `rooted`, and
+        // `/verbose` says nothing about it.
+        let rooted_run = &run_all(&test_reach(&root), std::slice::from_ref(&rooted), 10_000)[0];
+        assert_eq!(rooted_run.verdict.kind, VerdictKind::Rooted);
+        assert_eq!(
+            outcome_view(&rooted, rooted_run, None).reach,
+            Some(teton_protocol::events::Reach::Rooted)
+        );
+
+        // The shim a caller with no verdict reaches: silent, not `Rooted`.
+        let unclassified = outcome_view_unclassified(&opaque, &run.outcome, None);
+        assert_eq!(unclassified.reach, None);
+        assert_eq!(unclassified.reach_reason, None);
 
         std::fs::remove_dir_all(&root).ok();
     }
