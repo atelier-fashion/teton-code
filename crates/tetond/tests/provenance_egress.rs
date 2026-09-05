@@ -1842,13 +1842,22 @@ async fn a_model_invoked_project_skill_under_a_boundary_pins_the_turn_and_nothin
 /// The project skill goes out first on the same boundary set, so neither half
 /// can be satisfied by a transport that refuses everything (LESSON-479).
 ///
-/// **Mutation (run, red, reverted):** restore
-/// `(SkillSource::User, _) => ToolProvenance::Unknown` in `expand_and_fold` —
-/// the leave half's `result.is_ok()` goes red and the refused half's block path
-/// reads `<unknown-provenance>` instead of the file. **6 red** across the
-/// workspace: this test, its sibling below, `skill_boundary.rs`'s two user legs,
-/// `skill.rs`'s `a_user_skill_mints_a_home_scoped_id_and_a_project_skill_a_repo_scoped_one`,
-/// and `skill_turn.rs`'s `no_production_provenance_reads_spawned_any_more`.
+/// **Mutation, re-measured 2026-09-05 (REQ-619 verify, m8):** answer
+/// `ToolProvenance::Unknown` for a `SkillSource::User` row in `expand_and_fold`
+/// — the retired `(SkillSource::User, _)` arm. The leave half's
+/// `result.is_ok()` goes red and the refused half's block path reads
+/// `<unknown-provenance>` instead of the file. **22 red across the workspace**,
+/// not the 6 this record used to claim from before the e2e suite existed: 1 in
+/// the library, **18 in `tests/e2e`**, 1 here and 2 in `skill_boundary.rs`.
+///
+/// The e2e eighteen are one finding, not eighteen: this mutation is REQ-619
+/// verify **C1's leak by another route** — the fold's ids are dropped under a
+/// bare `Unknown`, `/shell allow` clears it over an empty source set, and
+/// `secrets/prod.env` leaves — and `assert_no_boundary_bytes` is a
+/// **process-global** claim over every captured payload in that binary, so it
+/// fails in every egress-touching test that runs after the leak. Recorded that
+/// way rather than as a bare number, because a reader who mutates this and
+/// counts is owed the reason the count is large.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_model_invoked_user_skill_gets_the_same_provenance_as_the_typed_one() {
     let trees = model_skill_trees();
@@ -1955,19 +1964,30 @@ async fn a_model_invoked_user_skill_gets_the_same_provenance_as_the_typed_one() 
 /// The project control runs first on the same boundary set, so the pinning half
 /// is "this command could not be proved" and not "this repo has a boundary".
 ///
-/// **Mutation (run, red, reverted):** restore the `(_, true) =>
-/// ToolProvenance::Unknown` arm — the rooted-failed leg is refused and its
-/// `result.is_ok()` goes red. **6 red** across the workspace (see the sibling
-/// above for the list). Second mutation (run, red, reverted): make the fold read
-/// the *outcome* — `did_spawn` answering `false` for `DynamicOutcome::Failed`,
-/// so a command that chose a non-zero exit contributes nothing — and the
-/// **pinning** leg goes green-to-red instead: the opaque failure stops pinning.
-/// **2 red**: this test and `skill_turn.rs`'s
-/// `a_boundary_naming_preamble_is_refused_whatever_it_exits`. Third mutation
-/// (run, red, reverted): map `unknown` to `BoundaryTouch` in
-/// `ExpansionProvenance::into_tool_provenance` — the block reads
-/// `<boundary-touch>` and the sentinel assertion goes red. **1 red**, this
-/// test, which is where that arm is pinned.
+/// # Mutations, re-measured 2026-09-05 (REQ-619 verify, m8)
+///
+/// **1 — restore the `(_, true) => ToolProvenance::Unknown` arm** (anything that
+/// spawned is unpinnable): the rooted-failed leg is refused and its
+/// `result.is_ok()` goes red. **18 red**: 17 in `tests/e2e` and this test. The
+/// e2e figure is a cascade of one leak, for the reason the sibling above spells
+/// out — the suite-wide `assert_no_boundary_bytes` fails in every
+/// egress-touching test after the first send that carries the secret.
+///
+/// **2 — make the fold read the *outcome***: `did_spawn` answering `false` for
+/// `DynamicOutcome::Failed`, so a command that chose a non-zero exit
+/// contributes nothing. The **pinning** leg goes green-to-red instead: the
+/// opaque failure stops pinning. **4 red**, not the 2 recorded before: this
+/// test, `skill_turn.rs`'s `a_boundary_naming_preamble_is_refused_whatever_it_exits`,
+/// the fold's own `the_fold_follows_the_adr_table`, and `tests/e2e`'s
+/// `the_exit_code_channel_is_closed_by_the_verdict` — one per altitude, which is
+/// what a side channel this specific should have.
+///
+/// **3 — map `unknown` to `BoundaryTouch` in
+/// `ExpansionProvenance::into_tool_provenance`**: the block reads
+/// `<boundary-touch>` and the sentinel assertion goes red. **3 red**: this test,
+/// the mapping's own `the_tool_provenance_mapping_is_the_shell_tools`, and
+/// `tests/e2e`'s
+/// `a_model_invoked_skill_with_an_opaque_and_a_boundary_preamble_keeps_the_file_after_a_lift`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_model_invocation_whose_opaque_command_failed_still_pins_and_a_rooted_one_does_not() {
     let trees = model_skill_trees();

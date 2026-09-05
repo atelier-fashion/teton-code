@@ -50,8 +50,25 @@ pub fn global_capture() -> &'static Mutex<Vec<Vec<u8>>> {
     CAPTURE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// The buffer, **poison-tolerant** — recovered rather than re-panicked on.
+///
+/// The first test to see a leak fails inside this lock, which poisons it for
+/// every test still to run; each of those then dies on `PoisonError` instead of
+/// on its own assertion. The result is that one real finding is reported as
+/// twenty unrelated ones, and a mutation record measured on that count says
+/// nothing about the mutation (REQ-619 verify, m8 — the counts recorded across
+/// this suite had to be re-measured, and this is what made them measurable).
+///
+/// Recovering is sound here because the data is append-only bytes with no
+/// invariant a panic could have broken mid-write: the buffer is exactly as
+/// valid after the poisoning as before it, and what the next test needs to see
+/// is *those* bytes.
+fn capture_guard() -> std::sync::MutexGuard<'static, Vec<Vec<u8>>> {
+    global_capture().lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn record_egress(body: Vec<u8>) {
-    global_capture().lock().unwrap().push(body);
+    capture_guard().push(body);
 }
 
 /// Assert the boundary secret has not appeared in any captured egress payload.
@@ -59,7 +76,7 @@ fn record_egress(body: Vec<u8>) {
 /// Called at the end of every egress-touching test, so a leak anywhere in the
 /// suite fails the run (BR-1 across the whole suite, not only AC-5).
 pub fn assert_no_boundary_bytes() {
-    let capture = global_capture().lock().unwrap();
+    let capture = capture_guard();
     // BR-1 is about the *content* of a boundary-protected file, not its path (a
     // user prompt may legitimately name the path). The sentinel and the database
     // URL are the file's content; neither may ever reach the wire.

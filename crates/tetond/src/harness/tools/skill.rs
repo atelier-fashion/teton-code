@@ -3277,12 +3277,23 @@ mod tests {
     /// [`fixture_under_home`] gives: the mint reads process-wide state a unit
     /// test may not write to.
     ///
-    /// **Mutation (run, red, reverted):** restore the
+    /// **Mutation, re-measured 2026-09-05 (REQ-619 verify, m8):** restore the
     /// `(_, true) | (SkillSource::User, _) => ToolProvenance::Unknown` match in
-    /// `expand_and_fold` — the user leg's `Sources` assertion goes red. **6
-    /// red** across the workspace, this test among them; the roster sibling
-    /// below is **not** one of them, because `roster_provenance` never went
-    /// through that match. Its own mutation is recorded there.
+    /// `expand_and_fold` — the user leg's `Sources` assertion goes red. **24 red
+    /// across the workspace**, not the 6 this record claimed from before the e2e
+    /// suite existed: this test, **18 in `tests/e2e`**, 2 in
+    /// `provenance_egress.rs`, 2 in `skill_boundary.rs` and
+    /// `skill_turn.rs`'s `no_production_provenance_reads_spawned_any_more`.
+    ///
+    /// The e2e eighteen are a cascade of one leak rather than eighteen
+    /// findings: a bare `Unknown` drops the fold's ids, `/shell allow` clears
+    /// it over an empty source set, and `secrets/prod.env` leaves — after which
+    /// the suite-wide `assert_no_boundary_bytes` fails in every egress-touching
+    /// test that runs behind it (REQ-619 verify, C1).
+    ///
+    /// The roster sibling below is still **not** among them, because
+    /// `roster_provenance` never went through that match. Its own mutation is
+    /// recorded there.
     #[tokio::test]
     async fn a_user_skill_mints_a_home_scoped_id_and_a_project_skill_a_repo_scoped_one() {
         let fx = ac1_fixture_under_home();
@@ -3480,11 +3491,13 @@ mod tests {
     /// roster the model sees does not name it — and asserting the count is what
     /// keeps this a claim about the union rather than about "some ids".
     ///
-    /// **Mutation (run, red, reverted):** make `roster_provenance` return
-    /// `ToolProvenance::Unknown` for any `SkillSource::User` row — the
-    /// pre-REQ-619 answer — and this test goes red on the first assertion.
-    /// **1 red**, this test, which is what makes it the roster's own guard
-    /// rather than a second reading of the expansion's.
+    /// **Mutation, re-measured 2026-09-05 (REQ-619 verify, m8):** make
+    /// `roster_provenance` return `ToolProvenance::Unknown` for any
+    /// `SkillSource::User` row — the pre-REQ-619 answer — and this test goes red
+    /// on the first assertion. **1 red across the whole workspace**, this test,
+    /// which is what makes it the roster's own guard rather than a second
+    /// reading of the expansion's. The figure was already right and is one of
+    /// the four in this REQ that survived re-measurement unchanged.
     #[tokio::test]
     async fn a_roster_holding_a_user_skill_is_the_union_of_the_two_scopes() {
         let fx = ac1_fixture_under_home();

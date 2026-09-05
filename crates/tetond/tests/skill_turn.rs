@@ -1688,12 +1688,14 @@ async fn a_project_skills_expansion_is_pinned_to_the_file_it_came_from() {
 /// difference is only where the file lives — and now the difference shows up as
 /// the *scope* of the id rather than as the presence of one.
 ///
-/// **Mutation (run, red, reverted):** make `skills::provenance_of` answer
-/// `None` for `SkillSource::User` again — the pre-REQ-619 reading — so the fold
-/// sets `unknown` and mints nothing. The `sources` equality and the `!unknown`
-/// leg both go red. **3 red**: this test, and `skill_boundary.rs`'s
-/// `a_user_skill_leaves_under_a_boundary_it_never_touched_and_is_refused_by_one_that_names_it`
-/// and `a_user_skill_reaches_the_provider_when_no_boundary_is_configured`.
+/// **Mutation, re-measured 2026-09-05 (REQ-619 verify, m8):** make
+/// `skills::provenance_of` answer `SkillIdentity::Unmintable` for
+/// `SkillSource::User` again — the pre-REQ-619 reading, which spelled it `None`
+/// — so the fold sets `unknown` and mints nothing. The `sources` equality and
+/// the `!unknown` leg both go red. **15 red across the workspace**, not the 3
+/// recorded before the e2e suite existed: this test, 3 in the library, 8 in
+/// `tests/e2e`, 1 in `provenance_egress.rs` and 2 in `skill_boundary.rs`.
+/// BUG-214's blast radius, measured.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_user_skill_outside_the_root_seeds_a_block_with_its_home_scoped_identity() {
     let repo = Tree::new("homeident");
@@ -3094,16 +3096,37 @@ async fn a_pinned_skill_turn_is_announced_through_the_existing_sink() {
 /// mention the fold would pass by having nothing to look at, so both files are
 /// required to call `fold_expansion(`.
 ///
-/// **Mutation (run, red, reverted):** add
-/// `skill.unknown |= outcomes.iter().any(DynamicOutcome::spawned);` back to
-/// `settle_dynamic_context` — this test goes red naming `runtime/turn.rs`.
-/// **4 red** in this file, this one among them. Second mutation (run, red,
-/// reverted): replace `fold_expansion(` in `harness/tools/skill.rs` with an
-/// inline `match identity` — the vacuity floor goes red naming that file.
-/// **1 red**, this test. Third mutation (run, red, reverted): restore the
-/// `(source, spawned)` match in `expand_and_fold` — this test goes red naming
-/// `harness/tools/skill.rs`. **6 red** across the workspace, this one among
-/// them.
+/// # Mutations, re-measured 2026-09-05 (REQ-619 verify, m8)
+///
+/// All three run once against the whole workspace, after touching the mutated
+/// file so the build was not served from a stale binary.
+///
+/// **1 — add `skill.unknown |= outcomes.iter().any(DynamicOutcome::spawned);`
+/// back to `settle_dynamic_context`**: this test goes red naming
+/// `runtime/turn.rs`. **8 red**, not the 4-in-this-file recorded before: 4 in
+/// this file and 4 in `tests/e2e`, which is the typed path's whole
+/// proportionality claim — every rooted preamble starts pinning again.
+///
+/// **2 — bind the fold to a local alias** (`let fold = fold_expansion;`) in
+/// `harness/tools/skill.rs`, so the call site survives and the anchor does not:
+/// the vacuity floor goes red naming that file. **1 red across the workspace**,
+/// this test, which is what a floor should measure. (The original record said
+/// "an inline `match identity`", which no longer type-checks now that
+/// `fold_expansion` takes a `SkillIdentity`; the alias is the same mutation with
+/// a build behind it, and a mutation whose build never ran is not evidence.)
+///
+/// **3 — restore the `(source, spawned)` match in `expand_and_fold`**: this test
+/// goes red naming `harness/tools/skill.rs`. **24 red across the workspace**,
+/// not 6 — 18 of them in `tests/e2e`, where the dropped source set leaks
+/// `secrets/prod.env` past a lift and the suite-wide capture assertion then
+/// fails in every egress-touching test behind it (REQ-619 verify, C1).
+///
+/// One thing the re-measurement found that the count alone hides: the scan
+/// pins the **path** spellings, so a mutation written as `r.outcome.spawned()`
+/// — a method call on the value — restores the retired rule without reddening
+/// this test. It is caught elsewhere (18 red in `tests/e2e` either way), and it
+/// is worth writing down that this scan's instrument is the spelling and not
+/// the predicate.
 #[test]
 fn no_production_provenance_reads_spawned_any_more() {
     for relative in ["runtime/turn.rs", "harness/tools/skill.rs"] {

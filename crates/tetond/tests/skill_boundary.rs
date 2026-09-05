@@ -542,19 +542,40 @@ async fn a_project_skill_mints_its_identity_and_pins_the_next_remote_turn() {
 /// `ToolOutcome::ok` default this file was written to catch — would pass the
 /// first and fail the second.
 ///
-/// **Mutation (run, red, reverted):** restore
-/// `(SkillSource::User, _) => ToolProvenance::Unknown` in `expand_and_fold` —
-/// the leave half's `result.is_ok()` goes red. **6 red** across the workspace:
-/// this test and `a_user_skill_reaches_the_provider_when_no_boundary_is_configured`
-/// here, `skill.rs`'s
-/// `a_user_skill_mints_a_home_scoped_id_and_a_project_skill_a_repo_scoped_one`,
-/// `skill_turn.rs`'s `no_production_provenance_reads_spawned_any_more`, and
-/// `provenance_egress.rs`'s two flipped legs. Second mutation (run, red,
-/// reverted): make `skills::provenance_of` answer `None` for `SkillSource::User`
-/// again — the leave half reddens as above and the refused half's block path
-/// reads `<unknown-provenance>` instead of the file. **3 red**: both tests here
-/// and `skill_turn.rs`'s
+/// # Mutations, re-measured (REQ-619 verify, m8)
+///
+/// The counts below were first written before the e2e suite existed, and were
+/// wrong by a factor of three by the time it did — the hazard m8 exists for. Run
+/// again on 2026-09-05 against the whole workspace, each once, after touching
+/// the mutated file so the build was not served from a stale binary.
+///
+/// **Mutation 1 — `expand_and_fold` answers `ToolProvenance::Unknown` for a
+/// `SkillSource::User` row** (the retired `(SkillSource::User, _)` arm). The
+/// leave half's `result.is_ok()` goes red. **22 red**: 1 in the library
+/// (`skill.rs`'s `a_user_skill_mints_a_home_scoped_id_and_a_project_skill_a_repo_scoped_one`),
+/// **18 in `tests/e2e`**, 1 in `provenance_egress.rs`
+/// (`a_model_invoked_user_skill_gets_the_same_provenance_as_the_typed_one`) and
+/// 2 here.
+///
+/// The e2e eighteen are not eighteen independent findings and should not be
+/// read as one: this mutation is REQ-619 verify **C1's leak by another route**
+/// — a model-invoked user skill folds to a bare `Unknown`, `/shell allow` clears
+/// it over an empty source set, and `secrets/prod.env` leaves — so
+/// `assert_no_boundary_bytes`, which is a **process-global** claim over every
+/// captured payload in that binary, fails in every egress-touching test that
+/// runs after the leak. That cascade is the honest shape of the defect and the
+/// reason the number is large.
+///
+/// **Mutation 2 — `skills::provenance_of` answers `SkillIdentity::Unmintable`
+/// for `SkillSource::User`** (the pre-REQ-619 reading; it was `None` then). The
+/// leave half reddens as above and the refused half's block path reads
+/// `<unknown-provenance>` instead of the file. **15 red**: 3 in the library, 8
+/// in `tests/e2e`, 1 in `provenance_egress.rs`, 2 here and
+/// `skill_turn.rs`'s
 /// `a_user_skill_outside_the_root_seeds_a_block_with_its_home_scoped_identity`.
+/// Fewer than mutation 1 and for a reason worth keeping: losing the *identity*
+/// pins the session, which is over-strict; losing the *mapping* drops the ids
+/// under an unknown, which leaks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_user_skill_leaves_under_a_boundary_it_never_touched_and_is_refused_by_one_that_names_it()
 {
@@ -708,11 +729,20 @@ async fn with_no_boundary_configured_a_user_skill_with_an_opaque_preamble_is_sen
 /// "distinct scopes" means in practice: the same relative path in the two roots
 /// produces two different ids and is matched by two different globs.
 ///
-/// **Mutation (run, red, reverted):** point `provenance_of`'s
-/// `SkillSource::Project` arm at `from_home_resolved` — the refusal names a
-/// `~`-scoped path and the equality goes red. **4 red** in this file: this test
-/// and the three project legs below and above it, which is the blast radius a
-/// scope confusion actually has.
+/// **Mutation, re-measured 2026-09-05 (REQ-619 verify, m8):** point
+/// `provenance_of`'s `SkillSource::Project` arm at `from_home_resolved` — the
+/// refusal names a `~`-scoped path and the equality goes red. **32 red across
+/// the workspace**, not the 4-in-this-file the record used to claim: 7 in the
+/// library, 4 here, 4 in `skill_turn.rs`, 4 in `provenance_egress.rs`, 6 in
+/// `skill_over_budget_offer.rs`, 4 in `skill_over_budget_recovery.rs`, and one
+/// each in `context_pressure.rs`, `skills_discovery.rs` and `tests/e2e`.
+///
+/// That spread *is* the finding, and it is why the old figure was worth
+/// re-measuring: a project skill's id is not a fact about the boundary tests
+/// alone. Every suite that puts a project skill in a context and then asserts
+/// something about the turn — the over-budget offer's whole flow, the window
+/// arithmetic — reads it, so a scope confusion here is felt in eight files.
+/// The blast radius is the argument for the mint having exactly one home.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_project_skill_still_mints_and_still_pins_as_a_read_would() {
     let fx = Fixture::new("projstill");
