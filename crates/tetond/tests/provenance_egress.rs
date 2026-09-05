@@ -1478,11 +1478,62 @@ async fn with_no_boundary_a_skills_expansion_reaches_the_provider_as_the_payload
 //   (b)  a command that **spawned** pins, whatever it exited with;
 //   (c)  with no boundary, the expansion reaches the provider.
 
-/// The two skills the model-path legs invoke, plus a home to put a user one in.
+/// The one directory every suite in this workspace that needs a real `$HOME`
+/// builds its fixture home under (REQ-619 verify, m7).
+///
+/// One parent, so what a killed run leaves in a developer's home is one named
+/// directory rather than three families of differently-prefixed ones that only
+/// the suite that wrote them can be expected to recognize.
+const FIXTURE_HOME_PARENT: &str = ".teton-test-fixtures";
+
+/// What a suite says when it cannot find a `$HOME` to build under.
+///
+/// Verbatim in `skill_boundary.rs` and `harness::tools::skill` too, and it is a
+/// **panic** in all three: the alternative these suites used to take was a bare
+/// `return`, which is a test that reports success for having asserted nothing.
+/// A user skill's identity is minted against `session_root::home()`, so a run
+/// with no `HOME` is a run in which every claim about the `~` scope is a claim
+/// about a scope that does not exist — worth failing over, and cheap to fix
+/// wherever it happens (REQ-619 BR-3, LESSON-594).
+const NEEDS_A_HOME: &str = "this fixture needs a real $HOME: a user skill's identity is minted \
+     against `session_root::home()`, so a run without one would be asserting \
+     about a scope that does not exist (REQ-619 BR-3)";
+
+/// The two skills the model-path legs invoke, plus a home to put a user one in
+/// — as an RAII guard, so the tree under the developer's own `$HOME` goes away
+/// however the test ends (REQ-619 verify, m7).
+///
+/// It used to be a trailing `clean_model_skill_trees(&repo, &home)` call, which
+/// is the shape that leaves litter: a panicking assertion — the ordinary way a
+/// failing test ends — unwinds straight past it, and this tree is under
+/// `$HOME` rather than under `/tmp`, so what it leaves behind is not the
+/// harmless kind. (It had already left five directories on the author's
+/// machine by the time the verify pass looked.) The sibling suites had guards;
+/// this one now does too.
 ///
 /// Deterministic and in-repo: every byte here is written by this function, and
 /// nothing reads `~/.claude` (LESSON-540).
-fn model_skill_trees() -> (PathBuf, PathBuf) {
+struct ModelSkillTrees {
+    repo: PathBuf,
+    home: PathBuf,
+}
+
+impl ModelSkillTrees {
+    /// Both paths, for a call site that wants to name them separately. The
+    /// guard keeps owning the directories; dropping it is what removes them.
+    fn paths(&self) -> (PathBuf, PathBuf) {
+        (self.repo.clone(), self.home.clone())
+    }
+}
+
+impl Drop for ModelSkillTrees {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.repo).ok();
+        std::fs::remove_dir_all(&self.home).ok();
+    }
+}
+
+fn model_skill_trees() -> ModelSkillTrees {
     static SEQ: AtomicUsize = AtomicUsize::new(0);
     let repo = temp_repo();
     // **Under the process's own `$HOME` (REQ-619 BR-3).** A user skill's id is
@@ -1496,9 +1547,10 @@ fn model_skill_trees() -> (PathBuf, PathBuf) {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|home| !home.as_os_str().is_empty())
-        .expect("a `~`-scoped skill identity needs a HOME to be relative to")
+        .expect(NEEDS_A_HOME)
+        .join(FIXTURE_HOME_PARENT)
         .join(format!(
-            ".teton-provskill-{}-{}",
+            "provenance-egress-{}-{}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::SeqCst)
         ));
@@ -1547,16 +1599,7 @@ fn model_skill_trees() -> (PathBuf, PathBuf) {
         home.join(".claude/skills/usr/SKILL.md"),
         "---\ndescription: the user skill\n---\n\nUSER-SKILL-BODY\n",
     );
-    (repo, home)
-}
-
-/// Remove both trees a [`model_skill_trees`] fixture built.
-///
-/// The home is under the user's real `$HOME`, so leaving it behind is not the
-/// harmless `/tmp` litter the `repo` half would be.
-fn clean_model_skill_trees(repo: &std::path::Path, home: &std::path::Path) {
-    std::fs::remove_dir_all(repo).ok();
-    std::fs::remove_dir_all(home).ok();
+    ModelSkillTrees { repo, home }
 }
 
 /// The `~`-scoped id `<home>/.claude/skills/<name>/SKILL.md` mints.
@@ -1716,7 +1759,8 @@ async fn drive_model_skill_call(
 /// everything" (LESSON-479).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_model_invoked_project_skill_under_a_boundary_pins_the_turn_and_nothing_leaves() {
-    let (repo, home) = model_skill_trees();
+    let trees = model_skill_trees();
+    let (repo, home) = trees.paths();
     let guarded = vec![PrivacyBoundary {
         path_glob: ".claude/skills/guarded/**".to_owned(),
         mode: BoundaryMode::LocalOnly,
@@ -1773,7 +1817,6 @@ async fn a_model_invoked_project_skill_under_a_boundary_pins_the_turn_and_nothin
             "boundary bytes reached the wire from a model-invoked expansion"
         );
     }
-    clean_model_skill_trees(&repo, &home);
 }
 
 /// **REQ-619 BR-6 — the model-invoked path gets the same provenance the typed
@@ -1808,7 +1851,8 @@ async fn a_model_invoked_project_skill_under_a_boundary_pins_the_turn_and_nothin
 /// and `skill_turn.rs`'s `no_production_provenance_reads_spawned_any_more`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_model_invoked_user_skill_gets_the_same_provenance_as_the_typed_one() {
-    let (repo, home) = model_skill_trees();
+    let trees = model_skill_trees();
+    let (repo, home) = trees.paths();
     let expected = user_skill_id(&home, "usr");
 
     // The contrast: the same unrelated boundary, a project skill, and the wire.
@@ -1886,7 +1930,6 @@ async fn a_model_invoked_user_skill_gets_the_same_provenance_as_the_typed_one() 
             "the expansion leaked past a boundary that names its file"
         );
     }
-    clean_model_skill_trees(&repo, &home);
 }
 
 /// **REQ-619 BR-2 — an *opaque* command that failed still pins; a *rooted* one
@@ -1927,7 +1970,8 @@ async fn a_model_invoked_user_skill_gets_the_same_provenance_as_the_typed_one() 
 /// test, which is where that arm is pinned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_model_invocation_whose_opaque_command_failed_still_pins_and_a_rooted_one_does_not() {
-    let (repo, home) = model_skill_trees();
+    let trees = model_skill_trees();
+    let (repo, home) = trees.paths();
 
     let (result, _, calls, blocks) = drive_model_skill_call(
         &repo,
@@ -1995,7 +2039,6 @@ async fn a_model_invocation_whose_opaque_command_failed_still_pins_and_a_rooted_
         contains_bytes(&captured[1], "ROOTEDFAIL-BODY-MARKER"),
         "the leave claim must be about a payload that really carried the expansion"
     );
-    clean_model_skill_trees(&repo, &home);
 }
 
 /// **AC-11(c).** With no boundary configured the choke point does not inspect,
@@ -2008,7 +2051,8 @@ async fn a_model_invocation_whose_opaque_command_failed_still_pins_and_a_rooted_
 /// something else satisfies a call count and fails this.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn with_no_boundary_a_model_invoked_expansion_reaches_the_provider() {
-    let (repo, home) = model_skill_trees();
+    let trees = model_skill_trees();
+    let (repo, home) = trees.paths();
     let (result, captured, calls, blocks) = drive_model_skill_call(
         &repo,
         Some(&home),
@@ -2041,7 +2085,6 @@ async fn with_no_boundary_a_model_invoked_expansion_reaches_the_provider() {
             String::from_utf8_lossy(body)
         );
     }
-    clean_model_skill_trees(&repo, &home);
 }
 
 // ---------------------------------------------------------------------------

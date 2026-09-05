@@ -2363,6 +2363,21 @@ mod tests {
     // fixtures — in-repo and deterministic, never a read of `~/.claude`
     // -----------------------------------------------------------------------
 
+    /// The one directory every suite that needs a real `$HOME` builds under
+    /// (REQ-619 verify, m7) — one named parent, rather than a
+    /// differently-prefixed family per suite that only its own author would
+    /// recognize.
+    const FIXTURE_HOME_PARENT: &str = ".teton-test-fixtures";
+
+    /// What a suite says when it cannot find a `$HOME` to build under. Verbatim
+    /// in `tests/provenance_egress.rs` and `tests/skill_boundary.rs` too, and a
+    /// **panic** in all three: the alternative is a test that reports success
+    /// for having asserted nothing (LESSON-594).
+    const NEEDS_A_HOME: &str =
+        "this fixture needs a real $HOME: a user skill's identity is minted \
+     against `session_root::home()`, so a run without one would be asserting \
+     about a scope that does not exist (REQ-619 BR-3)";
+
     /// A throwaway tree with a `home` and a `repo` in it (the
     /// `skills_discovery.rs` shape), removed on drop.
     ///
@@ -2438,31 +2453,35 @@ mod tests {
     /// daemon will actually use is to build the fixture there, in a
     /// process-and-sequence-named directory removed on drop.
     ///
-    /// `None` on a process with no `HOME` — the bare-service environment
-    /// `provenance_of` answers `None` for anyway, so the two callers skip
-    /// rather than assert against a home that does not exist.
-    fn fixture_under_home() -> Option<Fixture> {
+    /// **It panics on a process with no `HOME`** (REQ-619 verify, m7). It used
+    /// to answer `None`, and both callers met that with a bare `return` — a
+    /// test that reports success for having asserted nothing, which is exactly
+    /// the silence LESSON-594 is about. A run with no `HOME` cannot say
+    /// anything about the `~` scope, and that is worth failing over: the
+    /// message is the same sentence `provenance_egress.rs` and
+    /// `skill_boundary.rs` print, so whoever meets it once recognizes it
+    /// everywhere.
+    fn fixture_under_home() -> Fixture {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
-        let home = crate::session_root::home()?;
+        let home = crate::session_root::home().expect(NEEDS_A_HOME);
         let seq = SEQ.fetch_add(1, Ordering::SeqCst);
-        let root = home.join(format!(
-            ".teton-skilltool-{:x}{seq:x}",
-            std::process::id() & 0xffff
-        ));
-        std::fs::create_dir_all(root.join("home")).ok()?;
-        std::fs::create_dir_all(root.join("repo")).ok()?;
-        Some(Fixture { root })
+        let root = home
+            .join(FIXTURE_HOME_PARENT)
+            .join(format!("skill-tool-{}-{seq}", std::process::id()));
+        std::fs::create_dir_all(root.join("home")).unwrap();
+        std::fs::create_dir_all(root.join("repo")).unwrap();
+        Fixture { root }
     }
 
     /// [`ac1_fixture`]'s rows on a tree under the real `$HOME`, so the user
     /// rows mint (REQ-619 BR-3).
-    fn ac1_fixture_under_home() -> Option<Fixture> {
-        let fx = fixture_under_home()?;
+    fn ac1_fixture_under_home() -> Fixture {
+        let fx = fixture_under_home();
         fx.user("alpha", "description: the alpha skill\n", "Alpha body.\n");
         fx.user("beta", "disable-model-invocation: true\n", "Beta body.\n");
         fx.user("delta", "user-invocable: false\n", "Delta body.\n");
         fx.project("gamma", "description: the gamma skill\n", "Gamma body.\n");
-        Some(fx)
+        fx
     }
 
     /// The `~`-scoped id a file at `<fixture>/home/<relative>` must mint.
@@ -3266,9 +3285,7 @@ mod tests {
     /// through that match. Its own mutation is recorded there.
     #[tokio::test]
     async fn a_user_skill_mints_a_home_scoped_id_and_a_project_skill_a_repo_scoped_one() {
-        let Some(fx) = ac1_fixture_under_home() else {
-            return;
-        };
+        let fx = ac1_fixture_under_home();
         let expected = home_scoped_id(&fx, ".claude/skills/alpha/SKILL.md");
         let tool = tool(fx.registry());
         let ctx = fx.ctx();
@@ -3470,9 +3487,7 @@ mod tests {
     /// rather than a second reading of the expansion's.
     #[tokio::test]
     async fn a_roster_holding_a_user_skill_is_the_union_of_the_two_scopes() {
-        let Some(fx) = ac1_fixture_under_home() else {
-            return;
-        };
+        let fx = ac1_fixture_under_home();
         let alpha = home_scoped_id(&fx, ".claude/skills/alpha/SKILL.md");
         let delta = home_scoped_id(&fx, ".claude/skills/delta/SKILL.md");
         let tool = tool(fx.registry());

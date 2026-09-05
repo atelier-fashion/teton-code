@@ -85,6 +85,19 @@ const LISTING_MARKER: &str = "MARKER-skill-description-reached-the-model";
 /// The one prompt every fixture here opens with.
 const PROMPT: &str = "Run the validation skill and summarize what it says.";
 
+/// The one directory every suite that needs a real `$HOME` builds under
+/// (REQ-619 verify, m7) — one named parent, rather than a differently-prefixed
+/// family per suite that only its own author would recognize.
+const FIXTURE_HOME_PARENT: &str = ".teton-test-fixtures";
+
+/// What a suite says when it cannot find a `$HOME` to build under. Verbatim in
+/// `provenance_egress.rs` and `harness::tools::skill` too, and a **panic** in
+/// all three: the alternative is a test that reports success for having
+/// asserted nothing (LESSON-594).
+const NEEDS_A_HOME: &str = "this fixture needs a real $HOME: a user skill's identity is minted \
+     against `session_root::home()`, so a run without one would be asserting \
+     about a scope that does not exist (REQ-619 BR-3)";
+
 // ---------------------------------------------------------------------------
 // transport (the `provenance_egress.rs` shape)
 // ---------------------------------------------------------------------------
@@ -164,47 +177,56 @@ fn sse_turn(text: &str, tool: Option<(&str, &str, &str)>) -> String {
 // fixture
 // ---------------------------------------------------------------------------
 
-/// A throwaway tree with a `home` (the stand-in for `~`) and a `repo`.
+/// A throwaway pair of trees: a `home` (the stand-in for `~`) and a `repo`.
 ///
 /// `home` is handed to `discover` as a **parameter**, never read from the
 /// environment: a suite that set `HOME` would be a suite whose result depends on
 /// what else is running in the same process (LESSON-540).
 ///
-/// **REQ-619 TASK-401 — the whole tree is built under the process's own `$HOME`.**
-/// A user skill's identity is minted against `session_root::home()`, which reads
-/// `HOME`, and BR-3's claims here are about that id. The rule above still holds
-/// and is the reason for the placement rather than an exception to it: the way to
-/// put a fixture file **under** the home the daemon will use, without writing
-/// process-wide state every other test in this binary reads, is to build the
-/// fixture there. `repo` sits under the home too, which changes nothing — a
-/// project id is relative to the session root and never to the home.
+/// **The home half is built under the process's own `$HOME`** (REQ-619
+/// TASK-401). A user skill's identity is minted against `session_root::home()`,
+/// which reads `HOME`, and BR-3's claims here are about that id. The rule above
+/// still holds and is the reason for the placement rather than an exception to
+/// it: the way to put a fixture file *under* the home the daemon will use,
+/// without writing process-wide state every other test in this binary reads, is
+/// to build the fixture there.
+///
+/// **The repo half is not** (REQ-619 verify, m7). It used to sit beside the
+/// home under `$HOME`, on the reasoning that a project id is relative to the
+/// session root and never to the home — which is true, and is a statement about
+/// *ids* rather than about where a file holding
+/// `API_KEY=sk-live-DO-NOT-LEAK-…` belongs. Only the user skill needs the home;
+/// a repository with a planted credential in it belongs in a temp root, where a
+/// killed run leaves it somewhere the operating system clears. The guard below
+/// removes both either way.
 struct Fixture {
+    /// The home half, under the real `$HOME` because the mint reads it.
     root: PathBuf,
+    /// The repo half, under a temp root because nothing about it needs a home.
+    repo_root: PathBuf,
 }
 
 impl Fixture {
     fn new(tag: &str) -> Self {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .filter(|home| !home.as_os_str().is_empty())
-            .expect(
-                "this suite asserts a `~`-scoped skill identity, which needs a \
-                 HOME for the id to be relative to (REQ-619 BR-3)",
-            );
-        let root = home.join(format!(
-            ".teton-skillbnd-{tag}-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::SeqCst)
-        ));
+            .expect(NEEDS_A_HOME);
+        let root = home
+            .join(FIXTURE_HOME_PARENT)
+            .join(format!("skill-boundary-{tag}-{pid}-{seq}"));
+        let repo_root = std::env::temp_dir().join(format!("teton-skillbnd-{tag}-{pid}-{seq}"));
         std::fs::create_dir_all(root.join("home")).unwrap();
-        std::fs::create_dir_all(root.join("repo").join("secrets")).unwrap();
+        std::fs::create_dir_all(repo_root.join("repo").join("secrets")).unwrap();
         std::fs::write(
-            root.join("repo").join("secrets").join("prod.env"),
+            repo_root.join("repo").join("secrets").join("prod.env"),
             format!("{SECRET}\n"),
         )
         .unwrap();
-        Self { root }
+        Self { root, repo_root }
     }
 
     /// The `~`-scoped id `<home>/.claude/skills/<name>/SKILL.md` mints.
@@ -236,7 +258,7 @@ impl Fixture {
     }
 
     fn repo(&self) -> PathBuf {
-        self.root.join("repo")
+        self.repo_root.join("repo")
     }
 
     fn skill(&self, base: &Path, name: &str) {
@@ -271,6 +293,7 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         std::fs::remove_dir_all(&self.root).ok();
+        std::fs::remove_dir_all(&self.repo_root).ok();
     }
 }
 
