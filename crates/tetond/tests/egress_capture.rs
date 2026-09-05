@@ -907,15 +907,17 @@ async fn teton_docs_serves_its_topic_without_reaching_the_transport() {
 // **Two cases, asserted separately and named separately (ADR-9).** A *project*
 // skill sits under the session root and mints a root-relative identity, so it
 // pins exactly what its glob covers. A *user* skill at `~/.claude/skills/…` in a
-// repo-rooted session has **no** root-relative identity to mint, so its block is
-// marked unpinnable and pins the turn whenever *any* boundary is configured —
-// stricter than the `read`, and a different fact. Folding them into one test
-// would let either half carry the other.
+// repo-rooted session mints an id in a **different scope** (`~/…`, REQ-619 BR-3),
+// so its block is judged by the same globs against a different string — a
+// different fact, and folding the two into one test would let either half carry
+// the other. Until REQ-619 the second fact was "it mints nothing, so it pins
+// under any boundary"; the split is the same split, and the tests flipped rather
+// than merged.
 //
 // What each layer owns: that the daemon's turn assembly really produces these
 // two provenances is `tetond/tests/skill_turn.rs`
 // (`a_project_skills_expansion_is_pinned_to_the_file_it_came_from`,
-// `a_user_skill_outside_the_root_seeds_a_block_that_says_it_cannot_be_pinned`);
+// `a_user_skill_outside_the_root_seeds_a_block_with_its_home_scoped_identity`);
 // what egress does with them is here.
 //
 // **REQ-587's four legs are not here, and that is deliberate.** A *model*
@@ -926,8 +928,8 @@ async fn teton_docs_serves_its_topic_without_reaching_the_transport() {
 // driven through the real tool, the real loop and the real `Egress` in
 // `tetond/tests/provenance_egress.rs`
 // (`a_model_invoked_project_skill_under_a_boundary_pins_the_turn_and_nothing_leaves`,
-// `a_model_invoked_user_skill_pins_the_turn_wherever_any_boundary_exists`,
-// `a_model_invocation_whose_command_failed_still_pins_the_turn`,
+// `a_model_invoked_user_skill_gets_the_same_provenance_as_the_typed_one`,
+// `a_model_invocation_whose_opaque_command_failed_still_pins_and_a_rooted_one_does_not`,
 // `with_no_boundary_a_model_invoked_expansion_reaches_the_provider`). The two
 // tests below stay as the *user* path's half of the same two facts.
 
@@ -988,24 +990,47 @@ fn expansion_of(
     (expansion.pending_text(&frame), skill.path.clone())
 }
 
+/// A **project** skill's identity: repo-relative, as `skills::provenance_of`
+/// mints it for a `SkillSource::Project` row (REQ-619 ADR-619-3).
+fn project_id(root: &std::path::Path, file: &std::path::Path) -> Option<ProvenanceId> {
+    ProvenanceId::from_resolved(root, file).ok()
+}
+
+/// A **user** skill's identity: `~`-scoped, as `skills::provenance_of` mints it
+/// for a `SkillSource::User` row against the daemon's `$HOME` (REQ-619 BR-3).
+///
+/// The two scopes are separate functions here for the reason they are separate
+/// constructors in `teton_core`: a user skill at `skills/x/SKILL.md` and a
+/// project file at the same relative path must never share an id, and one
+/// helper taking "a root" would let a call site pick the wrong one silently.
+fn user_id(home: &std::path::Path, file: &std::path::Path) -> Option<ProvenanceId> {
+    ProvenanceId::from_home_resolved(home, file).ok()
+}
+
 /// One skill turn, scoped exactly as the daemon scopes it: the expansion is a
 /// **user** block carrying the skill file's identity (or the unpinnable mark),
 /// folded to an egress provenance through the daemon's own bridge
 /// (`context_provenance`) rather than through a paraphrase of it.
 ///
-/// The mint is the line `DaemonRuntime::accept_invocation` runs —
-/// `ProvenanceId::from_resolved(root, file)`, which refuses a file outside the
-/// root rather than inventing an identity for it (REQ-571 ADR-B). That the turn
-/// assembly really calls it is `skill_turn.rs`'s to prove; what it means at the
-/// wire is this file's.
+/// **The identity is the caller's (REQ-619 BR-3).** It used to be minted here,
+/// with `ProvenanceId::from_resolved(root, file)` — one scope, and `Err` for
+/// every file outside the session root, which is every user skill. There are two
+/// scopes now: a project skill mints against the session root, a user skill
+/// against the daemon's `$HOME` (`from_home_resolved`), and `skills::provenance_of`
+/// is the one place production branches between them. A helper that kept
+/// minting would have had to grow the same branch, and two spellings of one rule
+/// is how the wire's answer and the daemon's come apart — so the caller supplies
+/// the id and this function stays what it is: the seed and the fold.
+///
+/// `None` is still the fail-closed input: a file under neither root sets
+/// `unknown`, exactly as `accept_invocation`'s `fold_expansion(None, &[])` does.
 fn skill_expansion_turn(
-    root: &std::path::Path,
-    file: &std::path::Path,
+    identity: Option<ProvenanceId>,
     expansion: &str,
 ) -> (TransportRequest, Provenance) {
-    let (sources, unknown) = match ProvenanceId::from_resolved(root, file) {
-        Ok(id) => (std::collections::BTreeSet::from([id]), false),
-        Err(_) => (std::collections::BTreeSet::new(), true),
+    let (sources, unknown) = match identity {
+        Some(id) => (std::collections::BTreeSet::from([id]), false),
+        None => (std::collections::BTreeSet::new(), true),
     };
     let mut ctx = tetond::harness::ContextManager::new("You are Teton Code.", 1_000_000);
     // REQ-619 ADR-619-2: this fixture's expansions carry no preamble, so the
@@ -1045,7 +1070,7 @@ async fn a_project_skill_under_a_boundary_pins_the_turn_and_nothing_leaves() {
 
     // The positive control: a project skill the boundary does not cover.
     let (open, open_file) = expansion_of(Some(&home), &root, "open");
-    let (req, prov) = skill_expansion_turn(&root, &open_file, &open);
+    let (req, prov) = skill_expansion_turn(project_id(&root, &open_file), &open);
     assert!(
         egress.send(req, &prov, &ctx).await.is_ok(),
         "a skill outside every boundary must still reach the wire"
@@ -1058,7 +1083,7 @@ async fn a_project_skill_under_a_boundary_pins_the_turn_and_nothing_leaves() {
         "fixture: the expansion must actually carry the boundary file's bytes, \
          or the block below is about nothing"
     );
-    let (req, prov) = skill_expansion_turn(&root, &secret_file, &secret);
+    let (req, prov) = skill_expansion_turn(project_id(&root, &secret_file), &secret);
     match egress.send(req, &prov, &ctx).await {
         Err(EgressError::PrivacyBlocked {
             ref path,
@@ -1096,91 +1121,140 @@ async fn a_project_skill_under_a_boundary_pins_the_turn_and_nothing_leaves() {
     std::fs::remove_dir_all(root.parent().unwrap()).ok();
 }
 
-/// **AC-11(a), the user half (ADR-9's decided gap).** A user skill at
-/// `~/.claude/skills/…` in a repo-rooted session has no root-relative identity —
-/// `ProvenanceId::from_resolved` refuses rather than inventing one — so its
-/// block is marked unpinnable and the turn is pinned local whenever **any**
-/// boundary is configured, whether or not that boundary has anything to do with
-/// the file.
+/// **REQ-619 BR-3 at the wire — a user skill leaves under the shipped globs and
+/// is refused by one that names it.**
 ///
-/// That is strictly stricter than what a `read` of the same bytes would earn,
-/// and the asymmetry is the assertion: on the *same* egress, with the *same*
-/// unrelated boundary, a **project** skill goes out and the user one does not.
-/// The control at the end — no boundaries at all — proves the refusal is the
-/// boundary set doing the work rather than the block being unsendable.
+/// This was `a_user_skill_outside_the_root_pins_the_turn_wherever_any_boundary_exists`,
+/// AC-11(a)'s user half, and it asserted REQ-585 ADR-9's decided gap: a file at
+/// `~/.claude/skills/…` had no root-relative identity, `from_resolved` refused
+/// to invent one, and the block was therefore marked unpinnable and refused
+/// wherever **any** boundary existed. REQ-597 then made "any boundary" mean
+/// "every machine", and the result was BUG-214: every user-authored skill
+/// pinning every repo-rooted session over a file that matched no glob.
+///
+/// The claim now is the pair, and the **thirteen shipped globs are the fixture**
+/// rather than a hand-written stand-in — AC-1 asks that this be asserted against
+/// the set the product actually ships, because "no builtin matches a skill file"
+/// is a property of that list and would stop being true the day a fourteenth is
+/// added. The refusing glob is a user's own row over their skills directory, in
+/// the ordinary path form (OQ-1): `~` is an ordinary character to `globset`, so
+/// `**/.claude/skills/**` reaches a `~`-scoped id with no new glob language.
+///
+/// The project skill goes out first on the same egress, exactly as before, so
+/// neither half can be satisfied by a transport that sends or refuses
+/// everything (LESSON-479).
+///
+/// **Mutation (run, red, reverted):** hand `skill_expansion_turn` `None` for the
+/// user skill at both call sites below (the pre-REQ-619 answer) — the `is_unknown`
+/// assertion and the leave half's `is_ok` go red, and the refused half blocks on
+/// `<unknown-provenance>` instead of the file. **1 red**, this test, which
+/// carries both halves.
 #[tokio::test]
-async fn a_user_skill_outside_the_root_pins_the_turn_wherever_any_boundary_exists() {
+async fn a_user_skill_leaves_under_the_builtins_and_is_refused_by_a_glob_that_names_it() {
     let (root, home) = skill_trees("u");
-    let unrelated = vec![PrivacyBoundary {
-        // Names nothing this test touches: the point is that it does not have to.
-        path_glob: "secrets/**".to_owned(),
-        mode: BoundaryMode::LocalOnly,
-        origin: Default::default(),
-    }];
+    let builtins: Vec<PrivacyBoundary> = teton_core::config::DEFAULT_BOUNDARIES
+        .iter()
+        .map(|glob| PrivacyBoundary {
+            path_glob: (*glob).to_owned(),
+            mode: BoundaryMode::LocalOnly,
+            origin: Default::default(),
+        })
+        .collect();
+    assert_eq!(
+        builtins.len(),
+        13,
+        "the shipped set is the fixture; a change to its size is a change to \
+         what this test claims"
+    );
     let capture = CaptureTransport::default();
     let sink = Arc::new(CapturingSink::default());
-    let egress = Egress::new(capture.clone(), unrelated.clone(), sink.clone());
+    let egress = Egress::new(capture.clone(), builtins, sink.clone());
     let ctx = EgressContext::new("anthropic").with_session("sess-skill-user");
 
-    // The contrast, first: a **project** skill under this same unrelated
-    // boundary mints an identity, matches no glob, and goes out.
+    // The contrast, first: a **project** skill under the same shipped set mints
+    // an identity, matches no glob, and goes out.
     let (open, open_file) = expansion_of(Some(&home), &root, "open");
-    let (req, prov) = skill_expansion_turn(&root, &open_file, &open);
+    let (req, prov) = skill_expansion_turn(project_id(&root, &open_file), &open);
     assert!(
         egress.send(req, &prov, &ctx).await.is_ok(),
-        "a project skill under an unrelated boundary must still reach the wire — \
-         without this the refusal below would say nothing about *user* skills"
+        "a project skill under the builtins must still reach the wire — without \
+         this the claim below would say nothing about *user* skills"
     );
 
-    // The claim: the user skill cannot be pinned, so it is.
+    // The claim: the user skill mints in its own scope, matches none of the
+    // thirteen, and leaves.
     let (usr, usr_file) = expansion_of(Some(&home), &root, "usr");
     assert!(
         ProvenanceId::from_resolved(&root, &usr_file).is_err(),
-        "fixture: the user skill must genuinely sit outside the session root"
+        "fixture: the user skill must genuinely sit outside the session root, or \
+         the repo scope would be what is being asserted"
     );
-    let (req, prov) = skill_expansion_turn(&root, &usr_file, &usr);
+    let identity = user_id(&home, &usr_file).expect("a user skill under the home mints");
+    assert_eq!(
+        identity.as_str(),
+        "~/.claude/skills/usr/SKILL.md",
+        "the `~` marker is what keeps the two scopes from colliding, and it is \
+         the spelling a `privacy_block` line would print"
+    );
+    let (req, prov) = skill_expansion_turn(Some(identity.clone()), &usr);
     assert!(
-        prov.is_unknown(),
-        "an unmintable skill file must leave the block unknown, or it silently \
-         counts as drawn from nothing at all"
+        !prov.is_unknown(),
+        "a minted user skill is not unprovable; `unknown` here is the retired \
+         rule back again"
     );
-    match egress.send(req, &prov, &ctx).await {
-        Err(EgressError::PrivacyBlocked { ref path, .. }) => assert_eq!(
-            path,
-            tetond::egress::provenance::UNKNOWN_PROVENANCE_PATH,
-            "an unpinnable block is refused against the content-free sentinel, \
-             never against a path it does not have"
-        ),
-        other => panic!("an unpinnable skill expansion must fail closed: {other:?}"),
-    }
+    assert!(
+        egress.send(req, &prov, &ctx).await.is_ok(),
+        "none of the thirteen shipped globs names a skill file, so a user skill \
+         reaches the wire on a stock machine (AC-1)"
+    );
+    assert!(
+        contains_bytes(&capture.captured()[1].body, "USER-SKILL-BODY"),
+        "the leave claim must be about a payload that really carried the expansion"
+    );
+    assert!(sink.events().is_empty(), "nothing matched, nothing blocked");
 
-    // The control: with no boundary configured at all, the very same block is
-    // sent — so the refusal above is the boundary set, not an unsendable turn.
-    let open_capture = CaptureTransport::default();
-    let permissive = Egress::new(
-        open_capture.clone(),
-        Vec::new(),
+    // The other half: the same block, the same id, under a glob the user wrote
+    // over their skills directory — refused, naming their file.
+    let named = Egress::new(
+        CaptureTransport::default(),
+        vec![PrivacyBoundary {
+            path_glob: "**/.claude/skills/**".to_owned(),
+            mode: BoundaryMode::LocalOnly,
+            origin: Default::default(),
+        }],
         Arc::new(CapturingSink::default()),
     );
-    let (req, prov) = skill_expansion_turn(&root, &usr_file, &usr);
-    assert!(
-        permissive.send(req, &prov, &ctx).await.is_ok(),
-        "with no boundary configured the choke point does not inspect, so an \
-         unpinnable skill turn reaches the provider"
-    );
-    assert!(
-        contains_bytes(&open_capture.captured()[0].body, "USER-SKILL-BODY"),
-        "the control must really have sent the expansion"
-    );
-
-    // Nothing of the user skill reached the boundary-configured wire.
-    for req in &capture.captured() {
-        assert!(
-            !contains_bytes(&req.body, "USER-SKILL-BODY"),
-            "the unpinnable expansion leaked past a configured boundary"
-        );
+    let (req, prov) = skill_expansion_turn(Some(identity.clone()), &usr);
+    match named.send(req, &prov, &ctx).await {
+        Err(EgressError::PrivacyBlocked {
+            ref path,
+            ref action,
+            ref cause,
+            ..
+        }) => {
+            assert_eq!(
+                path,
+                identity.as_str(),
+                "the block names the user's own file, exactly as a `read` of it \
+                 would — the sentinel would tell them nothing about which file \
+                 to look at"
+            );
+            assert_eq!(*action, PrivacyAction::ReroutedToLocal);
+            assert_eq!(*cause, teton_protocol::events::BlockCause::Boundary);
+        }
+        other => panic!("a glob covering the skills directory must refuse it: {other:?}"),
     }
-    assert_eq!(sink.events().len(), 1, "one privacy_block for one refusal");
+
+    // Nothing of the user skill reached the boundary-configured wire, and the
+    // only thing the permissive one carried is the expansion asserted above.
+    for req in &capture.captured() {
+        for secret in [SECRET_ENV, "sk-live"] {
+            assert!(
+                !contains_bytes(&req.body, secret),
+                "boundary bytes reached the wire from a skill expansion"
+            );
+        }
+    }
     std::fs::remove_dir_all(root.parent().unwrap()).ok();
 }
 
@@ -1332,7 +1406,7 @@ async fn an_accepted_over_budget_expansion_still_answers_to_the_boundary() {
     let ctx = EgressContext::new("anthropic").with_session("sess-over-budget");
 
     // BR-1: the accepted send carries the expansion whole.
-    let (req, prov) = skill_expansion_turn(&root, &open_file, &open);
+    let (req, prov) = skill_expansion_turn(project_id(&root, &open_file), &open);
     assert!(
         egress.send(req, &prov, &ctx).await.is_ok(),
         "an oversized skill outside every boundary must still reach the wire once \
@@ -1353,7 +1427,7 @@ async fn an_accepted_over_budget_expansion_still_answers_to_the_boundary() {
     );
 
     // BR-11's boundary half: the same answer buys nothing here.
-    let (req, prov) = skill_expansion_turn(&root, &secret_file, &secret);
+    let (req, prov) = skill_expansion_turn(project_id(&root, &secret_file), &secret);
     match egress.send(req, &prov, &ctx).await {
         Err(EgressError::PrivacyBlocked {
             ref path,

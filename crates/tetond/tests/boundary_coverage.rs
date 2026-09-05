@@ -257,7 +257,11 @@ const COVERAGE: &[Covered] = &[
                    instructions rather than as data",
         // Two rules, two tests, plus the control that keeps them meaning
         // something (BR-10, ADR-8). The second is the one `ToolOutcome::ok`'s
-        // `Sources(∅)` default would have broken in silence.
+        // `Sources(∅)` default would have broken in silence — and REQ-619 BR-3
+        // renamed it: a user skill is no longer refused by *any* boundary for
+        // want of an identity, it mints a `~`-scoped one and is refused by a
+        // glob that names its file. The rule it covers is the same rule, which
+        // is why the citation moved rather than being dropped.
         tests: &[
             (
                 "skill_boundary.rs",
@@ -265,7 +269,7 @@ const COVERAGE: &[Covered] = &[
             ),
             (
                 "skill_boundary.rs",
-                "a_user_skill_is_unknown_and_pins_under_a_boundary_it_never_touched",
+                "a_user_skill_leaves_under_a_boundary_it_never_touched_and_is_refused_by_one_that_names_it",
             ),
         ],
     },

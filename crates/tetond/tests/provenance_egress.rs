@@ -1190,23 +1190,22 @@ const STATIC_SKILL: &str = "---\ndescription: the static skill\n---\n\
 /// plus whether the result can be pinned — the two values
 /// `DaemonRuntime::run_prompt_turn` carries into the seed.
 ///
-/// `unknown` is `sources-could-not-mint  ||  any command **spawned**`, which is
-/// the daemon's own line (`skill.unknown |= outcomes.iter().any(spawned)`). A
-/// project skill under the root mints, so in these fixtures the second disjunct
-/// is the only one that can be true — which is what makes (b) a claim about the
-/// *command* rather than about where the file lives (that is AC-11(a)'s, in
-/// `egress_capture.rs`).
+/// **REQ-619 TASK-401 — the second value is the fixture's seed, no longer a
+/// mirror of the daemon's rule.** Until this REQ the daemon's own line was
+/// `skill.unknown |= outcomes.iter().any(spawned)` and this helper reproduced
+/// it. That rule is retired (BR-1/BR-2): a preamble is now classified before it
+/// spawns and only an `Unknown` verdict marks the expansion unpinnable, which
+/// the daemon-driven suites (`skill_turn.rs`, `skill_boundary.rs`) assert. What
+/// the two callers below need from this helper is an expansion whose command
+/// really ran, plus the bit they choose to seed `push_user_from` with — so
+/// `spawned` stays here, in a **fixture**, where it describes the fixture and
+/// claims nothing about production. `no_production_provenance_reads_spawned_any_more`
+/// in `skill_turn.rs` is what holds the production side.
 ///
-/// **`spawned`, not `did_run`, and this helper was written the other way.**
-/// REQ-587 TASK-222 corrected it. `did_run` is the `Ran` arm alone, so a command
-/// that started and exited non-zero — or was killed at the deadline — read as
-/// "no command ran" here while the daemon marked the block unpinnable. The
-/// helper agreed with the daemon on the fixtures it happened to carry (both of
-/// which exit zero) and disagreed with it on the one predicate AC-11(b) exists
-/// to pin: an exit status is a value the command *chose*, and a mirror of the
-/// daemon's rule that drops the failing arms is exactly the side channel
-/// REQ-585's verify closed (LESSON-528's shape — the mirrored predicate that is
-/// identical until one side is edited).
+/// The runner is handed a real [`Reach`] — the same four values `ShellTool::run`
+/// hands the classifier — because the verdict-free shim it used to call is gone;
+/// with no boundaries in the set the classifier short-circuits and the verdicts
+/// are `Unknown`, which is what these callers' seeds already assume.
 fn ran_expansion(repo: &std::path::Path, name: &str, arguments: &str) -> (String, bool) {
     let registry = tetond::skills::discover(
         None,
@@ -1218,8 +1217,19 @@ fn ran_expansion(repo: &std::path::Path, name: &str, arguments: &str) -> (String
         .dispatchable_by_user(name)
         .unwrap_or_else(|| panic!("the fixture must register `{name}`"));
     let expansion = tetond::skills::expand(skill, arguments, &format!(".claude/…/{name}"));
-    let outcomes =
-        tetond::skills::dynamic::run_all_unclassified(repo, expansion.commands(), 10_000);
+    let reach = tetond::skills::dynamic::Reach {
+        root: repo.to_path_buf(),
+        root_kind: teton_protocol::methods::RootKind::Project,
+        // Empty on purpose: this helper's callers seed the provenance
+        // themselves and none of them is asserting a verdict.
+        boundaries: Vec::new(),
+        denied_prefixes: Vec::new(),
+    };
+    let outcomes: Vec<tetond::skills::DynamicOutcome> =
+        tetond::skills::dynamic::run_all(&reach, expansion.commands(), 10_000)
+            .into_iter()
+            .map(|run| run.outcome)
+            .collect();
     let ran = outcomes.iter().any(tetond::skills::DynamicOutcome::spawned);
     // The user path's frame, which is the one `accept_invocation` supplies
     // (REQ-587 ADR-6) — the daemon's own line, not a paraphrase of it.
@@ -1473,8 +1483,25 @@ async fn with_no_boundary_a_skills_expansion_reaches_the_provider_as_the_payload
 /// Deterministic and in-repo: every byte here is written by this function, and
 /// nothing reads `~/.claude` (LESSON-540).
 fn model_skill_trees() -> (PathBuf, PathBuf) {
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
     let repo = temp_repo();
-    let home = repo.join("home-outside");
+    // **Under the process's own `$HOME` (REQ-619 BR-3).** A user skill's id is
+    // minted against `session_root::home()`, so a home the fixture merely
+    // *names* — this used to be `repo.join("home-outside")` — mints nothing and
+    // every claim about the `~` scope below would be a claim about `None`.
+    // `HOME` itself is process-wide state this binary must not write to: two
+    // tests here read it (`an_out_of_root_boundary_path_blocks_on_the_boundary_touch_sentinel`
+    // resolves `~/.ssh/config` through it), so the fixture goes to the home
+    // rather than the home coming to the fixture (LESSON-540).
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty())
+        .expect("a `~`-scoped skill identity needs a HOME to be relative to")
+        .join(format!(
+            ".teton-provskill-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
     let write = |path: PathBuf, body: &str| {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, body).unwrap();
@@ -1504,12 +1531,53 @@ fn model_skill_trees() -> (PathBuf, PathBuf) {
         "---\ndescription: a skill whose command runs\n---\n\n\
          RAN-BODY-MARKER: !`echo RAN-OUTPUT-MARKER`\n",
     );
-    // A user skill, outside the root by construction.
+    // A project skill whose one command is **rooted and fails**: `grep -q` over
+    // an in-root file that does not hold the pattern exits 1. REQ-619 BR-2's
+    // twin to `failing` above — same `Failed` outcome, different verdict — so
+    // the pair separates "a command exited non-zero" from "a command could not
+    // be proved" (informed by REQ-614 BR-8).
+    write(
+        repo.join(".claude/skills/rootedfail/SKILL.md"),
+        "---\ndescription: a skill whose rooted command exits non-zero\n---\n\n\
+         ROOTEDFAIL-BODY-MARKER: !`grep -q NOTHING-MATCHES-THIS src/lib.rs`\n",
+    );
+    // A user skill, outside the **session root** by construction and under the
+    // home by construction — which is what gives it an identity at all.
     write(
         home.join(".claude/skills/usr/SKILL.md"),
         "---\ndescription: the user skill\n---\n\nUSER-SKILL-BODY\n",
     );
     (repo, home)
+}
+
+/// Remove both trees a [`model_skill_trees`] fixture built.
+///
+/// The home is under the user's real `$HOME`, so leaving it behind is not the
+/// harmless `/tmp` litter the `repo` half would be.
+fn clean_model_skill_trees(repo: &std::path::Path, home: &std::path::Path) {
+    std::fs::remove_dir_all(repo).ok();
+    std::fs::remove_dir_all(home).ok();
+}
+
+/// The `~`-scoped id `<home>/.claude/skills/<name>/SKILL.md` mints.
+///
+/// Composed from the fixture's layout, never by calling the minter under test.
+fn user_skill_id(home: &std::path::Path, name: &str) -> String {
+    let real_home = std::fs::canonicalize(std::env::var_os("HOME").map(PathBuf::from).unwrap())
+        .expect("the home resolves");
+    let file = std::fs::canonicalize(
+        home.join(".claude")
+            .join("skills")
+            .join(name)
+            .join("SKILL.md"),
+    )
+    .expect("the fixture skill file");
+    format!(
+        "~/{}",
+        file.strip_prefix(&real_home)
+            .expect("the fixture is built under the home")
+            .display()
+    )
 }
 
 /// Drive one **model-issued** `skill` call through the loop in front of a real
@@ -1548,7 +1616,7 @@ async fn drive_model_skill_call(
     let capture = transport.clone();
 
     let bus = Arc::new(EventBus::new());
-    let egress = Egress::new(transport, boundary_set, bus.clone());
+    let egress = Egress::new(transport, boundary_set.clone(), bus.clone());
     let provider = OpenAiCompatAdapter::new(OpenAiCompatConfig::new(
         "deepseek",
         "https://api.deepseek.com/v1/chat/completions",
@@ -1595,7 +1663,15 @@ async fn drive_model_skill_call(
         config.context_budget_tokens,
     );
     ctx.push_user(PROMPT);
-    let tool_ctx = ToolContext::new(repo);
+    // REQ-619 ADR-619-1: the tool builds its preamble `Reach` from **this**
+    // context, so it needs the session's real boundary set and a project root
+    // to reach any verdict but `Unknown` — the same reason `run_touching_tool`
+    // above gives for the `shell` classifier. Handed the same `boundary_set` the
+    // `Egress` was built with, because the daemon composes both from one
+    // `Config::effective_boundaries()`.
+    let tool_ctx = ToolContext::new(repo)
+        .with_root_kind(teton_protocol::methods::RootKind::Project)
+        .with_boundaries(boundary_set);
     let events = SessionEvents::new(Arc::clone(&bus), session_id.clone());
     let mut hook = NoopProvenanceHook;
     let mut sub = bus.subscribe(256);
@@ -1697,21 +1773,43 @@ async fn a_model_invoked_project_skill_under_a_boundary_pins_the_turn_and_nothin
             "boundary bytes reached the wire from a model-invoked expansion"
         );
     }
-    std::fs::remove_dir_all(&repo).ok();
+    clean_model_skill_trees(&repo, &home);
 }
 
-/// **AC-11(a2).** A model-invoked **user** skill has no root-relative identity
-/// at all — `from_resolved` refuses rather than inventing one — so its block is
-/// `Unknown` and the turn pins wherever **any** boundary is configured, whether
-/// or not that boundary has anything to do with the file.
+/// **REQ-619 BR-6 — the model-invoked path gets the same provenance the typed
+/// path gets, through the same fold.**
 ///
-/// Stricter than (a), and stricter than what a `read` of the same bytes would
-/// earn, which is why it is asserted apart: the asymmetry *is* the claim. On the
-/// same egress, under the same unrelated boundary, the project skill above goes
-/// out and this one does not.
+/// This was `a_model_invoked_user_skill_pins_the_turn_wherever_any_boundary_exists`,
+/// and it asserted REQ-587 BR-10's user clause: `from_resolved` refused a file
+/// outside the root, so the tool's `(SkillSource::User, _) => Unknown` arm
+/// pinned the turn wherever **any** boundary existed — stricter than a `read` of
+/// the same bytes, and asserted apart precisely because the asymmetry was the
+/// claim. BR-6 retires that clause. The two paths now share `provenance_of` for
+/// the identity and `fold_expansion` for the answer, so the asymmetry is gone
+/// and what is asserted instead is the agreement.
+///
+/// The typed twin is `egress_capture.rs`'s
+/// `a_user_skill_leaves_under_the_builtins_and_is_refused_by_a_glob_that_names_it`,
+/// and the two make the same two claims about the same two globs: a boundary
+/// that names nothing the skill touches lets it out, and one that names its file
+/// refuses it **by that file's `~`-scoped id**. The id string is asserted here
+/// rather than merely "something was blocked", because "the same provenance" is
+/// a claim about the value and a call count cannot see it.
+///
+/// The project skill goes out first on the same boundary set, so neither half
+/// can be satisfied by a transport that refuses everything (LESSON-479).
+///
+/// **Mutation (run, red, reverted):** restore
+/// `(SkillSource::User, _) => ToolProvenance::Unknown` in `expand_and_fold` —
+/// the leave half's `result.is_ok()` goes red and the refused half's block path
+/// reads `<unknown-provenance>` instead of the file. **6 red** across the
+/// workspace: this test, its sibling below, `skill_boundary.rs`'s two user legs,
+/// `skill.rs`'s `a_user_skill_mints_a_home_scoped_id_and_a_project_skill_a_repo_scoped_one`,
+/// and `skill_turn.rs`'s `no_production_provenance_reads_spawned_any_more`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_model_invoked_user_skill_pins_the_turn_wherever_any_boundary_exists() {
+async fn a_model_invoked_user_skill_gets_the_same_provenance_as_the_typed_one() {
     let (repo, home) = model_skill_trees();
+    let expected = user_skill_id(&home, "usr");
 
     // The contrast: the same unrelated boundary, a project skill, and the wire.
     let (result, captured, calls, blocks) = drive_model_skill_call(
@@ -1725,58 +1823,110 @@ async fn a_model_invoked_user_skill_pins_the_turn_wherever_any_boundary_exists()
     assert!(
         result.is_ok() && calls == 2 && blocks.is_empty(),
         "a project skill under an unrelated boundary must still reach the wire — \
-         without this the refusal below would say nothing about *user* skills: \
+         without this the claim below would say nothing about *user* skills: \
          {result:?}, {calls} call(s)"
     );
     assert!(contains_bytes(&captured[1], "PUBLIC-SKILL-BODY"));
 
-    // The claim: a user skill cannot be pinned, so it is.
+    // The claim, first half: the user skill mints in its own scope, matches
+    // neither `secrets/**` nor `**/.ssh/**`, and leaves.
     let (result, captured, calls, blocks) = drive_model_skill_call(
         &repo,
         Some(&home),
-        &SessionId::from("model-skill-user"),
+        &SessionId::from("model-skill-user-leaves"),
         "usr",
-        // Names nothing this test touches: the point is that it does not have to.
+        // Names nothing this skill touches: the point is that it no longer has
+        // to, which is exactly what changed.
         boundaries(),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "a user skill that mints is judged by the globs like any other file, so \
+         an unrelated boundary must not refuse it (BUG-214): {result:?}"
+    );
+    assert_eq!(calls, 2, "both calls went out: {calls}");
+    assert!(
+        blocks.is_empty(),
+        "nothing matched, nothing blocked: {blocks:?}"
+    );
+    assert!(
+        contains_bytes(&captured[1], "USER-SKILL-BODY"),
+        "the leave claim must be about a payload that really carried the expansion"
+    );
+
+    // Second half: a glob the user wrote over their skills directory refuses it,
+    // naming the file — which is only expressible because the id exists.
+    let (result, captured, calls, blocks) = drive_model_skill_call(
+        &repo,
+        Some(&home),
+        &SessionId::from("model-skill-user-named"),
+        "usr",
+        vec![PrivacyBoundary {
+            path_glob: "**/.claude/skills/**".to_owned(),
+            mode: BoundaryMode::LocalOnly,
+            origin: Default::default(),
+        }],
     )
     .await;
     match &result {
         Err(e) if e.is_privacy_blocked() => {}
-        other => panic!("an unpinnable expansion must fail closed: {other:?}"),
+        other => panic!("a glob covering the skills directory must refuse it: {other:?}"),
     }
     assert_eq!(calls, 1, "the turn carrying the expansion may not go out");
     assert_eq!(blocks.len(), 1, "exactly one privacy_block: {blocks:?}");
     assert_eq!(
-        blocks[0].path,
-        tetond::egress::provenance::UNKNOWN_PROVENANCE_PATH,
-        "an unpinnable block is refused against the content-free sentinel, \
-         never against a path it does not have"
+        blocks[0].path, expected,
+        "the block names the user's own file in the `~` scope — the same id the \
+         typed path's block carries, which is what BR-6 means by one rule"
     );
     for request in &captured {
         assert!(
             !contains_bytes(request, "USER-SKILL-BODY"),
-            "the unpinnable expansion leaked past a configured boundary"
+            "the expansion leaked past a boundary that names its file"
         );
     }
-    std::fs::remove_dir_all(&repo).ok();
+    clean_model_skill_trees(&repo, &home);
 }
 
-/// **AC-11(b).** A model invocation whose dynamic command **spawned** pins the
-/// turn local under any boundary — and the fixture's command exits **3**.
+/// **REQ-619 BR-2 — an *opaque* command that failed still pins; a *rooted* one
+/// that failed does not.**
 ///
-/// The predicate is `DynamicOutcome::spawned`, not `did_run`, and the
-/// difference is the whole test: an exit status is a value the command chose,
-/// so a rule that only marked the `Ran` arm would let a body write
-/// `!\`cat secrets/prod.env; exit 1\`` and have the output enter context
-/// pinnable. REQ-585's verify closed that side channel; a test written to "ran"
-/// exercises only the arm that was never the problem and passes on a build
-/// where the predicate regressed.
+/// This was `a_model_invocation_whose_command_failed_still_pins_the_turn`, whose
+/// subject was REQ-585's predicate: `DynamicOutcome::spawned`, not `did_run`,
+/// because an exit status is a value the command *chose* and a rule that only
+/// marked the `Ran` arm would let a body write `` !`cat secrets/prod.env; exit 1` ``
+/// and have the output enter context pinnable. That side channel is still closed
+/// and is closed **harder**: the verdict is taken before the spawn, so neither
+/// the exit status nor the output can reach any answer at all.
 ///
-/// The control is the project skill with no dynamic context, on the same
-/// boundary: it reaches the wire, so what is being asserted below is "a command
-/// spawned" and not "this repo has a boundary".
+/// What flipped is the other half of the old rule — "any command that spawned
+/// pins". Both fixtures here exit non-zero and both `Failed`; the only
+/// difference is what the classifier could prove about them before they ran.
+/// `` !`echo SPAWNED-MARKER; exit 3` `` has a segment (`exit`) the grammar does
+/// not model, so it is `Unknown` and pins. `` !`grep -q NOTHING-MATCHES-THIS
+/// src/lib.rs` `` names one in-root file that matches no glob, so it is `Rooted`
+/// — and exits 1 because the pattern is absent, which under the retired rule was
+/// indistinguishable from the first.
+///
+/// The project control runs first on the same boundary set, so the pinning half
+/// is "this command could not be proved" and not "this repo has a boundary".
+///
+/// **Mutation (run, red, reverted):** restore the `(_, true) =>
+/// ToolProvenance::Unknown` arm — the rooted-failed leg is refused and its
+/// `result.is_ok()` goes red. **6 red** across the workspace (see the sibling
+/// above for the list). Second mutation (run, red, reverted): make the fold read
+/// the *outcome* — `did_spawn` answering `false` for `DynamicOutcome::Failed`,
+/// so a command that chose a non-zero exit contributes nothing — and the
+/// **pinning** leg goes green-to-red instead: the opaque failure stops pinning.
+/// **2 red**: this test and `skill_turn.rs`'s
+/// `a_boundary_naming_preamble_is_refused_whatever_it_exits`. Third mutation
+/// (run, red, reverted): map `unknown` to `BoundaryTouch` in
+/// `ExpansionProvenance::into_tool_provenance` — the block reads
+/// `<boundary-touch>` and the sentinel assertion goes red. **1 red**, this
+/// test, which is where that arm is pinned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_model_invocation_whose_command_failed_still_pins_the_turn() {
+async fn a_model_invocation_whose_opaque_command_failed_still_pins_and_a_rooted_one_does_not() {
     let (repo, home) = model_skill_trees();
 
     let (result, _, calls, blocks) = drive_model_skill_call(
@@ -1792,6 +1942,7 @@ async fn a_model_invocation_whose_command_failed_still_pins_the_turn() {
         "the control must reach the provider: {result:?}, {calls} call(s)"
     );
 
+    // The pinning half: opaque, and it failed.
     let (result, captured, calls, blocks) = drive_model_skill_call(
         &repo,
         Some(&home),
@@ -1803,8 +1954,8 @@ async fn a_model_invocation_whose_command_failed_still_pins_the_turn() {
     match &result {
         Err(e) if e.is_privacy_blocked() => {}
         other => panic!(
-            "a command that spawned and exited non-zero must still pin the \
-             turn — `spawned`, not `did_run`: {other:?}"
+            "a command whose reach could not be proved must pin whatever it \
+             exited with: {other:?}"
         ),
     }
     assert_eq!(calls, 1, "not one packet may leave: {calls} call(s)");
@@ -1812,7 +1963,8 @@ async fn a_model_invocation_whose_command_failed_still_pins_the_turn() {
     assert_eq!(
         blocks[0].path,
         tetond::egress::provenance::UNKNOWN_PROVENANCE_PATH,
-        "command output has no identity for a glob to be compared against"
+        "an unprovable command's output has no identity for a glob to be \
+         compared against"
     );
     for request in &captured {
         assert!(
@@ -1820,7 +1972,30 @@ async fn a_model_invocation_whose_command_failed_still_pins_the_turn() {
             "the pinned expansion reached the wire"
         );
     }
-    std::fs::remove_dir_all(&repo).ok();
+
+    // The flip: rooted, and it failed too — same outcome kind, different
+    // verdict, and the turn goes out.
+    let (result, captured, calls, blocks) = drive_model_skill_call(
+        &repo,
+        Some(&home),
+        &SessionId::from("model-skill-rootedfail"),
+        "rootedfail",
+        boundaries(),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "a `rooted` command that exited non-zero proves exactly what it proved \
+         before it ran; the exit status is not an input to the verdict \
+         (REQ-614 BR-8): {result:?}"
+    );
+    assert_eq!(calls, 2, "both calls went out: {calls}");
+    assert!(blocks.is_empty(), "nothing to block: {blocks:?}");
+    assert!(
+        contains_bytes(&captured[1], "ROOTEDFAIL-BODY-MARKER"),
+        "the leave claim must be about a payload that really carried the expansion"
+    );
+    clean_model_skill_trees(&repo, &home);
 }
 
 /// **AC-11(c).** With no boundary configured the choke point does not inspect,
@@ -1866,7 +2041,7 @@ async fn with_no_boundary_a_model_invoked_expansion_reaches_the_provider() {
             String::from_utf8_lossy(body)
         );
     }
-    std::fs::remove_dir_all(&repo).ok();
+    clean_model_skill_trees(&repo, &home);
 }
 
 // ---------------------------------------------------------------------------
