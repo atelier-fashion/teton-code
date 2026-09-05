@@ -385,17 +385,41 @@ pub fn discover(
     registry
 }
 
-/// One skill file's repo-relative identity for the egress provenance channel,
-/// or `None` when it has none (REQ-585 BR-7, REQ-587 BR-10 / ADR-8).
+/// One skill file's identity for the egress provenance channel, or `None` when
+/// it has none (REQ-585 BR-7, REQ-587 BR-10 / ADR-8, REQ-619 BR-3/BR-4).
 ///
 /// **The** mint for a skill body, so the user path and the model path cannot
 /// come to disagree about which file a block came from.
 ///
-/// `None` is **fail-closed**, and every caller must spell it that way: as
-/// `unknown: true` on a seed block, or `ToolProvenance::Unknown` on a tool
-/// outcome. It is the ordinary answer for a **user** skill, which has no
-/// repo-relative identity in a repo-rooted session (ADR-9 refused to widen the
-/// minter), and it is the safe answer in the two cases below.
+/// # Two scopes, one per source (REQ-619 ADR-619-3)
+///
+/// | `skill.source` | root | id |
+/// |---|---|---|
+/// | [`SkillSource::Project`] | the session root | `.claude/skills/x/SKILL.md` |
+/// | [`SkillSource::User`] | the daemon's `$HOME` | `~/.claude/skills/x/SKILL.md` |
+///
+/// **A user skill has an identity.** It did not before REQ-619: `None` was the
+/// *ordinary* answer for a user skill, on the grounds that
+/// `~/.claude/skills/x/SKILL.md` has no repo-relative spelling and REQ-587 ADR-9
+/// refused to widen the minter to invent one. That refusal still stands — the
+/// minter was not widened — but the user scope now has a root of its own
+/// ([`teton_core::ProvenanceId::from_home_resolved`]) and discovery is the one
+/// place entitled to use it, because discovery is where the *file was listed*.
+/// The retired reading cost every user-authored skill a permanent pin on every
+/// boundary-configured machine (BUG-214) for a file that matched no glob and
+/// read nothing.
+///
+/// This widens nothing else: the tool jail is untouched, and a `read` of
+/// `~/.claude/skills/x/SKILL.md` from a repo-rooted session is refused exactly
+/// as it was (REQ-619 AC-9, BR-4).
+///
+/// # `None` is still fail-closed
+///
+/// Every caller must spell it that way — as `unknown: true` on a seed block, or
+/// `ToolProvenance::Unknown` on a tool outcome. Three things reach it now: a
+/// daemon with no `HOME` (so the user scope has no root), a user skill whose
+/// canonical path is **not** under that home (a skills directory symlinked out
+/// of it), and either source's file no longer resolving at all.
 ///
 /// # Why the path is resolved first
 ///
@@ -424,9 +448,44 @@ pub fn discover(
 /// nothing is at.
 #[must_use]
 pub fn provenance_of(root: &Path, skill: &Skill) -> Option<teton_core::ProvenanceId> {
-    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    provenance_of_with_home(root, crate::session_root::home().as_deref(), skill)
+}
+
+/// [`provenance_of`] with the home supplied rather than read from the
+/// environment.
+///
+/// The split exists for the tests and for nothing else: `HOME` is process-wide,
+/// so a unit test that set it to a fixture would be setting it for every other
+/// test in the same binary — including `session_root`'s, which read it — and
+/// the two would race. The rule under test is the *branch on source*, which is
+/// pure once the home is a parameter, so the environment read stays in the
+/// one-line wrapper above and the rule is asserted here (LESSON-569: pick the
+/// seam by the property you are asserting).
+///
+/// `home` is `None` on a daemon started without `HOME` (a bare service
+/// environment): the user scope then has no root, and a user skill answers
+/// `None` → `unknown`, fail-closed. It is canonicalized for the reason `root`
+/// is — a home reached through a link (`/tmp`-style on macOS, or a fixture home
+/// under one) would otherwise strip nothing and turn every user skill unknown,
+/// which is the same trap the project root already documents above.
+#[must_use]
+pub(crate) fn provenance_of_with_home(
+    root: &Path,
+    home: Option<&Path>,
+    skill: &Skill,
+) -> Option<teton_core::ProvenanceId> {
     let resolved = std::fs::canonicalize(&skill.path).ok()?;
-    teton_core::ProvenanceId::from_resolved(&root, &resolved).ok()
+    match skill.source {
+        SkillSource::Project => {
+            let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+            teton_core::ProvenanceId::from_resolved(&root, &resolved).ok()
+        }
+        SkillSource::User => {
+            let home = home?;
+            let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+            teton_core::ProvenanceId::from_home_resolved(&home, &resolved).ok()
+        }
+    }
 }
 
 /// Whether `dir` resolves to a path at or under `boundary` — the containment
@@ -955,6 +1014,136 @@ mod tests {
             "fail-closed twice: an unresolvable root registers no project skill \
              either, so the door it would refuse is never reached"
         );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+    /// **REQ-619 BR-4 / BR-10 — one mint, branching on the row's source.**
+    ///
+    /// `provenance_of` used to be a single `from_resolved` against the session
+    /// root, which is why every **user** skill answered `None` and every
+    /// boundary-configured machine pinned its session on the first `/name`
+    /// (BUG-214). It now picks the scope the row was discovered under: a project
+    /// row against the session root as before (BR-10 — unchanged), a user row
+    /// against the daemon's home (BR-3). Both legs are asserted here because
+    /// they are two rules and not one, and because a branch that took the wrong
+    /// arm would mint an id that reads plausibly and names the wrong scope.
+    ///
+    /// The three `None`s are the fail-closed half, and each is reachable in
+    /// production: no `HOME` at all (a bare service environment), a user row
+    /// whose canonical path is under neither root (a skills directory symlinked
+    /// out of the home), and a file that no longer resolves.
+    ///
+    /// The **symlinked home** leg is not decoration: `std::env::temp_dir()` is
+    /// under `/var` on macOS, which is a link to `/private/var`, so a home
+    /// compared un-canonicalized against a canonical file strips nothing and
+    /// turns every user skill unknown — the identical trap the project root
+    /// already documents.
+    ///
+    /// **Mutations run — four red, one green, and the green one is worth
+    /// writing down.**
+    /// 1. Make the `User` arm call `from_resolved(root, …)` — **red** (the user
+    ///    leg: `NotUnderRoot` → `None`).
+    /// 2. Make the `Project` arm call `from_home_resolved(home, …)` — **red**
+    ///    (the project leg mints `~/.claude/skills/projectskill/SKILL.md`).
+    /// 3. Drop the `canonicalize` on `home` — **red** at the very first user
+    ///    leg on macOS, where `temp_dir()` is under `/var → /private/var`, and
+    ///    at the explicit symlinked-home leg everywhere.
+    /// 4. Replace `let home = home?` with an empty-path default — **green, an
+    ///    equivalent mutant**: an empty root strips nothing, the remainder is
+    ///    still absolute, `mint` refuses it and `.ok()` yields the same `None`.
+    ///    The fail-closed legs below therefore cannot distinguish *why* an
+    ///    answer is `None`, which is why each is paired with a positive control
+    ///    (the project row still mints with no home; the same user row mints
+    ///    with one). Recorded rather than dropped: a reader who mutates only
+    ///    that line would otherwise conclude the test is asleep.
+    /// 5. Make the `User` arm mint from `skill.path_display` — which is already
+    ///    spelled `~/…`, and is the shortcut this function exists to refuse —
+    ///    **red** at the no-home leg and at the under-neither-root leg, because
+    ///    a display string is not a resolution.
+    #[test]
+    fn provenance_of_mints_by_source_and_refuses_a_file_under_neither_root() {
+        let base = temp_root("provenance-of");
+        let home = base.join("home");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(home.join(".claude/skills/userskill")).unwrap();
+        std::fs::write(
+            home.join(".claude/skills/userskill/SKILL.md"),
+            "---\ndescription: a user skill\n---\n\nUser body.\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.join(".claude/skills/projectskill")).unwrap();
+        std::fs::write(
+            repo.join(".claude/skills/projectskill/SKILL.md"),
+            "---\ndescription: a project skill\n---\n\nProject body.\n",
+        )
+        .unwrap();
+
+        let registry = discover(Some(&home), &repo, RootKind::Project, &RealFs);
+        let user = registry
+            .dispatchable_by_user("userskill")
+            .expect("the user row registers");
+        let project = registry
+            .dispatchable_by_user("projectskill")
+            .expect("the project row registers");
+        assert_eq!(user.source, SkillSource::User);
+        assert_eq!(project.source, SkillSource::Project);
+
+        // BR-3: the user row is `~`-scoped, which is the spelling a `**/`-prefixed
+        // boundary glob reaches and the one a user recognizes in a refusal line.
+        assert_eq!(
+            provenance_of_with_home(&repo, Some(&home), user)
+                .expect("a discovered user skill has a home-scoped identity")
+                .as_str(),
+            "~/.claude/skills/userskill/SKILL.md"
+        );
+        // BR-10: the project row is untouched — repo-relative, no marker.
+        assert_eq!(
+            provenance_of_with_home(&repo, Some(&home), project)
+                .expect("a project skill is under the session root")
+                .as_str(),
+            ".claude/skills/projectskill/SKILL.md"
+        );
+
+        // A home reached through a link still strips, because the home is
+        // canonicalized exactly as the root is.
+        let home_link = base.join("home-link");
+        std::os::unix::fs::symlink(&home, &home_link).unwrap();
+        assert_eq!(
+            provenance_of_with_home(&repo, Some(&home_link), user)
+                .expect("a symlinked home resolves to the same identity")
+                .as_str(),
+            "~/.claude/skills/userskill/SKILL.md"
+        );
+
+        // No `HOME`: the user scope has no root, so there is no identity — and
+        // the project scope is unaffected, because it never needed one.
+        assert!(
+            provenance_of_with_home(&repo, None, user).is_none(),
+            "a daemon with no HOME fails closed for a user row"
+        );
+        assert!(provenance_of_with_home(&repo, None, project).is_some());
+
+        // Under neither root: a user row whose file resolves outside the home
+        // (a skills directory linked out of it) mints nothing rather than an id
+        // in some third scope.
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("SKILL.md"), "body\n").unwrap();
+        let mut strayed = user.clone();
+        strayed.path = outside.join("SKILL.md");
+        assert!(
+            provenance_of_with_home(&repo, Some(&home), &strayed).is_none(),
+            "a user file under neither root has no identity in either scope"
+        );
+        let mut strayed_project = project.clone();
+        strayed_project.path = outside.join("SKILL.md");
+        assert!(provenance_of_with_home(&repo, Some(&home), &strayed_project).is_none());
+
+        // And a row whose file is gone answers `None` rather than minting an id
+        // for a path nothing is at — for either source.
+        let mut absent = user.clone();
+        absent.path = home.join(".claude/skills/absent/SKILL.md");
+        assert!(provenance_of_with_home(&repo, Some(&home), &absent).is_none());
 
         std::fs::remove_dir_all(&base).ok();
     }
