@@ -3,9 +3,17 @@
   "branch": "feat/REQ-619-proportionate-skill-provenance",
   "startedAt": "2026-09-05T16:58:44Z",
   "completed": false,
-  "currentPhase": 0,
-  "completedPhases": [],
-  "phaseHistory": [],
+  "currentPhase": 1,
+  "completedPhases": [
+    0
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree",
+      "completedAt": "2026-09-05T16:58:48Z"
+    }
+  ],
   "integrationBranch": "main",
   "repos": {
     "teton-code": {
@@ -14,15 +22,21 @@
       "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-619",
       "branch": "feat/REQ-619-proportionate-skill-provenance",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
-      "prCreatedAt": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/304",
+      "prNumber": 304,
+      "prCreatedAt": "2026-09-05T16:58:47Z",
       "merged": false,
       "snapshotBranch": null,
       "snapshotPR": null
     }
   },
-  "mergeOrder": ["teton-code"],
-  "phase4": { "currentTask": null, "completedTasks": [], "failedTasks": [] },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  },
   "conflictsResolved": []
 }
