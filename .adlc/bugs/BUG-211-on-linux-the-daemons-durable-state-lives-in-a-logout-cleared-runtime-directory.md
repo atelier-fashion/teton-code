@@ -1,7 +1,7 @@
 ---
 id: BUG-211
 title: "On Linux the daemon's durable state — cost.db, the web cache, config.toml, the model weights — lives under $XDG_RUNTIME_DIR, which is cleared at logout"
-status: open
+status: resolved
 severity: medium
 created: 2026-09-03
 updated: 2026-09-05
@@ -195,3 +195,8 @@ Notes for whoever takes it, so the migration is not itself the incident:
 - `crates/tetond/tests/e2e/state_dir.rs`, `tests/e2e.rs` — two end-to-end claims
 - `crates/tetond/tests/state_dir_migration.rs` — two runtime-level claims
 - `crates/tetond/src/harness/docs/doctor.md`, `README.md`, `docs/manual-verification.md`, `docs/release-runbook.md` — the two directories described
+
+## Deployment
+
+- Merged to `main` as `36687f3` via [PR #302](https://github.com/atelier-fashion/teton-code/pull/302) on 2026-09-05.
+- Staging / production: n/a — this repo ships through PR-gated CI on `main` and the release runbook; no deploy pipeline. The migration runs on each user's next daemon start after the release that carries it.
