@@ -518,43 +518,16 @@ pub fn outcome_view(
             VerdictKind::Unknown => teton_protocol::events::Reach::Unknown,
         }),
         reach_reason: Some(run.verdict.reason.to_owned()),
-        // One projection body, reached two ways (LESSON-544): the command's
-        // bounding and the outcome's mapping are not restated here.
-        ..outcome_view_unclassified(command, &run.outcome, door)
-    }
-}
-
-/// [`outcome_view`] for a caller that still holds a bare [`DynamicOutcome`].
-///
-/// **TASK-401 replaces this.** The two production callers (`runtime::turn` and
-/// the `skill` tool) reach the runner through [`run_all_unclassified`] and so
-/// have no verdict to hand over yet; when they build a [`Reach`] and take
-/// [`PreambleRun`]s, both this and its runner sibling go. One projection body,
-/// reached two ways — never two bodies (LESSON-544).
-///
-/// Its record carries **no** reach: a caller with no verdict has nothing to
-/// say about one, and `None` on the wire is exactly "this daemon did not
-/// classify" (REQ-619 ADR-619-5). Filling it with `Rooted` to avoid an
-/// `Option` would be the one lie this shim could tell.
-#[must_use]
-pub fn outcome_view_unclassified(
-    command: &Command,
-    outcome: &DynamicOutcome,
-    door: Option<NotRunReason>,
-) -> DynamicOutcomeView {
-    DynamicOutcomeView {
-        reach: None,
-        reach_reason: None,
         // File-supplied bytes on a surface: bounded and rendered on one line
         // here, at the same ceiling the fold's echoed placeholder uses (BR-3).
         command: teton_core::session_root::bounded_field(
             command.as_str(),
             crate::skills::expand::COMMAND_ECHO_MAX_CHARS,
         ),
-        outcome: match outcome {
+        outcome: match &run.outcome {
             DynamicOutcome::Ran { output, .. } => teton_protocol::events::DynamicOutcome::Ran {
                 output_bytes: output.len() as u64,
-                truncated: outcome.output_truncated(),
+                truncated: run.outcome.output_truncated(),
             },
             DynamicOutcome::NotRun { .. } => teton_protocol::events::DynamicOutcome::NotRun {
                 reason: door.unwrap_or(NotRunReason::CouldNotStart),
@@ -595,30 +568,6 @@ pub struct Reach {
     /// The prefixes the jail denies (the transcript directory, and whatever
     /// else the context denied), so a path under one is never called rooted.
     pub denied_prefixes: Vec<PathBuf>,
-}
-
-impl Reach {
-    /// A reach with **no boundaries**, for the callers TASK-401 has not moved
-    /// yet.
-    ///
-    /// [`classify`] short-circuits on an empty boundary set before it touches
-    /// the filesystem, so this costs nothing and cannot report a proof it did
-    /// not make: every verdict it produces is `Unknown`, which is exactly the
-    /// answer the pre-REQ-619 rule reached for any command that spawned.
-    /// [`run_all_unclassified`] drops those verdicts rather than publishing
-    /// them.
-    #[must_use]
-    fn unclassified(root: &Path) -> Self {
-        Self {
-            root: root.to_path_buf(),
-            // Unread: the empty boundary set is answered first. Spelled
-            // `Plain` rather than `Project` so a reader cannot mistake this
-            // for a claim about the root.
-            root_kind: RootKind::Plain,
-            boundaries: Vec::new(),
-            denied_prefixes: Vec::new(),
-        }
-    }
 }
 
 /// One preamble command's verdict and what it came to.
@@ -751,44 +700,6 @@ fn run_all_with(
                 verdict,
                 outcome: run_one(&reach.root, command, allowed),
             }
-        })
-        .collect()
-}
-
-/// [`run_all`] for a caller that has not been given a [`Reach`] yet.
-///
-/// **TASK-401 replaces this**, and it is deliberately the smallest thing that
-/// keeps the two production callers and the egress fixtures compiling: they
-/// still fold `DynamicOutcome::spawned`, which REQ-619 retires, and moving
-/// them onto the verdict is that task's work — done at both call sites at
-/// once, because a half-moved rule is the disagreement this REQ exists to end.
-///
-/// It runs through [`run_all`] rather than beside it: one spawn loop, one
-/// budget arithmetic (BUG-185), and the boundary-free [`Reach::unclassified`]
-/// makes every verdict `Unknown` without a filesystem touch. The verdicts are
-/// dropped here — nothing downstream may read a classification made against a
-/// reach the session did not supply.
-#[must_use]
-pub fn run_all_unclassified(
-    root: &Path,
-    commands: &[Command],
-    timeout_ms: u64,
-) -> Vec<DynamicOutcome> {
-    run_all(&Reach::unclassified(root), commands, timeout_ms)
-        .into_iter()
-        .map(|run| {
-            // The shim's one claim, checked rather than asserted in prose: a
-            // boundary-free `Reach` can only ever produce `Unknown`, so nothing
-            // here throws away a proof that was actually made. It fires the day
-            // somebody gives `Reach::unclassified` a boundary set instead of
-            // giving these callers a real one.
-            debug_assert_eq!(
-                run.verdict.kind,
-                VerdictKind::Unknown,
-                "a boundary-free reach proves nothing; this shim must not be \
-                 dropping a real verdict"
-            );
-            run.outcome
         })
         .collect()
 }
@@ -929,9 +840,9 @@ mod tests {
     /// the verdict.
     ///
     /// They ran against the pre-REQ-619 signature and their claims are
-    /// unchanged; routing them through a real [`Reach`] rather than through
-    /// [`run_all_unclassified`] means they keep exercising the production path
-    /// after TASK-401 deletes that shim.
+    /// unchanged; routing them through a real [`Reach`] is what keeps them
+    /// exercising the production path now that TASK-401 has deleted the
+    /// verdict-free shim they were briefly routed through.
     fn run(root: &Path, commands: &[Command], timeout_ms: u64) -> Vec<DynamicOutcome> {
         run_all(&test_reach(root), commands, timeout_ms)
             .into_iter()
@@ -1838,10 +1749,12 @@ mod tests {
     ///
     /// `command` is the one place command text legitimately lives, and it is
     /// REQ-585's field, bounded, unchanged by this REQ — so it is asserted
-    /// equal rather than merely absent. The last leg pins the shim
-    /// [`outcome_view_unclassified`]: `None` on the wire is "this daemon did
-    /// not classify", and a shim that answered `Rooted` would be the one lie in
-    /// reach of a caller with no verdict.
+    /// equal rather than merely absent.
+    ///
+    /// **REQ-619 TASK-401** deleted the verdict-free shim this test's last leg
+    /// used to pin (`outcome_view_unclassified`): every production caller now
+    /// holds a [`PreambleRun`], so there is no arm left that could answer
+    /// `None` — or lie with `Rooted` — and the leg went with the shim.
     ///
     /// Mutation (run, red, reverted): mapping `VerdictKind::Unknown` to
     /// `Reach::Rooted` in `outcome_view` — the reach assertion goes red, and
@@ -1912,11 +1825,6 @@ mod tests {
             outcome_view(&rooted, rooted_run, None).reach,
             Some(teton_protocol::events::Reach::Rooted)
         );
-
-        // The shim a caller with no verdict reaches: silent, not `Rooted`.
-        let unclassified = outcome_view_unclassified(&opaque, &run.outcome, None);
-        assert_eq!(unclassified.reach, None);
-        assert_eq!(unclassified.reach_reason, None);
 
         std::fs::remove_dir_all(&root).ok();
     }
