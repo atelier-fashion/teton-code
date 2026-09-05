@@ -1,7 +1,7 @@
 ---
 id: REQ-619
 title: "Proportionate skill provenance — a skill pins the session only when its body or its preamble output could have touched a boundary"
-status: draft
+status: approved
 deployable: true
 created: 2026-09-05
 updated: 2026-09-05
