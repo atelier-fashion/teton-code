@@ -2448,14 +2448,25 @@ mod shell_pin {
     /// behavioural test in this crate can hold a reference to the sink the
     /// daemon built for a turn. `e2e::shell_pin_shape` is the behavioural half.
     ///
-    /// Mutation record (run 2026-09-05): restoring `Egress::new(transport,
-    /// boundaries, events.clone())` at the prompt-turn site turns exactly this
-    /// test red in this module, and in the e2e binary turns
-    /// `an_opaque_shell_result_pins_with_unknown_shell_and_says_so` and
-    /// `a_typed_user_skill_pins_liftably_and_is_announced` red (no
-    /// `session_pinned` arrives) while the `Rooted` control
-    /// `a_rooted_shell_result_pins_nothing_and_the_next_send_leaves` stays
-    /// green — which is the benign path the fix must not disturb.
+    /// Mutation record (re-run 2026-09-05 under REQ-619): restoring
+    /// `Egress::new(transport, boundaries, events.clone())` at the prompt-turn
+    /// site turns exactly this test red in this module, and in the e2e binary
+    /// turns **9** red — every claim that reads a pin's cause or its lift. In
+    /// `shell_pin_shape`, 3: `an_opaque_shell_result_pins_with_unknown_shell_and_says_so`,
+    /// `after_shell_allow_the_next_prompt_leaves_the_machine` and
+    /// `a_boundary_read_after_a_lift_escalates_the_pin_and_nothing_later_leaves`.
+    /// In `skill_provenance`, 6: REQ-619's AC-4, AC-5, AC-6, AC-7, AC-11 and
+    /// AC-13, which drive the same sink through a skill's file and its
+    /// preambles.
+    ///
+    /// The controls that stay green are the point: the `Rooted` path
+    /// (`a_rooted_shell_result_pins_nothing_and_the_next_send_leaves`) and every
+    /// REQ-619 claim whose subject is a turn that *leaves* — AC-1, AC-2, AC-3,
+    /// AC-8, AC-9, AC-10 and AC-12 — are the benign paths this fix must not
+    /// disturb. `a_typed_user_skill_pins_liftably_and_is_announced` was named
+    /// here until REQ-619 retired the pin it asserted; it is now
+    /// `shell_pin_shape::a_typed_user_skill_leaves_under_the_builtins`, and it
+    /// is one of the greens.
     #[test]
     fn the_prompt_turn_egress_installs_the_tainting_sink() {
         let turn = include_str!("turn.rs");

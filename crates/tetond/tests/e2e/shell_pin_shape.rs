@@ -22,10 +22,19 @@
 //! | AC-11 (daemon half): `session_pinned` is published once, after the block and **before** the pinned local route | [`an_opaque_shell_result_pins_with_unknown_shell_and_says_so`] |
 //! | BR-5: `/shell allow` lifts an `unknown_shell` pin once, and a second lift is a no-op | [`an_opaque_shell_result_pins_with_unknown_shell_and_says_so`] |
 //! | AC-1 (benign path): a `Rooted` result pins nothing and the next send leaves | [`a_rooted_shell_result_pins_nothing_and_the_next_send_leaves`] |
-//! | BUG-214's shape: a typed user skill pins on its first send, liftably, and says so | [`a_typed_user_skill_pins_liftably_and_is_announced`] |
+//! | REQ-619 AC-1: a typed **user** skill leaves under the builtins, and pins nothing | [`a_typed_user_skill_leaves_under_the_builtins`] |
 //!
 //! Each remote-touching test also asserts the suite-wide BR-1 egress capture
 //! stayed clean.
+//!
+//! **REQ-619 flipped one row.** BUG-214's own fixture — a typed user skill —
+//! no longer pins at all: a skill file discovered under `~/.claude` mints a
+//! `~`-scoped identity, and one matching none of the thirteen builtin globs
+//! leaves like a project skill's. The row above says so, and the announcement
+//! claims BUG-214 bought — the liftable cause, the ordering, the `/shell allow`
+//! remedy — stay where a pin is still genuinely taken: the opaque-`shell` tests
+//! here, and `skill_provenance`'s AC-5 and AC-13, which drive them through an
+//! opaque **preamble**.
 //!
 //! **AC-3's routing half — BUG-215.** The prompt *after* `/shell allow` must
 //! leave the machine. Probed on 2026-09-05 and it did not: `RoutePin` honored
@@ -381,34 +390,43 @@ fn a_rooted_shell_result_pins_nothing_and_the_next_send_leaves() {
     assert_no_boundary_bytes();
 }
 
-/// **BUG-214's own shape.** A typed skill installed under `~/.claude/skills`
-/// has no repo-relative identity (REQ-587 ADR-9), so its expansion is seeded
-/// unknown and the turn's *first* remote send is blocked — no `shell` tool,
-/// no preamble, nothing read. That is by design and unchanged here. What the
-/// bug changed is what the daemon recorded and said about it: a pin with the
-/// liftable cause, announced.
+/// **REQ-619 AC-1 — the claim this test used to make, inverted.**
 ///
-/// The fixture HOME is the daemon's own — `DaemonOptions::env("HOME", …)` —
-/// so the skill really is discovered as a **user** skill, on a root the
-/// session's repo is not under.
+/// It was `a_typed_user_skill_pins_liftably_and_is_announced`, and its subject
+/// was BUG-214's fixture: a typed skill under `~/.claude/skills` had no
+/// repo-relative identity (REQ-587 ADR-9), so its expansion was seeded
+/// `unknown`, the turn's *first* remote send was blocked — no `shell` call, no
+/// preamble, nothing read — and the session was pinned. The bug was in what the
+/// daemon *recorded and said* about that pin, and this file's other tests are
+/// the fix for it.
+///
+/// REQ-619 BR-3 removes the pin itself. A user skill mints a `~`-scoped
+/// identity, egress matches it against the boundary globs like any other id,
+/// and a file matching none of the thirteen builtins **leaves**. So the fixture
+/// is unchanged and the assertions are inverted: one request, no block, no pin.
+/// The announcement claims BUG-214 bought stay on the opaque-shell tests above,
+/// where a pin is still taken — which is why this test was flipped rather than
+/// deleted.
+///
+/// The fixture HOME is the daemon's own — `DaemonOptions::env("HOME", …)` — so
+/// the skill really is discovered as a **user** skill, on a root the session's
+/// repository is not under. The boundary-glob half of BR-3 (a user glob over
+/// the skills directory refuses the same skill by name) lives in
+/// `skill_provenance::a_user_glob_naming_the_skills_directory_refuses_the_skill_by_name`.
 #[test]
-fn a_typed_user_skill_pins_liftably_and_is_announced() {
+fn a_typed_user_skill_leaves_under_the_builtins() {
     let provider = MockProvider::start(
         Vec::new(),
-        MockResponse::ok(openai_turn("Should never be reached.", None, 10, 5)),
+        MockResponse::ok(openai_turn("Described; done.", None, 10, 5)),
     );
     let ws = Workspace::new("pin-skill");
     ws.write_config(&config_for(&provider));
     let script = ws.write_script(&local_done_script());
 
-    let home = ws.root.join("home");
-    let skill_dir = home.join(".claude").join("skills").join("probe");
-    std::fs::create_dir_all(&skill_dir).unwrap();
-    std::fs::write(
-        skill_dir.join("SKILL.md"),
-        "---\ndescription: a user skill with no commands\n---\n\nDescribe the repository.\n",
-    )
-    .unwrap();
+    let home = ws.user_skill(
+        "probe",
+        "Describe the repository. USER-SKILL-BODY-PINSHAPE\n",
+    );
 
     let daemon = Daemon::spawn(
         &ws,
@@ -417,18 +435,11 @@ fn a_typed_user_skill_pins_liftably_and_is_announced() {
     let mut client = daemon.connect();
     let session = client.create_session("structured", Some("implement"));
 
-    let turn = client.call(
-        "session/prompt",
-        json!({
-            "session_id": session,
-            "prompt": [],
-            "skill": { "name": "probe", "raw_arguments": "" },
-        }),
-    );
+    let turn = client.skill(&session, "probe", "");
     assert_eq!(
         turn["result"]["stop_reason"].as_str(),
         Some("end_turn"),
-        "the skill turn is served locally after the block: {turn}"
+        "the skill turn completes: {turn}"
     );
     client.drain_events(Duration::from_millis(300));
 
@@ -437,40 +448,22 @@ fn a_typed_user_skill_pins_liftably_and_is_announced() {
         "fixture: the typed skill must have expanded: {:?}",
         client.event_names()
     );
-    let blocks = client.events_named("privacy_block");
-    assert_eq!(blocks.len(), 1, "one block on the first send: {blocks:?}");
-    assert_eq!(
-        blocks[0]["path"].as_str(),
-        Some(UNKNOWN_PROVENANCE_PATH),
-        "a user skill's expansion is refused against the sentinel: {:?}",
-        blocks[0]
-    );
     assert_eq!(
         provider.request_count(),
-        0,
-        "nothing of the skill turn reached the provider"
-    );
-
-    let pinned = client.events_named("session_pinned");
-    assert_eq!(
-        pinned.len(),
         1,
-        "BUG-214: the pin is announced; got {pinned:?} among {:?}",
+        "REQ-619 BR-3: the expansion carries a `~`-scoped identity that matches \
+         no builtin glob, so the send leaves: {:?}",
         client.event_names()
     );
-    assert_eq!(
-        pinned[0]["cause"].as_str(),
-        Some("unknown_shell"),
-        "BUG-214: the cause read off the sentinel is the liftable one: {:?}",
-        pinned[0]
+    assert!(
+        client.events_named("privacy_block").is_empty(),
+        "nothing is refused: {:?}",
+        client.event_names()
     );
-    assert_eq!(pinned[0]["liftable"].as_bool(), Some(true));
-
-    let lifted = client.call("shell/override", json!({ "session_id": session }));
-    assert_eq!(
-        lifted["result"]["lifted_now"].as_bool(),
-        Some(true),
-        "BUG-214: `/shell allow` was refused here with `boundary_hit`: {lifted}"
+    assert!(
+        client.events_named("session_pinned").is_empty(),
+        "BUG-214's pin is gone, not merely announced: {:?}",
+        client.event_names()
     );
 
     assert_no_boundary_bytes();
