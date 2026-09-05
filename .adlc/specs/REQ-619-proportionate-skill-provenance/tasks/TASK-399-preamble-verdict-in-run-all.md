@@ -1,7 +1,7 @@
 ---
 id: TASK-399
 title: "The preamble verdict is taken inside `run_all`, once per command, before it spawns"
-status: draft
+status: complete
 parent: REQ-619
 created: 2026-09-05
 updated: 2026-09-05
@@ -28,10 +28,10 @@ production callers move in TASK-401.
 
 ## Acceptance Criteria
 
-- [ ] `run_all` calls `classify` exactly once per command and before that command's `run_bounded`; a `NotRun` command (door closed) is still classified and still not spawned
-- [ ] A `Rooted` command that times out and a `Rooted` command that succeeds carry the same verdict; an `Unknown` command that prints nothing still carries `Unknown` (BR-2)
-- [ ] The verdict's `reason` is a `&'static str`; nothing in `PreambleRun` carries output or command text beyond what `DynamicOutcome` carried before
-- [ ] `cargo test -p tetond --lib skills::dynamic` green; guard suites green
+- [x] `run_all` calls `classify` exactly once per command and before that command's `run_bounded`; a `NotRun` command (door closed) is still classified and still not spawned
+- [x] A `Rooted` command that times out and a `Rooted` command that succeeds carry the same verdict; an `Unknown` command that prints nothing still carries `Unknown` (BR-2)
+- [x] The verdict's `reason` is a `&'static str`; nothing in `PreambleRun` carries output or command text beyond what `DynamicOutcome` carried before
+- [x] `cargo test -p tetond --lib skills::dynamic` green; guard suites green
 
 ## Verification
 
