@@ -2792,7 +2792,7 @@ impl DaemonRuntime {
                 // would — which is the only way this join can fail, since a
                 // `spawn_blocking` task is never cancelled.
                 tokio::task::spawn_blocking(move || {
-                    crate::skills::run_all(&root, &to_run, timeout_ms)
+                    crate::skills::dynamic::run_all_unclassified(&root, &to_run, timeout_ms)
                 })
                 .await
                 .expect("the dynamic-context runner does not panic")
@@ -2854,7 +2854,7 @@ impl DaemonRuntime {
                 outcomes: commands
                     .iter()
                     .zip(outcomes.iter())
-                    .map(|(command, outcome)| outcome_view(command, outcome, door))
+                    .map(|(command, outcome)| outcome_view_unclassified(command, outcome, door))
                     .collect(),
                 // A literal, and it stays one: the only path that reaches here
                 // is REQ-585's user-typed `/name` expansion. A model-issued

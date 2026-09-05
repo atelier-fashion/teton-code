@@ -1217,7 +1217,8 @@ fn ran_expansion(repo: &std::path::Path, name: &str, arguments: &str) -> (String
         .dispatchable_by_user(name)
         .unwrap_or_else(|| panic!("the fixture must register `{name}`"));
     let expansion = tetond::skills::expand(skill, arguments, &format!(".claude/…/{name}"));
-    let outcomes = tetond::skills::run_all(repo, expansion.commands(), 10_000);
+    let outcomes =
+        tetond::skills::dynamic::run_all_unclassified(repo, expansion.commands(), 10_000);
     let ran = outcomes.iter().any(tetond::skills::DynamicOutcome::spawned);
     // The user path's frame, which is the one `accept_invocation` supplies
     // (REQ-587 ADR-6) — the daemon's own line, not a paraphrase of it.

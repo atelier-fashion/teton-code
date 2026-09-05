@@ -73,6 +73,17 @@ pub use shell::ShellTool;
 pub use skill::{register_skill_tool, SkillTool, SKILL_TOOL_NAME};
 pub use web::{register_web_tool, WebTool, WEB_TOOL_NAME};
 
+/// REQ-614's reach grammar, named here because it now has a **second
+/// consumer**: skill preambles (REQ-619 ADR-619-1).
+///
+/// `skills::dynamic::run_all` classifies each `` !`cmd` `` line before it
+/// spawns, exactly as [`ShellTool::run`] classifies a `shell` call, and it
+/// reaches the classifier through this re-export rather than through
+/// `shell_provenance`'s own path — so the `skills` module names one grammar
+/// instead of growing a copy of it that is identical only until one of them is
+/// edited (LESSON-528).
+pub(crate) use shell_provenance::{classify, Verdict, VerdictKind};
+
 // ---------------------------------------------------------------------------
 // The cap-exempt reason table (ADR-10)
 // ---------------------------------------------------------------------------

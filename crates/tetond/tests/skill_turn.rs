@@ -4319,8 +4319,16 @@ fn no_model_call_happens_at_expansion_time() {
     );
 
     let seam = settle_dynamic_context_body();
+    // REQ-619 TASK-399 moved the spelling, not the hazard: the seam now calls
+    // `skills::dynamic::run_all_unclassified(` while both callers wait for the
+    // `Reach` TASK-401 gives them, and it will read `skills::run_all(` again
+    // after that. The pin is on the **runner's name**, which every one of those
+    // spellings carries and which the `shell` tool's own path never does, so
+    // this keys on "the expansion goes through the extracted runner" rather
+    // than on the module path it is reached through (conventions.md: assert on
+    // the hazard).
     assert!(
-        seam.contains("skills::run_all("),
+        seam.contains("::run_all"),
         "the dynamic context must run through the extracted runner (ADR-14), \
          which is the caller that has no duty attached to it"
     );
