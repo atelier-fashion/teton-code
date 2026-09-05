@@ -639,15 +639,24 @@ impl Harness {
     }
 
     fn rebuild_skills(&self, id: &SessionId, cwd: &Path) {
+        self.rebuild_skills_under(id, cwd, fixture_home());
+    }
+
+    /// [`Self::rebuild_skills`] with the **discovery** home given explicitly,
+    /// while `HOME` — which `skills::provenance_of` reads when it mints —
+    /// stays this binary's [`fixture_home`].
+    ///
+    /// That asymmetry is the point, and it is production's: a registry is a
+    /// snapshot taken at `session/create`, and the mint happens per turn. A
+    /// skills root that is not under the home the daemon mints against is
+    /// therefore a real state, and it is the only way to reach a skill file
+    /// under **neither** root without moving a directory out from under a live
+    /// session (REQ-619 verify, M6).
+    fn rebuild_skills_under(&self, id: &SessionId, cwd: &Path, home: &Path) {
         let probed = self.runtime.session_root_for(Some(cwd));
         self.sessions.set_skills(
             id,
-            tetond::skills::discover(
-                Some(fixture_home()),
-                &probed.path,
-                probed.view.kind,
-                &RealFs,
-            ),
+            tetond::skills::discover(Some(home), &probed.path, probed.view.kind, &RealFs),
         );
     }
 
@@ -2848,6 +2857,137 @@ async fn an_out_of_root_boundary_preamble_pins_on_the_boundary_touch_sentinel() 
         "the turn carrying the expansion reached the provider: {:?}",
         h.vendor.sent()
     );
+}
+
+/// **REQ-619 verify, M6 — a skill *file* no scope names, whose path a glob
+/// does.**
+///
+/// ADR-614-3 gave the `shell` tool a permanent pin for a boundary path it could
+/// not mint an id for; `provenance_of` had the same asymmetry one seam over and
+/// answered `None` — which the fold read as `unknown`, and `/shell allow` lifts.
+/// The file here is a `SKILL.md` under a skills root linked into a `.ssh`
+/// directory: no scope strips it, the builtin `**/.ssh/**` names it, and the
+/// turn must be refused with the **permanent** cause.
+///
+/// # The fixture, and why the home is not this binary's
+///
+/// A registry is a snapshot taken at `session/create` and the mint happens per
+/// turn, so "a skills root that is not under the home the daemon mints against"
+/// is an ordinary state rather than a contrivance — it is what a re-pointed
+/// link, a changed `HOME`, or a second checkout leaves behind. Discovering the
+/// roster under a home of the test's own is how that state is reached without
+/// moving a directory out from under a live session.
+///
+/// # The control is the whole test
+///
+/// The second leg is the same fixture, the same registry and the same file,
+/// with `secrets/**` as the session's only glob instead. It must come back
+/// `<unknown-provenance>` / `unknown_shell` / liftable. Without it this would
+/// pass on a build that answered `BoundaryTouch` for *every* unmintable file —
+/// which is conservative and useless: it would permanently pin every daemon
+/// started without `HOME` on the first `/name` it was given, which is BUG-214
+/// with a different cause word.
+///
+/// # Mutation
+///
+/// Ran with the `boundary_names_path` call deleted from
+/// `provenance_of_with_home` (straight to `Unmintable`, the pre-verify answer):
+/// red on the first leg — `<unknown-provenance>` for `<boundary-touch>`, and
+/// `unknown_shell` for `boundary_hit`, a pin `/shell allow` would release.
+/// **Two red in the workspace**, this test and the unit sibling
+/// `skills::discovery::tests::a_skill_file_no_scope_names_is_a_boundary_touch_when_a_glob_names_it`,
+/// which is deliberate: one asserts the mapping, one asserts that the turn
+/// reaches the user with it. Ran again with `boundary_names_path` answering
+/// `true` unconditionally: red on this test's control leg (three red across the
+/// workspace). Restored: green.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_skill_file_under_neither_root_whose_path_a_glob_names_pins_permanently() {
+    /// One fixture: a repo, and a home whose `.claude/skills` is a symlink into
+    /// a `.ssh` directory. Returns the two trees so the caller keeps them
+    /// alive, and the linked home.
+    fn planted(tag: &str) -> (Tree, Tree) {
+        let repo = Tree::new(tag);
+        let home = Tree::new(&format!("{tag}h"));
+        // The real skills live here — under a `.ssh` segment, which is what the
+        // builtin glob reaches.
+        let real = home.path().join("elsewhere").join(".ssh").join("skills");
+        std::fs::create_dir_all(real.join("sshlinked")).unwrap();
+        std::fs::write(
+            real.join("sshlinked").join("SKILL.md"),
+            skill_file("a skill reached through a linked root", "The body.\n"),
+        )
+        .unwrap();
+        // A **user** root is followed with no symlink check — the dogfood
+        // machine's own `~/.claude/skills` is a link into a checkout — so this
+        // registers, and `skill.path` keeps the spelling discovery walked.
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::os::unix::fs::symlink(&real, home.path().join(".claude").join("skills")).unwrap();
+        (repo, home)
+    }
+
+    // Leg one: the glob names the file's real path.
+    let (repo, home) = planted("m6ssh");
+    let h = Harness::with_boundary(128_000, "**/.ssh/**");
+    let session = h.session_at(repo.path());
+    h.rebuild_skills_under(&session, repo.path(), home.path());
+    h.at_level(&session, PermissionLevel::Full);
+    let mut sub = h.events.subscribe(256);
+    h.turn(&session, "", Harness::invoke("sshlinked", ""))
+        .await
+        .expect_err("a skill file a boundary glob names pins the turn");
+
+    let published = drain(&mut sub).await;
+    let blocked = privacy_blocks(&published);
+    assert_eq!(blocked.len(), 1, "exactly one privacy_block: {blocked:?}");
+    assert_eq!(
+        blocked[0].path,
+        tetond::egress::provenance::BOUNDARY_TOUCH_PATH,
+        "the file has no id to name it with, so the sentinel is the only honest \
+         path — and it is the one `taint::cause_of` reads as permanent"
+    );
+    let pins = session_pins(&published);
+    assert_eq!(pins.len(), 1, "{pins:?}");
+    assert_eq!(
+        pins[0].cause, "boundary_hit",
+        "a named protected path pins permanently, however unnameable it is"
+    );
+    assert!(
+        !pins[0].liftable,
+        "`/shell allow` must not release a boundary the daemon watched be crossed"
+    );
+    assert!(
+        h.vendor.sent().is_empty(),
+        "the turn carrying the expansion reached the provider: {:?}",
+        h.vendor.sent()
+    );
+
+    // Leg two, the control: same file, same unmintable identity, a glob that
+    // does not name it. Liftable, and named as such.
+    let (repo, home) = planted("m6ctl");
+    let h = Harness::with_boundary(128_000, "secrets/**");
+    let session = h.session_at(repo.path());
+    h.rebuild_skills_under(&session, repo.path(), home.path());
+    h.at_level(&session, PermissionLevel::Full);
+    let mut sub = h.events.subscribe(256);
+    h.turn(&session, "", Harness::invoke("sshlinked", ""))
+        .await
+        .expect_err("an unmintable skill file still fails closed");
+
+    let published = drain(&mut sub).await;
+    let blocked = privacy_blocks(&published);
+    assert_eq!(blocked.len(), 1, "{blocked:?}");
+    assert_eq!(
+        blocked[0].path,
+        tetond::egress::provenance::UNKNOWN_PROVENANCE_PATH,
+        "nothing was named, so there is no path to name"
+    );
+    let pins = session_pins(&published);
+    assert_eq!(pins.len(), 1, "{pins:?}");
+    assert_eq!(
+        pins[0].cause, "unknown_shell",
+        "a file no glob names crossed nothing, so its pin stays liftable"
+    );
+    assert!(pins[0].liftable);
 }
 
 /// **REQ-619 BR-8 — a pinned skill turn is announced as a pinned shell turn is,

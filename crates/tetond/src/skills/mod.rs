@@ -79,7 +79,9 @@ use std::path::{Path, PathBuf};
 
 use teton_protocol::methods::RootKind;
 
-pub use discovery::{discover, provenance_of, DirLister, Entry, ListError, ReadError, RealFs};
+pub use discovery::{
+    discover, provenance_of, DirLister, Entry, ListError, ReadError, RealFs, SkillIdentity,
+};
 pub use dynamic::{run_all, Command, DynamicOutcome};
 pub use expand::{expand, Expansion, Pending, PENDING_PLACEHOLDER};
 

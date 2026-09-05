@@ -83,7 +83,7 @@ use crate::skills::dynamic::{
     closed_door, door_outcome, outcome_view, preamble_verdict, run_all, PreambleRun, Reach,
 };
 use crate::skills::provenance::fold_expansion;
-use crate::skills::{expand, Skill, SkillRegistry, SkillSource};
+use crate::skills::{expand, Skill, SkillIdentity, SkillRegistry, SkillSource};
 
 /// The name the model calls this tool by.
 ///
@@ -1334,9 +1334,14 @@ impl Refusal {
     /// here clears `context_provenance` and the next remote turn takes those
     /// bytes off the machine, which is the thing BR-10 is.
     #[must_use]
-    pub fn into_outcome(self, registry: &SkillRegistry, root: &std::path::Path) -> ToolOutcome {
+    pub fn into_outcome(
+        self,
+        registry: &SkillRegistry,
+        root: &std::path::Path,
+        boundaries: &[teton_core::entities::PrivacyBoundary],
+    ) -> ToolOutcome {
         ToolOutcome::error(self.message(registry))
-            .with_provenance(roster_provenance(registry, root))
+            .with_provenance(roster_provenance(registry, root, boundaries))
             .with_disposition(ResultDisposition::UntrustedData)
     }
 }
@@ -1363,28 +1368,43 @@ impl Refusal {
 /// model-invocable ([`register_skill_tool`]), so every result it can produce
 /// describes at least one file.
 #[must_use]
-pub fn roster_provenance(registry: &SkillRegistry, root: &std::path::Path) -> ToolProvenance {
-    let mut ids = Vec::new();
+pub fn roster_provenance(
+    registry: &SkillRegistry,
+    root: &std::path::Path,
+    boundaries: &[teton_core::entities::PrivacyBoundary],
+) -> ToolProvenance {
+    let mut ids = std::collections::BTreeSet::new();
+    let mut unknown = false;
+    let mut boundary_touch = false;
     for skill in model_invocable(registry) {
         // Through `skills::provenance_of`, never `ProvenanceId::from_resolved`
         // directly: that is **the** mint for a skill body, and it resolves both
-        // sides — the session root for a project row, the daemon's `$HOME` for
-        // a user one. `Skill::path` is the spelling discovery walked, and a
-        // project root may be a symlink *within* the repository
-        // (`.claude/skills -> vendor/skills`), which `discover` permits — so
-        // minting off the spelling gives one file two identities and a
-        // `vendor/**` boundary matches neither.
-        match crate::skills::provenance_of(root, skill) {
-            Some(id) => ids.push(id),
-            // A row this daemon cannot name: a project file that will not
-            // resolve, or a user file under no home it knows of (a daemon
-            // started without `HOME`, a skills directory symlinked out of it).
-            // Fail closed, which is the posture `provenance_of` documents for
-            // its `None`.
-            None => return ToolProvenance::Unknown,
+        // sides — the session root first, the daemon's `$HOME` for a user row
+        // the root does not strip (REQ-619 verify, M2). `Skill::path` is the
+        // spelling discovery walked, and a project root may be a symlink
+        // *within* the repository (`.claude/skills -> vendor/skills`), which
+        // `discover` permits — so minting off the spelling gives one file two
+        // identities and a `vendor/**` boundary matches neither.
+        match crate::skills::provenance_of(root, skill, boundaries) {
+            SkillIdentity::Minted(id) => {
+                ids.insert(id);
+            }
+            // A row whose *path* a boundary glob names though no scope mints it
+            // — a skills directory linked to `~/.ssh`, say (REQ-619 verify,
+            // M6). Permanent, and it outranks the liftable bit below.
+            SkillIdentity::BoundaryTouch => boundary_touch = true,
+            // A row this daemon cannot name at all: a project file that will
+            // not resolve, or a user file under no home it knows of (a daemon
+            // started without `HOME`, a skills directory symlinked somewhere
+            // ordinary). Fail closed, liftably.
+            SkillIdentity::Unmintable => unknown = true,
         }
     }
-    ToolProvenance::paths(ids)
+    // The **one** precedence (REQ-619 verify, M3), which also means an
+    // unnameable row no longer discards the ids of the rows beside it: a mixed
+    // roster is `UnknownWith`, so a `/shell allow` over it still has the other
+    // skill files to match globs against (C1).
+    ToolProvenance::from_bits(ids, unknown, boundary_touch)
 }
 
 /// The registry row a refusal's record describes, or `None` when nothing of
@@ -1775,7 +1795,7 @@ impl SkillTool {
                 }),
             );
         }
-        refusal.into_outcome(&self.registry, ctx.repo_root())
+        refusal.into_outcome(&self.registry, ctx.repo_root(), ctx.boundaries())
     }
 
     /// The whole orchestration, async because the consent round-trips are.
@@ -1810,7 +1830,11 @@ impl SkillTool {
             // the call touched no repo file while handing the model the text of
             // every skill file in the session (BR-10).
             return ToolOutcome::ok(render_listing(&self.registry))
-                .with_provenance(roster_provenance(&self.registry, ctx.repo_root()))
+                .with_provenance(roster_provenance(
+                    &self.registry,
+                    ctx.repo_root(),
+                    ctx.boundaries(),
+                ))
                 .with_disposition(ResultDisposition::UntrustedData);
         };
 
@@ -2108,7 +2132,7 @@ impl SkillTool {
         // yields the id of the real file rather than of the link — one file,
         // one identity, whichever caller asked — and it answers `~/…` for a
         // user skill under the daemon's home.
-        let identity = crate::skills::provenance_of(ctx.repo_root(), skill);
+        let identity = crate::skills::provenance_of(ctx.repo_root(), skill, ctx.boundaries());
         let provenance = fold_expansion(identity, &runs).into_tool_provenance();
 
         self.turn_state().note_expansion(&skill.name, arguments);
@@ -3354,7 +3378,7 @@ mod tests {
         }
 
         // The roster's mint, which is the same question asked of every row.
-        match roster_provenance(&registry, fx.repo().as_path()) {
+        match roster_provenance(&registry, fx.repo().as_path(), fx.ctx().boundaries()) {
             ToolProvenance::Sources(ids) => assert_eq!(
                 ids.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
                 vec![expected],

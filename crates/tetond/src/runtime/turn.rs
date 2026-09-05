@@ -769,8 +769,15 @@ impl DaemonRuntime {
             // and answerable by nobody else, exactly as the dynamic-context
             // question below it is (REQ-585 ADR-7).
             Some(invocation) => Some(
-                self.accept_invocation(&skills, probed, invocation, gate, invoker)
-                    .await?,
+                self.accept_invocation(
+                    &skills,
+                    probed,
+                    invocation,
+                    gate,
+                    invoker,
+                    &config.effective_boundaries(),
+                )
+                .await?,
             ),
             None => None,
         };
@@ -2475,6 +2482,11 @@ impl DaemonRuntime {
         invocation: &SkillInvocation,
         gate: &PermissionGate,
         invoker: Option<ConnectionId>,
+        // REQ-619 verify M6: the composed set, not `config.boundaries` raw —
+        // the identity mint asks the same question of the same globs egress
+        // will ask of the answer (the reasoning at the `Reach` construction
+        // below, one seam earlier in the turn).
+        boundaries: &[teton_core::entities::PrivacyBoundary],
     ) -> Result<SkillTurn, RpcError> {
         if !crate::skills::is_valid_skill_name(&invocation.name) {
             return Err(RpcError::new(
@@ -2636,7 +2648,7 @@ impl DaemonRuntime {
         // and `skill.path` is the path discovery walked to the file, which a
         // symlinked-but-in-repo project root leaves non-canonical. That helper
         // is the one home for resolving both sides, and it fails closed.
-        let identity = crate::skills::provenance_of(&probed.path, skill);
+        let identity = crate::skills::provenance_of(&probed.path, skill, boundaries);
         let seeded = crate::skills::provenance::fold_expansion(identity.clone(), &[]);
 
         Ok(SkillTurn {

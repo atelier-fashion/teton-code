@@ -34,6 +34,7 @@ use teton_core::ProvenanceId;
 use crate::harness::context::ToolProvenance;
 use crate::harness::tools::VerdictKind;
 
+use super::discovery::SkillIdentity;
 use super::dynamic::{DynamicOutcome, PreambleRun};
 
 /// What a skill expansion's text is worth to egress: the files it can name, and
@@ -120,8 +121,9 @@ fn did_spawn(outcome: &DynamicOutcome) -> bool {
 ///
 /// | input | effect |
 /// |---|---|
-/// | `identity: Some(id)` | `sources ∪ {id}` |
-/// | `identity: None` | `unknown = true` |
+/// | `identity: Minted(id)` | `sources ∪ {id}` |
+/// | `identity: BoundaryTouch` | `boundary_touch = true` |
+/// | `identity: Unmintable` | `unknown = true` |
 /// | `Rooted` verdict on a command that ran | `sources ∪ verdict.sources` |
 /// | `BoundaryTouch` (any) | `sources ∪ verdict.sources` |
 /// | `BoundaryTouch` with `out_of_root_touch` | `boundary_touch = true`, **and** the in-root ids still cross |
@@ -129,7 +131,7 @@ fn did_spawn(outcome: &DynamicOutcome) -> bool {
 /// | `Unknown` | `unknown = true` |
 /// | any verdict on a `NotRun` command | nothing |
 ///
-/// The third row is REQ-619's verify (C2). The table used to key the bit on
+/// The `out_of_root_touch` row is REQ-619's verify (C2). The table used to key the bit on
 /// `sources` being empty, which is a *proxy* for "the touch was in-root" and is
 /// wrong for one shape: a command that names an out-of-root boundary file and
 /// an ordinary in-root one carries both, and the proxy read the ordinary file
@@ -137,9 +139,14 @@ fn did_spawn(outcome: &DynamicOutcome) -> bool {
 /// instead of inferring it, and the two are folded together rather than in
 /// exclusive arms — an in-root id is worth keeping even when the bit is set.
 ///
-/// `identity` is `None` for a skill file that will not mint — after TASK-398
-/// that is a file under neither the session root nor the home, and the answer
-/// stays what it has always been: fail closed (REQ-585 ADR-9).
+/// `identity` is not an `Option` any more (REQ-619 verify, M6). A skill file
+/// that will not mint is a file under neither the session root nor the home,
+/// and the answer has always been "fail closed" — but there are two ways to
+/// fail closed and they are not interchangeable. A file whose *path* a boundary
+/// glob names is [`SkillIdentity::BoundaryTouch`], whose pin is permanent; one
+/// nothing names is [`SkillIdentity::Unmintable`], whose pin `/shell allow`
+/// lifts. Collapsed into a single `None` the stricter case was served as the
+/// laxer (REQ-585 ADR-9, REQ-614 ADR-614-3).
 ///
 /// The `NotRun` row is BR-2's "a command that did not run contributes nothing".
 /// A command declined at the consent door, or held back at `plan`, still
@@ -154,13 +161,14 @@ fn did_spawn(outcome: &DynamicOutcome) -> bool {
 /// function's current body: a `Rooted` command that timed out folds exactly as
 /// one that printed a page.
 #[must_use]
-pub fn fold_expansion(identity: Option<ProvenanceId>, runs: &[PreambleRun]) -> ExpansionProvenance {
+pub fn fold_expansion(identity: SkillIdentity, runs: &[PreambleRun]) -> ExpansionProvenance {
     let mut folded = ExpansionProvenance::default();
     match identity {
-        Some(id) => {
+        SkillIdentity::Minted(id) => {
             folded.sources.insert(id);
         }
-        None => folded.unknown = true,
+        SkillIdentity::BoundaryTouch => folded.boundary_touch = true,
+        SkillIdentity::Unmintable => folded.unknown = true,
     }
     for run in runs {
         if !did_spawn(&run.outcome) {
@@ -300,13 +308,13 @@ mod tests {
         let skill = fixture_id(".claude/skills/release/SKILL.md");
 
         // Row: `identity: Some(id)`.
-        let only_identity = fold_expansion(Some(skill.clone()), &[]);
+        let only_identity = fold_expansion(SkillIdentity::Minted(skill.clone()), &[]);
         assert_eq!(ids(&only_identity), [".claude/skills/release/SKILL.md"]);
         assert!(!only_identity.unknown, "a minted skill file pins nothing");
         assert!(!only_identity.boundary_touch);
 
         // Row: `identity: None`.
-        let no_identity = fold_expansion(None, &[]);
+        let no_identity = fold_expansion(SkillIdentity::Unmintable, &[]);
         assert!(
             no_identity.unknown,
             "a file with no identity to mint fails closed"
@@ -317,7 +325,7 @@ mod tests {
         // Row: `Rooted` on a command that ran — the AC-3 shape, and the one a
         // proportionate fold exists for.
         let rooted = fold_expansion(
-            Some(skill.clone()),
+            SkillIdentity::Minted(skill.clone()),
             &[
                 run(VerdictKind::Rooted, &["README.md"], ran()),
                 run(VerdictKind::Rooted, &["docs/design.md"], ran()),
@@ -337,7 +345,7 @@ mod tests {
         // Row: `BoundaryTouch` **with** sources — an in-root boundary path
         // names itself, exactly as a `read` of it would.
         let in_root = fold_expansion(
-            Some(skill.clone()),
+            SkillIdentity::Minted(skill.clone()),
             &[run(
                 VerdictKind::BoundaryTouch,
                 &["secrets/prod.env"],
@@ -358,7 +366,7 @@ mod tests {
         // Row: `BoundaryTouch` **without** sources — `cat ~/.ssh/config`, which
         // mints nothing for a glob to match.
         let out_of_root = fold_expansion(
-            Some(skill.clone()),
+            SkillIdentity::Minted(skill.clone()),
             &[run(VerdictKind::BoundaryTouch, &[], ran())],
         );
         assert!(out_of_root.boundary_touch, "the bit is the only carrier");
@@ -371,7 +379,7 @@ mod tests {
         // must keep the id **and** set the bit, because the two facts are about
         // two different files.
         let mixed = fold_expansion(
-            Some(skill.clone()),
+            SkillIdentity::Minted(skill.clone()),
             &[PreambleRun {
                 verdict: out_of_root_touch_with(&["README.md"]),
                 outcome: ran(),
@@ -389,7 +397,7 @@ mod tests {
 
         // Row: `Unknown` — an opaque verb, liftable.
         let unknown = fold_expansion(
-            Some(skill.clone()),
+            SkillIdentity::Minted(skill.clone()),
             &[run(VerdictKind::Unknown, &[], ran())],
         );
         assert!(unknown.unknown);
@@ -401,15 +409,15 @@ mod tests {
         // AC-6: the exit code the command chose changes nothing. Same verdict,
         // three outcomes, one answer.
         let exit_zero = fold_expansion(
-            Some(skill.clone()),
+            SkillIdentity::Minted(skill.clone()),
             &[run(VerdictKind::BoundaryTouch, &[], ran())],
         );
         let exit_one = fold_expansion(
-            Some(skill.clone()),
+            SkillIdentity::Minted(skill.clone()),
             &[run(VerdictKind::BoundaryTouch, &[], exited(1))],
         );
         let exit_two = fold_expansion(
-            Some(skill.clone()),
+            SkillIdentity::Minted(skill.clone()),
             &[run(VerdictKind::BoundaryTouch, &[], exited(2))],
         );
         assert_eq!(
@@ -423,7 +431,7 @@ mod tests {
         // And a timeout is the same channel with a sleep.
         assert_eq!(
             fold_expansion(
-                Some(skill),
+                SkillIdentity::Minted(skill),
                 &[run(
                     VerdictKind::BoundaryTouch,
                     &[],
@@ -471,7 +479,7 @@ mod tests {
         };
 
         let folded = fold_expansion(
-            Some(skill.clone()),
+            SkillIdentity::Minted(skill.clone()),
             &[
                 declined(VerdictKind::Rooted, &["README.md"]),
                 declined(VerdictKind::BoundaryTouch, &["secrets/prod.env"]),
@@ -491,14 +499,14 @@ mod tests {
         );
         assert_eq!(
             folded,
-            fold_expansion(Some(skill.clone()), &[]),
+            fold_expansion(SkillIdentity::Minted(skill.clone()), &[]),
             "four declined commands must fold as no commands at all"
         );
 
         // Non-vacuity: the same four verdicts on commands that ran say all three
         // things.
         let spawned = fold_expansion(
-            Some(skill),
+            SkillIdentity::Minted(skill),
             &[
                 run(VerdictKind::Rooted, &["README.md"], ran()),
                 run(VerdictKind::BoundaryTouch, &["secrets/prod.env"], ran()),

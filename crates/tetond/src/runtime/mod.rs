@@ -1406,9 +1406,16 @@ struct SkillTurn {
     /// carried rather than assumed, because that is a fact about *this* build's
     /// resolution and not a property of the field.
     user_invocable: bool,
-    /// The skill **file's** own identity, as `skills::provenance_of` minted it
-    /// — repo-relative for a project skill, `~`-scoped for a user one (REQ-619
-    /// BR-3), and `None` for a file under neither root.
+    /// The skill **file's** own identity, as `skills::provenance_of` answered
+    /// it — repo-relative for a project skill (or a user one linked inside the
+    /// session root), `~`-scoped for a user one under the daemon's home
+    /// (REQ-619 BR-3).
+    ///
+    /// A [`SkillIdentity`](crate::skills::SkillIdentity) and not an `Option`
+    /// since REQ-619's verify (M6): a file no scope names still has a *path*,
+    /// and a boundary glob may name that. The two ways to have no identity fail
+    /// closed differently — `Unmintable` is liftable, `BoundaryTouch` is
+    /// permanent — and one `None` served the stricter as the laxer.
     ///
     /// Kept beside the three folded fields below because it is their *input*,
     /// not a fourth answer: the preamble seam re-folds
@@ -1416,7 +1423,7 @@ struct SkillTurn {
     /// recovering the identity by picking a member out of `sources` would be a
     /// second reading that stops being right the first time a rooted preamble
     /// adds an id of its own.
-    identity: Option<ProvenanceId>,
+    identity: crate::skills::SkillIdentity,
     /// Every identity the seeded user block may name: the file's own, plus each
     /// rooted preamble's resolved path arguments (REQ-619 ADR-619-4). The
     /// output of `skills::provenance::fold_expansion`, never assembled here.

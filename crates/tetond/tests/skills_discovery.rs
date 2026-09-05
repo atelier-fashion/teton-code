@@ -490,8 +490,14 @@ fn a_skill_reached_through_an_in_repo_symlinked_root_mints_the_id_of_the_real_fi
         "the row keeps the spelling the user recognizes"
     );
 
-    let id = tetond::skills::provenance_of(&fixture.repo(), skill)
-        .expect("a file under the root has a repo-relative identity");
+    // No boundary configured: the question here is which spelling the mint
+    // produces, and the glob set only speaks when no scope mints at all
+    // (REQ-619 verify, M6).
+    let unguarded: [teton_core::entities::PrivacyBoundary; 0] = [];
+    let id = tetond::skills::provenance_of(&fixture.repo(), skill, &unguarded)
+        .minted()
+        .expect("a file under the root has a repo-relative identity")
+        .clone();
     assert_eq!(
         id.as_str(),
         "vendor/skills/alpha/SKILL.md",
@@ -502,8 +508,9 @@ fn a_skill_reached_through_an_in_repo_symlinked_root_mints_the_id_of_the_real_fi
     // than an id for a path nothing is at.
     let mut moved = skill.clone();
     moved.path = fixture.path("repo/.claude/skills/absent/SKILL.md");
-    assert!(
-        tetond::skills::provenance_of(&fixture.repo(), &moved).is_none(),
+    assert_eq!(
+        tetond::skills::provenance_of(&fixture.repo(), &moved, &unguarded),
+        tetond::skills::SkillIdentity::Unmintable,
         "a path that does not resolve has no identity"
     );
 }

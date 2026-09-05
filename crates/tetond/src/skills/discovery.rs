@@ -413,13 +413,23 @@ pub fn discover(
 /// `~/.claude/skills/x/SKILL.md` from a repo-rooted session is refused exactly
 /// as it was (REQ-619 AC-9, BR-4).
 ///
-/// # `None` is still fail-closed
+/// A **user** row is tried against the session root first and the home second
+/// (REQ-619 verify, M2): the table's second column says where the row was
+/// *listed*, and a skills directory linked into a checkout puts the file under
+/// both. The session root is the scope egress judges every other file by, so a
+/// file inside it takes that spelling whichever list found it.
 ///
-/// Every caller must spell it that way — as `unknown: true` on a seed block, or
-/// `ToolProvenance::Unknown` on a tool outcome. Three things reach it now: a
-/// daemon with no `HOME` (so the user scope has no root), a user skill whose
-/// canonical path is **not** under that home (a skills directory symlinked out
-/// of it), and either source's file no longer resolving at all.
+/// # Failing to mint is fail-closed, in one of two ways
+///
+/// [`SkillIdentity`] says which (verify M6). `Unmintable` is `unknown: true` on
+/// a seed block or `ToolProvenance::Unknown` on a tool outcome — liftable,
+/// because nothing says a boundary was crossed. `BoundaryTouch` is the
+/// permanent cause, for a file no scope names whose *path* a boundary glob
+/// does. Three things reach the pair: a daemon with no `HOME` (so the user
+/// scope has no root), a skill whose canonical path is under neither root (a
+/// skills directory symlinked out of the home), and either source's file no
+/// longer resolving at all — and the first two can land on either variant
+/// depending on what the path matches.
 ///
 /// # Why the path is resolved first
 ///
@@ -447,8 +457,72 @@ pub fn discover(
 /// built the snapshot — answers `None` rather than minting an id for a path
 /// nothing is at.
 #[must_use]
-pub fn provenance_of(root: &Path, skill: &Skill) -> Option<teton_core::ProvenanceId> {
-    provenance_of_with_home(root, crate::session_root::home().as_deref(), skill)
+pub fn provenance_of(
+    root: &Path,
+    skill: &Skill,
+    boundaries: &[teton_core::entities::PrivacyBoundary],
+) -> SkillIdentity {
+    provenance_of_with_home(
+        root,
+        crate::session_root::home().as_deref(),
+        skill,
+        boundaries,
+    )
+}
+
+/// What [`provenance_of`] found: an identity, or one of the two ways a skill
+/// file can have none (REQ-619 verify, M6).
+///
+/// The answer used to be `Option<ProvenanceId>`, and the `None` covered two
+/// facts that egress treats very differently. Both fail closed — but one is
+/// `unknown`, which `/shell allow` lifts, and the other is a **named protected
+/// path**, whose pin is permanent (REQ-614 ADR-614-3). An `Option` had one
+/// spelling for both, so the stricter one was silently served as the laxer.
+///
+/// A variant per fact rather than a bool beside the option, for
+/// [`ToolProvenance::BoundaryTouch`](crate::harness::ToolProvenance)'s reason:
+/// this has to survive the fold, the seed block, the context-provenance union
+/// and the carry, and carried state sheds its invariants silently on a round
+/// trip (LESSON-501, LESSON-502). A variant makes the compiler enumerate the
+/// seams.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillIdentity {
+    /// The file resolved under a scope this daemon can name: repo-relative for
+    /// a project row (or a user row that lives inside the session root), and
+    /// `~`-scoped for a user row under the daemon's `$HOME`.
+    Minted(teton_core::ProvenanceId),
+    /// No scope strips the path, **and the path itself matches a boundary
+    /// glob** — a skills directory symlinked to `/Users/someone/.ssh/`, say,
+    /// under the builtin `**/.ssh/**`.
+    ///
+    /// The file has no id for a glob to match through
+    /// [`ToolProvenance::Sources`](crate::harness::ToolProvenance), so a bit is
+    /// the only carrier — the identical shape ADR-614-3 gave an out-of-root
+    /// `shell` read (LESSON-623), one seam over. Fail-closed and **not**
+    /// liftable: a protected path was actually named.
+    BoundaryTouch,
+    /// No scope strips the path and no glob names it: a daemon started without
+    /// `HOME`, a skills root linked somewhere ordinary, or a file that no longer
+    /// resolves at all. Fail-closed as `unknown`, and liftable — nothing here
+    /// says a boundary was crossed, only that reach could not be proved.
+    Unmintable,
+}
+
+impl SkillIdentity {
+    /// The minted id, or `None` for either failure — the shape callers that
+    /// only want to *name* the file (a display line, a test) already had.
+    ///
+    /// Deliberately not `Option`-returning sugar for the *provenance* decision:
+    /// a caller that folds this into an egress answer must handle all three
+    /// arms, which is what [`fold_expansion`](crate::skills::provenance::fold_expansion)
+    /// does and what the enum exists to force.
+    #[must_use]
+    pub fn minted(&self) -> Option<&teton_core::ProvenanceId> {
+        match self {
+            SkillIdentity::Minted(id) => Some(id),
+            SkillIdentity::BoundaryTouch | SkillIdentity::Unmintable => None,
+        }
+    }
 }
 
 /// [`provenance_of`] with the home supplied rather than read from the
@@ -473,19 +547,93 @@ pub(crate) fn provenance_of_with_home(
     root: &Path,
     home: Option<&Path>,
     skill: &Skill,
-) -> Option<teton_core::ProvenanceId> {
-    let resolved = std::fs::canonicalize(&skill.path).ok()?;
-    match skill.source {
-        SkillSource::Project => {
-            let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-            teton_core::ProvenanceId::from_resolved(&root, &resolved).ok()
-        }
-        SkillSource::User => {
-            let home = home?;
-            let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-            teton_core::ProvenanceId::from_home_resolved(&home, &resolved).ok()
-        }
+    boundaries: &[teton_core::entities::PrivacyBoundary],
+) -> SkillIdentity {
+    let Ok(resolved) = std::fs::canonicalize(&skill.path) else {
+        return SkillIdentity::Unmintable;
+    };
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let home = home.map(|home| std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf()));
+
+    let minted = match skill.source {
+        SkillSource::Project => teton_core::ProvenanceId::from_resolved(&root, &resolved).ok(),
+        // **The session root first, the home second (REQ-619 verify, M2).**
+        //
+        // The branch used to be on `skill.source` alone, which reads as "a user
+        // skill is a home-scoped thing" — and that is true of where it was
+        // *listed*, not of where the file *is*. A user who links
+        // `~/.claude/skills` into a checkout (or into one skill of it) has a
+        // file that lies under both roots, and taking the home first minted
+        // `~/GitHub/foo/secrets/notes.md` for a file whose repo-relative
+        // spelling is `secrets/notes.md`. A `secrets/**` boundary then matched
+        // nothing, because the id it was handed did not start where the glob
+        // does.
+        //
+        // The session root is the scope egress judges everything else by — a
+        // `read` of that same file mints `secrets/notes.md` — so a file inside
+        // it gets that spelling whatever list it was discovered on, and BR-7's
+        // "pins exactly as a `read` would" holds for the linked case too. The
+        // home is the fallback for the ordinary user skill, which is not under
+        // the root at all.
+        SkillSource::User => teton_core::ProvenanceId::from_resolved(&root, &resolved)
+            .ok()
+            .or_else(|| {
+                home.as_deref().and_then(|home| {
+                    teton_core::ProvenanceId::from_home_resolved(home, &resolved).ok()
+                })
+            }),
+    };
+    if let Some(id) = minted {
+        return SkillIdentity::Minted(id);
     }
+
+    // Neither scope strips it — and REQ-619's `None` stopped there, answering
+    // `unknown` for a file whose *path* a boundary glob may well name (verify
+    // M6). A skills directory linked to `/Users/someone/.ssh/` is the shape:
+    // the builtin `**/.ssh/**` reaches it, and answering `unknown` made that
+    // pin liftable by `/shell allow`. This is ADR-614-3's asymmetry one seam
+    // over, so it takes ADR-614-3's answer.
+    if boundary_names_path(&resolved, home.as_deref(), boundaries) {
+        return SkillIdentity::BoundaryTouch;
+    }
+    SkillIdentity::Unmintable
+}
+
+/// Whether a boundary glob names `resolved` directly — the test that only
+/// applies once no scope has minted an id for it (REQ-619 verify, M6).
+///
+/// Two spellings, the same two `shell_provenance::classify_segment`'s
+/// out-of-root arm tries and for the same reason (verify m2): the builtins are
+/// `**/`-prefixed and reach the absolute path with its leading `/` stripped,
+/// while a user glob written in the spelling REQ-619 taught the daemon to mint
+/// — `~/.claude/skills/**` — reaches only the home-relative one. Trying both
+/// can only *add* matches, and every added match is a refusal.
+///
+/// A boundary set that does not compile answers `false`. The file is failing
+/// closed either way — [`SkillIdentity::Unmintable`] is `unknown` at egress —
+/// so the only thing this decides is whether the pin is **permanent**, and
+/// claiming a glob matched when no glob ever ran would be asserting evidence
+/// that does not exist. It is the same reading `classify_segment` takes of the
+/// same failure.
+fn boundary_names_path(
+    resolved: &Path,
+    home: Option<&Path>,
+    boundaries: &[teton_core::entities::PrivacyBoundary],
+) -> bool {
+    let Ok(matcher) = teton_core::boundary::BoundaryMatcher::new(boundaries) else {
+        return false;
+    };
+    let spelling = resolved.to_string_lossy();
+    let stripped = spelling.strip_prefix('/').unwrap_or(&spelling);
+    let home_spelling = home
+        .and_then(|home| resolved.strip_prefix(home).ok())
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .filter(|rel| !rel.is_empty())
+        .map(|rel| format!("~/{rel}"));
+    matcher.match_path(stripped).is_some()
+        || home_spelling
+            .as_deref()
+            .is_some_and(|spelling| matcher.match_path(spelling).is_some())
 }
 
 /// Whether `dir` resolves to a path at or under `boundary` — the containment
@@ -1039,23 +1187,35 @@ mod tests {
     /// turns every user skill unknown — the identical trap the project root
     /// already documents.
     ///
-    /// **Mutations run — four red, one green, and the green one is worth
+    /// **Mutations run — five red, one green, and the green one is worth
     /// writing down.**
-    /// 1. Make the `User` arm call `from_resolved(root, …)` — **red** (the user
-    ///    leg: `NotUnderRoot` → `None`).
+    /// 0. **The M2 order, reversed** — try the home first and the session root
+    ///    second, which is what the branch-on-source did before REQ-619's
+    ///    verify. **One red in the whole workspace**: this test, on `the
+    ///    session root is the scope egress judges every other file by`
+    ///    (`~/…/repo/.claude/skills/projectskill/SKILL.md` for
+    ///    `.claude/skills/projectskill/SKILL.md`). One, and that count is the
+    ///    finding — the shape has no other coverage anywhere, because every
+    ///    other fixture puts the user skill somewhere the root does not reach.
+    /// 1. Delete the `.or_else(…)` home fallback from the `User` arm, leaving
+    ///    the session-root attempt alone — **red** (the user leg:
+    ///    `NotUnderRoot` → `Unmintable`), and red across the workspace: three
+    ///    in the library, eight in the e2e binary, one each in `skill_turn`,
+    ///    `skill_boundary`, `provenance_egress` — the ordinary user skill is
+    ///    what this arm exists for.
     /// 2. Make the `Project` arm call `from_home_resolved(home, …)` — **red**
     ///    (the project leg mints `~/.claude/skills/projectskill/SKILL.md`).
     /// 3. Drop the `canonicalize` on `home` — **red** at the very first user
     ///    leg on macOS, where `temp_dir()` is under `/var → /private/var`, and
     ///    at the explicit symlinked-home leg everywhere.
-    /// 4. Replace `let home = home?` with an empty-path default — **green, an
+    /// 4. Replace the `home?` with an empty-path default — **green, an
     ///    equivalent mutant**: an empty root strips nothing, the remainder is
-    ///    still absolute, `mint` refuses it and `.ok()` yields the same `None`.
+    ///    still absolute, `mint` refuses it and `.ok()` yields the same failure.
     ///    The fail-closed legs below therefore cannot distinguish *why* an
-    ///    answer is `None`, which is why each is paired with a positive control
-    ///    (the project row still mints with no home; the same user row mints
-    ///    with one). Recorded rather than dropped: a reader who mutates only
-    ///    that line would otherwise conclude the test is asleep.
+    ///    answer is `Unmintable`, which is why each is paired with a positive
+    ///    control (the project row still mints with no home; the same user row
+    ///    mints with one). Recorded rather than dropped: a reader who mutates
+    ///    only that line would otherwise conclude the test is asleep.
     /// 5. Make the `User` arm mint from `skill.path_display` — which is already
     ///    spelled `~/…`, and is the shortcut this function exists to refuse —
     ///    **red** at the no-home leg and at the under-neither-root leg, because
@@ -1088,17 +1248,26 @@ mod tests {
         assert_eq!(user.source, SkillSource::User);
         assert_eq!(project.source, SkillSource::Project);
 
+        // No boundary configured for these legs: the question is which scope
+        // mints, and a glob only speaks when neither does.
+        let unguarded: [teton_core::entities::PrivacyBoundary; 0] = [];
+        let mint = |root: &Path, home: Option<&Path>, skill: &Skill| {
+            provenance_of_with_home(root, home, skill, &unguarded)
+        };
+
         // BR-3: the user row is `~`-scoped, which is the spelling a `**/`-prefixed
         // boundary glob reaches and the one a user recognizes in a refusal line.
         assert_eq!(
-            provenance_of_with_home(&repo, Some(&home), user)
+            mint(&repo, Some(&home), user)
+                .minted()
                 .expect("a discovered user skill has a home-scoped identity")
                 .as_str(),
             "~/.claude/skills/userskill/SKILL.md"
         );
         // BR-10: the project row is untouched — repo-relative, no marker.
         assert_eq!(
-            provenance_of_with_home(&repo, Some(&home), project)
+            mint(&repo, Some(&home), project)
+                .minted()
                 .expect("a project skill is under the session root")
                 .as_str(),
             ".claude/skills/projectskill/SKILL.md"
@@ -1109,7 +1278,8 @@ mod tests {
         let home_link = base.join("home-link");
         std::os::unix::fs::symlink(&home, &home_link).unwrap();
         assert_eq!(
-            provenance_of_with_home(&repo, Some(&home_link), user)
+            mint(&repo, Some(&home_link), user)
+                .minted()
                 .expect("a symlinked home resolves to the same identity")
                 .as_str(),
             "~/.claude/skills/userskill/SKILL.md"
@@ -1117,33 +1287,182 @@ mod tests {
 
         // No `HOME`: the user scope has no root, so there is no identity — and
         // the project scope is unaffected, because it never needed one.
-        assert!(
-            provenance_of_with_home(&repo, None, user).is_none(),
+        assert_eq!(
+            mint(&repo, None, user),
+            SkillIdentity::Unmintable,
             "a daemon with no HOME fails closed for a user row"
         );
-        assert!(provenance_of_with_home(&repo, None, project).is_some());
+        assert!(mint(&repo, None, project).minted().is_some());
 
         // Under neither root: a user row whose file resolves outside the home
         // (a skills directory linked out of it) mints nothing rather than an id
-        // in some third scope.
+        // in some third scope. `Unmintable` and not `BoundaryTouch`, because no
+        // glob is configured to name it — the discriminating pair is the M6
+        // test below.
         let outside = base.join("outside");
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(outside.join("SKILL.md"), "body\n").unwrap();
         let mut strayed = user.clone();
         strayed.path = outside.join("SKILL.md");
-        assert!(
-            provenance_of_with_home(&repo, Some(&home), &strayed).is_none(),
+        assert_eq!(
+            mint(&repo, Some(&home), &strayed),
+            SkillIdentity::Unmintable,
             "a user file under neither root has no identity in either scope"
         );
         let mut strayed_project = project.clone();
         strayed_project.path = outside.join("SKILL.md");
-        assert!(provenance_of_with_home(&repo, Some(&home), &strayed_project).is_none());
+        assert_eq!(
+            mint(&repo, Some(&home), &strayed_project),
+            SkillIdentity::Unmintable
+        );
 
-        // And a row whose file is gone answers `None` rather than minting an id
-        // for a path nothing is at — for either source.
+        // **REQ-619 verify, M2.** A user row whose file is *inside* the session
+        // root — `~/.claude/skills` symlinked into a checkout, which is exactly
+        // how the toolkit's own author works — takes the repo-relative
+        // spelling, not the `~`-scoped one. Under the old source-first branch
+        // this minted `~/…/repo/.claude/skills/projectskill/SKILL.md` and a
+        // `.claude/**` boundary matched nothing, because the id it was handed
+        // did not start where the glob does.
+        let mut linked_in = user.clone();
+        linked_in.path = repo.join(".claude/skills/projectskill/SKILL.md");
+        assert_eq!(linked_in.source, SkillSource::User, "still a user row");
+        assert_eq!(
+            mint(&repo, Some(&home), &linked_in)
+                .minted()
+                .expect("a user row under the session root mints against it")
+                .as_str(),
+            ".claude/skills/projectskill/SKILL.md",
+            "the session root is the scope egress judges every other file by, \
+             so a file inside it takes that spelling whichever list found it"
+        );
+
+        // And a row whose file is gone is `Unmintable` rather than minting an
+        // id for a path nothing is at — for either source.
         let mut absent = user.clone();
         absent.path = home.join(".claude/skills/absent/SKILL.md");
-        assert!(provenance_of_with_home(&repo, Some(&home), &absent).is_none());
+        assert_eq!(mint(&repo, Some(&home), &absent), SkillIdentity::Unmintable);
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// **REQ-619 verify, M6 — the two ways to have no identity are not the
+    /// same way.**
+    ///
+    /// A skill file under neither root still has a *path*, and a boundary glob
+    /// may name it. `~/.claude/skills` pointed at `/Users/someone/.ssh/` is the
+    /// shape, and the builtin `**/.ssh/**` reaches it. Answering `None` for it
+    /// — which is what an `Option` could say — made that pin `unknown_shell`,
+    /// which `/shell allow` lifts. This is ADR-614-3's asymmetry one seam over,
+    /// and it takes ADR-614-3's answer: a **named** protected path pins
+    /// permanently even when nothing can name it back.
+    ///
+    /// # The pairs
+    ///
+    /// Every leg is a pair, because a single-direction assertion here would
+    /// pass on a build that answered `BoundaryTouch` for everything under
+    /// neither root — which would be conservative, and also useless: it would
+    /// make every daemon started without `HOME` permanently pinned by its own
+    /// user skills. The same path with no glob configured must come back
+    /// `Unmintable`, and a path a glob does not name must too.
+    ///
+    /// Both spellings are asserted (verify m2): the `**/`-prefixed builtin
+    /// reaches the leading-`/`-stripped absolute path, and a `~/…` glob reaches
+    /// only the home-relative one — so a file under the home that the home
+    /// scope nonetheless will not mint is reachable by the second alone.
+    ///
+    /// # Mutation
+    ///
+    /// Ran with the `boundary_names_path` call deleted (straight to
+    /// `Unmintable`, the pre-verify answer): **two red in the workspace** — this
+    /// test on `a path a boundary glob names pins permanently`, and
+    /// `skill_turn::a_skill_file_under_neither_root_whose_path_a_glob_names_pins_permanently`,
+    /// which is the same claim measured at the turn. Ran again with the
+    /// function answering `true` unconditionally: **three red** — those two,
+    /// plus the sibling above on its under-neither-root leg, which is the
+    /// control saying "conservative for everything" is not the answer. Ran a
+    /// third time with the home spelling dropped from `boundary_names_path`:
+    /// **one red in the library**, this test on the `~/…` leg alone, which is
+    /// why that leg is not folded into the first. Restored: green.
+    #[test]
+    fn a_skill_file_no_scope_names_is_a_boundary_touch_when_a_glob_names_it() {
+        use teton_core::entities::{BoundaryMode, PrivacyBoundary};
+
+        let base = temp_root("provenance-of-boundary");
+        let home = base.join("home");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(home.join(".claude/skills/userskill")).unwrap();
+        std::fs::write(
+            home.join(".claude/skills/userskill/SKILL.md"),
+            "---\ndescription: a user skill\n---\n\nUser body.\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        let registry = discover(Some(&home), &repo, RootKind::Project, &RealFs);
+        let user = registry
+            .dispatchable_by_user("userskill")
+            .expect("the user row registers");
+
+        // The file the row actually points at: under **neither** root, exactly
+        // as a `~/.claude/skills -> /Users/someone/.ssh` link would leave it.
+        let elsewhere = base.join("elsewhere").join(".ssh");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("x"), "not really a key\n").unwrap();
+        let mut strayed = user.clone();
+        strayed.path = elsewhere.join("x");
+
+        let ssh = [PrivacyBoundary::builtin("**/.ssh/**")];
+        let unrelated = [PrivacyBoundary::user("secrets/**", BoundaryMode::LocalOnly)];
+        let none: [PrivacyBoundary; 0] = [];
+
+        assert_eq!(
+            provenance_of_with_home(&repo, Some(&home), &strayed, &ssh),
+            SkillIdentity::BoundaryTouch,
+            "a path a boundary glob names pins permanently, even with no id to \
+             name it back"
+        );
+        // The two controls: the same file, and the difference is only the glob.
+        assert_eq!(
+            provenance_of_with_home(&repo, Some(&home), &strayed, &unrelated),
+            SkillIdentity::Unmintable,
+            "a glob that does not name it leaves the pin liftable"
+        );
+        assert_eq!(
+            provenance_of_with_home(&repo, Some(&home), &strayed, &none),
+            SkillIdentity::Unmintable,
+            "and with nothing configured there is nothing to have crossed"
+        );
+
+        // The `~/…` spelling (verify m2). It is reachable for a **project** row
+        // whose file resolves under the home: the project arm only ever tries
+        // the session root, so nothing mints, and the home spelling is then the
+        // only one a `~/…` glob can meet. The production shape is a
+        // `.claude/skills` link re-pointed into the home *after* discovery
+        // snapshotted the roster — the very race the durable-trust-root comment
+        // in `runtime::turn` describes, since a session reads its skills twice
+        // and a link may move between the two.
+        let private = home.join("private");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::write(private.join("notes.md"), "body\n").unwrap();
+        let mut repointed = user.clone();
+        repointed.source = SkillSource::Project;
+        repointed.path = private.join("notes.md");
+        assert_eq!(
+            provenance_of_with_home(&repo, Some(&home), &repointed, &none),
+            SkillIdentity::Unmintable,
+            "fixture: a project row under the home mints in neither scope"
+        );
+        // A glob only the home spelling can meet: the absolute spelling of this
+        // file is `<tmp>/…/home/private/notes.md`, which `~/private/**` does
+        // not match.
+        let home_glob = [PrivacyBoundary::user(
+            "~/private/**",
+            BoundaryMode::LocalOnly,
+        )];
+        assert_eq!(
+            provenance_of_with_home(&repo, Some(&home), &repointed, &home_glob),
+            SkillIdentity::BoundaryTouch,
+            "a glob in the `~/…` spelling reaches a file the absolute one does not"
+        );
 
         std::fs::remove_dir_all(&base).ok();
     }
