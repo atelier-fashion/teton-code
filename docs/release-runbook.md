@@ -433,10 +433,11 @@ is not, and a copied `pass` from another platform is a false claim.
 
 "Clean machine" means one with no recorded model decision and no downloaded
 weights — otherwise the first-run proposal, which is the entire point of AC-1,
-is not raised and the leg proves nothing. The daemon's state directory is not a
-single fixed path (`XDG_RUNTIME_DIR`, then macOS Application Support, then the
-temp dir); [manual-verification.md §0](manual-verification.md) resolves it and
-names exactly what to clear.
+is not raised and the leg proves nothing. The daemon's data directory is not a
+single fixed path (`XDG_DATA_HOME`, then `~/.local/share` on Linux or macOS
+Application Support, then the temp dir; `teton doctor` prints it);
+[manual-verification.md §0](manual-verification.md) resolves it and names
+exactly what to clear.
 
 ```
 AC-1 / AC-2 sign-off — teton vX.Y.Z

@@ -79,13 +79,24 @@ not mean now. Topic `context`.
 
 ## Where config lives
 
-`config.toml` in Teton's state directory: `$XDG_RUNTIME_DIR/teton` when that is
-set, otherwise `$HOME/Library/Application Support/teton` on macOS, and — when
-neither variable is set, which is unusual and usually means a stripped
-environment — the OS temp directory's `teton`. `TETON_CONFIG` overrides all
-three. Cost history and the downloaded model sit beside it. Keys never do.
+`config.toml` in Teton's **data** directory: `$XDG_DATA_HOME/teton` when that
+is set, otherwise `~/.local/share/teton` on Linux and
+`~/Library/Application Support/teton` on macOS, and — when neither `XDG_DATA_HOME`
+nor `HOME` is set, which is unusual and usually means a stripped environment —
+the OS temp directory's `teton`. `TETON_CONFIG` overrides all three. Cost
+history, the downloaded model, the recorded model decision, the project
+registry, the web cache and the transcripts sit beside it. Keys never do.
+Doctor prints this directory on its `data:` line.
 
-The third case is worth recognizing rather than debugging: a daemon started
-without `HOME` binds under the temp directory, so it has its own empty config
-and its own socket, and doctor reports "not running" from any shell that has
-`HOME` set. The paths doctor prints are the first line of that answer.
+The socket, the lock and the startup log live in the **runtime** directory
+instead — `$XDG_RUNTIME_DIR/teton` when that is set, else the same
+`Application Support` path on macOS — which on Linux is a tmpfs the system
+clears at logout. Until v0.1.31 everything lived there, so on Linux a logout
+took the config, the cost history and the weights with it; a daemon that finds
+those under the runtime directory now moves them to the data directory once,
+and says so on its own stderr.
+
+The temp-directory case is worth recognizing rather than debugging: a daemon
+started without `HOME` binds under the temp directory, so it has its own empty
+config and its own socket, and doctor reports "not running" from any shell that
+has `HOME` set. The paths doctor prints are the first line of that answer.

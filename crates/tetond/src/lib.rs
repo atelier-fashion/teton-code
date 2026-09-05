@@ -130,6 +130,7 @@ pub mod session_root;
 pub mod sessions;
 pub mod single_instance;
 pub mod skills;
+pub mod state_dir;
 pub mod structured;
 pub mod transcript;
 pub mod turn_context;

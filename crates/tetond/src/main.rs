@@ -97,6 +97,7 @@ fn main() -> anyhow::Result<ExitCode> {
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(std::env::temp_dir);
 
+    let data_dir = paths.data.clone();
     let socket_path_for_teardown = paths.socket.clone();
 
     let served = runtime.block_on(async move {
@@ -112,7 +113,11 @@ fn main() -> anyhow::Result<ExitCode> {
         // deliver never reached anyone. With no socket, the CLI's autostart poll
         // fails cleanly and reports the daemon's own stderr instead.
         let events = Arc::new(EventBus::new());
-        let daemon_runtime = Arc::new(DaemonRuntime::from_env(&base_dir, &events)?);
+        // BUG-211: the socket's directory and the data directory, named apart.
+        // On Linux the first is a tmpfs cleared at logout; every durable store
+        // opens under the second, and anything an older daemon left beside the
+        // socket is moved there once.
+        let daemon_runtime = Arc::new(DaemonRuntime::from_dirs(&base_dir, &data_dir, &events)?);
 
         let (policy, source) =
             lifetime::resolve_policy(policy_flags, policy_env, daemon_runtime.lifetime_config());

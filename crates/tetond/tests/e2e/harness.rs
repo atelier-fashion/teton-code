@@ -460,7 +460,19 @@ fn read_http_body(stream: &mut TcpStream) -> Vec<u8> {
 pub struct Workspace {
     pub root: PathBuf,
     pub repo: PathBuf,
+    /// Becomes `XDG_RUNTIME_DIR`: the socket, lock and log — and, before
+    /// BUG-211, everything else.
     pub runtime_dir: PathBuf,
+    /// Becomes `XDG_DATA_HOME`: where the daemon keeps its durable state
+    /// (BUG-211) and its transcripts (REQ-611). **Per workspace, not per
+    /// spawn**: the consent suite restarts a daemon and expects its weights,
+    /// its recorded decision and its config to still be there, which is the
+    /// whole point of a data directory. Two daemons spawned on one workspace
+    /// therefore share a transcript directory too; the prune at open removes
+    /// only files past `retain_days` (30 by default), so a sibling's fresh
+    /// files are never touched, and no test here asserts on transcript file
+    /// counts.
+    pub data_dir: PathBuf,
     pub config_path: PathBuf,
 }
 
@@ -480,12 +492,17 @@ impl Workspace {
         let repo = root.join("repo");
         let runtime_dir = root.join("x");
         std::fs::create_dir_all(&runtime_dir).unwrap();
+        // Not created: `resolve_data_dir` composes a path and the daemon
+        // creates what it needs, so a suite that pre-created one would be
+        // hiding the creation step from the code under test.
+        let data_dir = root.join("data");
         write_demo_repo(&repo);
         let config_path = root.join("config.toml");
         Self {
             root,
             repo,
             runtime_dir,
+            data_dir,
             config_path,
         }
     }
@@ -524,26 +541,17 @@ impl Workspace {
     /// The daemon's state directory: where the decision record and the weights
     /// live, and the reason a restarted daemon remembers anything (D-4).
     pub fn state_dir(&self) -> PathBuf {
-        self.runtime_dir.join("teton")
+        // BUG-211: the durable state lives under the **data** directory —
+        // `resolve_data_dir`'s `$XDG_DATA_HOME/teton` arm — not beside the
+        // socket. The runtime directory holds the socket, lock and log only.
+        self.data_dir.join("teton")
     }
 
-    /// A fresh `XDG_DATA_HOME` for the next daemon spawned on this workspace
-    /// (REQ-611 TASK-364).
-    ///
-    /// Not a field, because the *data* directory is per-daemon while the
-    /// workspace is per-test: `Daemon::spawn` is called more than once on one
-    /// workspace, and two daemons sharing a transcript directory would prune
-    /// each other's files at start (BR-13 runs a deletion pass on every open).
-    /// The counter is process-wide for `Workspace::new`'s reason — two tests on
-    /// one clock tick must not collide.
-    ///
-    /// The directory is **not** created: `resolve_data_dir` composes a path and
-    /// the sink creates what it needs, so a suite that pre-created one would be
-    /// hiding the creation step from the code under test.
-    pub fn data_dir_for_spawn(&self) -> PathBuf {
-        static SEQ: AtomicUsize = AtomicUsize::new(0);
-        self.root
-            .join(format!("data{}", SEQ.fetch_add(1, Ordering::SeqCst)))
+    /// The socket's directory — `resolve_base_dir`'s `$XDG_RUNTIME_DIR/teton`
+    /// arm. What a pre-BUG-211 daemon used for everything, and what a test
+    /// plants legacy state under to exercise the migration.
+    pub fn runtime_state_dir(&self) -> PathBuf {
+        self.runtime_dir.join("teton")
     }
 
     /// Where installed weights land. Local display only — this path never
@@ -644,9 +652,11 @@ impl Daemon {
             // Support/teton` on macOS — and since TASK-362 every daemon runs
             // `prune` over its transcript directory at start. Left unset, every
             // spawned daemon in this suite would run a deletion pass over the
-            // developer's own machine. Per-daemon, so two daemons in one test
-            // never prune each other's files either.
-            .env("XDG_DATA_HOME", workspace.data_dir_for_spawn())
+            // developer's own machine. Since BUG-211 it is also where the
+            // daemon keeps every durable store, so it is per **workspace**:
+            // a restarted daemon must find its weights and its recorded
+            // decision where it left them (see `Workspace::data_dir`).
+            .env("XDG_DATA_HOME", &workspace.data_dir)
             .env("TETON_CONFIG", &workspace.config_path)
             .env("TETON_REPO_ROOT", &workspace.repo)
             // DECISION 3: the acceptance suite drives the daemon through gated

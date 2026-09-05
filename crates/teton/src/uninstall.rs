@@ -41,10 +41,18 @@ pub struct Plan {
     /// were not brew-managed (or brew is broken) — the service and binary
     /// steps are skipped and reported, not silently dropped.
     pub brew_prefix: Option<PathBuf>,
-    /// The daemon state directory (socket parent — the same base `tetond`
-    /// resolves): model weights, cost ledger, config, selection record.
+    /// The daemon's **data** directory (`DaemonPaths::data`, the same one
+    /// `tetond` opens its stores under — BUG-211): model weights, cost ledger,
+    /// config, selection record, project registry, web cache, transcripts.
     pub state_dir: PathBuf,
-    /// Recursive size of `state_dir`, for the confirmation line.
+    /// The socket's directory, when it is a **different** place from
+    /// `state_dir` (Linux, where it is the logout-cleared runtime dir):
+    /// socket, lock, startup log, and whatever a pre-BUG-211 daemon left
+    /// there. `None` when the two coincide (macOS), so nothing is deleted or
+    /// counted twice.
+    pub runtime_dir: Option<PathBuf>,
+    /// Recursive size of `state_dir` plus `runtime_dir`, for the
+    /// confirmation line.
     pub state_bytes: u64,
     /// Does `state_dir` exist at all? Distinguishes "--keep-data kept it" from
     /// "there was nothing to delete" in the rendered plan.
@@ -66,12 +74,16 @@ impl Plan {
         brew_prefix: Option<PathBuf>,
         tap_registered: bool,
     ) -> Self {
-        let state_dir = paths
+        let state_dir = paths.data.clone();
+        // BUG-211: the socket's directory is deleted too when it is somewhere
+        // else — it holds the lock, the log and anything an older daemon left —
+        // but never counted or removed twice when it is the same place.
+        let runtime_dir = paths
             .socket
             .parent()
             .map(Path::to_path_buf)
-            .unwrap_or_else(std::env::temp_dir);
-        let state_exists = state_dir.is_dir();
+            .filter(|dir| dir != &state_dir && dir.is_dir());
+        let state_exists = state_dir.is_dir() || runtime_dir.is_some();
         let log_dir = brew_prefix
             .as_deref()
             .map(|prefix| prefix.join("var/log/teton"))
@@ -80,13 +92,14 @@ impl Plan {
             untap: brew_prefix.is_some() && tap_registered,
             brew_prefix,
             state_bytes: if state_exists {
-                dir_size(&state_dir)
+                dir_size(&state_dir) + runtime_dir.as_deref().map_or(0, dir_size)
             } else {
                 0
             },
             state_exists,
             delete_state: state_exists && !keep_data,
             state_dir,
+            runtime_dir,
             log_dir,
         }
     }
@@ -135,6 +148,15 @@ pub fn render_plan(plan: &Plan, surface: &mut dyn Surface) {
                 format_bytes(plan.state_bytes),
             ),
         );
+        if let Some(runtime_dir) = &plan.runtime_dir {
+            surface.line(
+                LineKind::Info,
+                &format!(
+                    "  - delete the daemon's runtime files at {}",
+                    runtime_dir.display()
+                ),
+            );
+        }
     } else if plan.state_exists {
         surface.line(
             LineKind::Notice,
@@ -199,8 +221,14 @@ fn execute(paths: &DaemonPaths, plan: &Plan, surface: &mut dyn Surface) -> anyho
     ensure_daemon_down(paths)?;
 
     if plan.delete_state {
-        std::fs::remove_dir_all(&plan.state_dir)
-            .map_err(|e| anyhow!("could not delete {}: {e}", plan.state_dir.display()))?;
+        if plan.state_dir.is_dir() {
+            std::fs::remove_dir_all(&plan.state_dir)
+                .map_err(|e| anyhow!("could not delete {}: {e}", plan.state_dir.display()))?;
+        }
+        if let Some(runtime_dir) = &plan.runtime_dir {
+            std::fs::remove_dir_all(runtime_dir)
+                .map_err(|e| anyhow!("could not delete {}: {e}", runtime_dir.display()))?;
+        }
         surface.line(
             LineKind::Info,
             &format!(
@@ -404,6 +432,7 @@ mod tests {
             lock: base.join("tetond.lock"),
             log: base.join("tetond.log"),
             projects: base.join("projects.json"),
+            data: base.to_path_buf(),
         }
     }
 
@@ -436,6 +465,49 @@ mod tests {
         let mut surface = RecordingSurface::new();
         render_plan(&absent, &mut surface);
         assert!(surface.any_line_contains(crate::render::LineKind::Notice, "nothing to delete"));
+    }
+
+    /// **BUG-211.** On Linux the socket's directory and the data directory
+    /// are different places; the plan names both, sizes both, and the run
+    /// deletes both. On macOS they coincide and the runtime arm is `None`, so
+    /// nothing is counted or removed twice — which is what
+    /// [`plan_measures_state_and_honours_keep_data`] asserts through
+    /// `temp_state`, whose `data` is the socket's parent.
+    #[test]
+    fn a_separate_runtime_dir_is_named_sized_and_deleted_with_the_data_dir() {
+        let mut paths = temp_state("split");
+        let data = paths.data.clone();
+        // A sibling of the data directory, never its parent: the parent is
+        // the shared OS temp dir.
+        let runtime = data.with_file_name(format!(
+            "{}-run",
+            data.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::write(runtime.join("tetond.log"), vec![0u8; 52]).unwrap();
+        paths.socket = runtime.join("tetond.sock");
+        paths.lock = runtime.join("tetond.lock");
+        paths.log = runtime.join("tetond.log");
+
+        let plan = Plan::build(&paths, false, None, false);
+        assert_eq!(plan.state_dir, data);
+        assert_eq!(plan.runtime_dir.as_deref(), Some(runtime.as_path()));
+        assert_eq!(plan.state_bytes, 2148 + 52, "both directories are sized");
+        let mut surface = RecordingSurface::new();
+        render_plan(&plan, &mut surface);
+        assert!(surface.any_line_contains(
+            crate::render::LineKind::Info,
+            "delete the daemon's runtime files at"
+        ));
+
+        // The same two, coinciding: no runtime arm, no double count.
+        paths.socket = data.join("tetond.sock");
+        let same = Plan::build(&paths, false, None, false);
+        assert_eq!(same.runtime_dir, None);
+        assert_eq!(same.state_bytes, 2148);
+
+        std::fs::remove_dir_all(&data).unwrap();
+        std::fs::remove_dir_all(&runtime).unwrap();
     }
 
     #[test]
