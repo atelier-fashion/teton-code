@@ -566,6 +566,21 @@
   should plan to raise the ceiling and re-derive the four figures below it
   (ASSUME-043).
 
+  **The command-awareness chain has a third guard** (ASSUME-044). REQ-617
+  pinned the roster to the CLI table and the docs page to the roster, and
+  nothing pinned the resident prompt's family list to either — so REQ-614's
+  `/shell allow`, the first command in a family that list did not name,
+  merged with both guards green. Now
+  `the_resident_prompt_names_every_command_family_the_roster_carries`
+  (`harness/turn_loop.rs`) reads the families out of the command sentence
+  itself — scoped to the sentence, because the guide also carries endpoint
+  paths — and holds them equal to the roster's, both directions and in `/help`
+  order, with an empty, documented list for families deliberately kept out.
+  `/shell` was added rather than exempted: the `shell` tool's description says
+  nothing about the pin, so the model has no other resident route to the
+  remedy. Seven bytes, re-measured 112 → 105 and 159 → 152, 57 usable above
+  the floor.
+
 - **A repository-touching act with no human typing a name gets its own gate
   entry point, keyed by the durable root** (REQ-613). Writing a missing
   `TETON.md` is a *daemon* act rather than a tool call, so no tool name is on
