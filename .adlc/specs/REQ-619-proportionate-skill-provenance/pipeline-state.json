@@ -1,0 +1,28 @@
+{
+  "req": "REQ-619",
+  "branch": "feat/REQ-619-proportionate-skill-provenance",
+  "startedAt": "2026-09-05T16:58:44Z",
+  "completed": false,
+  "currentPhase": 0,
+  "completedPhases": [],
+  "phaseHistory": [],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-619",
+      "branch": "feat/REQ-619-proportionate-skill-provenance",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "prCreatedAt": null,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": ["teton-code"],
+  "phase4": { "currentTask": null, "completedTasks": [], "failedTasks": [] },
+  "conflictsResolved": []
+}
