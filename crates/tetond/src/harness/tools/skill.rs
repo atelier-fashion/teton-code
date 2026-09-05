@@ -2031,13 +2031,33 @@ impl SkillTool {
             // for every command. The fold ignores a `NotRun`'s verdict — BR-2's
             // "a command that did not run contributes nothing" — which is
             // decided in `fold_expansion` and not by withholding it here.
-            Some(reason) => commands
-                .iter()
-                .map(|command| PreambleRun {
-                    verdict: preamble_verdict(&reach, command),
-                    outcome: door_outcome(reason),
+            //
+            // **On the blocking pool, exactly as the arm above (REQ-619 verify,
+            // M1).** No process is spawned here, which is what made an inline
+            // call look free — but `preamble_verdict` walks a subtree to decide
+            // whether a directory a command reads could hold a protected file,
+            // with a per-command budget of up to 1.5 s
+            // (`shell_provenance::subtree_is_boundary_free`), and an invocation
+            // may carry `MAX_DYNAMIC_COMMANDS` of them. A declined invocation
+            // could therefore park an async worker for tens of seconds and
+            // stall every other session on it — the same reason the
+            // consent-given arm is not inline. The door being shut changes how
+            // long the work takes, not where it belongs.
+            Some(reason) => {
+                let reach = reach.clone();
+                let to_classify = commands.clone();
+                tokio::task::spawn_blocking(move || {
+                    to_classify
+                        .iter()
+                        .map(|command| PreambleRun {
+                            verdict: preamble_verdict(&reach, command),
+                            outcome: door_outcome(reason),
+                        })
+                        .collect()
                 })
-                .collect(),
+                .await
+                .expect("the preamble classifier does not panic")
+            }
         };
         let outcomes: Vec<crate::skills::DynamicOutcome> =
             runs.iter().map(|run| run.outcome.clone()).collect();

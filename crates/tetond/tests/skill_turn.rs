@@ -41,6 +41,7 @@
 //! | **REQ-619 BR-2/AC-6: a boundary-naming preamble is refused whatever it exits** | [`a_boundary_naming_preamble_is_refused_whatever_it_exits`], [`an_out_of_root_boundary_preamble_pins_on_the_boundary_touch_sentinel`] |
 //! | **REQ-619 BR-8: a pinned skill turn is announced through the existing sink** | [`a_pinned_skill_turn_is_announced_through_the_existing_sink`] |
 //! | **REQ-619 BR-1: no production provenance reads `spawned`** (LESSON-550) | [`no_production_provenance_reads_spawned_any_more`] |
+//! | **REQ-619 verify M1: the closed door classifies on the blocking pool** | [`the_closed_door_arm_classifies_off_the_async_worker`] |
 //! | BR-12/ADR-15: the event, from the value the daemon emitted | [`the_invocation_event_carries_what_the_daemon_read_off_the_file`], [`a_skill_with_no_dynamic_context_asks_nothing_and_still_echoes_its_invocation`] |
 //! | BR-1/BUG-187: neither source reaches the wire absolute | [`the_invocation_event_carries_what_the_daemon_read_off_the_file`] |
 //! | BR-1/ADR-2: the relative spelling is bounded too | [`a_relative_path_past_the_display_ceiling_is_still_elided_on_the_wire`] |
@@ -2965,39 +2966,8 @@ async fn a_pinned_skill_turn_is_announced_through_the_existing_sink() {
 /// them.
 #[test]
 fn no_production_provenance_reads_spawned_any_more() {
-    /// The production half of one file, cut at its **test module**.
-    ///
-    /// Deliberately not [`production_source`], which cuts at the first
-    /// column-0 `#[cfg(test)]` of a file. `harness/tools/skill.rs` carries one
-    /// of those at line ~811 — a single test-only helper
-    /// (`durable_trust_root_name_by_resolving`), gated exactly so production
-    /// cannot reach it — and cutting there would leave 1,500 lines of
-    /// production code, the provenance mapping among them, outside the corpus.
-    /// A scan that silently stops before the thing it is scanning for is the
-    /// failure mode LESSON-594 names, and the vacuity floor below is what would
-    /// have caught it (and did).
-    fn production_half_of(relative: &str) -> String {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join(relative);
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-        match text.find("\n#[cfg(test)]\nmod tests {") {
-            Some(at) => text[..at].to_owned(),
-            None => text,
-        }
-    }
-
     for relative in ["runtime/turn.rs", "harness/tools/skill.rs"] {
-        let source = production_half_of(relative);
-        // Code, not prose *about* code: both files explain in comments why the
-        // rule was retired, and a scan that reddened on the explanation would
-        // make the honest thing to write the thing that fails.
-        let code: String = source
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let code = production_code_of(relative);
         for spelling in ["DynamicOutcome::spawned", ".any(DynamicOutcome::spawned)"] {
             assert!(
                 !code.contains(spelling),
@@ -3006,12 +2976,144 @@ fn no_production_provenance_reads_spawned_any_more() {
                  and reading both is how the two seams come to disagree"
             );
         }
+        // The floor reads the **same** corpus as the assertions above (REQ-619
+        // verify, m6). It used to read the uncommented source, which is a
+        // weaker instrument than the thing it is guarding: a file that had
+        // deleted its call but still mentioned `fold_expansion(` in a comment —
+        // and both of these files discuss it at length — would have kept the
+        // floor green while the negative assertions were scanning a corpus with
+        // no call site left in it. That is exactly the vacuity the floor is for.
         assert!(
-            source.contains("fold_expansion("),
+            code.contains("fold_expansion("),
             "vacuity floor: `{relative}` no longer calls the fold, so the \
              absence above is the absence of a call site rather than of a rule"
         );
     }
+}
+
+/// **REQ-619 verify, M1 — the closed door classifies on the blocking pool.**
+///
+/// Both skill paths take a verdict for every preamble even when the consent
+/// door is shut, because a verdict is a fact about the command *text* (BR-1).
+/// That work is not free: `preamble_verdict` may walk a subtree to decide
+/// whether a directory a command reads could hold a protected file, with a
+/// per-command budget of up to 1.5 seconds, and an invocation may carry
+/// `MAX_DYNAMIC_COMMANDS` of them. Run inline on the async worker — which is
+/// where both arms started — a *declined* invocation could park a tokio worker
+/// for tens of seconds and stall every other session assigned to it. The
+/// consent-given arm was already on `spawn_blocking` for exactly this reason;
+/// the closed-door arm is now beside it.
+///
+/// # Why this is a source scan
+///
+/// The property is "this work happens on the blocking pool", and no observation
+/// available to a test distinguishes that from "this work happens quickly". A
+/// timing assertion would be measuring the fixture's subtree, not the executor,
+/// and would be the flakiest kind of test on a loaded CI box. `tokio` exposes no
+/// per-task record of which pool ran a closure. So the assertion is about the
+/// shape of the code, in the two files that have the arm — the same instrument
+/// and the same reasoning as the scan above (LESSON-550).
+///
+/// # The bounded region
+///
+/// Scanning a whole file for `spawn_blocking` would pass on either arm having
+/// one. The region is therefore cut to the `match door` expression itself —
+/// from `let runs:` to the `let outcomes:` that consumes it — and inside it the
+/// closed-door arm is cut again at `Some(reason) =>`. What is asserted is that
+/// the arm mentions `spawn_blocking` **before** its `preamble_verdict(` call,
+/// which is what "inside the closure" means textually.
+///
+/// The floors are the other half, and there are three: the region must be
+/// found, the arm must be found, and the arm must still contain a
+/// `preamble_verdict(` call. Without them a rename of any one anchor turns this
+/// into a test that asserts nothing (LESSON-594).
+///
+/// # Mutation
+///
+/// Ran with the `harness/tools/skill.rs` arm reverted to the inline
+/// `commands.iter().map(…).collect()`: **one red**, this test, naming that
+/// file. Ran again with the `runtime/turn.rs` arm reverted: one red, naming
+/// that one. Ran a third time against the floor rather than the rule — the call
+/// bound to a local alias (`let classify = preamble_verdict;`) so the anchor
+/// disappears while the behaviour does not — and the arm floor goes red instead
+/// of the assertion passing on an empty region, which is what the floor is for.
+/// Restored each time: green, 60 of 60 in this file.
+#[test]
+fn the_closed_door_arm_classifies_off_the_async_worker() {
+    for relative in ["runtime/turn.rs", "harness/tools/skill.rs"] {
+        let code = production_code_of(relative);
+        // The `match door` expression, and nothing else in the file: a scan
+        // over the whole source would be satisfied by the consent-given arm's
+        // `spawn_blocking` and could never fail.
+        let from = code
+            .find("let runs:")
+            .unwrap_or_else(|| panic!("floor: no `let runs:` binding in `{relative}`"));
+        let to = code[from..]
+            .find("let outcomes:")
+            .unwrap_or_else(|| panic!("floor: no `let outcomes:` after it in `{relative}`"))
+            + from;
+        let region = &code[from..to];
+
+        let arm_at = region
+            .find("Some(reason) =>")
+            .unwrap_or_else(|| panic!("floor: no closed-door arm in `{relative}`"));
+        let arm = &region[arm_at..];
+
+        let verdict_at = arm.find("preamble_verdict(").unwrap_or_else(|| {
+            panic!(
+                "floor: the closed-door arm of `{relative}` no longer classifies \
+                 at all — BR-1 wants the verdict taken whether the command runs \
+                 or not, so this is not the way to get it off the async worker"
+            )
+        });
+        let blocking_at = arm.find("spawn_blocking").unwrap_or_else(|| {
+            panic!(
+                "the closed-door arm in `{relative}` classifies inline: \
+                 `preamble_verdict` can spend up to 1.5s per command walking a \
+                 subtree, and MAX_DYNAMIC_COMMANDS of them on an async worker \
+                 stalls every other session on it"
+            )
+        });
+        assert!(
+            blocking_at < verdict_at,
+            "the closed-door arm in `{relative}` classifies inline: its \
+             `preamble_verdict` call is not inside the `spawn_blocking` closure"
+        );
+    }
+}
+
+/// The production half of one file, comments stripped — the corpus the two
+/// source scans above read.
+///
+/// Deliberately not [`production_source`], which cuts at the first column-0
+/// `#[cfg(test)]` of a file. `harness/tools/skill.rs` carries one of those at
+/// line ~811 — a single test-only helper (`durable_trust_root_name_by_resolving`),
+/// gated exactly so production cannot reach it — and cutting there would leave
+/// 1,500 lines of production code, the provenance mapping among them, outside
+/// the corpus. A scan that silently stops before the thing it is scanning for
+/// is the failure mode LESSON-594 names, and a vacuity floor is what catches it
+/// (and did).
+///
+/// Comment lines are dropped because these scans are about code, not about
+/// prose describing code: both files explain at length why the `spawned` rule
+/// was retired and why the classification moved to the blocking pool, and a
+/// scan that reddened on the explanation would make the honest thing to write
+/// the thing that fails.
+fn production_code_of(relative: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join(relative);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    let production = match text.find("\n#[cfg(test)]\nmod tests {") {
+        Some(at) => &text[..at],
+        None => &text[..],
+    };
+    production
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ---------------------------------------------------------------------------
