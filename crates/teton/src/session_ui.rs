@@ -34,7 +34,7 @@ use teton_protocol::events::{
     PermissionOptionKind, PermissionRequest, PermissionSubject, PhaseTransition, PinRemedy,
     PrefixCache, PrefixCacheMiss, PrefixCacheOutcome, PrivacyAction, PrivacyBlock,
     ProvenanceRejected, ProvenanceRejection, ProviderDegraded, ProviderSetupCompleted,
-    ProviderSetupRejected, ProviderTested, RemedyKind, RouteDecided, SessionGrantMinted,
+    ProviderSetupRejected, ProviderTested, Reach, RemedyKind, RouteDecided, SessionGrantMinted,
     SessionPinLifted, SessionPinned, SessionUpdatePayload, ShellDutySkipped, SkillInvoked,
     SkillOverBudgetAccepted, SkillOverBudgetOffered, SkillOverBudgetRemedyApplied,
     SkillRefusedNoRoom, SkillStage, TierWarming, ToolCallRepeated, ToolCallStatus, TurnQueued,
@@ -1662,6 +1662,12 @@ fn render_invocation_detail(invoked: &SkillInvoked, surface: &mut dyn Surface) {
     }
     for view in &invoked.outcomes {
         surface.line(LineKind::Info, &dynamic_outcome_line(view));
+        // Under the command it is about, not gathered into a block of its own:
+        // "which preamble pinned this session" is answered by adjacency, and a
+        // second list would make the reader zip two lists by eye (REQ-619 BR-7).
+        if let Some(line) = reach_line(view) {
+            surface.line(LineKind::Info, &line);
+        }
     }
 }
 
@@ -1965,6 +1971,39 @@ fn dynamic_outcome_line(view: &DynamicOutcomeView) -> String {
         dynamic_command_text(&view.command),
         dynamic_outcome_words(&view.outcome)
     )
+}
+
+/// One `/verbose` line saying how far a dynamic command reached, or `None`
+/// when there is nothing to say (REQ-619 BR-7).
+///
+/// **Two silences, and they are different facts.** `reach: None` is a daemon
+/// that does not classify preambles at all — every build before REQ-619 — and
+/// [`Reach::Rooted`] is a command that *was* classified and proved harmless.
+/// Neither is news. A line under every `cat README.md` would bury the one
+/// command that pinned the session among three that did not, which is exactly
+/// the "which of my four preambles did this?" BUG-214 left a user unable to
+/// answer.
+///
+/// The reason is the daemon's own sentence, rendered and not re-worded: the
+/// classifier's closed set of reasons is its to change, and a client that
+/// composed its own would be a second author of them (LESSON-529). It is
+/// daemon-authored and `&'static` at the source, so it carries no command text
+/// and no output (BR-7); `Surface::line` defuses it here regardless, as it
+/// defuses every string this module draws.
+///
+/// A daemon that sent a reach with no reason still gets its line: the *kind* is
+/// the actionable half, and dropping the line for a missing adjective would
+/// answer "which preamble" with nothing.
+fn reach_line(view: &DynamicOutcomeView) -> Option<String> {
+    let words = match view.reach? {
+        Reach::Rooted => return None,
+        Reach::BoundaryTouch => "boundary touch",
+        Reach::Unknown => "unknown reach",
+    };
+    Some(match &view.reach_reason {
+        Some(reason) => format!("  reach: {words} — {reason}"),
+        None => format!("  reach: {words}"),
+    })
 }
 
 /// A dynamic command as both surfaces spell it — the consent and the
@@ -10890,6 +10929,8 @@ mod skill_tests {
 
     fn ran(command: &str, bytes: u64) -> DynamicOutcomeView {
         DynamicOutcomeView {
+            reach: None,
+            reach_reason: None,
             command: command.to_owned(),
             outcome: DynamicOutcome::Ran {
                 output_bytes: bytes,
@@ -10944,12 +10985,16 @@ mod skill_tests {
         let outcomes = vec![
             ran("ls -1", 120),
             DynamicOutcomeView {
+                reach: None,
+                reach_reason: None,
                 command: "date".to_owned(),
                 outcome: DynamicOutcome::NotRun {
                     reason: NotRunReason::Declined,
                 },
             },
             DynamicOutcomeView {
+                reach: None,
+                reach_reason: None,
                 command: "git status".to_owned(),
                 outcome: DynamicOutcome::NotRun {
                     reason: NotRunReason::Declined,
@@ -11454,6 +11499,8 @@ mod skill_tests {
     #[test]
     fn the_echo_line_counts_zero_and_one_in_words_that_read() {
         let declined = |command: &str| DynamicOutcomeView {
+            reach: None,
+            reach_reason: None,
             command: command.to_owned(),
             outcome: DynamicOutcome::NotRun {
                 reason: NotRunReason::Declined,
@@ -11482,6 +11529,8 @@ mod skill_tests {
                 vec![
                     ran("ls -1", 12),
                     DynamicOutcomeView {
+                        reach: None,
+                        reach_reason: None,
                         command: "false".to_owned(),
                         outcome: DynamicOutcome::Failed {
                             exit_status: Some(1),
@@ -11508,18 +11557,24 @@ mod skill_tests {
         let event = Event::SkillInvoked(invoked(vec![
             ran("ls -1 .adlc/specs", 2_048),
             DynamicOutcomeView {
+                reach: None,
+                reach_reason: None,
                 command: "git status --short".to_owned(),
                 outcome: DynamicOutcome::NotRun {
                     reason: NotRunReason::NoTerminal,
                 },
             },
             DynamicOutcomeView {
+                reach: None,
+                reach_reason: None,
                 command: "false".to_owned(),
                 outcome: DynamicOutcome::Failed {
                     exit_status: Some(1),
                 },
             },
             DynamicOutcomeView {
+                reach: None,
+                reach_reason: None,
                 command: "sleep 600".to_owned(),
                 outcome: DynamicOutcome::TimedOut,
             },
@@ -11562,6 +11617,96 @@ mod skill_tests {
                 "  !`sleep 600` — timed out",
             ],
             "one line per command, in document order"
+        );
+    }
+
+    /// **REQ-619 BR-7 / BR-8: `/verbose` says which preamble pinned the
+    /// session, and says nothing about the ones that did not.**
+    ///
+    /// BUG-214's shape, rendered: a skill whose four commands are one boundary
+    /// touch, one opaque verb and two ordinary reads. `session_pinned` already
+    /// tells the user the session pinned and offers `/shell allow` (BR-8 adds
+    /// no surface beside it); what it cannot say is *which* of the four did it,
+    /// and that is this line's whole job.
+    ///
+    /// The four rows are chosen so the three silences are distinguishable:
+    /// `Rooted` (classified, proved harmless), `None` (a daemon that does not
+    /// classify at all), and — by exact-sequence assertion rather than by
+    /// `any_line_contains` — the absence of a *fifth* line anywhere. A
+    /// contains-assertion here would pass a renderer that printed the reach
+    /// block under the wrong command, or twice, which is the failure adjacency
+    /// exists to prevent.
+    ///
+    /// Mutation (run, red, reverted): deleting the `Reach::Rooted => return
+    /// None` arm in `reach_line` so a rooted command renders `reach: rooted —
+    /// …` too. **1 red**, this test, on the exact-sequence leg. Second mutation
+    /// (run, red, reverted): rendering the reach lines in a second loop after
+    /// the outcome lines instead of inside the first — every line is still
+    /// drawn and the sequence leg goes red on the order. **1 red**, this test.
+    #[test]
+    fn a_non_rooted_preamble_prints_its_reason_under_verbose_and_a_rooted_one_prints_nothing() {
+        /// One classified outcome, as `outcome_view` projects one: the reason
+        /// is the daemon's `Verdict::reason` verbatim, and these are the
+        /// classifier's own literals.
+        fn classified(command: &str, reach: Reach, reason: &str) -> DynamicOutcomeView {
+            DynamicOutcomeView {
+                command: command.to_owned(),
+                outcome: DynamicOutcome::Ran {
+                    output_bytes: 64,
+                    truncated: false,
+                },
+                reach: Some(reach),
+                reach_reason: Some(reason.to_owned()),
+            }
+        }
+
+        let event = Event::SkillInvoked(invoked(vec![
+            classified(
+                "cat README.md",
+                Reach::Rooted,
+                "every path the command names resolved inside the session root",
+            ),
+            classified(
+                "cat secrets/prod.env",
+                Reach::BoundaryTouch,
+                "a path argument matches a privacy boundary",
+            ),
+            classified(
+                "sh .adlc/partials/ethos-include.sh",
+                Reach::Unknown,
+                "the command runs an interpreter, build tool or network client",
+            ),
+            // A daemon predating REQ-619: it classified nothing, so there is
+            // nothing to say — and what it said about the command is unchanged.
+            ran("date", 8),
+        ]));
+
+        // Nothing at all without `/verbose`: the reach line is detail, and the
+        // pin's own announcement is a separate event.
+        let mut quiet = RecordingSurface::new();
+        let mut state = SessionState::new();
+        render_event(&envelope(event.clone()), &mut quiet, &mut state);
+        assert_eq!(quiet.calls.len(), 1, "no reach detail without /verbose");
+
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.verbose = true;
+        render_event(&envelope(event), &mut surface, &mut state);
+
+        let detail = surface.lines_of(LineKind::Info);
+        assert_eq!(
+            &detail[2..],
+            [
+                "  !`cat README.md` — ran (64 B)",
+                "  !`cat secrets/prod.env` — ran (64 B)",
+                "  reach: boundary touch — a path argument matches a privacy boundary",
+                "  !`sh .adlc/partials/ethos-include.sh` — ran (64 B)",
+                "  reach: unknown reach — the command runs an interpreter, build tool or \
+                 network client",
+                "  !`date` — ran (8 B)",
+            ],
+            "two reach lines for four commands, each under its own — and the \
+             rooted row and the unclassified row are silent: {detail:?}"
         );
     }
 

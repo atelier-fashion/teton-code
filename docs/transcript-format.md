@@ -190,6 +190,29 @@ Two things never appear:
   belong to no session, and a file its owner may share should not carry other
   sessions' activity.
 
+### `skill_invoked` outcomes: how far each preamble reached
+
+One entry of `skill_invoked`'s `outcomes` array describes one `` !`command` ``
+the skill's body ran. Beside the `command` and the `outcome` it has always
+carried, an entry may carry two **optional** fields naming how far the daemon
+could prove that command reached, taken before it ran:
+
+| field | value |
+|---|---|
+| `outcomes[].reach` | `rooted`, `boundary_touch` or `unknown` — a closed vocabulary |
+| `outcomes[].reach_reason` | one sentence, from the classifier's own closed set |
+
+`rooted` means every path the command named resolved inside the session root
+and touched no privacy boundary; `boundary_touch` means one of them matched a
+`local-only` glob; `unknown` means nothing could be proved. Both keys are
+**absent** on a record written by a daemon that did not classify preambles —
+which is not the same fact as `"reach": "unknown"`, a command that *was*
+classified and proved nothing.
+
+`reach_reason` is chosen from a fixed set of sentences and can never contain the
+command's text or a byte of its output. The command itself appears once, on
+`command`, bounded, exactly as it did before these fields existed.
+
 ## Truncation is marked, never silent
 
 Any string value in a record — at any depth, so a prompt block's `text` and a
@@ -214,6 +237,9 @@ Two edges worth knowing when you compare lengths:
   of what the session is permitted to do.
 - **The wire to the model.** No composed provider request, no raw provider
   response. The transcript records the session's surface, not its egress.
+- **A skill preamble's output.** A `skill_invoked` outcome records how many
+  bytes a `` !`command` `` produced and how far it reached, never what it
+  printed.
 - **The transcript's own path**, in anything published. Clients are told that
   recording started or stopped; only the connection that asks is told where.
 
