@@ -212,7 +212,9 @@ use crate::router::{
 use crate::selection_store::SelectionStore;
 use crate::session_root::{home, ProbedRoot};
 use crate::sessions::{validate_session_cwd, GenerationState, SessionRegistry, TurnClaimError};
-use crate::skills::dynamic::{closed_door, door_outcome, outcome_view, preamble_verdict, Reach};
+use crate::skills::dynamic::{
+    closed_door, door_outcome, outcome_view, preamble_verdict, PreambleReach,
+};
 use crate::skills::{Expansion, Pending, SkillRegistry, SkillSource};
 // REQ-611: the sink is constructed here (`from_env`), and the two hand-offs the
 // runtime owns — a session's creation and a permission answer — are methods on

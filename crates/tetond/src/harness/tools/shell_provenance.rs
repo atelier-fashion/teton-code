@@ -202,6 +202,26 @@ impl Verdict {
         }
     }
 
+    /// The verdict for a command the daemon **did not classify at all**
+    /// (REQ-619 verify, m3).
+    ///
+    /// `Unknown`, and content-free like every other verdict here: "not asked"
+    /// and "asked, and could not prove it" must be indistinguishable
+    /// downstream, because the only honest thing to say about an unclassified
+    /// command is that its reach is unknown. It is a named constructor rather
+    /// than a raw [`Self::unknown`] call so the one legitimate synthesis site
+    /// is visible — `skills::dynamic::run_all_with`, for a command the
+    /// invocation's whole-run budget stopped before it started — and a second
+    /// one has to be added here to exist.
+    ///
+    /// The fold ignores a `NotRun` command's verdict entirely (BR-2), so this
+    /// value reaches no provenance decision. It exists because `PreambleRun`
+    /// carries a verdict for every command and a half-record would be worse
+    /// than a conservative one.
+    pub(crate) fn not_classified() -> Self {
+        Self::unknown("the invocation's budget was spent before this command was classified")
+    }
+
     /// A boundary touch, carrying whatever the tokens proved: the in-root ids
     /// in `sources`, and whether any matched path lay outside the root.
     ///

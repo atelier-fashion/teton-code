@@ -1202,7 +1202,7 @@ const STATIC_SKILL: &str = "---\ndescription: the static skill\n---\n\
 /// claims nothing about production. `no_production_provenance_reads_spawned_any_more`
 /// in `skill_turn.rs` is what holds the production side.
 ///
-/// The runner is handed a real [`Reach`] — the same four values `ShellTool::run`
+/// The runner is handed a real [`PreambleReach`] — the same four values `ShellTool::run`
 /// hands the classifier — because the verdict-free shim it used to call is gone;
 /// with no boundaries in the set the classifier short-circuits and the verdicts
 /// are `Unknown`, which is what these callers' seeds already assume.
@@ -1217,7 +1217,7 @@ fn ran_expansion(repo: &std::path::Path, name: &str, arguments: &str) -> (String
         .dispatchable_by_user(name)
         .unwrap_or_else(|| panic!("the fixture must register `{name}`"));
     let expansion = tetond::skills::expand(skill, arguments, &format!(".claude/…/{name}"));
-    let reach = tetond::skills::dynamic::Reach {
+    let reach = tetond::skills::dynamic::PreambleReach {
         root: repo.to_path_buf(),
         root_kind: teton_protocol::methods::RootKind::Project,
         // Empty on purpose: this helper's callers seed the provenance
@@ -1663,7 +1663,7 @@ async fn drive_model_skill_call(
         config.context_budget_tokens,
     );
     ctx.push_user(PROMPT);
-    // REQ-619 ADR-619-1: the tool builds its preamble `Reach` from **this**
+    // REQ-619 ADR-619-1: the tool builds its preamble `PreambleReach` from **this**
     // context, so it needs the session's real boundary set and a project root
     // to reach any verdict but `Unknown` — the same reason `run_touching_tool`
     // above gives for the `shell` classifier. Handed the same `boundary_set` the

@@ -318,12 +318,12 @@ struct ExpansionInputs<'a> {
     routed_text: &'a str,
     system: &'a str,
     /// The turn's tool jail, for the one thing the expansion stage asks of it:
-    /// the [`Reach`] its preambles are classified against (REQ-619 ADR-619-1).
+    /// the [`PreambleReach`] its preambles are classified against (REQ-619 ADR-619-1).
     ///
     /// It is the **same context** the tools run under — built by
     /// `assemble_harness` a few lines above the call site, with the transcript
     /// directory already denied — rather than a second assembly off `config`.
-    /// A `Reach` composed beside it would classify against a denial set the
+    /// A `PreambleReach` composed beside it would classify against a denial set the
     /// commands do not actually run under, and the two would agree only until
     /// one of them was edited.
     tool_ctx: &'a ToolContext,
@@ -1400,7 +1400,7 @@ impl DaemonRuntime {
             // `config.boundaries` raw: that is the un-composed row set, and
             // classifying against it would judge a command by a different
             // boundary list than the one egress will judge its output by.
-            let reach = Reach {
+            let reach = PreambleReach {
                 root: tool_ctx.repo_root().to_path_buf(),
                 root_kind: tool_ctx.root_kind(),
                 boundaries: tool_ctx.boundaries().to_vec(),
@@ -2484,7 +2484,7 @@ impl DaemonRuntime {
         invoker: Option<ConnectionId>,
         // REQ-619 verify M6: the composed set, not `config.boundaries` raw —
         // the identity mint asks the same question of the same globs egress
-        // will ask of the answer (the reasoning at the `Reach` construction
+        // will ask of the answer (the reasoning at the `PreambleReach` construction
         // below, one seam earlier in the turn).
         boundaries: &[teton_core::entities::PrivacyBoundary],
     ) -> Result<SkillTurn, RpcError> {
@@ -2796,7 +2796,7 @@ impl DaemonRuntime {
         // built by the caller from the turn's `ToolContext`. It carries the
         // commands' cwd as well as the boundary set, so the path the classifier
         // resolves against and the path `run_bounded` chdirs to are one value.
-        reach: &crate::skills::dynamic::Reach,
+        reach: &crate::skills::dynamic::PreambleReach,
         skill: &mut SkillTurn,
     ) {
         let events = tctx.core.events;

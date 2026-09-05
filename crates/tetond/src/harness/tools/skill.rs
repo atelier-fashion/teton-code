@@ -80,7 +80,7 @@ use super::{ResultDisposition, Tool, ToolContext, ToolOutcome, ToolRegistry};
 use crate::grants::ConnectionId;
 use crate::session_root::home;
 use crate::skills::dynamic::{
-    closed_door, door_outcome, outcome_view, preamble_verdict, run_all, PreambleRun, Reach,
+    closed_door, door_outcome, outcome_view, preamble_verdict, run_all, PreambleReach, PreambleRun,
 };
 use crate::skills::provenance::fold_expansion;
 use crate::skills::{expand, Skill, SkillIdentity, SkillRegistry, SkillSource};
@@ -2028,7 +2028,7 @@ impl SkillTool {
         // jailed to. One context, so the denial set the jail applies and the
         // one the classifier applies cannot come apart — and the typed path
         // assembles this from its own turn context in exactly this shape.
-        let reach = Reach {
+        let reach = PreambleReach {
             root: ctx.repo_root().to_path_buf(),
             root_kind: ctx.root_kind(),
             boundaries: ctx.boundaries().to_vec(),

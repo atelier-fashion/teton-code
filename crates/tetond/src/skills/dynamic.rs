@@ -501,10 +501,13 @@ pub fn door_outcome(door: NotRunReason) -> DynamicOutcome {
 /// reason is `&'static str`, so what reaches the event cannot be assembled from
 /// the command or its output — BR-7 holds by the type, not by care here.
 ///
-/// The wire [`teton_protocol::events::Reach`] is spelled in full because this
-/// module's own [`Reach`] is the classifier's *input*, four values wide; the
-/// two are one word apart and the same collision already governs
-/// [`DynamicOutcome`] below.
+/// The wire [`teton_protocol::events::Reach`] is spelled in full because it is
+/// a *different* thing from this module's [`PreambleReach`]: the wire enum is
+/// one command's answer, three values wide, and `PreambleReach` is the
+/// classifier's four-value *input*. They used to share the word `PreambleReach`, which
+/// is why every mention of either had to be qualified to be read (REQ-619
+/// verify, m5); the same collision still governs [`DynamicOutcome`] below,
+/// where the two names are genuinely two views of one fact.
 #[must_use]
 pub fn outcome_view(
     command: &Command,
@@ -546,15 +549,21 @@ pub fn outcome_view(
 /// `ShellTool::run` hands [`classify`], carried as one input so the runner and
 /// the `shell` tool cannot be given different ones (REQ-619 ADR-619-1).
 ///
+/// Named `PreambleReach` and not `PreambleReach` because
+/// [`teton_protocol::events::Reach`] is a live, unrelated type in the same
+/// sentences — one command's *answer* on the wire, against this type's
+/// four-value *input* to the classifier (REQ-619 verify, m5). Two things one
+/// word apart, in a module that mentions both.
+///
 /// **Built from the turn's `ToolContext`, never from `config`.** The jail
-/// applies `ctx.denied_prefixes()`; a `Reach` assembled beside it from the
+/// applies `ctx.denied_prefixes()`; a `PreambleReach` assembled beside it from the
 /// configuration would classify against a different denial set than the one
 /// the command actually runs under, and the two would agree only until one of
 /// them was edited. `root` is the session root the commands already run with
 /// as cwd (REQ-585 BR-6), so the classifier resolves the same relative paths
 /// the shell will.
 #[derive(Debug, Clone)]
-pub struct Reach {
+pub struct PreambleReach {
     /// The session root: the commands' cwd, and the root every path argument
     /// is resolved against.
     pub root: PathBuf,
@@ -596,7 +605,7 @@ pub struct PreambleRun {
 /// run (BR-1 — the verdict is a fact about the command text, not about a
 /// process).
 #[must_use]
-pub fn preamble_verdict(reach: &Reach, command: &Command) -> Verdict {
+pub fn preamble_verdict(reach: &PreambleReach, command: &Command) -> Verdict {
     classify(
         &reach.root,
         reach.root_kind,
@@ -630,7 +639,7 @@ pub fn preamble_verdict(reach: &Reach, command: &Command) -> Verdict {
 /// different answer and neither output nor exit status can reach any answer at
 /// all (BR-2).
 #[must_use]
-pub fn run_all(reach: &Reach, commands: &[Command], timeout_ms: u64) -> Vec<PreambleRun> {
+pub fn run_all(reach: &PreambleReach, commands: &[Command], timeout_ms: u64) -> Vec<PreambleRun> {
     run_all_within(reach, commands, timeout_ms, INVOCATION_BUDGET_MS)
 }
 
@@ -641,7 +650,7 @@ pub fn run_all(reach: &Reach, commands: &[Command], timeout_ms: u64) -> Vec<Prea
 /// [`run_all`] is the only caller that supplies it, so no call site can pick a
 /// different ceiling by accident.
 pub(crate) fn run_all_within(
-    reach: &Reach,
+    reach: &PreambleReach,
     commands: &[Command],
     timeout_ms: u64,
     budget_ms: u64,
@@ -659,38 +668,50 @@ pub(crate) fn run_all_within(
 /// budget is a parameter here for the same reason it is one in
 /// `shell_provenance::classify_with_budget`.
 fn run_all_with(
-    reach: &Reach,
+    reach: &PreambleReach,
     commands: &[Command],
     timeout_ms: u64,
     budget_ms: u64,
-    classify_with: &dyn Fn(&Reach, &Command) -> Verdict,
+    classify_with: &dyn Fn(&PreambleReach, &Command) -> Verdict,
 ) -> Vec<PreambleRun> {
     let started = Instant::now();
     let budget = Duration::from_millis(budget_ms);
     commands
         .iter()
         .map(|command| {
-            // REQ-619 BR-1/BR-2, and **first**: before the budget check, before
-            // `run_one`, before anything that could observe what the command
-            // did. A verdict taken after the spawn would be the same value
-            // today and a different one the first time somebody reads a file
-            // the command wrote; a verdict taken only for the commands that
-            // ran would leave the fold guessing about the rest.
-            let verdict = classify_with(reach, command);
-            // BUG-185's second half. The slot cap bounds the *count*; this
-            // bounds the *total*, and both are needed: 32 slots each taking the
-            // full per-command timeout is still 16 minutes on a blocking-pool
-            // thread that `spawn_blocking` cannot cancel.
+            // BUG-185's second half, and **first** (REQ-619 verify, m3). The
+            // slot cap bounds the *count*; this bounds the *total*, and both
+            // are needed: 32 slots each taking the full per-command timeout is
+            // still 16 minutes on a blocking-pool thread that `spawn_blocking`
+            // cannot cancel.
+            //
+            // The classification used to sit above this check, which made the
+            // budget's own arithmetic wrong in the direction it exists to
+            // prevent: `classify` may walk a subtree for up to 1.5 s per
+            // command (`shell_provenance::classify_with_budget`), so a
+            // 32-command invocation could spend 48 s *classifying* commands the
+            // budget had already stopped, and spend it after the deadline it
+            // was measured against. Deciding not to run something is not a
+            // reason to do work about it.
             let Some(left) = budget.checked_sub(started.elapsed()) else {
-                // Classified and not spawned: the door the runner itself
-                // closes. The fold ignores a `NotRun`'s verdict (BR-2), and
-                // the verdict is here anyway because "was it classified" and
-                // "did it run" are two questions.
+                // Not classified and not spawned — and the verdict says so
+                // rather than being absent, because `PreambleRun` carries one
+                // for every command and a half-record is worse than a
+                // conservative one. `Verdict::not_classified` is content-free
+                // and `Unknown`, which is the only honest answer about a
+                // command nothing looked at; the fold ignores a `NotRun`'s
+                // verdict anyway (BR-2), so nothing downstream can tell this
+                // from the classification it replaces.
                 return PreambleRun {
-                    verdict,
+                    verdict: Verdict::not_classified(),
                     outcome: DynamicOutcome::budget_exhausted(),
                 };
             };
+            // REQ-619 BR-1/BR-2: before `run_one`, before anything that could
+            // observe what the command did. A verdict taken after the spawn
+            // would be the same value today and a different one the first time
+            // somebody reads a file the command wrote.
+            let verdict = classify_with(reach, command);
             // The per-command timeout still applies; the invocation's remaining
             // budget only ever shortens it. A command started with 2 s left is
             // killed at 2 s rather than being allowed its own 30 s and taking
@@ -817,8 +838,8 @@ mod tests {
     /// argument — but the fixtures below still plant a `Cargo.toml`, because a
     /// root whose kind is asserted and whose contents disagree is a fixture
     /// that lies to the next reader.
-    fn test_reach(root: &Path) -> Reach {
-        Reach {
+    fn test_reach(root: &Path) -> PreambleReach {
+        PreambleReach {
             root: root.to_path_buf(),
             root_kind: RootKind::Project,
             boundaries: teton_core::config::DEFAULT_BOUNDARIES
@@ -840,7 +861,7 @@ mod tests {
     /// the verdict.
     ///
     /// They ran against the pre-REQ-619 signature and their claims are
-    /// unchanged; routing them through a real [`Reach`] is what keeps them
+    /// unchanged; routing them through a real [`PreambleReach`] is what keeps them
     /// exercising the production path now that TASK-401 has deleted the
     /// verdict-free shim they were briefly routed through.
     fn run(root: &Path, commands: &[Command], timeout_ms: u64) -> Vec<DynamicOutcome> {
@@ -1363,6 +1384,96 @@ mod tests {
     // REQ-619 BR-1 / BR-2 / BR-7: the preamble verdict
     // -----------------------------------------------------------------------
 
+    /// **REQ-619 verify, m3 — a command the budget stopped is not classified.**
+    ///
+    /// The verdict used to be taken above the budget check, so every command of
+    /// an over-budget invocation was classified whether or not it would be
+    /// attempted. That is neither free nor harmless: `classify` may walk a
+    /// subtree for up to 1.5 s per command, so a 32-slot invocation could spend
+    /// three quarters of a minute classifying commands the budget had already
+    /// stopped — spending it *after* the deadline the budget exists to hold, on
+    /// a blocking-pool thread `spawn_blocking` cannot cancel. Deciding not to
+    /// run something is not a reason to do work about it.
+    ///
+    /// The count is the assertion: **one classify call per attempted command**,
+    /// not one per command in the body. The instrument is `run_all_with`'s
+    /// classifier seam for the reason the sibling below gives — the real
+    /// classifier answers the same thing however many times it is asked, so
+    /// only a counting stand-in can tell "once" from "twice".
+    ///
+    /// # What replaces the verdict, and why it changes nothing
+    ///
+    /// `Verdict::not_classified()` — content-free and `Unknown`, the only
+    /// honest thing to say about a command nothing looked at.
+    /// [`super::provenance::fold_expansion`] ignores a `NotRun` command's
+    /// verdict outright (BR-2), which is what makes the substitution invisible
+    /// downstream; the last two assertions state the value at this level, so a
+    /// future fold that *did* read it would meet a conservative answer rather
+    /// than a stale one.
+    ///
+    /// # Mutation
+    ///
+    /// Ran with the `classify_with` call moved back above the budget check:
+    /// **2 red** — this test on `a command the budget stopped is not
+    /// classified` (2 calls where 1 was expected), and
+    /// `an_unrun_command_is_classified_but_not_spawned` on its budget-door
+    /// reason. Ran again with `Verdict::not_classified()` replaced by
+    /// `classify_with(reach, command)` in the budget arm — the same defect
+    /// spelled as a fallback — and the same two go red. Restored: green.
+    #[test]
+    fn a_command_the_budget_stopped_is_never_classified() {
+        let root = project_root("budget-classify");
+        let calls = std::cell::Cell::new(0usize);
+        let counting = |reach: &PreambleReach, command: &Command| {
+            calls.set(calls.get() + 1);
+            preamble_verdict(reach, command)
+        };
+
+        let runs = run_all_with(
+            &test_reach(&root),
+            &[
+                Command::new("sleep 1"),
+                Command::new("echo never > budget-classify-leg"),
+            ],
+            10_000,
+            300,
+            &counting,
+        );
+
+        // Fixture: the first command really did overrun and the second really
+        // was withheld, or the count below is about a run that never happened.
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].outcome, DynamicOutcome::TimedOut, "{runs:?}");
+        assert!(
+            matches!(&runs[1].outcome, DynamicOutcome::NotRun { reason } if reason.contains("budget")),
+            "{runs:?}"
+        );
+        assert!(
+            !root.join("budget-classify-leg").exists(),
+            "the second command must never have started"
+        );
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "a command the budget stopped is not classified: the classifier may \
+             walk a subtree for up to 1.5s per command, and spending that on a \
+             command the daemon has already decided not to run spends it past \
+             the very deadline the budget holds"
+        );
+
+        // The withheld command still carries a verdict — a half-record would be
+        // worse — and it is the conservative one, content-free and `Unknown`.
+        assert_eq!(runs[1].verdict.kind, VerdictKind::Unknown);
+        assert!(
+            runs[1].verdict.sources.is_empty() && !runs[1].verdict.out_of_root_touch,
+            "an unclassified command proves nothing about any file: {:?}",
+            runs[1].verdict
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// **BR-1: one verdict per command, and it is taken before that command
     /// spawns.**
     ///
@@ -1392,7 +1503,7 @@ mod tests {
             Command::new("echo spawn-a >> log"),
             Command::new("echo spawn-b >> log"),
         ];
-        let recording = |reach: &Reach, command: &Command| {
+        let recording = |reach: &PreambleReach, command: &Command| {
             use std::io::Write;
             let tag = command
                 .as_str()
@@ -1578,18 +1689,30 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **BR-2: a command the door left unrun is classified, and not spawned.**
+    /// **BR-2: a command the door left unrun carries a verdict, and is not
+    /// spawned.**
     ///
-    /// Two doors, because the runner owns one and the consent owns the other:
+    /// Two doors, and since REQ-619's verify (m3) they answer differently — on
+    /// purpose:
     ///
     /// - the **invocation budget** (BUG-185), which `run_all_within` closes
-    ///   itself — the verdict is taken above the budget check, so the record is
-    ///   complete and no process started;
+    ///   itself. A command it stops is *not classified at all*: the check comes
+    ///   first now, and the record is completed with
+    ///   `Verdict::not_classified()`. Classifying it would mean walking a
+    ///   subtree for up to 1.5 s per command, after the deadline the budget
+    ///   exists to hold — see
+    ///   [`a_command_the_budget_stopped_is_never_classified`], which counts the
+    ///   calls. Nothing downstream can tell the difference, because
+    ///   `fold_expansion` ignores a `NotRun` command's verdict outright.
     /// - the **consent** door, which never reaches the runner at all: the
     ///   caller builds the outcome (`door_outcome`) and classifies the command
-    ///   it did not run with `preamble_verdict`. That is the pair TASK-401 will
-    ///   assemble at both call sites, and it is a fact about command text — no
-    ///   process is involved in reaching it.
+    ///   it did not run with `preamble_verdict`. Here the *real* verdict is
+    ///   kept, and BR-1 asks for it — the record the user sees names each
+    ///   command's reach whether or not the door opened, and unlike the budget
+    ///   arm this classification happens on a path with no deadline running.
+    ///
+    /// The two verdicts are therefore asserted separately below, and the
+    /// difference between them is the finding this test now records.
     ///
     /// The control at the end is load-bearing: the same command, allowed to
     /// run, **does** create the sentinel. Without it "the sentinel is absent"
@@ -1600,8 +1723,10 @@ mod tests {
     /// budget-exhausted arm call `run_one` anyway — the sentinel appears and
     /// this test fails on `!sentinel.exists()`. **2 red**, with
     /// `the_invocation_budget_stops_commands_that_have_not_started`.
-    /// (b) replacing that arm's `verdict` with a fabricated
-    /// `Unknown("not classified")` — **1 red**, the reason assertion here.
+    /// (b) replacing that arm's `Verdict::not_classified()` with a real
+    /// `classify_with(reach, command)` — **2 red**, the consent-door
+    /// discriminator here and the call count in
+    /// [`a_command_the_budget_stopped_is_never_classified`].
     /// (Deleting the arm outright does not compile: `let …else` must diverge.
     /// Recorded rather than dropped — a mutation whose build never ran is not
     /// evidence.)
@@ -1622,21 +1747,34 @@ mod tests {
         );
         assert_eq!(held[0].verdict.kind, VerdictKind::Unknown);
         assert_eq!(
-            held[0].verdict.reason, "the command runs an interpreter, build tool or network client",
-            "the classification is the real one, not a stand-in for a command \
-             that did not run"
+            held[0].verdict.reason,
+            "the invocation's budget was spent before this command was classified",
+            "REQ-619 verify m3: the budget arm does not classify, and the \
+             verdict says which door it came through rather than borrowing a \
+             classifier's sentence for work nobody did"
         );
         assert!(
             !sentinel.exists(),
             "a command held at the budget must not have spawned"
         );
 
-        // The consent door, which the runner never sees.
+        // The consent door, which the runner never sees — and which *does*
+        // classify, because BR-1's record names every command's reach and no
+        // deadline is running on this path.
         let declined = PreambleRun {
             verdict: preamble_verdict(&reach, &command),
             outcome: door_outcome(NotRunReason::Declined),
         };
-        assert_eq!(declined.verdict.reason, held[0].verdict.reason);
+        assert_eq!(
+            declined.verdict.reason,
+            "the command runs an interpreter, build tool or network client",
+            "the consent door's classification is the real one, not a stand-in"
+        );
+        assert_ne!(
+            declined.verdict.reason, held[0].verdict.reason,
+            "the two doors are two answers: one classified the command, the \
+             other decided not to spend the time"
+        );
         assert_eq!(declined.outcome.reason(), Some("declined"));
         assert!(!sentinel.exists(), "classifying a command must not run it");
 
@@ -1649,8 +1787,10 @@ mod tests {
             ran[0].outcome
         );
         assert_eq!(
-            ran[0].verdict.reason, held[0].verdict.reason,
-            "running it changed nothing about its reach (BR-2)"
+            ran[0].verdict.reason, declined.verdict.reason,
+            "running it changed nothing about its reach (BR-2) — the comparison \
+             is against the *consent* door's verdict, which is the one that was \
+             classified; the budget door's says only that nothing looked"
         );
 
         std::fs::remove_dir_all(&root).ok();
@@ -1757,7 +1897,7 @@ mod tests {
     /// `None` — or lie with `Rooted` — and the leg went with the shim.
     ///
     /// Mutation (run, red, reverted): mapping `VerdictKind::Unknown` to
-    /// `Reach::Rooted` in `outcome_view` — the reach assertion goes red, and
+    /// `PreambleReach::Rooted` in `outcome_view` — the reach assertion goes red, and
     /// the `/verbose` renderer would have gone silent on the one command that
     /// pinned the session. **1 red**, this test. Second mutation (run, red,
     /// reverted): building `reach_reason` as

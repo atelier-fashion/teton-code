@@ -5034,7 +5034,7 @@ fn no_model_call_happens_at_expansion_time() {
     let seam = settle_dynamic_context_body();
     // REQ-619 TASK-399 moved the spelling, not the hazard, and TASK-401 moved
     // it back: the seam reads `skills::dynamic::run_all(` again, now with a
-    // `Reach` built from the turn's own `ToolContext`. The pin is on the
+    // `PreambleReach` built from the turn's own `ToolContext`. The pin is on the
     // **runner's name**, which every one of those spellings carries and which
     // the `shell` tool's own path never does, so this keys on "the expansion
     // goes through the extracted runner" rather than on the module path it is

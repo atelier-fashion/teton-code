@@ -1976,13 +1976,27 @@ fn dynamic_outcome_line(view: &DynamicOutcomeView) -> String {
 /// One `/verbose` line saying how far a dynamic command reached, or `None`
 /// when there is nothing to say (REQ-619 BR-7).
 ///
-/// **Two silences, and they are different facts.** `reach: None` is a daemon
-/// that does not classify preambles at all — every build before REQ-619 — and
-/// [`Reach::Rooted`] is a command that *was* classified and proved harmless.
-/// Neither is news. A line under every `cat README.md` would bury the one
-/// command that pinned the session among three that did not, which is exactly
-/// the "which of my four preambles did this?" BUG-214 left a user unable to
-/// answer.
+/// **Three silences, and they are different facts.** `reach: None` is a daemon
+/// that does not classify preambles at all — every build before REQ-619;
+/// [`Reach::Rooted`] is a command that *was* classified and proved harmless;
+/// and a [`DynamicOutcome::NotRun`] is a command that never happened (REQ-619
+/// verify, m4). None of the three is news. A line under every `cat README.md`
+/// would bury the one command that pinned the session among three that did not,
+/// which is exactly the "which of my four preambles did this?" BUG-214 left a
+/// user unable to answer.
+///
+/// The `NotRun` silence is the one this line got wrong. A declined invocation
+/// renders `!`sh probe.sh` — not run (declined)` and then, underneath it,
+/// `reach: unknown reach — the command runs an interpreter…` — a sentence about
+/// the reach of something that did not reach anywhere. Worse, it is the same
+/// sentence a command that *did* run and *did* pin the session prints, so the
+/// one line whose job is to name the culprit now appears under commands that
+/// are provably innocent. The daemon agrees: `fold_expansion` ignores a
+/// `NotRun` command's verdict outright (BR-2), so this line was reporting a
+/// value nothing downstream acts on.
+///
+/// The outcome is read for exactly that one bit, and never for what the command
+/// produced — the same reading the fold takes, for the same reason.
 ///
 /// The reason is the daemon's own sentence, rendered and not re-worded: the
 /// classifier's closed set of reasons is its to change, and a client that
@@ -1995,6 +2009,11 @@ fn dynamic_outcome_line(view: &DynamicOutcomeView) -> String {
 /// the actionable half, and dropping the line for a missing adjective would
 /// answer "which preamble" with nothing.
 fn reach_line(view: &DynamicOutcomeView) -> Option<String> {
+    // A command that never ran reached nowhere, whatever its text was
+    // classified as (REQ-619 verify, m4).
+    if matches!(view.outcome, DynamicOutcome::NotRun { .. }) {
+        return None;
+    }
     let words = match view.reach? {
         Reach::Rooted => return None,
         Reach::BoundaryTouch => "boundary touch",
@@ -11637,12 +11656,25 @@ mod skill_tests {
     /// block under the wrong command, or twice, which is the failure adjacency
     /// exists to prevent.
     ///
+    /// The fifth row is REQ-619's verify (m4): a command the consent door
+    /// **declined**, carrying the very same `Reach::Unknown` and the very same
+    /// reason as the third. It must be silent. A declined command reached
+    /// nowhere — the daemon agrees, and `fold_expansion` ignores its verdict
+    /// outright (BR-2) — so printing `reach: unknown reach — …` under it prints
+    /// the culprit sentence beneath a command that is provably innocent, which
+    /// is this line's own job done backwards. It is the *same* pair of values as
+    /// the third row on purpose: only the outcome differs, so the assertion
+    /// cannot pass by the reach happening to be absent.
+    ///
     /// Mutation (run, red, reverted): deleting the `Reach::Rooted => return
     /// None` arm in `reach_line` so a rooted command renders `reach: rooted —
     /// …` too. **1 red**, this test, on the exact-sequence leg. Second mutation
     /// (run, red, reverted): rendering the reach lines in a second loop after
     /// the outcome lines instead of inside the first — every line is still
     /// drawn and the sequence leg goes red on the order. **1 red**, this test.
+    /// Third mutation (run, red, reverted): deleting the `NotRun` guard so the
+    /// declined row prints its reach. **1 red**, this test, on the same leg —
+    /// which is what makes that guard this test's to hold.
     #[test]
     fn a_non_rooted_preamble_prints_its_reason_under_verbose_and_a_rooted_one_prints_nothing() {
         /// One classified outcome, as `outcome_view` projects one: the reason
@@ -11679,6 +11711,18 @@ mod skill_tests {
             // A daemon predating REQ-619: it classified nothing, so there is
             // nothing to say — and what it said about the command is unchanged.
             ran("date", 8),
+            // REQ-619 verify m4: classified exactly as the third row, and
+            // **declined** — so it reached nowhere and says nothing.
+            DynamicOutcomeView {
+                outcome: DynamicOutcome::NotRun {
+                    reason: NotRunReason::Declined,
+                },
+                ..classified(
+                    "sh other-partial.sh",
+                    Reach::Unknown,
+                    "the command runs an interpreter, build tool or network client",
+                )
+            },
         ]));
 
         // Nothing at all without `/verbose`: the reach line is detail, and the
@@ -11704,9 +11748,12 @@ mod skill_tests {
                 "  reach: unknown reach — the command runs an interpreter, build tool or \
                  network client",
                 "  !`date` — ran (8 B)",
+                "  !`sh other-partial.sh` — not run: the user declined",
             ],
-            "two reach lines for four commands, each under its own — and the \
-             rooted row and the unclassified row are silent: {detail:?}"
+            "two reach lines for five commands, each under its own — and the \
+             rooted row, the unclassified row and the declined row are silent, \
+             the last of them despite carrying the same verdict as the row that \
+             does print: {detail:?}"
         );
     }
 
