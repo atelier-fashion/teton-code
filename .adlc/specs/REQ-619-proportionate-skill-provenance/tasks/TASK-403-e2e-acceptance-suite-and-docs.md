@@ -1,7 +1,7 @@
 ---
 id: TASK-403
 title: "End-to-end acceptance suite through the real daemon, the flipped BUG-214 claim, and the documentation"
-status: draft
+status: complete
 parent: REQ-619
 created: 2026-09-05
 updated: 2026-09-05
