@@ -916,6 +916,7 @@ async fn probe_spelling(repo: &std::path::Path, path_arg: &str) -> (SessionProbe
         PROMPT,
         std::collections::BTreeSet::new(),
         false,
+        false,
         // No notes in this fixture, so a reroute has nothing to re-render.
         None,
     );
@@ -1332,7 +1333,7 @@ async fn a_skill_that_ran_a_command_blocks_the_remote_turn_under_any_boundary() 
     let (still, ran) = ran_expansion(&repo, "static", "the control");
     assert!(!ran, "fixture: the control skill runs no command");
     let mut ctx = ContextManager::new(scripted_system(), scripted_config().context_budget_tokens);
-    ctx.push_user_from(still, std::collections::BTreeSet::new(), false);
+    ctx.push_user_from(still, std::collections::BTreeSet::new(), false, false);
     let (result, captured, calls, blocks) = drive_seeded_turn(
         &repo,
         &SessionId::from("skill-static"),
@@ -1360,7 +1361,7 @@ async fn a_skill_that_ran_a_command_blocks_the_remote_turn_under_any_boundary() 
     let mut ctx = ContextManager::new(scripted_system(), scripted_config().context_budget_tokens);
     // The seed the daemon builds: a project skill mints, and the ran command is
     // what marks the block unpinnable.
-    ctx.push_user_from(expansion, std::collections::BTreeSet::new(), ran);
+    ctx.push_user_from(expansion, std::collections::BTreeSet::new(), ran, false);
     assert!(
         context_provenance(&ctx).is_unknown(),
         "an invocation that ran a command must taint the context as unknown \
@@ -1398,7 +1399,12 @@ async fn with_no_boundary_a_skills_expansion_reaches_the_provider_as_the_payload
     assert!(ran, "fixture: the command must actually have run");
 
     let mut ctx = ContextManager::new(scripted_system(), scripted_config().context_budget_tokens);
-    ctx.push_user_from(expansion.clone(), std::collections::BTreeSet::new(), ran);
+    ctx.push_user_from(
+        expansion.clone(),
+        std::collections::BTreeSet::new(),
+        ran,
+        false,
+    );
     let (result, captured, calls, blocks) = drive_seeded_turn(
         &repo,
         &SessionId::from("skill-open"),
@@ -2538,6 +2544,7 @@ async fn a_boundary_covered_notes_file_never_leaves_and_an_uncovered_one_is_in_t
         NOTES_PROMPT,
         std::collections::BTreeSet::new(),
         false,
+        false,
         // No notes in this fixture, so a reroute has nothing to re-render.
         None,
     );
@@ -2614,6 +2621,7 @@ async fn a_boundary_covered_notes_file_never_leaves_and_an_uncovered_one_is_in_t
         Vec::new(),
         NOTES_PROMPT,
         std::collections::BTreeSet::new(),
+        false,
         false,
         // No notes in this fixture, so a reroute has nothing to re-render.
         None,

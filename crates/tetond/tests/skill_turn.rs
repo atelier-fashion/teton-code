@@ -1577,7 +1577,11 @@ async fn a_project_skills_expansion_is_pinned_to_the_file_it_came_from() {
     let expected = ProvenanceId::from_resolved(&root, &root.join(".claude/skills/pinme/SKILL.md"))
         .expect("a project skill is under the root and mints");
     match &user.provenance {
-        Provenance::User { sources, unknown } => {
+        Provenance::User {
+            sources,
+            unknown,
+            boundary_touch,
+        } => {
             assert_eq!(
                 sources,
                 &BTreeSet::from([expected]),
@@ -1588,6 +1592,9 @@ async fn a_project_skills_expansion_is_pinned_to_the_file_it_came_from() {
                 !unknown,
                 "a project skill mints, so nothing about it is unpinnable"
             );
+            // REQ-619 ADR-619-2: this skill has no preambles, so nothing it
+            // carries could have named a path outside the root.
+            assert!(!boundary_touch, "a preamble-free skill touches no boundary");
         }
         other => panic!("a prompt turn seeds a user block: {other:?}"),
     }
@@ -1620,7 +1627,11 @@ async fn a_user_skill_outside_the_root_seeds_a_block_that_says_it_cannot_be_pinn
         .find(|block| block.role == BlockRole::User)
         .expect("the turn seeded a user block");
     match &user.provenance {
-        Provenance::User { sources, unknown } => {
+        Provenance::User {
+            sources,
+            unknown,
+            boundary_touch,
+        } => {
             assert!(
                 sources.is_empty(),
                 "nothing under `~` has a repo-relative identity to mint: {sources:?}"
@@ -1630,6 +1641,9 @@ async fn a_user_skill_outside_the_root_seeds_a_block_that_says_it_cannot_be_pinn
                 "an unmintable file must set `unknown`, or the turn silently \
                  counts as drawn from nothing at all"
             );
+            // REQ-619 ADR-619-2: unmintable is not the same fact as
+            // boundary-touching, and only the second is permanent.
+            assert!(!boundary_touch, "a preamble-free skill touches no boundary");
         }
         other => panic!("a prompt turn seeds a user block: {other:?}"),
     }
@@ -2530,8 +2544,14 @@ async fn an_invocation_that_ran_a_command_seeds_a_block_that_cannot_be_pinned() 
             .find(|block| block.role == BlockRole::User)
             .expect("the turn seeded a user block");
         match &user.provenance {
-            Provenance::User { sources, unknown } => {
+            Provenance::User {
+                sources,
+                unknown,
+                boundary_touch,
+            } => {
                 assert_eq!(*unknown, expect_unknown, "{why}");
+                // REQ-619 ADR-619-2: neither of these skills has a preamble.
+                assert!(!boundary_touch, "a preamble-free skill touches no boundary");
                 assert_eq!(
                     sources,
                     &BTreeSet::from([file.clone()]),
