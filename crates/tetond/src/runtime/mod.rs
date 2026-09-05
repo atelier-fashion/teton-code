@@ -1415,6 +1415,18 @@ struct SkillTurn {
     /// boundary is configured, exactly as `shell` output does, which is stricter
     /// than BR-7's letter and right in the charter's direction (ADR-9).
     unknown: bool,
+    /// Set when a preamble this expansion carries named a boundary file
+    /// **outside** the session root — a path that mints no id for `sources` to
+    /// hold, so only a bit can carry it (REQ-619 BR-2, ADR-619-2).
+    ///
+    /// Refuses the turn exactly as `unknown` does; what it adds is the pin's
+    /// cause, and so its permanence: `/shell allow` lifts an unprovable
+    /// preamble and never a boundary touch.
+    ///
+    /// `false` at construction and wired by TASK-401, which is also where the
+    /// `spawned` OR this REQ retires is replaced by
+    /// `skills::provenance::fold_expansion`.
+    boundary_touch: bool,
 }
 
 /// What one of BR-8's two budget stages decided about a **typed** skill turn
@@ -7988,10 +8000,10 @@ fn health_record_after_failure(class: FailureClass, now: Instant) -> Option<Heal
     }
 }
 
-/// The egress [`Provenance`] of a skill expansion, from the two values
-/// [`SkillTurn`] carries (REQ-587 BR-10, ADR-8).
+/// The egress [`Provenance`] of a skill expansion, from the three values
+/// [`SkillTurn`] carries (REQ-587 BR-10, ADR-8; REQ-619 ADR-619-2).
 ///
-/// The pair — a minted id set and a fail-closed bit — is the shape
+/// The triple — a minted id set and two fail-closed bits — is the shape
 /// `ContextManager::push_user_from` takes, because that is how the *seed* block
 /// records where a turn's text came from. A **duty** does not push a block; it
 /// sends a string, and the choke point in front of it wants a `Provenance`. This
@@ -7999,17 +8011,30 @@ fn health_record_after_failure(class: FailureClass, now: Instant) -> Option<Heal
 /// describe one string two ways.
 ///
 /// A **project** skill mints one id and is compared against the boundary globs
-/// like any `read`. A **user** skill has no repo-relative identity, arrives with
-/// `unknown` set, and is refused wherever any boundary is configured — stricter
-/// than a `read` of the same bytes, which is BR-10's stated consequence and not
-/// an accident of this function.
-fn expansion_provenance(sources: &BTreeSet<ProvenanceId>, unknown: bool) -> Provenance {
+/// like any `read`. A skill file with no identity to mint arrives with `unknown`
+/// set and is refused wherever any boundary is configured.
+///
+/// `boundary_touch` is rendered through [`Provenance::boundary_touch`] rather
+/// than through a second [`Provenance::mark_unknown`], and the difference is the
+/// whole point of the bit: both refuse the send, but only the boundary form
+/// reports `<boundary-touch>` as the path, and `taint::cause_of` reads that path
+/// to decide the pin is permanent rather than liftable by `/shell allow`
+/// (REQ-614 ADR-614-3). Merged, so a skill file's own ids are still named
+/// beside it.
+fn expansion_provenance(
+    sources: &BTreeSet<ProvenanceId>,
+    unknown: bool,
+    boundary_touch: bool,
+) -> Provenance {
     let mut provenance = Provenance::empty();
     for id in sources {
         provenance.merge(&Provenance::tainted_by(id.clone()));
     }
     if unknown {
         provenance.mark_unknown();
+    }
+    if boundary_touch {
+        provenance.merge(&Provenance::boundary_touch());
     }
     provenance
 }
@@ -17525,6 +17550,7 @@ provider_id = \"deepseek\"
                     prompt.to_owned(),
                     std::collections::BTreeSet::new(),
                     false,
+                    false,
                     // No notes in this fixture, so a reroute has nothing to re-render.
                     None,
                 )
@@ -20566,6 +20592,7 @@ provider_id = \"deepseek\"
                 Vec::new(),
                 "the opening prompt",
                 std::collections::BTreeSet::new(),
+                false,
                 false,
                 // No notes in this fixture, so a reroute has nothing to re-render.
                 None,

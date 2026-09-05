@@ -93,7 +93,7 @@ fn assembled(ctx: &ContextManager) -> String {
 fn the_ask_and_the_body_survive_a_compaction() {
     let mut ctx = manager();
     let body = format!("{ANALYZE_PROMPT}\n{}", filler(REPORTED_BODY_BYTES));
-    ctx.push_user_from(body.clone(), BTreeSet::new(), false);
+    ctx.push_user_from(body.clone(), BTreeSet::new(), false, false);
 
     // Twenty-six tool results, as the session ran. Each is well inside the
     // budget; together they are far past it.
@@ -150,7 +150,7 @@ fn the_ask_and_the_body_survive_a_compaction() {
 fn the_assembled_prompt_still_carries_the_ask() {
     let mut ctx = manager();
     let body = format!("{ANALYZE_PROMPT}\n{}", filler(REPORTED_BODY_BYTES));
-    ctx.push_user_from(body, BTreeSet::new(), false);
+    ctx.push_user_from(body, BTreeSet::new(), false, false);
     for n in 0..26 {
         ctx.push_tool_result_prov(
             "read",
@@ -246,7 +246,7 @@ fn the_reconstructed_session_keeps_both_prompts() {
     // Prompt three: `/analyze`, expanded, then twenty-six tool calls.
     let mut third = manager();
     let expansion = format!("{ANALYZE_PROMPT}\n{}", filler(REPORTED_BODY_BYTES));
-    third.push_user_from(expansion, BTreeSet::new(), false);
+    third.push_user_from(expansion, BTreeSet::new(), false, false);
     for n in 0..26 {
         third.push_model_call(format!("{{\"tool\":\"glob\",\"call\":{n}}}"));
         third.push_tool_result_prov(

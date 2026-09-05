@@ -1008,7 +1008,9 @@ fn skill_expansion_turn(
         Err(_) => (std::collections::BTreeSet::new(), true),
     };
     let mut ctx = tetond::harness::ContextManager::new("You are Teton Code.", 1_000_000);
-    ctx.push_user_from(expansion.to_owned(), sources, unknown);
+    // REQ-619 ADR-619-2: this fixture's expansions carry no preamble, so the
+    // out-of-root boundary bit is clear.
+    ctx.push_user_from(expansion.to_owned(), sources, unknown, false);
     let request = TransportRequest {
         method: HttpMethod::Post,
         url: "https://api.anthropic.com/v1/messages".to_owned(),

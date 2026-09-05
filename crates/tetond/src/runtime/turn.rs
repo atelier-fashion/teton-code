@@ -1348,7 +1348,7 @@ impl DaemonRuntime {
                 tctx.core,
                 sessions,
                 routed_text,
-                expansion_provenance(&skill.sources, skill.unknown),
+                expansion_provenance(&skill.sources, skill.unknown, skill.boundary_touch),
             );
         }
 
@@ -1523,9 +1523,14 @@ impl DaemonRuntime {
         // turn, the typed text otherwise. One block either way — `push_user_from`
         // with an empty set and `unknown: false` is byte-identical to the
         // `push_user` every typed turn has always taken.
-        let (prompt, prompt_sources, prompt_unknown) = match skill_turn {
-            Some(skill) => (skill.text, skill.sources, skill.unknown),
-            None => (prompt, BTreeSet::new(), false),
+        let (prompt, prompt_sources, prompt_unknown, prompt_boundary_touch) = match skill_turn {
+            Some(skill) => (
+                skill.text,
+                skill.sources,
+                skill.unknown,
+                skill.boundary_touch,
+            ),
+            None => (prompt, BTreeSet::new(), false, false),
         };
 
         // REQ-567 BR-1: this turn begins from what the session has already said.
@@ -1550,6 +1555,10 @@ impl DaemonRuntime {
             // skill outside the root. It is the same block either way.
             prompt_sources,
             prompt_unknown,
+            // REQ-619 BR-2: and the out-of-root boundary bit a preamble may have
+            // set, which the seed carries for the same reason it carries the
+            // other two — the block egress inspects is this one.
+            prompt_boundary_touch,
             // REQ-612 BR-3: the two halves of this turn's prompt, so a reroute
             // re-renders the notes at the cap of the route it lands on rather
             // than carrying a block sized for the route it left.
@@ -2637,6 +2646,11 @@ impl DaemonRuntime {
             name_note: skill.name_note.clone(),
             sources,
             unknown,
+            // REQ-619 ADR-619-2: nothing has run yet, so nothing has touched a
+            // boundary. The preamble seam sets it (TASK-401), which is also
+            // where `skills::provenance::fold_expansion` replaces the `spawned`
+            // OR below.
+            boundary_touch: false,
         })
     }
 

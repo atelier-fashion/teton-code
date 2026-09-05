@@ -930,7 +930,11 @@ pub fn context_provenance(ctx: &ContextManager) -> Provenance {
             // expansion's files mean to egress exactly what a `read` of them
             // means. The empty-set/`!unknown` case — ordinary typed prompt text
             // — contributes nothing and takes neither branch.
-            CtxProvenance::User { sources, unknown } => {
+            CtxProvenance::User {
+                sources,
+                unknown,
+                boundary_touch,
+            } => {
                 if !sources.is_empty() {
                     prov.merge(&tool_result_provenance(&ToolProvenance::Sources(
                         sources.clone(),
@@ -938,6 +942,18 @@ pub fn context_provenance(ctx: &ContextManager) -> Provenance {
                 }
                 if *unknown {
                     prov.merge(&tool_result_provenance(&ToolProvenance::Unknown));
+                }
+                // REQ-619 ADR-619-2, through the same mapping again: a preamble
+                // that named an out-of-root boundary file means to egress
+                // exactly what a `shell` command that did means. Folded on its
+                // own arm rather than OR'd into `unknown` above, because the
+                // two mappings differ in the **path** they report and that path
+                // is what decides whether `/shell allow` can lift the pin
+                // (REQ-614 ADR-614-3). `Provenance::boundary_touch` sets the
+                // `unknown` bit too, so a block carrying both bits folds to the
+                // same value either way.
+                if *boundary_touch {
+                    prov.merge(&tool_result_provenance(&ToolProvenance::BoundaryTouch));
                 }
             }
             CtxProvenance::System | CtxProvenance::Model => {}
@@ -1717,6 +1733,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             false,
+            false,
         );
 
         let prov = context_provenance(&ctx);
@@ -1743,7 +1760,7 @@ mod tests {
     fn a_user_block_whose_sources_cannot_be_minted_makes_the_context_unknown() {
         let mut ctx = ContextManager::new("system", 10_000);
         ctx.push_tool_result("read", Some(fixture_id("src/lib.rs")), "code");
-        ctx.push_user_from("run my personal skill", BTreeSet::new(), true);
+        ctx.push_user_from("run my personal skill", BTreeSet::new(), true, false);
 
         let prov = context_provenance(&ctx);
         assert!(
@@ -1754,6 +1771,84 @@ mod tests {
         // Known sources are still carried alongside the unknown bit — the pair,
         // not one collapsed into the other.
         assert!(prov.contains("src/lib.rs"));
+    }
+
+    /// **REQ-619 BR-5 / ADR-619-2 — the union carries the third field.**
+    ///
+    /// A skill expansion whose preamble read a boundary file outside the
+    /// session root folds through `tool_result_provenance(&BoundaryTouch)`
+    /// exactly as an unmintable one folds through `Unknown`. Both refuse the
+    /// send; the difference is the **path** the refusal reports, and that path
+    /// is what `taint::cause_of` reads to record `boundary_hit` and hold the
+    /// pin permanently (REQ-614 ADR-614-3).
+    ///
+    /// # Benign path
+    ///
+    /// The second half: the same conversation with a user block that carries
+    /// neither bit is not boundary-touched and not unknown, and its skill file
+    /// is still named. A union that had simply started reporting a boundary
+    /// touch for every user block would pass the first half.
+    ///
+    /// # Mutation
+    ///
+    /// Ran with the `if *boundary_touch` arm deleted from `context_provenance`:
+    /// red on `the union dropped a user block's boundary touch`, the provenance
+    /// coming back `unknown: false, boundary_touch: false` — the bit was the
+    /// only thing blocking that send, so the expansion left the machine. Ran
+    /// again with the arm folded through `ToolProvenance::Unknown` instead: red
+    /// on the same assertion with `unknown: true, boundary_touch: false` — the
+    /// send still refused and the pin now liftable, which is the failure the
+    /// separate field exists to prevent (had the assertion order been reversed
+    /// this is the mutation only the `with_unknown_lifted` line would catch).
+    /// Restored: green.
+    #[test]
+    fn context_provenance_carries_a_user_blocks_boundary_touch() {
+        let skill = fixture_id(".claude/skills/audit/SKILL.md");
+
+        let mut ctx = ContextManager::new("system", 10_000);
+        ctx.push_tool_result("read", Some(fixture_id("src/lib.rs")), "code");
+        ctx.push_user_from(
+            "audit the machine",
+            [skill.clone()].into_iter().collect(),
+            false,
+            true,
+        );
+
+        let prov = context_provenance(&ctx);
+        assert!(
+            prov.is_boundary_touch(),
+            "the union dropped a user block's boundary touch: {prov:?}"
+        );
+        assert!(prov.is_unknown(), "a boundary touch fails the turn closed");
+        assert!(
+            prov.with_unknown_lifted().is_unknown(),
+            "`/shell allow` must not lift a preamble that named a protected path"
+        );
+        // The ids it could mint ride beside the bit, not instead of it.
+        assert!(prov.contains("src/lib.rs"));
+        assert!(prov.contains(".claude/skills/audit/SKILL.md"));
+
+        // Benign twin: the same block without the bit. Nothing about a user
+        // block is inherently a boundary touch.
+        let mut clean = ContextManager::new("system", 10_000);
+        clean.push_tool_result("read", Some(fixture_id("src/lib.rs")), "code");
+        clean.push_user_from(
+            "audit the machine",
+            [skill].into_iter().collect(),
+            false,
+            false,
+        );
+
+        let clean_prov = context_provenance(&clean);
+        assert!(
+            !clean_prov.is_boundary_touch(),
+            "an ordinary skill expansion must not report a boundary touch"
+        );
+        assert!(
+            !clean_prov.is_unknown(),
+            "and it must reach the wire wherever its files do"
+        );
+        assert!(clean_prov.contains(".claude/skills/audit/SKILL.md"));
     }
 
     #[test]
