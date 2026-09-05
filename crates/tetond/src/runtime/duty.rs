@@ -531,6 +531,11 @@ impl DaemonRuntime {
                 .with_local_budget(Some(router.budget_for(None).budget_tokens as u64)),
         );
         let mut egress = Egress::new(transport, config.effective_boundaries(), sink)
+            // BUG-215: a duty that sends conversation context (`compact`) or a
+            // single opaque result (`digest`, `shell`) honors the user's
+            // `/shell allow` exactly as the prompt turn does, through the same
+            // `RoutePin` the six duty routes read.
+            .with_unknown_lift(Arc::new(self.route_pin()))
             .with_cost_meter(Arc::new(self.ledger.clone()))
             // REQ-588 BR-1/ADR-6: the user's ceiling, when they set one. Absent
             // leaves the choke point exactly as it was — no check, no pricing

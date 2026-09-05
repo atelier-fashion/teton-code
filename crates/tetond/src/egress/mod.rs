@@ -549,6 +549,30 @@ pub struct Egress<T: Transport> {
     /// Where a completed lookup attempt is recorded (BR-7) and announced (D-8).
     /// Absent means neither happens; it never changes a decision.
     lookup_recorder: Option<Arc<dyn lookup::LookupRecorder>>,
+    /// Whether the user has lifted a session's unknown-provenance opacity
+    /// (`/shell allow`, REQ-614 BR-4; BUG-215). `None` — the default, and
+    /// what every non-session choke point keeps — never lifts anything.
+    unknown_lift: Option<Arc<dyn UnknownLift>>,
+}
+
+/// The choke point's read of "has the user lifted this session's
+/// `unknown_shell` pin?" (REQ-614 BR-4/BR-5; BUG-215).
+///
+/// The same inversion [`lookup::TaintView`] uses: the choke point takes a
+/// trait object rather than the daemon runtime's `RoutePin`, so `egress` does
+/// not depend on `runtime`, and the only implementation that can answer `true`
+/// is one built over the override set whose setter is `pub(super)` to the
+/// runtime — a model's tool call has no path to it.
+///
+/// Read at **send time**, per request, rather than captured as a `bool` when
+/// the choke point is built: a turn that is already running when the user
+/// types `/shell allow` is served by an `Egress` built before the lift, and
+/// the lift should reach its next send rather than the next turn's.
+pub trait UnknownLift: Send + Sync {
+    /// `true` only when `session` is pinned with a **liftable** cause and the
+    /// user has lifted it. A permanent cause answers `false` whatever the
+    /// override set says.
+    fn unknown_lifted(&self, session: &SessionId) -> bool;
 }
 
 impl<T: Transport> Egress<T> {
@@ -571,6 +595,30 @@ impl<T: Transport> Egress<T> {
             search_redaction: None,
             fetch_redaction: None,
             lookup_recorder: None,
+            unknown_lift: None,
+        }
+    }
+
+    /// Let a user's `/shell allow` reach this choke point (BUG-215).
+    ///
+    /// Only the two session-scoped choke points that inspect conversation
+    /// context take one — the prompt turn's and the harness duties' — and the
+    /// source scan `runtime::taint::shell_pin::the_prompt_turn_egress_installs_the_tainting_sink`
+    /// holds them to it. The web lookup, the provider connection test and the
+    /// MCP path leave this `None`: none of them sends a `shell` result.
+    #[must_use]
+    pub fn with_unknown_lift(mut self, lift: Arc<dyn UnknownLift>) -> Self {
+        self.unknown_lift = Some(lift);
+        self
+    }
+
+    /// Whether the request in `ctx` belongs to a session whose opacity the
+    /// user has lifted. `false` without a session, without a view, or for a
+    /// permanent cause — every fail-closed direction.
+    fn unknown_lifted_for(&self, ctx: &EgressContext) -> bool {
+        match (&self.unknown_lift, &ctx.session_id) {
+            (Some(lift), Some(session)) => lift.unknown_lifted(session),
+            _ => false,
         }
     }
 
@@ -813,11 +861,25 @@ impl<T: Transport> Egress<T> {
 
         // Fast path: content from no file, or no boundaries configured, can never
         // intersect a boundary — skip building a matcher entirely.
-        if !provenance.is_empty() && !self.boundaries.is_empty() {
+        // BUG-215 / REQ-614 BR-4: the user's `/shell allow` reaches the
+        // inspection. A lifted session's provenance is inspected with its
+        // *opacity* released and everything else intact — every minted source
+        // is still matched, a boundary-touch sentinel still refuses — so what
+        // the lift releases is exactly the one thing the user asserted about:
+        // a result the daemon could not prove the reach of. Bound to the
+        // inspection alone; the malformed check above and the scans below
+        // read the caller's value.
+        let lifted;
+        let inspected = if provenance.is_unknown() && self.unknown_lifted_for(ctx) {
+            lifted = provenance.with_unknown_lifted();
+            &lifted
+        } else {
+            provenance
+        };
+        if !inspected.is_empty() && !self.boundaries.is_empty() {
             let matcher =
                 BoundaryMatcher::new(&self.boundaries).map_err(|_| EgressError::BoundaryCompile)?;
-            if let Inspection::Blocked(violation) = inspect(provenance, &matcher, ctx.block_action)
-            {
+            if let Inspection::Blocked(violation) = inspect(inspected, &matcher, ctx.block_action) {
                 let block = PrivacyBlock {
                     path: violation.path.clone(),
                     provider_id: ctx.provider_id.clone(),
@@ -1394,6 +1456,117 @@ mod tests {
         let forwarded = sent.lock().unwrap();
         assert_eq!(forwarded.len(), 1);
         assert_eq!(forwarded[0].body, b"public code");
+    }
+
+    /// A lift view that answers a fixed set of sessions.
+    struct LiftedSessions(Vec<&'static str>);
+
+    impl UnknownLift for LiftedSessions {
+        fn unknown_lifted(&self, session: &SessionId) -> bool {
+            self.0.iter().any(|s| SessionId::from(*s) == *session)
+        }
+    }
+
+    /// **BUG-215 / REQ-614 BR-4.** A lifted session's unknown-provenance
+    /// request reaches the wire; the same request in an unlifted session, or
+    /// with no lift view at all, is refused against the sentinel exactly as
+    /// before.
+    ///
+    /// Mutation: drop the `with_unknown_lifted` shadowing in `send` and the
+    /// first arm goes red; make `unknown_lifted_for` answer `true` without a
+    /// session and the third goes red.
+    #[tokio::test]
+    async fn a_lift_releases_unknown_provenance_for_that_session_only() {
+        let inner = CaptureTransport::default();
+        let sent = inner.sent.clone();
+        let sink = Arc::new(CapturingSink::default());
+        let egress = Egress::new(inner, boundaries(), sink.clone())
+            .with_unknown_lift(Arc::new(LiftedSessions(vec!["sess-lifted"])));
+
+        // Lifted: the opaque result goes out.
+        let lifted = EgressContext::new("anthropic").with_session("sess-lifted");
+        egress
+            .send(a_request("opaque result"), &Provenance::unknown(), &lifted)
+            .await
+            .expect("a lifted session's unknown provenance is sent");
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert!(
+            sink.events.lock().unwrap().is_empty(),
+            "no block was published"
+        );
+
+        // Another session on the same choke point: still refused.
+        let other = EgressContext::new("anthropic").with_session("sess-other");
+        match egress
+            .send(a_request("opaque result"), &Provenance::unknown(), &other)
+            .await
+        {
+            Err(EgressError::PrivacyBlocked { path, .. }) => {
+                assert_eq!(path, provenance::UNKNOWN_PROVENANCE_PATH);
+            }
+            other => panic!("an unlifted session must still fail closed: {other:?}"),
+        }
+
+        // No session at all: nothing to look up, so nothing is lifted.
+        let none = EgressContext::new("anthropic");
+        assert!(
+            egress
+                .send(a_request("opaque result"), &Provenance::unknown(), &none)
+                .await
+                .is_err(),
+            "a session-less request cannot be lifted"
+        );
+        assert_eq!(sent.lock().unwrap().len(), 1, "only the lifted send left");
+    }
+
+    /// The lift releases **opacity, not sources**: a lifted session that read
+    /// a boundary file is refused naming that file, and a boundary-touch
+    /// sentinel is refused as itself. What `/shell allow` asserts is "the
+    /// command I ran touched nothing protected" — never "this session may
+    /// send protected content".
+    ///
+    /// Mutation: make `Provenance::with_unknown_lifted` also clear `sources`
+    /// (or `boundary_touch`) and the corresponding arm goes red.
+    #[tokio::test]
+    async fn a_lift_does_not_release_a_boundary_source_or_a_boundary_touch() {
+        let inner = CaptureTransport::default();
+        let sent = inner.sent.clone();
+        let egress = Egress::new(inner, boundaries(), Arc::new(CapturingSink::default()))
+            .with_unknown_lift(Arc::new(LiftedSessions(vec!["sess-lifted"])));
+        let ctx = EgressContext::new("anthropic").with_session("sess-lifted");
+
+        // Opaque *and* a boundary source: the source is what is named.
+        let mut prov = Provenance::tainted_by(fixture_id("secrets/prod.env"));
+        prov.mark_unknown();
+        match egress
+            .send(a_request("API_KEY=super-secret-xyzzy"), &prov, &ctx)
+            .await
+        {
+            Err(EgressError::PrivacyBlocked { path, .. }) => assert_eq!(path, "secrets/prod.env"),
+            other => panic!("a lifted session's boundary read must still be refused: {other:?}"),
+        }
+
+        // A boundary touch is a named protected path with no id; the lift
+        // leaves it alone.
+        match egress
+            .send(a_request("touched"), &Provenance::boundary_touch(), &ctx)
+            .await
+        {
+            Err(EgressError::PrivacyBlocked { path, .. }) => {
+                assert_eq!(path, provenance::BOUNDARY_TOUCH_PATH);
+            }
+            other => panic!("a boundary touch is not opacity and must not lift: {other:?}"),
+        }
+
+        // And a plain in-root source in the same lifted session goes out —
+        // so the two refusals above are the sources doing the work.
+        let mut clean = Provenance::tainted_by(fixture_id("src/main.rs"));
+        clean.mark_unknown();
+        egress
+            .send(a_request("public code"), &clean, &ctx)
+            .await
+            .expect("a lifted session's unprotected source is sent");
+        assert_eq!(sent.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

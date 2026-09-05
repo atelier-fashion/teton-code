@@ -41,8 +41,10 @@ claim.
 | BR-2 | test-case | `crates/tetond/tests/provenance_egress.rs::an_unknown_shell_result_still_blocks_its_own_turn` | yes |
 | AC-1 | test-case | `crates/tetond/tests/provenance_egress.rs::ls_la_then_a_second_prompt_reaches_the_remote_provider` | yes |
 | AC-2 | test-case | `crates/tetond/tests/provenance_egress.rs::cat_dotenv_pins_permanently_and_nothing_later_leaves` | no |
-| AC-3 | test-case | `crates/tetond/tests/provenance_egress.rs::curl_pins_liftably_and_shell_allow_restores_routing` | yes |
-| AC-11 | test-case | `crates/tetond/tests/e2e/shell_pin_shape.rs::pinned_session_records_the_two_events_in_order` | no |
+| AC-3 | test-case | `crates/tetond/tests/e2e/shell_pin_shape.rs::an_opaque_shell_result_pins_with_unknown_shell_and_says_so` (pin half), `…::after_shell_allow_the_next_prompt_leaves_the_machine` (routing half, BUG-215) | yes |
+| BR-3 after a lift | test-case | `crates/tetond/tests/e2e/shell_pin_shape.rs::a_boundary_read_after_a_lift_escalates_the_pin_and_nothing_later_leaves` (BUG-215) | no |
+| AC-11 | test-case | `crates/tetond/tests/e2e/shell_pin_shape.rs::an_opaque_shell_result_pins_with_unknown_shell_and_says_so`, `crates/tetond/src/runtime/taint.rs::tests::pinned_session_records_the_two_events_in_order` (sink-level) | no |
+| BUG-214 | source-scan | `crates/tetond/src/runtime/taint.rs::shell_pin::the_prompt_turn_egress_installs_the_tainting_sink` | — |
 | AC-12 | test-case | `crates/tetond/tests/e2e/shell_pin_shape.rs::the_2026_09_04_cost_shape_cannot_recur` | yes |
 
 ## Technical Notes

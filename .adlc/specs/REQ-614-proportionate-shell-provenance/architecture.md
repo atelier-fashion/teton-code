@@ -138,6 +138,20 @@ line prints, and the *route* now consults `RoutePin`, which honors the lift.
 The carried block is still refused at egress for its own turn (BR-6) because
 egress inspects provenance, not the pin.
 
+**Amended 2026-09-05 (BUG-215).** The last sentence was the defect: with the
+carried block refused at egress on every later turn, the lift moved
+`route_decided` and nothing else. The predicate now has a **third** reader —
+the choke point. `Egress` takes a `with_unknown_lift(Arc<dyn UnknownLift>)`
+view, `RoutePin` implements it as `pins` negated, and a lifted session's
+provenance is inspected with its opacity released
+(`Provenance::with_unknown_lifted`: sources and `boundary_touch` kept). The
+two session-scoped `Egress::new` sites (prompt turn, harness duties) hand it
+the same `self.route_pin()` the routes read, held by the source scan in
+`taint.rs`. Its twin is `SessionTaint::mark_escalating`: a boundary read in a
+lifted session upgrades the pin to `boundary_hit` from the sink and the carry
+seam — the two writers whose cause came off a block's path — while the
+path-less backstop arm in `run_prompt_turn` keeps the first-cause-wins `mark`.
+
 ## ADR-614-5: A truncated subtree scan is `unknown` (spec W1, BR-1(d))
 
 BR-1(d) requires knowing whether any file under a directory argument matches
