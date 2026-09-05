@@ -1,7 +1,7 @@
 ---
 id: TASK-398
 title: "A `~`-scoped ProvenanceId for user skills — the home constructor, the repo-scope reservation, and discovery's branch on source"
-status: draft
+status: complete
 parent: REQ-619
 created: 2026-09-05
 updated: 2026-09-05
