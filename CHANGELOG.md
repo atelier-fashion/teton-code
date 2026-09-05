@@ -18,6 +18,158 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [0.1.31] - 2026-09-05
+
+Five requirements from one dogfood transcript (2026-09-04, v0.1.30): a session
+whose first shell command pinned it to the local tier for good, launched from
+the home folder, on a 32K local window that compacted the user's ask away.
+
+### Added
+
+- **The local engine loads at its full trained window (REQ-616).** The
+  compile-time 32,768-token window is gone. At load the daemon reads the
+  model's trained window from the GGUF metadata — 262,144 for the shipped
+  `Qwen3-Coder-30B-A3B-Instruct` — and allocates that, choosing the KV cache
+  type by what the machine can hold: `f16` when it fits, else `q8_0`, else
+  the largest 4,096-multiple at `q8_0` that fits, down to a quarter of the
+  trained window. Below that the local tier is **refused with the
+  arithmetic** (weights, KV bytes per step, admissible RAM, shortfall) rather
+  than loaded small. No RoPE scaling: a window above the trained one is
+  refused at config time. The decision is announced as `local_window_decided`
+  or `local_window_refused`, recorded in `model-selection.toml`, and shown by
+  `teton model status` and `teton model list` (`trained 262,144 · served
+  262,144 (KV q8_0)`). A prefill over 32,768 new tokens reports
+  `prefill_progress` once a second so a long first turn is visibly working.
+
+  **New `[inference]` table** in `config.toml`: `n_ctx` names an explicit
+  window (honoured when it fits, refused above the trained window),
+  `kv_cache_type = "f16" | "q8_0"` overrides the probe's pick, and
+  `allow_over_memory = true` loads at the trained window regardless of the
+  memory check.
+
+  **Budgets follow the window on every route.** The local route's context
+  budget rises from 21,162 to 174,080 words (522,240 bytes). Remote routes are
+  unchanged in size, but every surface now prints the window in the
+  provider's own tokens beside the derived word budget — `window 1,000,000
+  tokens; budget 665,984 words` — so a declared 1M window no longer reads as
+  a shortfall.
+
+- **A shell result pins the session only when it could have touched a
+  protected file (REQ-614).** Every `shell` result used to carry unknown
+  provenance, and with the builtin boundaries in force the first shell
+  command of any session rerouted the rest of it to the local tier. Now the
+  daemon classifies each command by its reach: `rooted` when it ran at the
+  session root, every path argument resolves inside it, none matches a
+  boundary glob, and the verb cannot read file contents it was not given
+  (`ls`, `pwd`, `git status`, `git log`, an explicit `cat <file>`); `unknown`
+  for interpreters, build tools, network clients and any content-reading verb
+  over a subtree that holds a boundary file — or a subtree scan that hit its
+  budget; `boundary_touch` when an argument itself matches a glob. A
+  `rooted` result carries the root's provenance and leaves the machine like a
+  `glob` would; `unknown` still fail-closes the turn it is in. A session
+  pinned by an `unknown` result is now **liftable**: `/shell allow` (typed
+  only, refused on piped stdin, one ledger row) routes later turns by
+  category again, while the blocks that caused the pin stay refused at
+  egress. A real boundary hit still pins for good, with no lift.
+
+  **The pin is announced.** The first time a session is pinned, the client
+  prints one standing line whether or not `/verbose` is on — `privacy — this
+  session is pinned to the local tier (21,162 tokens); cause: …` — with the
+  remedy or `no remedy`. `session_pinned` and `session_pin_lifted` carry it;
+  `/doctor` shows a live session's pin and whether a lift exists.
+
+- **The shell tool tells the truth about `cd` (REQ-615).** Each command starts
+  in the session root and `cd` never carries to the next one; the tool's
+  description now says so, and a result whose command contained `cd` carries
+  a harness note naming the root it actually ran in. At a **home or
+  filesystem root**, the environment block tells the model this is not a
+  project and only the user can move it; `edit` and any write-verb or
+  output-redirecting `shell` (`mkdir`, `touch`, `rm`, `mv`, `cp`, `tee`,
+  `git init`, `>`, `>>`) are refused before dispatch with the remedy
+  (`write_refused_non_project`); and a skill that needs a project — one that
+  declares `requires: project`, or whose `!cmd` preamble references
+  `.adlc/` — is refused with the known-projects list instead of expanded
+  (`skill_refused_needs_project`), spending no model turn. A preamble whose
+  `||` fallback fired is prefixed with a line saying so
+  (`skill_preamble_fallback`). A plain non-project folder is not gated, so
+  scaffolding a new project still works. In an interactive session a prompt
+  that is just `cd <path>` is not sent: the client names `/cd <path>` and the
+  `//cd` escape.
+
+- **The model knows the session's own commands, and stops repeating itself
+  (REQ-617).** The self-config guide carries the built-in command roster as
+  17 families, ending *"You cannot run any of these. Name the one the user
+  should type, then stop."*; `teton_docs` gains `commands` (every command and
+  its `teton` twin) and `transcript`, and its `context` and `skills` topics
+  now name the switches. A reply to a session-state question that does not
+  name the command — or names it while reciting a config-file hunt — gets one
+  deterministic `>>` line naming it. **A repeated identical tool call is
+  refused by the harness**: the second identical read-only call (`read`,
+  `glob`, `grep`, `projects`, `teton_docs`, a read-only `shell` verb) or the
+  third identical write-capable call in one turn comes back as a typed
+  refusal naming the earlier result, with `tool_call_repeated`. The `shell`
+  duty **never interprets a failed command** any more — a non-zero exit or
+  timeout returns the raw result and `ERROR:` line (`shell_duty_skipped`) —
+  and its prompt forbids telling the agent what to do next. On the local
+  route the per-turn `skill` invocation cap is 3 (12 elsewhere).
+
+- **Compaction keeps the ask (REQ-618).** The current and previous prompts,
+  the active skill body for its turn, and the repository notes are
+  **anchors**: no compaction, clamp or drop may summarize or remove them, and
+  a turn whose anchors alone exceed the budget is refused with the arithmetic
+  (`turn_refused_anchors_exceed_budget`) rather than served short. The anchor
+  is assigned by the harness from role and position, never from text. A
+  skill body that fits the budget but would leave less than 75 % of it free
+  is refused with the numbers through the existing proceed-once offer
+  (`skill_refused_no_room`). Every compaction is a bus event and therefore a
+  transcript record, `context_compacted`: bytes kept, dropped and
+  summarized, the dropped blocks' kinds and provenance class, and the route,
+  with `fallback: true` when the duty failed and mechanical truncation ran.
+  The summary block opens with a harness line saying what it replaced.
+
+### Changed
+
+- **The daemon needs more memory on load.** A 262,144-token KV cache is
+  about 12 GiB at `q8_0` and 24 GiB at `f16`, on top of the shipped model's
+  17 GiB of weights; the probe admits 75 % of physical RAM. On a 48 GiB
+  machine expect `q8_0` at the full window and roughly 30 GiB resident once
+  the model is loaded. A machine that cannot fit a quarter window refuses the
+  local tier and says why; set `[inference] n_ctx` to a window you can afford,
+  or `allow_over_memory = true` to load anyway. `teton doctor` and `teton
+  model status` show the decision.
+
+- **Remote spend goes up, because sessions stay on the remote tier.** Before
+  this release a session's first shell command silently rerouted everything
+  after it to the local model. Now ordinary commands stay remote, so the
+  `build` and `think` tiers are used as configured for the whole session.
+  `/cost` and REQ-588's spend cap remain the ceiling. Sessions that relied on
+  the accidental pin for privacy should add a boundary or bind the tiers
+  locally.
+
+- **A session launched from your home folder can no longer write there
+  through the tools.** Run `teton` from a project, or `/cd` into one.
+
+- **Transcripts carry new record kinds** for the events above
+  (`session_pinned`, `session_pin_lifted`, `context_compacted`,
+  `local_window_decided`, `local_window_refused`, `prefill_progress`,
+  `tool_call_repeated`, `shell_duty_skipped`, `write_refused_non_project`,
+  `skill_refused_needs_project`, `skill_preamble_fallback`,
+  `skill_refused_no_room`, `turn_refused_anchors_exceed_budget`). Readers
+  that switch on `kind` should tolerate unknown values, as
+  `docs/transcript-format.md` has always said.
+
+- **The wire protocol stays at version 2.** Every change since 0.1.30 is
+  additive: the events above, `ConfigUpdate::SetInference`, the `/shell
+  allow` command, and the optional `inference` posture in `config/get`. An
+  older client that does not know an event renders it as an unrecognised
+  line and drops nothing.
+
+- **The resident prompt margin is nearly spent.** Two of these REQs added
+  sentences to the system prompt against one shared margin; about 64 usable
+  bytes remain above the floor. The next change that grows the prompt must
+  raise `REDACT_BODY_OVERHEAD_BYTES` and re-derive the redact constants, not
+  trim another feature's text (ASSUME-043).
+
 ## [0.1.30] - 2026-09-04
 
 ### Added
