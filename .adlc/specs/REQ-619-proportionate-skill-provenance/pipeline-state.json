@@ -3,13 +3,14 @@
   "branch": "feat/REQ-619-proportionate-skill-provenance",
   "startedAt": "2026-09-05T16:58:44Z",
   "completed": false,
-  "currentPhase": 5,
+  "currentPhase": 6,
   "completedPhases": [
     0,
     1,
     2,
     3,
-    4
+    4,
+    5
   ],
   "phaseHistory": [
     {
@@ -40,6 +41,12 @@
       "name": "Implement",
       "completedAt": "2026-09-05T19:28:25Z",
       "result": "TASK-398..403 complete in three tiers (398+399 | 400+402 | 401 | 403); workspace 82 targets green; clippy -D warnings and fmt clean"
+    },
+    {
+      "phase": 5,
+      "name": "Verify",
+      "completedAt": "2026-09-05T23:28:37Z",
+      "result": "6 agents + delegate pre-pass: 3 Critical (C1 model-path drops sources under unknown; C2 out-of-root touch beside in-root file folds clean; C3 ReservedScope read as no-file by walker/resolver), 5 Major, 9 Minor; all fixed in two passes (A: classifier/core, B: runtime/skills/tests/docs) with recorded mutations; inspector arm order filed as BUG-216 and pinned by a test; stale mutation counts re-measured"
     }
   ],
   "integrationBranch": "main",
