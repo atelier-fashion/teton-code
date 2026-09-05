@@ -3,11 +3,12 @@
   "branch": "feat/REQ-619-proportionate-skill-provenance",
   "startedAt": "2026-09-05T16:58:44Z",
   "completed": false,
-  "currentPhase": 3,
+  "currentPhase": 4,
   "completedPhases": [
     0,
     1,
-    2
+    2,
+    3
   ],
   "phaseHistory": [
     {
@@ -26,6 +27,12 @@
       "name": "Architect",
       "completedAt": "2026-09-05T17:08:05Z",
       "result": "6 ADRs, 6 tasks (TASK-398..403), OQ-1 resolved (ordinary glob form via ~-scoped ids), OQ-2 resolved (no script reading); footprint published to PR #304"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Tasks",
+      "completedAt": "2026-09-05T17:08:34Z",
+      "result": "APPROVED; DAG valid, max 3 deps; obligation coverage 10/10 BR, 13/13 AC; benign paths on every detector-shaped BR; vacuous-run gate deferred to the cargo runs in Phase 4/5"
     }
   ],
   "integrationBranch": "main",
