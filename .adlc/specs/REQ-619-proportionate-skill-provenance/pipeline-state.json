@@ -3,10 +3,11 @@
   "branch": "feat/REQ-619-proportionate-skill-provenance",
   "startedAt": "2026-09-05T16:58:44Z",
   "completed": false,
-  "currentPhase": 2,
+  "currentPhase": 3,
   "completedPhases": [
     0,
-    1
+    1,
+    2
   ],
   "phaseHistory": [
     {
@@ -19,6 +20,12 @@
       "name": "Validate Spec",
       "completedAt": "2026-09-05T16:59:53Z",
       "result": "APPROVED; 0 blockers, 2 advisory warnings (named existing function in BR-4/AC-9; AC-8 fixture weight); builtin-glob assumption verified against DEFAULT_BOUNDARIES"
+    },
+    {
+      "phase": 2,
+      "name": "Architect",
+      "completedAt": "2026-09-05T17:08:05Z",
+      "result": "6 ADRs, 6 tasks (TASK-398..403), OQ-1 resolved (ordinary glob form via ~-scoped ids), OQ-2 resolved (no script reading); footprint published to PR #304"
     }
   ],
   "integrationBranch": "main",
