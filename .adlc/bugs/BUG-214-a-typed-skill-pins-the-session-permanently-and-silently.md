@@ -1,7 +1,7 @@
 ---
 id: BUG-214
 title: "A typed `/skill` on a boundary-configured machine pins the session permanently and silently — the prompt-turn egress never gets the tainting sink, so every turn-path pin is recorded as `boundary_hit`"
-status: open
+status: resolved
 severity: high
 created: 2026-09-05
 updated: 2026-09-05
@@ -194,3 +194,8 @@ does not reach the egress inspection — the prompt after `/shell allow` is
 routed remote, blocked again, and served local. Filed and fixed as BUG-215 on
 the same branch. Causes 1a and 1b above (fixes B and C) are unchanged and
 still open.
+
+## Deployment
+
+- Merged to `main` as `34d4fde` via [PR #300](https://github.com/atelier-fashion/teton-code/pull/300) on 2026-09-05.
+- Staging / production: n/a — this repo ships through PR-gated CI on `main` and the release runbook; no deploy pipeline.

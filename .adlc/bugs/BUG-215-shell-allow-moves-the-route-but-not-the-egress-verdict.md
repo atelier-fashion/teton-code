@@ -1,7 +1,7 @@
 ---
 id: BUG-215
 title: "`/shell allow` moves the route but not the egress verdict — the prompt after a lift is routed remote, blocked again at the choke point, and served local anyway"
-status: open
+status: resolved
 severity: medium
 created: 2026-09-05
 updated: 2026-09-05
@@ -171,3 +171,8 @@ permanently (the lift must not widen into `boundary_hit`).
 
 None that keeps the session. Start a new session; the pinned one will not
 leave the local tier however many times the pin is lifted.
+
+## Deployment
+
+- Merged to `main` as `34d4fde` via [PR #300](https://github.com/atelier-fashion/teton-code/pull/300) on 2026-09-05.
+- Staging / production: n/a — this repo ships through PR-gated CI on `main` and the release runbook; no deploy pipeline.
