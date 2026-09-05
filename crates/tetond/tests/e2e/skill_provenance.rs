@@ -32,6 +32,9 @@
 //! | AC-11 | project skills gain the classification and nothing else | [`a_project_skill_leaves_with_a_rooted_preamble_and_is_refused_with_a_boundary_one`] |
 //! | AC-12 | `skill_invoked` carries each command's reach — and no output | [`skill_invoked_carries_each_commands_reach_and_nothing_more`] |
 //! | AC-13 | BUG-214's own shape: the `sh` alone pins, liftably | [`the_bug_214_shape_pins_liftably_from_the_sh_alone`] |
+//! | verify C1 | an opaque **and** boundary-reading expansion keeps the file across `/shell allow` | [`a_model_invoked_skill_with_an_opaque_and_a_boundary_preamble_keeps_the_file_after_a_lift`] |
+//! | verify C2 | an out-of-root touch is not cancelled by an in-root file beside it | [`a_preamble_touching_a_boundary_outside_the_root_beside_an_in_root_file_is_refused`] |
+//! | verify m1 | the same pair on the **typed** door, pinning BUG-216's reported path | [`a_preamble_that_is_both_opaque_and_boundary_reading_pins_and_survives_the_lift`] |
 //!
 //! # What AC-8 proves, and what it does not
 //!
@@ -1312,6 +1315,420 @@ fn the_bug_214_shape_pins_liftably_from_the_sh_alone() {
         provider.request_count(),
         1,
         "after the lift the next prompt leaves: {:?}",
+        client.event_names()
+    );
+
+    assert_no_boundary_bytes();
+}
+
+// ---------------------------------------------------------------------------
+// REQ-619 verify — the two shapes one expansion's fold could not express
+// ---------------------------------------------------------------------------
+
+/// **REQ-619 verify, C1.** A **model-invoked** skill whose preambles are one
+/// opaque command and one in-root boundary read is *both* things at once, and
+/// the tool provenance has to carry both: the first send is refused against the
+/// content-free sentinel, `/shell allow` lifts the opacity, and the very next
+/// send is refused **again** — now naming `secrets/prod.env`, with the cause
+/// escalated to the permanent `boundary_hit`. The mock's request count does not
+/// move across the lift.
+///
+/// # The leak this pins
+///
+/// `ExpansionProvenance::into_tool_provenance` used to hand-write the mapping
+/// and answer `ToolProvenance::Unknown` for that pair, dropping the source set.
+/// Refusing the send made the build look correct — and it was correct right up
+/// to the lift, which is the point where dropping an id stops being
+/// conservative: `/shell allow` clears the opacity, a cleared `Unknown` over an
+/// **empty** source set is a *clean* provenance, and the conversation carrying
+/// `secrets/prod.env`'s bytes was then sent. `ToolProvenance::UnknownWith` keeps
+/// the id for the glob to match after the lift, which is the whole of what the
+/// lift is supposed to mean (BUG-215, REQ-614 BR-4).
+///
+/// The **typed** path never had this: `runtime::turn` pushes the fold's three
+/// fields onto the user block separately, so its sources survived. One rule,
+/// two doors, and only one of them lost the file — BR-6's own concern.
+///
+/// # Mutation
+///
+/// Ran with `into_tool_provenance` reverted to the hand-written match
+/// (`self.unknown => ToolProvenance::Unknown`): **9 red of 16** in this file.
+/// This test is the one that fails on its *own* subject — `the lifted send is
+/// refused a second time`, `left: 1, right: 2`: there is no second block,
+/// because after the lift the provenance was clean. The other eight fail on
+/// `BR-1 VIOLATION: boundary secret leaked into captured egress payload #13`,
+/// which is [`assert_no_boundary_bytes`] — process-global by construction, so
+/// once this test's send leaves with `secrets/prod.env`'s bytes in it every
+/// later egress-touching test in the binary reports the leak too. The cascade is
+/// the finding, not noise: the mutation does not merely mis-shape a value, it
+/// puts a protected file on the wire. Restored: green, 16 of 16.
+#[test]
+fn a_model_invoked_skill_with_an_opaque_and_a_boundary_preamble_keeps_the_file_after_a_lift() {
+    let provider = mock(vec![MockResponse::ok(openai_turn(
+        "Reaching for the release skill.",
+        Some(("c1", "skill", r#"{"name":"release"}"#)),
+        120,
+        20,
+    ))]);
+    let (_ws, _daemon, mut client, session) = user_skill_fixture(
+        "sp-c1",
+        &provider,
+        &[],
+        &[(
+            "release",
+            "USER-SKILL-BODY-C1\n\
+             Opaque: !`sh -c 'echo hi'`\n\
+             Env: !`cat secrets/prod.env`\n",
+        )],
+    );
+
+    let turn = client.prompt(&session, "Use whichever skill fits, then answer.");
+    assert_eq!(
+        turn["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "the refused turn is served locally: {turn}"
+    );
+    client.drain_events(Duration::from_millis(300));
+
+    assert_eq!(
+        reaches(one_invocation(&client)),
+        vec!["unknown", "boundary_touch"],
+        "fixture: the expansion is opaque **and** boundary-reading, which is the \
+         pair the tool provenance had no vocabulary for"
+    );
+
+    // Leg (a): the opacity is what the first refusal reports (the inspector
+    // reads `is_unknown` before it walks the sources — BUG-216).
+    let blocks = client.events_named("privacy_block");
+    assert_eq!(blocks.len(), 1, "one block: {blocks:?}");
+    assert_eq!(
+        blocks[0]["path"].as_str(),
+        Some(UNKNOWN_PROVENANCE_PATH),
+        "{:?}",
+        blocks[0]
+    );
+    let pinned = client.events_named("session_pinned");
+    assert_eq!(pinned.len(), 1, "{pinned:?}");
+    assert_eq!(
+        pinned[0]["cause"].as_str(),
+        Some("unknown_shell"),
+        "{:?}",
+        pinned[0]
+    );
+    assert_eq!(pinned[0]["liftable"].as_bool(), Some(true));
+
+    // The tool-call turn left; the send carrying the expansion did not.
+    let sent_before_lift = provider.request_count();
+    assert_eq!(
+        sent_before_lift,
+        1,
+        "fixture: the turn that *called* the tool left, and only that one: {:?}",
+        client.event_names()
+    );
+
+    // Leg (b): the lift is granted — the pin really was the liftable kind.
+    let lifted = client.call("shell/override", json!({ "session_id": session }));
+    assert_eq!(
+        lifted["result"]["lifted_now"].as_bool(),
+        Some(true),
+        "{lifted}"
+    );
+
+    // Leg (c): and the file the expansion proved is still there to refuse it.
+    let after = client.prompt(&session, "Now summarize the release checklist.");
+    assert_eq!(
+        after["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "{after}"
+    );
+    client.drain_events(Duration::from_millis(300));
+
+    let blocks = client.events_named("privacy_block");
+    assert_eq!(
+        blocks.len(),
+        2,
+        "the lifted send is refused a second time: {:?}",
+        client.event_names()
+    );
+    assert_eq!(
+        blocks[1]["path"].as_str(),
+        Some("secrets/prod.env"),
+        "the lift releases the opacity, not the file: {:?}",
+        blocks[1]
+    );
+    let pinned = client.events_named("session_pinned");
+    assert_eq!(
+        pinned.last().map(|p| p["cause"].as_str()),
+        Some(Some("boundary_hit")),
+        "…and the cause escalates to the permanent one: {pinned:?}"
+    );
+    assert_eq!(
+        provider.request_count(),
+        sent_before_lift,
+        "nothing left the machine across the lift: {:?}",
+        client.event_names()
+    );
+
+    assert_no_boundary_bytes();
+}
+
+/// **REQ-619 verify, C2.** One preamble that names a boundary file **outside**
+/// the session root *and* an ordinary in-root file — `` !`cat ~/.ssh/id_rsa
+/// README.md` `` — is refused against `<boundary-touch>` with the permanent
+/// cause, and the key's bytes never reach the wire.
+///
+/// # Why the in-root file is the whole test
+///
+/// Both the shell tool and the skill fold used to read `verdict.sources` being
+/// **empty** as the proof that a boundary touch was in-root — which is true for
+/// every command that names one path, and false for this one. `README.md` mints
+/// an id and lands in `sources`, so the emptiness test read an ordinary note
+/// file as evidence that the private key beside it had been nameable, folded the
+/// pair to a plain `Sources({README.md})`, and let the expansion — key bytes and
+/// all — leave. `Verdict::out_of_root_touch` states the fact rather than
+/// inferring it, and the two facts are folded together: the bit is set *and*
+/// `README.md` is still named.
+///
+/// The fixture's `.ssh/id_rsa` holds a distinctive marker rather than anything
+/// key-shaped, so the absence assertion below is a search for bytes that exist
+/// exactly once on the machine (LESSON-624 — the repo's own leak sentinel stays
+/// in `secrets/prod.env`, which nothing here reads).
+///
+/// # Mutation
+///
+/// Ran with `run.verdict.out_of_root_touch ||` dropped from `fold_expansion`'s
+/// `BoundaryTouch` arm, leaving the old `sources.is_empty()` reading: **1 red of
+/// 16** in this file, this test on `an out-of-root touch is not cancelled by an
+/// in-root file beside it`, `left: 0, right: 1` — no `privacy_block` at all.
+/// One, and that is the finding: every other row in this file names either an
+/// in-root path or no path, so the leak lived in the one shape nothing covered.
+/// Restored: green, 16 of 16.
+#[test]
+fn a_preamble_touching_a_boundary_outside_the_root_beside_an_in_root_file_is_refused() {
+    /// A line of the fixture home's fake `.ssh/id_rsa`. Not key-shaped on
+    /// purpose: what it has to be is unique, so finding it in a request body is
+    /// unambiguous.
+    const FAKE_KEY_MARKER: &str = "FAKE-KEY-MARKER-AC-C2";
+
+    let provider = mock(Vec::new());
+    let ws = Workspace::new("sp-c2");
+    ws.write_config(&config_for(&provider, &[]));
+    let script = ws.write_script(&local_done_script());
+
+    // The fixture HOME `Workspace::user_skill` plants into, named here because
+    // the skill body has to spell the key's path absolutely.
+    let home = ws.root.join("home");
+    let ssh = home.join(".ssh");
+    std::fs::create_dir_all(&ssh).unwrap();
+    std::fs::write(
+        ssh.join("id_rsa"),
+        format!("{FAKE_KEY_MARKER}\nnot-a-real-key\n"),
+    )
+    .unwrap();
+
+    // One command, two path arguments: the out-of-root key (matched by the
+    // builtin `**/.ssh/**`) and an in-root file that mints an ordinary id.
+    let key = ssh.join("id_rsa");
+    assert_eq!(
+        ws.user_skill(
+            "probe",
+            &format!(
+                "USER-SKILL-BODY-C2\nBoth: !`cat {} README.md`\n",
+                key.display()
+            ),
+        ),
+        home,
+        "fixture: one home per workspace"
+    );
+    let daemon = Daemon::spawn(
+        &ws,
+        probe_16gb_with_local(script).env("HOME", home.display().to_string()),
+    );
+    let mut client = daemon.connect();
+    let session = client.create_session("structured", Some("implement"));
+
+    let turn = client.skill(&session, "probe", "");
+    assert_eq!(
+        turn["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "the refused turn is served locally: {turn}"
+    );
+    client.drain_events(Duration::from_millis(300));
+
+    assert_eq!(
+        reaches(one_invocation(&client)),
+        vec!["boundary_touch"],
+        "fixture: the classifier saw the out-of-root key"
+    );
+
+    let blocks = client.events_named("privacy_block");
+    assert_eq!(
+        blocks.len(),
+        1,
+        "an out-of-root touch is not cancelled by an in-root file beside it: {:?}",
+        client.event_names()
+    );
+    assert_eq!(
+        blocks[0]["path"].as_str(),
+        Some("<boundary-touch>"),
+        "the key has no identity for the block to name, so the sentinel is the \
+         only honest path: {:?}",
+        blocks[0]
+    );
+
+    let pinned = client.events_named("session_pinned");
+    assert_eq!(pinned.len(), 1, "{pinned:?}");
+    assert_eq!(
+        pinned[0]["cause"].as_str(),
+        Some("boundary_hit"),
+        "a named protected path pins permanently, however unnameable it is: {:?}",
+        pinned[0]
+    );
+    assert_eq!(pinned[0]["liftable"].as_bool(), Some(false));
+
+    assert_eq!(
+        provider.request_count(),
+        0,
+        "nothing left the machine: {:?}",
+        client.event_names()
+    );
+    assert!(
+        !any_body_contains(&provider, FAKE_KEY_MARKER),
+        "the key's own bytes must not appear in any captured body"
+    );
+
+    assert_no_boundary_bytes();
+}
+
+/// **REQ-619 verify, m1 — a pin on BUG-216's reported path.** The same pair as
+/// C1 above (`` !`sh probe.sh` `` beside `` !`cat secrets/prod.env` ``) on the
+/// **typed** door, asserted at all three moments: what the first refusal names,
+/// that the lift is granted, and what the refusal after the lift names.
+///
+/// # What this test is for
+///
+/// Not the leak — C1 owns that, and the typed path never lost the id. This one
+/// exists because [BUG-216] is a **known, deliberately unfixed** ordering:
+/// `egress::inspector` tests `Provenance::is_unknown` before it walks the source
+/// set, so a context that is both opaque and boundary-naming reports the opacity
+/// first and the file only after `/shell allow` has taken the opacity away. That
+/// is not wrong — both refuse, and the user reaches the truth in two steps
+/// rather than one — but it is *chosen*, and an unpinned choice is one a later
+/// refactor makes silently.
+///
+/// So legs **(a)** and **(c)** are the pin. Reorder the inspector to walk the
+/// sources before the unknown test and both flip: (a) becomes
+/// `secrets/prod.env` / `boundary_hit` / not liftable, (b)'s `/shell allow` is
+/// then refused outright, and (c) never happens because the session was
+/// permanently pinned at the first block. Whoever makes that change is fixing
+/// BUG-216 and should rewrite this test to the new order — deliberately, which
+/// is the point.
+///
+/// Leg (b) is not decoration either: it is what proves the first pin was the
+/// liftable kind rather than a permanent one that merely reported a sentinel.
+///
+/// [BUG-216]: the inspector reports opacity before a matched boundary source
+#[test]
+fn a_preamble_that_is_both_opaque_and_boundary_reading_pins_and_survives_the_lift() {
+    let provider = mock(Vec::new());
+    let ws = Workspace::new("sp-m1");
+    ws.write_config(&config_for(&provider, &[]));
+    let script = ws.write_script(&local_done_script());
+    // An ordinary in-root script under an opaque verb: `sh` is opaque because of
+    // its **verb**, whatever it is handed.
+    std::fs::write(ws.repo.join("probe.sh"), "echo probing\n").unwrap();
+    let home = ws.user_skill(
+        "probe",
+        "USER-SKILL-BODY-M1\n\
+         Opaque: !`sh probe.sh`\n\
+         Env: !`cat secrets/prod.env`\n",
+    );
+    let daemon = Daemon::spawn(
+        &ws,
+        probe_16gb_with_local(script).env("HOME", home.display().to_string()),
+    );
+    let mut client = daemon.connect();
+    let session = client.create_session("structured", Some("implement"));
+
+    let turn = client.skill(&session, "probe", "");
+    assert_eq!(
+        turn["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "{turn}"
+    );
+    client.drain_events(Duration::from_millis(300));
+
+    assert_eq!(
+        reaches(one_invocation(&client)),
+        vec!["unknown", "boundary_touch"],
+        "fixture: one opaque command and one boundary read"
+    );
+
+    // (a) The opacity is reported first — BUG-216's ordering, pinned.
+    let blocks = client.events_named("privacy_block");
+    assert_eq!(blocks.len(), 1, "{blocks:?}");
+    assert_eq!(
+        blocks[0]["path"].as_str(),
+        Some(UNKNOWN_PROVENANCE_PATH),
+        "BUG-216: the inspector reads the unknown bit before the sources, so the \
+         first refusal names the opacity and not the file: {:?}",
+        blocks[0]
+    );
+    let pinned = client.events_named("session_pinned");
+    assert_eq!(pinned.len(), 1, "{pinned:?}");
+    assert_eq!(
+        pinned[0]["cause"].as_str(),
+        Some("unknown_shell"),
+        "{:?}",
+        pinned[0]
+    );
+    assert_eq!(pinned[0]["liftable"].as_bool(), Some(true));
+    assert_eq!(provider.request_count(), 0, "the pinned turn sent nothing");
+
+    // (b) …and the pin really is the liftable kind.
+    let lifted = client.call("shell/override", json!({ "session_id": session }));
+    assert_eq!(
+        lifted["result"]["lifted_now"].as_bool(),
+        Some(true),
+        "{lifted}"
+    );
+
+    // (c) The lift released the opacity and nothing else: the file the
+    // expansion proved refuses the next send, permanently.
+    let after = client.prompt(&session, "Now summarize what you found.");
+    assert_eq!(
+        after["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "{after}"
+    );
+    client.drain_events(Duration::from_millis(300));
+
+    let blocks = client.events_named("privacy_block");
+    assert_eq!(
+        blocks.len(),
+        2,
+        "the lifted send is refused again: {:?}",
+        client.event_names()
+    );
+    assert_eq!(
+        blocks[1]["path"].as_str(),
+        Some("secrets/prod.env"),
+        "and now the file is named: {:?}",
+        blocks[1]
+    );
+    assert_eq!(
+        client
+            .events_named("session_pinned")
+            .last()
+            .map(|p| p["cause"].as_str()),
+        Some(Some("boundary_hit")),
+        "…with the cause escalated to the permanent one: {:?}",
+        client.events_named("session_pinned")
+    );
+    assert_eq!(
+        provider.request_count(),
+        0,
+        "nothing left the machine at any point: {:?}",
         client.event_names()
     );
 
