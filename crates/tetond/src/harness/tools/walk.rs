@@ -287,6 +287,25 @@ pub struct WalkReport {
     /// posture [`WALK_SKIP_DIRS`] already has — a prune nothing names — and the
     /// count exists so a test can tell a pruned tree from an absent one.
     pub denied: usize,
+    /// Entries under the root whose identity would not mint, so nothing was
+    /// handed to the tool for them (REQ-619 verify, C3).
+    ///
+    /// A count, and no trailer line, for [`Self::denied`]'s reason: the only
+    /// way an entry *under a canonical root* fails to mint is
+    /// `ProvenanceError::ReservedScope` — a directory literally named `~`,
+    /// which a shell creates by accident inside quotes — and naming it back
+    /// tells the model about a path the walk deliberately surfaced nothing for.
+    ///
+    /// **It exists because a skipped entry is not an absent one.** A walk that
+    /// merely *counts* the files it looked at can ignore this; a walk that
+    /// concludes something from having found nothing cannot.
+    /// `shell_provenance::subtree_is_boundary_free` is the second kind — it
+    /// answers "no file under here matches a boundary glob" — and before this
+    /// count existed a `<root>/~/.env` was skipped by the `continue` below and
+    /// the scan answered *boundary-free* for a tree holding a `.env`. It reads
+    /// this field and fails closed on it, exactly as it does on
+    /// [`Self::truncated_by`].
+    pub unmintable: usize,
 }
 
 /// Walk `root` under `policy`, handing every entry seen to `on_entry` as
@@ -312,7 +331,10 @@ pub struct WalkReport {
 /// - An entry under one of the policy's denied prefixes is skipped before
 ///   anything else sees it (REQ-611 BR-8): not listed, not entered, counted on
 ///   the report as [`WalkReport::denied`] and named nowhere.
-/// - An entry whose identity cannot be minted surfaces nothing (REQ-571).
+/// - An entry whose identity cannot be minted surfaces nothing (REQ-571), and
+///   is counted on the report as [`WalkReport::unmintable`] so a caller whose
+///   answer is "I found nothing" can tell that apart from "I saw something I
+///   could not name" (REQ-619 verify, C3).
 /// - Every entry seen — file or directory — is counted against the entry
 ///   budget and handed to `on_entry` **before** the driver decides whether to
 ///   descend, so a pruned directory is still *seen* (glob can list `Library/`
@@ -424,6 +446,12 @@ impl Walk<'_> {
                 continue;
             }
             let Ok(id) = ProvenanceId::from_resolved(self.root, &path) else {
+                // Counted, then skipped — the skip is REQ-571's posture and is
+                // unchanged. What is new (REQ-619 verify, C3) is that the skip
+                // is now *visible*: a caller that draws a conclusion from having
+                // seen nothing must be able to tell "there was nothing" from
+                // "there was something I could not name".
+                self.report.unmintable += 1;
                 continue;
             };
             if (self.on_entry)(&path, &file_type, &id).is_break() {
@@ -737,6 +765,55 @@ mod tests {
         });
         seen.sort();
         (seen, report)
+    }
+
+    /// REQ-619 verify, C3: an entry the walk could not name is **counted**, not
+    /// merely skipped.
+    ///
+    /// `<root>/~/.env` is a real file with real bytes and no identity: the `~`
+    /// segment belongs to the home scope, so `from_resolved` refuses it
+    /// (`ProvenanceError::ReservedScope`). The entry stays unsurfaced — that is
+    /// REQ-571's posture and this does not change it — but the report now says
+    /// one entry went unnamed, which is the only thing a caller reasoning from
+    /// *absence* can use. Without the count, "the walk handed me no boundary
+    /// file" and "the walk skipped a file it could not name" are the same
+    /// observation.
+    ///
+    /// The benign twin is the second half: an ordinary tree counts zero, so the
+    /// field cannot be non-zero for every walk and quietly fail every scan.
+    ///
+    /// **Mutation (run, red, reverted):** delete `self.report.unmintable += 1`
+    /// from the mint-failure arm in `Walk::dir` and this test goes red on the
+    /// first assertion, together with
+    /// `shell_provenance::tests::a_file_the_walk_cannot_name_is_never_boundary_free`
+    /// — two, and the second is the leak.
+    #[test]
+    fn an_entry_whose_identity_will_not_mint_is_counted_not_silently_skipped() {
+        let root = temp_root("unmintable");
+        plant(&root, "src/main.rs");
+        // A directory literally named `~` — what `mkdir "~"` produces.
+        plant(&root, "~/.env");
+        let (seen, report) = files_seen(&root, RootKind::Project, &[], &WalkPolicy::default());
+        assert_eq!(
+            seen,
+            vec!["src/main.rs"],
+            "the unmintable entry must still surface nothing"
+        );
+        assert_eq!(
+            report.unmintable, 1,
+            "the walk saw a file it could not name and must say so: {report:?}"
+        );
+
+        let clean = temp_root("mintable");
+        plant(&clean, "src/main.rs");
+        let (_, clean_report) = files_seen(&clean, RootKind::Project, &[], &WalkPolicy::default());
+        assert_eq!(
+            clean_report.unmintable, 0,
+            "an ordinary tree names everything: {clean_report:?}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&clean).ok();
     }
 
     #[test]
@@ -1343,9 +1420,11 @@ mod tests {
     /// shape belongs in the recogniser, in the same change.
     #[test]
     fn every_harness_line_writer_is_recognised() {
-        // `WalkReport::denied` (REQ-611 BR-8) is absent from this enumeration on
-        // purpose: it writes no harness line, because naming a transcript
-        // directory in tool output is exactly what the denial exists to stop.
+        // `WalkReport::denied` (REQ-611 BR-8) and `WalkReport::unmintable`
+        // (REQ-619 verify, C3) are absent from this enumeration on purpose:
+        // neither writes a harness line, because naming a transcript directory
+        // — or a path the walk deliberately surfaced nothing for — in tool
+        // output is exactly what those skips exist to stop.
         let reports = [
             WalkReport {
                 truncated_by: Some(TruncatedBy::Entries(100_000)),
