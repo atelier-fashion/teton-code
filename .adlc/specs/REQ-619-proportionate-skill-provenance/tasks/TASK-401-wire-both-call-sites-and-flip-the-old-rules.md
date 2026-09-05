@@ -1,7 +1,7 @@
 ---
 id: TASK-401
 title: "Both call sites take their provenance from the fold; the `spawned` rule and the user-skill `unknown` are retired, and the tests that asserted them flip"
-status: draft
+status: complete
 parent: REQ-619
 created: 2026-09-05
 updated: 2026-09-05
