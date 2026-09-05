@@ -3105,6 +3105,19 @@ mod tests {
     /// refused to widen the minter), so `Sources(∅)` would let `~/.claude` bytes
     /// egress under any boundary. Both rules are asserted, because they are
     /// two rules and not one (BR-10).
+    ///
+    /// **REQ-619 TASK-398 — half retired, and this test is not yet the new
+    /// claim.** `skills::provenance_of` now mints a `~`-scoped identity for a
+    /// user skill under the daemon's `$HOME` (BR-3), so "a user skill has no
+    /// identity" is no longer why the answer below is `Unknown`. What still
+    /// produces it here is the *mapping* a few hundred lines up —
+    /// `(SkillSource::User, _) => ToolProvenance::Unknown` — which is
+    /// **TASK-401's** to replace with the fold. This test therefore keeps its
+    /// outcome assertion unchanged and flips there, together with the typed
+    /// path's twin, so the two arms move in one step rather than disagreeing
+    /// for a commit. The fixture's home is a temp directory and not the
+    /// process's `HOME`, so the roster sibling below is unaffected for a second
+    /// reason it should not be relied on for; TASK-401 removes both.
     #[tokio::test]
     async fn a_user_skill_is_unknown_and_a_project_skill_mints() {
         let fx = ac1_fixture();
@@ -3278,6 +3291,18 @@ mod tests {
     /// result: it cannot be `Sources` for half of itself. `Unknown` is the same
     /// posture that session's expansions get, and it is stricter than a `read`
     /// of the same bytes — which is BR-10's stated consequence, not a surprise.
+    ///
+    /// **REQ-619 TASK-398 — read this one as pending, not as a claim.**
+    /// `roster_provenance` calls `skills::provenance_of` directly, with no
+    /// mapping in front of it, and that function now mints a `~`-scoped id for
+    /// a user skill whose canonical path is under the daemon's `$HOME` (BR-3).
+    /// The assertion below still holds only because `Fixture`'s home is a temp
+    /// directory that is not this process's `HOME`, so the strip fails and the
+    /// row answers `None` — a true statement about the fixture and no longer a
+    /// statement about the rule. **TASK-401** threads the home through the
+    /// roster and flips this to the union of `~`-scoped and repo-scoped ids;
+    /// it is left as-is here so the roster and the expansion mapping move
+    /// together rather than in two commits.
     #[tokio::test]
     async fn a_roster_holding_a_user_skill_is_unknown_because_one_row_will_not_mint() {
         let fx = ac1_fixture();
