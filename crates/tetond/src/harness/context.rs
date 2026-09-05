@@ -6114,6 +6114,70 @@ mod tests {
         assert!(ctx.dropped_provenance().sources().is_empty());
     }
 
+    /// **The third half of seam 1's arm (REQ-619 verify, M5).** A dropped user
+    /// block that carried `boundary_touch` has to leave *that* bit behind, not
+    /// merely the `unknown` it implies.
+    ///
+    /// The arm gained the line with ADR-619-2 and nothing exercised it. It is
+    /// not covered by the sibling above, because `absorb` sets `unknown` from
+    /// `*unknown || *boundary_touch` — so a build that had forgotten the
+    /// permanence entirely still fails the next send closed, and the sibling
+    /// stays green. What is lost is only visible one question deeper:
+    /// `taint::cause_of` reads `is_boundary_touch` to decide whether the pin is
+    /// `boundary_hit` (permanent) or `unknown_shell` (liftable), so compacting
+    /// the block away would silently convert a crossed boundary into something
+    /// `/shell allow` releases. Dropping a block is not a lift.
+    ///
+    /// The last two assertions are the non-vacuity half: an ordinary unknown
+    /// expansion must **not** come back boundary-touched, or this test would
+    /// pass on an accumulator that had started setting the bit for everything.
+    ///
+    /// # Mutation
+    ///
+    /// Ran with `self.boundary_touch |= *boundary_touch;` deleted from
+    /// `absorb`'s `User` arm: **one red**, this test on `a dropped boundary
+    /// touch keeps its permanence`. One — the seam has exactly this test, which
+    /// is why it is here.
+    #[test]
+    fn absorbing_a_boundary_touched_user_block_keeps_the_bit() {
+        let mut ctx = ContextManager::new("HEAD", 1_000_000).with_budget_bytes(2_000);
+        // A skill expansion whose preamble read an out-of-root boundary file:
+        // no id to name it with, so the bit is the only carrier (LESSON-623).
+        ctx.push_user_from("x".repeat(1_500), BTreeSet::new(), false, true);
+        ctx.push_model("y".repeat(1_500));
+        // Three prompts in, for the reason the sibling above spells out.
+        ctx.push_user("and now the next prompt");
+        ctx.push_user("and the one after that");
+
+        let report = ctx.truncate_to_budget();
+        assert!(
+            report.dropped_blocks >= 1,
+            "non-vacuity: the gate dropped nothing, so nothing was absorbed"
+        );
+        assert!(
+            ctx.dropped_provenance().is_boundary_touch(),
+            "a dropped boundary touch keeps its permanence: {:?}",
+            ctx.dropped_provenance()
+        );
+        assert!(
+            ctx.dropped_provenance().is_unknown(),
+            "…and it still blocks, which is the half `unknown` carries"
+        );
+
+        // Non-vacuity: an ordinary unknown expansion is not promoted to one.
+        let mut liftable = ContextManager::new("HEAD", 1_000_000).with_budget_bytes(2_000);
+        liftable.push_user_from("x".repeat(1_500), BTreeSet::new(), true, false);
+        liftable.push_model("y".repeat(1_500));
+        liftable.push_user("and now the next prompt");
+        liftable.push_user("and the one after that");
+        assert!(liftable.truncate_to_budget().dropped_blocks >= 1);
+        assert!(liftable.dropped_provenance().is_unknown());
+        assert!(
+            !liftable.dropped_provenance().is_boundary_touch(),
+            "an unprovable expansion crossed nothing, so its pin stays liftable"
+        );
+    }
+
     /// **REQ-619 verify, M3 + C1.** The one mapping from three reach bits to
     /// this vocabulary, row for row.
     ///
