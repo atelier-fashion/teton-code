@@ -44,9 +44,16 @@
 //!   *records and announces*. An opaque `shell` result pins with the liftable
 //!   `unknown_shell` cause, `session_pinned` precedes the pinned local route,
 //!   `/shell allow` lifts it once; a `Rooted` result pins nothing and its next
-//!   send leaves; a typed user skill pins on its first send, liftably, and says
-//!   so. All asserted on what a client received from the real daemon, because
-//!   the in-process sink tests were green while the daemon never built the sink.
+//!   send leaves; and — since REQ-619 flipped it — a typed **user** skill leaves
+//!   under the builtins and pins nothing at all. All asserted on what a client
+//!   received from the real daemon, because the in-process sink tests were green
+//!   while the daemon never built the sink.
+//! - [`skill_provenance`] — REQ-619: a skill's provenance made proportionate.
+//!   Thirteen egress-capture claims through the daemon — a user skill's
+//!   `~`-scoped identity on both invocation doors, each preamble classified with
+//!   the `shell` grammar before it spawns, and the pins that remain (a boundary
+//!   file named, a verb nothing can prove) with their existing announcement and
+//!   `/shell allow` lift.
 //! - [`state_dir`] — BUG-211: the daemon keeps its durable state under
 //!   `$XDG_DATA_HOME/teton`, never beside the socket under the logout-cleared
 //!   `$XDG_RUNTIME_DIR/teton`, and a daemon that finds legacy state beside the
@@ -76,5 +83,7 @@ mod routing_categories;
 mod session_root;
 #[path = "e2e/shell_pin_shape.rs"]
 mod shell_pin_shape;
+#[path = "e2e/skill_provenance.rs"]
+mod skill_provenance;
 #[path = "e2e/state_dir.rs"]
 mod state_dir;
