@@ -32,9 +32,9 @@
 //! | AC-11 | project skills gain the classification and nothing else | [`a_project_skill_leaves_with_a_rooted_preamble_and_is_refused_with_a_boundary_one`] |
 //! | AC-12 | `skill_invoked` carries each command's reach — and no output | [`skill_invoked_carries_each_commands_reach_and_nothing_more`] |
 //! | AC-13 | BUG-214's own shape: the `sh` alone pins, liftably | [`the_bug_214_shape_pins_liftably_from_the_sh_alone`] |
-//! | verify C1 | an opaque **and** boundary-reading expansion keeps the file across `/shell allow` | [`a_model_invoked_skill_with_an_opaque_and_a_boundary_preamble_keeps_the_file_after_a_lift`] |
+//! | verify C1 | an opaque **and** boundary-reading expansion keeps the file, named at the first block | [`a_model_invoked_skill_with_an_opaque_and_a_boundary_preamble_names_the_file_at_the_first_block`] |
 //! | verify C2 | an out-of-root touch is not cancelled by an in-root file beside it | [`a_preamble_touching_a_boundary_outside_the_root_beside_an_in_root_file_is_refused`] |
-//! | verify m1 | the same pair on the **typed** door, pinning BUG-216's reported path | [`a_preamble_that_is_both_opaque_and_boundary_reading_pins_and_survives_the_lift`] |
+//! | verify m1 | the same pair on the **typed** door, named at the first block (BUG-216) | [`a_preamble_that_is_both_opaque_and_boundary_reading_pins_permanently_at_the_first_block`] |
 //!
 //! # What AC-8 proves, and what it does not
 //!
@@ -1353,9 +1353,12 @@ fn the_bug_214_shape_pins_liftably_from_the_sh_alone() {
 ///
 /// Ran with `into_tool_provenance` reverted to the hand-written match
 /// (`self.unknown => ToolProvenance::Unknown`): **9 red of 16** in this file.
-/// This test is the one that fails on its *own* subject — `the lifted send is
-/// refused a second time`, `left: 1, right: 2`: there is no second block,
-/// because after the lift the provenance was clean. The other eight fail on
+/// This test is the one that fails on its *own* subject — before BUG-216, `the
+/// lifted send is refused a second time`, `left: 1, right: 2`: there was no
+/// second block, because after the lift the provenance was clean. Since BUG-216
+/// moved the source walk ahead of the unknown arm it reds one leg earlier, at
+/// (a): with the id dropped the first block names `<unknown-provenance>` and
+/// the pin is liftable, where the fixed daemon names the file and pins for good. The other eight fail on
 /// `BR-1 VIOLATION: boundary secret leaked into captured egress payload #13`,
 /// which is [`assert_no_boundary_bytes`] — process-global by construction, so
 /// once this test's send leaves with `secrets/prod.env`'s bytes in it every
@@ -1363,7 +1366,8 @@ fn the_bug_214_shape_pins_liftably_from_the_sh_alone() {
 /// the finding, not noise: the mutation does not merely mis-shape a value, it
 /// puts a protected file on the wire. Restored: green, 16 of 16.
 #[test]
-fn a_model_invoked_skill_with_an_opaque_and_a_boundary_preamble_keeps_the_file_after_a_lift() {
+fn a_model_invoked_skill_with_an_opaque_and_a_boundary_preamble_names_the_file_at_the_first_block()
+{
     let provider = mock(vec![MockResponse::ok(openai_turn(
         "Reaching for the release skill.",
         Some(("c1", "skill", r#"{"name":"release"}"#)),
@@ -1397,25 +1401,30 @@ fn a_model_invoked_skill_with_an_opaque_and_a_boundary_preamble_keeps_the_file_a
          pair the tool provenance had no vocabulary for"
     );
 
-    // Leg (a): the opacity is what the first refusal reports (the inspector
-    // reads `is_unknown` before it walks the sources — BUG-216).
+    // Leg (a): the file is what the first refusal reports. Since BUG-216 the
+    // inspector walks the sources before it reads the unknown bit, so the id
+    // `UnknownWith` kept is named at the first block — and the pin is the
+    // permanent kind. Under the mutation this leg is the one that reds: with
+    // the id dropped there is no source to name, the block reports the opacity
+    // and the pin is liftable.
     let blocks = client.events_named("privacy_block");
     assert_eq!(blocks.len(), 1, "one block: {blocks:?}");
     assert_eq!(
         blocks[0]["path"].as_str(),
-        Some(UNKNOWN_PROVENANCE_PATH),
-        "{:?}",
+        Some("secrets/prod.env"),
+        "the id the fold kept is the one the glob matched: {:?}",
         blocks[0]
     );
+    assert_ne!(blocks[0]["path"].as_str(), Some(UNKNOWN_PROVENANCE_PATH));
     let pinned = client.events_named("session_pinned");
     assert_eq!(pinned.len(), 1, "{pinned:?}");
     assert_eq!(
         pinned[0]["cause"].as_str(),
-        Some("unknown_shell"),
+        Some("boundary_hit"),
         "{:?}",
         pinned[0]
     );
-    assert_eq!(pinned[0]["liftable"].as_bool(), Some(true));
+    assert_eq!(pinned[0]["liftable"].as_bool(), Some(false));
 
     // The tool-call turn left; the send carrying the expansion did not.
     let sent_before_lift = provider.request_count();
@@ -1426,15 +1435,22 @@ fn a_model_invoked_skill_with_an_opaque_and_a_boundary_preamble_keeps_the_file_a
         client.event_names()
     );
 
-    // Leg (b): the lift is granted — the pin really was the liftable kind.
+    // Leg (b): the lift is refused — no command lifts a boundary hit.
     let lifted = client.call("shell/override", json!({ "session_id": session }));
     assert_eq!(
-        lifted["result"]["lifted_now"].as_bool(),
+        lifted["result"]["was_pinned"].as_bool(),
         Some(true),
         "{lifted}"
     );
+    assert_eq!(
+        lifted["result"]["lifted_now"].as_bool(),
+        Some(false),
+        "{lifted}"
+    );
 
-    // Leg (c): and the file the expansion proved is still there to refuse it.
+    // Leg (c): the next turn is served locally without reaching the choke
+    // point — a permanently pinned session never tries a remote provider again
+    // — so nothing new is blocked, pinned or sent.
     let after = client.prompt(&session, "Now summarize the release checklist.");
     assert_eq!(
         after["result"]["stop_reason"].as_str(),
@@ -1443,29 +1459,22 @@ fn a_model_invoked_skill_with_an_opaque_and_a_boundary_preamble_keeps_the_file_a
     );
     client.drain_events(Duration::from_millis(300));
 
-    let blocks = client.events_named("privacy_block");
     assert_eq!(
-        blocks.len(),
-        2,
-        "the lifted send is refused a second time: {:?}",
+        client.events_named("privacy_block").len(),
+        1,
+        "a pinned session does not reach the choke point again: {:?}",
         client.event_names()
     );
     assert_eq!(
-        blocks[1]["path"].as_str(),
-        Some("secrets/prod.env"),
-        "the lift releases the opacity, not the file: {:?}",
-        blocks[1]
-    );
-    let pinned = client.events_named("session_pinned");
-    assert_eq!(
-        pinned.last().map(|p| p["cause"].as_str()),
-        Some(Some("boundary_hit")),
-        "…and the cause escalates to the permanent one: {pinned:?}"
+        client.events_named("session_pinned").len(),
+        1,
+        "a permanent pin is recorded once: {:?}",
+        client.events_named("session_pinned")
     );
     assert_eq!(
         provider.request_count(),
         sent_before_lift,
-        "nothing left the machine across the lift: {:?}",
+        "nothing left the machine after the pin: {:?}",
         client.event_names()
     );
 
@@ -1600,36 +1609,32 @@ fn a_preamble_touching_a_boundary_outside_the_root_beside_an_in_root_file_is_ref
     assert_no_boundary_bytes();
 }
 
-/// **REQ-619 verify, m1 — a pin on BUG-216's reported path.** The same pair as
-/// C1 above (`` !`sh probe.sh` `` beside `` !`cat secrets/prod.env` ``) on the
-/// **typed** door, asserted at all three moments: what the first refusal names,
-/// that the lift is granted, and what the refusal after the lift names.
+/// **REQ-619 verify, m1 / BUG-216 — the first refusal names the file.** The
+/// same pair as C1 above (`` !`sh probe.sh` `` beside `` !`cat secrets/prod.env` ``)
+/// on the **typed** door, asserted at all three moments: what the first refusal
+/// names, that no lift is granted, and that the turn after the refused lift
+/// never reaches the choke point at all.
 ///
 /// # What this test is for
 ///
 /// Not the leak — C1 owns that, and the typed path never lost the id. This one
-/// exists because [BUG-216] is a **known, deliberately unfixed** ordering:
-/// `egress::inspector` tests `Provenance::is_unknown` before it walks the source
-/// set, so a context that is both opaque and boundary-naming reports the opacity
-/// first and the file only after `/shell allow` has taken the opacity away. That
-/// is not wrong — both refuse, and the user reaches the truth in two steps
-/// rather than one — but it is *chosen*, and an unpinned choice is one a later
-/// refactor makes silently.
+/// pins the inspector's **arm order**: a context that is both opaque and
+/// boundary-naming is reported against the file, so the pin is the permanent
+/// `boundary_hit` and the client never prints the `/shell allow` remedy for a
+/// session that ingested protected bytes. Before BUG-216 the unknown arm ran
+/// first and legs (a) and (c) read the other way — `<unknown-provenance>`,
+/// liftable, and the file only named on the send *after* the lift.
 ///
-/// So legs **(a)** and **(c)** are the pin. Reorder the inspector to walk the
-/// sources before the unknown test and both flip: (a) becomes
-/// `secrets/prod.env` / `boundary_hit` / not liftable, (b)'s `/shell allow` is
-/// then refused outright, and (c) never happens because the session was
-/// permanently pinned at the first block. Whoever makes that change is fixing
-/// BUG-216 and should rewrite this test to the new order — deliberately, which
-/// is the point.
+/// Leg (b) is what proves the pin is the permanent kind rather than a liftable
+/// one that merely reported a path: the lift is refused with the cause, and
+/// leg (c) shows the refusal after it still names the file.
 ///
-/// Leg (b) is not decoration either: it is what proves the first pin was the
-/// liftable kind rather than a permanent one that merely reported a sentinel.
-///
-/// [BUG-216]: the inspector reports opacity before a matched boundary source
+/// **Mutation (run, red, reverted):** move `egress::inspector::inspect`'s source
+/// walk back below the unknown arm — this test and C1 both red at leg (a), on
+/// the path (`<unknown-provenance>` where the file was expected); 14 of 16 in
+/// this file stay green, because only these two build the opaque-and-named pair.
 #[test]
-fn a_preamble_that_is_both_opaque_and_boundary_reading_pins_and_survives_the_lift() {
+fn a_preamble_that_is_both_opaque_and_boundary_reading_pins_permanently_at_the_first_block() {
     let provider = mock(Vec::new());
     let ws = Workspace::new("sp-m1");
     ws.write_config(&config_for(&provider, &[]));
@@ -1664,37 +1669,51 @@ fn a_preamble_that_is_both_opaque_and_boundary_reading_pins_and_survives_the_lif
         "fixture: one opaque command and one boundary read"
     );
 
-    // (a) The opacity is reported first — BUG-216's ordering, pinned.
+    // (a) The file is named first: a proved boundary read is more specific
+    // than "we could not prove anything", and the pin it records is permanent.
     let blocks = client.events_named("privacy_block");
     assert_eq!(blocks.len(), 1, "{blocks:?}");
     assert_eq!(
         blocks[0]["path"].as_str(),
-        Some(UNKNOWN_PROVENANCE_PATH),
-        "BUG-216: the inspector reads the unknown bit before the sources, so the \
-         first refusal names the opacity and not the file: {:?}",
+        Some("secrets/prod.env"),
+        "BUG-216: the inspector walks the sources before it reads the unknown \
+         bit, so the first refusal names the file and not the opacity: {:?}",
         blocks[0]
     );
+    assert_ne!(blocks[0]["path"].as_str(), Some(UNKNOWN_PROVENANCE_PATH));
     let pinned = client.events_named("session_pinned");
     assert_eq!(pinned.len(), 1, "{pinned:?}");
     assert_eq!(
         pinned[0]["cause"].as_str(),
-        Some("unknown_shell"),
+        Some("boundary_hit"),
         "{:?}",
         pinned[0]
     );
-    assert_eq!(pinned[0]["liftable"].as_bool(), Some(true));
+    assert_eq!(pinned[0]["liftable"].as_bool(), Some(false));
     assert_eq!(provider.request_count(), 0, "the pinned turn sent nothing");
 
-    // (b) …and the pin really is the liftable kind.
+    // (b) …and the pin really is the permanent kind: the lift is refused.
     let lifted = client.call("shell/override", json!({ "session_id": session }));
     assert_eq!(
-        lifted["result"]["lifted_now"].as_bool(),
+        lifted["result"]["was_pinned"].as_bool(),
         Some(true),
         "{lifted}"
     );
+    assert_eq!(
+        lifted["result"]["lifted_now"].as_bool(),
+        Some(false),
+        "no command lifts a boundary hit: {lifted}"
+    );
+    assert_eq!(
+        lifted["result"]["cause"].as_str(),
+        Some("boundary_hit"),
+        "{lifted}"
+    );
 
-    // (c) The lift released the opacity and nothing else: the file the
-    // expansion proved refuses the next send, permanently.
+    // (c) The refused lift changed nothing: the next turn is served locally
+    // without ever reaching the choke point — a permanently pinned session
+    // never tries a remote provider again — so there is no second block and
+    // no second pin to record.
     let after = client.prompt(&session, "Now summarize what you found.");
     assert_eq!(
         after["result"]["stop_reason"].as_str(),
@@ -1703,26 +1722,16 @@ fn a_preamble_that_is_both_opaque_and_boundary_reading_pins_and_survives_the_lif
     );
     client.drain_events(Duration::from_millis(300));
 
-    let blocks = client.events_named("privacy_block");
     assert_eq!(
-        blocks.len(),
-        2,
-        "the lifted send is refused again: {:?}",
+        client.events_named("privacy_block").len(),
+        1,
+        "a pinned session does not reach the choke point again: {:?}",
         client.event_names()
     );
     assert_eq!(
-        blocks[1]["path"].as_str(),
-        Some("secrets/prod.env"),
-        "and now the file is named: {:?}",
-        blocks[1]
-    );
-    assert_eq!(
-        client
-            .events_named("session_pinned")
-            .last()
-            .map(|p| p["cause"].as_str()),
-        Some(Some("boundary_hit")),
-        "…with the cause escalated to the permanent one: {:?}",
+        client.events_named("session_pinned").len(),
+        1,
+        "a permanent pin is recorded once: {:?}",
         client.events_named("session_pinned")
     );
     assert_eq!(

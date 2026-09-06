@@ -4,7 +4,7 @@ title: "The egress inspector reports the unknown-provenance sentinel before a ma
 status: open
 severity: low
 created: 2026-09-05
-updated: 2026-09-05
+updated: 2026-09-06
 component: "daemon/egress"
 domain: "privacy"
 stack: ["rust", "daemon"]
@@ -65,13 +65,25 @@ liftable meaning without moving it behind the source loop.
 
 ## Resolution
 
-(open) Run the source loop before the unknown arm. This changes the reported
-path for pre-existing `read` + opaque-`shell` sessions, which is why REQ-619
-did not fold it in. REQ-619 pins the current behaviour with
-`e2e::skill_provenance::a_preamble_that_is_both_opaque_and_boundary_reading_pins_and_survives_the_lift`;
-when the order changes, legs (a) and (c) of that test flip to naming the file
-at the first block and the test becomes the record of the change.
+`inspect` walks `provenance.sources()` **first**: a matched source is the most
+specific reading there is (a named file the daemon proved is protected), so it
+is reported ahead of both sentinels, and `taint::cause_of` records
+`boundary_hit` at the first block. The two sentinel arms keep their relative
+order (`<boundary-touch>` before `<unknown-provenance>`, ADR-614-3). A context
+that is opaque and names only clean files still reports the opacity — the
+liftable pin is unchanged where nothing protected was named.
+
+The two REQ-619 e2e tests that pinned the old order are rewritten to the new
+one: the first refusal names `secrets/prod.env`, the pin is `boundary_hit` and
+not liftable, `/shell allow` answers `was_pinned: true, lifted_now: false`, and
+the next send is refused against the same file with no second pin recorded. C1
+still guards its leak, one leg earlier: with the fold's id dropped the first
+block names the sentinel and the pin lifts.
+
+Mutation: source walk moved back below the sentinels — the new unit test reds
+on both halves; the two e2e tests red on leg (a)'s path and cause.
 
 ## Files Changed
 
-- `crates/tetond/src/egress/inspector.rs` — arm order; tests
+- `crates/tetond/src/egress/inspector.rs` — arm order; `a_matched_source_is_named_ahead_of_both_sentinels`
+- `crates/tetond/tests/e2e/skill_provenance.rs` — C1 and m1 rewritten to the fixed order
