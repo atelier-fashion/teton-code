@@ -295,8 +295,16 @@ const READS_NOTHING: &[&str] = &[
 
 /// Verbs that surface **names**, not file contents. Listing a name is not
 /// reading a file, so these pass BR-1(d) without a subtree scan.
+///
+/// `test` is here because it only ever `stat`s its operands — `-s`, `-f`,
+/// `-d` and the rest answer questions about a name, never about content — and
+/// because the ADLC toolkit's ethos preamble is written as
+/// `test -s .adlc/ETHOS.md && cat .adlc/ETHOS.md || cat ~/.claude/skills/ETHOS.md`
+/// (BUG-218): the `test` is what keeps an empty project copy from swallowing
+/// the ethos, and without it here the guard alone made every toolkit skill
+/// `Unknown`. Its bracket spelling `[` stays unmodelled; see [`UNMODELLED`].
 const NAME_ONLY: &[&str] = &[
-    "ls", "find", "du", "basename", "dirname", "stat", "file", "which",
+    "ls", "find", "du", "basename", "dirname", "stat", "file", "which", "test",
 ];
 
 /// Verbs that can read file *contents*. Given a directory, a wildcard, or no
@@ -975,6 +983,71 @@ mod tests {
     /// [`verdict_full`] with the builtin boundaries and no denied prefix.
     fn verdict_with_home(root: &Path, home: &Path, command: &str) -> Verdict {
         verdict_full(root, Some(home), &builtins(), Vec::new(), command)
+    }
+
+    /// BUG-218 (adlc-toolkit): the ethos preamble every toolkit skill opens with
+    /// is `test -s .adlc/ETHOS.md && cat .adlc/ETHOS.md || echo "No ethos …"`,
+    /// and it must be `Rooted` — the `sh`-wrapped spelling it replaced was
+    /// `Unknown` by verb and pinned a session on every typed skill. `test`
+    /// only `stat`s its operand, so it is a name-only verb; `cat` names an
+    /// existing in-root file; `echo` reads nothing.
+    ///
+    /// The toolkit's first draft kept `cat ~/.claude/skills/ETHOS.md` as the
+    /// fallback, and the middle assertion is why it did not ship: a path
+    /// outside the session root is one this grammar cannot prove, whatever it
+    /// names, and the verdict says so. That is the REQ-614 design, not a gap —
+    /// widening it to "files under the home that match no glob" would be a
+    /// policy change (the `read` tool is root-jailed for the same reason), so
+    /// the toolkit moved instead.
+    ///
+    /// The last half is the benign path's mirror: `test` on a protected name
+    /// is still a boundary touch, exactly as `ls` on it is — being name-only
+    /// does not exempt the operand from the globs.
+    ///
+    /// **Mutation (run, red, reverted):** drop `"test"` from [`NAME_ONLY`] —
+    /// the first assertion reds with "the command's verb is not one this
+    /// classifier recognises"; the other two stay green.
+    #[test]
+    fn the_toolkit_ethos_preamble_is_rooted_and_test_is_name_only() {
+        let root = project_root("ethos");
+        let home = fixture_home("ethos");
+        std::fs::create_dir_all(root.join(".adlc")).unwrap();
+        std::fs::write(root.join(".adlc/ETHOS.md"), "# project ethos\n").unwrap();
+        std::fs::create_dir_all(home.join(".claude/skills")).unwrap();
+        std::fs::write(home.join(".claude/skills/ETHOS.md"), "# toolkit ethos\n").unwrap();
+
+        let v = verdict_with_home(
+            &root,
+            &home,
+            "test -s .adlc/ETHOS.md && cat .adlc/ETHOS.md || echo No ethos found",
+        );
+        assert_eq!(v.kind, VerdictKind::Rooted, "{}", v.reason);
+        assert!(!v.out_of_root_touch);
+
+        let v = verdict_with_home(
+            &root,
+            &home,
+            "test -s .adlc/ETHOS.md && cat .adlc/ETHOS.md || cat ~/.claude/skills/ETHOS.md",
+        );
+        assert_eq!(
+            v.kind,
+            VerdictKind::Unknown,
+            "an out-of-root fallback is unprovable even when it names a real, unprotected file ({})",
+            v.reason
+        );
+        assert_eq!(
+            v.reason,
+            "a path argument resolves outside the session root"
+        );
+
+        std::fs::write(root.join(".env"), "SECRET=1\n").unwrap();
+        let v = verdict_with_home(&root, &home, "test -s .env && cat README.md");
+        assert_eq!(
+            v.kind,
+            VerdictKind::BoundaryTouch,
+            "a name-only verb on a protected name is still a touch ({})",
+            v.reason
+        );
     }
 
     /// BR-1, benign path. The legitimate actor — the four commands AC-12 scripts
