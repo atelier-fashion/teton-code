@@ -1,10 +1,11 @@
 ---
 id: BUG-216
 title: "The egress inspector reports the unknown-provenance sentinel before a matched boundary source, so a session that read a protected file is recorded with the liftable cause"
-status: open
+status: resolved
 severity: low
 created: 2026-09-05
 updated: 2026-09-06
+resolved: 2026-09-06
 component: "daemon/egress"
 domain: "privacy"
 stack: ["rust", "daemon"]
@@ -82,6 +83,10 @@ block names the sentinel and the pin lifts.
 
 Mutation: source walk moved back below the sentinels — the new unit test reds
 on both halves; the two e2e tests red on leg (a)'s path and cause.
+
+## Deployment
+
+- Merged as aa85f30 (PR #307), 2026-09-06. No deploy target: the daemon ships by release tag.
 
 ## Files Changed
 
