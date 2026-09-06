@@ -57,6 +57,13 @@ teton-code/
   bare blocking syscall (LESSON-585). Cut every corpus at the first column-0
   `#[cfg(test)]`: a check whose own patterns appear in its own file will
   otherwise match itself and its vacuity floors can never fire.
+- **A recorded mutation count is owned by the last task that adds tests to
+  the rule** (REQ-619, LESSON-652). A task that widens coverage — an e2e suite
+  landing after the unit tests that first recorded a mutation — re-runs the
+  recorded mutations and rewrites the counts, after touching the mutated file
+  so cargo really rebuilds. Name what reddened, and say when a large count is
+  one leak cascading through a process-global assertion rather than many
+  findings.
 - **Re-run a derived check's mutation after any change to program structure**
   (LESSON-598). Do not re-read the check — a guard that has stopped covering its
   subject looks exactly like a guard that passes. REQ-600 moved one line into a
