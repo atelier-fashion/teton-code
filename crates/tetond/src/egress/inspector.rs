@@ -187,10 +187,33 @@ pub fn inspect(
             action,
         });
     }
+    // The arms are ordered most-specific first, and the order is the whole of
+    // the distinction: every arm blocks, and only the reported path tells the
+    // taint machinery (`runtime::taint::cause_of`) whether the pin lifts.
+    //
+    // A matched source is the most specific reading there is — a named file
+    // the daemon *proved* is protected — so it is reported ahead of either
+    // sentinel (BUG-216). Before the fix the unknown arm ran first, and a
+    // context that was both opaque and boundary-naming (a `read` of a
+    // protected file beside an opaque `shell` result, or one skill expansion
+    // with `sh probe.sh` and `cat secrets/prod.env` as preambles) was recorded
+    // as `unknown_shell`: liftable, with the client offering `/shell allow`
+    // for a session that had ingested protected bytes. The lift then released
+    // the opacity and the next send named the file — the truth, one wasted
+    // turn late.
+    for source in provenance.sources() {
+        // Any matching boundary forbids egress in the MVP (fail-closed on every
+        // mode; see the module docs). `match_path` already applies declaration
+        // -order precedence and gitignore-style glob semantics.
+        if matcher.match_path(source).is_some() {
+            return Inspection::Blocked(Violation {
+                path: source.to_owned(),
+                action,
+            });
+        }
+    }
     // REQ-614: ahead of the plain unknown arm, because a boundary touch is
-    // also unknown and the more specific reading is the true one. The order is
-    // the whole of the distinction — both block, and only the reported path
-    // tells the taint machinery whether the pin lifts.
+    // also unknown and the more specific reading is the true one.
     if provenance.is_boundary_touch() {
         return Inspection::Blocked(Violation {
             path: BOUNDARY_TOUCH_PATH.to_owned(),
@@ -202,17 +225,6 @@ pub fn inspect(
             path: UNKNOWN_PROVENANCE_PATH.to_owned(),
             action,
         });
-    }
-    for source in provenance.sources() {
-        // Any matching boundary forbids egress in the MVP (fail-closed on every
-        // mode; see the module docs). `match_path` already applies declaration
-        // -order precedence and gitignore-style glob semantics.
-        if matcher.match_path(source).is_some() {
-            return Inspection::Blocked(Violation {
-                path: source.to_owned(),
-                action,
-            });
-        }
     }
     Inspection::Allowed
 }
@@ -344,6 +356,53 @@ mod tests {
             .expect("unknown provenance must fail closed");
         assert_eq!(v.path, UNKNOWN_PROVENANCE_PATH);
         assert_eq!(v.action, PrivacyAction::ReroutedToLocal);
+    }
+
+    /// BUG-216: a context that is both opaque and names a protected file is
+    /// reported against the **file**, not against either sentinel. The path is
+    /// what `runtime::taint::cause_of` reads to choose the pin's cause, so this
+    /// is the difference between a permanent `boundary_hit` and a liftable
+    /// `unknown_shell` offered for a session that ingested protected bytes.
+    ///
+    /// **Mutation (run, red, reverted):** move the `for source in
+    /// provenance.sources()` loop back below the two sentinel arms — both
+    /// halves of this test fail, naming `<unknown-provenance>` and
+    /// `<boundary-touch>` respectively.
+    #[test]
+    fn a_matched_source_is_named_ahead_of_both_sentinels() {
+        use crate::egress::provenance::{BOUNDARY_TOUCH_PATH, UNKNOWN_PROVENANCE_PATH};
+        let bs = vec![boundary("secrets/**", BoundaryMode::LocalOnly)];
+        let m = matcher(&bs);
+
+        let opaque_and_named =
+            Provenance::tainted_by(fixture_id("secrets/prod.env")).union(&Provenance::unknown());
+        assert!(
+            opaque_and_named.is_unknown(),
+            "fixture: the unknown bit is set"
+        );
+        let out = inspect(&opaque_and_named, &m, PrivacyAction::ReroutedToLocal);
+        let v = out.violation().expect("blocked");
+        assert_eq!(v.path, "secrets/prod.env");
+        assert_ne!(v.path, UNKNOWN_PROVENANCE_PATH);
+
+        let touched_and_named = Provenance::tainted_by(fixture_id("secrets/prod.env"))
+            .union(&Provenance::boundary_touch());
+        assert!(
+            touched_and_named.is_boundary_touch(),
+            "fixture: the touch bit is set"
+        );
+        let out = inspect(&touched_and_named, &m, PrivacyAction::ReroutedToLocal);
+        let v = out.violation().expect("blocked");
+        assert_eq!(v.path, "secrets/prod.env");
+        assert_ne!(v.path, BOUNDARY_TOUCH_PATH);
+
+        // The benign path: an opaque context whose named sources are all
+        // outside every boundary still reports the opacity.
+        let opaque_and_clean =
+            Provenance::tainted_by(fixture_id("README.md")).union(&Provenance::unknown());
+        let out = inspect(&opaque_and_clean, &m, PrivacyAction::ReroutedToLocal);
+        let v = out.violation().expect("blocked");
+        assert_eq!(v.path, UNKNOWN_PROVENANCE_PATH);
     }
 
     // -----------------------------------------------------------------------
