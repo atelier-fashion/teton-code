@@ -179,11 +179,21 @@ expect_output() {
         report_fail "$1 [not checked: the case it reads from did not behave]"
         return 0
     fi
-    if printf '%s' "$CASE_OUT" | grep -qF -- "$2"; then
-        report_pass "$1"
-    else
-        report_fail "$1 [output does not contain: $2]" "$CASE_OUT"
+    # `case`, not `printf | grep -qF` (BUG-217): this file runs under
+    # `pipefail`, and `grep -q` exits on its first match, so a printf still
+    # writing takes SIGPIPE and the pipeline reports the MATCH as a failure.
+    # The race is timing-dependent, which made the harness go red on a commit
+    # that touched nothing under tools/release/. An empty needle is refused
+    # rather than matched, for the reason the smoke group records at length:
+    # `*""*` matches anything, exactly as `grep -qF -- ""` did.
+    if [ -z "$2" ]; then
+        report_fail "$1 [empty needle: an assertion that matches everything is not a check]"
+        return 0
     fi
+    case "$CASE_OUT" in
+        *"$2"*) report_pass "$1" ;;
+        *) report_fail "$1 [output does not contain: $2]" "$CASE_OUT" ;;
+    esac
     return 0
 }
 
