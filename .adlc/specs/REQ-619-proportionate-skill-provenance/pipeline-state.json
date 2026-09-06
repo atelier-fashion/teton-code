@@ -2,8 +2,8 @@
   "req": "REQ-619",
   "branch": "feat/REQ-619-proportionate-skill-provenance",
   "startedAt": "2026-09-05T16:58:44Z",
-  "completed": false,
-  "currentPhase": 7,
+  "completed": true,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
@@ -11,7 +11,9 @@
     3,
     4,
     5,
-    6
+    6,
+    7,
+    8
   ],
   "phaseHistory": [
     {
@@ -54,6 +56,18 @@
       "name": "Create PR",
       "completedAt": "2026-09-05T23:28:56Z",
       "result": "PR #304 flipped from draft to ready with full body; footprint block preserved"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-09-05T23:50:00Z",
+      "result": "all eight required checks green on 9ac5e33 after rebase onto main; mergeState CLEAN"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup",
+      "completedAt": "2026-09-05T23:56:22Z",
+      "result": "PR #304 squash-merged as c51fe27 at 2026-09-05T23:55:39Z (merged by the pipeline at the user's instruction after a pr-ready pause); worktree .worktrees/REQ-619 removed; terminal claim: merged"
     }
   ],
   "integrationBranch": "main",
@@ -67,9 +81,10 @@
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/304",
       "prNumber": 304,
       "prCreatedAt": "2026-09-05T16:58:47Z",
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
-      "snapshotPR": null
+      "snapshotPR": null,
+      "mergeCommit": "c51fe27"
     }
   },
   "mergeOrder": [
