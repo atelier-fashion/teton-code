@@ -18,6 +18,77 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [0.1.32] - 2026-09-06
+
+Five bugs and one requirement from the same dogfood session as 0.1.31, taken
+one layer further: the skill door, not just the shell tool.
+
+### Added
+
+- **A skill pins the session only when it could have touched a protected
+  file (REQ-619).** A typed `/skill` or a model-invoked one used to pin the
+  session on any `!cmd` preamble at all. Now each preamble is classified with
+  the REQ-614 shell grammar **before it runs**, so a `cat README.md` in a
+  skill and the same `cat` typed through `shell` reach the same verdict; a
+  skill's own file carries a provenance id (`~/…` for a user skill, so a skill
+  under the home is no longer unnameable), and `skill_invoked` reports each
+  preamble's `reach` (`rooted`, `boundary_touch`, `unknown`) and
+  `reach_reason`. An opaque preamble (`sh`, `python`, a `~/` path) still
+  pins — liftably, with `/shell allow` named — and a preamble that names a
+  protected file pins for good at the first block, naming the file.
+
+- **`test` is a name-only shell verb.** `test -s file && cat file` classifies
+  as `rooted`; the operand is still matched against the boundary globs.
+
+### Fixed
+
+- **A typed skill pinned the session permanently and silently (BUG-214).**
+  The prompt turn's egress never installed the tainting sink, so a pin from
+  a skill expansion fell to the backstop: permanent, no `session_pinned`,
+  nothing printed. It is now the same announced, liftable pin the shell tool
+  records.
+
+- **`/shell allow` moved the route but not the verdict (BUG-215).** After a
+  lift the next send was still refused against `<unknown-provenance>`. The
+  lift now reaches egress inspection; the blocks that caused the pin stay
+  refused only when they name a boundary file.
+
+- **A composite context named the opacity before the file (BUG-216).** A
+  context that was both opaque and boundary-naming was reported against
+  `<unknown-provenance>` and pinned liftably, offering `/shell allow` for a
+  session that had ingested protected bytes. The inspector now walks the
+  sources first: the first refusal names the file and the pin is permanent.
+
+- **On Linux the daemon's durable state lived in the runtime directory
+  (BUG-211)** — `cost.db`, the project registry, the model decision, the web
+  cache, the transcripts and the downloaded weights sat under
+  `$XDG_RUNTIME_DIR/teton`, which the login session clears. See *Changed*.
+
+- **The release self-test could fail a matching assertion (BUG-217).** A
+  `printf | grep -q` under `pipefail` reported a match as a failure when
+  `grep` exited first. The required check went red on a docs-only commit.
+
+### Changed
+
+- **Linux: durable state moves to the data directory, once, on the first
+  start after upgrade.** The daemon now keeps everything that must outlive a
+  logout under `$XDG_DATA_HOME/teton` (`~/.local/share/teton` when the
+  variable is unset) and only the socket, lock and log under
+  `$XDG_RUNTIME_DIR/teton`. On start it moves each durable entry it finds
+  beside its socket and absent from the data directory — renaming where it
+  can, copying through a temporary name across filesystems so no truncated
+  weights file ever sits under the real name — and prints one
+  `tetond: state — …` line per outcome. An entry present in both places is
+  kept in both and reported, never overwritten. **macOS is unchanged**: both
+  directories resolve to `~/Library/Application Support/teton`. `teton
+  doctor` prints a `data:` line beside `socket:`, and `teton uninstall`
+  removes both directories.
+
+- **The wire protocol stays at version 2.** Every change since 0.1.31 is
+  additive: `skill_invoked` gains optional `reach` and `reach_reason` per
+  preamble, and the `DaemonPaths` a client derives gains `data`. An older
+  client ignores both.
+
 ## [0.1.31] - 2026-09-05
 
 Five requirements from one dogfood transcript (2026-09-04, v0.1.30): a session
