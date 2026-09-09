@@ -96,7 +96,7 @@ use teton_protocol::methods::RootKind;
 use super::{
     opt_str_arg, opt_u64_arg, str_arg, RefinedOutcome, Tool, ToolContext, ToolDuties, ToolOutcome,
 };
-use crate::harness::context::ToolProvenance;
+use crate::harness::context::{ToolProvenance, UnknownReach};
 use crate::harness::digest::tool_result_provenance;
 use crate::harness::root_gate;
 use crate::harness::shell_duty;
@@ -374,7 +374,7 @@ impl Tool for ShellTool {
         // glob — instead of the one sentence every refusal used to share.
         let provenance = ToolProvenance::from_bits(
             verdict.sources.clone(),
-            verdict.unknown_reason(),
+            UnknownReach::from_classifier(verdict.unknown_reason()),
             verdict.out_of_root_touch
                 || (verdict.kind == shell_provenance::VerdictKind::BoundaryTouch
                     && verdict.sources.is_empty()),

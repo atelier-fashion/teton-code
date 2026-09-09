@@ -258,6 +258,25 @@ impl Provenance {
     pub fn mark_unknown_because(&mut self, reason: Option<&'static str>) {
         self.unknown = true;
         self.unknown_reason = self.unknown_reason.or(reason);
+        self.drop_reason_under_a_boundary_touch();
+    }
+
+    /// ADR-620-4's rule, enforced at every seam that can set either field: **a
+    /// boundary touch carries no class sentence.**
+    ///
+    /// Its cause is the *path*, which `privacy_block` already names, and the
+    /// pin it takes is `boundary_hit`, which renders no reason line. A syntax
+    /// class riding on such a pin would describe the wrong thing — and in the
+    /// worst case it would describe an *unrelated* command, since `merge`
+    /// unions a boundary touch from one contributor with an opacity class from
+    /// another (Phase-5 verify, M2e).
+    ///
+    /// Defence in depth rather than a new rule: the constructors already
+    /// produce the right pair, and this keeps the pair right after a fold.
+    fn drop_reason_under_a_boundary_touch(&mut self) {
+        if self.boundary_touch {
+            self.unknown_reason = None;
+        }
     }
 
     /// The class that explains this provenance's opacity, when one does.
@@ -284,20 +303,26 @@ impl Provenance {
     /// alone. Only the opacity that has no path behind it is released.
     #[must_use]
     pub fn with_unknown_lifted(&self) -> Self {
-        let unknown = self.unknown && self.boundary_touch;
-        Self {
+        let mut lifted = Self {
             sources: self.sources.clone(),
-            unknown,
+            unknown: self.unknown && self.boundary_touch,
             // **Cleared with the bit it explains** (REQ-620, LESSON-650). A
             // lift that kept the reason would leave a lifted session's next
             // block reporting the class of a command the user has already
             // vouched for — the same shape as a lift that reaches the route
-            // but not the choke point (BUG-215), one field down. The reason
-            // survives exactly where the bit does: a boundary touch, whose
-            // `unknown` a lift never clears.
-            unknown_reason: if unknown { self.unknown_reason } else { None },
+            // but not the choke point (BUG-215), one field down.
+            // ... and unconditionally, because **both** surviving cases want
+            // it (Phase-5 verify, M2e). Where the lift cleared the bit there
+            // is nothing left to explain; where it did not, the bit that
+            // survives is a boundary touch's, and ADR-620-4 gives a boundary
+            // touch no class at all — its cause is the path.
+            unknown_reason: None,
             boundary_touch: self.boundary_touch,
-        }
+        };
+        // Belt and braces, and the one statement of the rule: if a later
+        // author restores a conditional above, this still holds it.
+        lifted.drop_reason_under_a_boundary_touch();
+        lifted
     }
 
     /// Whether any contributing content had indeterminate origin (fail-closed).
@@ -355,6 +380,10 @@ impl Provenance {
         // Monotonic for the same reason `unknown` is: a union that folded a
         // boundary-touching contributor is boundary-touching.
         self.boundary_touch |= other.boundary_touch;
+        // Last, because it reads the bit the line above may have just set: a
+        // union of "this command used a glob" and "this command read a
+        // protected file" is a permanent pin whose cause is the path.
+        self.drop_reason_under_a_boundary_touch();
     }
 
     /// Consume two provenances into their union.
@@ -539,6 +568,77 @@ mod tests {
             ContextBlock::synthetic("developer"),
         ];
         assert!(assembled_provenance(&blocks).is_empty());
+    }
+
+    /// **REQ-620 ADR-620-4, Phase-5 verify M2e: a boundary touch carries no
+    /// class sentence, whatever it was folded with.**
+    ///
+    /// The ADR says it plainly — a `BoundaryTouch` carries `None`, because its
+    /// cause is the *path*, `privacy_block` already names it, and the pin it
+    /// takes (`boundary_hit`) renders no reason line. The constructors honour
+    /// that; the **folds** did not. `merge` unions a boundary touch from one
+    /// contributor with an opacity class from another, so a turn holding
+    /// `cat .env` beside `ls *.rs` produced a permanent pin advertising a glob
+    /// — a sentence about an unrelated command. `with_unknown_lifted` had the
+    /// same hole one step on, since the bit a lift *keeps* is the boundary
+    /// touch's.
+    ///
+    /// Defence in depth, so the rule holds after a fold and not only at the
+    /// constructor (LESSON-650's shape: a fact composed into one predicate
+    /// still has to reach every reader).
+    ///
+    /// **Mutation (run, reverted):** delete the
+    /// `drop_reason_under_a_boundary_touch` call from `merge` — **1 red**, this
+    /// test. Restore `with_unknown_lifted`'s old conditional
+    /// (`if lifted.unknown { self.unknown_reason } else { None }`) — **0 red**,
+    /// and that zero is the finding rather than a gap (LESSON-569: record what
+    /// the mutation actually did). No seam can build "a boundary touch that
+    /// carries a class" any more: `merge` and `mark_unknown_because` both drop
+    /// it, and the fields are private. The lift's arm is therefore genuinely
+    /// unobservable defence in depth — it is kept because it is free and
+    /// because the invariant should hold at every writer, not because a test
+    /// can see it.
+    #[test]
+    fn a_boundary_touch_carries_no_class_however_it_was_folded() {
+        const GLOB: &str = "the command uses a glob this classifier does not model";
+
+        let mut opaque = Provenance::unknown();
+        opaque.mark_unknown_because(Some(GLOB));
+        assert_eq!(
+            opaque.unknown_reason(),
+            Some(GLOB),
+            "non-vacuity: the class is there to be dropped"
+        );
+
+        let mut folded = opaque.clone();
+        folded.merge(&Provenance::boundary_touch());
+        assert!(folded.is_boundary_touch());
+        assert_eq!(
+            folded.unknown_reason(),
+            None,
+            "a permanent pin must not advertise another command's syntax class"
+        );
+
+        // The other order, so this is a property of the union and not of which
+        // side was the receiver.
+        let mut other_way = Provenance::boundary_touch();
+        other_way.merge(&opaque);
+        assert_eq!(other_way.unknown_reason(), None);
+
+        // And a touch that acquires the class *after* it is a touch.
+        let mut late = Provenance::boundary_touch();
+        late.mark_unknown_because(Some(GLOB));
+        assert_eq!(late.unknown_reason(), None);
+
+        // The lift keeps the boundary touch's `unknown` bit and still no class.
+        let lifted = folded.with_unknown_lifted();
+        assert!(lifted.is_unknown(), "a lift never clears a boundary touch");
+        assert_eq!(lifted.unknown_reason(), None);
+
+        // Must not fire: an ordinary opacity keeps its class right up to the
+        // lift, which is what the class exists for.
+        assert_eq!(opaque.unknown_reason(), Some(GLOB));
+        assert_eq!(opaque.with_unknown_lifted().unknown_reason(), None);
     }
 
     /// **BUG-215.** A lift releases opacity and nothing else: the sources stay,

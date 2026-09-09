@@ -31,7 +31,7 @@ use std::collections::BTreeSet;
 
 use teton_core::ProvenanceId;
 
-use crate::harness::context::ToolProvenance;
+use crate::harness::context::{ToolProvenance, UnknownReach};
 use crate::harness::tools::VerdictKind;
 
 use super::discovery::SkillIdentity;
@@ -112,10 +112,14 @@ impl ExpansionProvenance {
         // (a skill file that would not mint) must still arrive as one.
         ToolProvenance::from_bits(
             self.sources,
-            self.unknown.then(|| {
-                self.unknown_reason
-                    .unwrap_or(crate::harness::UNCLASSIFIED_REACH_REASON)
-            }),
+            if self.unknown {
+                UnknownReach::Because(
+                    self.unknown_reason
+                        .unwrap_or(crate::harness::UNCLASSIFIED_REACH_REASON),
+                )
+            } else {
+                UnknownReach::No
+            },
             self.boundary_touch,
         )
     }
@@ -580,6 +584,72 @@ mod tests {
     /// Ran again with the `sources`/`unknown` arguments to `from_bits` swapped
     /// — which does not compile, and that is the point of routing through a
     /// typed shared mapping rather than three hand-written matches.
+    /// **BR-6, Phase-5 verify M2: the class the *first* refused preamble named
+    /// is the one that travels.**
+    ///
+    /// A skill whose body holds two unmodelled preambles has two classes and
+    /// one pin, so the fold has to choose. The choice is arbitrary and it is
+    /// made once, here and in `ContextManager::compaction_summary` and in
+    /// `DroppedProvenance::absorb`, all three first-writer-wins — because the
+    /// alternative is that the sentence a user reads depends on which seam the
+    /// block happened to travel through, which is worse than either choice.
+    ///
+    /// The third row is the one nothing else covers: a refused preamble that
+    /// named **no** class (a `Verdict` synthesized by the budget) must not
+    /// overwrite a class already folded, and must not invent one either.
+    ///
+    /// **Mutation (run, red, reverted):** reverse the fold —
+    /// `folded.unknown_reason = run.verdict.unknown_reason().or(folded.unknown_reason)`
+    /// — and this test reds on its first assertion, alone in the crate's lib
+    /// suite. Alone because it is the only place two *differently* classed
+    /// preambles meet; every other fold test uses one literal reason.
+    #[test]
+    fn the_folds_class_is_the_first_refused_preambles() {
+        const QUOTE: &str = "the command uses a quoted string this classifier does not model";
+        const GLOB: &str = "the command uses a glob this classifier does not model";
+
+        let refused = |reason: &'static str| PreambleRun {
+            verdict: Verdict {
+                kind: VerdictKind::Unknown,
+                sources: BTreeSet::new(),
+                out_of_root_touch: false,
+                reason,
+            },
+            outcome: ran(),
+        };
+
+        let folded = fold_expansion(
+            SkillIdentity::Minted(fixture_id("skills/x/SKILL.md")),
+            &[refused(QUOTE), refused(GLOB)],
+        );
+        assert_eq!(
+            folded.unknown_reason,
+            Some(QUOTE),
+            "the first refused preamble's class is the one the pin carries"
+        );
+
+        // The other order, so the assertion above is about *first* and not
+        // about which sentence sorts first.
+        let reversed = fold_expansion(
+            SkillIdentity::Minted(fixture_id("skills/x/SKILL.md")),
+            &[refused(GLOB), refused(QUOTE)],
+        );
+        assert_eq!(reversed.unknown_reason, Some(GLOB));
+
+        // A refused preamble that named no class neither overwrites one nor
+        // invents one — the bit is still set either way.
+        let unclassified = PreambleRun {
+            verdict: Verdict::not_classified(),
+            outcome: ran(),
+        };
+        let after = fold_expansion(
+            SkillIdentity::Minted(fixture_id("skills/x/SKILL.md")),
+            &[refused(QUOTE), unclassified],
+        );
+        assert_eq!(after.unknown_reason, Some(QUOTE));
+        assert!(after.unknown, "and it is still an unknown");
+    }
+
     #[test]
     fn the_tool_provenance_mapping_is_the_shell_tools() {
         const GLOB_CLASS: &str = "the command uses a glob this classifier does not model";

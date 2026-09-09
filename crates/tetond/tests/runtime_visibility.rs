@@ -98,6 +98,16 @@ const MUST_BE_PRESENT: &[&str] = &[
 /// | `LOCAL_ENGINE_N_CTX_DEFAULT` | `egress/redact.rs`, `harness/budget.rs`, `harness/compact.rs` |
 /// | `taint_pin_line` | `carry.rs` |
 /// | `endpoint_query_names_a_credential` | `provider_recipes.rs`, `web_setup_catalog.rs` |
+/// | `PinRecord` | `carry.rs` |
+///
+/// `PinRecord` joined at REQ-620's Phase-5 verify (M6). `carry.rs` reads what
+/// `runtime::context_taint_cause` derived from a context's provenance — the
+/// cause, and the class that explains it — and handed back as a bare
+/// `(TaintCause, Option<&'static str>)`. A two-field tuple crossing a module
+/// boundary is a shape whose halves a caller can transpose without the compiler
+/// noticing, and `TaintCause` is already crate-visible through `views.rs`, so
+/// the pair is no wider than what it carries. Re-derived by the method above:
+/// demoting it to `pub(super)` yields `E0603` at `carry.rs:532`.
 ///
 /// `RenderedProviderSetup` was on this list and is not any more: see the module
 /// docs. Nothing outside `runtime/` names it, and the accessor that appeared to
@@ -109,6 +119,7 @@ const MUST_BE_PRESENT: &[&str] = &[
 /// reason recorded here — a removal needs the item to be gone, and it is.
 const CRATE_WIDE: &[&str] = &[
     "LOCAL_ENGINE_N_CTX_DEFAULT",
+    "PinRecord",
     "endpoint_query_names_a_credential",
     "taint_pin_line",
 ];
@@ -527,11 +538,29 @@ fn nothing_in_the_submodules_is_public_but_the_dozen_that_are_meant_to_be() {
     );
 }
 
-/// No submodule field is `pub(crate)`.
+/// The submodule fields that are `pub(crate)`, and the argument for each.
 ///
-/// A separate, empty-set ratchet rather than a line in `CRATE_WIDE`: there are
-/// none today, and "none" is the strongest form this can take. A field that
-/// earns crate visibility should have to argue for it here.
+/// | field | reached from | why a field |
+/// |---|---|---|
+/// | `taint.rs::cause`, `taint.rs::reason` | `carry.rs` | they are `PinRecord`'s two halves |
+///
+/// This was an **empty-set** ratchet — "none, and none is the strongest form
+/// this can take" — until REQ-620's Phase-5 verify made `PinRecord`
+/// crate-visible. The doc block for that entry carries the argument for the
+/// type; the argument for its *fields* is that `PinRecord` is a two-field
+/// record with no invariant between the halves and no `pub use` export, so
+/// accessors would buy nothing but two more crate-wide function names on
+/// `CRATE_WIDE` — and `cause`/`reason` are exactly the generic names that would
+/// blanket-permit a later, unrelated `pub(crate) fn cause` anywhere under
+/// `runtime/`. The narrower ratchet is the field allowlist.
+///
+/// The type this test's message names, `SessionTaintView`, is still the hazard:
+/// it is `pub use`-exported, so a `pub(crate)` field on *it* is readable from
+/// `crate::harness::tools`. `PinRecord` is exported nowhere.
+const CRATE_WIDE_FIELDS: &[&str] = &["taint.rs::cause", "taint.rs::reason"];
+
+/// No submodule field is `pub(crate)` but the ones that argued for it in
+/// [`CRATE_WIDE_FIELDS`].
 #[test]
 fn no_submodule_field_reaches_beyond_the_module_tree() {
     let fields: Vec<String> = submodules()
@@ -548,12 +577,32 @@ fn no_submodule_field_reaches_beyond_the_module_tree() {
                 .collect::<Vec<_>>()
         })
         .collect();
+    let allowed: BTreeSet<&str> = CRATE_WIDE_FIELDS.iter().copied().collect();
+    let extra: Vec<&String> = fields
+        .iter()
+        .filter(|f| !allowed.contains(f.as_str()))
+        .collect();
     assert!(
-        fields.is_empty(),
-        "these struct fields are `pub(crate)`: {fields:?}\n\
+        extra.is_empty(),
+        "these struct fields are `pub(crate)`: {extra:?}\n\
          A field is as reachable as a function. `SessionTaintView` is \
          `pub use`-exported, so a `pub(crate)` field on it is readable from \
-         `crate::harness::tools` — which `taint.rs`'s header says must not happen."
+         `crate::harness::tools` — which `taint.rs`'s header says must not happen. \
+         If a field earns crate visibility, add it to `CRATE_WIDE_FIELDS` with the \
+         argument."
+    );
+    // The allowlist is a ratchet, not a wish: a name that has been narrowed
+    // again must leave it, or the next field to take that name inherits the
+    // permission silently.
+    let missing: Vec<&&str> = CRATE_WIDE_FIELDS
+        .iter()
+        .filter(|n| !fields.iter().any(|f| f == *n))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "pinned as crate-visible but no longer found: {missing:?}\n\
+         Either the field was narrowed deliberately — remove it from \
+         `CRATE_WIDE_FIELDS` — or this parser stopped matching it."
     );
 }
 

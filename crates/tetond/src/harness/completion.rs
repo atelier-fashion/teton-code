@@ -984,7 +984,14 @@ pub fn context_provenance(ctx: &ContextManager) -> Provenance {
     if dropped.is_boundary_touch() {
         prov.merge(&tool_result_provenance(&ToolProvenance::BoundaryTouch));
     } else if dropped.is_unknown() {
-        prov.merge(&tool_result_provenance(&ToolProvenance::unknown()));
+        // REQ-620 BR-6, Phase-5 verify M2: the class the forgotten blocks
+        // carried, or `None` when none of them carried one. `Unknown(None)`
+        // renders the pre-REQ-620 notice, which is the honest thing to say
+        // about a fold with nothing to name — it is not a licence to invent
+        // `UNCLASSIFIED_REACH_REASON` here.
+        prov.merge(&tool_result_provenance(&ToolProvenance::Unknown(
+            dropped.unknown_reason(),
+        )));
     }
     prov
 }

@@ -73,7 +73,7 @@ use teton_protocol::events::{
 use teton_protocol::methods::{project_skill_trust_key, RootKind};
 use tokio::runtime::Handle;
 
-use super::super::context::ToolProvenance;
+use super::super::context::{ToolProvenance, UnknownReach};
 use super::super::permissions::{PermissionGate, SkillConsent};
 use super::super::render;
 use super::{ResultDisposition, Tool, ToolContext, ToolOutcome, ToolRegistry};
@@ -1412,7 +1412,11 @@ pub fn roster_provenance(
     // caused.
     ToolProvenance::from_bits(
         ids,
-        unknown.then_some(crate::harness::UNCLASSIFIED_REACH_REASON),
+        if unknown {
+            UnknownReach::Because(crate::harness::UNCLASSIFIED_REACH_REASON)
+        } else {
+            UnknownReach::No
+        },
         boundary_touch,
     )
 }

@@ -114,10 +114,18 @@ pub struct SessionTaint {
 ///
 /// A struct rather than a tuple so a third fact — should one ever be recorded —
 /// has a place to go that is not a wider tuple every reader has to re-destructure.
+///
+/// `pub(crate)` since REQ-620's Phase-5 verify (M6): the **carry seam** derives
+/// exactly this pair from a context's provenance
+/// (`runtime::context_taint_cause`) and used to hand it back as a bare
+/// `(TaintCause, Option<&'static str>)`, which is the tuple this type exists
+/// instead of. One shape, produced by the derivation and consumed by
+/// [`SessionTaint::mark`], so the two cannot come to disagree about which half
+/// is which.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PinRecord {
-    cause: TaintCause,
-    reason: Option<&'static str>,
+pub(crate) struct PinRecord {
+    pub(crate) cause: TaintCause,
+    pub(crate) reason: Option<&'static str>,
 }
 
 impl SessionTaint {

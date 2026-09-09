@@ -3512,6 +3512,45 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// **[`is_recognised_verb`] has a must-not-fire half.**
+    ///
+    /// *(Phase-5 verify, M4.)* Its only caller —
+    /// [`super::shell::tests::the_reach_contract_is_one_paragraph_the_description_and_the_test_share`]
+    /// — asks it about four verbs the contract names and asserts `true` for
+    /// each. A function that answered `true` for everything would pass that
+    /// cross-check exactly as it does now, and the cross-check exists to catch
+    /// a contract offering the model a verb the grammar refuses. So the
+    /// negative half is asserted here, where the tables are.
+    ///
+    /// The `git` rows are the shape that needs its own claim: `git status` is a
+    /// two-word phrase read against [`GIT_NAME_ONLY`], and a bare `git` and a
+    /// `git commit` are both false — the first names no subcommand, the second
+    /// names one that reads content.
+    #[test]
+    fn an_unrecognised_verb_is_not_a_recognised_one() {
+        for phrase in ["ls", "cat", "grep", "git status", "echo", "test"] {
+            assert!(
+                is_recognised_verb(phrase),
+                "`{phrase}` is in one of this module's permissive tables"
+            );
+        }
+        for phrase in [
+            "python",
+            "curl",
+            "git commit",
+            "git",
+            "frobnicate",
+            "",
+            "git status --short",
+            "bin/ls",
+        ] {
+            assert!(
+                !is_recognised_verb(phrase),
+                "`{phrase}` is not a verb this classifier recognises"
+            );
+        }
+    }
+
     /// The allowlist can only ever *remove* a walk a content verb would have
     /// taken — so every entry has to be a content verb.
     ///

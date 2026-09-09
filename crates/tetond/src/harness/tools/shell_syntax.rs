@@ -161,10 +161,17 @@
 //! re-measuring them would have been three rebuilds to confirm a zero. Recorded
 //! as not-run rather than as measured (LESSON-569).
 
-/// The null device, spelled once.
+/// The null device, spelled once for every **parser** in the crate.
 ///
-/// LESSON-494's rule applied to a literal: the crate greps clean for
-/// `/dev/null` outside this module, its tests, and the prose that explains it.
+/// LESSON-494's rule applied to a literal, and stated exactly (reworded at the
+/// Phase-5 verify, M3 — the claim used to read "the crate greps clean for
+/// `/dev/null` outside this module", which is false). The literal does appear
+/// elsewhere in production source, in two human-facing **sentences** that no
+/// code matches on: `shell.rs`'s `reach_contract!`, which tells the model
+/// `2>/dev/null` is fine, and `UnmodelledSyntax::Redirect`'s reason, which
+/// tells the user a redirect to anything else was refused. Neither is a
+/// recogniser, so neither can drift out of step with this one; what LESSON-494
+/// forbids is a *second reading* of these bytes, and there is exactly one.
 const NULL_DEVICE: &str = "/dev/null";
 
 /// The separator characters the classifier's splitter reads, for the trailing

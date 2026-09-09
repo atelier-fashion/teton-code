@@ -39,6 +39,10 @@ use std::path::Path;
 use teton_protocol::methods::RootKind;
 
 use crate::harness::tools::shell::command_position_programs;
+use crate::harness::tools::shell_syntax::strip_null_redirects;
+/// Doc-link only: this gate no longer calls the recogniser directly — it calls
+/// [`strip_null_redirects`], which is the one wrapper both gates share.
+#[cfg(doc)]
 use crate::harness::tools::shell_syntax::NullRedirect;
 
 /// Whether a write is permitted from this session root.
@@ -164,7 +168,7 @@ fn names_a_write_verb(command: &str) -> bool {
 /// target this scanner cannot resolve — fail closed, as the REQ's assumption
 /// requires. The quote awareness is what keeps `echo "2 > 1"` allowed.
 ///
-/// # One recogniser, two gates (REQ-620 ADR-620-1)
+/// # One recogniser, two gates, and **one wrapper** (REQ-620 ADR-620-1)
 ///
 /// Both exemptions moved to [`NullRedirect`], which
 /// [`super::tools::shell_provenance::classify`] also reads. Two hand-rolled
@@ -172,43 +176,48 @@ fn names_a_write_verb(command: &str) -> bool {
 /// of them accepts `2>/dev/nullx` and the other does not, one gate is wrong and
 /// no test says which.
 ///
-/// The move is **whole-word** where the old inline scan was positional, and
-/// that tightens two spellings neither the table below nor any transcript
-/// carries: `cmd>&2` and `cmd >|/dev/null` (a `>|` glued to the device) are now
-/// writes. Both directions of this gate are not symmetric — a false "write"
-/// refuses a command at a home root, a false "not a write" scaffolds a project
-/// into `$HOME` — so the tightening is the safe way to be wrong, and it is
-/// recorded here rather than papered over.
+/// **Sharing the recogniser was not enough** (Phase-5 verify, M1). The first
+/// version of this function wrapped [`NullRedirect`] in a *positional* scan of
+/// its own — find each top-level `>`, widen to its whitespace-delimited word,
+/// ask the recogniser about that word — while the classifier wrapped the same
+/// recogniser in [`strip_null_redirects`], which peels a redirect glued to a
+/// following separator. Two wrappers around one recogniser is the same defect
+/// one step out: `ls 2>&1; ls` read nothing in the classifier and was a
+/// **write** here, which the pre-REQ-620 gate had allowed. So the question is
+/// now asked once, of the residue: *after the strip, does any word still carry
+/// a `>` or a `<` outside quotes?*
 ///
-/// **Mutation (run, red, reverted):** force [`redirection_reads_nothing`] to
-/// `false` and [`tests::the_write_gate_refuses_both_triggers_and_nothing_benign`]
-/// reds on `cat missing 2>/dev/null`; force it to `true` and the same test reds
-/// on `echo hi > notes.md`. One red each way, and nothing else in the suite
-/// notices — the benign table is the only thing holding this arm.
+/// # What the unification tightens, and why that is the safe direction
+///
+/// Three spellings neither the table below nor any transcript carries become
+/// writes: `cmd>&2` and `cmd >|/dev/null` (whole-word, where the old inline
+/// scan was positional), and any top-level `<` — `cat < input` — which the old
+/// scan never looked for at all. The two directions of this gate are not
+/// symmetric: a false "write" refuses a command at a home root, a false "not a
+/// write" scaffolds a project into `$HOME`. So the tightening is the safe way
+/// to be wrong, and it is recorded here rather than papered over.
+///
+/// # Quoting still belongs to this gate
+///
+/// [`strip_null_redirects`] is whitespace-word-based and quote-blind, and it
+/// cannot become quote-aware without becoming the shell lexer ADR-614-1
+/// refuses. It does not have to be: no word carrying a quote parses as a
+/// [`NullRedirect`], so a lift can never change the residue's quote parity, and
+/// [`top_level_positions`] does the quote reasoning over the residue exactly as
+/// it did over the command. `echo "2 > 1"` is still allowed.
+///
+/// **Mutation (run, red, reverted):** drop the strip, so the residue is the
+/// command — [`tests::the_write_gate_refuses_both_triggers_and_nothing_benign`]
+/// reds on `cat missing 2>/dev/null` and
+/// [`tests::the_write_gate_and_the_classifier_agree_on_what_reads_nothing`]
+/// reds on its first row. Drop the `<` disjunct and the differential test reds
+/// on `cat < input`, alone.
 #[must_use]
 pub(crate) fn has_top_level_redirection(command: &str) -> bool {
-    top_level_positions(command, '>').any(|at| !redirection_reads_nothing(command, at))
-}
-
-/// Whether the whitespace-delimited word holding the `>` at byte `at` is a
-/// [`NullRedirect`] — alone, or as an operator whose next word is the device.
-fn redirection_reads_nothing(command: &str, at: usize) -> bool {
-    let start = command[..at]
-        .char_indices()
-        .rev()
-        .find(|(_, c)| c.is_whitespace())
-        .map_or(0, |(i, c)| i + c.len_utf8());
-    let end = command[at..]
-        .find(char::is_whitespace)
-        .map_or(command.len(), |offset| at + offset);
-    let word = &command[start..end];
-    if NullRedirect::parse(word).is_some() {
-        return true;
-    }
-    command[end..]
-        .split_whitespace()
-        .next()
-        .is_some_and(|next| NullRedirect::parse_spaced(word, next).is_some())
+    let residue = strip_null_redirects(command).residue;
+    ['>', '<']
+        .into_iter()
+        .any(|needle| top_level_positions(&residue, needle).next().is_some())
 }
 
 /// Byte offsets of every top-level occurrence of `needle` in `command`.
@@ -460,6 +469,14 @@ mod tests {
                 "cat .adlc/context/architecture.md 2>/dev/null || echo none",
                 "the shipped ADLC preamble shape",
             ),
+            // Phase-5 verify, M1: the three shapes the positional scan called
+            // writes and the pre-REQ-620 gate allowed.
+            ("ls 2>&1; ls", "a duplication glued to a `;`"),
+            (
+                "ls 2>&1; echo ok",
+                "the same, with the separator spaced off",
+            ),
+            ("ls 2>&1|head", "a duplication glued to a pipe"),
         ];
         for (command, why) in allowed {
             assert_eq!(
@@ -467,6 +484,96 @@ mod tests {
                 WriteVerdict::Allowed,
                 "`{command}` must still run at a home root ({why})"
             );
+        }
+    }
+
+    /// **Phase-5 verify, M1: the write gate and the classifier ask one
+    /// question of one recogniser.**
+    ///
+    /// Sharing [`NullRedirect`] was not enough. Both gates wrapped it, and the
+    /// wrappers disagreed: this one widened each top-level `>` to its
+    /// whitespace word, `strip_null_redirects` peeled a redirect glued to a
+    /// following separator, and `ls 2>&1; ls` came out "reads nothing" in the
+    /// classifier and "write" here — a regression against the pre-REQ-620 gate,
+    /// which allowed it. The wrapper is now the strip, for both.
+    ///
+    /// So this is a **differential** table (LESSON-494's shape): each row goes
+    /// through [`has_top_level_redirection`] *and* through the residue the
+    /// classifier reads, and the two must answer the same question. A row that
+    /// only asserted the gate's verdict would go green again the day the two
+    /// wrappers drift apart, which is exactly the defect being fixed.
+    ///
+    /// **Mutation (run, red, reverted):** restore the positional scan (drop the
+    /// strip from [`has_top_level_redirection`]) — the three separator-glued
+    /// benign rows red here and in
+    /// [`tests::the_write_gate_refuses_both_triggers_and_nothing_benign`].
+    /// Drop the `<` disjunct — the `cat < input` row reds here, alone.
+    #[test]
+    fn the_write_gate_and_the_classifier_agree_on_what_reads_nothing() {
+        // `reads_nothing` is the classifier's own question, asked of the same
+        // residue: nothing the strip left behind still carries a redirect.
+        let reads_nothing = |command: &str| {
+            let residue = strip_null_redirects(command).residue;
+            !['>', '<']
+                .into_iter()
+                .any(|needle| top_level_positions(&residue, needle).next().is_some())
+        };
+
+        let benign = [
+            "ls 2>&1; echo ok",
+            "ls 2>&1|head",
+            "cat x > /dev/null; ls",
+            "ls 2>&1; ls",
+            "ls -la",
+            "cat missing 2>/dev/null",
+            "cat missing 2> /dev/null",
+            "make 2>&1",
+            "cmd >&2",
+            "echo \"2 > 1\"",
+            "echo 'a > b'",
+            "cat .adlc/context/architecture.md 2>/dev/null || echo none",
+        ];
+        for command in benign {
+            assert!(
+                reads_nothing(command),
+                "`{command}` leaves no redirect in the residue"
+            );
+            assert_eq!(
+                write_gate(command, RootKind::Home),
+                WriteVerdict::Allowed,
+                "`{command}` reads nothing, so it is not a write"
+            );
+        }
+
+        // The tightenings, recorded rather than papered over: each is a write
+        // now and was not before REQ-620, and each is the *safe* way for this
+        // asymmetric gate to be wrong.
+        let tightened = [
+            ("cmd>&2", "a duplication glued to its verb"),
+            ("cmd >|/dev/null", "a `>|` glued to the device"),
+            (
+                "cmd >| /dev/null",
+                "and spaced — `>|` is not a bare operator",
+            ),
+            ("cat < input", "a `<` the old scan never looked for"),
+        ];
+        for (command, why) in tightened {
+            assert!(
+                !reads_nothing(command),
+                "`{command}` still carries a redirect ({why})"
+            );
+            assert_eq!(
+                write_gate(command, RootKind::Home),
+                WriteVerdict::RefusedNonProject,
+                "`{command}` is a write under the unified wrapper ({why})"
+            );
+        }
+
+        // Ordinary writes, so the table cannot pass by calling everything a
+        // write: the benign half above is what stops that, and this half is
+        // what stops the mutation "always answer `reads_nothing`".
+        for command in ["echo hi > notes.md", "cat a >> b", "cat a > /dev/nullx"] {
+            assert!(!reads_nothing(command), "`{command}` is a real redirection");
         }
     }
 
