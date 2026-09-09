@@ -1,7 +1,7 @@
 ---
 id: TASK-406
 title: "The shell tool description states the grammar to the model, and the prompt margin is raised to pay for it"
-status: draft
+status: complete
 parent: REQ-620
 created: 2026-09-09
 updated: 2026-09-09
@@ -26,10 +26,10 @@ paragraph changes model behaviour often but not always.
 
 ## Acceptance Criteria
 
-- [ ] `exposed_tool_specs()` output for the shell tool contains `SHELL_REACH_CONTRACT` verbatim, and the same bytes for a typed and a model-invoked turn
-- [ ] `the_overhead_raise_restates_the_chunk_count_and_the_scannable_bound`, `the_scannable_bound_plus_overhead_and_escaping_fits_under_the_cap`, `the_total_cap_clears_the_harness_context_budget_with_margin` green at 24 KiB with the re-derived figures
-- [ ] The recorded margin after the raise is positive and asserted, not narrated
-- [ ] The paragraph is description of the daemon's behaviour, not an instruction about repository text (REQ-612 framing)
+- [x] `exposed_tool_specs()` output for the shell tool contains `SHELL_REACH_CONTRACT` verbatim, and the same bytes for a typed and a model-invoked turn
+- [x] `the_overhead_raise_restates_the_chunk_count_and_the_scannable_bound`, `the_scannable_bound_plus_overhead_and_escaping_fits_under_the_cap`, `the_total_cap_clears_the_harness_context_budget_with_margin` green at 24 KiB with the re-derived figures
+- [x] The recorded margin after the raise is positive and asserted, not narrated
+- [x] The paragraph is description of the daemon's behaviour, not an instruction about repository text (REQ-612 framing)
 
 ## Verification
 

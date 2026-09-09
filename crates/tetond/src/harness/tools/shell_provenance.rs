@@ -960,6 +960,51 @@ fn subtree_is_boundary_free(
     !hit && report.truncated_by.is_none() && report.unmintable == 0
 }
 
+/// Whether `phrase` is a verb this grammar recognises as reading names,
+/// contents, or nothing — i.e. one it can classify without falling through to
+/// `Unknown` (REQ-620 TASK-406).
+///
+/// **One reader, and it is a cross-check, not a gate.** Nothing in the
+/// classifier calls this: [`classify_segment`] consults the tables directly and
+/// its fallthrough is what actually makes an unrecognised verb `Unknown`. It
+/// exists so that the model-facing paragraph in
+/// [`SHELL_REACH_CONTRACT`](super::shell::SHELL_REACH_CONTRACT) — which names
+/// example verbs to a model that will then write them — can be held against
+/// these tables by a test in the module that owns the paragraph. A contract
+/// naming a verb this grammar refuses would teach the model to pin itself,
+/// which is worse than a contract that names none (LESSON-542: a grammar taught
+/// to the model must be read on every path it can answer through).
+///
+/// `git <sub>` is accepted as a two-word phrase against [`GIT_NAME_ONLY`],
+/// because that is the shape the contract names (`git status`) and the shape
+/// [`classify_segment`] reads.
+///
+/// `#[cfg(test)]` because the cross-check is its only reader: production code
+/// must go through [`classify_segment`], whose fallthrough is the real gate, and
+/// a second table-reader on the production path is how a grammar comes to have
+/// two answers (LESSON-494).
+#[cfg(test)]
+#[must_use]
+pub(crate) fn is_recognised_verb(phrase: &str) -> bool {
+    let mut words = phrase.split_whitespace();
+    let Some(verb) = words.next() else {
+        return false;
+    };
+    let sub = words.next();
+    if words.next().is_some() {
+        return false;
+    }
+    match (verb, sub) {
+        ("git", Some(sub)) => GIT_NAME_ONLY.contains(&sub),
+        (verb, None) => {
+            READS_NOTHING.contains(&verb)
+                || NAME_ONLY.contains(&verb)
+                || READS_CONTENT.contains(&verb)
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -133,6 +133,56 @@ pub(crate) const MAX_OUTPUT_CHARS: usize = 8_000;
 /// one deadline (LESSON-528).
 pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
+/// One home for the reach paragraph's **bytes** (REQ-620 BR-7).
+///
+/// The paragraph has to be two things at once: a `pub(crate) const` a test can
+/// read and measure ([`SHELL_REACH_CONTRACT`]), and a `concat!` argument, since
+/// [`SHELL_DESCRIPTION`] is a compile-time constant and `std` has no const
+/// string concatenation. A `macro_rules!` expanding to the literal is what makes
+/// those the same bytes rather than two spellings a later edit can separate —
+/// the alternative, writing the paragraph twice with a test comparing the
+/// copies, is the drift LESSON-446 is about with a guard bolted on afterwards.
+///
+/// Not a `OnceLock` or a leak, for `SkillTool::description`'s reason turned
+/// around: this text is genuinely static — it does not vary with the session
+/// root — so it belongs in the binary, not on the heap once per process.
+macro_rules! reach_contract {
+    () => {
+        "Commands are checked before they run. A command keeps the session on its \
+         current tier when ordinary read verbs (ls, cat, grep, git status) name \
+         paths inside the session root; `2>/dev/null` and `2>&1` are fine. Quotes, \
+         other redirects, globs, `$`, `~/` paths, interpreters, network clients, or \
+         an unknown verb pin the rest of the session to the local tier; the pin is \
+         announced and only the user can lift it."
+    };
+}
+
+/// The `shell` tool's description, resident in every remote turn's system
+/// prompt.
+///
+/// A `const` built with `concat!` rather than a literal returned from
+/// [`Tool::description`], because its last sentence group is BR-7's reach
+/// contract and that paragraph has readers of its own — `SHELL_REACH_CONTRACT`,
+/// at the foot of this file, and `completion.rs`'s assertion that the bytes
+/// reach the provider. Both spellings expand `reach_contract!`, so there is one
+/// paragraph and not two.
+const SHELL_DESCRIPTION: &str = concat!(
+    // REQ-615 BR-1. The cwd sentence is **verbatim** and pinned by a
+    // prompt-margin test: LESSON-570's rule is that a prompt sentence must be
+    // true after the REQ ships, and this one is made true by the fresh child
+    // `run_bounded` spawns for every call. It lives beside the tool rather than
+    // only in the environment block because a small model transfers data
+    // reliably and a fact three paragraphs away unreliably (LESSON-532) — and
+    // because the fact the block states is exactly what a `cd … && pwd` result
+    // appears to contradict.
+    "Run a shell command in the session root under a timeout. Use it to verify \
+     changes (build, test, grep). Secrets in the environment are removed. Each \
+     command starts in the session root; `cd` inside a command does not carry to \
+     the next one. Only the user can move the root, with `/cd <path>` — say so \
+     instead of trying. ",
+    reach_contract!()
+);
+
 /// Runs shell commands under a timeout, cwd jail, and composed environment.
 ///
 /// No longer `Copy` since REQ-615: it carries an optional event emitter for
@@ -185,19 +235,11 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        // REQ-615 BR-1. The cwd sentence is **verbatim** and pinned by a
-        // prompt-margin test: LESSON-570's rule is that a prompt sentence must
-        // be true after the REQ ships, and this one is made true by the fresh
-        // child `run_bounded` spawns for every call. It lives beside the tool
-        // rather than only in the environment block because a small model
-        // transfers data reliably and a fact three paragraphs away unreliably
-        // (LESSON-532) — and because the fact the block states is exactly what
-        // a `cd … && pwd` result appears to contradict.
-        "Run a shell command in the session root under a timeout. Use it to \
-         verify changes (build, test, grep). Secrets in the environment are \
-         removed. Each command starts in the session root; `cd` inside a \
-         command does not carry to the next one. Only the user can move the \
-         root, with `/cd <path>` — say so instead of trying."
+        // One `const` (REQ-620 ADR-620-5): the cwd contract and the reach
+        // contract are one string the provider receives, and the reach half has
+        // a second reader — `SHELL_REACH_CONTRACT`, which its own test measures
+        // and `completion.rs` asserts reaches the wire.
+        SHELL_DESCRIPTION
     }
 
     fn input_schema(&self) -> Value {
@@ -993,6 +1035,50 @@ fn render_output(
     outcome.measuring(raw_output_chars)
 }
 
+/// **The reach grammar, stated to the model** (REQ-620 BR-7, ADR-620-5).
+///
+/// REQ-614's classifier decides, before a command runs, whether everything it
+/// could read is inside the session root, and refuses anything its grammar does
+/// not model — which pins the session to the local tier for the rest of that
+/// session. The model had never been told any of that, so it wrote
+/// `2>/dev/null` from habit and pinned the first agentic turn of every session.
+/// REQ-620's BR-1 and BR-4 teach the grammar the forms that provably read
+/// nothing; this paragraph is the other half, and it is the *best-effort* half
+/// (ASSUME-048): a description steers a model often, not always, which is why
+/// the grammar and not the prose is what makes the pin proportionate.
+///
+/// **Description, not instruction** (REQ-612's framing): every sentence is a
+/// fact about what this daemon does with a command it is handed. None of it
+/// tells the model to act on anything it reads in the repository.
+///
+/// Four hundred and twenty bytes is the ceiling, asserted by
+/// `tests::the_reach_contract_names_every_pinning_class_and_fits_its_budget`
+/// alongside the classes it has to name. The budget is not free: a tool
+/// description is resident in every remote turn's system prompt, and paying for
+/// this one took [`REDACT_BODY_OVERHEAD_BYTES`](crate::egress::redact) from 23
+/// to 24 KiB — the ledger line on that constant is where the arithmetic is.
+///
+/// Every verb the paragraph names is cross-checked against the classifier's own
+/// tables ([`shell_provenance::is_recognised_verb`]) by the same test: a
+/// contract that promised reach for a verb the grammar refuses would teach the
+/// model to pin itself, which is worse than saying nothing (LESSON-542).
+///
+/// **`#[cfg(test)]`, and down here rather than beside [`SHELL_DESCRIPTION`],
+/// for two different reasons.** Test-only because the production path reads the
+/// paragraph through the macro; a second production reader would be a second
+/// spelling of the same bytes, which is what the macro exists to prevent
+/// (the shape [`RECORDED_PROMPT_MARGIN_BYTES`](crate::egress::redact) is
+/// `#[cfg(test)]` for too). Down here because half a dozen source-scan tests cut
+/// this file's production corpus at the **first** column-0 `#[cfg(test)]`
+/// (`the_output_cap_has_exactly_one_home`, `the_verdict_is_computed_before_measurement`,
+/// `child_env::a_childs_environment_has_exactly_one_construction_site`), so one
+/// placed above the `impl` truncates every one of them to the file's opening
+/// lines and they pass on a corpus that contains almost nothing — ASSUME-010's
+/// hazard, met the moment this constant was first written at the top. Run that
+/// mutation before moving it back: it is silent, and it is three green tests.
+#[cfg(test)]
+pub(crate) const SHELL_REACH_CONTRACT: &str = reach_contract!();
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1053,6 +1139,105 @@ mod tests {
                  fact a `cd … && pwd` result appears to contradict:\n{docs}"
             );
         }
+    }
+
+    /// **REQ-620 BR-7 / AC-8: the reach contract names every class that pins,
+    /// fits its budget, and promises reach for nothing the grammar refuses.**
+    ///
+    /// Three claims, and they fail for different reasons on purpose:
+    ///
+    /// 1. **The classes.** A paragraph that has stopped naming `~/` is a
+    ///    paragraph that no longer covers the case the originating transcript
+    ///    pinned on. Folded to ASCII lowercase first, so the prose words are
+    ///    pinned by meaning rather than by where a sentence happens to break;
+    ///    the syntax tokens (`/dev/null`, `2>&1`, `$`, `~/`) fold to themselves.
+    /// 2. **The budget.** 420 bytes, the ceiling ADR-620-5 set and the raise of
+    ///    `REDACT_BODY_OVERHEAD_BYTES` was sized against. Asserted here rather
+    ///    than only in the prompt-margin sweep because the sweep's failure says
+    ///    "the resident prompt moved" about a whole prompt, and this one names
+    ///    the sentence that moved it.
+    /// 3. **The verbs are real.** Every verb the paragraph offers as an example
+    ///    of "ordinary read verbs" is checked against the classifier's own
+    ///    tables. This is the claim with teeth: the paragraph is read by a model
+    ///    that will then write those verbs, so a contract naming a verb
+    ///    `shell_provenance` refuses would teach the model to pin itself —
+    ///    LESSON-542's rule that a grammar taught to the model must be read on
+    ///    every path it can answer through. The list here is typed out rather
+    ///    than parsed out of the prose: a parser over the paragraph would find
+    ///    whatever the paragraph happened to say, which is the thing under test.
+    ///
+    /// **Mutation (run, red, reverted):** shorten `reach_contract!` to drop the
+    /// `` `~/` paths `` clause. Claim 1 goes red naming `~/`; the byte and verb
+    /// claims stay green, which is the discrimination the three-claim split is
+    /// for. It reddens
+    /// `egress::redact::tests::the_total_cap_clears_the_harness_context_budget_with_margin`
+    /// too — the recorded margin goes 721 → 733 — and that is the pair working
+    /// as intended rather than a duplicate: this test says *which sentence*
+    /// changed, the sweep says the resident prompt moved at all.
+    #[test]
+    fn the_reach_contract_names_every_pinning_class_and_fits_its_budget() {
+        /// ADR-620-5's ceiling. The contract is resident in every remote turn's
+        /// system prompt, so its length is a budget and not a style note.
+        const CONTRACT_MAX_BYTES: usize = 420;
+
+        let folded = SHELL_REACH_CONTRACT.to_ascii_lowercase();
+        for (needle, class) in [
+            (
+                "/dev/null",
+                "a redirect to the null device, which reads nothing",
+            ),
+            ("2>&1", "a descriptor duplication, which reads nothing"),
+            ("quotes", "quoting, which the grammar refuses whole"),
+            ("globs", "wildcards, which the grammar refuses whole"),
+            ("$", "variables and substitution"),
+            ("~/", "a path outside the session root"),
+            (
+                "local tier",
+                "what a pin costs — the rest of the session on the small model",
+            ),
+        ] {
+            assert!(
+                folded.contains(needle),
+                "the reach contract no longer names {class} (`{needle}`), so a model \
+                 reading it cannot avoid that pin:\n{SHELL_REACH_CONTRACT}"
+            );
+        }
+
+        assert!(
+            SHELL_REACH_CONTRACT.len() <= CONTRACT_MAX_BYTES,
+            "the reach contract is {} bytes against a {CONTRACT_MAX_BYTES}-byte \
+             ceiling. It is resident in every remote turn's system prompt and the \
+             `REDACT_BODY_OVERHEAD_BYTES` raise was sized against this ceiling — \
+             shorten the paragraph, or make the ceiling case in the redact ledger \
+             and re-measure both prompt-margin sweeps.",
+            SHELL_REACH_CONTRACT.len()
+        );
+
+        for verb in ["ls", "cat", "grep", "git status"] {
+            assert!(
+                SHELL_REACH_CONTRACT.contains(verb),
+                "`{verb}` is cross-checked against the classifier's tables below \
+                 but no longer appears in the contract, so this row is asserting \
+                 nothing about the paragraph:\n{SHELL_REACH_CONTRACT}"
+            );
+            assert!(
+                shell_provenance::is_recognised_verb(verb),
+                "the contract offers `{verb}` as an ordinary read verb, but \
+                 `shell_provenance` does not recognise it — so a model that took \
+                 the contract at its word would pin the session on the first call. \
+                 Either add it to the classifier's tables or take it out of the \
+                 paragraph (LESSON-542)."
+            );
+        }
+
+        assert!(
+            ShellTool::default()
+                .description()
+                .ends_with(SHELL_REACH_CONTRACT),
+            "the contract is no longer the tool description's last sentence group, \
+             so what the provider receives and what this test measures have come \
+             apart"
+        );
     }
 
     /// **REQ-615 BR-2 / AC-2: a `cd`-bearing command carries the cwd note, and

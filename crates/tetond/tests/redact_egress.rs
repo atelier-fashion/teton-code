@@ -1761,10 +1761,11 @@ fn system_prompt_with_notes(notes: RepoContextBlock) -> String {
 /// ## The bound
 ///
 /// The body is assembled at [`REDACT_SCANNABLE_CONTEXT_BYTES`] as `derive`
-/// answers it today — 184,265 bytes since this REQ raised the overhead 14 → 23
-/// KiB and the chunk cap went 3 → 4. Nothing here restates that figure: the
-/// bound is derived by the production function and then spent, so the day the
-/// next overhead raise moves it this test moves with it.
+/// answers it today — 183,334 bytes since REQ-620 took the overhead 23 → 24 KiB
+/// (it was 184,265 from REQ-612's 14 → 23 KiB raise, which is also the one that
+/// took the chunk cap 3 → 4). Nothing here restates that figure: the bound is
+/// derived by the production function and then spent, so the day the next
+/// overhead raise moves it this test moves with it — as it just did.
 ///
 /// ## Mutation (run 2026-09-03)
 ///

@@ -1706,6 +1706,112 @@ mod tests {
         assert!(specs[0].input_schema.is_object());
     }
 
+    /// **REQ-620 BR-7 / AC-8: the reach contract reaches the provider, and the
+    /// same bytes reach it on a typed turn and a model-invoked skill turn.**
+    ///
+    /// [`exposed_tool_specs`] is the *only* place a tool's description becomes a
+    /// [`ToolSpec`] for a remote provider — `RemoteProviderSource::produce_turn`
+    /// has the one call site — so a description that survives this projection is
+    /// a description the provider receives. The test asserts on that function
+    /// directly rather than by streaming two turns through a mock provider: the
+    /// two turn kinds do not differ in anything `produce_turn` does with the
+    /// tool list, and a turn-shaped fixture would assert the mock's plumbing
+    /// while looking like it asserted the contract.
+    ///
+    /// **What "typed" and "model-invoked" actually differ in, and why that is
+    /// the right pair to cross.** REQ-619 BR-6's claim is that a skill run
+    /// because the user typed `/skill` and one run because the *model* called
+    /// the `skill` tool are served the same reach rules. The only difference
+    /// those two turns present to this projection is the registry: a session
+    /// holding a model-invocable skill gets a `skill` tool registered
+    /// cap-exempt per turn (REQ-587 ADR-9) and a session without one does not.
+    /// So the two registries below are the two turn kinds as this seam sees
+    /// them, and the assertion is that the `shell` spec is byte-identical
+    /// across them — one tool, one description, no per-turn variation to drift.
+    ///
+    /// `SkillToolDocs` rather than the real `SkillTool` for the reason the
+    /// prompt-margin sweeps give: the real one holds a permission gate and a
+    /// runtime handle, and its prompt bytes are pinned byte-identical to this
+    /// fixture's elsewhere.
+    ///
+    /// **Mutation (run, red, reverted):** drop `reach_contract!()` from
+    /// `SHELL_DESCRIPTION`'s `concat!` — both `contains` rows go red naming the
+    /// paragraph, while the byte-equality row stays green, because a
+    /// description missing the contract is still the *same* description on both
+    /// turn kinds.
+    #[test]
+    fn the_shell_reach_contract_reaches_the_provider_for_typed_and_model_turns() {
+        use crate::harness::tools::shell::SHELL_REACH_CONTRACT;
+        use crate::harness::tools::Tool;
+        use crate::harness::turn_loop::SkillToolDocs;
+
+        /// The `shell` spec out of a registry's projection, or a failure naming
+        /// the turn kind — an absent tool must not read as an empty
+        /// description that trivially satisfies nothing.
+        fn shell_description(tools: &ToolRegistry, kind: &str) -> String {
+            let specs = exposed_tool_specs(tools, None);
+            specs
+                .iter()
+                .find(|s| s.name == "shell")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the {kind} turn's tool list carries no `shell` spec, so this \
+                         test cannot say anything about what the provider receives: {:?}",
+                        specs.iter().map(|s| &s.name).collect::<Vec<_>>()
+                    )
+                })
+                .description
+                .clone()
+        }
+
+        // The typed shape: builtins only, which is what a session with no
+        // model-invocable skill registers.
+        let typed = ToolRegistry::with_builtins();
+
+        // The model-invoked shape: the same builtins plus the `skill` tool the
+        // model calls, registered the way `register_skill_tool` registers it.
+        let mut model_invoked = ToolRegistry::with_builtins();
+        model_invoked.register_cap_exempt(Arc::new(SkillToolDocs::worst_case()) as Arc<dyn Tool>);
+
+        let typed_shell = shell_description(&typed, "typed");
+        let model_shell = shell_description(&model_invoked, "model-invoked");
+
+        for (docs, kind) in [(&typed_shell, "typed"), (&model_shell, "model-invoked")] {
+            assert!(
+                docs.contains(SHELL_REACH_CONTRACT),
+                "the {kind} turn's serialised `shell` spec does not carry the reach \
+                 contract verbatim, so the model is being asked to avoid a grammar it \
+                 was never shown (REQ-620 BR-7):\n{docs}"
+            );
+        }
+
+        assert_eq!(
+            typed_shell, model_shell,
+            "the `shell` tool's description differs between a typed turn and a \
+             model-invoked skill turn. There is one tool and one description; a \
+             difference here means something is composing the description per turn, \
+             which is exactly the drift REQ-619 BR-6 forbids."
+        );
+
+        // Non-vacuity: the model-invoked registry really is the other shape.
+        // Without this, both rows above would pass on two identical registries
+        // and the byte-equality assertion would be measuring nothing.
+        assert!(
+            exposed_tool_specs(&model_invoked, None)
+                .iter()
+                .any(|s| s.name == "skill"),
+            "the model-invoked registry carries no `skill` tool, so it is the typed \
+             shape under another name and this test crosses nothing"
+        );
+        assert!(
+            !exposed_tool_specs(&typed, None)
+                .iter()
+                .any(|s| s.name == "skill"),
+            "the typed registry already carries a `skill` tool, so the two shapes \
+             below are the same shape"
+        );
+    }
+
     /// **Seam 2 of three (REQ-585 BR-7, ADR-9).** The union is over every block
     /// that carries file provenance — which now includes a **user** block, because
     /// a `/skill` expansion is prompt text by role and file content by origin and
