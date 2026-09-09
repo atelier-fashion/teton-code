@@ -1288,6 +1288,9 @@ pub enum SelectionSource {
     ConfigPin,
     /// The explicit opt-in auto-accept path took it unattended (BR-5).
     AutoAccept,
+    /// The tier stepped down from a model that missed the BR-8 latency duty to
+    /// the next smaller catalog entry that fits (REQ-544 step-down).
+    StepDown,
 }
 
 /// A model-selection decision was recorded (spec: `model_selection_decided`).
@@ -8269,6 +8272,7 @@ mod tests {
             SelectionSource::UserOverride,
             SelectionSource::ConfigPin,
             SelectionSource::AutoAccept,
+            SelectionSource::StepDown,
         ] {
             round_trip(&ModelSelectionDecided {
                 request_id: Some(RequestId::from("m1")),
@@ -8300,6 +8304,7 @@ mod tests {
             (SelectionSource::UserOverride, "\"user_override\""),
             (SelectionSource::ConfigPin, "\"config_pin\""),
             (SelectionSource::AutoAccept, "\"auto_accept\""),
+            (SelectionSource::StepDown, "\"step_down\""),
         ] {
             assert_eq!(serde_json::to_string(&source).unwrap(), expected);
         }

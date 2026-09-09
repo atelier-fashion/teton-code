@@ -355,6 +355,7 @@ pub fn source_label(source: SelectionSource) -> &'static str {
         SelectionSource::UserOverride => "user override",
         SelectionSource::ConfigPin => "config pin",
         SelectionSource::AutoAccept => "auto-accept",
+        SelectionSource::StepDown => "stepped down after a failed benchmark",
     }
 }
 

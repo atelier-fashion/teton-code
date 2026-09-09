@@ -378,6 +378,11 @@ const GIT_NAME_ONLY: &[&str] = &[
     "tag",
     "rev-parse",
     "diff-tree",
+    // `worktree list` and `for-each-ref` print ref names, paths and commit
+    // metadata — the same reach `log` and `branch` already have; neither can
+    // print a tracked file's content.
+    "worktree",
+    "for-each-ref",
 ];
 
 /// Characters whose presence means `sh` will do something this grammar does not
@@ -1050,6 +1055,59 @@ mod tests {
         );
     }
 
+    /// Toolkit BUG-220 / teton-code BUG-219: the shapes every ADLC skill
+    /// preamble was rewritten into must be `Rooted` against a project that has
+    /// been `/init`ed, and the shapes they replaced must still be `Unknown` —
+    /// the grammar rejects quoting and redirection before it reads the verb, so
+    /// this is the contract the toolkit's `conventions.md` is written against.
+    #[test]
+    fn the_toolkit_preamble_shapes_are_rooted_and_the_old_ones_are_not() {
+        let root = project_root("toolkit-preambles");
+        std::fs::create_dir_all(root.join(".adlc/context")).unwrap();
+        std::fs::create_dir_all(root.join(".adlc/specs/REQ-1-x")).unwrap();
+        std::fs::write(root.join(".adlc/ETHOS.md"), "ethos\n").unwrap();
+        std::fs::write(root.join(".adlc/context/architecture.md"), "arch\n").unwrap();
+        std::fs::write(
+            root.join(".adlc/specs/REQ-1-x/requirement.md"),
+            "status: draft\n",
+        )
+        .unwrap();
+        for rewritten in [
+            "test -s .adlc/ETHOS.md && cat .adlc/ETHOS.md || echo No ethos found — run /init to vendor .adlc/ETHOS.md",
+            "cat .adlc/context/architecture.md || echo No architecture context found",
+            "grep -rl -e status:.draft -e status:.approved -e status:.in-progress --include requirement.md .adlc/specs || echo No active specs",
+            "ls .adlc/specs/ || echo No specs found",
+            "find .adlc/specs -name pipeline-state.json",
+            "git branch --show-current || echo Not a git repo",
+            "git diff-tree --stat -r main HEAD || echo No diff available",
+            "git status --short",
+            "git worktree list || echo Not a git repo",
+            "git for-each-ref refs/remotes/origin/feat",
+            "which gh && echo installed - auth and network checked at run || echo not installed — branch-only",
+            "test -f .adlc/ETHOS.md && echo present || echo absent — run /init",
+        ] {
+            let v = verdict(&root, rewritten);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Rooted,
+                "{rewritten:?} should be Rooted, got {:?} ({})",
+                v.kind,
+                v.reason
+            );
+        }
+        for old in [
+            r#"test -s .adlc/ETHOS.md && cat .adlc/ETHOS.md || echo "No ethos found — run /init to vendor .adlc/ETHOS.md""#,
+            r#"cat .adlc/context/architecture.md 2>/dev/null || echo "No architecture context found""#,
+            r#"grep -rl 'status: draft\|status: approved' .adlc/specs/*/requirement.md 2>/dev/null | head -20 || echo "No active specs""#,
+            "git diff main --stat || echo No diff available",
+            "cat .adlc/templates/task-template.md || cat ~/.claude/skills/templates/task-template.md || echo none",
+        ] {
+            let v = verdict(&root, old);
+            assert_eq!(v.kind, VerdictKind::Unknown, "{old:?} should be Unknown");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// BR-1, benign path. The legitimate actor — the four commands AC-12 scripts
     /// plus an explicit file read — must NOT trip the classifier. A detector
     /// validated only against adversarial input ships broken and passes its own
@@ -1063,6 +1121,8 @@ mod tests {
             "ls src",
             "git status",
             "git log -3",
+            "git worktree list",
+            "git for-each-ref refs/remotes/origin/feat",
             "cat src/main.rs",
             "wc -l src/main.rs",
             "sleep 60",
