@@ -1337,6 +1337,7 @@ mod tests {
             SelectionSource::UserOverride,
             SelectionSource::ConfigPin,
             SelectionSource::AutoAccept,
+            SelectionSource::StepDown,
         ] {
             let status = status_with(Some(selected("m", source)), None);
             let line = one_line(&status);

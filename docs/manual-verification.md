@@ -48,7 +48,10 @@ observe each one, and record anything that differs from this list.
 2. ~~**No post-install benchmark.**~~ **FIXED (engine wiring, this branch.)**
    The consent flow now runs `teton_inference::benchmark::run_benchmark` on the
    freshly loaded engine and publishes the measured `benchmark` stage before
-   `ready`; `ready` is withheld (with the reason) if the BR-8 duty fails.
+   `ready`; if the BR-8 duty fails, a probe pick steps down to the next
+   smaller catalog model (`stepped_down`, then that model's own install and
+   benchmark; BUG-219) and `ready` is withheld with the reason only for a user
+   override or when nothing smaller fits.
    Expect a `benchmark <model>: first token … ms, … tok/s` line with *measured*
    numbers after the install and on every startup.
 3. ~~**The startup lifecycle overstates reality.**~~ **FIXED (TASK-009.)** The

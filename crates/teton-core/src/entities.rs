@@ -370,6 +370,12 @@ pub enum SelectionSource {
     /// The explicit opt-in auto-accept path took the decision unattended
     /// (REQ-547 BR-5) — the CI/unattended route.
     AutoAccept,
+    /// The tier stepped down from a model that missed its BR-8 latency duty to
+    /// the next smaller catalog entry that fits this machine (REQ-544's
+    /// auto-step-down, BUG-219). Recorded like a probe pick — the user
+    /// consented to the local tier, not to one model — and, like one, eligible
+    /// to step down again if the smaller model misses the duty too.
+    StepDown,
 }
 
 /// The recorded answer to a model proposal (System Model: `ModelSelection`).
@@ -555,6 +561,7 @@ mod tests {
             ModelSelection::accepted("qwen2.5-coder-3b", SelectionSource::ConfigPin, 1),
             ModelSelection::accepted("qwen2.5-coder-7b", SelectionSource::AutoAccept, 2),
             ModelSelection::accepted("qwen2.5-coder-3b", SelectionSource::UserOverride, 3),
+            ModelSelection::accepted("qwen2.5-coder-1.5b", SelectionSource::StepDown, 5),
             ModelSelection::declined(4),
         ] {
             let text = toml::to_string(&sel).unwrap();
@@ -588,6 +595,7 @@ mod tests {
             (SelectionSource::UserOverride, "user_override"),
             (SelectionSource::ConfigPin, "config_pin"),
             (SelectionSource::AutoAccept, "auto_accept"),
+            (SelectionSource::StepDown, "step_down"),
         ] {
             let text = toml::to_string(&Wrap { source }).unwrap();
             assert!(text.contains(expected), "got: {text}");

@@ -18,6 +18,36 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [Unreleased]
+
+### Fixed
+
+- **A model that misses the latency duty steps down before the tier is
+  disabled (BUG-219).** REQ-544 promised the next smaller catalog model when
+  the post-load benchmark fails BR-8; the daemon answered a miss with
+  `disabled` instead, for its lifetime, and paid the same failing load again at
+  the next start. A probe pick, an auto-accept, or an earlier step-down that
+  misses now publishes `stepped_down` with the measurement and goes through the
+  one install path for the next smaller model that fits — downloaded if it is
+  not on disk, verified, loaded and benchmarked in its turn — until one passes
+  or nothing smaller fits. The step is recorded as a new selection source,
+  `step_down` ("stepped down after a failed benchmark" in `teton model status`),
+  so the next start loads the model that passed. A `teton model set` choice is
+  the user's and is not revised: the tier is disabled with the measurement and
+  the command that picks a smaller model.
+
+  **Upgrade note:** a machine whose probe pick has been failing the duty will,
+  on its first session after upgrading, download the next smaller model (for
+  the large band, `qwen2.5-coder-7b`, 4.4 GiB) without asking again — the
+  consent given was to the local tier, not to one model. `teton model set
+  <name>` is the way back up, and a downgraded selection file is not readable
+  by an older daemon.
+
+- **`git worktree` and `git for-each-ref` are name-only shell verbs.** They
+  print ref names, paths and commit metadata, the reach `log` and `branch`
+  already have, so a skill preamble that lists worktrees or fetched branches
+  classifies as `rooted` (toolkit BUG-220).
+
 ## [0.1.32] - 2026-09-06
 
 Five bugs and one requirement from the same dogfood session as 0.1.31, taken

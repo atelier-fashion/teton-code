@@ -354,6 +354,19 @@ impl Harness {
         config: LocalModelConfig,
         loader: Option<Arc<dyn LocalEngineLoader>>,
     ) -> Self {
+        Self::build_with_catalog(dir, profile, test_catalog(), fetcher, config, loader)
+    }
+
+    /// [`Self::build`] over a catalog other than the three-entry fixture: the
+    /// step-down tests need two entries that both fit, in different bands.
+    fn build_with_catalog(
+        dir: PathBuf,
+        profile: HardwareProfile,
+        catalog: Catalog,
+        fetcher: RecordingFetcher,
+        config: LocalModelConfig,
+        loader: Option<Arc<dyn LocalEngineLoader>>,
+    ) -> Self {
         let bus = Arc::new(EventBus::new());
         let pending = Arc::new(PendingModelDecisions::new());
         let store = Arc::new(SelectionStore::open(&dir));
@@ -374,7 +387,7 @@ impl Harness {
         let gate = Arc::new(
             ModelConsentGate::new(
                 profile,
-                test_catalog(),
+                catalog,
                 config,
                 Arc::clone(&bus),
                 Arc::clone(&pending),
@@ -1678,6 +1691,185 @@ async fn an_engine_that_misses_the_latency_duty_is_benchmarked_then_disabled_not
             .iter()
             .any(|stage| matches!(stage, ModelLifecycleStage::Ready)),
         "a duty-missing engine must not publish `ready`; got {stages:?}"
+    );
+    h.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// BR-8's other half: a failed duty steps down before it disables (BUG-219)
+// ---------------------------------------------------------------------------
+
+/// Two entries that both fit the 16 GiB machine, in different bands, so a
+/// failed duty on the larger one has somewhere to go.
+fn step_down_catalog() -> Catalog {
+    Catalog {
+        version: 1,
+        models: vec![
+            entry("small-fit", SMALL_BODY, SMALL_SHA, 8 * GIB, TierBand::Small),
+            entry("large-fit", BIG_BODY, BIG_SHA, 12 * GIB, TierBand::Mid),
+        ],
+    }
+}
+
+fn step_down_fetcher() -> RecordingFetcher {
+    let mut bodies = HashMap::new();
+    bodies.insert("small-fit".to_owned(), SMALL_BODY.to_vec());
+    bodies.insert("large-fit".to_owned(), BIG_BODY.to_vec());
+    RecordingFetcher {
+        calls: Mutex::new(Vec::new()),
+        bodies,
+        offline: false,
+    }
+}
+
+/// A loader that misses the BR-8 duty for one named model and passes it for
+/// every other — the instrument the step-down chain is measured with. The
+/// failing figures are the ones from the 2026-09-09 dogfood session.
+struct DutyFailsFor(&'static str);
+
+impl LocalEngineLoader for DutyFailsFor {
+    fn load(&self, model_name: &str) -> Result<EngineLoadReport, String> {
+        let benchmark = if model_name == self.0 {
+            BenchmarkResult {
+                first_token_ms: 2_021,
+                tokens_per_sec: 27.4,
+            }
+        } else {
+            BenchmarkResult {
+                first_token_ms: 5,
+                tokens_per_sec: 120.0,
+            }
+        };
+        Ok(EngineLoadReport {
+            duty: teton_inference::DutySpec::default().evaluate(&benchmark),
+            benchmark,
+            window: None,
+            window_event: None,
+        })
+    }
+}
+
+fn step_down_harness(tag: &str) -> Harness {
+    Harness::build_with_catalog(
+        temp_dir(tag),
+        machine(),
+        step_down_catalog(),
+        step_down_fetcher(),
+        LocalModelConfig::default(),
+        Some(Arc::new(DutyFailsFor("large-fit"))),
+    )
+}
+
+/// The probe's pick misses the duty: the tier steps down to the next smaller
+/// model, installs it through the one install path, benchmarks it, and reaches
+/// `ready` on it — recorded as a step-down, so the next start loads the model
+/// that passed rather than paying the failed load again.
+#[tokio::test]
+async fn a_probe_pick_that_misses_the_duty_steps_down_to_the_next_model_that_passes() {
+    let h = step_down_harness("step-down");
+    let mut sub = h.bus.subscribe(256);
+    h.store
+        .record(&ModelSelection::accepted(
+            "large-fit",
+            SelectionSource::Probe,
+            1,
+        ))
+        .expect("record the probe pick");
+
+    let outcome = h.gate.install_recorded().await;
+
+    assert!(
+        matches!(
+            &outcome,
+            ConsentOutcome::Ready { selection }
+                if selection.model_name.as_deref() == Some("small-fit")
+                    && selection.source == SelectionSource::StepDown
+        ),
+        "{outcome:?}"
+    );
+    let current = h.store.current().expect("a selection is recorded");
+    assert_eq!(current.model_name.as_deref(), Some("small-fit"));
+    assert_eq!(current.source, SelectionSource::StepDown);
+    assert!(h.installed("large-fit").exists());
+    assert!(h.installed("small-fit").exists());
+
+    let stages = lifecycle_stages(&mut sub).await;
+    let stepped = stages.iter().position(|stage| {
+        matches!(
+            stage,
+            ModelLifecycleStage::SteppedDown { from_model, to_model, reason }
+                if from_model == "large-fit"
+                    && to_model == "small-fit"
+                    && reason.contains("first-token latency")
+        )
+    });
+    let ready = stages
+        .iter()
+        .position(|stage| matches!(stage, ModelLifecycleStage::Ready));
+    assert!(
+        stepped.is_some() && ready.is_some() && stepped < ready,
+        "expected stepped_down before ready; got {stages:?}"
+    );
+    assert!(
+        stages.iter().any(|stage| matches!(
+            stage,
+            ModelLifecycleStage::Benchmark {
+                first_token_ms: 2_021,
+                ..
+            }
+        )),
+        "the failing measurement is still published; got {stages:?}"
+    );
+    assert!(
+        !stages
+            .iter()
+            .any(|stage| matches!(stage, ModelLifecycleStage::Disabled { .. })),
+        "a tier that stepped down to a passing model is not disabled; got {stages:?}"
+    );
+    h.cleanup();
+}
+
+/// A user override that misses the duty is the user's choice to revise: the
+/// tier is disabled with the measurement and the command that picks another
+/// model, and nothing is downloaded on their behalf.
+#[tokio::test]
+async fn a_user_override_that_misses_the_duty_is_disabled_not_stepped_down() {
+    let h = step_down_harness("no-step-down-override");
+    let mut sub = h.bus.subscribe(256);
+    h.gate
+        .set_model("large-fit", false)
+        .expect("large-fit fits");
+
+    let outcome = h.gate.install_recorded().await;
+
+    assert!(
+        matches!(
+            &outcome,
+            ConsentOutcome::EngineLoadFailed { model_name, reason }
+                if model_name == "large-fit"
+                    && reason.contains("first-token latency")
+                    && reason.contains("user override")
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        h.store.current().and_then(|s| s.model_name).as_deref(),
+        Some("large-fit")
+    );
+    assert!(!h.installed("small-fit").exists());
+    let stages = lifecycle_stages(&mut sub).await;
+    assert!(
+        !stages
+            .iter()
+            .any(|stage| matches!(stage, ModelLifecycleStage::SteppedDown { .. })),
+        "{stages:?}"
+    );
+    assert!(
+        stages.iter().any(|stage| matches!(
+            stage,
+            ModelLifecycleStage::Disabled { reason } if reason.contains("first-token latency")
+        )),
+        "{stages:?}"
     );
     h.cleanup();
 }

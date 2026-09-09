@@ -384,6 +384,7 @@ fn wire_source(source: SelectionSource) -> WireSelectionSource {
         SelectionSource::UserOverride => WireSelectionSource::UserOverride,
         SelectionSource::ConfigPin => WireSelectionSource::ConfigPin,
         SelectionSource::AutoAccept => WireSelectionSource::AutoAccept,
+        SelectionSource::StepDown => WireSelectionSource::StepDown,
     }
 }
 
@@ -1627,7 +1628,49 @@ impl ModelConsentGate {
                     }
                     DutyOutcome::Fail { reason } => {
                         loader.abandon(model_name);
-                        reason
+                        match self.step_down_target(model_name, selection.source) {
+                            StepDown::To(next) => {
+                                // BR-8's other half (REQ-544 auto-step-down,
+                                // BUG-219): a duty the largest model misses is
+                                // not a verdict on the tier. The step is
+                                // announced with the measurement that caused
+                                // it, then the smaller model goes through the
+                                // one install path — recorded, downloaded if
+                                // it is not already on disk, verified, loaded
+                                // and benchmarked in its turn — so it can step
+                                // down again or reach `ready` honestly.
+                                //
+                                // Boxed because this is the recursion:
+                                // `commit` → `run_install` →
+                                // `report_install_success` → here.
+                                self.events.publish(
+                                    None,
+                                    Event::ModelLifecycle(ModelLifecycle {
+                                        model_id: model_name.to_owned(),
+                                        stage: ModelLifecycleStage::SteppedDown {
+                                            from_model: model_name.to_owned(),
+                                            to_model: next.name.clone(),
+                                            reason,
+                                        },
+                                    }),
+                                );
+                                return Box::pin(self.commit(
+                                    &next,
+                                    SelectionSource::StepDown,
+                                    None,
+                                ))
+                                .await;
+                            }
+                            StepDown::Pinned => format!(
+                                "{reason}; the selection is a user override, so the tier \
+                                 was not stepped down — `teton model set <name>` picks a \
+                                 smaller model"
+                            ),
+                            StepDown::Exhausted => format!(
+                                "{reason}; no smaller catalog model fits this machine, so \
+                                 the local tier is disabled"
+                            ),
+                        }
                     }
                 }
             }
@@ -1660,6 +1703,28 @@ impl ModelConsentGate {
     ///
     /// AC-10's "clear network error": the reason is the [`InstallError`]'s own
     /// actionable message, which names no path and no URL (BR-11).
+    /// Where the tier goes after `model_name` missed the BR-8 duty.
+    ///
+    /// A probe pick, an auto-accept, or an earlier step-down is the daemon's
+    /// choice of model, and the daemon may revise it: the user consented to
+    /// *a* local tier, and REQ-544 promised the next smaller model when the
+    /// benchmark fails. A user override is the user's choice, and REQ-544
+    /// BR-9's "a user pin always overrides" cuts both ways — the daemon does
+    /// not quietly swap out a model someone named, it reports the duty and
+    /// names the command that picks another. `ConfigPin` is retained for wire
+    /// compatibility only (no daemon records it any more) and is read as a pin.
+    fn step_down_target(&self, model_name: &str, source: SelectionSource) -> StepDown {
+        match source {
+            SelectionSource::UserOverride | SelectionSource::ConfigPin => StepDown::Pinned,
+            SelectionSource::Probe | SelectionSource::AutoAccept | SelectionSource::StepDown => {
+                match self.catalog.step_down_from(model_name, &self.profile) {
+                    Some(next) => StepDown::To(next.clone()),
+                    None => StepDown::Exhausted,
+                }
+            }
+        }
+    }
+
     fn report_install_failure(&self, entry: &ModelEntry, error: InstallError) -> ConsentOutcome {
         self.events.publish(
             None,
@@ -1749,6 +1814,16 @@ fn report_persist_failure(what: &str, err: &SelectionStoreError) {
 }
 
 /// The probe's own sentence for a machine with no usable local tier.
+/// The answer to [`ModelConsentGate::step_down_target`].
+enum StepDown {
+    /// Step down to this catalog entry.
+    To(ModelEntry),
+    /// The selection is the user's, not the daemon's to revise.
+    Pinned,
+    /// Nothing smaller fits this machine.
+    Exhausted,
+}
+
 fn disabled_reason(decision: &TierDecision) -> String {
     match decision {
         TierDecision::Disabled { reason } => reason.clone(),
