@@ -26,18 +26,31 @@
 //! as a segment separator. A splitter that saw them second would classify `2>`
 //! as a verb and `1` as the next segment's, so [`strip_null_redirects`] runs
 //! **before** both the unmodelled scan and the split (ADR-620-2, BR-1), over
-//! whitespace-delimited words only. A form glued to its verb (`ls>/dev/null`)
-//! or to a following separator's tail (`2>&1;ls`) is *not* lifted: it stays a
-//! word this module does not recognise, the unmodelled scan sees its `>`, and
-//! the command is `Unknown` exactly as it was before REQ-620. Every miss lands
-//! on the old answer, which is the module-level rule
-//! [`super::shell_provenance`] opens with.
+//! whitespace-delimited words only. A form glued to its **verb**
+//! (`ls>/dev/null`) is *not* lifted: it stays a word this module does not
+//! recognise, the unmodelled scan sees its `>`, and the command is `Unknown`
+//! exactly as it was before REQ-620. Every miss lands on the old answer, which
+//! is the module-level rule [`super::shell_provenance`] opens with.
 //!
-//! The one shape that is peeled is a **trailing run of separator characters**
-//! (`;`, `&`, `|`), because a model writes `ls 2>&1; echo` far more often than
-//! it writes `ls 2>&1 ; echo` and the peel is decidable without lexing: the
-//! head has to parse as a redirect on its own or nothing is peeled at all, and
-//! the tail is re-emitted as its own word so the splitter still sees it.
+//! The one shape that **is** peeled is a redirect glued to a following
+//! **separator** — `ls 2>&1; echo`, `ls 2>&1|head`, `ls 2>&1;ls` — because a
+//! model writes those far more often than the spaced spelling and the peel is
+//! decidable without lexing: the head has to parse as a redirect *in its
+//! entirety* or nothing is peeled at all, and the tail is re-emitted as its own
+//! word so the splitter still sees it ([`split_glued_redirect`]). The spaced
+//! form is stricter still — the operator word must be bare, so `>|`, `2>&` and
+//! `2>;` never lift a following `/dev/null`; peeling a separator off a head
+//! that does not parse on its own would invent a separator `sh` never saw.
+//!
+//! # `&>/dev/null` lifts to a `&` (Phase-5 verify, C2)
+//!
+//! [`NullRedirect::BothStreams`] is the one form whose residue is not empty.
+//! `&>` is bash; the executor is `sh -c`, and `dash` — `/bin/sh` on the Linux
+//! CI leg — reads the `&` as a command separator. Lifting the word whole made
+//! `ls &>/dev/null grep -r SECRET . 1>&2` a single segment whose verb is `ls`,
+//! and the `grep -r` was never verb-checked. Re-emitting the separator
+//! reproduces `dash`'s parse and is strictly more conservative than `bash`'s.
+//! See [`NullRedirect::residue_separator`].
 //!
 //! # `/dev/null` is consumed here and never travels
 //!
@@ -50,19 +63,20 @@
 //!
 //! # Mutation record (conventions.md — show the test can fail)
 //!
-//! Four mutations, run against `cargo test -p tetond --lib` and reverted. The
+//! Six mutations, run against `cargo test -p tetond --lib` and reverted. The
 //! counts are the finding (LESSON-640); the reds outside this module are named
 //! because a recogniser whose only guard is its own unit table is a recogniser
 //! nothing downstream is holding to anything.
 //!
-//! **Re-measured 2026-09-09 at TASK-405**, which is the last task to add tests
-//! to this rule (conventions.md: the count is owned by that task). Two of the
-//! four moved, and both moves are *coverage arriving*, not behaviour changing:
-//! TASK-404's piped-reader test and TASK-405's syntax-class test each caught a
-//! mutation the record was written before.
+//! **Re-measured 2026-09-09 at REQ-620's Phase-5 verify**, which rewrote
+//! [`strip_line`] for C2 and M1 — conventions.md/LESSON-598 require every
+//! recorded mutation to be re-run after a change to program structure, not
+//! re-read. Three of the four earlier counts moved and all three moves are
+//! *coverage arriving* rather than behaviour changing: the C2 test is new, and
+//! it spells a command mutations 1–3 each disturb.
 //!
 //! 1. **[`strip_null_redirects`] made a no-op** (return the command unchanged,
-//!    `lifted: 0`) — **8 red** (was 7 at TASK-403):
+//!    `lifted: 0`) — **9 red** (was 8 at TASK-405):
 //!    [`tests::the_strip_lifts_words_and_leaves_the_separators_standing`], and
 //!    in [`super::shell_provenance`]
 //!    `null_redirects_are_lifted_before_the_scan_and_the_split` (first, on the
@@ -70,34 +84,56 @@
 //!    `an_opaque_verb_with_a_null_redirect_is_still_unknown`,
 //!    `a_redirect_never_hides_a_boundary_read`,
 //!    `the_2026_09_09_command_is_rooted_without_its_home_probe`,
-//!    `the_redirect_differential_table` and — new at TASK-404 —
-//!    `a_piped_reader_with_no_path_reads_stdin_not_the_root`, whose
+//!    `the_redirect_differential_table`,
+//!    `a_piped_reader_with_no_path_reads_stdin_not_the_root` (whose
 //!    `ls 2>&1 | head` row stops being a pipeline once the `&` is a separator
-//!    again. Two things stayed green and should have:
-//!    `every_other_redirect_stays_unmodelled`, which asserts the refusal a
-//!    no-op preserves, and `root_gate`'s benign table, which reads
-//!    [`NullRedirect::parse`] directly rather than through the strip.
+//!    again) and — new at the verify —
+//!    `the_both_streams_form_re_emits_the_separator_it_hides`. Two things
+//!    stayed green and should have: `every_other_redirect_stays_unmodelled`,
+//!    which asserts the refusal a no-op preserves, and `root_gate`'s benign
+//!    table, whose rows are all bare or spaced forms the *gate* now reads
+//!    through this same strip.
 //! 2. **The whole-word rule dropped** — [`NullRedirect::from_operator`]
 //!    relaxed to accept any operator ending in `>`, so `ls>/dev/null` lifts —
-//!    **2 red**, unchanged:
-//!    [`tests::the_recogniser_accepts_the_entity_forms_and_nothing_else`] and
-//!    `null_redirects_are_lifted_before_the_scan_and_the_split`.
+//!    **4 red** (was 2):
+//!    [`tests::the_recogniser_accepts_the_entity_forms_and_nothing_else`],
+//!    [`tests::the_strip_lifts_words_and_leaves_the_separators_standing`],
+//!    `null_redirects_are_lifted_before_the_scan_and_the_split` and
+//!    `the_both_streams_form_re_emits_the_separator_it_hides`.
 //! 3. **The recogniser made non-total** — [`strip_line`] lifting any word
-//!    carrying `>` or `<` — **7 red** (was 6 at TASK-403):
+//!    carrying `>` or `<` — **8 red** (was 7):
 //!    [`tests::the_strip_lifts_words_and_leaves_the_separators_standing`],
 //!    `every_other_redirect_stays_unmodelled` (`ls > out.txt` came back
 //!    `Rooted`), `dev_null_is_never_a_path_token`,
 //!    `null_redirects_are_lifted_before_the_scan_and_the_split`,
-//!    `the_redirect_differential_table`, TASK-405's
+//!    `the_redirect_differential_table`,
 //!    `each_unmodelled_class_names_itself_and_nothing_else` (its `ls > ZQX9`
-//!    row is the redirect class, and a lifted `>` leaves nothing to name), and
-//!    — the one that matters most — REQ-614's own
+//!    row is the redirect class, and a lifted `>` leaves nothing to name),
+//!    `the_both_streams_form_re_emits_the_separator_it_hides`, and — the one
+//!    that matters most — REQ-614's own
 //!    `adversarial_spellings_are_all_unknown`, on `cat <src/main.rs`.
 //! 4. **The spaced form's `/dev/null` follower left in place** (drop the
 //!    `words.next()` in [`strip_line`]'s spaced arm) — **4 red**, unchanged,
 //!    and `dev_null_is_never_a_path_token` reds as a `BoundaryTouch` on
 //!    `cat README.md > /dev/null`, which is BR-3's failure mode exactly: the
 //!    device scored as a file access.
+//! 5. **[`NullRedirect::BothStreams`] lifted to nothing** — the `&` dropped
+//!    from [`NullRedirect::residue_separator`], which is the pre-verify
+//!    behaviour C2 fixed — **3 red**:
+//!    [`tests::the_strip_lifts_words_and_leaves_the_separators_standing`] on
+//!    its three `&>` residue rows,
+//!    `null_redirects_are_lifted_before_the_scan_and_the_split`, and
+//!    `the_both_streams_form_re_emits_the_separator_it_hides`, whose
+//!    `ls &>/dev/null grep -r SECRET . 1>&2` comes back one segment and
+//!    `Rooted` on a root holding a `.env`. That last red *is* the privacy
+//!    defect, so the count is small and the row is the finding.
+//! 6. **The spaced arm allowed to peel separators off its head** —
+//!    `parse_spaced(word.trim_end_matches(TRAILING_SEPARATORS), …)`, which is
+//!    the unsound peel M1 removed — **1 red**:
+//!    [`tests::the_strip_lifts_words_and_leaves_the_separators_standing`], on
+//!    `ls >| /dev/null`. One, and that is the whole point of adding those three
+//!    rows: nothing else in the crate spells an operator word that does not
+//!    parse on its own.
 //!
 //! The write gate's own arm was mutated in
 //! [`super::super::root_gate::has_top_level_redirection`]; the record is there.
@@ -210,6 +246,31 @@ impl NullRedirect {
         }
     }
 
+    /// The word this form leaves standing in the residue, if any.
+    ///
+    /// Every form but one lifts to nothing. [`Self::BothStreams`] lifts to a
+    /// bare `&`, and that is a correctness fix rather than a nicety
+    /// (REQ-620 Phase-5 verify, C2): `&>/dev/null` is **bash**, and the
+    /// executor is `sh -c` ([`super::shell::run_bounded`]), which on the Linux
+    /// CI leg is `dash`. `dash` reads the `&` as a command separator and the
+    /// `>/dev/null` as a redirect on the command *before* it, so
+    /// `ls &>/dev/null grep -r SECRET . 1>&2` runs two commands and the second
+    /// is a recursive `grep`. Lifting the word whole made that one segment
+    /// whose verb is `ls`, and the `grep` was never verb-checked at all.
+    ///
+    /// Re-emitting the `&` reproduces `dash`'s parse exactly and is strictly
+    /// more conservative than `bash`'s, where the same text is one command:
+    /// a spurious separator can only ever split a segment into two, and two
+    /// segments are each classified in full. LESSON-494's rule points this way
+    /// — where two shells disagree, the gate takes the reading that grants the
+    /// least reach.
+    const fn residue_separator(self) -> Option<&'static str> {
+        match self {
+            Self::BothStreams => Some("&"),
+            Self::Write | Self::Append | Self::Stdin | Self::Duplicate => None,
+        }
+    }
+
     /// `[n]>&m` — the descriptor duplication, whole word, single digits.
     ///
     /// `>&-` (a close), `2>&11` (two digits) and `>&file` (bash's `>&` word
@@ -275,33 +336,40 @@ fn strip_line(line: &str, lifted: &mut usize) -> String {
     let mut kept: Vec<&str> = Vec::new();
     let mut words = line.split_whitespace().peekable();
     while let Some(word) = words.next() {
-        let (head, tail) = split_trailing_separators(word);
-        if head.is_empty() {
-            // A word that is nothing but separators (`&&`, `;`). It is not a
-            // redirect and it is not peelable; it is the splitter's.
-            kept.push(word);
-            continue;
-        }
-        if NullRedirect::parse(head).is_some() {
+        // 1. The whole word is a redirect.
+        if let Some(form) = NullRedirect::parse(word) {
             *lifted += 1;
-            if !tail.is_empty() {
-                kept.push(tail);
-            }
+            kept.extend(form.residue_separator());
             continue;
         }
-        // The spaced form. The follower is peeled the same way, so
-        // `cat x 2> /dev/null; ls` lifts both words and keeps the `;`.
+        // 2. A redirect glued to a following separator — `2>&1;ls`,
+        //    `2>&1|head`, `&>/dev/null&&ls`. The head has to parse as a
+        //    redirect *in its entirety* and the tail has to begin with a
+        //    separator character, so the peel is decidable without lexing and
+        //    the tail is re-emitted as its own word for the splitter to read.
+        if let Some((form, tail)) = split_glued_redirect(word) {
+            *lifted += 1;
+            kept.extend(form.residue_separator());
+            kept.push(tail);
+            continue;
+        }
+        // 3. The spaced form. The operator word must be **bare** — `>`, `>>`,
+        //    `2>`, `&>`, `<` and nothing else. Peeling a separator run off a
+        //    head that does not parse on its own would invent a separator `sh`
+        //    never saw: `>|`, `2>&` and `2>;` are not operators, and reading
+        //    them as one plus a `|`/`&`/`;` would hand the splitter a pipeline
+        //    the shell would have refused outright.
         let follower = words
             .peek()
             .copied()
-            .map(split_trailing_separators)
-            .filter(|(next_head, _)| NullRedirect::parse_spaced(head, next_head).is_some());
-        if let Some((_, next_tail)) = follower {
+            .map(split_at_first_separator)
+            .and_then(|(target, next_tail)| {
+                NullRedirect::parse_spaced(word, target).map(|form| (form, next_tail))
+            });
+        if let Some((form, next_tail)) = follower {
             words.next();
             *lifted += 2;
-            if !tail.is_empty() {
-                kept.push(tail);
-            }
+            kept.extend(form.residue_separator());
             if !next_tail.is_empty() {
                 kept.push(next_tail);
             }
@@ -312,16 +380,33 @@ fn strip_line(line: &str, lifted: &mut usize) -> String {
     kept.join(" ")
 }
 
-/// Split a word into its head and a trailing run of separator characters.
+/// A word that is a [`NullRedirect`] glued to a trailing run beginning with a
+/// separator character — the head's form and the tail, or `None`.
 ///
-/// The caller lifts only when the head parses as a redirect on its own, so
-/// this can never turn a word the recogniser rejects into one it accepts — it
-/// only lets `2>&1;` be read as the redirect it is followed by the separator
-/// it is followed by. A word that is *all* separators (`&&`, `;`) yields an
-/// empty head, which the caller declines to parse.
-fn split_trailing_separators(word: &str) -> (&str, &str) {
-    let head = word.trim_end_matches(TRAILING_SEPARATORS);
-    (head, &word[head.len()..])
+/// The head must parse **whole**, which is what stops this from turning a word
+/// the recogniser rejects into one it accepts: `ls>/dev/null` has no parsing
+/// prefix followed by a separator and stays exactly where it is (the Deferred
+/// note in the REQ, and mutation 2 below). The longest candidate wins so that
+/// `2>&1` is preferred to any shorter prefix; `2>&11` has no separator after
+/// its parsing prefix and is not peeled at all.
+fn split_glued_redirect(word: &str) -> Option<(NullRedirect, &str)> {
+    (1..word.len())
+        .rev()
+        .filter(|&at| word.is_char_boundary(at))
+        .filter(|&at| word[at..].starts_with(TRAILING_SEPARATORS))
+        .find_map(|at| NullRedirect::parse(&word[..at]).map(|form| (form, &word[at..])))
+}
+
+/// Split a redirect **target** word at its first separator character.
+///
+/// Only ever applied to the spaced form's follower, whose one accepted value
+/// (`/dev/null`) contains no separator character — so the split can only ever
+/// peel a glued tail off the device and never cut the device itself.
+fn split_at_first_separator(word: &str) -> (&str, &str) {
+    match word.find(TRAILING_SEPARATORS) {
+        Some(at) => (&word[..at], &word[at..]),
+        None => (word, ""),
+    }
 }
 
 /// `("2>", …)` → `(Some('2'), ">")`; anything not starting with an ASCII digit
@@ -457,16 +542,35 @@ mod tests {
         for (command, residue, lifted) in [
             ("ls 2>&1 && echo", "ls && echo", 1),
             ("ls 2>&1; ls", "ls ; ls", 1),
-            ("ls &>/dev/null || echo no", "ls || echo no", 1),
+            // C2: `&>` is bash, and `dash` reads the `&` as a separator, so the
+            // separator is re-emitted where the word stood.
+            ("ls &>/dev/null || echo no", "ls & || echo no", 1),
+            (
+                "ls &>/dev/null grep -r SECRET . 1>&2",
+                "ls & grep -r SECRET .",
+                2,
+            ),
+            ("cat x &> /dev/null", "cat x &", 2),
             ("cat x 2> /dev/null", "cat x", 2),
             ("cat x 2> /dev/null; ls", "cat x ; ls", 2),
             ("2>/dev/null cat x", "cat x", 1),
+            // Glued to a following separator: peeled, because the head parses
+            // whole and the tail is re-emitted for the splitter.
+            ("ls 2>&1|head", "ls |head", 1),
+            ("ls 2>&1;ls", "ls ;ls", 1),
+            ("cat x 2> /dev/null;ls", "cat x ;ls", 2),
             ("ls & ls", "ls & ls", 0),
             ("ls > out.txt", "ls > out.txt", 0),
             ("ls 2> out", "ls 2> out", 0),
             ("ls\ncat x", "ls\ncat x", 0),
             ("ls 2>&1\ncat x", "ls\ncat x", 1),
             ("ls</dev/null", "ls</dev/null", 0),
+            // The spaced arm's soundness rows: none of these heads parses as a
+            // redirect on its own, so peeling the separator off them would
+            // invent one the shell never saw.
+            ("ls >| /dev/null", "ls >| /dev/null", 0),
+            ("ls 2>& /dev/null", "ls 2>& /dev/null", 0),
+            ("ls 2>; /dev/null", "ls 2>; /dev/null", 0),
         ] {
             let stripped = strip_null_redirects(command);
             assert_eq!(
@@ -481,15 +585,16 @@ mod tests {
 
         // BR-3, stated as a property over every accepted form: the residue
         // never spells the device, so no later stage can resolve it as a path.
-        for form in [
-            "2>/dev/null",
-            "2>> /dev/null",
-            "&>/dev/null",
-            "</dev/null",
-            "> /dev/null",
+        // `&>` leaves the separator C2 requires and nothing else.
+        for (form, residue) in [
+            ("2>/dev/null", "cat README.md"),
+            ("2>> /dev/null", "cat README.md"),
+            ("&>/dev/null", "cat README.md &"),
+            ("</dev/null", "cat README.md"),
+            ("> /dev/null", "cat README.md"),
         ] {
             let stripped = strip_null_redirects(&format!("cat README.md {form}"));
-            assert_eq!(stripped.residue, "cat README.md");
+            assert_eq!(stripped.residue, residue);
             assert!(
                 !stripped.residue.contains("/dev/"),
                 "`{form}` left the device in the residue"

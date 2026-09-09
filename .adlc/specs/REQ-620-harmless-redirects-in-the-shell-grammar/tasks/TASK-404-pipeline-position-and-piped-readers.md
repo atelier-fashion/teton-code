@@ -18,7 +18,7 @@ argument unless it is recursive `grep` (ADR-620-2 step 3, ADR-620-3).
 
 ## Files to Create/Modify
 
-- `crates/tetond/src/harness/tools/shell_provenance.rs` — `SegmentPosition`, the position-aware splitter, `reads_tree(verb, words)`, the amended root-walk arm, docs and mutation record; tests
+- `crates/tetond/src/harness/tools/shell_provenance.rs` — `SegmentPosition`, the position-aware splitter, `reads_only_its_stdin(verb, words)` (`reads_tree` before REQ-620's Phase-5 verify inverted its polarity), the amended root-walk arm, docs and mutation record; tests
 
 ## Acceptance Criteria
 
@@ -26,14 +26,14 @@ argument unless it is recursive `grep` (ADR-620-2 step 3, ADR-620-3).
 - [ ] Same root: `ls src | grep -r foo`, `ls src | grep -rn foo`, `ls src | grep --recursive foo`, `ls src | grep -d recurse foo` → `Unknown` "reads the root"
 - [ ] Same root: `head -5` alone, and `ls; head -5` → `Unknown` "reads the root" (a `First` segment)
 - [ ] `ls || head -5` treats `head` as `First` (an *or* is not a pipe)
-- [ ] The splitter's mutation record names the test that goes red when `Piped` is returned for every separator, and the one that goes red when `reads_tree` is deleted
+- [ ] The splitter's mutation record names the test that goes red when `Piped` is returned for every separator, and the one that goes red when `reads_only_its_stdin` accepts everything
 
 ## Verification
 
 | rule | kind | artifact | benign_path |
 |------|------|----------|-------------|
 | BR-4 | test-case | `crates/tetond/src/harness/tools/shell_provenance.rs::tests::a_piped_reader_with_no_path_reads_stdin_not_the_root` | yes |
-| BR-4 | test-case | `crates/tetond/src/harness/tools/shell_provenance.rs::tests::recursive_grep_reads_the_tree_whatever_its_stdin` | yes |
+| BR-4 | test-case | `crates/tetond/src/harness/tools/shell_provenance.rs::tests::the_piped_exemption_is_a_closed_allowlist` | yes |
 | AC-5 | test-case | `crates/tetond/src/harness/tools/shell_provenance.rs::tests::a_piped_reader_with_no_path_reads_stdin_not_the_root` | yes |
 
 ## Technical Notes

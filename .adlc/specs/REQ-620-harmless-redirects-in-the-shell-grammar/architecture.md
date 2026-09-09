@@ -84,19 +84,33 @@ lone `&`, still two segments).
 
 **Decision.** In `classify_segment`, the root-walk condition
 `reads_content && (paths.is_empty() || !named_an_existing_file) && !saw_directory` gains
-`&& !(position == Piped && paths.is_empty() && !reads_tree(verb, flags))`, where
-`reads_tree` is true only for `grep`/`egrep`/`fgrep` carrying `-r`, `-R`, `--recursive`,
-`-d recurse`, or a short-flag cluster containing `r` or `R`.
+`&& !(position == Piped && reads_its_default_source && reads_only_its_stdin(verb, flags))`.
+
+**Amended at the Phase-5 verify (2026-09-09), C1 — the polarity is an allowlist.** This
+ADR first specified `reads_tree`, a **denylist** of the recursive `grep` spellings, and
+TASK-404 shipped it. A denylist inside an allowlist grammar is a machine for false
+negatives, and this one had four: `grep --directories recurse`, its `--dir` abbreviation,
+`--dereference-recursive` and `--rec` are all recursion GNU `grep` accepts, none was on
+the list, and each skipped the root walk and returned `rooted` for a command that reads
+every file under the root. The ADR's own claim that the enumerated forms "are the ones GNU
+and BSD `grep` accept" was false as written, and the list could not have been completed by
+adding rows. So the question is inverted: `reads_only_its_stdin` is true only for a closed
+set of **pure filters** (`head`, `tail`, `wc`, `sort`, `uniq`, `cut`, `nl`, `tr`, `md5`,
+`shasum`, `less`, `more`) and for `grep`/`egrep`/`fgrep` when **no** word starts with `--`,
+**no** word is `-d`, and **no** single-`-` cluster carries `r` or `R`. Everything else —
+`sed`, `awk`, `diff`, `cat`, and every `grep` flag not enumerated — keeps the walk.
 
 **Rationale.** A piped `head -5` reads bytes the previous segment produced and the previous
 segment was classified on its own paths; walking the root for it is a walk for a read that
-cannot happen. Recursive grep is the documented exception because `grep -r foo` with stdin
-attached still searches `.`. The walk's budget and skip set stay as they are — the
-requirement's third open question records the `target/` exhaustion as a separate decision.
+cannot happen. Every miss of the allowlist lands on the pre-REQ-620 answer, which is the
+property that makes the widening provable. The walk's budget and skip set stay as they are
+— the requirement's third open question records the `target/` exhaustion as a separate
+decision.
 
 **Consequences.** `head -5` as a first segment still walks the root and still goes
-`unknown` on a root the walk cannot finish. `cat README.md | grep -r foo` walks.
-`ls | grep foo` does not.
+`unknown` on a root the walk cannot finish. `cat README.md | grep -r foo` walks, and so now
+do `ls | grep --color foo`, `ls | sed -r foo` and `ls | cat missing`, each of which
+TASK-404 asserted the other way. `ls | grep foo` and `ls | head -5` do not.
 
 ### ADR-620-4: The reason travels on the provenance value, as an explicit bit
 

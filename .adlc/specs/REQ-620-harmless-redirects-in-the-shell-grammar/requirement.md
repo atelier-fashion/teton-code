@@ -85,10 +85,10 @@ No event carries command text, a path, or output (REQ-619 BR-7, unchanged).
 
 ## Business Rules
 
-- [x] **BR-1: A redirect to `/dev/null` or a descriptor duplication is stripped before the segment is classified, and the rest of the segment is classified exactly as today.** The forms are the `NullRedirect` entity's, and no others: `2>/dev/null`, `>/dev/null`, `1>/dev/null`, `2>>/dev/null`, `&>/dev/null`, `</dev/null`, `2>&1`, `1>&2`, each as one whitespace-delimited word, or as the operator word (`2>`, `>`, `>>`, `&>`, `<`) immediately followed by the separate word `/dev/null`. The stripped segment's verdict is `rooted`, `boundary_touch` or `unknown` by REQ-614 BR-1 unchanged — a redirect never adds reach and never removes it (informed by REQ-614, LESSON-653). **The forms are recognised as whole words before the command is split into segments**: `2>&1` and `&>/dev/null` contain `&`, which the grammar otherwise reads as a segment separator, and a splitter that saw them second would classify `2>` and `1` as verbs. `&&`, `||`, a lone `&`, `;` and `|` remain separators exactly as REQ-614 ADR-614-1 has them (informed by LESSON-494).
+- [x] **BR-1: A redirect to `/dev/null` or a descriptor duplication is stripped before the segment is classified, and the rest of the segment is classified exactly as today.** The forms are the `NullRedirect` entity's, and no others: `2>/dev/null`, `>/dev/null`, `1>/dev/null`, `2>>/dev/null`, `&>/dev/null`, `</dev/null`, `2>&1`, `1>&2`, each as one whitespace-delimited word, or as the operator word (`2>`, `>`, `>>`, `&>`, `<`) immediately followed by the separate word `/dev/null`. The stripped segment's verdict is `rooted`, `boundary_touch` or `unknown` by REQ-614 BR-1 unchanged — a redirect never adds reach and never removes it (informed by REQ-614, LESSON-653). **The forms are recognised as whole words before the command is split into segments**: `2>&1` and `&>/dev/null` contain `&`, which the grammar otherwise reads as a segment separator, and a splitter that saw them second would classify `2>` and `1` as verbs. `&&`, `||`, a lone `&`, `;` and `|` remain separators exactly as REQ-614 ADR-614-1 has them (informed by LESSON-494). **`&>/dev/null` lifts to a bare `&`, not to nothing** (added at the Phase-5 verify, C2): `&>` is bash, the executor is `sh -c`, and `dash` — `/bin/sh` on the Linux CI leg — reads that `&` as a command separator, so re-emitting it reproduces the parse of the shell that grants the *least* reach and is strictly more conservative than bash's.
 - [x] **BR-2: Every other use of `>` or `<` stays unmodelled.** `> out.txt`, `>> log`, `< input`, `2>/dev/nul`, `2>/dev/null/x`, `2>/dev/nullx`, `2>$f`, `> "$f"`, a here-doc, and process substitution all refuse the whole command as `unknown`, as REQ-614 left them. Widening beyond `/dev/null` and descriptor duplication is a separate requirement (informed by REQ-614, LESSON-494).
 - [x] **BR-3: `/dev/null` in a stripped redirect is not a path token.** It never reaches path resolution, never counts as an out-of-root touch, and never matches a boundary glob — the same seam LESSON-623 named: a path that is not a file access must not be scored as one (informed by LESSON-623, REQ-571).
-- [x] **BR-4: A content-reading verb in a `piped` segment that names no existing file reads its stdin, not the root.** A segment is `piped` only when the separator before it is `|`; after `;`, `&&`, `||` or `&` its stdin is the terminal's and it is `first`. `ls src | head -5`, `git log | wc -l`, `cat README.md | grep foo` classify the piped segment as reading the previous segment's output, which was itself classified, so no root walk runs. The exception is recursive `grep` (`-r`, `-R`, `--recursive`, `-d recurse`, or any short-flag cluster containing `r`/`R`), which reads the current directory whatever its stdin is and keeps today's root-walk rule. A `first` segment is unchanged: it reads the root (REQ-614 BR-1). **"No path argument" means "names no existing file"** (reworded at TASK-404 to match what shipped): the exemption is expressed over BR-1(d)'s own question — *was this verb handed explicit files?* — because a **pattern word is not a path**. `git log | grep fix` and `cat README.md | grep foo` name a pattern, and the second is listed above among the shapes that read their stdin; a file argument that does not **exist** is the same case (`ls | cat missing`), since the classifier cannot tell `cat missing` from a pattern and BR-1(d) already scores the two alike. A piped verb that *did* name an existing file never reaches the walk at all.
+- [x] **BR-4: A content-reading verb in a `piped` segment that names no existing file reads its stdin, not the root.** A segment is `piped` only when the separator before it is `|`; after `;`, `&&`, `||` or `&` its stdin is the terminal's and it is `first`. `ls src | head -5`, `git log | wc -l`, `cat README.md | grep foo` classify the piped segment as reading the previous segment's output, which was itself classified, so no root walk runs. **The exemption is a closed allowlist** (reworded at the Phase-5 verify, C1; it was first stated as a denylist of the recursive `grep` spellings, and `grep --directories recurse`, `--dir recurse`, `--dereference-recursive` and `--rec` all fell through it): it is granted only to the pure filters `head`, `tail`, `wc`, `sort`, `uniq`, `cut`, `nl`, `tr`, `md5`, `shasum`, `less`, `more`, and to `grep`/`egrep`/`fgrep` when no word starts with `--`, no word is `-d`, and no single-`-` cluster carries `r` or `R`. Every other content verb — `sed` and `awk` (whose `-f` takes a script that can open any path), `diff`, `cat` — and every unenumerated `grep` flag keeps today's root-walk rule. A `first` segment is unchanged: it reads the root (REQ-614 BR-1). **"No path argument" means "names no existing file"** (reworded at TASK-404 to match what shipped): the exemption is expressed over BR-1(d)'s own question — *was this verb handed explicit files?* — because a **pattern word is not a path**. `git log | grep fix` and `cat README.md | grep foo` name a pattern, and the second is listed above among the shapes that read their stdin; a file argument that does not **exist** is the same case *for a verb on the allowlist* (`ls | grep missing`), since the classifier cannot tell it from a pattern and BR-1(d) already scores the two alike. `ls | cat missing` is **not** that case and walks: `cat`'s operand is a path and never a pattern, so a `cat` whose file does not exist is a typo the walk should still account for. A piped verb that *did* name an existing file never reaches the walk at all.
 - [x] **BR-5: A `first` or `piped` segment whose verb is opaque is `unknown` regardless of any redirect.** `python x.py 2>/dev/null` and `curl … >/dev/null 2>&1` pin exactly as before. **The order is the reverse of what this rule first stated, and every observable is unchanged** (reworded at TASK-403 to match ADR-620-2): the strip in BR-1 runs **first** — before the unmodelled scan and before the split, therefore before any verb is read — because the scan refuses on `>` and the splitter reads the `&` in `2>&1` as a separator, so a strip that ran second could not work at all. It cannot change the verb the opaque check reads: it lifts only whole whitespace-delimited words that are redirects in their entirety, and a redirect word is never a verb, so the first non-redirect word of each segment is the same word `sh` would take as the command (which is also why a *leading* redirect, `2>/dev/null cat secrets/prod.env`, still classifies on `cat` — AC-3). The opaque-verb verdict, its reason, and the boundary precedence of BUG-216 are what they were.
 - [x] **BR-6: The `unknown` reason names the syntax class, and only the class.** One content-free sentence per `UnmodelledSyntax.class` ("the command uses a quoted string this classifier does not model", "…a redirect other than to /dev/null…", "…a glob…"), carried on `skill_invoked.reach_reason`, on the `session_pinned` event, and rendered in the CLI's pin notice. The sentence contains no byte of the command (REQ-619 BR-7; egress-capture posture of LESSON-624).
 - [x] **BR-7: The `shell` tool's description states the grammar to the model.** One paragraph the model receives with the tool: commands stay in reach when they use recognised verbs on paths inside the session root; a redirect to `/dev/null` and `2>&1` are fine; quotes, other redirects, globs, `$`, `~/` paths, interpreters and network clients, and an unrecognised verb pin the rest of the session to the local tier; a pin is announced and only the user can lift it. The paragraph is one constant the description and its test both read (informed by BUG-214's Fix B, REQ-619 BR-6).
@@ -137,7 +137,7 @@ No event carries command text, a path, or output (REQ-619 BR-7, unchanged).
 
 ## Deferred
 
-Three things this REQ knowingly did not do. None is a gap in what it claims;
+Four things this REQ knowingly did not do. None is a gap in what it claims;
 each is recorded so the next reader does not rediscover it as a defect.
 
 - **A *typed* `/skill` pin carries no syntax class — BUG-223 (open, low).**
@@ -152,14 +152,32 @@ each is recorded so the next reader does not rediscover it as a defect.
   the `User` variant threaded through the three seams REQ-619 ADR-619-3 pins,
   each needing its own test; the `CtxProvenance::User` arm in
   `crates/tetond/src/harness/completion.rs` says so in a comment at the seam.
-- **A glued redirect stays `unknown`, by design.** The recogniser is
-  whole-word: `ls>/dev/null` (glued to its verb) and `2>&1;ls` (glued to a
-  following command) are words it does not accept, so the unmodelled scan sees
-  their `>` and refuses the command exactly as before REQ-620. A *trailing* run
-  of separator characters **is** peeled (`ls 2>&1; echo` works), because that
-  peel is decidable without lexing. Every miss lands on the old answer, which
+- **A redirect glued to its *verb* stays `unknown`, by design.**
+  `ls>/dev/null` is a word the recogniser does not accept, so the unmodelled
+  scan sees its `>` and refuses the command exactly as before REQ-620. A
+  redirect glued to a following **separator** *is* peeled (`ls 2>&1; echo`,
+  `ls 2>&1;ls`, `ls 2>&1|head`), because that peel is decidable without lexing:
+  the head has to parse as a redirect in its entirety and the tail has to begin
+  with a separator character, and the tail is re-emitted as its own word so the
+  splitter still sees it. *(Widened at the Phase-5 verify, M1: the peel took a
+  trailing **run** of separators only, so `2>&1|head` was not peeled and the
+  write gate — which now wraps the same recogniser — refused `cmd 2>&1|head`
+  at a home root, which the pre-REQ-620 gate allowed.)* The spaced form is
+  stricter still: the operator word must be bare, so `>|`, `2>&` and `2>;`
+  never lift a following `/dev/null`. Every miss lands on the old answer, which
   is the property that keeps BR-1's widening provable; relaxing the whole-word
-  rule is what mutation 2 in `shell_syntax.rs`'s record shows going red.
+  rule is what mutation 2 in `shell_syntax.rs`'s record shows going red, and
+  relaxing the spaced arm is mutation 6.
+- **`awk -f FILE` and `sed -f FILE` stay `rooted` where their script file
+  exists — a follow-up, not a REQ-620 regression.** Both read a *program* from
+  that file, and a program can open any path on the machine; the classifier
+  scores the `-f` operand as an ordinary existing file and asks nothing about
+  what it says. This is pre-existing REQ-614 behaviour, unchanged by anything
+  here (REQ-620's C1 only stops `sed`/`awk` from taking the **piped** stdin
+  exemption). Closing it means either treating an interpreter's script operand
+  as opaque — which is BR-1(e)'s reading one argument further in — or moving
+  `sed` and `awk` to `OPAQUE`, and both are widenings of the *denylist* that
+  want their own requirement and their own benign table.
 - **AC-1's literal command is discharged at the unit level.** TASK-403's
   `shell_provenance::tests::the_2026_09_09_command_is_rooted_without_its_home_probe`
   asserts both halves against fixture roots the module mints; TASK-407 records

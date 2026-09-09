@@ -131,11 +131,17 @@
 //! verdict and wrong for a position — an *or* is not a pipe.
 //!
 //! [`classify_segment`] takes the position and, for a `Piped` segment reading
-//! its default source, skips the root walk. The one exception is
-//! [`reads_tree`]: `grep -r foo` searches `.` recursively whatever is on its
-//! stdin, so recursive `grep` keeps the walk. The exception is verb-scoped on
-//! purpose — a rule that read "any verb carrying `-r`" would catch `sed -r`
-//! (extended regexes) and `cp -r`, neither of which is this verb's `-r`.
+//! its default source, skips the root walk — but only when the verb is on
+//! [`reads_only_its_stdin`]'s **allowlist**. That polarity is the whole of the
+//! rule. It shipped at TASK-404 as a denylist of the recursive `grep`
+//! spellings, and a denylist inside an allowlist grammar is a machine for
+//! false negatives: `ls | grep --directories recurse SECRET`, `--dir recurse`,
+//! `--dereference-recursive` and `--rec` are all recursion GNU `grep` accepts,
+//! none of them was on the list, and each came back `Rooted` for a command
+//! that reads every file under the root. The exemption is now granted to a
+//! closed set of pure filters (`head`, `wc`, `sort`, …) plus `grep` when every
+//! word of the segment is a short flag that cannot be recursion; `sed`, `awk`,
+//! `diff`, `cat` and every unrecognised `grep` flag keep the walk.
 //!
 //! The widening does not touch the walk, its budget or its skip set, and it
 //! does not reach a `First` segment: `head -5` alone and `ls; head -5` still
@@ -199,11 +205,11 @@
 //! [`tests::a_truncated_scan_is_unknown_never_rooted`] red — two, because the
 //! default budget also stops the starved-scan fixture from truncating.
 //!
-//! REQ-620's strip was mutated four ways and the counts live with the
+//! REQ-620's strip was mutated six ways and the counts live with the
 //! recogniser ([`super::shell_syntax`]'s module docs), because that is the
 //! module that owns the rule. Two results belong here. Making
-//! [`super::shell_syntax::strip_null_redirects`] a no-op reds **six** tests in
-//! this module and leaves [`tests::every_other_redirect_stays_unmodelled`]
+//! [`super::shell_syntax::strip_null_redirects`] a no-op reds **eight** tests
+//! in this module and leaves [`tests::every_other_redirect_stays_unmodelled`]
 //! green — correctly, since a no-op preserves exactly the refusal that test
 //! asserts, and a widening that broke BR-2 would have to be a different
 //! mutation. That different mutation is the third: lifting any word carrying
@@ -211,6 +217,14 @@
 //! [`tests::adversarial_spellings_are_all_unknown`], on `cat <src/main.rs`.
 //! One widening, both suites — which is the evidence that the REQ-614 grammar
 //! is still the thing being widened rather than replaced.
+//!
+//! Making [`reads_only_its_stdin`] answer `true` unconditionally — the
+//! allowlist accepting everything, which is the polarity C1 inverted — turns
+//! **exactly one** test red: [`tests::the_piped_exemption_is_a_closed_allowlist`],
+//! on all sixteen of its must-fire rows. One, because that table is the only
+//! place the piped exemption's *boundary* is asserted;
+//! [`tests::a_piped_reader_with_no_path_reads_stdin_not_the_root`] asserts the
+//! exemption fires and a mutation that widens it cannot move that.
 
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
@@ -900,35 +914,68 @@ fn split_segments(command: &str) -> Vec<(SegmentPosition, &str)> {
     segments
 }
 
-/// Whether this verb reads the directory tree **whatever is on its stdin** —
-/// the one exception BR-4 carves out of the piped-reader rule.
+/// The verbs whose **only** input, when they were handed no existing file, is
+/// their stdin — the closed allowlist BR-4's piped exemption is drawn over.
 ///
-/// `grep -r foo` with a pipe attached still searches `.` recursively; the flag
-/// overrides the default source rather than filtering it. Nothing else in
-/// [`READS_CONTENT`] behaves that way, so the rule is scoped to `grep` and its
-/// two aliases by name. Reading it as "any verb carrying `-r`" would catch
-/// `sed -r` (extended regular expressions) and turn a widening into a
-/// tightening for a flag that means something else entirely.
+/// Every entry is also in [`READS_CONTENT`] (asserted by
+/// [`tests::the_piped_allowlist_is_a_subset_of_the_content_verbs`]): the
+/// exemption can only ever remove the root walk from a verb that would
+/// otherwise have taken it. What is *not* here is the point — `sed` and `awk`
+/// take a `-f script` that can open any path, `diff` needs two operands, and
+/// `cat` names paths rather than patterns, so a `cat` whose file does not exist
+/// is a typo the walk should still account for. All four keep the walk.
+const PIPED_STDIN_ONLY: &[&str] = &[
+    "head", "tail", "wc", "sort", "uniq", "cut", "nl", "tr", "md5", "shasum", "less", "more",
+];
+
+/// Whether a `Piped` segment's verb reads **nothing but its stdin** — the
+/// condition BR-4's exemption is granted on.
 ///
-/// The forms are the ones GNU and BSD `grep` accept: the long `--recursive`,
-/// the `-d recurse` pair, and any **short-flag cluster** carrying `r` or `R` —
-/// `-r`, `-R`, `-rn`, `-nR`. A cluster is a word starting with a single `-`;
-/// the `--` test is load-bearing, because `--color` carries an `r` and is not
-/// recursion.
-fn reads_tree(verb: &str, rest: &[&str]) -> bool {
+/// # The polarity is an allowlist, and that is the whole safety argument
+///
+/// This function used to be `reads_tree`, a **denylist** of the recursive
+/// `grep` spellings, inside a module whose opening paragraph says an allowlist
+/// is the only shape a reach grammar may take. It was the leak that shape
+/// exists to prevent: `ls | grep --directories recurse SECRET`,
+/// `--dir recurse`, `--dereference-recursive` and `--rec` are all spellings GNU
+/// `grep` accepts for recursion, none of them was in the denylist, and each
+/// skipped the root walk and came back `Rooted` for a command that reads every
+/// file under the root. (The doc comment claimed "the forms are the ones GNU
+/// and BSD `grep` accept"; GNU `grep` accepts `--directories=recurse`,
+/// `--dereference-recursive`, and any unambiguous abbreviation of a long
+/// option, so the claim was false as written and the denylist could not have
+/// been completed by adding rows.)
+///
+/// So the question is inverted. The exemption is granted only to
+/// [`PIPED_STDIN_ONLY`], plus `grep` and its two aliases when **every** word of
+/// the segment is one of the short flags that cannot mean recursion:
+///
+/// * no word starts with `--` — every long option is unrecognised, including
+///   the ones nobody has thought of;
+/// * no word is `-d` — `-d recurse` is the `--directories` pair;
+/// * no single-`-` cluster carries `r` or `R` — `-r`, `-R`, `-rn`, `-nR`.
+///
+/// Every other content verb, and every `grep` flag this list does not
+/// enumerate, keeps the root walk. A miss is therefore the pre-REQ-620 answer
+/// (`Unknown` on a root the walk cannot clear), which is the module's standing
+/// rule: the classifier may only be more permissive than the old daemon by an
+/// amount it can prove.
+fn reads_only_its_stdin(verb: &str, rest: &[&str]) -> bool {
+    if PIPED_STDIN_ONLY.contains(&verb) {
+        return true;
+    }
     if !matches!(verb, "grep" | "egrep" | "fgrep") {
         return false;
     }
-    rest.iter().enumerate().any(|(i, word)| {
-        if *word == "--recursive" {
-            return true;
+    rest.iter().all(|word| {
+        if word.starts_with("--") || *word == "-d" {
+            return false;
         }
-        if *word == "-d" {
-            return rest.get(i + 1).is_some_and(|next| *next == "recurse");
+        match word.strip_prefix('-') {
+            Some(flags) => !flags.chars().any(|c| c == 'r' || c == 'R'),
+            // A pattern, or any other operand: not a flag, so not recursion.
+            None => true,
         }
-        word.strip_prefix('-').is_some_and(|flags| {
-            !flags.starts_with('-') && flags.chars().any(|c| c == 'r' || c == 'R')
-        })
     })
 }
 
@@ -1192,8 +1239,9 @@ fn classify_segment(
     // REQ-620 BR-4 / ADR-620-3. For a `Piped` segment that default source is
     // the previous segment's stdout — bytes the previous segment was already
     // classified on — so the root walk below is a walk for a read that cannot
-    // happen. `reads_tree` is the one exception: recursive `grep` searches `.`
-    // whatever its stdin, so it keeps the walk.
+    // happen. `reads_only_its_stdin` is the allowlist that grants the
+    // exemption: everything it does not name — `sed`, `awk`, `diff`, `cat`, and
+    // every `grep` flag that could be recursion — keeps the walk.
     //
     // The exemption is expressed over the same "was it given explicit files"
     // question BR-1(d) asks, because that is what BR-4's "no path argument"
@@ -1202,8 +1250,9 @@ fn classify_segment(
     // lists both as reading their stdin. A segment that *did* name an existing
     // file never reaches this line anyway — it was given files, and they are in
     // `sources`.
-    let reads_stdin_not_the_root =
-        position == SegmentPosition::Piped && reads_its_default_source && !reads_tree(verb, &rest);
+    let reads_stdin_not_the_root = position == SegmentPosition::Piped
+        && reads_its_default_source
+        && reads_only_its_stdin(verb, &rest);
 
     if reads_content
         && reads_its_default_source
@@ -2630,7 +2679,9 @@ mod tests {
         // The lift itself: whole words out, separators standing.
         for (command, residue, lifted) in [
             ("ls 2>&1 && echo ok", "ls && echo ok", 1),
-            ("ls &>/dev/null || echo no", "ls || echo no", 1),
+            // C2: `&>` lifts to a bare `&`, which is what `dash` — `/bin/sh` on
+            // the Linux CI leg — reads the word's own `&` as.
+            ("ls &>/dev/null || echo no", "ls & || echo no", 1),
             ("ls 2>&1; ls", "ls ; ls", 1),
             ("ls 2>&1 | head", "ls | head", 1),
             ("cat x 2> /dev/null", "cat x", 2),
@@ -2679,6 +2730,55 @@ mod tests {
         assert_eq!(
             before.kind, after.kind,
             "the redirect's filesystem effect must not reach the verdict"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **Phase-5 verify, C2: `&>` is bash, and the executor's `sh` may be
+    /// `dash`.**
+    ///
+    /// `dash` is `/bin/sh` on the Linux CI leg, and it reads the `&` of
+    /// `&>/dev/null` as a command separator with the `>/dev/null` attached to
+    /// the command before it. So
+    /// `ls &>/dev/null grep -r SECRET . 1>&2` is **two** commands there, and
+    /// the second is a recursive `grep` over the session root. Lifting the word
+    /// whole made the residue a single segment whose verb was `ls`; the `grep`
+    /// arrived as an argument, met no verb check, and the command came back
+    /// `Rooted` on a root holding a `.env`.
+    ///
+    /// Re-emitting the separator reproduces `dash`'s parse. It is also strictly
+    /// more conservative than `bash`'s, where the same text is one command: a
+    /// separator can only ever split a segment in two, and both halves are
+    /// classified in full.
+    ///
+    /// **Mutation (run, red, reverted):** drop the [`NullRedirect::BothStreams`]
+    /// arm from `NullRedirect::residue_separator` so the form lifts to nothing
+    /// again — this test reds on both assertions, and
+    /// `shell_syntax::tests::the_strip_lifts_words_and_leaves_the_separators_standing`
+    /// reds on its three `&>` residue rows.
+    #[test]
+    fn the_both_streams_form_re_emits_the_separator_it_hides() {
+        let root = piped_root("both-streams");
+        const COMMAND: &str = "ls &>/dev/null grep -r SECRET . 1>&2";
+
+        let residue = strip_null_redirects(COMMAND).residue;
+        let segments: Vec<&str> = split_segments(&residue)
+            .into_iter()
+            .map(|(_, segment)| segment.trim())
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        assert_eq!(
+            segments,
+            vec!["ls", "grep -r SECRET ."],
+            "`&>` must leave the separator `dash` reads it as"
+        );
+
+        let v = verdict(&root, COMMAND);
+        assert_eq!(
+            v.kind,
+            VerdictKind::Unknown,
+            "the second command is a recursive grep over a root holding a .env ({})",
+            v.reason
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -3306,45 +3406,69 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **BR-4's exception: recursive `grep` reads the tree whatever its stdin.**
+    /// **BR-4's exemption is a closed allowlist, and everything off it walks.**
     ///
-    /// `grep -r foo` with a pipe attached still searches `.` recursively — the
-    /// flag replaces the default source rather than filtering it — so it keeps
-    /// the root walk and this fixture's `.env` refuses it. Without this arm
-    /// `ls | grep -r foo` would return `Rooted` for a command that reads every
-    /// file under the root, which is the leak the `named_an_existing_file` rule
-    /// was written to close, re-opened one position along.
+    /// *(Phase-5 verify, C1. This test shipped at TASK-404 as
+    /// `recursive_grep_reads_the_tree_whatever_its_stdin`, asserting a
+    /// **denylist** of the recursive `grep` spellings. The first four must-fire
+    /// rows below are the spellings that denylist missed: GNU `grep` accepts
+    /// `--directories recurse`, its `--dir` abbreviation,
+    /// `--dereference-recursive`, and `--rec` for `--recursive`, and each of
+    /// them came back `Rooted` for a command that reads every file under a root
+    /// holding a `.env`. A denylist inside an allowlist grammar cannot be
+    /// completed by adding rows, so the question was inverted.)*
     ///
-    /// The must-not-fire rows are three separate claims (LESSON-440): a short
-    /// cluster without `r` is not recursion; `--color` carries an `r` and is a
-    /// long flag, which is what the single-`-` test exists for; `-d skip` is the
-    /// same flag as `-d recurse` and the opposite answer. The last row is the
-    /// verb scope — `sed -r` is an extended-regex flag, and a rule reading "any
-    /// verb carrying `-r`" would pin it.
+    /// The must-not-fire half is the load-bearing half (LESSON-440): the
+    /// exemption still has to fire, or BR-4 is not implemented at all. `-i`,
+    /// `-c` and `-n` are the short flags that cannot mean recursion, and
+    /// `head`/`wc`/`sort` are the pure filters the allowlist names directly.
     ///
-    /// **Mutation (run, red, reverted):** make [`reads_tree`] return `false`
-    /// unconditionally — this reds here, on `ls src | grep -r foo` coming back
-    /// `Rooted`, and nothing else in the crate's library tests.
+    /// The last two rows of the must-fire table are the tightenings the
+    /// inversion buys and TASK-404 asserted the other way: `--color` is a long
+    /// option this grammar does not enumerate, and `sed` is not a filter — its
+    /// `-f` takes a script that can open any path. Both now walk, which is the
+    /// pre-REQ-620 answer for both.
+    ///
+    /// **Mutation (run, red, reverted):** make [`reads_only_its_stdin`] return
+    /// `true` unconditionally — the allowlist accepts everything — and every
+    /// must-fire row here reds, alongside `an_unrecognised_verb_is_unknown…`'s
+    /// neighbour rows staying green. Counts are in the module docs.
     #[test]
-    fn recursive_grep_reads_the_tree_whatever_its_stdin() {
-        let root = piped_root("recursive-grep");
+    fn the_piped_exemption_is_a_closed_allowlist() {
+        let root = piped_root("piped-allowlist");
 
         for command in [
+            // The four spellings the denylist missed (C1).
+            "ls src | grep --directories recurse foo",
+            "ls src | grep --dir recurse foo",
+            "ls src | grep --dereference-recursive foo",
+            "ls src | grep --rec foo",
+            // The spellings it did carry.
+            "ls src | grep -d recurse foo",
             "ls src | grep -r foo",
             "ls src | grep -rn foo",
             "ls src | grep -nR foo",
             "ls src | grep --recursive foo",
-            "ls src | grep -d recurse foo",
             "ls src | egrep -R foo",
             "ls src | fgrep -r foo",
+            // The tightenings: an unenumerated long option, and a verb that is
+            // not a filter.
+            "ls src | grep --color foo",
+            "ls src | grep -d skip foo",
+            "ls src | sed -r foo",
+            "ls src | awk -f prog",
+            "ls src | cat missing",
         ] {
             let v = verdict(&root, command);
             assert_eq!(
                 v.kind,
                 VerdictKind::Unknown,
-                "`{command}` searches the tree whatever is on its stdin ({})",
+                "`{command}` is off the allowlist and keeps the root walk ({})",
                 v.reason
             );
+            // Not merely `Unknown`: `Unknown` **by the walk**. A row refused by
+            // the unmodelled scan or by an unrecognised verb would pass this
+            // table while saying nothing about the allowlist.
             assert_eq!(
                 v.reason, READS_THE_ROOT_REASON,
                 "`{command}` should be refused by the root walk"
@@ -3352,11 +3476,12 @@ mod tests {
         }
 
         for command in [
-            "ls src | grep -n foo",
             "ls src | grep -i foo",
-            "ls src | grep --color foo",
-            "ls src | grep -d skip foo",
-            "ls src | sed -r foo",
+            "ls src | grep -c foo",
+            "ls src | grep -n foo",
+            "ls src | head -5",
+            "ls src | wc -l",
+            "ls src | sort",
         ] {
             let v = verdict(&root, command);
             assert_eq!(
@@ -3367,14 +3492,46 @@ mod tests {
             );
         }
 
-        // The exception is about the *walk*, not about the position: a `First`
+        // The exemption is about the *walk*, not about the position: a `First`
         // recursive grep was `Unknown` before this REQ and still is.
         assert_eq!(
             verdict(&root, "grep -r foo").reason,
             READS_THE_ROOT_REASON,
             "an unpiped recursive grep is unchanged"
         );
+
+        // `.` is a **path** in this grammar, not a regex, so a piped
+        // `grep -c .` names the root directory explicitly and is refused by
+        // BR-1(d)'s directory scan before the allowlist is consulted at all.
+        // Recorded here rather than left as a surprising row in either table.
+        assert_eq!(
+            verdict(&root, "ls src | grep -c .").reason,
+            "a directory the command reads could hold a protected file",
+            "`.` names the root, and a named directory is scanned"
+        );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The allowlist can only ever *remove* a walk a content verb would have
+    /// taken — so every entry has to be a content verb.
+    ///
+    /// A name here that [`READS_CONTENT`] does not carry would be a row with no
+    /// effect at all (a `NAME_ONLY` or `READS_NOTHING` verb never reaches the
+    /// walk), which is the shape a later author mistakes for coverage.
+    #[test]
+    fn the_piped_allowlist_is_a_subset_of_the_content_verbs() {
+        for verb in PIPED_STDIN_ONLY {
+            assert!(
+                READS_CONTENT.contains(verb),
+                "`{verb}` is on the piped allowlist but is not a content verb"
+            );
+        }
+        for verb in ["sed", "awk", "diff", "cat"] {
+            assert!(
+                !PIPED_STDIN_ONLY.contains(&verb),
+                "`{verb}` takes a file or a script and must keep the walk"
+            );
+        }
     }
 
     /// The splitter, on its own: only a single `|` pipes.
