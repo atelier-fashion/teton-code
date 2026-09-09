@@ -97,7 +97,7 @@ assertions (its `small-fit` is a user override).
 
 ## Deployment
 
-- Pending merge on `claude/errors-5b0092`.
+- Merged as 894e05f (PR #312), 2026-09-09. Ships in v0.1.33. LESSON-656.
 
 ## Files Changed
 
