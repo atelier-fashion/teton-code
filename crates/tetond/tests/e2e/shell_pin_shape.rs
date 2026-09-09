@@ -48,6 +48,16 @@
 //! | AC-3 (routing half): after `/shell allow` the next prompt's request **leaves**, with no second block | [`after_shell_allow_the_next_prompt_leaves_the_machine`] |
 //! | BR-3 after a lift: a boundary read **escalates** the pin to permanent, is announced, and `/shell allow` is refused | [`a_boundary_read_after_a_lift_escalates_the_pin_and_nothing_later_leaves`] |
 //!
+//! **REQ-620 adds the redirect pair.** The grammar now lifts a redirect to
+//! `/dev/null` and a descriptor duplication before it refuses anything, so the
+//! commands a *model* writes stop pinning every session on their first call.
+//! Two claims say what that did and did not change:
+//!
+//! | Claim | Test |
+//! |---|---|
+//! | AC-10 / BR-9: after a cleared command the next turn routes to the provider, its reason names no pin, and the pin RPC and doctor's config both report an unpinned remote session | [`a_cleared_shell_call_leaves_doctor_and_the_route_on_the_provider`] |
+//! | BR-8 / AC-3: the same redirect on `cat secrets/prod.env` still names the file, pins `boundary_hit` permanently, and `/shell allow` does not lift it | [`shell_allow_does_not_lift_a_boundary_hit_behind_a_redirect`] |
+//!
 //! Mutation record (run 2026-09-05): dropping `.with_unknown_lift(..)` from the
 //! prompt turn's `Egress::new` reddens the two lift claims above and
 //! `taint.rs`'s source scan, and nothing else here; swapping the sink's
@@ -801,6 +811,302 @@ fn a_boundary_read_after_a_lift_escalates_the_pin_and_nothing_later_leaves() {
         "a permanently pinned session is not routed remote again"
     );
     assert_eq!(provider.request_count(), 2, "nothing later leaves");
+
+    assert_no_boundary_bytes();
+}
+
+// ---------------------------------------------------------------------------
+// REQ-620 — a cleared command, and a boundary read the redirect did not hide
+// ---------------------------------------------------------------------------
+
+/// The 2026-09-09 shape, reduced to the two redirect forms the transcript
+/// tripped on, either side of a `&&` the grammar must still read as a
+/// separator.
+const CLEARED_COMMAND: &str = r#"{"command":"ls src 2>/dev/null && echo ok 2>&1"}"#;
+
+/// The same redirect on a command that reads the fixture's boundary file.
+const BOUNDARY_COMMAND: &str = r#"{"command":"cat secrets/prod.env 2>/dev/null"}"#;
+
+/// The `route_decided` events naming `provider`, in the order the client
+/// received them.
+fn routes_to<'a>(client: &'a Client, provider: &str) -> Vec<&'a Value> {
+    client
+        .events_named("route_decided")
+        .into_iter()
+        .filter(|e| e["provider_id"].as_str() == Some(provider))
+        .collect()
+}
+
+/// **BR-8's second half, and AC-3 at the wire.** A boundary read wearing
+/// `2>/dev/null` pins **permanently**, and `/shell allow` does not lift it.
+///
+/// The redirect is the only thing REQ-620 changed about this command, and what
+/// it changed is nothing: the path still resolves, `privacy_block` still names
+/// `secrets/prod.env`, `session_pinned` still carries `boundary_hit` with
+/// `liftable: false` and no remedy — and, per BR-6's must-not-fire half, no
+/// `reason`, because the cause is a path the block already named.
+///
+/// This is the must-not-fire twin of
+/// [`a_cleared_shell_call_leaves_doctor_and_the_route_on_the_provider`] below:
+/// the two commands differ in their path and in nothing else, and they land on
+/// opposite sides. Without it, a strip that had swallowed the whole command
+/// would pass every claim that test makes.
+///
+/// **Inversion (run 2026-09-09, red, restored):** with
+/// `shell_syntax::strip_null_redirects` made a no-op this test reds at the
+/// `privacy_block` path, which comes back `<unknown-provenance>`, and the pin
+/// becomes the liftable `unknown_shell` — so `/shell allow` would have lifted
+/// it. Note what the mutation does **not** do: nothing leaves under it either,
+/// because a strip that lifts nothing can only make the grammar more
+/// suspicious. The red is the *report* degrading and the pin becoming liftable,
+/// not a leak — which is why the hole-opening direction for BR-8 is the
+/// *widening* mutation (lift any word carrying `>` or `<`), recorded with the
+/// recogniser in `harness::tools::shell_syntax`.
+#[test]
+fn shell_allow_does_not_lift_a_boundary_hit_behind_a_redirect() {
+    let provider = MockProvider::start(
+        vec![MockResponse::ok(openai_turn(
+            "Reading the production config.",
+            Some(("c1", "shell", BOUNDARY_COMMAND)),
+            120,
+            20,
+        ))],
+        MockResponse::ok(openai_turn("Should never be reached.", None, 10, 5)),
+    );
+    let ws = Workspace::new("pin-redirect-boundary");
+    ws.write_config(&config_for(&provider));
+    let script = ws.write_script(&local_done_script());
+    let daemon = Daemon::spawn(&ws, probe_16gb_with_local(script));
+    let mut client = daemon.connect();
+    let session = client.create_session("structured", Some("implement"));
+
+    let first = client.prompt(&session, "Read the production configuration.");
+    assert_eq!(
+        first["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "{first}"
+    );
+    client.drain_events(Duration::from_millis(300));
+
+    // The block names the file, not the content-free sentinel: the redirect did
+    // not stop the path from resolving.
+    let blocks = client.events_named("privacy_block");
+    assert_eq!(blocks.len(), 1, "one block: {blocks:?}");
+    assert_eq!(
+        blocks[0]["path"].as_str(),
+        Some("secrets/prod.env"),
+        "BR-8: the redirect did not hide the read — the block names the file, \
+         not `{UNKNOWN_PROVENANCE_PATH}`: {:?}",
+        blocks[0]
+    );
+
+    // The pin: permanent, no remedy, and no syntax class.
+    let pinned = client.events_named("session_pinned");
+    assert_eq!(
+        pinned.len(),
+        1,
+        "the pin is announced once: {:?}",
+        client.event_names()
+    );
+    let pinned = pinned[0];
+    assert_eq!(pinned["cause"].as_str(), Some("boundary_hit"), "{pinned}");
+    assert_eq!(pinned["liftable"].as_bool(), Some(false), "{pinned}");
+    assert_eq!(pinned["remedy"]["kind"].as_str(), Some("none"), "{pinned}");
+    assert!(
+        pinned.get("reason").is_none(),
+        "BR-6: a pin whose cause is a path says nothing about shell syntax: {pinned}"
+    );
+
+    // BR-8: `/shell allow` is refused, naming the cause.
+    let refused = client.call("shell/override", json!({ "session_id": session }));
+    assert_eq!(
+        refused["result"]["was_pinned"].as_bool(),
+        Some(true),
+        "{refused}"
+    );
+    assert_eq!(
+        refused["result"]["lifted_now"].as_bool(),
+        Some(false),
+        "BR-8: no command lifts a boundary hit, redirect or not: {refused}"
+    );
+    assert_eq!(
+        refused["result"]["cause"].as_str(),
+        Some("boundary_hit"),
+        "{refused}"
+    );
+    client.drain_events(Duration::from_millis(200));
+    assert!(
+        client.events_named("session_pin_lifted").is_empty(),
+        "a refused lift announces nothing: {:?}",
+        client.event_names()
+    );
+
+    // And the session stays local: the prompt after the refused lift is neither
+    // routed nor sent remote.
+    let second = client.prompt(&session, "Summarize what you read.");
+    assert_eq!(
+        second["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "{second}"
+    );
+    client.drain_events(Duration::from_millis(300));
+    assert_eq!(
+        count_route_decided_to(&client, "deepseek"),
+        1,
+        "a permanently pinned session is not routed remote again: {:?}",
+        client.event_names()
+    );
+    assert_eq!(
+        provider.request_count(),
+        1,
+        "…and nothing later leaves: only the tool-call turn ever reached the mock"
+    );
+
+    assert_no_boundary_bytes();
+}
+
+/// **AC-10, and BR-9's routing half.** After a `shell` call the grammar clears,
+/// the session's next turn routes to the **provider**, its `route_decided`
+/// reason mentions no pin, and the two surfaces a user would check for one —
+/// the pin RPC behind `/shell allow`, and the config `teton doctor` renders —
+/// report an unpinned session on the remote provider.
+///
+/// ## Why the assertion is `config/get` and `shell/override`, not a spawned `teton doctor`
+///
+/// AC-10 names `teton doctor`. Two facts about that command decide where its
+/// claim can honestly be made:
+///
+/// 1. **Doctor has no session line.** Its report is daemon-scoped —
+///    `doctor_header`, the attach line, then `render_config` over the
+///    `config/get` snapshot, the transcript and repo-context postures, and the
+///    trailer. There is no pin line and no per-session routing line in it, so
+///    "doctor's session line shows the provider" describes a surface that does
+///    not exist. What doctor *does* show about a provider is
+///    `config/get`'s `providers` rows, verbatim — asserted below through the
+///    same RPC doctor makes.
+/// 2. **The CLI binary is not linkable from here.** `CARGO_BIN_EXE_*` is
+///    defined only for binaries of the *package under test*; `teton` lives in
+///    another crate, so this suite can spawn `teton-code` and not `teton`. A
+///    doctor run belongs to `crates/teton`'s own CLI end-to-end suite.
+///
+/// So the daemon half of AC-10 is asserted here, on what a client received, and
+/// the CLI half is the rendering of these same two answers.
+///
+/// **Inversion (run 2026-09-09, red, restored):** with
+/// `shell_syntax::strip_null_redirects` made a no-op this test reds at the
+/// first `privacy_block` assertion — the residue still carries `>`, the command
+/// is refused whole on the redirect class, the session pins `unknown_shell`,
+/// and every claim below about the second turn's route and request follows it
+/// down. Both REQ-620 tests in this file red under that mutation and the six
+/// REQ-614/BUG-214/BUG-215/REQ-619 tests above stay green, which is the
+/// separation the widening should have.
+#[test]
+fn a_cleared_shell_call_leaves_doctor_and_the_route_on_the_provider() {
+    let provider = MockProvider::start(
+        vec![MockResponse::ok(openai_turn(
+            "Listing the sources.",
+            Some(("c1", "shell", CLEARED_COMMAND)),
+            120,
+            20,
+        ))],
+        MockResponse::ok(openai_turn("Listed; done.", None, 10, 5)),
+    );
+    let ws = Workspace::new("pin-redirect-clear");
+    ws.write_config(&config_for(&provider));
+    let script = ws.write_script(&local_done_script());
+    let daemon = Daemon::spawn(&ws, probe_16gb_with_local(script));
+    let mut client = daemon.connect();
+    let session = client.create_session("structured", Some("implement"));
+
+    let first = client.prompt(&session, "List the sources and tell me what you see.");
+    assert_eq!(
+        first["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "{first}"
+    );
+    client.drain_events(Duration::from_millis(300));
+
+    assert!(
+        client.events_named("privacy_block").is_empty(),
+        "AC-4: a command whose only unmodelled bytes are null redirects is not \
+         refused: {:?}",
+        client.event_names()
+    );
+    assert!(
+        client.events_named("session_pinned").is_empty(),
+        "AC-4: and nothing pins: {:?}",
+        client.event_names()
+    );
+    assert_eq!(
+        provider.request_count(),
+        2,
+        "the tool-call turn and the send carrying its result both reach the provider"
+    );
+
+    // The turn *after* the cleared command: routed remote, and its request
+    // leaves.
+    let second = client.prompt(&session, "Now summarize what you listed.");
+    assert_eq!(
+        second["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "{second}"
+    );
+    client.drain_events(Duration::from_millis(300));
+
+    let remote = routes_to(&client, "deepseek");
+    assert_eq!(
+        remote.len(),
+        2,
+        "AC-10: the turn after the cleared command routes to the provider: {:?}",
+        client.event_names()
+    );
+    assert_eq!(
+        provider.request_count(),
+        3,
+        "…and its request leaves the machine"
+    );
+    // AC-10's reason half. Both sentences the daemon composes for a pinned
+    // route contain "pinned to the local tier", so the substring is what
+    // separates a clean route from a pinned one.
+    let reason = remote[1]["reason"].as_str().unwrap_or_default();
+    assert!(
+        !reason.contains("pin"),
+        "AC-10: the route after a cleared command explains itself without a \
+         pin: {reason:?}"
+    );
+    assert!(
+        client.events_named("session_pinned").is_empty(),
+        "AC-10: still nothing pinned after the second turn: {:?}",
+        client.event_names()
+    );
+
+    // The pin-facing RPC — what `/shell allow` calls and what the CLI renders
+    // when a user asks whether this session is pinned.
+    let pin_state = client.call("shell/override", json!({ "session_id": session }));
+    assert_eq!(
+        pin_state["result"]["was_pinned"].as_bool(),
+        Some(false),
+        "AC-10: nothing to lift, because nothing pinned: {pin_state}"
+    );
+    assert!(
+        pin_state["result"]["cause"].is_null(),
+        "…and no cause to name: {pin_state}"
+    );
+
+    // The doctor half: the providers doctor renders come off this snapshot.
+    let snapshot = client.call("config/get", json!({}));
+    let providers = snapshot["result"]["snapshot"]["providers"]
+        .as_array()
+        .expect("the snapshot lists providers");
+    let deepseek = providers
+        .iter()
+        .find(|p| p["id"].as_str() == Some("deepseek"))
+        .unwrap_or_else(|| panic!("doctor's provider list must name the remote route: {snapshot}"));
+    assert_eq!(
+        deepseek["model"].as_str(),
+        Some("deepseek-chat"),
+        "AC-10: doctor reports the remote provider this session is served by: {deepseek}"
+    );
 
     assert_no_boundary_bytes();
 }

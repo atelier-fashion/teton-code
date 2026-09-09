@@ -101,6 +101,29 @@
 //!
 //! The write gate's own arm was mutated in
 //! [`super::super::root_gate::has_top_level_redirection`]; the record is there.
+//!
+//! ## The integration reds (TASK-407, 2026-09-09)
+//!
+//! The four counts above are `--lib` counts and stay `--lib` counts. TASK-407
+//! added the rule's first coverage *outside* the crate's unit tests — the
+//! charter-level claim that a cleared command does not pin and the next
+//! prompt's bytes reach the provider — so mutation 1 was re-run against the two
+//! integration binaries that now hold it. **Four more red**, none of them in
+//! `--lib`:
+//!
+//! - `tests/provenance_egress.rs`:
+//!   `a_null_redirect_does_not_pin_and_the_next_prompt_reaches_the_provider`
+//!   (turn 1 comes back `PrivacyBlocked` where `Ok` was asserted) and
+//!   `a_redirect_does_not_hide_a_boundary_read` (the provenance degrades to
+//!   `unknown` with an empty source set, and the block stops naming the file);
+//! - `tests/e2e.rs`: `shell_pin_shape::a_cleared_shell_call_leaves_doctor_and_the_route_on_the_provider`
+//!   and `shell_pin_shape::shell_allow_does_not_lift_a_boundary_hit_behind_a_redirect`.
+//!
+//! Mutations 2–4 were **not** re-run at TASK-407 and their counts are TASK-405's
+//! unchanged: none of the four new tests spells a command those mutations move
+//! (no glued operator, no non-`/dev/null` redirect, no spaced form), so
+//! re-measuring them would have been three rebuilds to confirm a zero. Recorded
+//! as not-run rather than as measured (LESSON-569).
 
 /// The null device, spelled once.
 ///
