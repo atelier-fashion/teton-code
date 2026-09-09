@@ -829,7 +829,12 @@ digest-verified weights to a `LocalEngineLoader`, which loads on the blocking
 pool, benchmarks against the BR-8 duty, and **stages** the engine per model; the
 gate **commits** it into the daemon's model-tagged engine slot only after
 re-checking that the model is still the recorded selection (abandoning it
-otherwise), and only then publishes `ready`. The load phase holds the same
+otherwise), and only then publishes `ready`. A duty the model misses is not
+terminal for a selection the daemon made: the gate publishes `stepped_down` and
+re-enters `commit` for the next smaller catalog entry that fits, recorded as
+`SelectionSource::StepDown`, so the smaller model takes the same
+download → verify → load → benchmark path (BUG-219); a user override is
+disabled with the reason instead (REQ-544 BR-9). The load phase holds the same
 in-flight claim as the download. The only other engine source is the ungated
 `TETON_LOCAL_SCRIPT` scripted stand-in, which is present from construction and
 whose install outcomes never touch the tier gate (E-5).
