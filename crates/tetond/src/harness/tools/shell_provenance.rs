@@ -79,7 +79,7 @@
 //! the user's home, so a boundary glob written the way REQ-619 taught the
 //! daemon to *mint* reaches a file a shell command named (m2).
 //!
-//! # One widening, and the order it depends on (REQ-620)
+//! # The redirect widening, and the order it depends on (REQ-620 BR-1)
 //!
 //! [`UNMODELLED`] refuses every command containing `>` or `<`, and that rule
 //! was written for commands a user types. On 2026-09-09 the first shell call a
@@ -109,6 +109,38 @@
 //! `python x.py 2>/dev/null` is the opaque-verb `Unknown` it always was (BR-5).
 //! The verdict is still a function of the command's text alone (BR-10) — the
 //! strip is a pure string transform and no redirect's *effect* is consulted.
+//!
+//! # The pipeline widening: a piped reader reads its stdin (REQ-620 BR-4)
+//!
+//! BR-1(d) walks the root whenever a content verb was not handed explicit
+//! files, because "the reach is whatever the verb defaults to" and the default
+//! used to be assumed to be the current directory. For a segment whose stdin is
+//! a pipe that is simply false: `head -5` after a `|` reads the bytes the
+//! previous segment produced, and the previous segment was classified on its
+//! own paths. Walking the root for it is a walk for a read that cannot happen —
+//! and on any repository with a build tree the walk exhausts its budget, so the
+//! verdict was `Unknown` by exhaustion (the REQ's third open question).
+//!
+//! So the splitter records **which separator preceded each segment**
+//! ([`split_segments`], ADR-620-2 step 3). Exactly one `|` makes a segment
+//! [`SegmentPosition::Piped`]; `;`, `&&`, `||`, a lone `&`, `(`, `)` and a
+//! newline all leave it [`SegmentPosition::First`], because after any of those
+//! the segment's stdin is the terminal's. `||` and `&&` are therefore tokenised
+//! **longest-match-first**: REQ-614's byte-wise `split` read `||` as two `|`
+//! separators with an empty segment between them, which is harmless for a
+//! verdict and wrong for a position — an *or* is not a pipe.
+//!
+//! [`classify_segment`] takes the position and, for a `Piped` segment reading
+//! its default source, skips the root walk. The one exception is
+//! [`reads_tree`]: `grep -r foo` searches `.` recursively whatever is on its
+//! stdin, so recursive `grep` keeps the walk. The exception is verb-scoped on
+//! purpose — a rule that read "any verb carrying `-r`" would catch `sed -r`
+//! (extended regexes) and `cp -r`, neither of which is this verb's `-r`.
+//!
+//! The widening does not touch the walk, its budget or its skip set, and it
+//! does not reach a `First` segment: `head -5` alone and `ls; head -5` still
+//! read the root, and `cat missing | head` still walks in its *first* segment,
+//! on `cat missing`. That is BR-4's stated limit rather than a gap.
 //!
 //! # Mutation record (conventions.md — show the test can fail)
 //!
@@ -546,11 +578,15 @@ fn classify_with_budget(
     let mut sources = BTreeSet::new();
     let mut evidence = BoundaryEvidence::default();
 
-    for segment in command.split(['|', ';', '&', '(', ')', '\n']) {
+    // ADR-620-2 step 3: the split records the separator that preceded each
+    // segment, because the root-walk rule inside `classify_segment` needs to
+    // know what the segment's stdin is and nothing else in the segment's text
+    // says. Empty segments are skipped exactly as REQ-614 skipped them.
+    for (position, segment) in split_segments(command) {
         if segment.trim().is_empty() {
             continue;
         }
-        match classify_segment(&scope, segment, &mut sources, &mut evidence) {
+        match classify_segment(&scope, position, segment, &mut sources, &mut evidence) {
             SegmentVerdict::Rooted => {}
             // `evidence.any` is already set by the token that matched; the arm
             // is kept so the three outcomes stay enumerated at the caller.
@@ -590,19 +626,113 @@ fn classify_with_budget(
     }
 }
 
+/// What a segment's **stdin** is, which is the only thing the separator before
+/// it tells this grammar (REQ-620 BR-4).
+///
+/// Not "is there a pipe anywhere in the command": `ls | grep foo; head -5` has
+/// a pipe and its third segment is [`Self::First`], because a `;` hands the
+/// next command the terminal's stdin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentPosition {
+    /// The start of the command, or after `;`, `&&`, `||`, a lone `&`, `(`,
+    /// `)` or a newline. Stdin is the terminal's or nothing, so a content verb
+    /// with no explicit file reads the root — REQ-614 BR-1(d), unchanged.
+    First,
+    /// After exactly one `|`. Stdin is the previous segment's stdout, and that
+    /// segment was classified on its own paths.
+    Piped,
+}
+
+/// Split a command into segments, each carrying the position its preceding
+/// separator gave it (ADR-620-2 step 3).
+///
+/// Separators are tokenised **longest-match-first**, which is the whole reason
+/// this replaced REQ-614's `command.split(['|', ';', '&', '(', ')', '\n'])`.
+/// That split saw `||` as two `|` separators with an empty segment between, and
+/// `&&` as two `&`s — invisible in a verdict, since the empty segment is
+/// skipped and both spellings separate, and wrong the moment a segment's
+/// position is read from its separator. An *or* is not a pipe.
+///
+/// Empty segments are returned rather than filtered, so the caller keeps
+/// REQ-614's `trim().is_empty()` skip and this function stays a pure statement
+/// about separators.
+///
+/// Byte indexing is safe here without a char-boundary check: every separator is
+/// ASCII, so no match can begin inside a multi-byte character, and the only
+/// indices this slices at are match positions.
+fn split_segments(command: &str) -> Vec<(SegmentPosition, &str)> {
+    let bytes = command.as_bytes();
+    let mut segments = Vec::new();
+    let mut position = SegmentPosition::First;
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let separator = match bytes[i] {
+            b'|' if bytes.get(i + 1) == Some(&b'|') => Some((2, SegmentPosition::First)),
+            b'&' if bytes.get(i + 1) == Some(&b'&') => Some((2, SegmentPosition::First)),
+            b'|' => Some((1, SegmentPosition::Piped)),
+            b';' | b'&' | b'(' | b')' | b'\n' => Some((1, SegmentPosition::First)),
+            _ => None,
+        };
+        let Some((width, next)) = separator else {
+            i += 1;
+            continue;
+        };
+        segments.push((position, &command[start..i]));
+        position = next;
+        i += width;
+        start = i;
+    }
+    segments.push((position, &command[start..]));
+    segments
+}
+
+/// Whether this verb reads the directory tree **whatever is on its stdin** —
+/// the one exception BR-4 carves out of the piped-reader rule.
+///
+/// `grep -r foo` with a pipe attached still searches `.` recursively; the flag
+/// overrides the default source rather than filtering it. Nothing else in
+/// [`READS_CONTENT`] behaves that way, so the rule is scoped to `grep` and its
+/// two aliases by name. Reading it as "any verb carrying `-r`" would catch
+/// `sed -r` (extended regular expressions) and turn a widening into a
+/// tightening for a flag that means something else entirely.
+///
+/// The forms are the ones GNU and BSD `grep` accept: the long `--recursive`,
+/// the `-d recurse` pair, and any **short-flag cluster** carrying `r` or `R` —
+/// `-r`, `-R`, `-rn`, `-nR`. A cluster is a word starting with a single `-`;
+/// the `--` test is load-bearing, because `--color` carries an `r` and is not
+/// recursion.
+fn reads_tree(verb: &str, rest: &[&str]) -> bool {
+    if !matches!(verb, "grep" | "egrep" | "fgrep") {
+        return false;
+    }
+    rest.iter().enumerate().any(|(i, word)| {
+        if *word == "--recursive" {
+            return true;
+        }
+        if *word == "-d" {
+            return rest.get(i + 1).is_some_and(|next| *next == "recurse");
+        }
+        word.strip_prefix('-').is_some_and(|flags| {
+            !flags.starts_with('-') && flags.chars().any(|c| c == 'r' || c == 'R')
+        })
+    })
+}
+
 enum SegmentVerdict {
     Rooted,
     BoundaryTouch,
     Unknown(&'static str),
 }
 
-/// One `|`/`;`/`&`-separated segment.
+/// One `|`/`;`/`&`-separated segment, and the stdin its separator gave it.
 ///
 /// **The fallthrough is `Unknown`** — see the module docs. Every verb this does
 /// not recognise, every path form it cannot resolve, every scan that ran out of
 /// budget lands here.
 fn classify_segment(
     scope: &Scope<'_>,
+    position: SegmentPosition,
     segment: &str,
     sources: &mut BTreeSet<ProvenanceId>,
     evidence: &mut BoundaryEvidence,
@@ -837,14 +967,35 @@ fn classify_segment(
         return SegmentVerdict::BoundaryTouch;
     }
 
-    // BR-1(d): a content-reading verb given no path at all reads whatever is
-    // under the root.
-    // BR-1(d): a content-reading verb reads the root when it names no path at
-    // all, and may read it when none of its tokens named an existing file (see
-    // `named_an_existing_file` above). Either way the root's subtree decides.
+    // BR-1(d): a content-reading verb reads its **default source** when it
+    // names no path at all, and may be reading it when none of its tokens named
+    // an existing file (see `named_an_existing_file` above). This is the
+    // grammar's answer to "was that token a pattern or a path?", which it
+    // refuses to decide with a per-verb option table (ADR-614-1): given at
+    // least one existing file the verb was given explicit files, and given none
+    // its reach is whatever it falls back to.
+    let reads_its_default_source = paths.is_empty() || !named_an_existing_file;
+
+    // REQ-620 BR-4 / ADR-620-3. For a `Piped` segment that default source is
+    // the previous segment's stdout — bytes the previous segment was already
+    // classified on — so the root walk below is a walk for a read that cannot
+    // happen. `reads_tree` is the one exception: recursive `grep` searches `.`
+    // whatever its stdin, so it keeps the walk.
+    //
+    // The exemption is expressed over the same "was it given explicit files"
+    // question BR-1(d) asks, because that is what BR-4's "no path argument"
+    // means in this module's vocabulary: `git log | grep fix` and
+    // `cat README.md | grep foo` name a *pattern*, not a path, and the REQ
+    // lists both as reading their stdin. A segment that *did* name an existing
+    // file never reaches this line anyway — it was given files, and they are in
+    // `sources`.
+    let reads_stdin_not_the_root =
+        position == SegmentPosition::Piped && reads_its_default_source && !reads_tree(verb, &rest);
+
     if reads_content
-        && (paths.is_empty() || !named_an_existing_file)
+        && reads_its_default_source
         && !saw_directory
+        && !reads_stdin_not_the_root
         && !subtree_is_boundary_free(
             scope.root,
             scope.denied_prefixes,
@@ -2675,5 +2826,252 @@ mod tests {
             "a lone `&` is not a redirect"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The reason a segment that reads the root carries once the walk **hits**.
+    /// Asserting it rather than the bare `Unknown` is what keeps the piped rows
+    /// below from passing because the fixture happened to be refused for some
+    /// other reason.
+    const READS_THE_ROOT_REASON: &str =
+        "the command reads the root and it could hold a protected file";
+
+    /// A project root the boundary walk **hits**: it holds a `.env`, which
+    /// `DEFAULT_BOUNDARIES` matches. It also holds the one file the piped rows
+    /// name explicitly.
+    ///
+    /// LESSON-485 — a fixture that cannot reach the discriminating state is not
+    /// a test. Without the `.env` every row below would be `Rooted`, the
+    /// `Rooted` rows for the reason they claim and the `Unknown` rows for no
+    /// reason at all, and deleting the whole of BR-4 would leave the test green.
+    fn piped_root(tag: &str) -> PathBuf {
+        let root = project_root(tag);
+        std::fs::write(root.join(".env"), "SECRET=1\n").unwrap();
+        std::fs::write(root.join("README.md"), "# fixture\n").unwrap();
+        root
+    }
+
+    /// **BR-4 / AC-5: a content verb after a `|` reads its stdin, and after
+    /// anything else it still reads the root.**
+    ///
+    /// The two halves are the rule; either alone is not. A piped `head -5` has
+    /// no file to read but the bytes `ls src` produced, and `ls src` was
+    /// classified — so walking the root for it is a walk for a read that cannot
+    /// happen, and on this fixture it is a walk that *finds something*. The
+    /// second half is the must-not-fire one (LESSON-440) and it is where the
+    /// separator table earns its keep: `;`, `&&`, `||` and a lone `&` all hand
+    /// the next command the terminal's stdin, so `ls || head -5` is a `First`
+    /// segment reading the root even though the command contains two `|` bytes.
+    ///
+    /// `git log | grep fix` names a token, `fix`, and it is still a stdin read:
+    /// `fix` is a *pattern*, and BR-1(d) already answers "pattern or path?" with
+    /// "did any token name an existing file" rather than a per-verb option table
+    /// (ADR-614-1). The REQ lists this command and `cat README.md | grep foo`
+    /// among the reads-its-stdin shapes for that reason.
+    ///
+    /// **Mutation (run, red, reverted):** make [`split_segments`] return
+    /// [`SegmentPosition::Piped`] for every separator — this reds here, on
+    /// `ls; head -5` coming back `Rooted`, and in
+    /// [`tests::only_a_single_pipe_makes_the_next_segment_piped`]. Two, and no
+    /// more: the first segment of a command has no separator before it, so
+    /// `head -5` alone is `First` under the mutation too and cannot catch it.
+    #[test]
+    fn a_piped_reader_with_no_path_reads_stdin_not_the_root() {
+        let root = piped_root("piped");
+
+        for command in [
+            "ls src | head -5",
+            "ls src | wc -l",
+            "git log | grep fix",
+            "cat README.md | grep foo",
+            // The residue of a stripped redirect is still a pipe (TASK-403).
+            "ls src 2>/dev/null | head -5",
+            // Two pipes: both readers are piped.
+            "ls src | grep foo | wc -l",
+        ] {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Rooted,
+                "`{command}` reads the previous segment's output, not the root ({})",
+                v.reason
+            );
+        }
+
+        // The other half: after anything but a single `|`, stdin is the
+        // terminal's and BR-1(d) is unchanged. The first row is the vacuity
+        // floor — it proves the walk on this fixture *hits*, so the rows above
+        // are `Rooted` by the exemption and not by a clean tree.
+        for command in [
+            "head -5",
+            "ls; head -5",
+            "ls && head -5",
+            "ls || head -5",
+            "ls & head -5",
+            "ls\nhead -5",
+        ] {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Unknown,
+                "`{command}` runs `head` on the terminal's stdin ({})",
+                v.reason
+            );
+            assert_eq!(
+                v.reason, READS_THE_ROOT_REASON,
+                "`{command}` should be refused by the root walk"
+            );
+        }
+
+        // BR-4's stated limit, not a gap: the exemption is about the piped
+        // segment, and `cat missing` is the *first* one.
+        let v = verdict(&root, "cat missing | head");
+        assert_eq!(
+            v.kind,
+            VerdictKind::Unknown,
+            "`cat missing` walks in its own right ({})",
+            v.reason
+        );
+        assert_eq!(v.reason, READS_THE_ROOT_REASON);
+
+        // And a boundary is not hidden by a pipe: BUG-216's precedence holds.
+        let v = verdict(&root, "cat .env | head -5");
+        assert_eq!(
+            v.kind,
+            VerdictKind::BoundaryTouch,
+            "a protected file named before the pipe is still a touch ({})",
+            v.reason
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **BR-4's exception: recursive `grep` reads the tree whatever its stdin.**
+    ///
+    /// `grep -r foo` with a pipe attached still searches `.` recursively — the
+    /// flag replaces the default source rather than filtering it — so it keeps
+    /// the root walk and this fixture's `.env` refuses it. Without this arm
+    /// `ls | grep -r foo` would return `Rooted` for a command that reads every
+    /// file under the root, which is the leak the `named_an_existing_file` rule
+    /// was written to close, re-opened one position along.
+    ///
+    /// The must-not-fire rows are three separate claims (LESSON-440): a short
+    /// cluster without `r` is not recursion; `--color` carries an `r` and is a
+    /// long flag, which is what the single-`-` test exists for; `-d skip` is the
+    /// same flag as `-d recurse` and the opposite answer. The last row is the
+    /// verb scope — `sed -r` is an extended-regex flag, and a rule reading "any
+    /// verb carrying `-r`" would pin it.
+    ///
+    /// **Mutation (run, red, reverted):** make [`reads_tree`] return `false`
+    /// unconditionally — this reds here, on `ls src | grep -r foo` coming back
+    /// `Rooted`, and nothing else in the crate's library tests.
+    #[test]
+    fn recursive_grep_reads_the_tree_whatever_its_stdin() {
+        let root = piped_root("recursive-grep");
+
+        for command in [
+            "ls src | grep -r foo",
+            "ls src | grep -rn foo",
+            "ls src | grep -nR foo",
+            "ls src | grep --recursive foo",
+            "ls src | grep -d recurse foo",
+            "ls src | egrep -R foo",
+            "ls src | fgrep -r foo",
+        ] {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Unknown,
+                "`{command}` searches the tree whatever is on its stdin ({})",
+                v.reason
+            );
+            assert_eq!(
+                v.reason, READS_THE_ROOT_REASON,
+                "`{command}` should be refused by the root walk"
+            );
+        }
+
+        for command in [
+            "ls src | grep -n foo",
+            "ls src | grep -i foo",
+            "ls src | grep --color foo",
+            "ls src | grep -d skip foo",
+            "ls src | sed -r foo",
+        ] {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Rooted,
+                "must not fire: `{command}` reads its stdin ({})",
+                v.reason
+            );
+        }
+
+        // The exception is about the *walk*, not about the position: a `First`
+        // recursive grep was `Unknown` before this REQ and still is.
+        assert_eq!(
+            verdict(&root, "grep -r foo").reason,
+            READS_THE_ROOT_REASON,
+            "an unpiped recursive grep is unchanged"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The splitter, on its own: only a single `|` pipes.
+    ///
+    /// REQ-614's `split(['|', ';', '&', '(', ')', '\n'])` read `||` as two `|`
+    /// separators around an empty segment. The verdict could not tell — the
+    /// empty segment is skipped and both spellings separate — so this is the
+    /// unit that says the two-character separators are one token each, at the
+    /// level where the difference is observable.
+    ///
+    /// **Mutation (run, red, reverted):** return [`SegmentPosition::Piped`] for
+    /// every separator and this reds on the `a || b` row, alongside
+    /// [`tests::a_piped_reader_with_no_path_reads_stdin_not_the_root`].
+    #[test]
+    fn only_a_single_pipe_makes_the_next_segment_piped() {
+        use SegmentPosition::{First, Piped};
+
+        assert_eq!(
+            split_segments("a | b"),
+            vec![(First, "a "), (Piped, " b")],
+            "a single `|` pipes"
+        );
+        assert_eq!(
+            split_segments("a || b"),
+            vec![(First, "a "), (First, " b")],
+            "an `or` is not a pipe, and it is one separator, not two"
+        );
+        assert_eq!(
+            split_segments("a && b"),
+            vec![(First, "a "), (First, " b")],
+            "an `and` is one separator, not two"
+        );
+        for (command, expected) in [
+            ("a", vec![(First, "a")]),
+            ("a ; b", vec![(First, "a "), (First, " b")]),
+            ("a & b", vec![(First, "a "), (First, " b")]),
+            ("a\nb", vec![(First, "a"), (First, "b")]),
+            (
+                "a | b | c",
+                vec![(First, "a "), (Piped, " b "), (Piped, " c")],
+            ),
+            // A pipe after an `or`: the `or` ends a segment as `First` and the
+            // `|` that follows pipes the one after it.
+            (
+                "a || b | c",
+                vec![(First, "a "), (First, " b "), (Piped, " c")],
+            ),
+            // Subshell parens separate and never pipe; the empty and
+            // whitespace-only segments they leave are the caller's
+            // `trim().is_empty()` skip.
+            (
+                "(a) | b",
+                vec![(First, ""), (First, "a"), (First, " "), (Piped, " b")],
+            ),
+            // A trailing separator leaves an empty last segment, carrying the
+            // position it would have given a segment that was there.
+            ("a |", vec![(First, "a "), (Piped, "")]),
+        ] {
+            assert_eq!(split_segments(command), expected, "`{command}`");
+        }
     }
 }

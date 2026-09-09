@@ -1,7 +1,7 @@
 ---
 id: TASK-404
 title: "Segments carry their position; a piped reader with no path reads stdin, not the root"
-status: draft
+status: complete
 parent: REQ-620
 created: 2026-09-09
 updated: 2026-09-09
