@@ -18,7 +18,9 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
-## [Unreleased]
+## [0.1.33] - 2026-09-09
+
+One dogfood bug at the local tier's floor, and the toolkit-side half of another.
 
 ### Fixed
 
