@@ -1261,7 +1261,7 @@ const CLASS_PREAMBLES: &[(&str, &str)] = &[
     ),
     (
         "echo a!b",
-        "the command uses a history expansion (`!`) this classifier does not model",
+        "the command uses a history expansion this classifier does not model",
     ),
 ];
 

@@ -149,11 +149,11 @@ pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 macro_rules! reach_contract {
     () => {
         "Commands are checked before they run. A command keeps the session on its \
-         current tier when ordinary read verbs (ls, cat, grep, git status) name \
-         paths inside the session root; `2>/dev/null` and `2>&1` are fine. Quotes, \
-         other redirects, globs, `$`, `~/` paths, interpreters, network clients, or \
-         an unknown verb pin the rest of the session to the local tier; the pin is \
-         announced and only the user can lift it."
+         current tier when read verbs (ls, cat, grep, git status) name paths in the \
+         session root; `2>/dev/null` and `2>&1` are fine. Quotes, other redirects, \
+         globs, `$`, `~/` paths, other shell syntax, interpreters, network clients, \
+         or an unknown verb pin the rest of the session to the local tier; the pin \
+         is announced and only the user can lift it."
     };
 }
 
@@ -1177,9 +1177,15 @@ mod tests {
     /// claims stay green, which is the discrimination the three-claim split is
     /// for. It reddens
     /// `egress::redact::tests::the_total_cap_clears_the_harness_context_budget_with_margin`
-    /// too — the recorded margin goes 721 → 733 — and that is the pair working
-    /// as intended rather than a duplicate: this test says *which sentence*
+    /// too — the recorded margin moves — and that is the pair working as
+    /// intended rather than a duplicate: this test says *which sentence*
     /// changed, the sweep says the resident prompt moved at all.
+    ///
+    /// **Mutation (run, red, reverted, Phase-5 verify):** drop
+    /// `other shell syntax` from the paragraph — claim 1b reds three times over
+    /// (`Brace`, `Escape`, `History`), and the two margin sweeps red with it.
+    /// Before 1b existed that edit reddened only the sweeps, which say the
+    /// prompt moved and not that it stopped being true.
     #[test]
     fn the_reach_contract_names_every_pinning_class_and_fits_its_budget() {
         /// ADR-620-5's ceiling. The contract is resident in every remote turn's
@@ -1206,6 +1212,42 @@ mod tests {
                 folded.contains(needle),
                 "the reach contract no longer names {class} (`{needle}`), so a model \
                  reading it cannot avoid that pin:\n{SHELL_REACH_CONTRACT}"
+            );
+        }
+
+        // 1b. **Every** class, driven from the classifier's own enumeration
+        //     rather than from a list typed here (Phase-5 verify). The table
+        //     above was written by hand and named five of the eight: brace
+        //     expansion, backslash escapes and history expansion all pin, none
+        //     of them appeared, and a model reading the paragraph would have
+        //     believed `echo {a,b}` kept its tier. Iterating
+        //     `UNMODELLED_ORDER` makes a ninth class a failing row instead of a
+        //     silent omission.
+        for class in shell_provenance::UNMODELLED_ORDER {
+            let needle = match class {
+                shell_provenance::UnmodelledSyntax::Quote => "quotes",
+                shell_provenance::UnmodelledSyntax::Redirect => "redirects",
+                shell_provenance::UnmodelledSyntax::Glob => "globs",
+                // Both spell themselves with a `$`, and the paragraph has the
+                // room for the character but not for two more clauses.
+                shell_provenance::UnmodelledSyntax::Variable
+                | shell_provenance::UnmodelledSyntax::Substitution => "$",
+                // The three narrow spellings. Naming each would cost more than
+                // the paragraph's whole remaining budget and buy a model
+                // nothing it can act on — "braces" is not a shape it reaches
+                // for by habit the way `2>/dev/null` is. They are covered by
+                // the catch-all clause, which is what makes the sentence honest
+                // rather than merely short.
+                shell_provenance::UnmodelledSyntax::Brace
+                | shell_provenance::UnmodelledSyntax::Escape
+                | shell_provenance::UnmodelledSyntax::History => "other shell syntax",
+            };
+            assert!(
+                folded.contains(needle),
+                "the reach contract does not name {class:?} (looked for `{needle}`). \
+                 Every class in `UNMODELLED_ORDER` pins the session, so a class the \
+                 paragraph does not cover — directly or through its catch-all — is a \
+                 pin the model cannot avoid:\n{SHELL_REACH_CONTRACT}"
             );
         }
 

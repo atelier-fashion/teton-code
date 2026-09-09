@@ -42,15 +42,26 @@ redirects, and a boundary read with a redirect.
 | rule | kind | artifact | benign_path |
 |------|------|----------|-------------|
 | BR-1 | test-case | `crates/tetond/src/harness/tools/shell_provenance.rs::tests::null_redirects_are_lifted_before_the_scan_and_the_split` | yes |
-| BR-2 | test-case | `crates/tetond/src/harness/tools/shell_provenance.rs::tests::every_other_redirect_stays_unmodelled` | yes |
+| BR-2 | test-case | `crates/tetond/src/harness/tools/shell_provenance.rs::tests::every_other_redirect_stays_unmodelled` | no |
 | BR-3 | test-case | `crates/tetond/src/harness/tools/shell_provenance.rs::tests::dev_null_is_never_a_path_token` | no |
-| BR-5 | test-case | `crates/tetond/src/harness/tools/shell_provenance.rs::tests::an_opaque_verb_with_a_null_redirect_is_still_unknown` | yes |
+| BR-5 | test-case | `crates/tetond/src/harness/tools/shell_provenance.rs::tests::an_opaque_verb_with_a_null_redirect_is_still_unknown` | no |
 | BR-8 | test-case | `crates/tetond/src/harness/tools/shell_provenance.rs::tests::a_redirect_never_hides_a_boundary_read` | yes |
 | BR-10 | test-case | `crates/tetond/src/harness/tools/shell_provenance.rs::tests::null_redirects_are_lifted_before_the_scan_and_the_split` | no |
 | AC-1 | test-case | `crates/tetond/src/harness/tools/shell_provenance.rs::tests::the_2026_09_09_command_is_rooted_without_its_home_probe` | yes |
 | AC-2 | test-case | `crates/tetond/src/harness/tools/shell_provenance.rs::tests::the_redirect_differential_table` | yes |
 | AC-7 | test-case | `crates/tetond/src/harness/tools/shell_provenance.rs::tests::an_opaque_verb_with_a_null_redirect_is_still_unknown` | no |
 | AC-9 | test-case | `crates/tetond/src/harness/tools/shell_provenance.rs::tests::the_toolkit_preamble_shapes_are_rooted_and_the_old_ones_are_not` | yes |
+
+**BR-2 and BR-5 were `yes` and are `no`** (corrected at the Phase-5 verify).
+Both tests are *entirely* must-fire: every row of
+`every_other_redirect_stays_unmodelled` asserts a refusal, and every row of
+`an_opaque_verb_with_a_null_redirect_is_still_unknown` asserts an opaque verb
+still pins. Neither carries a row that must **not** fire, so neither has a
+benign path of its own. The benign coverage for both lives in
+`the_redirect_differential_table` (AC-2), which runs every accepted BR-1 form
+against five verbs and asserts `Rooted` — that is the table a widening of BR-2
+or a narrowing of BR-5 would redden, and it is where LESSON-440's must-not-fire
+half is discharged for this rule.
 
 ## Technical Notes
 

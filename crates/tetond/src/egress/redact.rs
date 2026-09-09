@@ -661,7 +661,7 @@ pub(crate) const MIN_PROMPT_HEADROOM_BYTES: usize = 48;
 /// last time. Add a ledger line to [`REDACT_BODY_OVERHEAD_BYTES`] saying which
 /// REQ spent the bytes, then move this number in the same diff.
 #[cfg(test)]
-pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 721;
+pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 714;
 
 /// The same pin for the **web-enabled** prompt shape measured by
 /// `harness::tools::web::tests::the_web_tool_docs_clear_the_outbound_body_overhead`.
@@ -673,7 +673,7 @@ pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 721;
 /// holds the budget vocabulary, so the two shapes cannot come to disagree about
 /// which constant they are measuring against.
 #[cfg(test)]
-pub(crate) const RECORDED_WEB_PROMPT_MARGIN_BYTES: usize = 768;
+pub(crate) const RECORDED_WEB_PROMPT_MARGIN_BYTES: usize = 761;
 
 /// The gap between the two recorded margins, pinned (REQ-617).
 ///
@@ -2711,16 +2711,24 @@ mod tests {
     /// **152**, the same 47 bytes looser it always is. The account, and the
     /// guard the bytes bought, is on [`REDACT_BODY_OVERHEAD_BYTES`].
     ///
-    /// **Recorded headroom at REQ-620:** `worst` **17,507** + `escaping` 6,348
-    /// = `spent` **23,855** against an overhead raised 23 → 24 KiB by this REQ,
-    /// leaving a margin of **721**. The opted-in twin is 17,460 / 23,808 /
-    /// **768** and stays the looser of the two by the same 47 bytes it always
-    /// has. REQ-620 spent **408** on both shapes: `SHELL_REACH_CONTRACT` (407
+    /// **Recorded headroom at REQ-620:** `worst` **17,514** + `escaping` 6,348
+    /// = `spent` **23,862** against an overhead raised 23 → 24 KiB by this REQ,
+    /// leaving a margin of **714**. The opted-in twin is 17,467 / 23,815 /
+    /// **761** and stays the looser of the two by the same 47 bytes it always
+    /// has. REQ-620 spent **415** on both shapes: `SHELL_REACH_CONTRACT` (414
     /// bytes) and the space joining it to REQ-615's cwd contract, in the `shell`
     /// tool's description — BR-7's paragraph telling the model which command
-    /// shapes pin the session. Against the 105 this REQ inherited that is 303
+    /// shapes pin the session. Against the 105 this REQ inherited that is 310
     /// over the ceiling, which is why the ceiling moved; the account is on
     /// [`REDACT_BODY_OVERHEAD_BYTES`].
+    ///
+    /// *(The contract was 407 bytes and the margins 721 / 768 until REQ-620's
+    /// Phase-5 verify. The paragraph named five of the eight syntax classes
+    /// that pin and left brace expansion, backslash escapes and history
+    /// expansion unmentioned — so a model reading it would have believed
+    /// `echo {a,b}` kept its tier. Adding "other shell syntax" and trimming two
+    /// words elsewhere cost a net **7** bytes on both shapes, re-measured here
+    /// rather than reasoned.)*
     ///
     /// **Mutation run for REQ-620.** Setting the overhead back to `23 * 1024`
     /// with the contract in place → red at the first assertion, 303 bytes over

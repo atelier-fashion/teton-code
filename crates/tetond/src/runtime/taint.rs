@@ -282,14 +282,30 @@ impl SessionTaint {
             .map(|r| r.cause)
     }
 
-    /// The content-free class sentence recorded with `session`'s pin, when one
-    /// explained it (REQ-620 BR-6).
+    /// The content-free class sentence **recorded** with `session`'s pin, when
+    /// one explained it (REQ-620 BR-6).
     ///
     /// `None` for an unpinned session, and for a pin nothing classified — a
     /// boundary read, an opaque MCP result. Read beside [`Self::cause`] rather
     /// than folded into it because every existing caller wants the cause alone;
     /// what this exists for is to make the pair *readable together*, which is
     /// how the escalation invariant above is asserted.
+    ///
+    /// # It reports the record, and it is **not** composed through [`RoutePin`]
+    ///
+    /// Stated because the asymmetry surprises (Phase-5 verify). `/shell allow`
+    /// records a *lift* in [`ShellTaintOverride`], a sibling set, and never
+    /// erases this map's entry — [`RoutePin::pins`] composes the two at the
+    /// point of use, which is ADR-614-4's whole design. So a lifted session
+    /// still answers `Some(class)` here, exactly as it still answers
+    /// `Some(cause)` from [`Self::cause`].
+    ///
+    /// That is correct and it is also why this must never become a routing
+    /// input: the question "which class pinned this session" has an answer for
+    /// a lifted session, and the question "must this turn stay local" does not
+    /// have the same one. Every route asks [`RoutePin::pins`]; this is read by
+    /// the notice and by tests. `taint_is_pinned_but_lifted_still_records_its_class`
+    /// is the row that says so.
     #[must_use]
     pub fn reason(&self, session: &SessionId) -> Option<&'static str> {
         self.tainted
@@ -3010,6 +3026,61 @@ mod shell_pin_lifecycle {
             None,
             "the class of the command that took the liftable pin must not \
              explain the permanent one"
+        );
+    }
+
+    /// **Phase-5 verify: a lifted session keeps its recorded class, and the
+    /// class is not a routing input.**
+    ///
+    /// `/shell allow` writes to [`ShellTaintOverride`], a sibling set, and
+    /// never touches the taint map — [`RoutePin::pins`] composes the two at the
+    /// point of use (ADR-614-4). So both `cause` and `reason` still answer for
+    /// a lifted session, which is right (the pin *was* taken, and the record of
+    /// why is what the escalation invariant is asserted against) and is the
+    /// thing a later reader is most likely to get wrong: reading `reason` as
+    /// "this session is pinned, because…" would keep a lifted session local.
+    ///
+    /// The row that carries the claim is the `pins` pair — every route asks
+    /// that and nothing else — beside the record that outlives it.
+    ///
+    /// **Mutation (run, red, reverted):** make `RoutePin::pins` read
+    /// `self.taint.reason(session).is_some()` instead of composing the cause
+    /// with the override — this reds on the `pins` assertion after the lift,
+    /// which is the exact shape of a class sentence becoming a routing input.
+    /// It reds among **many** (the dispatch suite pins every duty route on
+    /// `RoutePin`), and that is the point of recording the count: this row is
+    /// the only one that reddens on the *lifted* half — every other red is a
+    /// `boundary_hit` pin whose reason is `None`, which the mutation reads as
+    /// "not pinned".
+    #[test]
+    fn taint_is_pinned_but_lifted_still_records_its_class() {
+        let taint = std::sync::Arc::new(SessionTaint::new());
+        let lifted = std::sync::Arc::new(ShellTaintOverride::new());
+        let session = SessionId::from("lifted-but-recorded");
+        let pin = RoutePin::new(taint.clone(), lifted.clone());
+
+        assert!(taint.mark(
+            &session,
+            TaintCause::UnknownShell,
+            Some(SHELL_PIN_FIXTURE_REASON)
+        ));
+        assert!(pin.pins(&session), "before the lift, the route is local");
+        assert_eq!(taint.reason(&session), Some(SHELL_PIN_FIXTURE_REASON));
+
+        assert!(lifted.lift(&session), "the user lifts it");
+        assert!(
+            !pin.pins(&session),
+            "after the lift, every route reads through `RoutePin` and sees no pin"
+        );
+        assert_eq!(
+            taint.cause(&session),
+            Some(TaintCause::UnknownShell),
+            "the record persists — the lift is a sibling fact, not an erasure"
+        );
+        assert_eq!(
+            taint.reason(&session),
+            Some(SHELL_PIN_FIXTURE_REASON),
+            "and so does the class, which is why it must not be read as a pin"
         );
     }
 

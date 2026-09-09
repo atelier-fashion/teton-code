@@ -2383,10 +2383,10 @@ mod tests {
     /// two by the same 47 B it always has. The account, and the guard the bytes
     /// bought, is `egress::redact`'s twin of this paragraph.
     ///
-    /// **Recorded headroom at REQ-620:** `worst` **17,460**, `spent` **23,808**,
-    /// margin **768** — against an overhead raised 23 → 24 KiB by that REQ,
+    /// **Recorded headroom at REQ-620:** `worst` **17,467**, `spent` **23,815**,
+    /// margin **761** — against an overhead raised 23 → 24 KiB by that REQ,
     /// with the floor unmoved at 48 and this shape still the looser of the two
-    /// by 47 B. Both shapes pay the same **408**: `SHELL_REACH_CONTRACT` (407
+    /// by 47 B. Both shapes pay the same **415**: `SHELL_REACH_CONTRACT` (414
     /// bytes) plus the space joining it to REQ-615's cwd contract, in the
     /// `shell` tool's description — BR-7's paragraph telling the model which
     /// command shapes pin the session to the local tier. It did not fit the 152
@@ -2394,6 +2394,11 @@ mod tests {
     /// account — why the ceiling moved rather than the paragraph shrinking, and
     /// the 931 bytes it costs every scanned route — is `egress::redact`'s twin
     /// of this paragraph.
+    ///
+    /// *(407 / 768 until REQ-620's Phase-5 verify, which added "other shell
+    /// syntax" to the paragraph — brace expansion, backslash escapes and
+    /// history expansion all pin and none of them was named — for a net 7
+    /// bytes on both shapes. Re-measured, not reasoned.)*
     ///
     /// **Mutation run for REQ-612:** dropping `repo_context` from the config
     /// rows below turns this red at the block self-check, naming the reason,

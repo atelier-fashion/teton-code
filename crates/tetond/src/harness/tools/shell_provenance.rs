@@ -553,8 +553,22 @@ const UNMODELLED: &[char] = &[
 /// ("and only the class"): it is a property of the type, not a rule a
 /// contributor has to keep. A sentence therefore names the *class* — "a quoted
 /// string" — and never the byte, the position or the word it was found in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum UnmodelledSyntax {
+/// (The `History` sentence used to read "a history expansion (`!`)", which was
+/// the one place that claim was false of its own sentences; the parenthetical
+/// went at the Phase-5 verify.)
+///
+/// # `pub(crate)`, and no ordering derive
+///
+/// Both narrowed at the Phase-5 verify. Nothing outside the crate names this
+/// type — the sentences leave as `&'static str` on a provenance, an event and
+/// a notice, never as a discriminant — and `PartialOrd`/`Ord` implied an order
+/// this type does not have: the only order that means anything here is
+/// [`UNMODELLED_ORDER`], which is a `&[UnmodelledSyntax]` and deliberately not
+/// the declaration order a derive would have exposed. A comparison operator
+/// that silently answered declaration order would be a second, wrong answer to
+/// the question `UNMODELLED_ORDER` exists to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnmodelledSyntax {
     /// `'` or `"` — a quoted string.
     Quote,
     /// A backtick, or `$(` — a command substitution.
@@ -585,7 +599,7 @@ pub enum UnmodelledSyntax {
 /// The order is severity-of-guessing: the classes at the top are the ones that
 /// would make a lexer of this grammar (quoting, substitution, expansion), and
 /// the ones at the bottom are the narrow spellings.
-const UNMODELLED_ORDER: &[UnmodelledSyntax] = &[
+pub(crate) const UNMODELLED_ORDER: &[UnmodelledSyntax] = &[
     UnmodelledSyntax::Quote,
     UnmodelledSyntax::Substitution,
     UnmodelledSyntax::Variable,
@@ -617,9 +631,7 @@ impl UnmodelledSyntax {
             Self::Glob => "the command uses a glob this classifier does not model",
             Self::Brace => "the command uses a brace expansion this classifier does not model",
             Self::Escape => "the command uses a backslash escape this classifier does not model",
-            Self::History => {
-                "the command uses a history expansion (`!`) this classifier does not model"
-            }
+            Self::History => "the command uses a history expansion this classifier does not model",
         }
     }
 
@@ -1598,6 +1610,18 @@ mod tests {
             "git for-each-ref refs/remotes/origin/feat",
             "which gh && echo installed - auth and network checked at run || echo not installed — branch-only",
             "test -f .adlc/ETHOS.md && echo present || echo absent — run /init",
+            // AC-9's flipped rows, added at the Phase-5 verify: two toolkit
+            // shapes that were `Unknown` before REQ-620 and are `Rooted` now.
+            // The AC says the rows that flip must "say why" — these two are
+            // that, and without them the table asserts only the shapes the
+            // toolkit had already been rewritten to avoid.
+            //
+            // The first is the redirect widening (BR-1): the `2>/dev/null` is
+            // lifted and `cat <path> || echo none` is the grammar it always
+            // was. The second is the pipeline widening (BR-4): `head` after a
+            // `|` reads the previous segment's output, not the root.
+            "cat .adlc/context/architecture.md 2>/dev/null || echo none",
+            "ls .adlc/partials/ | head",
         ] {
             let v = verdict(&root, rewritten);
             assert_eq!(
@@ -1608,15 +1632,43 @@ mod tests {
                 v.reason
             );
         }
-        for old in [
-            r#"test -s .adlc/ETHOS.md && cat .adlc/ETHOS.md || echo "No ethos found — run /init to vendor .adlc/ETHOS.md""#,
-            r#"cat .adlc/context/architecture.md 2>/dev/null || echo "No architecture context found""#,
-            r#"grep -rl 'status: draft\|status: approved' .adlc/specs/*/requirement.md 2>/dev/null | head -20 || echo "No active specs""#,
-            "git diff main --stat || echo No diff available",
-            "cat .adlc/templates/task-template.md || cat ~/.claude/skills/templates/task-template.md || echo none",
+        // The old shapes, still `Unknown` — and the first three **for the
+        // quote**, which is the assertion the Phase-5 verify added. Each of
+        // them also carries a `2>/dev/null` or a glob, so a table asserting
+        // only `Unknown` would have gone on passing had REQ-620's strip
+        // wrongly cleared them: the reason is what says the quote is what is
+        // still refusing the command.
+        for (old, class) in [
+            (
+                r#"test -s .adlc/ETHOS.md && cat .adlc/ETHOS.md || echo "No ethos found — run /init to vendor .adlc/ETHOS.md""#,
+                Some(UnmodelledSyntax::Quote),
+            ),
+            (
+                r#"cat .adlc/context/architecture.md 2>/dev/null || echo "No architecture context found""#,
+                Some(UnmodelledSyntax::Quote),
+            ),
+            (
+                r#"grep -rl 'status: draft\|status: approved' .adlc/specs/*/requirement.md 2>/dev/null | head -20 || echo "No active specs""#,
+                Some(UnmodelledSyntax::Quote),
+            ),
+            // These two carry no unmodelled byte at all: the first is refused
+            // on the `git` subcommand table and the second on a `~/` path
+            // outside the root, so neither has a class to name.
+            ("git diff main --stat || echo No diff available", None),
+            (
+                "cat .adlc/templates/task-template.md || cat ~/.claude/skills/templates/task-template.md || echo none",
+                None,
+            ),
         ] {
             let v = verdict(&root, old);
             assert_eq!(v.kind, VerdictKind::Unknown, "{old:?} should be Unknown");
+            if let Some(class) = class {
+                assert_eq!(
+                    v.reason,
+                    class.reason(),
+                    "{old:?} is refused on its quote, not on its redirect"
+                );
+            }
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2676,22 +2728,11 @@ mod tests {
     /// ending in `>`) — this reds, one of two, on the `ls>/dev/null` row.
     #[test]
     fn null_redirects_are_lifted_before_the_scan_and_the_split() {
-        // The lift itself: whole words out, separators standing.
-        for (command, residue, lifted) in [
-            ("ls 2>&1 && echo ok", "ls && echo ok", 1),
-            // C2: `&>` lifts to a bare `&`, which is what `dash` — `/bin/sh` on
-            // the Linux CI leg — reads the word's own `&` as.
-            ("ls &>/dev/null || echo no", "ls & || echo no", 1),
-            ("ls 2>&1; ls", "ls ; ls", 1),
-            ("ls 2>&1 | head", "ls | head", 1),
-            ("cat x 2> /dev/null", "cat x", 2),
-            ("2>/dev/null cat x", "cat x", 1),
-            // Must not fire: a lone `&` is a separator, not a redirect, and a
-            // form glued to its verb is a word this grammar does not model.
-            ("ls & ls", "ls & ls", 0),
-            ("ls>/dev/null", "ls>/dev/null", 0),
-            ("ls > out.txt", "ls > out.txt", 0),
-        ] {
+        // The lift itself: whole words out, separators standing. The rows
+        // are `shell_syntax`'s own (`STRIP_ROWS`), read from one place since
+        // the Phase-5 verify: this table and that one held six rows in common
+        // and had already come to disagree on `ls &>/dev/null || echo no`.
+        for (command, residue, lifted) in super::super::shell_syntax::STRIP_ROWS.iter().copied() {
             let stripped = strip_null_redirects(command);
             assert_eq!(
                 stripped.residue, residue,
@@ -2856,6 +2897,31 @@ mod tests {
         ("ls ZQX9!", UnmodelledSyntax::History),
     ];
 
+    /// One command per **adjacent** pair of [`UNMODELLED_ORDER`], carrying
+    /// exactly those two classes and answering the earlier one.
+    ///
+    /// Seven rows for eight entries. Adjacency is what makes the table a pin on
+    /// the whole order: any single transposition of the order moves exactly one
+    /// of these rows, whereas a table of far-apart pairs is cleared by
+    /// transpositions in between (Phase-5 verify — the two precedence rows this
+    /// replaced left `Brace`/`Escape` free to swap with nothing going red).
+    const ADJACENT_PAIRS: &[(&str, UnmodelledSyntax)] = &[
+        // Quote > Substitution
+        ("echo \"x\" `y`", UnmodelledSyntax::Quote),
+        // Substitution > Variable
+        ("echo $(x) $y", UnmodelledSyntax::Substitution),
+        // Variable > Redirect
+        ("echo $x > y", UnmodelledSyntax::Variable),
+        // Redirect > Glob
+        ("echo > y *", UnmodelledSyntax::Redirect),
+        // Glob > Brace
+        ("echo * {a,b}", UnmodelledSyntax::Glob),
+        // Brace > Escape
+        ("echo {a} \\x", UnmodelledSyntax::Brace),
+        // Escape > History
+        ("echo \\x !y", UnmodelledSyntax::Escape),
+    ];
+
     /// **BR-6 / AC-6: eight classes, eight distinct sentences, each naming only
     /// its own class — and none of them naming the command.**
     ///
@@ -2886,6 +2952,13 @@ mod tests {
     /// reports the glob) and on nothing else in the workspace, because the
     /// per-class rows are single-class by construction and every other suite
     /// asserts a `kind` rather than a sentence.
+    ///
+    /// **Re-measured at the Phase-5 verify, over every adjacent transposition:**
+    /// `Quote`↔`Substitution`, `Glob`↔`Brace`, `Brace`↔`Escape` and
+    /// `Escape`↔`History` were each swapped in turn and each reds **1**, this
+    /// test, on its own [`ADJACENT_PAIRS`] row. Before those rows existed the
+    /// `Brace`↔`Escape` swap reddened **nothing at all** — two precedence
+    /// asserts pinned two comparisons and left the rest of the order free.
     #[test]
     fn each_unmodelled_class_names_itself_and_nothing_else() {
         let root = redirect_root("classes");
@@ -2936,6 +3009,31 @@ mod tests {
             verdict(&root, "ls $ZQX9 > out").reason,
             UnmodelledSyntax::Variable.reason(),
             "a variable outranks a redirect"
+        );
+        // ... and every **adjacent** pair of the order, so the order is pinned
+        // along its whole length rather than at two points (Phase-5 verify).
+        // Two rows left seven of the eight entries free to move: swapping
+        // `Brace` and `Escape` reddened nothing at all.
+        //
+        // Each command carries exactly the two classes its row names, so the
+        // assertion is about which of *those two* wins and nothing else — and
+        // an adjacent pair is the only comparison that can distinguish two
+        // orders that differ by one transposition.
+        for (command, expected) in ADJACENT_PAIRS {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.reason,
+                expected.reason(),
+                "`{command}` holds two classes and {expected:?} comes first in \
+                 UNMODELLED_ORDER ({})",
+                v.reason
+            );
+        }
+        assert_eq!(
+            ADJACENT_PAIRS.len(),
+            UNMODELLED_ORDER.len() - 1,
+            "one row per adjacent pair, so a ninth class cannot ship with its \
+             position unasserted"
         );
 
         // 4. Content-freeness: the reason names the class and nothing the
@@ -3628,6 +3726,16 @@ mod tests {
             // A trailing separator leaves an empty last segment, carrying the
             // position it would have given a segment that was there.
             ("a |", vec![(First, "a "), (Piped, "")]),
+            // Must not fire, and the premise is what is being recorded
+            // (Phase-5 verify): a **leading** `|` makes the first segment
+            // empty and the second `Piped`, which would exempt `head -5` from
+            // the root walk on a command that reads nothing at all. It is safe
+            // because `sh` rejects `| head -5` outright — there is no producer,
+            // so nothing runs and there is nothing to leak. The row exists so
+            // that premise is written down rather than assumed: were the
+            // executor ever to accept the form, this is the segment that would
+            // need a `First`.
+            ("| head -5", vec![(First, ""), (Piped, " head -5")]),
         ] {
             assert_eq!(split_segments(command), expected, "`{command}`");
         }

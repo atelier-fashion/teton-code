@@ -268,8 +268,18 @@ impl ToolProvenance {
     /// [`Self::BoundaryTouch`] answers `None` on purpose: its cause is the
     /// *path*, which `privacy_block` already names, and a class sentence there
     /// would describe the wrong thing (ADR-620-4).
+    ///
+    /// `#[cfg(test)]` and `pub(crate)` since REQ-620's Phase-5 verify. It was
+    /// `pub`, and it has never had a production caller: the bridge that carries
+    /// the reason onward — `digest::tool_result_provenance` — matches the
+    /// variants directly and hands the payload to
+    /// `Provenance::mark_unknown_because`, because it must set the bit in the
+    /// same arm. So this is an assertion helper, and saying so is what stops a
+    /// second reader of the reason growing on the production path (LESSON-494's
+    /// rule, applied to a getter).
+    #[cfg(test)]
     #[must_use]
-    pub fn unknown_reason(&self) -> Option<&'static str> {
+    pub(crate) fn unknown_reason(&self) -> Option<&'static str> {
         match self {
             ToolProvenance::Unknown(reason) | ToolProvenance::UnknownWith(_, reason) => *reason,
             ToolProvenance::Sources(_) | ToolProvenance::BoundaryTouch => None,

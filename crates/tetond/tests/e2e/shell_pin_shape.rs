@@ -992,6 +992,20 @@ fn shell_allow_does_not_lift_a_boundary_hit_behind_a_redirect() {
 /// So the daemon half of AC-10 is asserted here, on what a client received, and
 /// the CLI half is the rendering of these same two answers.
 ///
+/// ## Which row carries the claim (recorded at the Phase-5 verify)
+///
+/// The `config/get` row is **session-independent**: it reports what the daemon
+/// is configured with, and it would answer identically on a session pinned for
+/// the rest of its life. It is here because doctor's provider lines come off
+/// that snapshot verbatim, and because AC-10 names doctor — not because it
+/// proves anything about *this* session. Read alone it would be a decoration.
+///
+/// The claim is carried by the other two rows, both of which are keyed on the
+/// session id: `route_decided`'s provider and reason for the turn after the
+/// cleared command, and `shell/override`'s `was_pinned: false` / `cause: null`.
+/// Those are what move when the strip stops working, and the inversion below is
+/// measured on them.
+///
 /// **Inversion (run 2026-09-09, red, restored):** with
 /// `shell_syntax::strip_null_redirects` made a no-op this test reds at the
 /// first `privacy_block` assertion — the residue still carries `>`, the command
@@ -1094,6 +1108,9 @@ fn a_cleared_shell_call_leaves_doctor_and_the_route_on_the_provider() {
     );
 
     // The doctor half: the providers doctor renders come off this snapshot.
+    // Session-independent by construction — see the doc comment. The claim
+    // about *this* session is the pair above.
+
     let snapshot = client.call("config/get", json!({}));
     let providers = snapshot["result"]["snapshot"]["providers"]
         .as_array()

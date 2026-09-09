@@ -428,6 +428,58 @@ fn split_leading_digit(word: &str) -> (Option<char>, &str) {
     }
 }
 
+/// The strip's residue table, read by both suites that assert it (Phase-5
+/// verify).
+///
+/// `(command, residue, lifted)`. It lived twice — here and in
+/// [`super::shell_provenance`]'s
+/// `null_redirects_are_lifted_before_the_scan_and_the_split` — with six rows in
+/// common and the two copies already disagreeing on
+/// `ls &>/dev/null || echo no` by the time the verify read them. One table, so
+/// a row added for one suite is a row the other runs too.
+///
+/// `#[cfg(test)]` and `pub(crate)`: it is a fixture, and the only reader
+/// outside this module is that sibling test.
+#[cfg(test)]
+pub(crate) const STRIP_ROWS: &[(&str, &str, usize)] = &[
+    ("ls 2>&1 && echo", "ls && echo", 1),
+    ("ls 2>&1 && echo ok", "ls && echo ok", 1),
+    ("ls 2>&1; ls", "ls ; ls", 1),
+    ("ls 2>&1 | head", "ls | head", 1),
+    // C2: `&>` is bash, and `dash` reads the `&` as a separator, so the
+    // separator is re-emitted where the word stood.
+    ("ls &>/dev/null || echo no", "ls & || echo no", 1),
+    (
+        "ls &>/dev/null grep -r SECRET . 1>&2",
+        "ls & grep -r SECRET .",
+        2,
+    ),
+    ("cat x &> /dev/null", "cat x &", 2),
+    ("cat x 2> /dev/null", "cat x", 2),
+    ("cat x 2> /dev/null; ls", "cat x ; ls", 2),
+    ("2>/dev/null cat x", "cat x", 1),
+    // Glued to a following separator: peeled, because the head parses whole
+    // and the tail is re-emitted for the splitter.
+    ("ls 2>&1|head", "ls |head", 1),
+    ("ls 2>&1;ls", "ls ;ls", 1),
+    ("cat x 2> /dev/null;ls", "cat x ;ls", 2),
+    // Must not fire: a lone `&` is a separator, not a redirect, and a form
+    // glued to its verb is a word this grammar does not model.
+    ("ls & ls", "ls & ls", 0),
+    ("ls>/dev/null", "ls>/dev/null", 0),
+    ("ls > out.txt", "ls > out.txt", 0),
+    ("ls 2> out", "ls 2> out", 0),
+    ("ls\ncat x", "ls\ncat x", 0),
+    ("ls 2>&1\ncat x", "ls\ncat x", 1),
+    ("ls</dev/null", "ls</dev/null", 0),
+    // The spaced arm's soundness rows: none of these heads parses as a
+    // redirect on its own, so peeling the separator off them would invent one
+    // the shell never saw.
+    ("ls >| /dev/null", "ls >| /dev/null", 0),
+    ("ls 2>& /dev/null", "ls 2>& /dev/null", 0),
+    ("ls 2>; /dev/null", "ls 2>; /dev/null", 0),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,39 +598,7 @@ mod tests {
     /// docs.
     #[test]
     fn the_strip_lifts_words_and_leaves_the_separators_standing() {
-        for (command, residue, lifted) in [
-            ("ls 2>&1 && echo", "ls && echo", 1),
-            ("ls 2>&1; ls", "ls ; ls", 1),
-            // C2: `&>` is bash, and `dash` reads the `&` as a separator, so the
-            // separator is re-emitted where the word stood.
-            ("ls &>/dev/null || echo no", "ls & || echo no", 1),
-            (
-                "ls &>/dev/null grep -r SECRET . 1>&2",
-                "ls & grep -r SECRET .",
-                2,
-            ),
-            ("cat x &> /dev/null", "cat x &", 2),
-            ("cat x 2> /dev/null", "cat x", 2),
-            ("cat x 2> /dev/null; ls", "cat x ; ls", 2),
-            ("2>/dev/null cat x", "cat x", 1),
-            // Glued to a following separator: peeled, because the head parses
-            // whole and the tail is re-emitted for the splitter.
-            ("ls 2>&1|head", "ls |head", 1),
-            ("ls 2>&1;ls", "ls ;ls", 1),
-            ("cat x 2> /dev/null;ls", "cat x ;ls", 2),
-            ("ls & ls", "ls & ls", 0),
-            ("ls > out.txt", "ls > out.txt", 0),
-            ("ls 2> out", "ls 2> out", 0),
-            ("ls\ncat x", "ls\ncat x", 0),
-            ("ls 2>&1\ncat x", "ls\ncat x", 1),
-            ("ls</dev/null", "ls</dev/null", 0),
-            // The spaced arm's soundness rows: none of these heads parses as a
-            // redirect on its own, so peeling the separator off them would
-            // invent one the shell never saw.
-            ("ls >| /dev/null", "ls >| /dev/null", 0),
-            ("ls 2>& /dev/null", "ls 2>& /dev/null", 0),
-            ("ls 2>; /dev/null", "ls 2>; /dev/null", 0),
-        ] {
+        for (command, residue, lifted) in STRIP_ROWS.iter().copied() {
             let stripped = strip_null_redirects(command);
             assert_eq!(
                 stripped.residue, residue,
