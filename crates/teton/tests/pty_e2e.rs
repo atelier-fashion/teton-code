@@ -1888,9 +1888,10 @@ fn a_permanent_acknowledgment_writes_its_row_only_where_presence_is_satisfied() 
 //
 // The fixture is the shape of the reported failure that opened this REQ: a
 // typed `/analyze` from a repository's own `.claude/skills`, measured at Stage
-// A against the local route's pair, on a route that declares no window —
-// `bound: local engine`, verdict `WindowUnknown`, remedy `BindTierRemote`. It
-// is the one cell of the reachability table the report actually landed in.
+// A against the local route's pair, on the local engine's own window —
+// `bound: local engine`, verdict `ExceedsWindow` (BUG-222: the engine's window
+// is a fact, and this body is past it), remedy `BindTierRemote`. It is the
+// cell of the reachability table the report actually landed in.
 //
 // The *figures* are no longer the report's own: REQ-590 gave the local tier a
 // derived pair (`BUDGET_PAIR`, 21,162 words / 63 KB on the 32,768-token
@@ -1999,13 +2000,16 @@ fn over_budget_skill_body() -> String {
 /// non-vacuity threshold all read it rather than restating it.
 const BUDGET_PAIR: &str = "21,162 words / 63 KB";
 
-/// BR-3's `WindowUnknown` clause. The route declares no window, so the daemon
-/// says it cannot promise — and names the backstop ADR-3 built for exactly this
+/// BR-3's `ExceedsWindow` clause on the local engine (BUG-222). The fixture
+/// body is a quarter past the word budget — max(26,452 × 3/2, bytes / 2) is
+/// past the engine's 32,768 — so the daemon says the send will blow the window
+/// the engine allocated, and names the backstop ADR-3 built for exactly this
 /// tier rather than promising the send will serve.
-const WINDOW_UNKNOWN_CLAUSE: &str = "This route declares no context window, so this daemon cannot \
-                                     promise the send will fit; if it does not, the turn ends \
-                                     with a context-length error rather than quietly losing \
-                                     anything.";
+const EXCEEDS_ENGINE_WINDOW_CLAUSE: &str = "This will blow the context window the engine \
+                                            allocated: proceeding will very likely be rejected \
+                                            by the engine, and the turn ends with a \
+                                            context-length error rather than quietly losing \
+                                            anything.";
 
 /// The remedy as ADR-1 binds it: the **concrete write**, never "raise the
 /// limit".
@@ -2072,7 +2076,7 @@ fn offer_sentence(measured: &str) -> String {
     format!(
         "`/analyze` (this repository's skill) does not fit this route's context budget: the body \
          alone, with the system prompt, comes to about {measured}, and the budget is \
-         {BUDGET_PAIR} ({LOCAL_BOUND}). {WINDOW_UNKNOWN_CLAUSE} The durable fix is to {}. \
+         {BUDGET_PAIR} ({LOCAL_BOUND}). {EXCEEDS_ENGINE_WINDOW_CLAUSE} The durable fix is to {}. \
          Send it whole this once, take the durable fix, both, or neither?",
         remedy_clause()
     )
@@ -2098,9 +2102,10 @@ fn decline_refusal(measured: &str) -> String {
 /// The four rows as the terminal draws them, numbered, in the daemon's order.
 ///
 /// The order is the daemon's and this test asserts the numbers, because BR-3's
-/// "leads with the remedy" **is** the order and nothing else (ADR-14): a
-/// `WindowUnknown` verdict does not lead with it, so the one-time override is
-/// row 1. A client that sorted these rows would silently undo the rule, and the
+/// "leads with the remedy" **is** the order and nothing else (ADR-14): an
+/// `ExceedsWindow` verdict leads with it — the daemon expects the send to fail,
+/// so the durable fix is row 1 and the one-time override row 2 (BUG-222 moved
+/// this fixture into that cell; it was `WindowUnknown`, override first). A client that sorted these rows would silently undo the rule, and the
 /// numbers are what a person types.
 ///
 /// Rows 2 and 3 carry [`remedy_clause`] whole — the same rendering the sentence
@@ -2109,10 +2114,10 @@ fn decline_refusal(measured: &str) -> String {
 /// the honest form of that for the two answers that make none.
 fn option_rows() -> [String; 4] {
     [
-        "  1) Send it whole this once, over budget — writes nothing, and nothing is remembered, \
+        format!("  1) Send it whole this once, and {}", remedy_clause()),
+        "  2) Send it whole this once, over budget — writes nothing, and nothing is remembered, \
          so the next invocation asks again"
             .to_owned(),
-        format!("  2) Send it whole this once, and {}", remedy_clause()),
         format!("  3) Do not send it, but {}", remedy_clause()),
         "  4) Do not send it — refuse the turn exactly as this route does today, and write nothing"
             .to_owned(),
@@ -2353,11 +2358,11 @@ fn measured_pair(transcript: &str) -> String {
 /// * a stray `y` — the reflex answer at a consent prompt, and the answer this
 ///   one *must not* read — re-asks instead of sending an oversized turn.
 ///
-/// The `WindowVerdict::Unknown` hedge is asserted **absent**. `WindowUnknown`
-/// ("this route declares no window") and `Unknown` ("this build cannot read the
-/// verdict") are different claims about a route, and ADR-13 exists because
-/// quietly relabelling one as the other would tell a user their provider
-/// declares no window on the strength of a parse failure.
+/// The `WindowVerdict::Unknown` hedge is asserted **absent**, and so is
+/// `WindowUnknown` ("this route declares no window"): the local engine's window
+/// is a fact (BUG-222), and ADR-13 exists because quietly relabelling a verdict
+/// would tell a user their route declares no window on the strength of a parse
+/// failure.
 #[test]
 fn the_over_budget_offer_is_drawn_at_a_terminal_in_the_daemons_own_words() {
     let mut parked = park_at_the_over_budget_offer("words");
@@ -2404,7 +2409,7 @@ fn the_over_budget_offer_is_drawn_at_a_terminal_in_the_daemons_own_words() {
     );
 
     // The four rows, verbatim, numbered, in the daemon's order — and
-    // `WindowUnknown` does not lead with the remedy, so the override is row 1.
+    // `ExceedsWindow` leads with the remedy, so the durable fix is row 1.
     let rows = option_rows();
     let at = |needle: &str| {
         asking
@@ -2461,9 +2466,9 @@ fn the_over_budget_offer_is_drawn_at_a_terminal_in_the_daemons_own_words() {
     // quoted, character for character, and the budget it was measured against.
     assert!(
         after.contains(&format!(
-            "{ACCEPTED_NOTICE_HEAD}{measured} against a budget of {BUDGET_PAIR}, on a route that \
-             declares no window; measured from its body, before any dynamic-context command ran. \
-             Nothing was shortened."
+            "{ACCEPTED_NOTICE_HEAD}{measured} against a budget of {BUDGET_PAIR}, past the \
+             route's context window; measured from its body, before any dynamic-context command \
+             ran. Nothing was shortened."
         )),
         "the accepted record must quote the offer's own figures; transcript:\n{after}"
     );
@@ -2493,8 +2498,8 @@ fn the_over_budget_offer_is_drawn_at_a_terminal_in_the_daemons_own_words() {
 fn each_over_budget_answer_settles_the_turn_the_way_its_label_said() {
     // (typed answer, tag, sends, writes)
     let rows: &[(&str, &str, bool, bool)] = &[
-        ("1", "once", true, false),
-        ("2", "both", true, true),
+        ("1", "both", true, true),
+        ("2", "once", true, false),
         ("3", "fix", false, true),
         ("4", "no", false, false),
         // Not an id — the prompt's own parenthetical, kept.

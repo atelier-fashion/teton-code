@@ -320,8 +320,11 @@ to serve" is too strong for this band: the prompt fits the declared window but l
 little or no room for the *reply*, because the reservation it is eating is precisely what
 the budget set aside for generation. On `Window`/`UserCap` + `FitsWindow`, the sentence
 must say the prompt fits the declared window but may leave little room for the response —
-never an unqualified promise. `LocalEngine`/`DefaultUnknown` are unaffected (no window
-fact), and `ExceedsWindow` is unaffected (already the strong warning).
+never an unqualified promise. `DefaultUnknown` is unaffected (no window fact), and
+`ExceedsWindow` is unaffected (already the strong warning). `LocalEngine` was listed as
+unaffected here until BUG-222: its window is the engine's allocation, so it reaches both
+verdicts and carries its own two sentences, worded "the engine allocated" because the
+route declares nothing.
 
 ### ADR-16 — The daemon words the offer; the client only presents it
 
@@ -406,7 +409,7 @@ any other cell passes vacuously (LESSON-520):
 
 | Bound | Reachable verdicts | Remedy (BR-7) |
 |---|---|---|
-| `LocalEngine` | `WindowUnknown` only | `BindTierRemote` |
+| `LocalEngine` | `FitsWindow`, `ExceedsWindow` (BUG-222; was `WindowUnknown` only) | `BindTierRemote` |
 | `DefaultUnknown` | `WindowUnknown` only | `DeclareWindow` |
 | `Window` | `FitsWindow`, `ExceedsWindow` | `RaiseWindow` |
 | `UserCap` | `FitsWindow`, `ExceedsWindow` | `RaiseCap` |

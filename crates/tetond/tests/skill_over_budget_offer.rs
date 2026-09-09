@@ -74,7 +74,7 @@
 //!
 //! | Bound | Verdict | Where |
 //! |---|---|---|
-//! | `LocalEngine` | `WindowUnknown` | AC-1, AC-6, AC-7 |
+//! | `LocalEngine` | `FitsWindow`, `ExceedsWindow` | AC-1, AC-6, AC-7 (BUG-222) |
 //! | `DefaultUnknown` | `WindowUnknown` | AC-1's wire leg, AC-6, AC-7, AC-18 |
 //! | `Window` | `FitsWindow` | AC-6, AC-7, AC-7a |
 //! | `Window` | `ExceedsWindow` | AC-6 |
@@ -159,6 +159,18 @@ const FITS_WINDOW_CLAUSE: &str =
     "The prompt fits the context window this route declares; it is this daemon's own budget that \
      refused it.";
 
+/// BR-3's `FitsWindow` clause on the local engine, whose window was allocated,
+/// not declared (BUG-222).
+const FITS_ENGINE_WINDOW_INTO_THE_RESERVATION: &str =
+    "The prompt fits the context window the engine allocated, but the budget it went past is \
+     the room held back for the reply — so it may leave the response very little to work with.";
+
+/// BR-3's `ExceedsWindow` clause on the local engine (BUG-222).
+const EXCEEDS_ENGINE_WINDOW_CLAUSE: &str =
+    "This will blow the context window the engine allocated: proceeding will very likely be \
+     rejected by the engine, and the turn ends with a context-length error rather than quietly \
+     losing anything.";
+
 /// BR-3's `WindowUnknown` clause.
 const WINDOW_UNKNOWN_CLAUSE: &str =
     "This route declares no context window, so this daemon cannot promise the send will fit; if \
@@ -191,9 +203,11 @@ const CLOSING_ONE_TIME_ONLY: &str = "Send it whole this once, or refuse the turn
 
 /// Every clause BR-3's arms can produce, so a leg that pins one can assert the
 /// absence of the rest rather than only the presence of its own.
-const EVERY_VERDICT_CLAUSE: [&str; 4] = [
+const EVERY_VERDICT_CLAUSE: [&str; 6] = [
     EXCEEDS_WINDOW_CLAUSE,
+    EXCEEDS_ENGINE_WINDOW_CLAUSE,
     FITS_WINDOW_INTO_THE_RESERVATION,
+    FITS_ENGINE_WINDOW_INTO_THE_RESERVATION,
     FITS_WINDOW_CLAUSE,
     WINDOW_UNKNOWN_CLAUSE,
 ];
@@ -744,8 +758,8 @@ const RECIPE_MODEL: &str = "kimi-k3";
 const UNRECOGNIZED_MODEL: &str = "claude-opus-4";
 
 /// Every tier on the local engine: the route the reported `/analyze` failure ran
-/// on. `bound: local engine`, and the reachability table gives it no verdict but
-/// `WindowUnknown`.
+/// on. `bound: local engine`; since BUG-222 the reachability table gives it the
+/// engine's window to be inside or past, never `WindowUnknown`.
 fn local_route() -> String {
     let mut cfg = String::from("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n");
     for tier in ["reflex", "scan", "build", "think"] {
@@ -1187,8 +1201,10 @@ async fn the_reported_analyze_measurement_serves_on_both_halves_of_the_local_pai
     assert_eq!(offer.bound, BudgetBound::LocalEngine, "the reported route");
     assert_eq!(
         offer.verdict,
-        WindowVerdict::WindowUnknown,
-        "the local tier declares no window, so no other verdict is reachable"
+        WindowVerdict::FitsWindow,
+        "one byte over the pair is well inside the engine's 32,768-token window — \
+         max(4,097 × 3/2, 63,489 / 2) = 31,744 — and the verdict is the engine's \
+         window fact, not a claim that none exists (BUG-222)"
     );
     assert!(
         offer.measured_tokens < offer.budget_tokens,
@@ -1256,7 +1272,7 @@ async fn the_reported_analyze_measurement_serves_on_both_halves_of_the_local_pai
         "the accepted record carries the pair `skill_fit` measured, not a second \
          measurement of a shortened expansion"
     );
-    assert_eq!(record[0].window_verdict, WindowVerdict::WindowUnknown);
+    assert_eq!(record[0].window_verdict, WindowVerdict::FitsWindow);
     assert!(
         published
             .iter()
@@ -1689,10 +1705,12 @@ async fn no_unanswered_offer_resolves_to_proceed() {
 async fn each_reachable_window_verdict_is_offered_and_pins_its_own_sentence() {
     let cells: [(&str, BudgetBound, WindowVerdict, &str); 7] = [
         (
-            "local engine / window unknown",
+            // `over_the_local_pair` is a quarter past the word half, so its
+            // claimed provider tokens clear the engine's 32,768 too (BUG-222).
+            "local engine / exceeds",
             BudgetBound::LocalEngine,
-            WindowVerdict::WindowUnknown,
-            WINDOW_UNKNOWN_CLAUSE,
+            WindowVerdict::ExceedsWindow,
+            EXCEEDS_ENGINE_WINDOW_CLAUSE,
         ),
         (
             "unknown window / window unknown",
@@ -1781,7 +1799,7 @@ async fn each_reachable_window_verdict_is_offered_and_pins_its_own_sentence() {
 /// The provider is returned alongside so the caller keeps the socket alive.
 fn route_for(bound: BudgetBound, verdict: WindowVerdict) -> (Fixture, Option<MockProvider>) {
     match (bound, verdict) {
-        (BudgetBound::LocalEngine, WindowVerdict::WindowUnknown) => (
+        (BudgetBound::LocalEngine, WindowVerdict::ExceedsWindow) => (
             Fixture::new(Spec::new("v6loc", local_route(), over_the_local_pair())),
             None,
         ),

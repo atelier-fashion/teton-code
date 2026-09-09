@@ -131,8 +131,9 @@ AC-9's "nobody was asked and nobody decided" distinction, kept where it already 
     band IS the generation reservation — the sentence says the prompt fits the declared
     window but may leave the reply little room. On `RedactScan` the band is the egress byte
     clamp, and the sentence claims neither fact.
-  - `WindowUnknown` — no window fact exists (the local tier, or a remote provider with
-    `max_context = 0`): offer, stating that the daemon **cannot promise** the send will
+  - `WindowUnknown` — no window fact exists (a remote provider with `max_context = 0`;
+    the local tier was listed here until BUG-222 — its engine-allocated window is a
+    fact, and the sentence saying otherwise was false): offer, stating that the daemon **cannot promise** the send will
     fit, with the typed `context_length_exceeded` outcome as the backstop.
     **Correction (architecture phase):** that outcome is produced today only on the
     *remote* path (`completion.rs:535`/`:1259`); the local engine's failure becomes
@@ -151,7 +152,7 @@ AC-9's "nobody was asked and nobody decided" distinction, kept where it already 
 
   | Bound | Reachable verdicts |
   |---|---|
-  | `LocalEngine` | `WindowUnknown` only |
+  | `LocalEngine` | `FitsWindow`, `ExceedsWindow` — **amended by BUG-222**: the engine's window is a fact since REQ-590/REQ-616, compared against as the engine's allocation and worded apart ("the engine allocated", not "this route declares"). Originally `WindowUnknown` only. |
   | `DefaultUnknown` | `WindowUnknown` only |
   | `Window` | `FitsWindow`, `ExceedsWindow` |
   | `UserCap` | `FitsWindow`, `ExceedsWindow` |

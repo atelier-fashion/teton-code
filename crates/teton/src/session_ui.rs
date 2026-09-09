@@ -1430,12 +1430,25 @@ fn stage_words(stage: SkillStage) -> &'static str {
 /// a claim about this binary, and only the second is true of an
 /// `#[serde(other)]` value. Collapsing them would have an old client state a
 /// routing fact it has no evidence for.
-fn verdict_words(verdict: WindowVerdict) -> &'static str {
-    match verdict {
-        WindowVerdict::FitsWindow => "inside the window this route declares",
-        WindowVerdict::ExceedsWindow => "past the window this route declares",
-        WindowVerdict::WindowUnknown => "on a route that declares no window",
-        WindowVerdict::Unknown => "against a window verdict this build cannot read",
+///
+/// The local engine's window was allocated, not declared, so where the bound
+/// is known the two window-bearing verdicts say which (BUG-222) — the same
+/// distinction the daemon's offer sentences draw. The `accepted` event carries
+/// no bound, so its line says "the route's window" and claims neither.
+fn verdict_words(verdict: WindowVerdict, bound: Option<BudgetBound>) -> &'static str {
+    match (verdict, bound) {
+        (WindowVerdict::FitsWindow, Some(BudgetBound::LocalEngine)) => {
+            "inside the window the engine allocated"
+        }
+        (WindowVerdict::ExceedsWindow, Some(BudgetBound::LocalEngine)) => {
+            "past the window the engine allocated"
+        }
+        (WindowVerdict::FitsWindow, Some(_)) => "inside the window this route declares",
+        (WindowVerdict::ExceedsWindow, Some(_)) => "past the window this route declares",
+        (WindowVerdict::FitsWindow, None) => "inside the route's context window",
+        (WindowVerdict::ExceedsWindow, None) => "past the route's context window",
+        (WindowVerdict::WindowUnknown, _) => "on a route that declares no window",
+        (WindowVerdict::Unknown, _) => "against a window verdict this build cannot read",
     }
 }
 
@@ -1489,7 +1502,7 @@ fn format_context_compacted(compacted: &ContextCompacted) -> String {
 /// The `skill_refused_no_room` notice (REQ-618 BR-4).
 fn format_refused_no_room(refused: &SkillRefusedNoRoom) -> String {
     format!(
-        "no room: skill `{}` fits this route's budget ({} B against {} B) but would take more          than {}% of it, leaving the turn nothing to work with",
+        "no room: skill `{}` fits this route's budget ({} B against {} B) but would take more than {}% of it, leaving the turn nothing to work with",
         refused.skill, refused.body_bytes, refused.budget_bytes, refused.room_percent,
     )
 }
@@ -1525,7 +1538,7 @@ fn format_over_budget_offered(offered: &SkillOverBudgetOffered) -> String {
             offered.bound,
             false,
         ),
-        verdict_words(offered.window_verdict),
+        verdict_words(offered.window_verdict, Some(offered.bound)),
         remedy_words(offered.remedy_kind),
     )
 }
@@ -1544,7 +1557,7 @@ fn format_over_budget_accepted(accepted: &SkillOverBudgetAccepted) -> String {
         slash::source_word(accepted.source),
         figure_pair(accepted.measured_tokens, accepted.measured_bytes),
         figure_pair(accepted.budget_tokens, accepted.budget_bytes),
-        verdict_words(accepted.window_verdict),
+        verdict_words(accepted.window_verdict, None),
         stage_words(accepted.stage),
     )
 }
@@ -12705,7 +12718,7 @@ mod over_budget_tests {
             "…and says outright which claim it is not making:\n{drawn}"
         );
         assert!(
-            !drawn.contains(verdict_words(WindowVerdict::WindowUnknown)),
+            !drawn.contains(verdict_words(WindowVerdict::WindowUnknown, None)),
             "…and never borrows `WindowUnknown`'s words:\n{drawn}"
         );
 
@@ -12728,8 +12741,8 @@ mod over_budget_tests {
     /// `.contains` assertion anywhere can pass for the wrong one (ADR-13).
     #[test]
     fn the_unreadable_verdict_and_the_undeclared_window_are_different_sentences() {
-        let hedge = verdict_words(WindowVerdict::Unknown);
-        let undeclared = verdict_words(WindowVerdict::WindowUnknown);
+        let hedge = verdict_words(WindowVerdict::Unknown, None);
+        let undeclared = verdict_words(WindowVerdict::WindowUnknown, None);
         assert_ne!(hedge, undeclared);
         assert!(!hedge.contains(undeclared) && !undeclared.contains(hedge));
         assert!(
@@ -12949,7 +12962,7 @@ mod over_budget_tests {
         assert!(line.contains("(project)"), "ASSUME-018 here too: {line}");
         assert!(line.contains("Nothing was shortened"), "{line}");
         assert!(
-            line.contains(verdict_words(WindowVerdict::ExceedsWindow)),
+            line.contains(verdict_words(WindowVerdict::ExceedsWindow, None)),
             "what the user was told before they answered: {line}"
         );
         assert!(
