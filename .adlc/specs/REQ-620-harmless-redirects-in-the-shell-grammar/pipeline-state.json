@@ -3,12 +3,13 @@
   "branch": "feat/REQ-620-harmless-redirects-in-the-shell-grammar",
   "startedAt": "2026-09-09T20:13:59Z",
   "completed": false,
-  "currentPhase": 4,
+  "currentPhase": 5,
   "completedPhases": [
     0,
     1,
     2,
-    3
+    3,
+    4
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -31,6 +32,11 @@
       "phase": 3,
       "name": "Validate Architecture & Tasks",
       "completedAt": "2026-09-09T20:15:07Z"
+    },
+    {
+      "phase": 4,
+      "name": "Implement (TASK-403 1f7c381, TASK-406 1218aaf, TASK-404 b3adedd, TASK-405 8b07987, TASK-407 3b7311b, TASK-408 8671fb8)",
+      "completedAt": "2026-09-09T22:15:58Z"
     }
   ],
   "repos": {
@@ -52,13 +58,24 @@
     "teton-code"
   ],
   "phase4": {
-    "currentTask": "TASK-403",
-    "completedTasks": [],
-    "failedTasks": [],
-    "inFlight": [
+    "currentTask": null,
+    "completedTasks": [
       "TASK-403",
-      "TASK-406"
-    ]
+      "TASK-406",
+      "TASK-404",
+      "TASK-405",
+      "TASK-407",
+      "TASK-408"
+    ],
+    "failedTasks": [],
+    "inFlight": []
   },
-  "conflictsResolved": []
+  "conflictsResolved": [],
+  "notes": [
+    "TASK-403 landed 1f7c381. BR-5's 'strip runs after the opaque-verb check' reads against ADR-620-2's strip-first order; observables agree. Reconcile BR-5's wording in TASK-408.",
+    "TASK-406 landed 1218aaf: contract 407 B; REDACT_BODY_OVERHEAD_BYTES 23->24 KiB; REDACT_SCANNABLE_CONTEXT_BYTES 184,265->183,334; margins 105->721 / 152->768; ASSUME-048. Upgrade note for CHANGELOG (TASK-408).",
+    "TASK-404 landed b3adedd. BR-4's 'no path argument' is implemented as 'names no existing file' (paths.is_empty() || !named_an_existing_file), required by its own rows (`git log | grep fix`). Reword BR-4 in TASK-408.",
+    "TASK-405 landed 8b07987. AC-6's 'no event carries command bytes' holds over the non-permitted carriers only (tool_call title and permission_request quote the command by REQ-611 BR-4 design); a typed /skill pin does not carry the class (Provenance::User has no reason field) \u2014 follow-up. Reword AC-6 in TASK-408; file the typed-skill follow-up there.",
+    "TASK-407 landed 3b7311b. AC-10 lives in shell_pin_shape.rs (no doctor fixture in model_identity.rs; doctor is daemon-scoped). AC-1's literal command is discharged at unit level (TASK-403)."
+  ]
 }
