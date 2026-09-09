@@ -124,7 +124,12 @@ impl CapturingSink {
 }
 
 impl PrivacyEventSink for CapturingSink {
-    fn privacy_block(&self, session_id: Option<SessionId>, block: PrivacyBlock) {
+    fn privacy_block(
+        &self,
+        session_id: Option<SessionId>,
+        block: PrivacyBlock,
+        _unknown_reason: Option<&'static str>,
+    ) {
         self.events.lock().unwrap().push((session_id, block));
     }
     // Required no-op: this AC-9 fixture captures blocks, not rejections.
@@ -551,8 +556,8 @@ fn sole_identity(outcome: &tetond::harness::ToolOutcome) -> String {
             assert_eq!(ids.len(), 1, "expected exactly one source, got {ids:?}");
             ids[0].to_owned()
         }
-        tetond::harness::ToolProvenance::Unknown
-        | tetond::harness::ToolProvenance::UnknownWith(_) => {
+        tetond::harness::ToolProvenance::Unknown(_)
+        | tetond::harness::ToolProvenance::UnknownWith(..) => {
             panic!("a first-party file tool must never report unknown provenance")
         }
         // REQ-614: only `shell` can produce this, and this matrix covers the
@@ -841,7 +846,7 @@ async fn teton_docs_serves_its_topic_without_reaching_the_transport() {
             "`{DOCS_TOOL_NAME}` claimed a source it never opened: {:?}",
             ids.iter().map(ProvenanceId::as_str).collect::<Vec<_>>()
         ),
-        ToolProvenance::Unknown | ToolProvenance::UnknownWith(_) => {
+        ToolProvenance::Unknown(_) | ToolProvenance::UnknownWith(..) => {
             panic!("a body compiled into this binary has knowable provenance")
         }
         // REQ-614: `docs` names no path at all, so a boundary touch is

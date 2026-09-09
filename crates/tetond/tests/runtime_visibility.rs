@@ -180,6 +180,13 @@ const PUBLIC: &[&str] = &[
     "taint.rs::mark",
     "taint.rs::new",
     "taint.rs::pins",
+    // REQ-620. A **reader**, and the other half of `cause`: a pinned session's
+    // recorded cause and the content-free class sentence that explains it are
+    // one record, and reading them apart is how the two come to disagree
+    // (LESSON-653). `pub` rather than `pub(super)` for the reason `cause` is:
+    // it is the record's accessor, not a setter — the REQ's writers
+    // (`mark`, `mark_escalating`) keep the visibility they had.
+    "taint.rs::reason",
     "taint.rs::try_mark",
     "views.rs::BoundaryPosture",
     "views.rs::builtin_count",
@@ -205,7 +212,11 @@ const PUBLIC: &[&str] = &[
 /// three, `cause` twice. Every one is a reader or a type — the REQ's one new
 /// setter, `ShellTaintOverride::lift`, is `pub(super)` and therefore does not
 /// appear here, which is the property this test exists to protect.
-const PUBLIC_DECLARATIONS: usize = 29;
+///
+/// 29 -> 30 at REQ-620: one new unique name, `SessionTaint::reason`, the
+/// reader for the class sentence a pin now records beside its cause. A reader,
+/// like every other name this file admits.
+const PUBLIC_DECLARATIONS: usize = 30;
 
 fn runtime_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime")

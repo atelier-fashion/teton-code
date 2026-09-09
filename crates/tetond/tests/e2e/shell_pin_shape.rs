@@ -318,6 +318,142 @@ fn an_opaque_shell_result_pins_with_unknown_shell_and_says_so() {
     assert_no_boundary_bytes();
 }
 
+/// A string that exists only inside the model's `shell` command, so "the pin
+/// says nothing the command said" can be asserted rather than reasoned about
+/// (LESSON-624's egress-capture posture, applied to an event).
+const COMMAND_MARKER: &str = "ZQX9MARKER";
+
+/// **REQ-620 BR-6 / AC-6, at the wire.** The pin names the syntax class that
+/// refused the command, and carries no byte of the command itself.
+///
+/// The model runs `ls 'ZQX9MARKER'`. The quote is unmodelled, so the classifier
+/// refuses it as `unknown`, the result enters context opaque, the next remote
+/// send is blocked, and the session pins. What is new is the pin's `reason`:
+/// before REQ-620 the user was told `cause: unknown_shell` and nothing about
+/// which byte to change — the 2026-09-09 session's whole complaint.
+///
+/// Three claims:
+///
+/// 1. `session_pinned.reason` is the **quote** class's sentence, verbatim.
+/// 2. `session_pinned` for the pin still carries everything BUG-214 bought —
+///    the liftable cause, the remedy, the budget — so the field is additive at
+///    the wire as well as in the type.
+/// 3. The marker appears in **no privacy event**: not on `session_pinned`, not
+///    on `privacy_block`, not on `provenance_rejected`. The two events that do
+///    carry it are the ones whose whole job is to show the user what the model
+///    asked to run — `session_update`'s `tool_call` title (`describe_call`,
+///    REQ-611 BR-4) and the `permission_request` the user answers, neither of
+///    which could do its job without quoting the command. The assertion names
+///    the permitted carriers rather than excluding a list, so a *new* event
+///    quoting the command fails here rather than slipping past.
+///
+/// **Mutation (run 2026-09-09, red, reverted):** have the sink pass `None`
+/// instead of the block's reason for an `unknown_shell` cause — claim 1 reds,
+/// alone in this binary.
+///
+/// Claim 3 has no mutation and is recorded as a **ratchet** rather than as one
+/// that was run (LESSON-569: do not claim a mutation you did not run). The leak
+/// it forbids is unconstructible today — the reason is a `&'static str` from a
+/// closed set for its whole journey and is owned only at the wire seam — so the
+/// only way to fail it is to widen that type, which is exactly the change this
+/// assertion exists to catch.
+#[test]
+fn a_pin_carries_the_class_that_refused_and_no_command_bytes() {
+    const QUOTE_CLASS: &str = "the command uses a quoted string this classifier does not model";
+
+    let provider = MockProvider::start(
+        vec![MockResponse::ok(openai_turn(
+            "Listing one thing.",
+            Some(("c1", "shell", r#"{"command":"ls 'ZQX9MARKER'"}"#)),
+            120,
+            20,
+        ))],
+        MockResponse::ok(openai_turn("Should never be reached.", None, 10, 5)),
+    );
+    let ws = Workspace::new("pin-class");
+    ws.write_config(&config_for(&provider));
+    let script = ws.write_script(&local_done_script());
+    let daemon = Daemon::spawn(&ws, probe_16gb_with_local(script));
+    let mut client = daemon.connect();
+    let session = client.create_session("structured", Some("implement"));
+
+    let first = client.prompt(&session, "Run a quick shell check.");
+    assert_eq!(
+        first["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "{first}"
+    );
+    client.drain_events(Duration::from_millis(300));
+
+    // 1 + 2. The announcement, with the class beside the cause.
+    let pinned = client.events_named("session_pinned");
+    assert_eq!(
+        pinned.len(),
+        1,
+        "a pinned session announces itself once: {:?}",
+        client.event_names()
+    );
+    let pinned = pinned[0];
+    assert_eq!(pinned["cause"].as_str(), Some("unknown_shell"), "{pinned}");
+    assert_eq!(
+        pinned["reason"].as_str(),
+        Some(QUOTE_CLASS),
+        "the pin names the class that refused the command: {pinned}"
+    );
+    assert_eq!(pinned["liftable"].as_bool(), Some(true), "{pinned}");
+    assert_eq!(
+        pinned["remedy"]["command"].as_str(),
+        Some("/shell allow"),
+        "{pinned}"
+    );
+    assert!(pinned["budget_tokens"].is_u64(), "{pinned}");
+    assert_eq!(
+        client.events_named("privacy_block")[0]["path"].as_str(),
+        Some(UNKNOWN_PROVENANCE_PATH),
+        "fixture: the pin came from the unknown-provenance sentinel"
+    );
+
+    // 3. Where the command's bytes went, exhaustively. Two surfaces exist to
+    //    show the user what the model asked to run; nothing else may quote it.
+    const MAY_QUOTE_THE_COMMAND: &[&str] = &["session_update/tool_call", "permission_request/-"];
+    let carriers: Vec<String> = client
+        .events()
+        .iter()
+        .filter(|e| e.to_string().contains(COMMAND_MARKER))
+        .map(|e| {
+            format!(
+                "{}/{}",
+                e["event"].as_str().unwrap_or("?"),
+                e["update"]["kind"].as_str().unwrap_or("-")
+            )
+        })
+        .collect();
+    assert!(
+        carriers
+            .iter()
+            .all(|c| MAY_QUOTE_THE_COMMAND.contains(&c.as_str())),
+        "only the surfaces that show the user what was asked may quote the \
+         command; these also did: {carriers:?}"
+    );
+    assert!(
+        !carriers.is_empty(),
+        "fixture: the marker must have reached the daemon at all — an empty \
+         carrier list would make this assertion vacuous"
+    );
+    //    And the privacy chain by name, so the check above cannot go quiet if
+    //    the event vocabulary is renamed out from under it.
+    for name in ["session_pinned", "privacy_block", "provenance_rejected"] {
+        for event in client.events_named(name) {
+            assert!(
+                !event.to_string().contains(COMMAND_MARKER),
+                "`{name}` must carry no byte of the command: {event}"
+            );
+        }
+    }
+
+    assert_no_boundary_bytes();
+}
+
 /// **AC-1 — the benign path.** `ls -la` names no file and reads nothing the
 /// classifier cannot see, so REQ-614 proves it `Rooted`: the result enters
 /// context pinned to nothing, the loop's next send **leaves**, no block is
@@ -628,6 +764,14 @@ fn a_boundary_read_after_a_lift_escalates_the_pin_and_nothing_later_leaves() {
     );
     assert_eq!(pinned[1]["liftable"].as_bool(), Some(false));
     assert_eq!(pinned[1]["remedy"]["kind"].as_str(), Some("none"));
+    // REQ-620 BR-6's must-not-fire half: a pin whose cause is a *path* carries
+    // no class sentence — the block beside it names the file, and the earlier
+    // liftable pin's class does not survive the escalation.
+    assert!(
+        pinned[1].get("reason").is_none(),
+        "a boundary_hit pin says nothing about shell syntax: {:?}",
+        pinned[1]
+    );
 
     let refused = client.call("shell/override", json!({ "session_id": session }));
     assert_eq!(

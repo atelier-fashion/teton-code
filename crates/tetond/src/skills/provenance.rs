@@ -54,6 +54,17 @@ pub struct ExpansionProvenance {
     /// itself had no identity to mint. Fail-closed at egress, liftable by
     /// `/shell allow` (REQ-614 BR-5).
     pub unknown: bool,
+    /// Why, when a classifier said so (REQ-620 BR-6): the `UnmodelledSyntax`
+    /// class the **first** unknown preamble was refused on.
+    ///
+    /// Beside [`Self::unknown`] rather than replacing it, for the reason the
+    /// egress `Provenance` carries the same pair: the bit is what blocks, and
+    /// the sentence is what the pin notice says. `None` is a real state — a
+    /// skill file that would not mint is unknown with no command behind it —
+    /// and [`Self::into_tool_provenance`] supplies the generic reason there,
+    /// so the bit can never be lost on its way to
+    /// [`ToolProvenance::from_bits`].
+    pub unknown_reason: Option<&'static str>,
     /// Some contributing preamble named a boundary file **outside** the session
     /// root — no id exists for a glob to match, so a bit is the only carrier
     /// (LESSON-623). Fail-closed at egress and **not** liftable: the pin is
@@ -71,7 +82,8 @@ impl ExpansionProvenance {
     /// skill expansion and a `shell` result mean the same thing to egress and
     /// three hand-written orderings of one mapping are how one of them comes to
     /// be laxer (REQ-614 BR-10). This function's whole job is to say that an
-    /// [`ExpansionProvenance`]'s three fields *are* those three bits.
+    /// [`ExpansionProvenance`]'s fields *are* those bits — and, since REQ-620,
+    /// that the unknown bit travels with the class that caused it.
     ///
     /// # What the shared mapping does with them
     ///
@@ -95,7 +107,17 @@ impl ExpansionProvenance {
     /// nothing and pins nothing.
     #[must_use]
     pub fn into_tool_provenance(self) -> ToolProvenance {
-        ToolProvenance::from_bits(self.sources, self.unknown, self.boundary_touch)
+        // REQ-620 ADR-620-4: `Some(reason)` **is** the unknown bit, so the
+        // fallback is not cosmetic — an unknown with no classifier behind it
+        // (a skill file that would not mint) must still arrive as one.
+        ToolProvenance::from_bits(
+            self.sources,
+            self.unknown.then(|| {
+                self.unknown_reason
+                    .unwrap_or(crate::harness::UNCLASSIFIED_REACH_REASON)
+            }),
+            self.boundary_touch,
+        )
     }
 }
 
@@ -191,7 +213,13 @@ pub fn fold_expansion(identity: SkillIdentity, runs: &[PreambleRun]) -> Expansio
                 folded.boundary_touch |=
                     run.verdict.out_of_root_touch || run.verdict.sources.is_empty();
             }
-            VerdictKind::Unknown => folded.unknown = true,
+            // REQ-620 BR-6: the class the classifier named, first one wins —
+            // the reason is what the user is told, and a later preamble's
+            // refusal does not rewrite the first one's story.
+            VerdictKind::Unknown => {
+                folded.unknown = true;
+                folded.unknown_reason = folded.unknown_reason.or(run.verdict.unknown_reason());
+            }
         }
     }
     folded
@@ -554,6 +582,7 @@ mod tests {
     /// typed shared mapping rather than three hand-written matches.
     #[test]
     fn the_tool_provenance_mapping_is_the_shell_tools() {
+        const GLOB_CLASS: &str = "the command uses a glob this classifier does not model";
         let sources: BTreeSet<_> = [fixture_id("README.md")].into_iter().collect();
         let secret: BTreeSet<_> = [fixture_id("secrets/prod.env")].into_iter().collect();
 
@@ -561,6 +590,7 @@ mod tests {
             ExpansionProvenance {
                 sources: sources.clone(),
                 unknown: false,
+                unknown_reason: None,
                 boundary_touch: false,
             }
             .into_tool_provenance(),
@@ -571,10 +601,11 @@ mod tests {
             ExpansionProvenance {
                 sources: secret.clone(),
                 unknown: true,
+                unknown_reason: Some(GLOB_CLASS),
                 boundary_touch: false,
             }
             .into_tool_provenance(),
-            ToolProvenance::UnknownWith(secret),
+            ToolProvenance::UnknownWith(secret, Some(GLOB_CLASS)),
             "an unknown expansion still names what it proved"
         );
         // And an unknown expansion with nothing proved is still the bare
@@ -583,15 +614,32 @@ mod tests {
             ExpansionProvenance {
                 sources: BTreeSet::new(),
                 unknown: true,
+                unknown_reason: Some(GLOB_CLASS),
                 boundary_touch: false,
             }
             .into_tool_provenance(),
-            ToolProvenance::Unknown
+            ToolProvenance::Unknown(Some(GLOB_CLASS))
+        );
+        // REQ-620 ADR-620-4: an unknown with no classifier behind it — a skill
+        // file that would not mint — must still arrive as an unknown. The
+        // fallback in `into_tool_provenance` is what stops `Some(reason)`
+        // being the bit *and* a way to lose it.
+        assert_eq!(
+            ExpansionProvenance {
+                sources: BTreeSet::new(),
+                unknown: true,
+                unknown_reason: None,
+                boundary_touch: false,
+            }
+            .into_tool_provenance(),
+            ToolProvenance::Unknown(Some(crate::harness::UNCLASSIFIED_REACH_REASON)),
+            "the bit survives an unexplained opacity"
         );
         assert_eq!(
             ExpansionProvenance {
                 sources,
                 unknown: true,
+                unknown_reason: Some(GLOB_CLASS),
                 boundary_touch: true,
             }
             .into_tool_provenance(),

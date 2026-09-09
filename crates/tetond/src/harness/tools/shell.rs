@@ -366,9 +366,15 @@ impl Tool for ShellTool {
         // The second disjunct is belt and braces: a `BoundaryTouch` that named
         // nothing at all is out-of-root by construction, and stays mapped to
         // the sentinel even if a future arm forgets to set the flag.
+        //
+        // REQ-620 ADR-620-4: the unknown bit and the class that caused it are
+        // one value. `Verdict::unknown_reason` is `Some` exactly when the kind
+        // is `Unknown`, so the pin this provenance later takes names the
+        // syntax class the command was refused on — a quote, a redirect, a
+        // glob — instead of the one sentence every refusal used to share.
         let provenance = ToolProvenance::from_bits(
             verdict.sources.clone(),
-            verdict.kind == shell_provenance::VerdictKind::Unknown,
+            verdict.unknown_reason(),
             verdict.out_of_root_touch
                 || (verdict.kind == shell_provenance::VerdictKind::BoundaryTouch
                     && verdict.sources.is_empty()),
@@ -1396,9 +1402,13 @@ mod tests {
         let ctx = ToolContext::new(&root);
         let out = ShellTool::default().run(&ctx, &json!({ "command": "cat secrets/prod.env" }));
         assert!(!out.is_error, "{}", out.content);
-        assert_eq!(out.provenance, ToolProvenance::Unknown);
+        // REQ-620: the reason travels with the bit, and the classifier's
+        // no-boundary short circuit is a reason like any other — the *bit* is
+        // what BR-9 is about, and it is unchanged.
+        const NO_BOUNDARY: &str = "no privacy boundary is configured";
+        assert_eq!(out.provenance, ToolProvenance::Unknown(Some(NO_BOUNDARY)));
         let out2 = ShellTool::default().run(&ctx, &json!({ "command": "echo hi" }));
-        assert_eq!(out2.provenance, ToolProvenance::Unknown);
+        assert_eq!(out2.provenance, ToolProvenance::Unknown(Some(NO_BOUNDARY)));
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1452,7 +1462,14 @@ mod tests {
         std::fs::write(root.join(".env"), "K=v\n").unwrap();
         let ctx = project_ctx(&root);
         let opaque = ShellTool::default().run(&ctx, &json!({ "command": "echo $(ls)" }));
-        assert_eq!(opaque.provenance, ToolProvenance::Unknown);
+        // REQ-620 BR-6: still `Unknown`, and now saying which class refused it
+        // — `$(` is a command substitution, first of the two the scan sees.
+        assert_eq!(
+            opaque.provenance,
+            ToolProvenance::Unknown(Some(
+                "the command uses a command substitution this classifier does not model"
+            ))
+        );
         // An **in-root** boundary path rides the existing machinery: the result
         // names the real file, and egress blocks on the glob exactly as it does
         // for a `read` of it. `ToolProvenance::BoundaryTouch` is reserved for
@@ -2690,9 +2707,14 @@ search_key_ref = "env:{web_var}"
             "nor the measurement the gate above read"
         );
         assert_eq!(
-            refined.outcome.provenance,
-            ToolProvenance::Unknown,
-            "interpreting a result cannot make its origin knowable"
+            refined.outcome.provenance, raw.provenance,
+            "interpreting a result cannot make its origin knowable — nor change \
+             what the classifier said about it"
+        );
+        assert!(
+            matches!(refined.outcome.provenance, ToolProvenance::Unknown(_)),
+            "fixture: the interpreted result is the unknown one: {:?}",
+            refined.outcome.provenance
         );
         std::fs::remove_dir_all(&root).ok();
     }

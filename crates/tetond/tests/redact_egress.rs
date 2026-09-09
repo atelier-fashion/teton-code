@@ -203,7 +203,12 @@ impl CapturingSink {
 }
 
 impl PrivacyEventSink for CapturingSink {
-    fn privacy_block(&self, session_id: Option<SessionId>, block: PrivacyBlock) {
+    fn privacy_block(
+        &self,
+        session_id: Option<SessionId>,
+        block: PrivacyBlock,
+        _unknown_reason: Option<&'static str>,
+    ) {
         self.events
             .lock()
             .expect("sink poisoned")

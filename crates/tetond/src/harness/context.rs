@@ -91,7 +91,19 @@ pub enum ToolProvenance {
     Sources(BTreeSet<ProvenanceId>),
     /// The tool's touched files cannot be determined (e.g. `shell`): fail-closed
     /// at egress whenever any boundary is configured.
-    Unknown,
+    ///
+    /// The payload is **why** — the classifier's content-free sentence, which
+    /// names the `UnmodelledSyntax` class a `shell` command was refused on
+    /// (REQ-620 BR-6). `&'static str` from a closed set, so a variant that
+    /// travels to an event cannot carry a byte of the command; `None` where no
+    /// classifier ran at all (an opaque MCP server, a synthesized fold), which
+    /// renders the pin notice exactly as it read before REQ-620.
+    ///
+    /// It rides *on the variant* rather than beside it because three readers —
+    /// the router, the choke point, the notice — already share this value, and
+    /// a reason carried on a parallel channel would be a second thing to keep
+    /// in step (ADR-620-4, LESSON-653).
+    Unknown(Option<&'static str>),
     /// Unknown reach that nonetheless **proved** these identities (REQ-619
     /// verify, C1).
     ///
@@ -112,7 +124,11 @@ pub enum ToolProvenance {
     /// Not merged into `Sources` with a flag for [`Self::BoundaryTouch`]'s
     /// reason: a variant makes the compiler enumerate the seams that must
     /// handle it (LESSON-501, LESSON-502).
-    UnknownWith(BTreeSet<ProvenanceId>),
+    ///
+    /// The second field is [`Self::Unknown`]'s reason, for the same use and
+    /// under the same rule: a pin taken over this value names the class that
+    /// refused it (REQ-620 BR-6).
+    UnknownWith(BTreeSet<ProvenanceId>, Option<&'static str>),
     /// A path the tool named matches a `local-only` boundary glob, and the
     /// ordinary identity path cannot say so (REQ-614 ADR-614-3).
     ///
@@ -194,23 +210,74 @@ impl ToolProvenance {
     /// sound in exactly one direction: those arms refuse everything a source
     /// set could have permitted. Arm 2 exists because arm 3 is the direction
     /// that is **not** sound once the opacity can be lifted.
+    ///
+    /// # `unknown` is an `Option`, not a `bool` (REQ-620 ADR-620-4)
+    ///
+    /// `Some(reason)` is the unknown bit **and** its cause, so a caller cannot
+    /// pass one without the other and a later arm cannot lose the reason while
+    /// keeping the bit. The reason is the classifier's own `&'static str` —
+    /// the `UnmodelledSyntax` class for a refused `shell` command — and
+    /// [`UNCLASSIFIED_REACH_REASON`] is what a caller that never ran a
+    /// classifier passes when it has an unknown to report and nothing to say
+    /// about it.
     #[must_use]
     pub(crate) fn from_bits(
         sources: BTreeSet<ProvenanceId>,
-        unknown: bool,
+        unknown: Option<&'static str>,
         boundary_touch: bool,
     ) -> ToolProvenance {
         if boundary_touch {
             ToolProvenance::BoundaryTouch
-        } else if unknown && !sources.is_empty() {
-            ToolProvenance::UnknownWith(sources)
-        } else if unknown {
-            ToolProvenance::Unknown
+        } else if unknown.is_some() && !sources.is_empty() {
+            ToolProvenance::UnknownWith(sources, unknown)
+        } else if unknown.is_some() {
+            ToolProvenance::Unknown(unknown)
         } else {
             ToolProvenance::Sources(sources)
         }
     }
+
+    /// A bare unknown with no classifier behind it — the value every site that
+    /// used to write `ToolProvenance::Unknown` means.
+    ///
+    /// Named rather than spelled `Unknown(None)` at each site so the *absence*
+    /// of a reason reads as a decision: this tool's reach was never classified,
+    /// as opposed to classified and refused on a syntax class.
+    #[must_use]
+    pub fn unknown() -> Self {
+        ToolProvenance::Unknown(None)
+    }
+
+    /// Why this provenance is unknown, when something knows (REQ-620 BR-6).
+    ///
+    /// `None` both for a provenance that is not unknown at all and for one
+    /// whose opacity no classifier explained — the two are the same to every
+    /// reader of this value, which renders the pin notice without a reason
+    /// clause in either case.
+    ///
+    /// [`Self::BoundaryTouch`] answers `None` on purpose: its cause is the
+    /// *path*, which `privacy_block` already names, and a class sentence there
+    /// would describe the wrong thing (ADR-620-4).
+    #[must_use]
+    pub fn unknown_reason(&self) -> Option<&'static str> {
+        match self {
+            ToolProvenance::Unknown(reason) | ToolProvenance::UnknownWith(_, reason) => *reason,
+            ToolProvenance::Sources(_) | ToolProvenance::BoundaryTouch => None,
+        }
+    }
 }
+
+/// The reason an unknown provenance carries when nothing classified the tool's
+/// reach (REQ-620 BR-6).
+///
+/// The `shell` classifier and the skill fold name an `UnmodelledSyntax` class;
+/// an opaque MCP server, a tool that declares itself unknowable
+/// ([`ToolOutcome::with_unknown_provenance`](crate::harness::ToolOutcome::with_unknown_provenance))
+/// and a fold that synthesizes an unknown have no class to name, and this is
+/// what they say instead. One constant, so the eight class sentences and the
+/// generic one are read from the same place and a reader of the pin notice sees
+/// one vocabulary.
+pub const UNCLASSIFIED_REACH_REASON: &str = "the tool's reach could not be classified";
 
 #[cfg(test)]
 pub(crate) use crate::fixture_id;
@@ -435,12 +502,12 @@ impl DroppedProvenance {
                 // REQ-614: both block, so both set `unknown` — but a boundary
                 // touch additionally records *why*, because the pin it produces
                 // is permanent and an unknown's is liftable.
-                ToolProvenance::Unknown => self.unknown = true,
+                ToolProvenance::Unknown(_) => self.unknown = true,
                 // REQ-619 verify, C1: both halves, because this accumulator's
                 // whole posture is that "unknown" and "these files" are true at
                 // once (see the field docs). Folding it to the bit alone would
                 // shed exactly the ids the variant exists to keep.
-                ToolProvenance::UnknownWith(paths) => {
+                ToolProvenance::UnknownWith(paths, _) => {
                     self.sources.extend(paths.iter().cloned());
                     self.unknown = true;
                 }
@@ -1122,8 +1189,8 @@ impl ProvenanceClass {
             // block's reach any more determined than a bare `Unknown`'s.
             Provenance::Tool {
                 provenance:
-                    ToolProvenance::Unknown
-                    | ToolProvenance::UnknownWith(_)
+                    ToolProvenance::Unknown(_)
+                    | ToolProvenance::UnknownWith(..)
                     | ToolProvenance::BoundaryTouch,
                 ..
             } => ProvenanceClass::Unknown,
@@ -2387,6 +2454,12 @@ impl ContextManager {
         }
         let mut sources = BTreeSet::new();
         let mut unknown = false;
+        // REQ-620 BR-6: the **first** explained opacity's class, so a summary
+        // of a conversation whose `shell` result was refused on a quote still
+        // pins with the quote's sentence. First rather than last for the reason
+        // the taint registry keeps the first cause: it is the one the user was
+        // told about, and a summary is not a new refusal.
+        let mut unknown_reason: Option<&'static str> = None;
         let mut boundary_touch = false;
         for block in &self.blocks {
             match &block.provenance {
@@ -2397,14 +2470,18 @@ impl ContextManager {
                     // restrictive as the block was — and must stay *permanent*,
                     // or compaction would quietly make a `~/.ssh/config` pin
                     // liftable.
-                    ToolProvenance::Unknown => unknown = true,
+                    ToolProvenance::Unknown(reason) => {
+                        unknown = true;
+                        unknown_reason = unknown_reason.or(*reason);
+                    }
                     // REQ-619 verify, C1. Both halves, for `absorb`'s reason:
                     // the collapse below is only sound because it can never be
                     // *less* restrictive, and dropping proved ids from a value
                     // that will later be lifted is the one way it could be.
-                    ToolProvenance::UnknownWith(paths) => {
+                    ToolProvenance::UnknownWith(paths, reason) => {
                         sources.extend(paths.iter().cloned());
                         unknown = true;
+                        unknown_reason = unknown_reason.or(*reason);
                     }
                     ToolProvenance::BoundaryTouch => {
                         unknown = true;
@@ -2474,7 +2551,14 @@ impl ContextManager {
                 // to be written out here, in `ShellTool::run` and in the skill
                 // fold — three copies of one rule, which is how one of them
                 // comes to disagree.
-                provenance: ToolProvenance::from_bits(sources, unknown, boundary_touch),
+                provenance: ToolProvenance::from_bits(
+                    sources,
+                    // The bit and its cause in one value (ADR-620-4): a
+                    // summary that folded an unknown block is unknown, and
+                    // says why when the block did.
+                    unknown.then(|| unknown_reason.unwrap_or(UNCLASSIFIED_REACH_REASON)),
+                    boundary_touch,
+                ),
             },
         })
     }
@@ -3373,11 +3457,11 @@ mod tests {
         // REQ-544 C-1: a shell-shaped result folds in as Unknown, distinct from
         // the "no sources" state a benign result carries.
         let mut ctx = ContextManager::new("sys", 10_000);
-        ctx.push_tool_result_prov("shell", ToolProvenance::Unknown, "ran a command");
+        ctx.push_tool_result_prov("shell", ToolProvenance::unknown(), "ran a command");
         match &ctx.blocks()[0].provenance {
             Provenance::Tool { tool, provenance } => {
                 assert_eq!(tool, "shell");
-                assert_eq!(provenance, &ToolProvenance::Unknown);
+                assert_eq!(provenance, &ToolProvenance::unknown());
             }
             other => panic!("expected a tool block, got {other:?}"),
         }
@@ -5432,7 +5516,7 @@ mod tests {
     #[tokio::test]
     async fn a_compaction_of_unknown_provenance_stays_unknown() {
         let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(TEST_BUDGET_BYTES);
-        ctx.push_tool_result_prov("shell", ToolProvenance::Unknown, "x".repeat(1_000));
+        ctx.push_tool_result_prov("shell", ToolProvenance::unknown(), "x".repeat(1_000));
         ctx.push_tool_result("read", Some(fixture_id("src/lib.rs")), "y".repeat(1_000));
         // A model turn, for the reason recorded on the sibling test above.
         ctx.push_model("z".repeat(1_000));
@@ -5607,7 +5691,7 @@ mod tests {
         );
         first.push_model("reading");
         first.push_tool_result("read", Some(fixture_id("src/lib.rs")), "code");
-        first.push_tool_result_prov("shell", ToolProvenance::Unknown, "ran a command");
+        first.push_tool_result_prov("shell", ToolProvenance::unknown(), "ran a command");
         let before: Vec<Provenance> = first
             .blocks()
             .iter()
@@ -5915,7 +5999,7 @@ mod tests {
     fn a_dropped_unknown_result_still_fails_the_context_closed() {
         let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(TEST_BUDGET_BYTES);
         ctx.push_tool_result("read", Some(fixture_id("src/lib.rs")), "x".repeat(1_000));
-        ctx.push_tool_result_prov("shell", ToolProvenance::Unknown, "x".repeat(1_000));
+        ctx.push_tool_result_prov("shell", ToolProvenance::unknown(), "x".repeat(1_000));
         for _ in 0..4 {
             ctx.push_user("x".repeat(1_000));
         }
@@ -6203,48 +6287,76 @@ mod tests {
     /// Both halves are needed; neither covers the other.
     #[test]
     fn from_bits_is_the_one_precedence_and_it_keeps_proved_ids_under_unknown() {
+        const CLASS: &str = "the command uses a glob this classifier does not model";
         let a = fixture_id("a.rs");
         let secret = fixture_id("secrets/prod.env");
         let both: BTreeSet<ProvenanceId> = [a.clone(), secret.clone()].into_iter().collect();
 
         // Row 4: nothing unprovable, nothing touched — the proportionate answer.
         assert_eq!(
-            ToolProvenance::from_bits(both.clone(), false, false),
+            ToolProvenance::from_bits(both.clone(), None, false),
             ToolProvenance::Sources(both.clone())
         );
         // ... and its empty case: content that names nothing and pins nothing.
         assert_eq!(
-            ToolProvenance::from_bits(BTreeSet::new(), false, false),
+            ToolProvenance::from_bits(BTreeSet::new(), None, false),
             ToolProvenance::none()
         );
 
         // Row 3: unknown, nothing proved.
         assert_eq!(
-            ToolProvenance::from_bits(BTreeSet::new(), true, false),
-            ToolProvenance::Unknown
+            ToolProvenance::from_bits(BTreeSet::new(), Some(CLASS), false),
+            ToolProvenance::Unknown(Some(CLASS))
         );
 
         // Row 2, the C1 row: unknown **and** these files.
         assert_eq!(
-            ToolProvenance::from_bits(both.clone(), true, false),
-            ToolProvenance::UnknownWith(both.clone()),
+            ToolProvenance::from_bits(both.clone(), Some(CLASS), false),
+            ToolProvenance::UnknownWith(both.clone(), Some(CLASS)),
             "unknown with proved ids keeps them"
         );
 
         // Row 1: a boundary touch outranks both, whatever else is set — its pin
         // is permanent and every other arm refuses the send anyway.
         for (unknown, sources) in [
-            (false, BTreeSet::new()),
-            (true, BTreeSet::new()),
-            (false, both.clone()),
-            (true, both.clone()),
+            (None, BTreeSet::new()),
+            (Some(CLASS), BTreeSet::new()),
+            (None, both.clone()),
+            (Some(CLASS), both.clone()),
         ] {
             assert_eq!(
                 ToolProvenance::from_bits(sources, unknown, true),
                 ToolProvenance::BoundaryTouch,
-                "boundary_touch is first (unknown={unknown})"
+                "boundary_touch is first (unknown={unknown:?})"
             );
         }
+
+        // REQ-620 ADR-620-4: `Some(reason)` **is** the unknown bit, and the
+        // reason reaches every arm that carries the bit. A `BoundaryTouch`
+        // answers `None` because its cause is the path, not a syntax class.
+        assert_eq!(
+            ToolProvenance::from_bits(BTreeSet::new(), Some(CLASS), false).unknown_reason(),
+            Some(CLASS)
+        );
+        assert_eq!(
+            ToolProvenance::from_bits(both.clone(), Some(CLASS), false).unknown_reason(),
+            Some(CLASS)
+        );
+        assert_eq!(
+            ToolProvenance::from_bits(BTreeSet::new(), Some(CLASS), true).unknown_reason(),
+            None,
+            "a boundary touch is explained by its path, never by a syntax class"
+        );
+        assert_eq!(
+            ToolProvenance::from_bits(both, None, false).unknown_reason(),
+            None,
+            "content that is not unknown has nothing to explain"
+        );
+        assert_eq!(
+            ToolProvenance::unknown().unknown_reason(),
+            None,
+            "an unknown nothing classified says only that it is unknown"
+        );
     }
 
     /// **REQ-619 verify, C1**, at the accumulator that outlives the block.
@@ -6265,6 +6377,7 @@ mod tests {
             tool: "skill".to_owned(),
             provenance: ToolProvenance::UnknownWith(
                 [fixture_id("secrets/prod.env")].into_iter().collect(),
+                None,
             ),
         });
         assert!(dropped.is_unknown(), "the opacity outlives the block");
@@ -6281,7 +6394,7 @@ mod tests {
         let mut bare = DroppedProvenance::default();
         bare.absorb(&Provenance::Tool {
             tool: "shell".to_owned(),
-            provenance: ToolProvenance::Unknown,
+            provenance: ToolProvenance::unknown(),
         });
         assert!(bare.is_unknown());
         assert!(bare.sources().is_empty());
@@ -6854,7 +6967,7 @@ mod tests {
     #[test]
     fn a_mechanical_fallback_records_what_it_took() {
         let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(1_200);
-        ctx.push_tool_result_prov("shell", ToolProvenance::Unknown, "a".repeat(1_000));
+        ctx.push_tool_result_prov("shell", ToolProvenance::unknown(), "a".repeat(1_000));
         ctx.push_tool_result("read", Some(fixture_id("src/lib.rs")), "b".repeat(1_000));
         ctx.push_user("and what now?");
 

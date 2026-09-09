@@ -2843,15 +2843,36 @@ fn format_web_consent(decided: &WebConsentDecided) -> String {
 }
 
 /// The notice a `web_taint_overridden` draws.
-/// The standing line a pinned session prints once (REQ-614 BR-7).
+/// The standing line a pinned session prints once (REQ-614 BR-7, REQ-620 BR-6).
 ///
-/// Three facts, in the order a reader needs them: what happened, what it costs,
-/// and what to do about it. The remedy is a typed absence rather than an empty
-/// string, so "no command lifts this" is a sentence the user gets rather than a
-/// blank where one should be.
+/// Four facts, in the order a reader needs them: what happened, what it costs,
+/// why, and what to do about it. The remedy is a typed absence rather than an
+/// empty string, so "no command lifts this" is a sentence the user gets rather
+/// than a blank where one should be.
+///
+/// # The reason is rendered, never re-derived
+///
+/// `unknown_shell` says a shell result was opaque; it does not say which byte
+/// made it so, and the user cannot act on a cause word. Since REQ-620 the
+/// daemon's classifier names the syntax class and the class rides here on the
+/// event — so this function *appends* what it was given and branches on
+/// nothing. Deriving a class from `pinned.cause` here would be a second
+/// classifier in the client, disagreeing with the first the day the grammar
+/// widens (ADR-620-4, LESSON-653).
+///
+/// A pin with no reason renders **exactly** the pre-REQ-620 line: a
+/// `boundary_hit`, whose cause is a path the `privacy_block` beside it already
+/// names, and any pin nothing classified.
 fn format_session_pinned(pinned: &SessionPinned) -> String {
     let budget = match pinned.budget_tokens {
         Some(tokens) => format!(" (context budget {tokens} tokens)"),
+        None => String::new(),
+    };
+    // Rendered as part of the cause clause rather than as a sentence of its
+    // own, because it *is* the cause said in words a user can act on — a
+    // separate sentence would read as a second, unrelated fact.
+    let reason = match &pinned.reason {
+        Some(reason) => format!(" — {reason}"),
         None => String::new(),
     };
     let remedy = match &pinned.remedy {
@@ -2861,7 +2882,7 @@ fn format_session_pinned(pinned: &SessionPinned) -> String {
         PinRemedy::None => "No remedy: a protected file was read.".to_owned(),
     };
     format!(
-        "privacy — this session is pinned to the local tier{budget}; cause: {}. {remedy}",
+        "privacy — this session is pinned to the local tier{budget}; cause: {}{reason}. {remedy}",
         pinned.cause
     )
 }
@@ -14077,12 +14098,100 @@ mod session_pin_render {
     }
 
     fn pinned(cause: &str, liftable: bool, remedy: PinRemedy) -> Event {
+        pinned_because(cause, liftable, remedy, None)
+    }
+
+    /// [`pinned`], with the REQ-620 class sentence the daemon's classifier
+    /// names.
+    fn pinned_because(
+        cause: &str,
+        liftable: bool,
+        remedy: PinRemedy,
+        reason: Option<&str>,
+    ) -> Event {
         Event::SessionPinned(SessionPinned {
             cause: cause.to_owned(),
             liftable,
             remedy,
             budget_tokens: Some(21_162),
+            reason: reason.map(str::to_owned),
         })
+    }
+
+    /// **REQ-620 BR-6 — the reason follows the cause, and only where there is
+    /// one.**
+    ///
+    /// The line a user reads is the last surface the class sentence has to
+    /// reach: `unknown_shell` alone told the 2026-09-09 session's user that
+    /// *something* was opaque and not that a `2>&1` was the byte to change.
+    ///
+    /// Two claims, and the second is the one that keeps the first honest:
+    ///
+    /// 1. A pin carrying a reason renders `cause: unknown_shell — <sentence>.`
+    ///    — the sentence attached to the cause it explains, before the remedy,
+    ///    with the remedy and the budget unmoved.
+    /// 2. A `boundary_hit` pin, which carries none, renders **byte for byte**
+    ///    the line it rendered before REQ-620. A renderer that emitted an empty
+    ///    clause, a dangling dash or the word "None" would pass a `contains`
+    ///    assertion and fail a user.
+    ///
+    /// **Mutation (run 2026-09-09, red, reverted):** render the reason
+    /// unconditionally (`format!(" — {:?}", pinned.reason)`) and claim 2 reds
+    /// on the exact line; drop the reason clause entirely and claim 1 reds.
+    /// Both times this test is the only red in the binary — which is the point
+    /// of asserting the whole line rather than a substring of it.
+    #[test]
+    fn a_reason_follows_the_cause_and_a_boundary_hit_has_none() {
+        const QUOTE_CLASS: &str = "the command uses a quoted string this classifier does not model";
+
+        let with = SessionPinned {
+            cause: "unknown_shell".to_owned(),
+            liftable: true,
+            remedy: PinRemedy::Command("/shell allow".to_owned()),
+            budget_tokens: Some(21_162),
+            reason: Some(QUOTE_CLASS.to_owned()),
+        };
+        assert_eq!(
+            format_session_pinned(&with),
+            format!(
+                "privacy — this session is pinned to the local tier (context budget 21162 \
+                 tokens); cause: unknown_shell — {QUOTE_CLASS}. `/shell allow` lifts it if \
+                 you know the command touched no protected file."
+            )
+        );
+
+        let without = SessionPinned {
+            cause: "boundary_hit".to_owned(),
+            liftable: false,
+            remedy: PinRemedy::None,
+            budget_tokens: Some(21_162),
+            reason: None,
+        };
+        assert_eq!(
+            format_session_pinned(&without),
+            "privacy — this session is pinned to the local tier (context budget 21162 \
+             tokens); cause: boundary_hit. No remedy: a protected file was read.",
+            "a pin with no class renders exactly the pre-REQ-620 line"
+        );
+
+        // And it reaches the surface, not only the formatter.
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.verbose = false;
+        render_event(
+            &envelope(pinned_because(
+                "unknown_shell",
+                true,
+                PinRemedy::Command("/shell allow".to_owned()),
+                Some(QUOTE_CLASS),
+            )),
+            &mut surface,
+            &mut state,
+        );
+        assert!(
+            surface.any_line_contains(LineKind::Notice, QUOTE_CLASS),
+            "the class the daemon named must reach the standing line"
+        );
     }
 
     /// BR-7. **Verbose off**, and the line still prints.

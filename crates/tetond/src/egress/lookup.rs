@@ -4222,6 +4222,7 @@ mod tests {
                 &self,
                 _session_id: Option<SessionId>,
                 _block: teton_protocol::events::PrivacyBlock,
+                _unknown_reason: Option<&'static str>,
             ) {
                 *self.calls.lock().unwrap() += 1;
             }

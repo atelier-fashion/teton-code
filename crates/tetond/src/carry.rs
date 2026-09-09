@@ -529,8 +529,8 @@ impl CarriedTurn {
         // of, so this seam cannot disagree with the egress sink about why a
         // session was pinned — and a `shell` result of unknown reach records
         // `unknown_shell`, the one cause `/shell allow` can lift.
-        if let Some(cause) = context_taint_cause(&ctx, &self.boundaries) {
-            if self.taint.try_mark(&self.session_id, cause) {
+        if let Some((cause, reason)) = context_taint_cause(&ctx, &self.boundaries) {
+            if self.taint.try_mark(&self.session_id, cause, reason) {
                 let _ = writeln!(std::io::stderr(), "{}", taint_pin_line(cause));
             }
         }

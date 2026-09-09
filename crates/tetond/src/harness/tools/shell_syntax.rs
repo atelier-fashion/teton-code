@@ -55,36 +55,47 @@
 //! because a recogniser whose only guard is its own unit table is a recogniser
 //! nothing downstream is holding to anything.
 //!
+//! **Re-measured 2026-09-09 at TASK-405**, which is the last task to add tests
+//! to this rule (conventions.md: the count is owned by that task). Two of the
+//! four moved, and both moves are *coverage arriving*, not behaviour changing:
+//! TASK-404's piped-reader test and TASK-405's syntax-class test each caught a
+//! mutation the record was written before.
+//!
 //! 1. **[`strip_null_redirects`] made a no-op** (return the command unchanged,
-//!    `lifted: 0`) — **7 red**:
+//!    `lifted: 0`) — **8 red** (was 7 at TASK-403):
 //!    [`tests::the_strip_lifts_words_and_leaves_the_separators_standing`], and
 //!    in [`super::shell_provenance`]
 //!    `null_redirects_are_lifted_before_the_scan_and_the_split` (first, on the
 //!    `ls 2>&1 && echo ok` residue), `dev_null_is_never_a_path_token`,
 //!    `an_opaque_verb_with_a_null_redirect_is_still_unknown`,
 //!    `a_redirect_never_hides_a_boundary_read`,
-//!    `the_2026_09_09_command_is_rooted_without_its_home_probe` and
-//!    `the_redirect_differential_table`. Two things stayed green and should
-//!    have: `every_other_redirect_stays_unmodelled`, which asserts the refusal
-//!    a no-op preserves, and `root_gate`'s benign table, which reads
+//!    `the_2026_09_09_command_is_rooted_without_its_home_probe`,
+//!    `the_redirect_differential_table` and — new at TASK-404 —
+//!    `a_piped_reader_with_no_path_reads_stdin_not_the_root`, whose
+//!    `ls 2>&1 | head` row stops being a pipeline once the `&` is a separator
+//!    again. Two things stayed green and should have:
+//!    `every_other_redirect_stays_unmodelled`, which asserts the refusal a
+//!    no-op preserves, and `root_gate`'s benign table, which reads
 //!    [`NullRedirect::parse`] directly rather than through the strip.
 //! 2. **The whole-word rule dropped** — [`NullRedirect::from_operator`]
 //!    relaxed to accept any operator ending in `>`, so `ls>/dev/null` lifts —
-//!    **2 red**:
+//!    **2 red**, unchanged:
 //!    [`tests::the_recogniser_accepts_the_entity_forms_and_nothing_else`] and
 //!    `null_redirects_are_lifted_before_the_scan_and_the_split`.
 //! 3. **The recogniser made non-total** — [`strip_line`] lifting any word
-//!    carrying `>` or `<` — **6 red**:
+//!    carrying `>` or `<` — **7 red** (was 6 at TASK-403):
 //!    [`tests::the_strip_lifts_words_and_leaves_the_separators_standing`],
 //!    `every_other_redirect_stays_unmodelled` (`ls > out.txt` came back
 //!    `Rooted`), `dev_null_is_never_a_path_token`,
 //!    `null_redirects_are_lifted_before_the_scan_and_the_split`,
-//!    `the_redirect_differential_table`, and — the one that matters most —
-//!    REQ-614's own `adversarial_spellings_are_all_unknown`, on
-//!    `cat <src/main.rs`.
+//!    `the_redirect_differential_table`, TASK-405's
+//!    `each_unmodelled_class_names_itself_and_nothing_else` (its `ls > ZQX9`
+//!    row is the redirect class, and a lifted `>` leaves nothing to name), and
+//!    — the one that matters most — REQ-614's own
+//!    `adversarial_spellings_are_all_unknown`, on `cat <src/main.rs`.
 //! 4. **The spaced form's `/dev/null` follower left in place** (drop the
-//!    `words.next()` in [`strip_line`]'s spaced arm) — **4 red**, and
-//!    `dev_null_is_never_a_path_token` reds as a `BoundaryTouch` on
+//!    `words.next()` in [`strip_line`]'s spaced arm) — **4 red**, unchanged,
+//!    and `dev_null_is_never_a_path_token` reds as a `BoundaryTouch` on
 //!    `cat README.md > /dev/null`, which is BR-3's failure mode exactly: the
 //!    device scored as a file access.
 //!
@@ -412,11 +423,12 @@ mod tests {
     /// splitter is written against. The `ls & ls` row is the must-not-fire one:
     /// a lone `&` is a separator and stays.
     ///
-    /// **Mutation (run, red, reverted):** make [`strip_null_redirects`] a
-    /// no-op — this test reds first among seven; lift any word carrying `>` or
-    /// `<` — this test reds on `cat x 2> /dev/null`, among six; leave the
-    /// spaced form's follower in place — this test reds, among four. The full
-    /// counts are in the module docs.
+    /// **Mutation (run, re-measured 2026-09-09, red, reverted):** make
+    /// [`strip_null_redirects`] a no-op — this test reds first among eight;
+    /// lift any word carrying `>` or `<` — this test reds on
+    /// `cat x 2> /dev/null`, among seven; leave the spaced form's follower in
+    /// place — this test reds, among four. The full counts are in the module
+    /// docs.
     #[test]
     fn the_strip_lifts_words_and_leaves_the_separators_standing() {
         for (command, residue, lifted) in [

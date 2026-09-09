@@ -1729,8 +1729,14 @@ impl DaemonRuntime {
                             TaintCause::BoundaryHit
                         }
                     };
+                    // `None` for the reason (REQ-620 BR-6): this arm holds a
+                    // `BlockDetail` and no provenance at all, so it has no
+                    // class to name — the same blindness that makes it use
+                    // `mark` rather than `mark_escalating`.
                     if taints_the_session(detail)
-                        && self.session_taint.mark(tctx.core.session_id, backstop)
+                        && self
+                            .session_taint
+                            .mark(tctx.core.session_id, backstop, None)
                     {
                         eprintln!("{}", taint_pin_line(backstop));
                     }

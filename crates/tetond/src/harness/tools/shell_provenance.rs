@@ -142,7 +142,40 @@
 //! read the root, and `cat missing | head` still walks in its *first* segment,
 //! on `cat missing`. That is BR-4's stated limit rather than a gap.
 //!
+//! # The refusal names its class (REQ-620 BR-6)
+//!
+//! The [`UNMODELLED`] scan used to answer one sentence — "the command uses
+//! shell syntax this classifier does not model" — for all thirteen characters.
+//! That sentence reaches three surfaces (`skill_invoked.reach_reason`, the
+//! `session_pinned` event, the CLI's pin notice) and told none of their readers
+//! anything they could act on: the model that pinned the 2026-09-09 `/analyze`
+//! session could not learn from it that a `2>&1` was the offending byte, and
+//! the user reading the notice could not either.
+//!
+//! So the scan reports an [`UnmodelledSyntax`] class and the class names the
+//! sentence. The class is the **first present in [`UNMODELLED_ORDER`]**, not
+//! the first to appear in the command: `ls *.rs 'x'` reports the quote, because
+//! a fixed order is the only way the reason is a function of the command rather
+//! than of where a byte happens to fall.
+//!
+//! The sentences stay content-free the way every other reason here does, and
+//! one step harder: [`UnmodelledSyntax::reason`] is a `const fn` over a closed
+//! set, so what reaches an event is chosen at compile time and cannot be
+//! assembled from the command (REQ-619 BR-7, LESSON-624's egress-capture
+//! posture). The class travels onward as an explicit `Option<&'static str>`
+//! beside the unknown bit — [`Verdict::unknown_reason`], then
+//! `ToolProvenance::from_bits`, the egress `Provenance`, the taint sink and
+//! `SessionPinned::reason` — rather than being re-derived at the notice from
+//! the cause word, which would be a second classifier (ADR-620-4, LESSON-653).
+//!
 //! # Mutation record (conventions.md — show the test can fail)
+//!
+//! Swapping [`UNMODELLED_ORDER`] so `Glob` precedes `Quote` turns
+//! [`tests::each_unmodelled_class_names_itself_and_nothing_else`] red on its
+//! precedence row (`ls *.rs 'ZQX9'`) and **nothing else in this crate's lib
+//! suite** — measured, 1 of 2,237: the eight per-class rows are each
+//! single-class by construction, so the order is only observable where two
+//! classes meet. Run 2026-09-09, red, reverted.
 //!
 //! Inverting the fallthrough in [`classify_segment`] so an unrecognised verb
 //! yields `Rooted` turns **exactly one** test red:
@@ -270,6 +303,22 @@ pub struct Verdict {
 }
 
 impl Verdict {
+    /// [`Self::reason`], but only for an `Unknown` verdict — the shape
+    /// [`ToolProvenance::from_bits`](crate::harness::ToolProvenance::from_bits)
+    /// takes (REQ-620 ADR-620-4).
+    ///
+    /// `Some(reason)` **is** the unknown bit and its cause at once, which is
+    /// what stops a caller from passing one without the other. A `Rooted` or
+    /// `BoundaryTouch` verdict answers `None`: neither is opaque, and a
+    /// boundary touch's cause is the path, already named by `privacy_block`.
+    #[must_use]
+    pub fn unknown_reason(&self) -> Option<&'static str> {
+        match self.kind {
+            VerdictKind::Unknown => Some(self.reason),
+            VerdictKind::Rooted | VerdictKind::BoundaryTouch => None,
+        }
+    }
+
     fn unknown(reason: &'static str) -> Self {
         Self {
             kind: VerdictKind::Unknown,
@@ -473,6 +522,167 @@ const UNMODELLED: &[char] = &[
     '\'', '"', '`', '$', '\\', '>', '<', '{', '}', '!', '*', '?', '[',
 ];
 
+/// Which of [`UNMODELLED`]'s shapes refused a command (REQ-620 BR-6).
+///
+/// The `UnmodelledSyntax` entity. One sentence per class rather than one
+/// sentence for all of them, because the single sentence — "the command uses
+/// shell syntax this classifier does not model" — told a user, and a model,
+/// nothing they could act on: the model that pinned the 2026-09-09 `/analyze`
+/// session could not tell from it that a `2>&1` was the offending byte, and
+/// nor could the user reading the pin notice.
+///
+/// # Content-free by construction
+///
+/// [`Self::reason`] is a `const fn` returning a `&'static str` from a closed
+/// set, so the sentence a class names is fixed at compile time and cannot be
+/// assembled from the command. That is the whole of BR-6's second clause
+/// ("and only the class"): it is a property of the type, not a rule a
+/// contributor has to keep. A sentence therefore names the *class* — "a quoted
+/// string" — and never the byte, the position or the word it was found in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UnmodelledSyntax {
+    /// `'` or `"` — a quoted string.
+    Quote,
+    /// A backtick, or `$(` — a command substitution.
+    Substitution,
+    /// `$` not opening a substitution — a shell variable.
+    Variable,
+    /// `>` or `<` that survived [`strip_null_redirects`] — a redirect to
+    /// something other than the null device (REQ-620 BR-2).
+    Redirect,
+    /// `*`, `?` or `[` — a glob.
+    Glob,
+    /// `{` or `}` — a brace expansion.
+    Brace,
+    /// `\` — a backslash escape.
+    Escape,
+    /// `!` — a history expansion.
+    History,
+}
+
+/// The order [`first_unmodelled_class`] reports in.
+///
+/// Fixed, and fixed *here* rather than derived from [`UNMODELLED`]'s order or
+/// from where the character happens to fall in the command, so the reason a
+/// given command draws is a function of the command alone and cannot move when
+/// somebody rewrites the character list. A command carrying a quote and a glob
+/// reports the quote whichever comes first in its text.
+///
+/// The order is severity-of-guessing: the classes at the top are the ones that
+/// would make a lexer of this grammar (quoting, substitution, expansion), and
+/// the ones at the bottom are the narrow spellings.
+const UNMODELLED_ORDER: &[UnmodelledSyntax] = &[
+    UnmodelledSyntax::Quote,
+    UnmodelledSyntax::Substitution,
+    UnmodelledSyntax::Variable,
+    UnmodelledSyntax::Redirect,
+    UnmodelledSyntax::Glob,
+    UnmodelledSyntax::Brace,
+    UnmodelledSyntax::Escape,
+    UnmodelledSyntax::History,
+];
+
+impl UnmodelledSyntax {
+    /// The content-free sentence this class refuses with — the value that rides
+    /// `skill_invoked.reach_reason`, the `session_pinned` event and the CLI's
+    /// pin notice (BR-6).
+    ///
+    /// Eight distinct sentences in one shape, so a reader who has seen one has
+    /// read them all and the class is the only thing that varies.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::Quote => "the command uses a quoted string this classifier does not model",
+            Self::Substitution => {
+                "the command uses a command substitution this classifier does not model"
+            }
+            Self::Variable => "the command uses a shell variable this classifier does not model",
+            Self::Redirect => {
+                "the command uses a redirect other than to /dev/null this classifier does not model"
+            }
+            Self::Glob => "the command uses a glob this classifier does not model",
+            Self::Brace => "the command uses a brace expansion this classifier does not model",
+            Self::Escape => "the command uses a backslash escape this classifier does not model",
+            Self::History => {
+                "the command uses a history expansion (`!`) this classifier does not model"
+            }
+        }
+    }
+
+    /// This class's bit in [`first_unmodelled_class`]'s presence set.
+    ///
+    /// Written out rather than taken from `self as u16`. A discriminant is an
+    /// accident of declaration order: a ninth class declared *above* an
+    /// existing one would silently renumber every bit, and a ninth declared
+    /// below would index past a fixed-width set. Spelling the bit makes both
+    /// a compile error instead.
+    const fn bit(self) -> u16 {
+        match self {
+            Self::Quote => 1 << 0,
+            Self::Substitution => 1 << 1,
+            Self::Variable => 1 << 2,
+            Self::Redirect => 1 << 3,
+            Self::Glob => 1 << 4,
+            Self::Brace => 1 << 5,
+            Self::Escape => 1 << 6,
+            Self::History => 1 << 7,
+        }
+    }
+}
+
+/// The first class of [`UNMODELLED`] syntax present in `command`, in
+/// [`UNMODELLED_ORDER`], or `None` when every byte is modelled.
+///
+/// One walk, collecting which classes are present into a bit set, then one
+/// lookup in the order: the alternative — eight walks, short-circuiting on the
+/// first hit — reports the same class and reads as eight rules instead of one.
+/// `$` is the only character whose class depends on its neighbour (`$(` is a
+/// substitution and `$f` a variable), which is why the walk is over a peekable
+/// iterator rather than over [`UNMODELLED`] itself.
+///
+/// Every character in [`UNMODELLED`] maps to exactly one class — asserted by
+/// [`tests::each_unmodelled_class_names_itself_and_nothing_else`], so a
+/// character added to that list without a class here is a compile-green
+/// refusal with no sentence, which this function would otherwise report as
+/// "modelled".
+fn first_unmodelled_class(command: &str) -> Option<UnmodelledSyntax> {
+    // [`UNMODELLED`] is still the definition of "this grammar does not model
+    // it"; the classes below only *explain* which of its characters was found.
+    // Reading the list here rather than letting the arms below stand in for it
+    // is what keeps the two in one relationship instead of two lists that drift
+    // — and it is the early-out for the overwhelmingly common command that
+    // carries none of them.
+    if !command.chars().any(|c| UNMODELLED.contains(&c)) {
+        return None;
+    }
+    let mut present: u16 = 0;
+    let mut chars = command.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let class = match ch {
+            '\'' | '"' => UnmodelledSyntax::Quote,
+            '`' => UnmodelledSyntax::Substitution,
+            '$' => {
+                if chars.peek() == Some(&'(') {
+                    UnmodelledSyntax::Substitution
+                } else {
+                    UnmodelledSyntax::Variable
+                }
+            }
+            '>' | '<' => UnmodelledSyntax::Redirect,
+            '*' | '?' | '[' => UnmodelledSyntax::Glob,
+            '{' | '}' => UnmodelledSyntax::Brace,
+            '\\' => UnmodelledSyntax::Escape,
+            '!' => UnmodelledSyntax::History,
+            _ => continue,
+        };
+        present |= class.bit();
+    }
+    UNMODELLED_ORDER
+        .iter()
+        .copied()
+        .find(|class| present & class.bit() != 0)
+}
+
 /// Classify one `shell` invocation.
 ///
 /// Takes **no exit status and no output** (REQ-614 BR-8): a `pwd` that timed
@@ -557,8 +767,11 @@ fn classify_with_budget(
     let stripped = strip_null_redirects(command);
     let command = stripped.residue.as_str();
 
-    if command.chars().any(|c| UNMODELLED.contains(&c)) {
-        return Verdict::unknown("the command uses shell syntax this classifier does not model");
+    // REQ-620 BR-6: the scan names the class it refused on rather than
+    // answering one sentence for all eight. The order is
+    // [`UNMODELLED_ORDER`]'s, not the command's.
+    if let Some(class) = first_unmodelled_class(command) {
+        return Verdict::unknown(class.reason());
     }
 
     let matcher = match BoundaryMatcher::new(boundaries) {
@@ -2319,11 +2532,14 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The sentence [`UNMODELLED`] refuses with today. TASK-405 splits it into
-    /// one sentence per `UnmodelledSyntax` class; until then every look-alike
-    /// below carries this one, and the accepted forms must carry *none* of it
-    /// (LESSON-550: assert the absence, not the remedy).
-    const UNMODELLED_REASON: &str = "the command uses shell syntax this classifier does not model";
+    /// Whether `reason` is one of the eight [`UnmodelledSyntax`] sentences.
+    ///
+    /// The accepted redirect forms must carry **none** of them (LESSON-550:
+    /// assert the absence, not the remedy), and "none of the eight" is the
+    /// absence to assert now that the refusal is not one sentence.
+    fn is_unmodelled_reason(reason: &str) -> bool {
+        UNMODELLED_ORDER.iter().any(|c| c.reason() == reason)
+    }
 
     /// Every `NullRedirect` form the entity names, attached where `sh` allows
     /// the attached spelling.
@@ -2353,18 +2569,26 @@ mod tests {
     ];
 
     /// Every other use of `>` and `<`, which REQ-620 BR-2 leaves exactly where
-    /// REQ-614 put it. The three `/dev/null`-adjacent rows are LESSON-494's
-    /// failure mode written out: one byte's difference between the gate and the
-    /// shell that runs the command.
-    const REDIRECT_LOOKALIKES: &[&str] = &[
-        "> out.txt",
-        ">> log",
-        "< input",
-        "2>/dev/nul",
-        "2>/dev/null/x",
-        "2>/dev/nullx",
-        "2>$f",
-        "> \"$f\"",
+    /// REQ-614 put it, beside the [`UnmodelledSyntax`] class each one refuses
+    /// on. The three `/dev/null`-adjacent rows are LESSON-494's failure mode
+    /// written out: one byte's difference between the gate and the shell that
+    /// runs the command.
+    ///
+    /// The last two rows are why the class is a column rather than a constant.
+    /// `2>$f` carries a redirect **and** a variable and `> "$f"` carries a
+    /// redirect, a variable and a quote; under [`UNMODELLED_ORDER`] they report
+    /// the variable and the quote, because the order is fixed and does not ask
+    /// which byte the reader was thinking about. Both are still `Unknown`,
+    /// which is the half BR-2 is about.
+    const REDIRECT_LOOKALIKES: &[(&str, UnmodelledSyntax)] = &[
+        ("> out.txt", UnmodelledSyntax::Redirect),
+        (">> log", UnmodelledSyntax::Redirect),
+        ("< input", UnmodelledSyntax::Redirect),
+        ("2>/dev/nul", UnmodelledSyntax::Redirect),
+        ("2>/dev/null/x", UnmodelledSyntax::Redirect),
+        ("2>/dev/nullx", UnmodelledSyntax::Redirect),
+        ("2>$f", UnmodelledSyntax::Variable),
+        ("> \"$f\"", UnmodelledSyntax::Quote),
     ];
 
     /// The verbs the differential table is run against — one from each of the
@@ -2396,9 +2620,9 @@ mod tests {
     /// nothing else — but the classifier's answer is the property the REQ
     /// states, so it is the one asserted.
     ///
-    /// **Mutation (run, red, reverted):** make
+    /// **Mutation (run, re-measured 2026-09-09, red, reverted):** make
     /// [`strip_null_redirects`](super::shell_syntax::strip_null_redirects) a
-    /// no-op — this reds first of seven, on the `ls 2>&1 && echo ok` residue
+    /// no-op — this reds first of eight, on the `ls 2>&1 && echo ok` residue
     /// row. Drop the whole-word rule (`from_operator` accepting any operator
     /// ending in `>`) — this reds, one of two, on the `ls>/dev/null` row.
     #[test]
@@ -2466,9 +2690,10 @@ mod tests {
     /// byte from a form this grammar now accepts, and each is a real file write
     /// the classifier cannot prove anything about.
     ///
-    /// **Mutation (run, red, reverted):** make the recogniser non-total — lift
-    /// any word carrying `>` or `<` — and this reds on `ls > out.txt`, which
-    /// comes back `Rooted`. It is one of six, and REQ-614's own
+    /// **Mutation (run, re-measured 2026-09-09, red, reverted):** make the
+    /// recogniser non-total — lift any word carrying `>` or `<` — and this
+    /// reds on `ls > out.txt`, which comes back `Rooted`. It is one of seven,
+    /// and REQ-614's own
     /// [`tests::adversarial_spellings_are_all_unknown`] is another, on
     /// `cat <src/main.rs`: the same widening reaches both suites, which is what
     /// makes the recogniser's totality a property and not a comment. A no-op
@@ -2478,7 +2703,7 @@ mod tests {
     fn every_other_redirect_stays_unmodelled() {
         let root = redirect_root("lookalikes");
         for verb in REDIRECT_TABLE_VERBS {
-            for lookalike in REDIRECT_LOOKALIKES {
+            for (lookalike, class) in REDIRECT_LOOKALIKES {
                 let command = format!("{verb} {lookalike}");
                 let v = verdict(&root, &command);
                 assert_eq!(
@@ -2488,20 +2713,156 @@ mod tests {
                     v.reason
                 );
                 assert_eq!(
-                    v.reason, UNMODELLED_REASON,
-                    "`{command}` should carry the redirect-class reason"
+                    v.reason,
+                    class.reason(),
+                    "`{command}` should carry {class:?}'s sentence"
                 );
             }
         }
         // A here-doc and a process substitution, named by BR-2 and refused by
-        // the same scan.
+        // the same scan — both on the redirect class, since neither carries a
+        // quote, a substitution or a variable.
         for exotic in ["cat << EOF", "diff <(ls) <(ls)"] {
             assert_eq!(
                 verdict(&root, exotic).reason,
-                UNMODELLED_REASON,
+                UnmodelledSyntax::Redirect.reason(),
                 "`{exotic}` must stay unmodelled"
             );
         }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A string that appears **only** in a test command, never in this file's
+    /// sentences, so "the reason carries no byte of the command" can be
+    /// asserted rather than reasoned about (LESSON-624's egress-capture
+    /// posture, applied to a reason instead of a payload).
+    const COMMAND_MARKER: &str = "ZQX9";
+
+    /// One command per [`UnmodelledSyntax`] class, each carrying **that class
+    /// alone** plus [`COMMAND_MARKER`].
+    ///
+    /// Single-class on purpose: a row that carried two would assert the
+    /// precedence rule instead of the class-to-sentence mapping, and the
+    /// precedence is asserted separately below where a mutation to
+    /// [`UNMODELLED_ORDER`] can be seen to move it.
+    const ONE_PER_CLASS: &[(&str, UnmodelledSyntax)] = &[
+        ("ls 'ZQX9'", UnmodelledSyntax::Quote),
+        ("ls $(echo ZQX9)", UnmodelledSyntax::Substitution),
+        ("ls $ZQX9", UnmodelledSyntax::Variable),
+        ("ls > ZQX9", UnmodelledSyntax::Redirect),
+        ("ls ZQX9*", UnmodelledSyntax::Glob),
+        ("ls {ZQX9}", UnmodelledSyntax::Brace),
+        ("ls ZQX9\\x", UnmodelledSyntax::Escape),
+        ("ls ZQX9!", UnmodelledSyntax::History),
+    ];
+
+    /// **BR-6 / AC-6: eight classes, eight distinct sentences, each naming only
+    /// its own class — and none of them naming the command.**
+    ///
+    /// Four claims, and each is a different way the refusal could go wrong:
+    ///
+    /// 1. **The mapping.** Each single-class command draws its own class's
+    ///    sentence. A table rather than eight asserts, so a class added to the
+    ///    enum without a row here is a missing row rather than a silent gap.
+    /// 2. **Distinctness.** Eight sentences, eight distinct strings. Two
+    ///    classes sharing a sentence would be the pre-REQ-620 defect in
+    ///    miniature — a reason that does not tell the reader which byte to fix.
+    /// 3. **Precedence.** `ls *.rs 'ZQX9'` holds a glob *before* a quote in the
+    ///    text and reports the quote, because [`UNMODELLED_ORDER`] decides and
+    ///    the command's byte order does not. The `$…>` row proves the order is
+    ///    read past its first entry.
+    /// 4. **Content-freeness.** No sentence contains [`COMMAND_MARKER`], and no
+    ///    sentence contains the command that produced it. The `&'static str`
+    ///    type is what makes this true; the assertion is what makes it *stay*
+    ///    true if somebody ever reaches for `format!`.
+    ///
+    /// The totality row is the fifth thing and belongs here rather than in its
+    /// own test: [`UNMODELLED`] is the list [`classify_with_budget`] no longer
+    /// reads, so a character added to it with no arm in
+    /// [`first_unmodelled_class`] would be a *refusal that stopped happening*.
+    ///
+    /// **Mutation (run, red, reverted):** swap [`UNMODELLED_ORDER`] so `Glob`
+    /// precedes `Quote` — this reds on claim 3's first row (`ls *.rs 'ZQX9'`
+    /// reports the glob) and on nothing else in the workspace, because the
+    /// per-class rows are single-class by construction and every other suite
+    /// asserts a `kind` rather than a sentence.
+    #[test]
+    fn each_unmodelled_class_names_itself_and_nothing_else() {
+        let root = redirect_root("classes");
+
+        // 1. The mapping, through the classifier rather than through
+        //    `first_unmodelled_class` alone — the sentence has to reach a
+        //    `Verdict`, which is what every consumer reads.
+        for (command, class) in ONE_PER_CLASS {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Unknown,
+                "`{command}` must stay unmodelled ({})",
+                v.reason
+            );
+            assert_eq!(
+                v.reason,
+                class.reason(),
+                "`{command}` should carry {class:?}'s sentence"
+            );
+            assert_eq!(
+                v.unknown_reason(),
+                Some(class.reason()),
+                "an Unknown verdict's reason is the one that rides the pin: `{command}`"
+            );
+        }
+        assert_eq!(
+            ONE_PER_CLASS.len(),
+            UNMODELLED_ORDER.len(),
+            "one command per class, so a new class cannot ship untested"
+        );
+
+        // 2. Eight distinct sentences.
+        let sentences: BTreeSet<&str> = UNMODELLED_ORDER.iter().map(|c| c.reason()).collect();
+        assert_eq!(
+            sentences.len(),
+            UNMODELLED_ORDER.len(),
+            "each class must name itself, not share a sentence: {sentences:?}"
+        );
+
+        // 3. Precedence: the order decides, not the command's byte order.
+        assert_eq!(
+            verdict(&root, "ls *.rs 'ZQX9'").reason,
+            UnmodelledSyntax::Quote.reason(),
+            "a command with a quote and a glob reports the quote"
+        );
+        assert_eq!(
+            verdict(&root, "ls $ZQX9 > out").reason,
+            UnmodelledSyntax::Variable.reason(),
+            "a variable outranks a redirect"
+        );
+
+        // 4. Content-freeness: the reason names the class and nothing the
+        //    command said.
+        for (command, _) in ONE_PER_CLASS {
+            let reason = verdict(&root, command).reason;
+            assert!(
+                !reason.contains(COMMAND_MARKER),
+                "`{command}`'s reason carried a byte planted in the command: {reason}"
+            );
+            assert!(
+                !reason.contains(command),
+                "`{command}`'s reason quoted the command: {reason}"
+            );
+        }
+
+        // 5. Totality: every character `UNMODELLED` refuses on has a class, so
+        //    the scan cannot silently stop refusing one.
+        for ch in UNMODELLED {
+            let probe = format!("ls x{ch}");
+            assert!(
+                first_unmodelled_class(&probe).is_some(),
+                "`{ch}` is in UNMODELLED with no class in `first_unmodelled_class`, \
+                 so a command carrying it would be read as fully modelled"
+            );
+        }
+
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2771,12 +3132,13 @@ mod tests {
                     "`{command}` should be Rooted ({})",
                     v.reason
                 );
-                assert_ne!(
-                    v.reason, UNMODELLED_REASON,
-                    "`{command}` should not carry the refusal it was cleared of"
+                assert!(
+                    !is_unmodelled_reason(v.reason),
+                    "`{command}` should not carry any refusal it was cleared of ({})",
+                    v.reason
                 );
             }
-            for lookalike in REDIRECT_LOOKALIKES {
+            for (lookalike, class) in REDIRECT_LOOKALIKES {
                 let command = format!("{verb} {lookalike}");
                 let v = verdict(&root, &command);
                 assert_eq!(
@@ -2785,7 +3147,7 @@ mod tests {
                     "`{command}` should be Unknown ({})",
                     v.reason
                 );
-                assert_eq!(v.reason, UNMODELLED_REASON, "`{command}`");
+                assert_eq!(v.reason, class.reason(), "`{command}`");
             }
         }
 

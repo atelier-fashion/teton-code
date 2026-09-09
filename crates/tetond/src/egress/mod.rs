@@ -395,7 +395,23 @@ fn wire_kind(kind: redact::FindingKind) -> WireFindingKind {
 /// [`NoopSink`] is available where events are irrelevant.
 pub trait PrivacyEventSink: Send + Sync {
     /// Publish a `privacy_block` event, scoped to `session_id` when known.
-    fn privacy_block(&self, session_id: Option<SessionId>, block: PrivacyBlock);
+    ///
+    /// `unknown_reason` is the classifier's content-free sentence for the
+    /// **provenance** the payload was refused under, when one explained it
+    /// (REQ-620 BR-6) — the `UnmodelledSyntax` class a `shell` command was
+    /// refused on. It is a third argument rather than a field on
+    /// [`PrivacyBlock`] because it is not part of the wire record of the
+    /// block: the pin the sink takes is what says it, on `session_pinned`, and
+    /// a block that pins nothing has nobody to tell. `None` for every block
+    /// with no provenance behind it — a redaction finding, a malformed source,
+    /// an MCP refusal — and for a boundary path, whose cause the block already
+    /// names.
+    fn privacy_block(
+        &self,
+        session_id: Option<SessionId>,
+        block: PrivacyBlock,
+        unknown_reason: Option<&'static str>,
+    );
 
     /// Publish a `provenance_rejected` event (REQ-571 ADR-D), scoped to
     /// `session_id` when known.
@@ -414,7 +430,14 @@ pub trait PrivacyEventSink: Send + Sync {
 
 /// The production sink: broadcast to attached clients over the daemon event bus.
 impl PrivacyEventSink for EventBus {
-    fn privacy_block(&self, session_id: Option<SessionId>, block: PrivacyBlock) {
+    fn privacy_block(
+        &self,
+        session_id: Option<SessionId>,
+        block: PrivacyBlock,
+        // The bus publishes the wire record; the reason is for a sink that
+        // takes a pin from it.
+        _unknown_reason: Option<&'static str>,
+    ) {
         self.publish(session_id, Event::PrivacyBlock(block));
     }
 
@@ -428,7 +451,13 @@ impl PrivacyEventSink for EventBus {
 pub struct NoopSink;
 
 impl PrivacyEventSink for NoopSink {
-    fn privacy_block(&self, _session_id: Option<SessionId>, _block: PrivacyBlock) {}
+    fn privacy_block(
+        &self,
+        _session_id: Option<SessionId>,
+        _block: PrivacyBlock,
+        _unknown_reason: Option<&'static str>,
+    ) {
+    }
     // Explicit no-op: NoopSink has no subscriber, so dropping the event is the
     // stated decision the required method forces (not an inherited silence).
     fn provenance_rejected(&self, _session_id: Option<SessionId>, _rejected: ProvenanceRejected) {}
@@ -850,7 +879,10 @@ impl<T: Transport> Egress<T> {
                 // `provenance_rejected` event rather than on a fourth cause.
                 cause: BlockCause::Boundary,
             };
-            self.sink.privacy_block(ctx.session_id.clone(), block);
+            // No class: a malformed source is a refusal about the provenance's
+            // *shape*, and the paired `provenance_rejected` event carries what
+            // was wrong with it.
+            self.sink.privacy_block(ctx.session_id.clone(), block, None);
             return Err(EgressError::PrivacyBlocked {
                 path: MALFORMED_PROVENANCE_PATH.to_owned(),
                 provider_id: ctx.provider_id.clone(),
@@ -891,7 +923,11 @@ impl<T: Transport> Egress<T> {
                     // not as a way for this emit site to leave the cause unsaid.
                     cause: BlockCause::Boundary,
                 };
-                self.sink.privacy_block(ctx.session_id.clone(), block);
+                // REQ-620 BR-6: the reason of the value that was actually
+                // inspected — so a lifted session's block cannot report the
+                // class of the opacity the lift released.
+                self.sink
+                    .privacy_block(ctx.session_id.clone(), block, inspected.unknown_reason());
                 return Err(EgressError::PrivacyBlocked {
                     path: violation.path,
                     provider_id: ctx.provider_id.clone(),
@@ -946,6 +982,9 @@ impl<T: Transport> Egress<T> {
                         action: ctx.block_action,
                         cause,
                     },
+                    // A redaction finding is about the payload's bytes, not
+                    // about any block's provenance: there is no class to name.
+                    None,
                 );
                 return Err(EgressError::PrivacyBlocked {
                     path,
@@ -1409,7 +1448,12 @@ mod tests {
     }
 
     impl PrivacyEventSink for CapturingSink {
-        fn privacy_block(&self, _session_id: Option<SessionId>, block: PrivacyBlock) {
+        fn privacy_block(
+            &self,
+            _session_id: Option<SessionId>,
+            block: PrivacyBlock,
+            _unknown_reason: Option<&'static str>,
+        ) {
             self.events.lock().unwrap().push(block);
         }
 

@@ -213,7 +213,12 @@ impl CapturingSink {
 }
 
 impl PrivacyEventSink for CapturingSink {
-    fn privacy_block(&self, session_id: Option<SessionId>, block: PrivacyBlock) {
+    fn privacy_block(
+        &self,
+        session_id: Option<SessionId>,
+        block: PrivacyBlock,
+        _unknown_reason: Option<&'static str>,
+    ) {
         self.events.lock().unwrap().push((session_id, block));
     }
     // Required no-op: this AC-9 fixture captures blocks, not rejections.
@@ -243,7 +248,7 @@ fn identities(outcome: &ToolOutcome) -> Vec<String> {
             .iter()
             .map(|id| ProvenanceId::as_str(id).to_owned())
             .collect(),
-        ToolProvenance::Unknown | ToolProvenance::UnknownWith(_) => {
+        ToolProvenance::Unknown(_) | ToolProvenance::UnknownWith(..) => {
             panic!("a first-party file tool must never report unknown provenance")
         }
         // REQ-614: only `shell` produces this variant, and no `shell` outcome

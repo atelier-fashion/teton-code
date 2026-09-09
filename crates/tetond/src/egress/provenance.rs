@@ -143,6 +143,20 @@ pub struct Provenance {
     sources: BTreeSet<ProvenanceId>,
     /// Some contributing content had indeterminate origin: block fail-closed.
     unknown: bool,
+    /// Why, when something knew (REQ-620 BR-6): the classifier's content-free
+    /// sentence naming the `UnmodelledSyntax` class a `shell` command was
+    /// refused on, carried here so the pin the block produces can say it.
+    ///
+    /// Beside [`Self::unknown`] rather than folded into it, because the two
+    /// are different facts: the bit is what refuses the send, and the sentence
+    /// is what the user is told. A `None` beside a `true` is a real state — an
+    /// opaque MCP result, a synthesized fold — and renders the pin notice
+    /// exactly as it read before REQ-620.
+    ///
+    /// `&'static str`, which is the content-freeness proof: no `String` is
+    /// built from a command anywhere between the classifier and the event, so
+    /// this field cannot come to hold one (REQ-619 BR-7, ADR-620-4).
+    unknown_reason: Option<&'static str>,
     /// Some contributing content named a boundary file the source set cannot
     /// hold — a path outside the session root, which mints no `ProvenanceId`
     /// for a glob to match (REQ-614, LESSON-623).
@@ -162,6 +176,7 @@ impl Provenance {
         Self {
             sources: BTreeSet::new(),
             unknown: false,
+            unknown_reason: None,
             boundary_touch: false,
         }
     }
@@ -174,6 +189,7 @@ impl Provenance {
         Self {
             sources,
             unknown: false,
+            unknown_reason: None,
             boundary_touch: false,
         }
     }
@@ -185,9 +201,22 @@ impl Provenance {
     /// boundary-free, so it refuses to send it remotely.
     #[must_use]
     pub fn unknown() -> Self {
+        Self::unknown_because(None)
+    }
+
+    /// [`Self::unknown`], carrying the classifier's reason for the opacity
+    /// (REQ-620 BR-6).
+    ///
+    /// `None` is the ordinary unknown — nothing classified this content's
+    /// reach, so the pin it takes says only that. `Some(reason)` is a
+    /// classified refusal, and the sentence rides to `session_pinned::reason`
+    /// and the CLI's notice.
+    #[must_use]
+    pub fn unknown_because(reason: Option<&'static str>) -> Self {
         Self {
             sources: BTreeSet::new(),
             unknown: true,
+            unknown_reason: reason,
             boundary_touch: false,
         }
     }
@@ -202,6 +231,10 @@ impl Provenance {
         Self {
             sources: BTreeSet::new(),
             unknown: true,
+            // No class sentence: this verdict's cause is the **path**, which
+            // `privacy_block` already names, and a pin over it is permanent
+            // rather than liftable (ADR-620-4).
+            unknown_reason: None,
             boundary_touch: true,
         }
     }
@@ -218,6 +251,25 @@ impl Provenance {
         self.unknown = true;
     }
 
+    /// [`Self::mark_unknown`], recording why (REQ-620 BR-6).
+    ///
+    /// First writer wins, like [`Self::merge`]: the reason a user is told is
+    /// the one that took the pin, and a second contributor does not rewrite it.
+    pub fn mark_unknown_because(&mut self, reason: Option<&'static str>) {
+        self.unknown = true;
+        self.unknown_reason = self.unknown_reason.or(reason);
+    }
+
+    /// The class that explains this provenance's opacity, when one does.
+    ///
+    /// `None` both for content that is not unknown and for content whose
+    /// opacity nothing classified — the pin notice renders the same line in
+    /// either case, which is the pre-REQ-620 line.
+    #[must_use]
+    pub fn unknown_reason(&self) -> Option<&'static str> {
+        self.unknown_reason
+    }
+
     /// The same provenance with its **opacity** lifted — `unknown` cleared —
     /// and everything else kept (BUG-215, REQ-614 BR-4).
     ///
@@ -232,9 +284,18 @@ impl Provenance {
     /// alone. Only the opacity that has no path behind it is released.
     #[must_use]
     pub fn with_unknown_lifted(&self) -> Self {
+        let unknown = self.unknown && self.boundary_touch;
         Self {
             sources: self.sources.clone(),
-            unknown: self.unknown && self.boundary_touch,
+            unknown,
+            // **Cleared with the bit it explains** (REQ-620, LESSON-650). A
+            // lift that kept the reason would leave a lifted session's next
+            // block reporting the class of a command the user has already
+            // vouched for — the same shape as a lift that reaches the route
+            // but not the choke point (BUG-215), one field down. The reason
+            // survives exactly where the bit does: a boundary touch, whose
+            // `unknown` a lift never clears.
+            unknown_reason: if unknown { self.unknown_reason } else { None },
             boundary_touch: self.boundary_touch,
         }
     }
@@ -288,6 +349,9 @@ impl Provenance {
             self.sources.insert(s.clone());
         }
         self.unknown |= other.unknown;
+        // First explained opacity wins: the reason a pin is announced with is
+        // the one that caused it, and a union is not a second refusal.
+        self.unknown_reason = self.unknown_reason.or(other.unknown_reason);
         // Monotonic for the same reason `unknown` is: a union that folded a
         // boundary-touching contributor is boundary-touching.
         self.boundary_touch |= other.boundary_touch;
@@ -518,6 +582,72 @@ mod tests {
             clean,
             "nothing to lift, nothing changed"
         );
+    }
+
+    /// **REQ-620 / LESSON-650 — a lift clears the reason with the bit it
+    /// explains.**
+    ///
+    /// The failure this forbids is the stale-class one: a session pinned on a
+    /// quoted command, lifted, and then blocked again for some other cause
+    /// would report "the command uses a quoted string…" about a command the
+    /// user has already vouched for. LESSON-650's shape exactly — a lift that
+    /// reaches one reader of the fact it lifts and not the next.
+    ///
+    /// The boundary-touch row is the must-not-fire half: its `unknown` bit
+    /// survives a lift, so anything travelling with that bit has to survive
+    /// too — and it carries no class in the first place, which the row also
+    /// says.
+    ///
+    /// **Mutation (run 2026-09-09, red, reverted):** keep the reason across the
+    /// lift (`unknown_reason: self.unknown_reason`) and this test reds on its
+    /// first assertion — alone in the lib suite, because the sink's own
+    /// cause gate is what protects the *escalated* pin and this is the only
+    /// assertion about a lift's own residue.
+    #[test]
+    fn a_lift_clears_the_class_that_explained_the_opacity() {
+        const CLASS: &str = "the command uses a quoted string this classifier does not model";
+
+        let opaque = Provenance::unknown_because(Some(CLASS));
+        assert_eq!(opaque.unknown_reason(), Some(CLASS));
+        let lifted = opaque.with_unknown_lifted();
+        assert!(!lifted.is_unknown());
+        assert_eq!(
+            lifted.unknown_reason(),
+            None,
+            "a lifted session's next block must not report a stale class"
+        );
+        assert_eq!(
+            lifted,
+            Provenance::empty(),
+            "…and lifts to exactly the provenance that pins nothing"
+        );
+
+        // The bit that survives a lift keeps whatever travels with it — and a
+        // boundary touch has nothing to keep.
+        let touch = Provenance::boundary_touch();
+        assert_eq!(touch.unknown_reason(), None);
+        assert_eq!(touch.with_unknown_lifted(), touch);
+    }
+
+    /// **REQ-620** — the reason is monotonic the way the bit is, and
+    /// **first-writer-wins**: the class a user was told about is the one that
+    /// took the pin, and a later contributor does not rewrite it.
+    #[test]
+    fn the_unknown_reason_merges_first_writer_wins() {
+        const FIRST: &str = "the command uses a quoted string this classifier does not model";
+        const SECOND: &str = "the command uses a glob this classifier does not model";
+
+        let mut p = Provenance::unknown_because(Some(FIRST));
+        p.merge(&Provenance::unknown_because(Some(SECOND)));
+        assert_eq!(p.unknown_reason(), Some(FIRST));
+
+        // A bare unknown folded in first leaves the field open for the class
+        // that follows — "nothing said why" is not an answer to keep.
+        let mut q = Provenance::unknown();
+        assert_eq!(q.unknown_reason(), None);
+        q.merge(&Provenance::unknown_because(Some(SECOND)));
+        assert_eq!(q.unknown_reason(), Some(SECOND));
+        assert!(q.is_unknown(), "and the bit is still what refuses the send");
     }
     #[test]
     fn unknown_provenance_is_not_empty_so_egress_still_inspects_it() {

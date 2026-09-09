@@ -941,7 +941,17 @@ pub fn context_provenance(ctx: &ContextManager) -> Provenance {
                     )));
                 }
                 if *unknown {
-                    prov.merge(&tool_result_provenance(&ToolProvenance::Unknown));
+                    // REQ-620 BR-6: no class, deliberately. `Provenance::User`
+                    // carries the bit and not the classifier's sentence, so a
+                    // **typed** `/skill` whose preamble was refused pins with
+                    // the pre-REQ-620 notice. That is not a gap the class has
+                    // to close here: the same turn publishes `skill_invoked`,
+                    // whose `outcomes[].reach_reason` already names the class
+                    // for every preamble (REQ-619 BR-7) — the surface a `shell`
+                    // call has no equivalent of, which is why the pin carries
+                    // the reason for that path. A model-invoked `skill` result
+                    // is a `Tool` block and does carry it.
+                    prov.merge(&tool_result_provenance(&ToolProvenance::unknown()));
                 }
                 // REQ-619 ADR-619-2, through the same mapping again: a preamble
                 // that named an out-of-root boundary file means to egress
@@ -974,7 +984,7 @@ pub fn context_provenance(ctx: &ContextManager) -> Provenance {
     if dropped.is_boundary_touch() {
         prov.merge(&tool_result_provenance(&ToolProvenance::BoundaryTouch));
     } else if dropped.is_unknown() {
-        prov.merge(&tool_result_provenance(&ToolProvenance::Unknown));
+        prov.merge(&tool_result_provenance(&ToolProvenance::unknown()));
     }
     prov
 }
@@ -1965,7 +1975,7 @@ mod tests {
         ctx.push_tool_result("read", Some(fixture_id("src/lib.rs")), "code");
         ctx.push_tool_result_prov(
             "shell",
-            ToolProvenance::Unknown,
+            ToolProvenance::unknown(),
             "cat secrets/prod.env output",
         );
 

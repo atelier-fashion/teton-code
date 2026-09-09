@@ -2338,6 +2338,27 @@ pub struct SessionPinned {
     /// here because it is the half of the consequence a user can act on: the
     /// 2026-09-04 session went from 665,984 tokens to 21,162 and nothing said so.
     pub budget_tokens: Option<u64>,
+    /// The content-free sentence naming *what* the daemon could not classify,
+    /// when something could say (REQ-620 BR-6).
+    ///
+    /// For an `unknown_shell` pin this is the `UnmodelledSyntax` class the
+    /// command was refused on — "the command uses a quoted string this
+    /// classifier does not model" — which is the half of the cause a user, and
+    /// a model, can act on: `unknown_shell` alone says a shell result was
+    /// opaque and not which byte made it so.
+    ///
+    /// **It carries no command text.** The daemon's value is a `&'static str`
+    /// from a closed set for its whole journey and is owned only here, at the
+    /// wire seam, because the wire type cannot be static (REQ-619 BR-7,
+    /// ADR-620-4).
+    ///
+    /// Absent for a pin whose cause is a path (`boundary_hit`) — the
+    /// `privacy_block` beside it already names the file — and for one nothing
+    /// classified. Additive and optional, so a v2 daemon that omits it and a
+    /// v2 client that ignores it are both correct: `PROTOCOL_VERSION_MIN` and
+    /// `MAX` stay at 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// The user lifted an `unknown_shell` pin (REQ-614 BR-5).
@@ -10221,12 +10242,18 @@ mod session_pin_events {
             liftable: true,
             remedy: PinRemedy::Command("/shell allow".to_owned()),
             budget_tokens: Some(21_162),
+            reason: Some(
+                "the command uses a quoted string this classifier does not model".to_owned(),
+            ),
         };
         let permanent = SessionPinned {
             cause: "boundary_hit".to_owned(),
             liftable: false,
             remedy: PinRemedy::None,
             budget_tokens: Some(21_162),
+            // REQ-620 BR-6: a pin whose cause is a path has nothing to add —
+            // the `privacy_block` beside it names the file.
+            reason: None,
         };
         // The pair a client must be able to tell apart: one offers a command,
         // the other says there is none. An empty-string remedy would render as
@@ -10234,6 +10261,62 @@ mod session_pin_events {
         assert!(matches!(liftable.remedy, PinRemedy::Command(ref c) if c == "/shell allow"));
         assert!(matches!(permanent.remedy, PinRemedy::None));
         assert!(liftable.liftable && !permanent.liftable);
+        assert!(liftable.reason.is_some() && permanent.reason.is_none());
+    }
+
+    /// **REQ-620 BR-6's wire half.** `reason` is additive and optional: a
+    /// record carrying one round-trips with it, a record without one **emits
+    /// no key at all**, and a frame written by a daemon that never heard of the
+    /// field deserializes into `None`.
+    ///
+    /// The absent case is what keeps `PROTOCOL_VERSION_MIN == MAX == 2`
+    /// honest: a field that serialized as `"reason": null` would still be a
+    /// shape older clients had not seen, which is a version bump wearing an
+    /// `Option`.
+    ///
+    /// **Mutation (run 2026-09-09):** dropping `skip_serializing_if` reds this
+    /// test on the "emits no key" assertion, and nothing else in the crate.
+    /// Dropping `#[serde(default)]` reds **nothing** — serde already reads a
+    /// missing `Option` field as `None`, so the attribute is belt and braces
+    /// here rather than the thing that makes the legacy frame parse. It is
+    /// kept because the *statement* is what a reader of this field needs, and
+    /// the legacy-frame row is kept for the same reason: it asserts the
+    /// property, not the attribute that happens to provide it (LESSON-550).
+    #[test]
+    fn the_pin_reason_is_additive_present_and_absent() {
+        let with = SessionPinned {
+            cause: "unknown_shell".to_owned(),
+            liftable: true,
+            remedy: PinRemedy::Command("/shell allow".to_owned()),
+            budget_tokens: Some(21_162),
+            reason: Some("the command uses a glob this classifier does not model".to_owned()),
+        };
+        let json = serde_json::to_string(&with).expect("serializes");
+        let back: SessionPinned = serde_json::from_str(&json).expect("round-trips");
+        assert_eq!(back, with);
+        assert_eq!(
+            back.reason.as_deref(),
+            Some("the command uses a glob this classifier does not model"),
+            "the class sentence crosses the wire verbatim: {json}"
+        );
+
+        let without = SessionPinned {
+            reason: None,
+            ..with.clone()
+        };
+        let json = serde_json::to_string(&without).expect("serializes");
+        assert!(
+            !json.contains("reason"),
+            "an absent reason emits no key, so a pre-REQ-620 client sees the              record it already knows: {json}"
+        );
+        let back: SessionPinned = serde_json::from_str(&json).expect("round-trips");
+        assert_eq!(back, without);
+
+        // A frame a daemon without this field wrote.
+        let legacy = r#"{"cause":"boundary_hit","liftable":false,"remedy":{"kind":"none"},"budget_tokens":21162}"#;
+        let back: SessionPinned = serde_json::from_str(legacy).expect("v2 frames still parse");
+        assert_eq!(back.reason, None);
+        assert_eq!(back.cause, "boundary_hit");
     }
 
     /// AC-11's wire half: both records round-trip, and their event names are the
@@ -10247,6 +10330,11 @@ mod session_pin_events {
                     liftable: true,
                     remedy: PinRemedy::Command("/shell allow".to_owned()),
                     budget_tokens: Some(21_162),
+                    reason: Some(
+                        "the command uses a redirect other than to /dev/null this classifier \
+                         does not model"
+                            .to_owned(),
+                    ),
                 }),
                 "session_pinned",
             ),

@@ -196,7 +196,12 @@ impl CapturingSink {
 }
 
 impl PrivacyEventSink for CapturingSink {
-    fn privacy_block(&self, session_id: Option<SessionId>, block: PrivacyBlock) {
+    fn privacy_block(
+        &self,
+        session_id: Option<SessionId>,
+        block: PrivacyBlock,
+        _unknown_reason: Option<&'static str>,
+    ) {
         self.events.lock().unwrap().push((session_id, block));
     }
     // Required no-op: this AC-9 fixture captures blocks, not rejections.

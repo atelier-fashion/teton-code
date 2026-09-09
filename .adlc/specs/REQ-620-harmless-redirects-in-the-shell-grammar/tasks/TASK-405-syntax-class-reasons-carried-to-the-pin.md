@@ -1,7 +1,7 @@
 ---
 id: TASK-405
 title: "The unmodelled scan names its syntax class, and the reason rides the provenance bit to the pin notice"
-status: draft
+status: complete
 parent: REQ-620
 created: 2026-09-09
 updated: 2026-09-09
