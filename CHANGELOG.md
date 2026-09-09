@@ -20,6 +20,70 @@ user having asked for it.
 
 ## [Unreleased]
 
+### Added
+
+- **A shell command that provably reads nothing no longer pins the session to
+  the local tier (REQ-620).** REQ-614's classifier decides, before a command
+  runs, whether everything it could read is inside the session root, and an
+  `unknown` verdict pins the session until the user types `/shell allow`. That
+  grammar was written for commands a user types: on 2026-09-09 the first shell
+  call a remote model made in an `/analyze` turn — six `ls` calls, an `echo`
+  and a `which` — pinned the session on a `2>&1`, and every later turn in it
+  ran on the 7B local model. The grammar now lifts the redirect forms that read
+  nothing out of a command before classifying the rest: `2>/dev/null`,
+  `>/dev/null`, `1>/dev/null`, `2>>/dev/null`, `&>/dev/null`, `</dev/null`,
+  `2>&1` and `1>&2`, attached or space-separated, and no others — `> out.txt`,
+  `< input`, `2>/dev/nul` and `2>$f` still refuse the whole command. And a
+  content-reading verb after a single `|` that names no existing file
+  (`ls src | head -5`, `git log | grep fix`) is now read as taking its stdin
+  from the previous segment, which was itself classified, instead of being
+  scored as a read of the whole session root; recursive `grep` is the
+  exception, because `grep -r` searches the tree whatever is on its stdin.
+  Nothing else widens: quotes, globs, `$`, other redirects, interpreters,
+  network clients, paths outside the root and unrecognised verbs pin exactly as
+  before, and a boundary read behind a redirect
+  (`cat secrets/prod.env 2>/dev/null`) still blocks and still pins permanently.
+
+  **Upgrade note:** a session that used to fall back to the local tier on the
+  first model-written `2>/dev/null` will now stay on its remote provider, so
+  turns that were being answered locally are answered remotely again. Nothing
+  about which files may be read changed — the boundary rules, the root jail and
+  the permanent `boundary_hit` pin are untouched — but if you were relying on
+  the pin as an incidental brake on remote traffic, this removes it.
+
+- **A pin says which syntax class refused the command.** `session_pinned` for
+  an `unknown_shell` pin now carries a `reason`: one content-free sentence per
+  class — quote, substitution, variable, redirect, glob, brace, escape, history
+  — the same sentences `skill_invoked.outcomes[].reach_reason` already carried,
+  rendered by the CLI after the cause (`cause: unknown_shell — the command uses
+  a quoted string this classifier does not model`). The field is additive and
+  omitted when absent, so the protocol version is unchanged: an older client
+  ignores it and an older daemon omits it. A `boundary_hit` pin carries none —
+  its cause is the path `privacy_block` already names — and no event carries a
+  byte of the command.
+
+- **The `shell` tool tells the model what keeps a command in reach.** The tool
+  description the model receives now states the grammar in one paragraph:
+  ordinary read verbs on paths inside the session root keep the session on its
+  current tier, `2>/dev/null` and `2>&1` are fine, and quotes, other redirects,
+  globs, `$`, `~/` paths, interpreters, network clients or an unknown verb pin
+  the rest of the session to the local tier, announced, and liftable only by
+  the user. The same bytes are served for a typed and a model-invoked turn.
+
+### Changed
+
+- **The system-prompt overhead ceiling rises 23 → 24 KiB
+  (`REDACT_BODY_OVERHEAD_BYTES`).** The reach contract above is 407 bytes and
+  the resident prompt had 105 left, so this is the raise REQ-617 said the next
+  claimant would have to make rather than shortening its way in. The four
+  figures derived from the ceiling were re-derived and re-asserted: the chunk
+  count stays 4, the total cap and the per-scan maximum are unmoved.
+
+  **Upgrade note:** every route with `[privacy] redact = true` now scans 931
+  fewer bytes of context per turn — the scannable bound falls 184,265 →
+  183,334. Nothing else moves: no configuration key, on-disk file, or wire
+  shape changes with it, and routes without redaction are unaffected.
+
 ### Fixed
 
 - **The over-budget offer on the local tier no longer says the route declares no
