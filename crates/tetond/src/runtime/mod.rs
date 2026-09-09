@@ -25012,7 +25012,9 @@ provider_id = \"deepseek\"
             assert_eq!(record.skill, "heavy");
             assert_eq!(record.stage, WireSkillStage::Body);
             assert_eq!(record.bound, BudgetBound::LocalEngine);
-            assert_eq!(record.window_verdict, WindowVerdict::WindowUnknown);
+            // The fixture is past the engine's 32,768-token window as well as
+            // the pair, and the verdict says so (BUG-222).
+            assert_eq!(record.window_verdict, WindowVerdict::ExceedsWindow);
             assert_eq!(
                 record.remedy_kind,
                 RemedyKind::BindTierRemote,
@@ -25105,7 +25107,7 @@ provider_id = \"deepseek\"
             };
             assert_eq!(record.skill, "heavy");
             assert_eq!(record.stage, WireSkillStage::Body);
-            assert_eq!(record.window_verdict, WindowVerdict::WindowUnknown);
+            assert_eq!(record.window_verdict, WindowVerdict::ExceedsWindow);
             assert!(
                 record.measured_tokens > record.budget_tokens,
                 "the record names what was over budget, not a figure that fits"
@@ -25179,9 +25181,14 @@ provider_id = \"deepseek\"
                 "AC-2: the bound is named verbatim, from the stamped budget: {sentence}"
             );
             assert!(
-                sentence.contains("cannot promise"),
-                "BR-3’s `WindowUnknown` clause is the one true thing about a route \
-                 with no window fact, and it has no other surface: {sentence}"
+                sentence.contains("blow the context window the engine allocated"),
+                "BR-3’s `ExceedsWindow` clause, worded for the engine's window rather \
+                 than a declared one (BUG-222): {sentence}"
+            );
+            assert!(
+                !sentence.contains("declares no context window"),
+                "the local route has a window fact — its own clause quotes it — so the \
+                 offer may not say it has none (BUG-222): {sentence}"
             );
             assert!(
                 !sentence.contains("Nothing was sent and no provider saw this turn"),

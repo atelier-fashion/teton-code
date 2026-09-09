@@ -2040,6 +2040,25 @@ const FITS_WINDOW_INTO_THE_RESERVATION: &str =
     "The prompt fits the context window this route declares, but the budget it went past is the \
      room held back for the reply — so it may leave the response very little to work with.";
 
+/// BR-3's `FitsWindow` sentence on the **local engine** (BUG-222).
+///
+/// The same fact as [`FITS_WINDOW_INTO_THE_RESERVATION`] — the band the prompt
+/// landed in is the generation reservation — said of a window the engine
+/// allocated rather than one a provider declared, because "declares" is the
+/// word the local route has no right to.
+const FITS_ENGINE_WINDOW_INTO_THE_RESERVATION: &str =
+    "The prompt fits the context window the engine allocated, but the budget it went past is \
+     the room held back for the reply — so it may leave the response very little to work with.";
+
+/// BR-3's `ExceedsWindow` sentence on the **local engine** (BUG-222).
+///
+/// The backstop it names is the typed `context_length_exceeded` outcome ADR-3
+/// built for the local tier, so the sentence promises what the daemon does.
+const EXCEEDS_ENGINE_WINDOW_CLAUSE: &str =
+    "This will blow the context window the engine allocated: proceeding will very likely be \
+     rejected by the engine, and the turn ends with a context-length error rather than quietly \
+     losing anything.";
+
 /// BR-3's `FitsWindow` sentence where the bound is **not** a window or a cap.
 ///
 /// Reachable on [`BudgetBound::RedactScan`] alone (the reachability table), and
@@ -2119,18 +2138,23 @@ const ACCEPTED_TAIL: &str =
 /// the one arm ADR-15 splits — by the bound.
 ///
 /// The verdict is the key because the verdict is the fact; the bound is
-/// consulted only to choose between two true readings of `FitsWindow`, and only
-/// over the cells the reachability table says occur. `LocalEngine` and
-/// `DefaultUnknown` never reach `FitsWindow` at all — [`window_verdict`]
-/// answers `WindowUnknown` for them — so no arm here can speak of a declared
-/// window on a route that declares none.
+/// consulted only to choose between true readings of the same verdict, and
+/// only over the cells the reachability table says occur. `DefaultUnknown`
+/// never reaches `FitsWindow` or `ExceedsWindow` at all — [`window_verdict`]
+/// answers `WindowUnknown` for it — so no arm here can speak of a declared
+/// window on a route that declares none. The local engine reaches both, and
+/// is worded apart because its window was allocated, not declared (BUG-222).
 const fn window_clause(verdict: WindowVerdict, bound: BudgetBound) -> &'static str {
     match verdict {
-        WindowVerdict::ExceedsWindow => EXCEEDS_WINDOW_CLAUSE,
+        WindowVerdict::ExceedsWindow => match bound {
+            BudgetBound::LocalEngine => EXCEEDS_ENGINE_WINDOW_CLAUSE,
+            _ => EXCEEDS_WINDOW_CLAUSE,
+        },
         WindowVerdict::FitsWindow => match bound {
             // ADR-15: here the band between the budget and the window is the
             // generation reservation, and the sentence has to say so.
             BudgetBound::Window | BudgetBound::UserCap => FITS_WINDOW_INTO_THE_RESERVATION,
+            BudgetBound::LocalEngine => FITS_ENGINE_WINDOW_INTO_THE_RESERVATION,
             // `RedactScan` in practice; the rest are unreachable with this
             // verdict and answered rather than assumed away.
             _ => FITS_WINDOW_CLAUSE,
@@ -2754,12 +2778,21 @@ fn claimed_provider_tokens(measured: Fit) -> u64 {
 ///
 /// # The verdict and the bound are not independent axes
 ///
-/// [`BudgetBound::LocalEngine`] and [`BudgetBound::DefaultUnknown`] reach
-/// [`WindowVerdict::WindowUnknown`] alone — there is no window fact to have a
-/// verdict about — while `Window`, `UserCap` and `RedactScan` reach
-/// [`WindowVerdict::FitsWindow`] and [`WindowVerdict::ExceedsWindow`]. Nine of
+/// [`BudgetBound::DefaultUnknown`] reaches [`WindowVerdict::WindowUnknown`]
+/// alone — there is no window fact to have a verdict about — while
+/// `LocalEngine`, `Window`, `UserCap` and `RedactScan` reach
+/// [`WindowVerdict::FitsWindow`] and [`WindowVerdict::ExceedsWindow`]. Seven of
 /// the fifteen cells cannot occur, and a test written for one of them passes
 /// vacuously (LESSON-520).
+///
+/// `LocalEngine` used to sit with `DefaultUnknown` (BUG-222). That was true
+/// when the local budget was a constant pair; since REQ-590 the pair derives
+/// from the engine's window and since REQ-616 that window is what the engine
+/// actually allocated, so the route *has* a window fact — the budget's own
+/// clause quotes it — and telling the user in the next sentence that the route
+/// declares no window was false. The window compared against is the one
+/// [`verdict_window`] resolves: the engine's for this bound, the declared one
+/// for the rest.
 ///
 /// A declared window of `0` is *the absence of a window fact* rather than a
 /// window of size zero — that is what [`BudgetBound::DefaultUnknown`] means —
@@ -2769,8 +2802,11 @@ fn claimed_provider_tokens(measured: Fit) -> u64 {
 #[must_use]
 pub fn window_verdict(bound: BudgetBound, window: u32, measured: Fit) -> WindowVerdict {
     match bound {
-        BudgetBound::LocalEngine | BudgetBound::DefaultUnknown => WindowVerdict::WindowUnknown,
-        BudgetBound::Window | BudgetBound::UserCap | BudgetBound::RedactScan => match window {
+        BudgetBound::DefaultUnknown => WindowVerdict::WindowUnknown,
+        BudgetBound::LocalEngine
+        | BudgetBound::Window
+        | BudgetBound::UserCap
+        | BudgetBound::RedactScan => match window {
             0 => WindowVerdict::WindowUnknown,
             declared if claimed_provider_tokens(measured) > u64::from(declared) => {
                 WindowVerdict::ExceedsWindow
@@ -2786,6 +2822,23 @@ pub fn window_verdict(bound: BudgetBound, window: u32, measured: Fit) -> WindowV
         // be relabelled `WindowUnknown`, which is a different, specific claim
         // about the route.
         BudgetBound::Unknown => WindowVerdict::Unknown,
+    }
+}
+
+/// The window [`window_verdict`] compares a measurement against, for a budget
+/// and the window the route *declared*.
+///
+/// On every remote bound that is the declaration itself — never the cap, which
+/// is a ceiling the user set below it (ADR-15) — and on the local bound it is
+/// the window the engine allocated, which `derive` stamped on the budget
+/// (REQ-616) and which the route declares nowhere else. One resolver, read by
+/// the offer and by the tests that check the offer against the classifier, so
+/// the two cannot pick different windows (BUG-222).
+#[must_use]
+pub fn verdict_window(budget: &RouteBudget, declared: u32) -> u32 {
+    match budget.bound {
+        BudgetBound::LocalEngine => budget.window_tokens,
+        _ => declared,
     }
 }
 
@@ -3155,7 +3208,11 @@ impl OverBudgetOffer {
             skill: skill.to_owned(),
             stage,
             measured,
-            window_verdict: window_verdict(budget.bound, window, measured.fit),
+            window_verdict: window_verdict(
+                budget.bound,
+                verdict_window(budget, window),
+                measured.fit,
+            ),
             // BR-7's own answer, which is the widest this can ever be. The
             // applying surface narrows it with
             // [`OverBudgetOffer::withhold_remedy`] once it knows whether it
@@ -6753,12 +6810,24 @@ mod tests {
             RemedyKind,
         )] = &[
             (
-                "the local engine declares no window, and its remedy is the route's, not the \
-                 pair's",
+                // claimed = max(25,000 × 3/2, 100,000 / 2) = 50,000 > 32,768.
+                "the local engine's window is the engine's, and its remedy is the route's, not \
+                 the pair's",
                 BudgetInputs::local(),
                 BudgetBound::LocalEngine,
                 measured(25_000, 100_000, false),
-                WindowVerdict::WindowUnknown,
+                WindowVerdict::ExceedsWindow,
+                RemedyKind::BindTierRemote,
+            ),
+            (
+                // Over the pair's word half (21,500 > 21,162) and inside the
+                // engine's window: claimed = max(21,500 × 3/2, 60,000 / 2) =
+                // 32,250 ≤ 32,768 (BUG-222).
+                "the local engine reaches the fits arm too, worded for an allocated window",
+                BudgetInputs::local(),
+                BudgetBound::LocalEngine,
+                measured(21_500, 60_000, false),
+                WindowVerdict::FitsWindow,
                 RemedyKind::BindTierRemote,
             ),
             (
@@ -6864,7 +6933,11 @@ mod tests {
             // what `window_verdict` says and does not decide again.
             assert_eq!(
                 offer.window_verdict,
-                window_verdict(budget.bound, inputs.window, fit.fit),
+                window_verdict(
+                    budget.bound,
+                    verdict_window(&budget, inputs.window),
+                    fit.fit
+                ),
                 "{name}: the offer and the classifier disagree"
             );
             // BR-3: every one of them is a question. There is no arm that
@@ -7347,10 +7420,16 @@ mod tests {
     fn each_window_verdict_pins_its_own_wording() {
         let rows: &[(&str, BudgetInputs<'_>, Measured, WindowVerdict)] = &[
             (
-                "the local engine has no window fact",
+                "the local engine: past the window the engine allocated",
                 BudgetInputs::local(),
                 measured(25_000, 100_000, false),
-                WindowVerdict::WindowUnknown,
+                WindowVerdict::ExceedsWindow,
+            ),
+            (
+                "the local engine: over the pair, inside the engine's window",
+                BudgetInputs::local(),
+                measured(21_500, 60_000, false),
+                WindowVerdict::FitsWindow,
             ),
             (
                 "max_context = 0 has none either",

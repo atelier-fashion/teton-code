@@ -18,6 +18,20 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [Unreleased]
+
+### Fixed
+
+- **The over-budget offer on the local tier no longer says the route declares no
+  window (BUG-222).** The offer quoted the engine's 32,768-token window in one
+  sentence and said "this route declares no context window" in the next. The
+  local-engine bound now reaches the same two verdicts as a declared window —
+  compared against what the engine allocated — with sentences worded for an
+  allocated window: over the pair but inside it, or past it with the typed
+  context-length outcome named as what happens.
+- **The "no room" notice had a run of spaces in the middle of its sentence
+  (BUG-221).**
+
 ## [0.1.33] - 2026-09-09
 
 One dogfood bug at the local tier's floor, and the toolkit-side half of another.
