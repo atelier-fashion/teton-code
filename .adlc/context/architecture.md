@@ -585,14 +585,18 @@
   the floor.
 
   **REQ-620 is the claimant that raised the ceiling (2026-09-09).** The `shell`
-  tool's description now carries a 407-byte reach contract — 303 more than the
+  tool's description now carries a 414-byte reach contract — 310 more than the
   105 the chain had left — so `REDACT_BODY_OVERHEAD_BYTES` went 23 → 24 KiB and
   the four figures below it were re-derived rather than re-reasoned: the chunk
   count stays 4 (quotient 3.08 → 3.11), the total cap and `REDACT_MAX_CHUNKS`
   are unmoved, and `REDACT_SCANNABLE_CONTEXT_BYTES` **falls** 184,265 →
   183,334, so the whole KiB comes off every redact-scanning route's budget
   rather than out of the chunk count the way REQ-612's raise did. Margins
-  re-measured, not reasoned: 105 → **721** and 152 → **768**, the gap still 47.
+  re-measured, not reasoned: 105 → **714** and 152 → **761**, the gap still 47.
+  (721/768 against a 407-byte contract until REQ-620's own Phase-5 verify, which
+  found the paragraph naming five of the eight syntax classes that pin — brace
+  expansion, backslash escapes and history expansion unmentioned — and spent
+  seven more bytes on "other shell syntax" to make the sentence honest.)
   It also retires the sentence above — the `shell` description now states the
   grammar the pin enforces, so `/shell allow` is no longer the model's only
   resident route to it (REQ-620 ADR-620-5, ASSUME-043 resolved, ASSUME-048).
@@ -705,8 +709,16 @@
   single `|` makes a segment piped** — an *or* is not a pipe — where a content
   verb that names no existing file reads its stdin, which the previous segment
   was already classified on, instead of being scored as a read of the whole
-  root; recursive `grep` keeps the walk, because `grep -r` searches `.`
-  whatever is on its stdin. The walk, its budget and its skip set are
+  root. The exemption is an **allowlist** — a closed set of pure filters
+  (`head`, `wc`, `sort`, …) plus `grep` when no word starts with `--`, no word
+  is `-d`, and no single-`-` cluster carries `r` or `R`. It shipped at TASK-404
+  as a denylist of the recursive `grep` spellings and REQ-620's own Phase-5
+  verify inverted it: `grep --directories recurse`, `--dir recurse`,
+  `--dereference-recursive` and `--rec` are all recursion GNU grep accepts,
+  none was on the list, and each returned `rooted` for a command that reads
+  every file under the root — a denylist inside an allowlist grammar cannot be
+  completed by adding rows. `sed`, `awk`, `diff`, `cat` and every unenumerated
+  `grep` flag keep the walk. The walk, its budget and its skip set are
   untouched. **(c)** The unmodelled scan reports the **class** it refused on —
   quote, substitution, variable, redirect, glob, brace, escape, history, the
   first present in a fixed order rather than the first in the text — and the

@@ -565,6 +565,23 @@ mod tests {
             Some(Stdin),
             "and from the device as well as to it"
         );
+        // The rest of the operator words `sh` accepts, spaced. The attached
+        // table above carries all five forms; before the Phase-5 verify the
+        // spaced arm was asserted on `2>` and `<` alone, so three of the five
+        // could have stopped parsing without a row moving.
+        for (operator, form) in [
+            ("&>", BothStreams),
+            (">>", Append),
+            ("1>", Write),
+            ("2>>", Append),
+            (">", Write),
+        ] {
+            assert_eq!(
+                NullRedirect::parse_spaced(operator, "/dev/null"),
+                Some(form),
+                "`{operator} /dev/null` is a form `sh` accepts"
+            );
+        }
         for (operator, target, why) in [
             (">", "out.txt", "an operator with an ordinary follower"),
             (">", "/dev/nullx", "a follower that merely starts like it"),

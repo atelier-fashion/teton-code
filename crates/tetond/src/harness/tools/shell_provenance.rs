@@ -378,26 +378,6 @@ impl Verdict {
     }
 }
 
-/// What the tokens seen so far proved about a boundary — the state that used to
-/// be a bare `saw_boundary` local in each of [`classify`] and
-/// [`classify_segment`] (REQ-619 verify, C2 and H1).
-///
-/// Two changes ride on making it a value the segment classifier **shares with
-/// its caller** rather than recomputes:
-///
-/// - `out_of_root` is the evidence [`Verdict::out_of_root_touch`] carries, and
-///   it can only be observed in the token loop that matched the glob.
-/// - `any` is now set the moment a token matches, so an `Unknown` returned
-///   *later in the same segment* — a denied prefix, a dirty subtree, an
-///   unresolvable token — no longer discards it. Before, the segment-level
-///   precedence rule ("a boundary touch outranks an unknown") held between
-///   segments and silently failed within one: `cat ~/.ssh/id_rsa /tmp/x` was
-///   `Unknown`, which `/shell allow` lifts.
-///
-/// Carrying `any` across segments is deliberate and cannot loosen a verdict:
-/// the caller already answers `BoundaryTouch` for the whole command once any
-/// segment touched, so a later segment that short-circuits on it only skips
-/// work whose answer could not have changed the result.
 /// The environment one segment is classified in: the session root, the compiled
 /// glob set, the directories no tool may read, the scan budget, and the user's
 /// home.
@@ -419,6 +399,26 @@ struct Scope<'a> {
     home: Option<&'a Path>,
 }
 
+/// What the tokens seen so far proved about a boundary — the state that used to
+/// be a bare `saw_boundary` local in each of [`classify`] and
+/// [`classify_segment`] (REQ-619 verify, C2 and H1).
+///
+/// Two changes ride on making it a value the segment classifier **shares with
+/// its caller** rather than recomputes:
+///
+/// - `out_of_root` is the evidence [`Verdict::out_of_root_touch`] carries, and
+///   it can only be observed in the token loop that matched the glob.
+/// - `any` is now set the moment a token matches, so an `Unknown` returned
+///   *later in the same segment* — a denied prefix, a dirty subtree, an
+///   unresolvable token — no longer discards it. Before, the segment-level
+///   precedence rule ("a boundary touch outranks an unknown") held between
+///   segments and silently failed within one: `cat ~/.ssh/id_rsa /tmp/x` was
+///   `Unknown`, which `/shell allow` lifts.
+///
+/// Carrying `any` across segments is deliberate and cannot loosen a verdict:
+/// the caller already answers `BoundaryTouch` for the whole command once any
+/// segment touched, so a later segment that short-circuits on it only skips
+/// work whose answer could not have changed the result.
 #[derive(Debug, Default)]
 struct BoundaryEvidence {
     /// Some path argument matched a boundary glob.
@@ -2772,6 +2772,61 @@ mod tests {
             before.kind, after.kind,
             "the redirect's filesystem effect must not reach the verdict"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **The glued forms, at the verdict rather than at the strip.**
+    ///
+    /// *(Phase-5 verify.)* `shell_syntax`'s own table asserts what the strip
+    /// leaves behind; this asserts what the **classifier** answers, which is
+    /// the value every consumer reads. Two claims, and they point opposite
+    /// ways on purpose:
+    ///
+    /// * A redirect glued to its **verb** (`ls>/dev/null`, `ls>&1`) is a word
+    ///   the recogniser does not accept, so the unmodelled scan sees its `>`
+    ///   and refuses the command on the redirect class — the pre-REQ-620
+    ///   answer, and the REQ's Deferred section says so.
+    /// * A redirect glued to a following **separator** (`ls 2>&1;ls`,
+    ///   `ls 2>&1|head`) *is* peeled, and the command classifies as though the
+    ///   separator had been spaced. That is M1's widening, and it is asserted
+    ///   here because the write gate depends on it: the pre-REQ-620 gate
+    ///   allowed `cmd 2>&1|head` at a home root and the first REQ-620 gate
+    ///   refused it.
+    ///
+    /// **Mutation (run, red, reverted):** delete [`split_glued_redirect`]'s
+    /// call from `strip_line` — **7 red**, this test's second half among them,
+    /// with `root_gate`'s two tables (the benign separator-glued rows and the
+    /// cross-gate differential), `shell_syntax`'s strip table, and three of
+    /// this module's redirect tests. The first half stays green, correctly:
+    /// dropping the peel cannot make a verb-glued form *more* modelled.
+    #[test]
+    fn a_redirect_glued_to_its_verb_is_unknown_and_one_glued_to_a_separator_is_not() {
+        let root = redirect_root("glued");
+
+        for command in ["ls>/dev/null", "ls>&1", "cat README.md>/dev/null"] {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Unknown,
+                "`{command}` is glued to its verb and stays unmodelled ({})",
+                v.reason
+            );
+            assert_eq!(
+                v.reason,
+                UnmodelledSyntax::Redirect.reason(),
+                "`{command}` is refused by the scan on its surviving `>`"
+            );
+        }
+
+        for command in ["ls 2>&1;ls", "ls 2>&1|head", "ls 2>&1; ls"] {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Rooted,
+                "`{command}` peels at the separator and classifies as spaced ({})",
+                v.reason
+            );
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 

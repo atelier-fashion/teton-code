@@ -10307,7 +10307,8 @@ mod session_pin_events {
         let json = serde_json::to_string(&without).expect("serializes");
         assert!(
             !json.contains("reason"),
-            "an absent reason emits no key, so a pre-REQ-620 client sees the              record it already knows: {json}"
+            "an absent reason emits no key, so a pre-REQ-620 client sees the \
+             record it already knows: {json}"
         );
         let back: SessionPinned = serde_json::from_str(&json).expect("round-trips");
         assert_eq!(back, without);

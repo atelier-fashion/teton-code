@@ -2842,7 +2842,6 @@ fn format_web_consent(decided: &WebConsentDecided) -> String {
     }
 }
 
-/// The notice a `web_taint_overridden` draws.
 /// The standing line a pinned session prints once (REQ-614 BR-7, REQ-620 BR-6).
 ///
 /// Four facts, in the order a reader needs them: what happened, what it costs,
@@ -2896,6 +2895,7 @@ fn format_session_pin_lifted(lifted: &SessionPinLifted) -> String {
     )
 }
 
+/// The notice a `web_taint_overridden` draws.
 fn format_web_taint_overridden(tiers: &[WebTier]) -> String {
     if tiers.is_empty() {
         return "web taint restriction lifted for this session; no tiers were granted to \

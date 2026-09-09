@@ -893,7 +893,7 @@ impl ToolOutcome {
     /// egress) — the `shell` tool, whose touched files cannot be parsed.
     ///
     /// The reason is the fixed generic one
-    /// ([`UNCLASSIFIED_REACH_REASON`](crate::harness::UNCLASSIFIED_REACH_REASON)),
+    /// ([`UNCLASSIFIED_REACH_REASON`](super::UNCLASSIFIED_REACH_REASON)),
     /// because this is the **any-spawn** arm: a tool reaching for it is saying
     /// it never classified anything, so there is no syntax class to name
     /// (REQ-620 BR-6). The `shell` tool's own classified refusals do not come
@@ -902,7 +902,7 @@ impl ToolOutcome {
     #[must_use]
     pub fn with_unknown_provenance(self) -> Self {
         self.with_provenance(ToolProvenance::Unknown(Some(
-            crate::harness::UNCLASSIFIED_REACH_REASON,
+            super::UNCLASSIFIED_REACH_REASON,
         )))
     }
 }

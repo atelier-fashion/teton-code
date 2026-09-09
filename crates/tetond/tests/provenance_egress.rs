@@ -876,6 +876,17 @@ const SECOND_PROMPT: &str = "Summarize the listing (redirect-clear-probe-7731)."
 /// two tests below differ in the *path* and in nothing else.
 const BOUNDARY_COMMAND: &str = r#"{"command":"cat secrets/prod.env 2>/dev/null"}"#;
 
+/// The same read behind the **other** BR-1 form (Phase-5 verify).
+///
+/// A descriptor duplication is a different arm of the recogniser from a write
+/// to the null device — and, unlike it, the word carries an `&`, the byte the
+/// classifier's splitter reads as a segment separator. So a strip that lifted
+/// it wrongly would not merely fail to strip: it would hand `2>` to the segment
+/// classifier as a *verb* and the boundary path to a segment that no longer has
+/// a content verb in front of it. Only the `/dev/null` form was driven at the
+/// wire; this is the one whose failure mode is a re-segmentation.
+const BOUNDARY_COMMAND_DUPLICATION: &str = r#"{"command":"cat secrets/prod.env 2>&1"}"#;
+
 /// **BR-9 + AC-4, at the wire.** The model's first `shell` call carries a
 /// redirect to `/dev/null` and a descriptor duplication. Nothing pins, and the
 /// **next prompt's own bytes** reach the provider.
@@ -1034,7 +1045,10 @@ async fn a_null_redirect_does_not_pin_and_the_next_prompt_reaches_the_provider()
 /// **BR-8 + AC-3, at the wire.** The same redirect on a command that reads a
 /// boundary file changes nothing about the verdict: `cat secrets/prod.env
 /// 2>/dev/null` is a boundary touch, the send carrying it is refused naming the
-/// file, and the session pins **permanently**.
+/// file, and the session pins **permanently**. Driven for **both** BR-1 forms
+/// since the Phase-5 verify — the null-device write and the descriptor
+/// duplication — because they are different arms of the recogniser and the
+/// second is the one whose word carries the splitter's separator byte.
 ///
 /// The must-not-fire twin of the test above (LESSON-440), and the reason the
 /// widening is a widening rather than a hole: the two commands differ in their
@@ -1063,6 +1077,14 @@ async fn a_null_redirect_does_not_pin_and_the_next_prompt_reaches_the_provider()
 /// as the hole-opening direction.
 #[tokio::test]
 async fn a_redirect_does_not_hide_a_boundary_read() {
+    // Both BR-1 forms on one path, because they are different arms of the
+    // recogniser with different failure modes — see
+    // [`BOUNDARY_COMMAND_DUPLICATION`].
+    boundary_read_is_not_hidden_by(BOUNDARY_COMMAND).await;
+    boundary_read_is_not_hidden_by(BOUNDARY_COMMAND_DUPLICATION).await;
+}
+
+async fn boundary_read_is_not_hidden_by(command: &'static str) {
     let repo = temp_repo();
     let sessions = SessionRegistry::new();
     let session_id = sessions
@@ -1084,13 +1106,8 @@ async fn a_redirect_does_not_hide_a_boundary_read() {
         false,
         None,
     );
-    let (result, captured, blocks) = drive_scripted_turn(
-        &repo,
-        &session_id,
-        ("c1", "shell", BOUNDARY_COMMAND),
-        turn.ctx_mut(),
-    )
-    .await;
+    let (result, captured, blocks) =
+        drive_scripted_turn(&repo, &session_id, ("c1", "shell", command), turn.ctx_mut()).await;
 
     // The verdict: a boundary touch that names the file, not an opaque refusal
     // and not a pass.
