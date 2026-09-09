@@ -1,7 +1,7 @@
 ---
 id: TASK-403
 title: "One null-redirect recogniser, shared by the write gate and the classifier, with the differential table"
-status: draft
+status: complete
 parent: REQ-620
 created: 2026-09-09
 updated: 2026-09-09

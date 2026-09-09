@@ -59,6 +59,10 @@ a path position, a backslash, or a segment whose first word is not in the
 known-verb table yields `unknown`. `command_position_programs` is reused for
 segment splitting only — never as the sole basis for a `rooted` verdict.
 
+**REQ-620 amends this list (2026-09-09).** A redirect to `/dev/null` or a
+descriptor duplication is lifted out before the unmodelled scan and the split;
+everything else in the list stands.
+
 ## ADR-614-2: `rooted` additionally requires a `project` root (OQ-1 resolved: yes)
 
 **Decision.** `classify` takes `RootKind` and returns `unknown` for any root

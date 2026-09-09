@@ -79,6 +79,37 @@
 //! the user's home, so a boundary glob written the way REQ-619 taught the
 //! daemon to *mint* reaches a file a shell command named (m2).
 //!
+//! # One widening, and the order it depends on (REQ-620)
+//!
+//! [`UNMODELLED`] refuses every command containing `>` or `<`, and that rule
+//! was written for commands a user types. On 2026-09-09 the first shell call a
+//! remote model made in an `/analyze` turn was six `ls` calls, an `echo` and a
+//! `which` — nothing outside the root but a `~/bin` probe — and it pinned the
+//! session for the rest of its life on a `2>&1`. Nothing in that command could
+//! have read a protected byte, and a model that has never seen this grammar
+//! cannot avoid writing the form (REQ-620 Description).
+//!
+//! So [`classify_with_budget`] now runs
+//! [`super::shell_syntax::strip_null_redirects`] **before** the [`UNMODELLED`]
+//! scan and **before** the segment split (ADR-620-2 steps 1–2). Only the
+//! `NullRedirect` entity's forms are lifted, as whole words; every other use of
+//! `>` and `<` refuses the whole command exactly as REQ-614 left it (BR-2).
+//! The order is not a preference:
+//!
+//! - Stripping *after* the unmodelled scan cannot work — the scan refuses on
+//!   the `>` the strip exists to remove.
+//! - Stripping *after* the split cannot work — `2>&1` and `&>/dev/null` contain
+//!   `&`, which the splitter reads as a segment separator, so it would hand
+//!   `2>` to [`classify_segment`] as a verb.
+//!
+//! The widening adds no reach in either direction. A lifted redirect
+//! contributes no path token, so `/dev/null` never reaches [`resolve_token`]
+//! and never matches a boundary glob (BR-3); and it removes none, so
+//! `cat .env 2>/dev/null` is the `BoundaryTouch` it always was (BR-8) and
+//! `python x.py 2>/dev/null` is the opaque-verb `Unknown` it always was (BR-5).
+//! The verdict is still a function of the command's text alone (BR-10) — the
+//! strip is a pure string transform and no redirect's *effect* is consulted.
+//!
 //! # Mutation record (conventions.md — show the test can fail)
 //!
 //! Inverting the fallthrough in [`classify_segment`] so an unrecognised verb
@@ -102,6 +133,19 @@
 //! [`tests::the_scan_does_not_inherit_the_discovery_walks_skip_set`] and
 //! [`tests::a_truncated_scan_is_unknown_never_rooted`] red — two, because the
 //! default budget also stops the starved-scan fixture from truncating.
+//!
+//! REQ-620's strip was mutated four ways and the counts live with the
+//! recogniser ([`super::shell_syntax`]'s module docs), because that is the
+//! module that owns the rule. Two results belong here. Making
+//! [`super::shell_syntax::strip_null_redirects`] a no-op reds **six** tests in
+//! this module and leaves [`tests::every_other_redirect_stays_unmodelled`]
+//! green — correctly, since a no-op preserves exactly the refusal that test
+//! asserts, and a widening that broke BR-2 would have to be a different
+//! mutation. That different mutation is the third: lifting any word carrying
+//! `>` or `<` reds `every_other_redirect_stays_unmodelled` *and* REQ-614's own
+//! [`tests::adversarial_spellings_are_all_unknown`], on `cat <src/main.rs`.
+//! One widening, both suites — which is the evidence that the REQ-614 grammar
+//! is still the thing being widened rather than replaced.
 
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
@@ -113,6 +157,7 @@ use teton_core::entities::PrivacyBoundary;
 use teton_core::provenance_id::{ProvenanceError, ProvenanceId};
 use teton_protocol::methods::RootKind;
 
+use super::shell_syntax::strip_null_redirects;
 use super::walk::{self, WalkBudget, WalkPolicy};
 use super::{canonical_through_existing_ancestor, lexical_normalize, under_denied_prefix};
 
@@ -469,6 +514,16 @@ fn classify_with_budget(
     if root_kind != RootKind::Project {
         return Verdict::unknown("the session root is not a project");
     }
+
+    // REQ-620 ADR-620-2, steps 1 and 2. The strip is **first**, and the order
+    // is the whole correctness argument: stripping after the unmodelled scan
+    // cannot work (the scan refuses on `>`), and stripping after the split
+    // cannot work (the `&` in `2>&1` is a separator, so a splitter that saw it
+    // first would hand `2>` to `classify_segment` as a verb and `1` to the next
+    // segment as one). Everything past this line reads the residue and is
+    // exactly the REQ-614 grammar.
+    let stripped = strip_null_redirects(command);
+    let command = stripped.residue.as_str();
 
     if command.chars().any(|c| UNMODELLED.contains(&c)) {
         return Verdict::unknown("the command uses shell syntax this classifier does not model");
@@ -909,7 +964,7 @@ fn subtree_is_boundary_free(
 mod tests {
     use super::*;
     use teton_core::config::DEFAULT_BOUNDARIES;
-    use teton_core::entities::PrivacyBoundary;
+    use teton_core::entities::{BoundaryMode, PrivacyBoundary};
 
     /// A **project** root — ADR-614-2 makes `RootKind::Project` a precondition
     /// for `Rooted`, so a bare temp dir would classify everything `Unknown` and
@@ -2064,6 +2119,515 @@ mod tests {
             verdict(&root, "grep -r foo .").kind,
             VerdictKind::Unknown,
             "a boundary file under a normally-pruned directory must still be seen"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The sentence [`UNMODELLED`] refuses with today. TASK-405 splits it into
+    /// one sentence per `UnmodelledSyntax` class; until then every look-alike
+    /// below carries this one, and the accepted forms must carry *none* of it
+    /// (LESSON-550: assert the absence, not the remedy).
+    const UNMODELLED_REASON: &str = "the command uses shell syntax this classifier does not model";
+
+    /// Every `NullRedirect` form the entity names, attached where `sh` allows
+    /// the attached spelling.
+    const NULL_REDIRECTS: &[&str] = &[
+        ">/dev/null",
+        "1>/dev/null",
+        "2>/dev/null",
+        ">>/dev/null",
+        "2>>/dev/null",
+        "&>/dev/null",
+        "</dev/null",
+        "2>&1",
+        "1>&2",
+        ">&2",
+    ];
+
+    /// The same forms in the spaced spelling. Only the operator forms have one
+    /// — a descriptor duplication is one word or it is not this form at all.
+    const SPACED_NULL_REDIRECTS: &[&str] = &[
+        "> /dev/null",
+        "1> /dev/null",
+        "2> /dev/null",
+        ">> /dev/null",
+        "2>> /dev/null",
+        "&> /dev/null",
+        "< /dev/null",
+    ];
+
+    /// Every other use of `>` and `<`, which REQ-620 BR-2 leaves exactly where
+    /// REQ-614 put it. The three `/dev/null`-adjacent rows are LESSON-494's
+    /// failure mode written out: one byte's difference between the gate and the
+    /// shell that runs the command.
+    const REDIRECT_LOOKALIKES: &[&str] = &[
+        "> out.txt",
+        ">> log",
+        "< input",
+        "2>/dev/nul",
+        "2>/dev/null/x",
+        "2>/dev/nullx",
+        "2>$f",
+        "> \"$f\"",
+    ];
+
+    /// The verbs the differential table is run against — one from each of the
+    /// grammar's four tables plus a `git` subcommand, so a regression in the
+    /// strip cannot hide behind a single arm of [`classify_segment`].
+    const REDIRECT_TABLE_VERBS: &[&str] =
+        &["ls", "cat README.md", "git status", "test -s x", "echo hi"];
+
+    /// A project root for the redirect tables: clean of boundary files, holding
+    /// the one file `cat README.md` names.
+    fn redirect_root(tag: &str) -> PathBuf {
+        let root = project_root(tag);
+        std::fs::write(root.join("README.md"), "# fixture\n").unwrap();
+        root
+    }
+
+    /// **BR-1 / BR-10: a null redirect is lifted as a whole word, before the
+    /// unmodelled scan and before the split, and adds no reach.**
+    ///
+    /// The residue rows are the load-bearing half. `2>&1` contains `&`, which
+    /// the splitter reads as a segment separator, so a strip that ran second
+    /// would hand `2>` to [`classify_segment`] as a verb and `1` to the next
+    /// segment as one — and the separators that really are separators have to
+    /// survive the lift as their own words for TASK-404's splitter to see them.
+    ///
+    /// BR-10 is the last pair: the redirect exists precisely because the file
+    /// might not, and the verdict may not move when it appears. The signature
+    /// does most of that work — [`strip_null_redirects`] takes a `&str` and
+    /// nothing else — but the classifier's answer is the property the REQ
+    /// states, so it is the one asserted.
+    ///
+    /// **Mutation (run, red, reverted):** make
+    /// [`strip_null_redirects`](super::shell_syntax::strip_null_redirects) a
+    /// no-op — this reds first of seven, on the `ls 2>&1 && echo ok` residue
+    /// row. Drop the whole-word rule (`from_operator` accepting any operator
+    /// ending in `>`) — this reds, one of two, on the `ls>/dev/null` row.
+    #[test]
+    fn null_redirects_are_lifted_before_the_scan_and_the_split() {
+        // The lift itself: whole words out, separators standing.
+        for (command, residue, lifted) in [
+            ("ls 2>&1 && echo ok", "ls && echo ok", 1),
+            ("ls &>/dev/null || echo no", "ls || echo no", 1),
+            ("ls 2>&1; ls", "ls ; ls", 1),
+            ("ls 2>&1 | head", "ls | head", 1),
+            ("cat x 2> /dev/null", "cat x", 2),
+            ("2>/dev/null cat x", "cat x", 1),
+            // Must not fire: a lone `&` is a separator, not a redirect, and a
+            // form glued to its verb is a word this grammar does not model.
+            ("ls & ls", "ls & ls", 0),
+            ("ls>/dev/null", "ls>/dev/null", 0),
+            ("ls > out.txt", "ls > out.txt", 0),
+        ] {
+            let stripped = strip_null_redirects(command);
+            assert_eq!(
+                stripped.residue, residue,
+                "`{command}` should strip to `{residue}`"
+            );
+            assert_eq!(
+                stripped.lifted, lifted,
+                "`{command}` lifted the wrong count"
+            );
+        }
+
+        let root = redirect_root("lifted");
+        // A form on its own adds nothing and removes nothing: the verdict is
+        // the one the bare command gets.
+        let bare = verdict(&root, "ls");
+        assert_eq!(bare.kind, VerdictKind::Rooted, "{}", bare.reason);
+        for form in NULL_REDIRECTS.iter().chain(SPACED_NULL_REDIRECTS) {
+            let command = format!("ls {form}");
+            let v = verdict(&root, &command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Rooted,
+                "`{command}` should classify exactly as `ls` does ({})",
+                v.reason
+            );
+            assert_eq!(v.reason, bare.reason, "`{command}` reached a different arm");
+            assert!(v.sources.is_empty(), "`{command}` minted a source");
+        }
+
+        // BR-10: from the text alone. The redirect is there because the file
+        // may not exist, and the verdict may not move when it does.
+        let before = verdict(&root, "ls not-yet-there 2>/dev/null");
+        std::fs::write(root.join("not-yet-there"), "now it is\n").unwrap();
+        let after = verdict(&root, "ls not-yet-there 2>/dev/null");
+        assert_eq!(before.kind, VerdictKind::Rooted, "{}", before.reason);
+        assert_eq!(
+            before.kind, after.kind,
+            "the redirect's filesystem effect must not reach the verdict"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **BR-2: every other use of `>` or `<` stays exactly as REQ-614 left it.**
+    ///
+    /// The must-not-fire half of BR-1 (LESSON-440). `2>/dev/nul`,
+    /// `2>/dev/null/x` and `2>/dev/nullx` are the rows that matter: each is one
+    /// byte from a form this grammar now accepts, and each is a real file write
+    /// the classifier cannot prove anything about.
+    ///
+    /// **Mutation (run, red, reverted):** make the recogniser non-total — lift
+    /// any word carrying `>` or `<` — and this reds on `ls > out.txt`, which
+    /// comes back `Rooted`. It is one of six, and REQ-614's own
+    /// [`tests::adversarial_spellings_are_all_unknown`] is another, on
+    /// `cat <src/main.rs`: the same widening reaches both suites, which is what
+    /// makes the recogniser's totality a property and not a comment. A no-op
+    /// strip leaves this test green, correctly — it asserts the refusal a
+    /// no-op preserves.
+    #[test]
+    fn every_other_redirect_stays_unmodelled() {
+        let root = redirect_root("lookalikes");
+        for verb in REDIRECT_TABLE_VERBS {
+            for lookalike in REDIRECT_LOOKALIKES {
+                let command = format!("{verb} {lookalike}");
+                let v = verdict(&root, &command);
+                assert_eq!(
+                    v.kind,
+                    VerdictKind::Unknown,
+                    "`{command}` must stay unmodelled ({})",
+                    v.reason
+                );
+                assert_eq!(
+                    v.reason, UNMODELLED_REASON,
+                    "`{command}` should carry the redirect-class reason"
+                );
+            }
+        }
+        // A here-doc and a process substitution, named by BR-2 and refused by
+        // the same scan.
+        for exotic in ["cat << EOF", "diff <(ls) <(ls)"] {
+            assert_eq!(
+                verdict(&root, exotic).reason,
+                UNMODELLED_REASON,
+                "`{exotic}` must stay unmodelled"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **BR-3: `/dev/null` in a lifted redirect is not a path token.**
+    ///
+    /// LESSON-623's seam read the other way round — a path that is *not* a file
+    /// access must not be scored as one. The assertion is a differential on one
+    /// boundary glob that matches the device: named as a redirect target it
+    /// contributes nothing, named as an argument it is a touch. A test that only
+    /// checked the redirect form would pass against a classifier that never ran
+    /// the matcher at all.
+    ///
+    /// **Mutation (run, red, reverted):** stop consuming the spaced form's
+    /// `/dev/null` follower (drop the `words.next()` in `strip_line`'s spaced
+    /// arm) — this reds on `cat README.md > /dev/null` as a `BoundaryTouch`,
+    /// one of four. That is BR-3's failure mode exactly: the device left in
+    /// the residue, resolved as a path, and scored against a glob.
+    #[test]
+    fn dev_null_is_never_a_path_token() {
+        let root = redirect_root("devnull");
+        // A user glob that matches the device, so a `/dev/null` that reached
+        // path resolution would be visible as a boundary touch rather than as
+        // a silent no-op.
+        let mut boundaries = builtins();
+        boundaries.push(PrivacyBoundary::user("**/null", BoundaryMode::LocalOnly));
+
+        for form in NULL_REDIRECTS.iter().chain(SPACED_NULL_REDIRECTS) {
+            let command = format!("cat README.md {form}");
+            let v = verdict_full(&root, None, &boundaries, Vec::new(), &command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Rooted,
+                "`{command}` must not score the device as a file ({})",
+                v.reason
+            );
+            assert!(
+                !v.out_of_root_touch,
+                "`{command}` recorded an out-of-root touch"
+            );
+            assert!(
+                v.sources.iter().all(|id| !id.as_str().contains("null")),
+                "`{command}` minted an id for the device"
+            );
+            assert!(
+                !strip_null_redirects(&command).residue.contains("/dev/"),
+                "`{command}` left the device in the residue"
+            );
+        }
+
+        // The differential: the same bytes as an *argument* are a path token,
+        // and the glob finds them.
+        let v = verdict_full(&root, None, &boundaries, Vec::new(), "cat /dev/null");
+        assert_eq!(
+            v.kind,
+            VerdictKind::BoundaryTouch,
+            "the device named as an argument is an ordinary path ({})",
+            v.reason
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **BR-5 / AC-7: an opaque verb with a null redirect is still `Unknown`,
+    /// with the opaque-verb reason.**
+    ///
+    /// The REQ's BR-5 sentence orders the strip *after* the opaque-verb check;
+    /// ADR-620-2 orders it first, and the two agree on every observable,
+    /// because lifting a redirect cannot turn an unrecognised verb into a
+    /// recognised one. This test is what pins that: it asserts the *reason*,
+    /// not just the kind, so a `curl` that started refusing as "unmodelled
+    /// syntax" instead of "a network client" would red here even though the
+    /// verdict is the same.
+    ///
+    /// **Mutation (run, red, reverted):** make
+    /// [`strip_null_redirects`](super::shell_syntax::strip_null_redirects) a
+    /// no-op and this reds on `python x.py 2>/dev/null` — not on the kind,
+    /// which stays `Unknown`, but on the *reason*, which becomes the unmodelled
+    /// sentence. A test asserting only the kind would have passed.
+    #[test]
+    fn an_opaque_verb_with_a_null_redirect_is_still_unknown() {
+        let root = redirect_root("opaque");
+        for command in [
+            "python x.py 2>/dev/null",
+            "curl example.com >/dev/null 2>&1",
+            "sh -c ls 2>/dev/null",
+            "cargo build 2>&1 | head",
+        ] {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Unknown,
+                "`{command}` must pin ({})",
+                v.reason
+            );
+            assert_eq!(
+                v.reason, "the command runs an interpreter, build tool or network client",
+                "`{command}` should refuse on the verb, not on the redirect"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **BR-8: a redirect never hides a boundary read.**
+    ///
+    /// The strip runs before any verb is read, so the boundary path is still
+    /// resolved by [`classify_segment`] and BUG-216's precedence — a touch
+    /// outranks an unknown — is untouched. Two boundary sets, because the
+    /// builtin `**/.env` and a user glob reach the matcher by different
+    /// spellings, and both orders of the redirect, because `sh` accepts a
+    /// leading one and a model writes both.
+    ///
+    /// **Mutation (run, red, reverted):** make
+    /// [`strip_null_redirects`](super::shell_syntax::strip_null_redirects) a
+    /// no-op — this reds on `cat .env 2>/dev/null`, which comes back as the
+    /// unmodelled `Unknown` a `/shell allow` would lift rather than the
+    /// permanent touch it is.
+    #[test]
+    fn a_redirect_never_hides_a_boundary_read() {
+        let root = redirect_root("boundary");
+        std::fs::write(root.join(".env"), "SECRET=1\n").unwrap();
+        std::fs::create_dir_all(root.join("secrets")).unwrap();
+        std::fs::write(root.join("secrets/prod.env"), "TOKEN=2\n").unwrap();
+
+        // The builtin `**/.env`, which needs no configuration to be in force.
+        for command in [
+            "cat .env 2>/dev/null",
+            "2>/dev/null cat .env",
+            "cat .env 2>&1",
+            "cat .env </dev/null",
+        ] {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::BoundaryTouch,
+                "`{command}` must still be a touch ({})",
+                v.reason
+            );
+        }
+
+        // A user glob, over the path AC-3 names. `**/.env` does not reach
+        // `secrets/prod.env`, so this row would pass vacuously without it.
+        let mut boundaries = builtins();
+        boundaries.push(PrivacyBoundary::user("secrets/**", BoundaryMode::LocalOnly));
+        for command in [
+            "cat secrets/prod.env 2>/dev/null",
+            "2>/dev/null cat secrets/prod.env",
+        ] {
+            let v = verdict_full(&root, None, &boundaries, Vec::new(), command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::BoundaryTouch,
+                "`{command}` must still be a touch ({})",
+                v.reason
+            );
+        }
+        assert_eq!(
+            verdict_full(
+                &root,
+                None,
+                &builtins(),
+                Vec::new(),
+                "cat secrets/prod.env 2>/dev/null"
+            )
+            .kind,
+            VerdictKind::Rooted,
+            "must not fire: without the glob that covers it, the same read is an ordinary one"
+        );
+
+        // BUG-216's precedence, through a strip: a touch outranks an unknown
+        // even when the unknown is in a later segment.
+        let v = verdict(&root, "cat .env 2>/dev/null && python x.py");
+        assert_eq!(
+            v.kind,
+            VerdictKind::BoundaryTouch,
+            "a touch outranks an opaque verb ({})",
+            v.reason
+        );
+
+        // Must not fire: an ordinary read with the same redirect is clean.
+        let v = verdict(&root, "cat README.md 2>/dev/null");
+        assert_eq!(v.kind, VerdictKind::Rooted, "{}", v.reason);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **AC-1: the 2026-09-09 command, which pinned a session on a `2>&1`.**
+    ///
+    /// The command is the REQ's Description verbatim. Six `ls` calls, three
+    /// `echo`s, a `which`, and nothing outside the root but the final `~/bin`
+    /// probe — so without that segment it is `Rooted`, and with it the reason
+    /// names the path, not the redirect. That last distinction is the whole
+    /// point of AC-1: a user told "a redirect pinned your session" would delete
+    /// the redirect and pin again on the next turn.
+    ///
+    /// **Mutation (run, red, reverted):** make
+    /// [`strip_null_redirects`](super::shell_syntax::strip_null_redirects) a
+    /// no-op — the first assertion reds with "the command uses shell syntax
+    /// this classifier does not model", which is the 2026-09-09 pin verbatim
+    /// and the behaviour this REQ exists to end.
+    #[test]
+    fn the_2026_09_09_command_is_rooted_without_its_home_probe() {
+        let root = project_root("2026-09-09");
+        let home = fixture_home("2026-09-09");
+        std::fs::create_dir_all(root.join(".adlc/context")).unwrap();
+        std::fs::create_dir_all(root.join(".adlc/partials")).unwrap();
+        std::fs::write(root.join(".adlc/context/architecture.md"), "arch\n").unwrap();
+        std::fs::write(root.join(".adlc/context/conventions.md"), "conv\n").unwrap();
+
+        let without_the_probe = "ls .adlc/context/architecture.md .adlc/context/conventions.md 2>&1; echo ---; ls .adlc/ 2>/dev/null; echo ---; ls .adlc/partials/ 2>/dev/null | head; echo ---; ls tools/lint-skills/ 2>/dev/null; echo ---; which adlc-read";
+        let v = verdict_with_home(&root, &home, without_the_probe);
+        assert_eq!(
+            v.kind,
+            VerdictKind::Rooted,
+            "the command that pinned the 2026-09-09 session reads nothing outside the root ({})",
+            v.reason
+        );
+
+        let with_the_probe = format!("{without_the_probe}; ls ~/bin/adlc-read 2>/dev/null");
+        let v = verdict_with_home(&root, &home, &with_the_probe);
+        assert_eq!(
+            v.kind,
+            VerdictKind::Unknown,
+            "the `~/bin` probe is still outside the root ({})",
+            v.reason
+        );
+        assert_eq!(
+            v.reason, "a path argument resolves outside the session root",
+            "the reason must name the path, not the redirect"
+        );
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// **AC-2: the differential table.**
+    ///
+    /// One fixture, three halves. Every accepted form — attached and spaced —
+    /// on five verbs, each `Rooted` and each carrying *none* of the unmodelled
+    /// sentence (LESSON-550: assert the absence, not the remedy). Every
+    /// look-alike on the same five verbs, each `Unknown` with that sentence.
+    /// And the `&`-bearing forms beside the separators they must not be
+    /// mistaken for: `2>&1` and `&>/dev/null` are lifted whole, while `&&`,
+    /// `||`, `;` and a lone `&` still separate segments.
+    ///
+    /// The `ls & frobnicate` row is the must-not-fire one and it is why the
+    /// separator rows are not vacuous: `ls & ls` would pass against a splitter
+    /// that had stopped splitting on `&` entirely, because both halves are the
+    /// same benign verb. An unrecognised verb after the `&` proves a second
+    /// segment was classified.
+    ///
+    /// **Mutation (run, red, reverted):** make
+    /// [`strip_null_redirects`](super::shell_syntax::strip_null_redirects) a
+    /// no-op and this reds on `ls >/dev/null`; make the recogniser non-total
+    /// (lift any word carrying `>` or `<`) and it reds on `ls > /dev/null`
+    /// resolving the device outside the root; leave the spaced form's follower
+    /// in place and it reds again. Three of the four mutations in
+    /// [`super::shell_syntax`]'s record reach this table, which is what a
+    /// differential table is for.
+    #[test]
+    fn the_redirect_differential_table() {
+        let root = redirect_root("differential");
+
+        for verb in REDIRECT_TABLE_VERBS {
+            for form in NULL_REDIRECTS.iter().chain(SPACED_NULL_REDIRECTS) {
+                let command = format!("{verb} {form}");
+                let v = verdict(&root, &command);
+                assert_eq!(
+                    v.kind,
+                    VerdictKind::Rooted,
+                    "`{command}` should be Rooted ({})",
+                    v.reason
+                );
+                assert_ne!(
+                    v.reason, UNMODELLED_REASON,
+                    "`{command}` should not carry the refusal it was cleared of"
+                );
+            }
+            for lookalike in REDIRECT_LOOKALIKES {
+                let command = format!("{verb} {lookalike}");
+                let v = verdict(&root, &command);
+                assert_eq!(
+                    v.kind,
+                    VerdictKind::Unknown,
+                    "`{command}` should be Unknown ({})",
+                    v.reason
+                );
+                assert_eq!(v.reason, UNMODELLED_REASON, "`{command}`");
+            }
+        }
+
+        // The `&`-bearing forms beside the separators they must not be mistaken
+        // for.
+        for command in [
+            "ls 2>&1 && echo ok",
+            "ls &>/dev/null || echo no",
+            "ls 2>&1; ls",
+            "ls 2>&1 | head",
+            "ls & ls",
+        ] {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Rooted,
+                "`{command}` should be Rooted ({})",
+                v.reason
+            );
+        }
+
+        // Must not fire: a lone `&` is still a separator, so the word after it
+        // is still read as a verb.
+        let v = verdict(&root, "ls & frobnicate");
+        assert_eq!(
+            v.kind,
+            VerdictKind::Unknown,
+            "a lone `&` must still start a segment ({})",
+            v.reason
+        );
+        assert_eq!(
+            v.reason, "the command's verb is not one this classifier recognises",
+            "the second segment's verb is what should have refused"
+        );
+        assert_eq!(
+            strip_null_redirects("ls & frobnicate").lifted,
+            0,
+            "a lone `&` is not a redirect"
         );
         std::fs::remove_dir_all(&root).ok();
     }

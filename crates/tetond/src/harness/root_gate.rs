@@ -39,6 +39,7 @@ use std::path::Path;
 use teton_protocol::methods::RootKind;
 
 use crate::harness::tools::shell::command_position_programs;
+use crate::harness::tools::shell_syntax::NullRedirect;
 
 /// Whether a write is permitted from this session root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,20 +163,52 @@ fn names_a_write_verb(command: &str) -> bool {
 /// Everything else with a top-level `>` is treated as a write, including a
 /// target this scanner cannot resolve — fail closed, as the REQ's assumption
 /// requires. The quote awareness is what keeps `echo "2 > 1"` allowed.
+///
+/// # One recogniser, two gates (REQ-620 ADR-620-1)
+///
+/// Both exemptions moved to [`NullRedirect`], which
+/// [`super::tools::shell_provenance::classify`] also reads. Two hand-rolled
+/// readings of `2>/dev/null` in one daemon is LESSON-494's shape: the day one
+/// of them accepts `2>/dev/nullx` and the other does not, one gate is wrong and
+/// no test says which.
+///
+/// The move is **whole-word** where the old inline scan was positional, and
+/// that tightens two spellings neither the table below nor any transcript
+/// carries: `cmd>&2` and `cmd >|/dev/null` (a `>|` glued to the device) are now
+/// writes. Both directions of this gate are not symmetric — a false "write"
+/// refuses a command at a home root, a false "not a write" scaffolds a project
+/// into `$HOME` — so the tightening is the safe way to be wrong, and it is
+/// recorded here rather than papered over.
+///
+/// **Mutation (run, red, reverted):** force [`redirection_reads_nothing`] to
+/// `false` and [`tests::the_write_gate_refuses_both_triggers_and_nothing_benign`]
+/// reds on `cat missing 2>/dev/null`; force it to `true` and the same test reds
+/// on `echo hi > notes.md`. One red each way, and nothing else in the suite
+/// notices — the benign table is the only thing holding this arm.
 #[must_use]
 pub(crate) fn has_top_level_redirection(command: &str) -> bool {
-    top_level_positions(command, '>').any(|at| {
-        // Step past the operator itself: `>`, `>>` or `>|`.
-        let after = command[at..]
-            .trim_start_matches('>')
-            .trim_start_matches('|');
-        // `>&2` and `2>&1`: the target is a descriptor.
-        if after.starts_with('&') {
-            return false;
-        }
-        // `> /dev/null` and `>/dev/null`.
-        !matches!(after.split_whitespace().next(), Some("/dev/null"))
-    })
+    top_level_positions(command, '>').any(|at| !redirection_reads_nothing(command, at))
+}
+
+/// Whether the whitespace-delimited word holding the `>` at byte `at` is a
+/// [`NullRedirect`] — alone, or as an operator whose next word is the device.
+fn redirection_reads_nothing(command: &str, at: usize) -> bool {
+    let start = command[..at]
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    let end = command[at..]
+        .find(char::is_whitespace)
+        .map_or(command.len(), |offset| at + offset);
+    let word = &command[start..end];
+    if NullRedirect::parse(word).is_some() {
+        return true;
+    }
+    command[end..]
+        .split_whitespace()
+        .next()
+        .is_some_and(|next| NullRedirect::parse_spaced(word, next).is_some())
 }
 
 /// Byte offsets of every top-level occurrence of `needle` in `command`.
