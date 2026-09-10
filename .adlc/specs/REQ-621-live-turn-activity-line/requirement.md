@@ -1,7 +1,7 @@
 ---
 id: REQ-621
 title: "A live activity line while a turn is working — what the agent is doing, for how long, and that it is still alive"
-status: approved
+status: complete
 deployable: true
 created: 2026-09-10
 updated: 2026-09-10

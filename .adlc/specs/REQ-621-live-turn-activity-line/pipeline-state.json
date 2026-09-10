@@ -4,13 +4,14 @@
   "startedAt": "2026-09-10T13:52:12Z",
   "integrationBranch": "main",
   "completed": false,
-  "currentPhase": 5,
+  "currentPhase": 6,
   "completedPhases": [
     0,
     1,
     2,
     3,
-    4
+    4,
+    5
   ],
   "phaseHistory": [
     {
@@ -37,6 +38,11 @@
       "phase": 4,
       "name": "Implement",
       "completedAt": "2026-09-10T15:55:49Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify",
+      "completedAt": "2026-09-10T18:00:39Z"
     }
   ],
   "repos": {
@@ -86,6 +92,7 @@
       "84d93f3"
     ],
     "stepD": "correctness/security/architecture/test-audit re-run; all closed after one follow-up fix",
-    "pendingUserQuestion": "BR-5/BR-9 while typing and submitting over the animating row: accept the recorded bounded exception (abandon on a submitted line, one frame left in scrollback) or open a BUG for raw-mode input handling"
+    "pendingUserQuestion": null,
+    "userDecision": "option 2: accept the recorded BR-5 exception; follow-up BUG-225 opened for raw-mode input handling"
   }
 }
