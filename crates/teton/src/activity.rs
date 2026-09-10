@@ -78,7 +78,7 @@ use teton_protocol::SessionId;
 
 use crate::client::should_render;
 use crate::cost_ui::format_usd;
-use crate::markdown::{char_display_width, display_width};
+use crate::markdown::display_width;
 use crate::session_ui::tier_warming_clause;
 
 /// How long this turn may go without a daemon event before the row says so
@@ -349,6 +349,32 @@ impl TurnActivity {
         self.phase
     }
 
+    /// Whether a row is due at `now` — the one spelling of BR-1's "silent
+    /// phase" that [`Self::frame`] and the pump's width read both consult.
+    ///
+    /// Separate from `frame` because the pump needs the answer *before* it can
+    /// call `frame`: the terminal width is an `ioctl`, and reading it on every
+    /// tick of a phase that draws nothing (a whole streamed reply, a whole
+    /// human wait at a permission prompt) is the per-tick cost
+    /// [`crate::client::RowState::width`] exists to avoid.
+    #[must_use]
+    pub fn has_row(&self, now: Instant) -> bool {
+        let Some(last_event) = self.last_event else {
+            return false;
+        };
+        let stalled = now.saturating_duration_since(last_event) >= STALL_AFTER
+            && self.phase != Phase::ToolRunning;
+        match self.phase {
+            Phase::Idle | Phase::AwaitingPermission => false,
+            Phase::Streaming => stalled,
+            Phase::Preparing
+            | Phase::AwaitingModel
+            | Phase::ToolRunning
+            | Phase::Held
+            | Phase::Compacting => true,
+        }
+    }
+
     /// The row to draw at `tick`, or `None` when nothing should be drawn.
     ///
     /// Pure: the same state, `now`, `tick` and `width` always yield the same
@@ -369,6 +395,9 @@ impl TurnActivity {
     /// column of the sentence to state something the missing text already says.
     #[must_use]
     pub fn frame(&self, now: Instant, tick: u64, width: usize) -> Option<String> {
+        if !self.has_row(now) {
+            return None;
+        }
         let (Some(turn_started), Some(phase_since), Some(last_event)) =
             (self.turn_started, self.phase_since, self.last_event)
         else {
@@ -377,8 +406,8 @@ impl TurnActivity {
         let quiet = now.saturating_duration_since(last_event);
         let stalled = quiet >= STALL_AFTER && self.phase != Phase::ToolRunning;
         let sentence = match self.phase {
-            // Nothing to draw, at any tick: there is no turn, or the phase is
-            // its own liveness signal (BR-1).
+            // Unreachable: `has_row` already answered for these. Kept as arms
+            // rather than a wildcard so a new phase is a compile error here.
             Phase::Idle | Phase::AwaitingPermission => return None,
             Phase::Streaming if !stalled => return None,
             Phase::Preparing => "preparing turn".to_owned(),
@@ -603,15 +632,19 @@ fn fit(row: &str, width: usize) -> String {
     if display_width(row) <= width {
         return row.to_owned();
     }
+    // Measured as a **string** after every push, never as a running sum of
+    // per-char widths: `unicode-width` charges an emoji presentation sequence
+    // (a base plus U+FE0F) two columns as a string and one as two chars, so a
+    // per-char sum admits twice the row the terminal will draw — the same
+    // wrapped row, and the same residue, the defuse above closes for control
+    // bytes. Quadratic in the row's length, which is bounded by the terminal.
     let mut fitted = String::new();
-    let mut used = 0;
     for c in row.chars() {
-        let cost = char_display_width(c);
-        if used + cost > width {
+        fitted.push(c);
+        if display_width(&fitted) > width {
+            fitted.pop();
             break;
         }
-        used += cost;
-        fitted.push(c);
     }
     fitted
 }
@@ -1372,6 +1405,32 @@ mod tests {
     /// unconditional arm (`self.enter(Phase::ToolRunning, now)` for every
     /// status). Only this test fails, on the first `assert_eq!`. Reverted with
     /// the same edit.
+    /// An emoji presentation sequence is two columns to the terminal and to
+    /// `unicode-width`'s string measure, but one column per `char`. A row
+    /// fitted by a per-char sum admits twice the width the terminal draws.
+    ///
+    /// Mutation (applied, observed, reverted): restoring the per-char
+    /// accumulator in `fit` reddens this test alone — 100 sequences at width 80
+    /// produce a row measuring well over 79 columns.
+    #[test]
+    fn an_emoji_presentation_sequence_is_charged_what_the_terminal_draws() {
+        let t0 = Instant::now();
+        let mut a = TurnActivity::default();
+        a.begin(t0);
+        a.observe(
+            &env(tool_call(&"\u{2764}\u{FE0F}".repeat(100))),
+            Some(&ours()),
+            t0,
+        );
+        let row = a.frame(t0, 0, 80).expect("a running tool has a row");
+        assert!(!row.is_empty());
+        assert!(
+            display_width(&row) <= 79,
+            "the row measures {} columns at a width of 80: {row:?}",
+            display_width(&row)
+        );
+    }
+
     #[test]
     fn a_tool_call_that_arrives_finished_is_not_running() {
         let t0 = Instant::now();

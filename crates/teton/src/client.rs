@@ -387,12 +387,14 @@ fn paint_row(row: &mut RowState, ctx: &mut UiContext, now: Instant) {
     }
     // A row about to be **drawn** is fitted to the terminal as it is now, and a
     // repaint keeps the width its row was drawn at — see [`RowState::width`]
-    // for why those are different decisions. Skipped while the projection is
-    // idle, which is every non-turn RPC pumping through this loop: the query is
-    // an `ioctl` and an idle projection has no row to fit. That is a cost
-    // guard and not a second answer to "is there a row" — the frame below is
-    // still the only thing that decides (ADR-621-1).
-    if !row.visible && ctx.state.activity.phase() != crate::activity::Phase::Idle {
+    // for why those are different decisions. Read only when a row is **due**
+    // ([`TurnActivity::has_row`]): the query is an `ioctl`, and a phase that
+    // draws nothing — an idle projection on a non-turn RPC, a whole streamed
+    // reply, a whole human wait at a permission prompt — would otherwise pay
+    // it eight times a second for a row it never fits. `has_row` is the same
+    // predicate `frame` answers with, so this is a cost guard and not a second
+    // opinion about whether there is a row (ADR-621-1).
+    if !row.visible && ctx.state.activity.has_row(now) {
         row.width = (row.measure_width)();
     }
     match ctx.state.activity.frame(now, row.tick, row.width) {
@@ -402,6 +404,12 @@ fn paint_row(row: &mut RowState, ctx: &mut UiContext, now: Instant) {
             }
         }
         Some(text) => {
+            // The one write here that reports nothing: `line` is the seam every
+            // durable write shares and is infallible by signature, so a draw
+            // whose bytes did not land still marks the row visible. That is the
+            // asymmetry BR-13 leaves — the fallible verbs are the two that move
+            // the cursor — and it self-corrects on the next tick: a stdout that
+            // dropped the draw drops the repaint too, and *that* verb reports it.
             ctx.surface.line(LineKind::Activity, &text);
             row.visible = true;
         }
@@ -720,19 +728,6 @@ impl Connection {
             } else {
                 Wake::Message(self.recv()?)
             };
-            // **BR-9, ahead of everything that reads or writes the row.** A
-            // line submitted while the row was animating has moved the cursor
-            // a row down, so every offset the row owns is now short by one and
-            // the next paint would land on the line the user typed. The row is
-            // abandoned rather than repainted or withdrawn — the reasoning is
-            // written out at [`RowState::abandon`], including why the frame it
-            // leaves in scrollback is the cheaper failure.
-            //
-            // Here rather than in each arm below, because it is not only the
-            // paints that would be wrong: the withdraw-before-dispatch and
-            // `call`'s own close-out would each erase that line on their way
-            // out, and this runs before both on every wake, including the one
-            // that carries the response.
             // **BR-9, ahead of everything that reads or writes the row.** A
             // line submitted while the row was animating has moved the cursor
             // a row down, so every offset the row owns is now short by one and
