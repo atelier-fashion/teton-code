@@ -1044,8 +1044,11 @@ impl RefinedOutcome {
 /// (failures come back as `ToolOutcome { is_error: true }`).
 ///
 /// [`Tool::run`] is **synchronous**: tool work is filesystem and process I/O,
-/// and the loop dispatches it inline. [`Tool::refine`] is the async half, for
-/// the one thing a tool cannot do synchronously — make a model call.
+/// and the loop dispatches it through `block_in_place_if_multithread`, so the
+/// worker it would otherwise hold — and the event forwarder parked in that
+/// worker's LIFO slot by the `tool_call` publish — carry on while a child
+/// process runs (BUG-226). [`Tool::refine`] is the async half, for the one
+/// thing a tool cannot do synchronously — make a model call.
 #[async_trait]
 pub trait Tool: Send + Sync {
     /// Stable tool name the model calls it by.
