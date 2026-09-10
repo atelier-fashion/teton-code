@@ -1,7 +1,7 @@
 ---
 id: REQ-620
 title: "Harmless redirects and pipeline stdin in the shell provenance grammar, and a model-facing contract for what pins"
-status: approved
+status: complete
 deployable: true
 created: 2026-09-09
 updated: 2026-09-09
