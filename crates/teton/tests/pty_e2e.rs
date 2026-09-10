@@ -3971,8 +3971,10 @@ fn the_truncated_notes_notice_reaches_the_terminal() {
 // **The `preparing` frame.** BR-2 has the row say `preparing turn` until
 // `route_decided` names something, and no leg here sees that frame. The daemon
 // publishes its first `route_decided` well inside one `FRAME_INTERVAL` of the
-// prompt going on the wire — the classifier's reflex route arrives first, then
-// the turn's own — so the row's *first* paint is already an `awaiting_model`
+// prompt going on the wire — two of them, in fact: the turn's own, and the
+// session-naming duty's `reflex` route from the detached task
+// `spawn_title_session` starts, in whichever order the scheduler runs them (see
+// the AC-1 leg) — so the row's *first* paint is already an `awaiting_model`
 // sentence, drawn from the message arm rather than from a tick. Nothing in the
 // fixture can hold the daemon quiet for that first 120 ms: the only seam that
 // could is `Connection`'s own receive, which is reachable from a unit test and
@@ -4084,6 +4086,17 @@ fn clocks(row: &str) -> &str {
     row.split_once(" · ").map_or("", |(_, clocks)| clocks)
 }
 
+/// The tier band a row's sentence carries — the parenthesised word.
+///
+/// `⠋ waiting on local local (build) · 2s · turn 2s` yields `build`, and a row
+/// with no parenthesis yields `""`, which no tier is called, so it fails the
+/// set comparison that reads it rather than being skipped by it.
+fn band(row: &str) -> &str {
+    row.split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map_or("", |(band, _)| band)
+}
+
 /// The distinct clock clauses in `rows`, in the order they first appeared.
 fn distinct_clocks(rows: &[String]) -> Vec<&str> {
     let mut seen: Vec<&str> = Vec::new();
@@ -4136,7 +4149,9 @@ fn assert_no_row_on_screen(transcript: &str, whose: &str) {
 ///    arrived;
 /// 2. its sentence names what the daemon reported: `waiting on`, the provider,
 ///    and the model out of `route_decided` (BR-2 — see the section header on why
-///    the `preparing` frame is not observable here);
+///    the `preparing` frame is not observable here), and the tier band is one
+///    of the two routes the daemon published on this session, both of which
+///    appear, in an order this leg deliberately does not pin (see below);
 /// 3. the counter shows **at least two distinct** values and the row is
 ///    repainted in place while it does, so the animation is running off the
 ///    client's own clock during a stretch in which the daemon says nothing
@@ -4172,6 +4187,56 @@ fn assert_no_row_on_screen(transcript: &str, whose: &str) {
 /// tick arm at all — with no live rows the pump keeps its blocking receive — so
 /// a mutation of that arm is invisible to it by construction, which is BR-6's
 /// own claim arriving as evidence rather than as an argument.
+///
+/// # The 2026-09-10 macOS flake, and why claim (2) no longer pins an order
+///
+/// This leg failed once on the macOS runner for PR #321 (run 34515728597) and
+/// passed on ubuntu and locally, on a change — `block_in_place_if_multithread`
+/// around the tool dispatch — that is not on this leg's path, since the turn
+/// makes no tool call. The failing assertion was claim (2)'s old last line,
+/// "the last row before the reply must name `(build)`", and the rows it quoted
+/// read `(build)` **first** and `(reflex)` for every row after it.
+///
+/// The comment above that assertion said the classifier's reflex route is
+/// published before the turn's own. Two things about that were wrong. The
+/// `(reflex)` route is not the classifier's: `classify::run` publishes nothing,
+/// and the `route` category's resolution is only the plan it runs under — its
+/// answer picks the turn's own category, whose `route_decided` is the `(build)`
+/// one. The reflex-tier event is the **session title** duty's — `title` is a
+/// reflex category — and it is published from inside the `tokio::spawn` that
+/// `spawn_title_session` starts and drops, when `DutyRoute::perform` announces
+/// the route on use. And the daemon promises no order between the two: the
+/// turn emits its own route at the top of its attempt loop, on the turn's
+/// task, while the naming task is polled whenever the multi-thread scheduler
+/// gets to it — usually before that emit, and on a loaded runner sometimes
+/// after it. The daemon's own runtime test says as much: it discriminates the
+/// title's `route_decided` "by category, which the event carries, rather than
+/// by position, which is the racy thing".
+///
+/// So the old assertion was pinning a scheduler artifact and calling it BR-2.
+/// BR-2's actual claim is that the row names whatever the daemon last reported
+/// and never a name the client composed, and that is what claim (2) now reads:
+/// every band is one the daemon published, both routes were published (the
+/// pump repaints on every event, so each `route_decided` leaves a row in its
+/// own band), and the row moved between them exactly once — two publications,
+/// one change — settling on whichever came second. The order is left to the
+/// scheduler because it is the scheduler's; a test that needs it fixed would
+/// need the daemon to announce the naming duty's route synchronously before
+/// the spawn, which is an announce-before-use BR-2 itself forbids.
+///
+/// The rewritten claim was **mutated against the daemon, built, and observed
+/// failing** (AC-11, LESSON-441), and the set comparison passes the exact rows
+/// the macOS run quoted:
+///
+/// | Mutation | Fails |
+/// |---|---|
+/// | `title_route` builds its `DutyRoute` without `.announcing(...)`, so the naming duty publishes no `route_decided` | claim (2)'s per-row check, quoting `⠋ preparing turn · 0s · turn 0s` |
+///
+/// Which row it quotes is the finding: with the naming duty's route gone, the
+/// turn's own no longer lands inside the first `FRAME_INTERVAL` and the
+/// `preparing` frame the section header calls unobservable becomes the first
+/// paint. The set comparison sits behind that check and is what would catch
+/// the same mutation on a run where the first tick happened to land later.
 #[test]
 fn the_row_appears_before_the_first_byte_and_withdraws_when_text_streams() {
     const REPLY: &str = "The delayed reply arrives at last.";
@@ -4234,12 +4299,15 @@ fn the_row_appears_before_the_first_byte_and_withdraws_when_text_streams() {
     // tier that decision went through.
     //
     // Two bands appear, and that is the rule working rather than a wobble: the
-    // classifier's own reflex route is published on this session before the
-    // turn's, so the row names `(reflex)` for as long as that is the last thing
-    // the daemon said and moves to `(build)` when the turn's route arrives. A
-    // row that named the turn's tier before the daemon had chosen it would be
-    // exactly the invention BR-2 forbids, so the assertion is "whatever was
-    // last reported", with the turn's own route pinned as the one it ends on.
+    // daemon publishes two `route_decided`s on this session before the reply's
+    // first byte — the turn's own, `(build)`, and the session-naming duty's,
+    // `(reflex)`, from the detached task the turn never waits on — and the row
+    // names whichever it heard last. Which of the two comes second is the
+    // scheduler's to decide, not the daemon's (see the doc comment on the
+    // 2026-09-10 flake), so the claim is BR-2's and no more: every band is one
+    // the daemon published, both were published, and the row moved between
+    // them exactly once. A band the daemon never reported would be the
+    // invention BR-2 forbids, and the set comparison is what catches it.
     for row in &rows {
         assert!(
             row.contains("waiting on local local ("),
@@ -4248,11 +4316,26 @@ fn the_row_appears_before_the_first_byte_and_withdraws_when_text_streams() {
              name the client composed (BR-2); row: {row:?}\ntranscript:\n{seen}"
         );
     }
-    assert!(
-        rows.last().is_some_and(|row| row.contains("(build)")),
-        "the last row before the reply must name the tier the *turn* resolved \
-         through, which is the last route the daemon reported before it started \
-         streaming; rows: {rows:#?}\ntranscript:\n{seen}"
+    let bands: Vec<&str> = rows.iter().map(|row| band(row)).collect();
+    let mut distinct: Vec<&str> = bands.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct,
+        ["build", "reflex"],
+        "the lead-in rows must wear exactly the two tiers the daemon reported on \
+         this session — the turn's own and the naming duty's — and no other; a \
+         missing one means a `route_decided` never reached the row before the \
+         reply, an extra one is a tier the daemon never published (BR-2); rows: \
+         {rows:#?}\ntranscript:\n{seen}"
+    );
+    let moves = bands.windows(2).filter(|pair| pair[0] != pair[1]).count();
+    assert_eq!(
+        moves, 1,
+        "two `route_decided`s were published, so the row must change band \
+         exactly once — from whichever the daemon said first to whichever it \
+         said last — and then stay there; bands in order: {bands:?}\n\
+         transcript:\n{seen}"
     );
 
     // (3), second half: the row was repainted **in place** while the clock
