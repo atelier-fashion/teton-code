@@ -3,8 +3,8 @@
   "branch": "feat/REQ-621-live-turn-activity-line",
   "startedAt": "2026-09-10T13:52:12Z",
   "integrationBranch": "main",
-  "completed": false,
-  "currentPhase": 7,
+  "completed": true,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
@@ -12,7 +12,9 @@
     3,
     4,
     5,
-    6
+    6,
+    7,
+    8
   ],
   "phaseHistory": [
     {
@@ -49,6 +51,19 @@
       "phase": 6,
       "name": "Create Pull Request",
       "completedAt": "2026-09-10T18:01:14Z"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-09-10T18:06:36Z",
+      "ciTip": "63d001e"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup",
+      "completedAt": "2026-09-10T18:10:39Z",
+      "mergeCommit": "585546f",
+      "pr": "https://github.com/atelier-fashion/teton-code/pull/319"
     }
   ],
   "repos": {
@@ -61,7 +76,7 @@
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/319",
       "prNumber": 319,
       "prCreatedAt": "2026-09-10T13:52:11Z",
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }
@@ -89,7 +104,8 @@
   "conflictsResolved": [],
   "notes": [
     "TASK-413 finding: a line submitted mid-animation leaves the last frame on screen (echoed newline scrolls under the \\x1b[1A bookkeeping); delivery intact (BR-9) but BR-5 residue while typing over the row \u2014 carry to Phase 5.",
-    "TASK-414 flake: a_running_tool_shows_its_title_elapsed_and_cost_so_far_beneath_its_running_line failed once in a full pty run (time-derived distinct_clocks>=2 snapshot); carry to Phase 5."
+    "TASK-414 flake: a_running_tool_shows_its_title_elapsed_and_cost_so_far_beneath_its_running_line failed once in a full pty run (time-derived distinct_clocks>=2 snapshot); carry to Phase 5.",
+    "Wrapup: LESSON-659, ASSUME-049 (landed with the feature), BUG-225 follow-up; worktree .worktrees/REQ-621 removed; close-out via chore/REQ-621-wrapup from origin/main."
   ],
   "phase5": {
     "fixCommits": [
@@ -100,5 +116,6 @@
     "stepD": "correctness/security/architecture/test-audit re-run; all closed after one follow-up fix",
     "pendingUserQuestion": null,
     "userDecision": "option 2: accept the recorded BR-5 exception; follow-up BUG-225 opened for raw-mode input handling"
-  }
+  },
+  "terminal": "merged"
 }
