@@ -4308,6 +4308,39 @@ fn the_row_appears_before_the_first_byte_and_withdraws_when_text_streams() {
 ///    and the row correctly carries no cost clause. The oracle is `teton cost`
 ///    rather than a literal, so a build that priced local calls fails here
 ///    instead of passing vacuously.
+///
+/// # The 2026-09-10 flake, and why the sleep is still three seconds
+///
+/// This leg failed once in a full run of the suite and passed in isolation and
+/// on every full run after it. The failing output was not kept; of its claims,
+/// (2) is the only one time can move, and (2) is what a starved event
+/// forwarder produces. The daemon dispatched `Tool::run` **inline** on its
+/// async worker, so a `shell` call held that worker for as long as `sleep 3`
+/// ran — and the `tool_call` publish immediately before it had woken this
+/// connection's forwarder into that same worker's LIFO slot, which no other
+/// worker steals (tokio-rs/tokio#4941). When the scheduling fell that way, the
+/// client received `tool_call` and `tool_call_update` together as the tool
+/// finished: one row, painted by the `tool_call` arm and withdrawn by the next
+/// message, reading one clause. That is BUG-226, and it is the silent stretch
+/// this leg exists to catch — the fix moved the dispatch behind
+/// `block_in_place_if_multithread` (observed on tokio 1.53 with a standalone
+/// probe: the forwarder waited out the whole block in 8 of 8 trials inline,
+/// and 0 of 8 through the helper).
+///
+/// Claim (2) is polled rather than read once, which is right for the reason
+/// its comment gives — but polling cannot reopen a window that closed with
+/// the tool. Rows are painted only while the tool runs, and a starved
+/// forwarder leaves one of them however long the poll waits, so under BUG-226
+/// the poll exhausts its window and quotes that one row. Neither the tool's
+/// length nor the `>= 2` claim changed: a longer sleep or a looser count would
+/// hide a starved forwarder, which compresses the window to nothing however
+/// long the tool runs, and `>= 2` over three seconds is ~25 paints of margin
+/// on the client's side. This leg catches the starvation only when tokio's
+/// scheduling hands the forwarder the slot, so the deterministic half is
+/// `tetond`'s `the_turn_path_takes_no_blocking_wait`, which holds the dispatch
+/// inside the helper by source. Claim (2)'s message lists the rows in the
+/// tool's window, so a one-row window and a frozen counter across many rows
+/// are told apart on the spot.
 #[test]
 fn a_running_tool_shows_its_title_elapsed_and_cost_so_far_beneath_its_running_line() {
     const REPLY: &str = "The tool turn is done.";
@@ -4336,19 +4369,25 @@ fn a_running_tool_shows_its_title_elapsed_and_cost_so_far_beneath_its_running_li
     // over inside it failed instead of waiting the one frame it needed. The
     // window is the tool's own — from its `[running]` line to its `[done]`, or
     // to the end of what has arrived while it is still running.
-    let while_tool_ran = |seen: &str| -> usize {
+    let tool_window = |seen: &str| -> Vec<String> {
         let Some(from) = seen.find(RUNNING) else {
-            return 0;
+            return Vec::new();
         };
         let window = &seen[from..];
         let window = window.split_once(DONE).map_or(window, |(open, _)| open);
-        distinct_clocks(&activity_rows(window)).len()
+        activity_rows(window)
     };
     assert!(
-        session.wait_until(|seen| while_tool_ran(seen) >= 2),
+        session.wait_until(|seen| distinct_clocks(&tool_window(seen)).len() >= 2),
         "the row's counter never moved while a three-second tool ran — a tool's \
          elapsed counter is the only signal there is while it runs, because the \
-         daemon publishes nothing (BR-4); transcript:\n{}",
+         daemon publishes nothing (BR-4). Two readings, told apart by the rows \
+         in the tool's window: one row, or two, means `[running]` and `[done]` \
+         reached the client together, because the daemon parked the worker its \
+         event forwarder was queued on (BUG-226); many rows all reading alike \
+         mean the counter is not on the client's own clock. Rows: {:#?}\n\
+         transcript:\n{}",
+        tool_window(&session.snapshot()),
         session.snapshot()
     );
     assert!(

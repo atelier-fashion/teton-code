@@ -19747,6 +19747,13 @@ provider_id = \"deepseek\"
         ///   `store_session_skills`, reached from `session/create` and `/cd` —
         ///   never from a turn. That is BUG-184's actual site, and
         ///   `multi_client.rs` already parks there.
+        /// - **BUG-226 found the wait this check was not watching for.** The
+        ///   tool dispatch is a synchronous call on the turn path that holds
+        ///   its worker for as long as a child process runs, and it is spelled
+        ///   `tools.dispatch(`, which is on no hazard list. It is now the one
+        ///   argued call in `harness/turn_loop.rs`, and it is keyed on the
+        ///   hazard below: every dispatch must be the wrapped one, and there
+        ///   must be one.
         ///
         /// What invariant 4 means *for this REQ* is therefore the other
         /// direction: the decomposition must not **introduce** a blocking wait
@@ -19757,7 +19764,10 @@ provider_id = \"deepseek\"
         /// `self.session_root_for(...)` in `block_in_place_if_multithread`
         /// fails here with `left: 1`. Widening the body-start pattern to
         /// `"    pub async fn "` — so the span starts at some other function —
-        /// fires the span floor rather than passing on the wrong text.
+        /// fires the span floor rather than passing on the wrong text. Taking
+        /// the helper back off `tools.dispatch` (BUG-226's defect, restored)
+        /// fails the dispatch check with `left: 1, right: 0` — that check
+        /// runs first, so the argued count behind it is never reached.
         #[test]
         fn the_turn_path_takes_no_blocking_wait() {
             // **Keyed on the hazard, not on the remedy** — LESSON-585, which this
@@ -19827,16 +19837,58 @@ provider_id = \"deepseek\"
             // names the helper is not a call and is stripped below so the bare
             // `block_in_place` hazard can still be scanned for underneath it.
             const REMEDY_CALL: &str = "block_in_place_if_multithread(";
-            const ARGUED: &[(&str, usize, &str)] = &[(
-                "runtime/turn.rs",
-                1,
-                "REQ-612 BR-6: the repository-notes re-read behind a moved `stat` \
-                 key opens and reads up to 64 KiB of a user-controlled path at \
-                 the session root — BUG-184's own hazard, taking BUG-184's own \
-                 remedy. The quiet turn (an unchanged key) stays inline at one \
-                 `stat`, which is what the split of `RepoContext::verdict` from \
-                 the load exists for.",
-            )];
+            const ARGUED: &[(&str, usize, &str)] = &[
+                (
+                    "runtime/turn.rs",
+                    1,
+                    "REQ-612 BR-6: the repository-notes re-read behind a moved `stat` \
+                     key opens and reads up to 64 KiB of a user-controlled path at \
+                     the session root — BUG-184's own hazard, taking BUG-184's own \
+                     remedy. The quiet turn (an unchanged key) stays inline at one \
+                     `stat`, which is what the split of `RepoContext::verdict` from \
+                     the load exists for.",
+                ),
+                (
+                    "harness/turn_loop.rs",
+                    1,
+                    "BUG-226: `Tool::run` is synchronous, and a `shell` call holds \
+                     its worker for as long as its child runs. The `tool_call` \
+                     publish just before it wakes this connection's event forwarder \
+                     into that same worker's LIFO slot, which no other worker steals \
+                     (tokio-rs/tokio#4941) — so dispatched inline, the client received \
+                     `tool_call` and `tool_call_update` together when the tool \
+                     finished. The dispatch is the one call on this path that is \
+                     *meant* to wait on a child, and the helper is what lets the \
+                     forwarder run while it does.",
+                ),
+            ];
+
+            // BUG-226, keyed on the hazard rather than the remedy (LESSON-585):
+            // the dispatch is a blocking wait however it is spelled, so every
+            // one of them must be the argued, wrapped one — and there must be
+            // at least one, or a loop that stopped dispatching tools would
+            // pass here.
+            const DISPATCH: &str = "tools.dispatch(";
+            const WRAPPED_DISPATCH: &str = "block_in_place_if_multithread(|| tools.dispatch(";
+            let (loop_name, loop_text) = corpus
+                .iter()
+                .find(|(name, _)| name.ends_with("harness/turn_loop.rs"))
+                .expect("vacuity floor: the corpus names harness/turn_loop.rs");
+            let dispatches = loop_text.matches(DISPATCH).count();
+            assert!(
+                dispatches >= 1,
+                "vacuity floor: {loop_name} dispatches no tool, so this check is \
+                 reading the wrong file"
+            );
+            assert_eq!(
+                dispatches,
+                loop_text.matches(WRAPPED_DISPATCH).count(),
+                "{loop_name} dispatches a tool outside `block_in_place_if_multithread`. \
+                 `Tool::run` waits on a child process for as long as it runs, and a \
+                 worker parked in it starves the event forwarder the `tool_call` \
+                 publish woke into its LIFO slot: the client's `[running]` line \
+                 arrives with `[done]` (BUG-226)."
+            );
             let corpus: Vec<(String, String)> = corpus
                 .into_iter()
                 .map(|(name, text)| {

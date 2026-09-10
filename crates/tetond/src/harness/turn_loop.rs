@@ -1938,7 +1938,22 @@ async fn run_the_allowed_tool(
             return Ok(());
         }
     }
-    let outcome = tools.dispatch(name, tool_ctx, arguments);
+    // **Off the async worker** (BUG-226). `Tool::run` is synchronous and a
+    // `shell` call holds this thread for as long as its child runs — up to the
+    // tool's ceiling. That is not only this turn's time: `tool_started` above
+    // woke this connection's event forwarder, and a task woken from a worker
+    // goes into that worker's LIFO slot, which no other worker can steal
+    // (tokio-rs/tokio#4941). Dispatched inline, the forwarder sat in the slot
+    // until the tool returned, and the client received `tool_call` and
+    // `tool_call_update` together — a `[running]` line printed at the moment
+    // the tool finished, which is the silent stretch REQ-621 exists to remove.
+    // Observed on tokio 1.53 with a standalone probe (8 of 8 trials; 0 of 8
+    // through the helper), and intermittently as
+    // `a_running_tool_shows_its_title_elapsed_and_cost_so_far_beneath_its_running_line`
+    // finding one row where it expects a counter. The helper hands the core —
+    // run queue and slot — to a fresh thread before this one blocks.
+    let outcome =
+        crate::runtime::block_in_place_if_multithread(|| tools.dispatch(name, tool_ctx, arguments));
     // REQ-567 OQ-1: the tool has RUN. Everything from here
     // to the fold below awaits — the tool's own duty, then
     // `digest` — and a cancellation landing in one of those
