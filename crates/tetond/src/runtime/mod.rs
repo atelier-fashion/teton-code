@@ -259,6 +259,16 @@ pub use views::BoundaryPosture;
 /// Separator between reply blocks in a `TETON_LOCAL_SCRIPT` file.
 const SCRIPT_SEPARATOR: &str = "---";
 
+/// The first line a reply block may open with to make the stand-in engine hold
+/// the turn open before its first token: `@delay-ms <n>` (REQ-621 ADR-621-6).
+///
+/// Honoured only under the seam master switch — a debug build with
+/// `TETON_TEST_SEAMS=1`, [`test_seams_enabled`] — and streamed verbatim
+/// everywhere else, so a script cannot change meaning outside the seam and a
+/// release build never honours it. See [`ScriptedFileEngine`] for why the
+/// directive exists at all, and [`delay_directive`] for the grammar.
+const SCRIPT_DELAY_DIRECTIVE: &str = "@delay-ms";
+
 /// A placeholder a scripted reply may contain to force its continuation to depend
 /// on the **real** tool output of the current turn's context.
 ///
@@ -474,6 +484,22 @@ pub(crate) const DRAFT_CONTRACT_PREFIX_BYTES: usize = 2_048;
 /// which is a property of the fixtures, not of the seam. The contract is a shared
 /// constant on both sides precisely so the recognizer cannot drift away from the
 /// prompt it recognizes.
+///
+/// **A block may also ask to be held open** (REQ-621 ADR-621-6).
+/// [`SCRIPT_DELAY_DIRECTIVE`] as a block's first line — `@delay-ms 250` — makes
+/// [`Engine::complete`] sleep that long before emitting the first token, and
+/// strips the line, so nothing test-visible about the reply changes but its
+/// timing. REQ-621's activity line is a surface that exists only *while a turn
+/// is working*, and its pty legs need a turn that is still working when they
+/// look: without the directive there is no deterministic way to hold one open,
+/// and REQ-556 left the equivalent leg uncovered rather than invent a
+/// production delay to make it possible. This is not that — the directive is
+/// part of the script grammar of a *fixture* engine, and it rides the same
+/// master switch every other test seam rides. A release build never honours it
+/// (it refuses to start at all while the switch is set), and with the seam off
+/// the line is simply the reply's own first line, streamed verbatim — as is a
+/// malformed one (`@delay-ms x`) under the seam. The duty arms answer before
+/// the directive is ever read, so no duty can be delayed by a script.
 pub struct ScriptedFileEngine {
     model_id: String,
     replies: Vec<String>,
@@ -568,11 +594,32 @@ impl Engine for ScriptedFileEngine {
         &self.model_id
     }
 
+    /// Reads the seam master switch **once**, here, through the same predicate
+    /// every other seam in this runtime reads, and hands the answer down.
+    ///
+    /// One spelling of the gate rather than two (LESSON-494): from here down the
+    /// seam is a parameter, which is also what lets the honoured half of
+    /// [`SCRIPT_DELAY_DIRECTIVE`] be tested without a test mutating a
+    /// process-global environment variable that the rest of this suite asserts
+    /// is unset (`attest::tests::the_presence_seam_is_unreachable_without_the_master_switch`).
     fn complete(
         &self,
         prompt: &str,
         params: &GenParams,
         on_token: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<Completion, EngineError> {
+        self.complete_scripted(prompt, params, on_token, test_seams_enabled())
+    }
+}
+
+impl ScriptedFileEngine {
+    /// [`Engine::complete`] with the seam decision passed in rather than read.
+    fn complete_scripted(
+        &self,
+        prompt: &str,
+        params: &GenParams,
+        on_token: &mut dyn FnMut(&str) -> bool,
+        seams: bool,
     ) -> Result<Completion, EngineError> {
         // A duty, not a turn: answered off-script so the block sequence keeps
         // meaning what the fixture author wrote (see the type's docs).
@@ -625,10 +672,25 @@ impl Engine for ScriptedFileEngine {
             scripted_classification().to_owned()
         } else {
             let idx = self.calls.fetch_add(1, Ordering::SeqCst);
-            self.replies
+            let block = self
+                .replies
                 .get(idx)
                 .cloned()
-                .unwrap_or_else(|| "Done.".to_owned())
+                .unwrap_or_else(|| "Done.".to_owned());
+            // REQ-621 ADR-621-6: the block chosen for *this* call — and only a
+            // script block, never one of the duty answers above — may open with
+            // `@delay-ms <n>` and ask the engine to hold the turn open that long
+            // before its first token, so a pty leg can look at a turn that is
+            // still working. Under the seam the line is consumed; off the seam,
+            // or malformed, it is the reply's own first line and streams
+            // verbatim.
+            match seams.then(|| delay_directive(&block)).flatten() {
+                Some((delay, rest)) => {
+                    std::thread::sleep(delay);
+                    rest
+                }
+                None => block,
+            }
         };
         // A reply may quote the current turn's real tool output via the
         // placeholder, so the scripted continuation genuinely depends on the
@@ -658,6 +720,28 @@ impl Engine for ScriptedFileEngine {
         let prompt_tokens = u32::try_from(prompt.split_whitespace().count()).unwrap_or(u32::MAX);
         Ok(Completion::cold(text, prompt_tokens, completion_tokens))
     }
+}
+
+/// The delay a reply block's first line asks for, and the block without it.
+///
+/// The grammar is exactly [`SCRIPT_DELAY_DIRECTIVE`], then whitespace, then a
+/// `u64` count of milliseconds. Anything else is `None` and the caller streams
+/// the block verbatim: `@delay-ms x`, a negative or overflowing count,
+/// `@delay-ms250` with no space, or a directive with no second line to stream
+/// after it. A fixture that mistypes the directive therefore fails on the reply
+/// text it asserts — the directive is right there in the tokens — rather than
+/// quietly running without the delay it asked for, which is the failure that
+/// would look like the surface under test being wrong.
+fn delay_directive(block: &str) -> Option<(Duration, String)> {
+    let (first, rest) = block.split_once('\n')?;
+    let arg = first.strip_prefix(SCRIPT_DELAY_DIRECTIVE)?;
+    if !arg.starts_with(char::is_whitespace) {
+        return None;
+    }
+    Some((
+        Duration::from_millis(arg.trim().parse().ok()?),
+        rest.to_owned(),
+    ))
 }
 
 /// Which door an offer came through, and what it may do (REQ-613 ADR-6).
@@ -9610,6 +9694,108 @@ provider_id = "on-device"
         assert_eq!(
             engine.complete("p", &params, &mut sink).unwrap().text,
             "Done."
+        );
+    }
+
+    /// REQ-621 AC-11 / ADR-621-6: `@delay-ms` holds a turn open for the pty
+    /// timing legs, and does so **only** under the seam master switch.
+    ///
+    /// Three legs, all of them through the real streaming loop:
+    ///
+    /// 1. **Honoured.** With the seam on, `@delay-ms 250\nhello` streams
+    ///    `hello` and nothing else, no sooner than 250 ms after the call was
+    ///    entered. Both halves matter: the timing is what the pty legs buy, and
+    ///    the stripping is why no test-visible byte changes (the directive must
+    ///    never reach a caller that is asserting on reply text).
+    /// 2. **Seam off.** The ordinary path, taken through [`Engine::complete`]
+    ///    itself rather than the inner method, so what is asserted is the real
+    ///    predicate's answer in a suite that never sets the switch: the
+    ///    directive is just the reply's first line, streamed verbatim and
+    ///    promptly. This is the leg that says a script cannot change meaning
+    ///    outside the seam, and by extension not in a release build, which
+    ///    refuses the switch outright.
+    /// 3. **Malformed under the seam.** `@delay-ms x` is not a delay and is not
+    ///    stripped either — a mistyped directive fails loudly on the text a
+    ///    fixture asserts instead of silently running with no delay.
+    ///
+    /// **Mutation run.** Changing `delay_directive`'s
+    /// `first.strip_prefix(SCRIPT_DELAY_DIRECTIVE)` to
+    /// `first.strip_prefix("@never-matches")` — a parse that can never match —
+    /// reddens leg 1 at "the directive line must be consumed, not streamed",
+    /// `left: "@delay-ms 250\nhello"` against `right: "hello"`. That assertion
+    /// panics before the timing one is reached, so the ~0 ms hold it would also
+    /// have caught goes unobserved in this run; either half alone is enough to
+    /// fail. Legs 2 and 3 stay green, as they must — they assert the verbatim
+    /// behaviour a never-matching parse also produces, which is why leg 1 is the
+    /// one carrying the claim.
+    #[test]
+    fn the_delay_directive_is_honoured_only_under_the_seam() {
+        /// One leg: stream a one-block script and report what the caller was
+        /// given and how long the call took. `seams: None` goes through the
+        /// real [`Engine::complete`], which reads the master switch itself.
+        fn stream(script: &str, seams: Option<bool>) -> (String, Duration) {
+            let engine = ScriptedFileEngine::from_script("m", script);
+            let params = GenParams::default();
+            let mut tokens = String::new();
+            let started = Instant::now();
+            let completion = {
+                let mut sink = |token: &str| {
+                    tokens.push_str(token);
+                    true
+                };
+                match seams {
+                    Some(seams) => engine.complete_scripted("p", &params, &mut sink, seams),
+                    None => engine.complete("p", &params, &mut sink),
+                }
+                .expect("the scripted engine cannot fail")
+            };
+            let held = started.elapsed();
+            assert_eq!(
+                completion.text, tokens,
+                "the completion must be exactly what the caller was streamed"
+            );
+            (tokens, held)
+        }
+
+        let held_open = format!("{SCRIPT_DELAY_DIRECTIVE} 250\nhello");
+
+        // 1. Honoured under the seam.
+        let (tokens, held) = stream(&held_open, Some(true));
+        assert_eq!(
+            tokens, "hello",
+            "the directive line must be consumed, not streamed"
+        );
+        assert!(
+            held >= Duration::from_millis(250),
+            "the turn was not held: {held:?} elapsed before the reply was complete"
+        );
+
+        // 2. Seam off — the ordinary path, and this suite's own state.
+        assert!(
+            !test_seams_enabled(),
+            "this leg is only meaningful with the master switch off, which is \
+             every run of this suite"
+        );
+        let (tokens, held) = stream(&held_open, None);
+        assert_eq!(
+            tokens, held_open,
+            "off the seam the directive is just the reply's first line"
+        );
+        assert!(
+            held < Duration::from_millis(250),
+            "nothing may sleep off the seam, and {held:?} elapsed"
+        );
+
+        // 3. Malformed under the seam: not a delay, and not stripped.
+        let malformed = format!("{SCRIPT_DELAY_DIRECTIVE} x\nhello");
+        let (tokens, held) = stream(&malformed, Some(true));
+        assert_eq!(
+            tokens, malformed,
+            "a directive that does not parse is reply text, not a delay"
+        );
+        assert!(
+            held < Duration::from_millis(250),
+            "a malformed directive must not sleep, and {held:?} elapsed"
         );
     }
 

@@ -1,7 +1,7 @@
 ---
 id: TASK-412
 title: "A debug-only @delay-ms directive in the scripted engine, and a shell block that sleeps"
-status: draft
+status: complete
 parent: REQ-621
 created: 2026-09-10
 updated: 2026-09-10
@@ -26,11 +26,11 @@ cannot silently change meaning outside the seam. Document the directive beside
 
 ## Acceptance Criteria
 
-- [ ] A block `@delay-ms 250\nhello` under the seam streams `hello` no sooner than 250 ms after `complete` is entered, and never streams the directive
-- [ ] The same block with the seam off streams `@delay-ms 250\nhello` verbatim
-- [ ] A malformed directive (`@delay-ms x`) is streamed verbatim under the seam too — it is not a delay
-- [ ] The duty arms (redaction, digest, title, …) are unaffected: they answer off-script before the directive is read
-- [ ] `cargo test -p tetond runtime::` green; clippy and fmt clean
+- [x] A block `@delay-ms 250\nhello` under the seam streams `hello` no sooner than 250 ms after `complete` is entered, and never streams the directive
+- [x] The same block with the seam off streams `@delay-ms 250\nhello` verbatim
+- [x] A malformed directive (`@delay-ms x`) is streamed verbatim under the seam too — it is not a delay
+- [x] The duty arms (redaction, digest, title, …) are unaffected: they answer off-script before the directive is read
+- [x] `cargo test -p tetond runtime::` green; clippy and fmt clean
 
 ## Verification
 
