@@ -317,6 +317,17 @@ kill %1 && ./target/release/tetond &
       REQ-556 this is the **fallback** rather than the primary experience — the
       indicator above should already have told you.
 
+> **The pre-turn counterpart.** REQ-556's indicator animates above the entry
+> frame while the session cannot yet take a prompt; REQ-621's turn activity row
+> animates beneath the conversation through the silent phases of a turn already
+> in flight, and a turn submitted into a warming tier is the row saying
+> `held until <id> finishes loading` — the same news, one turn later. The two
+> animations share `FRAME_INTERVAL` and the no-ETA rule (REQ-621 ADR-621-1,
+> BR-3). Only the checkbox above is manual: the turn row's fixture can hold a
+> turn open with a scripted delay, so it is covered automatically in
+> `crates/teton/tests/pty_e2e.rs`, while the load window is what no seam can
+> hold.
+
 ---
 
 ## Sign-off

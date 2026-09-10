@@ -2879,6 +2879,20 @@ struct RenderedSession {
     _daemon: TestDaemon,
 }
 
+/// The daemon config every typed-turn leg here shares, plus `extra`.
+///
+/// One `kind = "local"` provider with **every** tier bound to it, for the
+/// REQ-558 reason the other typed-turn tests in this file bind them: otherwise
+/// the turn resolves to the unreachable remote provider and fails before it can
+/// reply.
+fn local_tier_config(extra: &str) -> String {
+    let tiers: String = ["reflex", "scan", "build", "think"]
+        .iter()
+        .map(|t| format!("[[tiers]]\ntier = \"{t}\"\nprovider_id = \"local\"\n\n"))
+        .collect();
+    format!("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n{tiers}{extra}")
+}
+
 impl RenderedSession {
     /// Open a session at a pty exactly `cols` wide whose scripted tier answers
     /// one typed turn per entry of `replies`, with `client_env` on the
@@ -2897,16 +2911,28 @@ impl RenderedSession {
     /// a runner with no `TERM` at all is a different case again). AC-8 then puts
     /// `NO_COLOR` back deliberately, which is the whole of what it varies.
     fn open(cols: u16, replies: &[&str], client_env: &[(&str, &str)]) -> Self {
+        Self::open_with_config(cols, replies, client_env, &local_tier_config(""))
+    }
+
+    /// [`Self::open`] with the daemon's whole config handed in rather than
+    /// composed (REQ-621 TASK-413).
+    ///
+    /// Two of REQ-621's legs need a config the shared one cannot express: the
+    /// running-tool leg needs `[permissions] default_level = "full"` so a
+    /// `shell` call runs without a question standing between the turn and the
+    /// row, and the RPC-error leg needs a tier bound to a provider that cannot
+    /// answer. Appending would not do for the second — a tier names exactly one
+    /// provider and the daemon refuses to start on a duplicate binding — so the
+    /// whole document is the parameter, and [`local_tier_config`] is what every
+    /// other leg passes.
+    fn open_with_config(
+        cols: u16,
+        replies: &[&str],
+        client_env: &[(&str, &str)],
+        config: &str,
+    ) -> Self {
         let daemon_path = daemon_bin();
-        // Every tier bound to the scripted local tier, for the REQ-558 reason
-        // the other typed-turn tests here bind them: otherwise the turn resolves
-        // to an unreachable remote provider and fails before it can reply.
-        let tiers: String = ["reflex", "scan", "build", "think"]
-            .iter()
-            .map(|t| format!("[[tiers]]\ntier = \"{t}\"\nprovider_id = \"local\"\n\n"))
-            .collect();
-        let config = format!("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n{tiers}");
-        let daemon = TestDaemon::spawn_with(&daemon_path, &config, replies);
+        let daemon = TestDaemon::spawn_with(&daemon_path, config, replies);
 
         let pty = native_pty_system()
             .openpty(PtySize {
@@ -2956,12 +2982,58 @@ impl RenderedSession {
         self.writer.flush().ok();
     }
 
+    /// Type `bytes` at the terminal exactly as given — no trailing return.
+    ///
+    /// [`Self::type_line`]'s other half, for REQ-621's AC-10 leg: what that
+    /// leg is about is bytes reaching the kernel's line buffer *while the row
+    /// is animating*, so it needs to choose when the return goes in rather than
+    /// have one appended for it.
+    fn type_raw(&mut self, bytes: &str) {
+        self.writer
+            .write_all(bytes.as_bytes())
+            .expect("type at the pty");
+        self.writer.flush().ok();
+    }
+
+    fn wait_until(&self, ready: impl Fn(&str) -> bool) -> bool {
+        wait_until(&self.transcript, ready)
+    }
+
     fn wait_for(&self, marker: &str) -> bool {
         wait_for(&self.transcript, marker)
     }
 
     fn snapshot(&self) -> String {
         snapshot(&self.transcript)
+    }
+
+    /// Kill the daemon this session is talking to, and reap it (REQ-621 AC-7).
+    ///
+    /// The `Drop` below kills it again and ignores the failure, so the leg does
+    /// not have to hand ownership anywhere: what BR-12 is about is the
+    /// *client's* control flow when the socket goes away mid-turn, and this is
+    /// the only way to take the socket away.
+    fn kill_daemon(&mut self) {
+        let _ = self._daemon.child.kill();
+        let _ = self._daemon.child.wait();
+    }
+
+    /// Run `teton cost` against this session's daemon and return its stdout.
+    ///
+    /// The producer as the oracle (LESSON-544): what a turn cost is the
+    /// daemon's own figure, read back through the daemon's own report, rather
+    /// than a price written into a test that would keep passing after the
+    /// ledger changed its mind.
+    fn cost_report(&self) -> String {
+        let out = std::process::Command::new(teton_bin())
+            .arg("cost")
+            .env("XDG_RUNTIME_DIR", &self._daemon.runtime_dir)
+            .env("XDG_DATA_HOME", self._daemon.root.join("d"))
+            .env("TETON_CONFIG", self._daemon.root.join("config.toml"))
+            .env("TETON_REPO_ROOT", &self._daemon.root)
+            .output()
+            .expect("run `teton cost` against the fixture daemon");
+        String::from_utf8_lossy(&out.stdout).into_owned()
     }
 }
 
@@ -3856,4 +3928,1250 @@ fn the_truncated_notes_notice_reaches_the_terminal() {
         "this session is quiet: a `/verbose` route line would mean the notice \
          above proves nothing about BR-3's ungated announcement; transcript:\n{seen}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-621 — the live activity row at a real terminal (TASK-413)
+// ---------------------------------------------------------------------------
+//
+// ## Why every leg below is here, and can be nowhere else
+//
+// `Surface::has_live_rows` answers `true` for exactly one constructor —
+// `PlainSurface::with_markdown`, the one `main.rs` reaches for when stdout is a
+// terminal — and the pump reads that answer once per call, into `RowState::live`.
+// Answered `false` the pump keeps the blocking receive it has always had and
+// never enters its tick arm at all, so a piped run cannot emit a frame it did
+// not emit before. That is how BR-6 holds by construction, and it is also what
+// makes `cli_e2e` **structurally blind** to every claim below rather than merely
+// uninterested in it.
+//
+// The two halves that are testable without a terminal are tested without one:
+// `activity.rs` pins the frame text against a table of literals, and
+// `client.rs` pins the pump's withdraw/dispatch/redraw discipline against a
+// `RecordingSurface`. What is left — that a real session wakes on its own clock
+// with the daemon silent, at the width `TIOCGWINSZ` reports, and takes the row
+// back before anything durable prints or the turn ends — is a fact only a
+// process observed from outside can produce (BR-7, LESSON-481).
+//
+// ## How a turn is held open, and why that is a fixture and not a delay
+//
+// The row exists only *while a turn is working*, so a leg that looks at it needs
+// a turn that is still working when it looks. `@delay-ms <n>` as a scripted
+// block's first line supplies exactly that (ADR-621-6): the fixture engine
+// sleeps that long before its first token and strips the line, so nothing
+// test-visible about the reply changes but its timing. It rides
+// `TETON_TEST_SEAMS`, the master switch a release build refuses to start under,
+// and it is part of the script grammar of an engine that exists only for tests.
+// REQ-556 left its dots-advancing leg uncovered rather than invent a
+// *production* delay to make it possible; this is the other trade, and BUG-191
+// is what claiming pty coverage without the leg looks like.
+//
+// ## What these legs deliberately do not prove
+//
+// **The `preparing` frame.** BR-2 has the row say `preparing turn` until
+// `route_decided` names something, and no leg here sees that frame. The daemon
+// publishes its first `route_decided` well inside one `FRAME_INTERVAL` of the
+// prompt going on the wire — the classifier's reflex route arrives first, then
+// the turn's own — so the row's *first* paint is already an `awaiting_model`
+// sentence, drawn from the message arm rather than from a tick. Nothing in the
+// fixture can hold the daemon quiet for that first 120 ms: the only seam that
+// could is `Connection`'s own receive, which is reachable from a unit test and
+// not from a process. The frame is pinned there instead —
+// `client.rs::the_pump_ticks_while_the_daemon_is_silent` asserts the literal
+// `⠋ preparing turn · 0s · turn 0s` over a `RecordingSurface` — and what is
+// observed here is the
+// property AC-1 is actually about: a row is on screen before the first reply
+// byte, naming a phase and a model the daemon reported, with its counter
+// advancing.
+//
+// **A non-zero cost so far.** No scripted tier can be priced, and that is by
+// design rather than by omission: the local model is absent from the bundled
+// price table, so a local call is recorded *unpriced* and never assigned a
+// guessed cost (REQ-564 BR-9). Its `cost_recorded` rows therefore carry
+// `usd_micros = 0`, and BR-3's "shown once it is non-zero" correctly shows
+// nothing. The running-tool leg asserts that against the daemon's **own**
+// figure rather than against a literal, so a build that started pricing local
+// calls turns the leg red instead of leaving it vacuous (LESSON-544); the
+// non-zero rendering is `activity.rs`'s frame table's to prove.
+//
+// **A mid-stream stall (OQ-2).** BR-11's streaming clause needs reply bytes to
+// stop for longer than the quiet bound *after* some have arrived, and the
+// directive holds a block before its first token rather than between two of
+// them. `activity.rs` covers it (`Streaming` past the bound renders `receiving
+// the reply` with the annotation); the pty leg would need a second directive,
+// which is a fixture change this task did not make.
+
+/// Every glyph the activity row can open with — [`common::ACTIVITY_GLYPHS`],
+/// under the name the legs below read it by.
+///
+/// It lives in `tests/common` because `cli_e2e` needs the same list for the
+/// opposite claim (BR-6: none of them reaches a pipe), and because a list
+/// imported from `activity.rs` would agree with whatever `activity.rs` said
+/// (LESSON-569). Nothing else this binary prints draws braille, so a search for
+/// one of these characters is a search for an activity row — which is what lets
+/// the residue claims below be made over a whole screen.
+const ROW_GLYPHS: [char; 11] = common::ACTIVITY_GLYPHS;
+
+/// The glyph a stalled row shows in place of a spinner frame (ADR-621-5).
+const STALLED_GLYPH: char = '⠿';
+
+/// The two config lines every leg that needs a tool to run unattended carries.
+///
+/// `full` is the level at which a `shell` call runs without a question standing
+/// between the turn and the row — at the default level the row correctly steps
+/// aside for the permission prompt (BR-1), which is a different leg's subject.
+///
+/// `generate = "never"` is there because the first turn of a session inside a
+/// project *offers* to write a `TETON.md` (REQ-613), and at `full` the
+/// permission gate grants that offer without asking — so a fixture that only
+/// meant to allow `sleep 3` would also have the daemon draft a file into
+/// whichever directory `cargo test` happens to run from. Suppressing the offer
+/// is the narrow fix; the level is what the leg is actually varying.
+const FULL_AND_NO_CONTEXT_OFFER: &str =
+    "[permissions]\ndefault_level = \"full\"\n\n[context]\ngenerate = \"never\"\n\n";
+
+/// The bytes a repaint of a live row opens with (`PlainSurface::repaint_row_above`).
+///
+/// The row's *animation*, specifically: a first draw goes through `line()` and a
+/// withdraw through `\x1b[{n}A\r\x1b[K`, and only a repaint saves the cursor
+/// first. Counting these is therefore counting ticks that painted, which is
+/// what the mutation recorded on the leg below removes.
+const REPAINT_OPEN: &str = "\x1b[s\x1b[1A\r\x1b[K";
+
+/// A repaint's first two escapes: save the cursor, then step up a row.
+///
+/// A prefix of [`REPAINT_OPEN`] rather than the whole of it, because the claim
+/// it serves is "no repaint was *attempted* past this point" (AC-10, half 2).
+/// Counting the full sequence would miss a build that saved and stepped up and
+/// then erased differently, and stepping up onto the line the user is typing on
+/// is the intrusion, whatever is written next.
+const REPAINT_MEASURE: &str = "\x1b[s\x1b[1A";
+
+/// The bytes that take a live row back (`PlainSurface::withdraw_row_above`).
+///
+/// No cursor save/restore pair, unlike the repaint: the cursor is meant to end
+/// up on the row it cleared, so whatever prints next lands where the row was
+/// and the scrollback closes over it without a gap (BR-5).
+const WITHDRAW: &str = "\x1b[1A\r\x1b[K";
+
+/// Every activity row `transcript` carries, in the order they were painted.
+///
+/// A row is found by its opening glyph and read to the first byte that is not
+/// part of it — an escape (the trailing `\x1b[0m` of a `line()` draw, or the
+/// `\x1b[u` of a repaint) or the end of the line. So this reads the row's
+/// *text*, whichever verb drew it, which is what lets one helper serve the
+/// first-draw, repaint and stall legs alike.
+fn activity_rows(transcript: &str) -> Vec<String> {
+    let mut rows = Vec::new();
+    for (at, c) in transcript.char_indices() {
+        if !ROW_GLYPHS.contains(&c) {
+            continue;
+        }
+        let tail = &transcript[at..];
+        let end = tail.find(['\x1b', '\r', '\n']).unwrap_or(tail.len());
+        rows.push(tail[..end].to_owned());
+    }
+    rows
+}
+
+/// The clocks a row is showing — everything from its first ` · ` on.
+///
+/// `⠋ waiting on local local (build) · 2s · turn 2s` yields `2s · turn 2s`.
+/// Split off the sentence rather than parsed into numbers: what the legs below
+/// assert is that the figures *changed*, and comparing the clause as written
+/// says that without a second parser deciding what a second is.
+fn clocks(row: &str) -> &str {
+    row.split_once(" · ").map_or("", |(_, clocks)| clocks)
+}
+
+/// The distinct clock clauses in `rows`, in the order they first appeared.
+fn distinct_clocks(rows: &[String]) -> Vec<&str> {
+    let mut seen: Vec<&str> = Vec::new();
+    for row in rows {
+        let clocks = clocks(row);
+        if !seen.contains(&clocks) {
+            seen.push(clocks);
+        }
+    }
+    seen
+}
+
+/// Assert that replaying `transcript` through a terminal leaves no activity row
+/// on screen (BR-5, BR-12).
+///
+/// This is the assertion that cannot be made on the stream. A withdrawn row is
+/// still in the bytes — `\x1b[1A\r\x1b[K` tells a terminal to draw over
+/// characters, it does not unsend them — so a `contains` finds the whole
+/// animation whether or not the last frame was taken back. Replaying is what
+/// tells the two apart, and `common::rendered_screen` is the replay.
+fn assert_no_row_on_screen(transcript: &str, whose: &str) {
+    let screen = common::rendered_screen(transcript);
+    let left_behind: Vec<&String> = screen
+        .iter()
+        .filter(|row| row.chars().any(|c| ROW_GLYPHS.contains(&c)))
+        .collect();
+    assert!(
+        left_behind.is_empty(),
+        "{whose}: the turn left an activity row on screen — BR-5 has the row \
+         withdrawn rather than blanked, so the scrollback after a turn is what \
+         it would have been without the feature. Rows still showing:\n\
+         {left_behind:#?}\nWhole screen:\n{screen:#?}"
+    );
+}
+
+/// **REQ-621 AC-1 / BR-1 / BR-3 — the row is on screen before the first reply
+/// byte, it counts, and the arriving text takes it back.**
+///
+/// The silent lead-in is the stretch this REQ exists for: between Enter and the
+/// first streamed byte the old session showed an unmoving cursor, and a user
+/// cannot tell that from a hang. `@delay-ms 3000` makes that stretch three
+/// seconds long on purpose, which is long enough for the counter to pass
+/// through several values and for the assertions to be about ordering rather
+/// than about timing.
+///
+/// Four claims, and the third is the one with teeth:
+///
+/// 1. a row is drawn **before** the reply's first byte — positionally, not by a
+///    pair of `contains` that would both be true from the moment the second
+///    arrived;
+/// 2. its sentence names what the daemon reported: `waiting on`, the provider,
+///    and the model out of `route_decided` (BR-2 — see the section header on why
+///    the `preparing` frame is not observable here);
+/// 3. the counter shows **at least two distinct** values and the row is
+///    repainted in place while it does, so the animation is running off the
+///    client's own clock during a stretch in which the daemon says nothing
+///    (BR-4);
+/// 4. nothing activity-shaped appears from the first reply byte to the end of
+///    the turn, and the reply's first byte lands on the withdrawn row's own line
+///    (BR-1: the arriving text *is* the liveness signal, so the row steps
+///    aside).
+///
+/// # What breaks this test
+///
+/// The mutation below was **applied to `client.rs`, built, and observed
+/// failing**, not reasoned about (AC-11, LESSON-441):
+///
+/// | Mutation | Fails |
+/// |---|---|
+/// | the pump's `Wake::Tick` arm advances `row.tick` but does not call `paint_row` | **all five** of REQ-621's pty legs — 5 red of 28 here — and **none** of `cli_e2e`'s 85 (2026-09-10) |
+///
+/// This leg is the one that fails on the *property*. Claim (3) is what catches
+/// it: a pump that never paints on a tick leaves only the frames the *message*
+/// arm drew, and the daemon says nothing for three seconds, so the clock never
+/// turns over. When the mutation was run this claim was still a single
+/// evaluation after the reply and it failed immediately, reporting "3 rows, all
+/// reading `0s · turn 0s`"; it is now the polled condition above, which under
+/// the same mutation exhausts its window and quotes the same unmoving rows.
+/// Claims (1), (2) and (4) stay green under the mutation, and that is right:
+/// the row is still drawn and still withdrawn by the message path, whose
+/// discipline this mutation does not touch. The other four legs redden on their
+/// non-vacuity guards ("the row never animated, so this leg is not asking …"),
+/// which is what those guards are for.
+///
+/// The piped suite staying green is not a gap in it. `cli_e2e` cannot reach the
+/// tick arm at all — with no live rows the pump keeps its blocking receive — so
+/// a mutation of that arm is invisible to it by construction, which is BR-6's
+/// own claim arriving as evidence rather than as an argument.
+#[test]
+fn the_row_appears_before_the_first_byte_and_withdraws_when_text_streams() {
+    const REPLY: &str = "The delayed reply arrives at last.";
+    let mut session = RenderedSession::open(100, &[&format!("@delay-ms 3000\n{REPLY}")], &[]);
+    session.type_line("hold the turn open");
+
+    // (3), polled **before** the turn's own marker is awaited, so the condition
+    // the leg waits on is the condition it asserts (LESSON-450). Evaluated once
+    // after the reply had landed, this claim was a snapshot of a window that
+    // had already closed: a run in which the clock had not yet turned over when
+    // the reply arrived reported a flake rather than waiting the extra frame it
+    // needed. The window is the lead-in either way — before the reply arrives
+    // the whole transcript is the lead-in, and after it the split is the same
+    // one the assertions below read.
+    assert!(
+        session.wait_until(|seen| {
+            let lead_in = seen.split_once(REPLY).map_or(seen, |(lead_in, _)| lead_in);
+            distinct_clocks(&activity_rows(lead_in)).len() >= 2
+        }),
+        "the row's counter never moved across a three-second silence. Either \
+         the pump is not waking on its own clock (BR-4) or the frame is not \
+         reading the tick it is handed (BR-3); rows: {:#?}\ntranscript:\n{}",
+        activity_rows(&session.snapshot()),
+        session.snapshot()
+    );
+    assert!(
+        session.wait_for(REPLY),
+        "the scripted reply never reached the screen, so the turn under test \
+         never ran; transcript:\n{}",
+        session.snapshot()
+    );
+    // The turn's own end: the entry frame is redrawn after it, and claim (4) is
+    // about the whole of the turn rather than about the reply's arrival.
+    assert!(
+        session.wait_for("ready (freeform)")
+            && session.wait_until(|seen| seen.ends_with("\x1b[0m ")),
+        "the session never got back to its entry prompt; transcript:\n{}",
+        session.snapshot()
+    );
+
+    let seen = session.snapshot();
+    let reply_at = seen
+        .find(REPLY)
+        .unwrap_or_else(|| panic!("the reply is not in the transcript:\n{seen}"));
+    let (lead_in, streaming) = seen.split_at(reply_at);
+    let rows = activity_rows(lead_in);
+
+    // (1) A row, before the first byte of the reply.
+    assert!(
+        !rows.is_empty(),
+        "no activity row was drawn in the three seconds before the first reply \
+         byte — the whole of BR-1's silent lead-in showed nothing, which is the \
+         defect this REQ exists to remove; transcript:\n{seen}"
+    );
+
+    // (2) The sentence is the daemon's, in every part of it. `local` twice is
+    // this fixture's own reading of `route_decided` — the provider id and the
+    // model the local tier reports are both `local`, and `route_clause` prints
+    // each only when the event carries one — and the parenthesised band is the
+    // tier that decision went through.
+    //
+    // Two bands appear, and that is the rule working rather than a wobble: the
+    // classifier's own reflex route is published on this session before the
+    // turn's, so the row names `(reflex)` for as long as that is the last thing
+    // the daemon said and moves to `(build)` when the turn's route arrives. A
+    // row that named the turn's tier before the daemon had chosen it would be
+    // exactly the invention BR-2 forbids, so the assertion is "whatever was
+    // last reported", with the turn's own route pinned as the one it ends on.
+    for row in &rows {
+        assert!(
+            row.contains("waiting on local local ("),
+            "every lead-in row must name the phase and the route the daemon \
+             reported — the provider and model out of `route_decided`, never a \
+             name the client composed (BR-2); row: {row:?}\ntranscript:\n{seen}"
+        );
+    }
+    assert!(
+        rows.last().is_some_and(|row| row.contains("(build)")),
+        "the last row before the reply must name the tier the *turn* resolved \
+         through, which is the last route the daemon reported before it started \
+         streaming; rows: {rows:#?}\ntranscript:\n{seen}"
+    );
+
+    // (3), second half: the row was repainted **in place** while the clock
+    // advanced. The advance itself was the polled condition above.
+    assert!(
+        lead_in.matches(REPAINT_OPEN).count() >= 2,
+        "the row was drawn but never repainted in place, so each frame appended \
+         another line instead of replacing the last — which is the scrollback \
+         BR-5 forbids. {} repaints in the lead-in; transcript:\n{seen}",
+        lead_in.matches(REPAINT_OPEN).count()
+    );
+
+    // (4) The reply's first byte lands on the row's own line, and nothing
+    // activity-shaped follows it for the rest of the turn.
+    assert!(
+        lead_in.ends_with(WITHDRAW),
+        "the reply did not begin on the row's own line: the bytes immediately \
+         before it should be the withdraw, so the row leaves no gap and no \
+         residue behind it (BR-5). Instead: {:?}",
+        &lead_in[lead_in.len().saturating_sub(24)..]
+    );
+    assert!(
+        activity_rows(streaming).is_empty(),
+        "an activity row was painted while the reply was streaming, or after the \
+         turn ended — during `streaming` the arriving text is the liveness \
+         signal and the row is withdrawn (BR-1); rows: {:#?}\ntranscript:\n{seen}",
+        activity_rows(streaming)
+    );
+    assert_no_row_on_screen(&seen, "the silent lead-in");
+}
+
+/// **REQ-621 AC-2 / AC-5 / BR-3 — a running tool shows its title, its elapsed
+/// seconds and its cost so far, beneath its own durable line.**
+///
+/// The second silent stretch: a forty-second test suite used to be one
+/// `[running]` line and then a cursor that did not move. Here it is a scripted
+/// `shell` call running `sleep 3`, which is a **real** tool rather than a seam
+/// — the row's sentence has to come from the title the daemon composed for
+/// `tool_call`, and the phase has to be driven by the daemon's own publisher on
+/// both edges (AC-5, LESSON-544).
+///
+/// Four claims:
+///
+/// 1. the durable `[running]` line prints where it always did and the row
+///    appears **beneath** it, not in place of it (BR-10: no second renderer);
+/// 2. the row says `running` and the daemon's title, and its counter advances
+///    while the tool runs;
+/// 3. on completion the `[done]` line prints where the row was and the row comes
+///    back in `awaiting_model` — the model is composing its next step, which is
+///    the phase after a tool result by construction;
+/// 4. the cost clause is the daemon's own figure. See the section header: this
+///    fixture's calls are unpriced by design, so the daemon reports `$0.000000`
+///    and the row correctly carries no cost clause. The oracle is `teton cost`
+///    rather than a literal, so a build that priced local calls fails here
+///    instead of passing vacuously.
+#[test]
+fn a_running_tool_shows_its_title_elapsed_and_cost_so_far_beneath_its_running_line() {
+    const REPLY: &str = "The tool turn is done.";
+    const RUNNING: &str = " - shell: sleep 3 [running]";
+    const DONE: &str = " - shell: sleep 3 [done]";
+    let mut session = RenderedSession::open_with_config(
+        100,
+        &[
+            r#"{"tool": "shell", "arguments": {"command": "sleep 3"}}"#,
+            REPLY,
+        ],
+        &[],
+        // `full`, so nothing stands between the turn and the tool. At the
+        // default level a `shell` call is a question, the row steps aside for
+        // it (BR-1), and this leg would be about the permission prompt instead
+        // — which is `permission_levels_change_what_a_session_asks_about`'s
+        // subject, over a pipe, where it belongs.
+        &local_tier_config(FULL_AND_NO_CONTEXT_OFFER),
+    );
+    session.type_line("run the slow tool");
+
+    // (2)'s counter claim, polled **before** the turn's own marker is awaited,
+    // so the condition the leg waits on is the condition it asserts
+    // (LESSON-450). Evaluated once after the reply had landed this flaked: the
+    // window it read was already closed, so a run whose clock had not turned
+    // over inside it failed instead of waiting the one frame it needed. The
+    // window is the tool's own — from its `[running]` line to its `[done]`, or
+    // to the end of what has arrived while it is still running.
+    let while_tool_ran = |seen: &str| -> usize {
+        let Some(from) = seen.find(RUNNING) else {
+            return 0;
+        };
+        let window = &seen[from..];
+        let window = window.split_once(DONE).map_or(window, |(open, _)| open);
+        distinct_clocks(&activity_rows(window)).len()
+    };
+    assert!(
+        session.wait_until(|seen| while_tool_ran(seen) >= 2),
+        "the row's counter never moved while a three-second tool ran — a tool's \
+         elapsed counter is the only signal there is while it runs, because the \
+         daemon publishes nothing (BR-4); transcript:\n{}",
+        session.snapshot()
+    );
+    assert!(
+        session.wait_for(REPLY),
+        "the tool turn never finished; transcript:\n{}",
+        session.snapshot()
+    );
+
+    let seen = session.snapshot();
+    let running_at = seen
+        .find(RUNNING)
+        .unwrap_or_else(|| panic!("the tool never announced itself:\n{seen}"));
+    let done_at = seen
+        .find(DONE)
+        .unwrap_or_else(|| panic!("the tool never reported completion:\n{seen}"));
+    let reply_at = seen
+        .find(REPLY)
+        .unwrap_or_else(|| panic!("the reply is not in the transcript:\n{seen}"));
+
+    // (1) The row is beneath the `[running]` line, and the line is untouched.
+    assert!(
+        running_at < done_at && done_at < reply_at,
+        "the tool's two durable lines and the reply must land in that order — \
+         {running_at}, {done_at}, {reply_at}; transcript:\n{seen}"
+    );
+    let while_running = &seen[running_at..done_at];
+    let rows = activity_rows(while_running);
+    assert!(
+        !rows.is_empty(),
+        "a tool ran for three seconds and the row showed nothing beneath its \
+         `[running]` line, which is the second silent stretch this REQ is about \
+         (BR-1); transcript:\n{seen}"
+    );
+
+    // (2) The daemon's title, and a counter that moves.
+    for row in &rows {
+        assert!(
+            row.starts_with(|c| ROW_GLYPHS.contains(&c)) && row.contains("running shell: sleep 3"),
+            "the row must say what is running, in the title the daemon composed \
+             for `tool_call` rather than in a second reading of the tool's \
+             arguments (BR-2, LESSON-456); row: {row:?}\ntranscript:\n{seen}"
+        );
+    }
+
+    // (3) `[done]` lands where the row was, and the row comes back in
+    // `awaiting_model` — the model composing its next step.
+    assert!(
+        seen[..done_at].ends_with(WITHDRAW),
+        "the `[done]` line did not land on the row's own line: a durable line \
+         prints where the row was and the row returns beneath it (ADR-621-3); \
+         before it: {:?}",
+        &seen[done_at.saturating_sub(24)..done_at]
+    );
+    let after_done = activity_rows(&seen[done_at..reply_at]);
+    // `any`, not `all`, and the emptiness checked first. The claim is that the
+    // row **moves to** the model phase once the tool result is in, and the
+    // post-tool window is a stretch of the turn in which the daemon may
+    // legitimately say something else: any notice-shaped event landing in it —
+    // a route re-decided, a cost row, a compaction — changes the sentence of
+    // the frames after it, and an `all` would read that as the transition
+    // having failed. So the assertion is on the transition, and the frames
+    // either side of an event are the daemon's to name (BR-2).
+    //
+    // `all` was also *vacuously true* over an empty window, which is the state
+    // that matters here — no row came back at all — so the emptiness check
+    // goes first and says that in its own words rather than leaving it to a
+    // quantifier.
+    assert!(
+        !after_done.is_empty(),
+        "the row did not come back after the tool finished, so the stretch \
+         while the model composes its next step is silent again (BR-1); \
+         transcript:\n{seen}"
+    );
+    assert!(
+        after_done
+            .iter()
+            .any(|row| row.contains("waiting on local")),
+        "after a tool result the row must move to the model phase — there is no \
+         `model request issued` event and by construction the next thing the \
+         daemon can send is a chunk, a tool call or the result (ADR-621-2); \
+         rows: {after_done:#?}\ntranscript:\n{seen}"
+    );
+
+    // (4) The cost clause is the daemon's own figure, whatever that figure is.
+    let report = session.cost_report();
+    let total = report
+        .lines()
+        .find_map(|line| line.strip_prefix("total: "))
+        .and_then(|tail| tail.split_whitespace().next())
+        .unwrap_or_else(|| panic!("`teton cost` printed no total:\n{report}"))
+        .to_owned();
+    let with_cost: Vec<&String> = rows.iter().filter(|row| row.contains('$')).collect();
+    if total == "$0.000000" {
+        assert!(
+            with_cost.is_empty(),
+            "the daemon recorded no spend for this turn ({total} — this \
+             fixture's model is unpriced, REQ-564 BR-9) and BR-3 shows the \
+             figure only once it is non-zero, so no row may carry one: \
+             {with_cost:#?}\ncost report:\n{report}"
+        );
+    } else {
+        assert!(
+            !with_cost.is_empty() && with_cost.iter().all(|row| row.contains(&total)),
+            "the daemon recorded {total} for this turn, so every row drawn \
+             after it must carry that exact amount — the row and the cost meter \
+             read one accumulator and cannot print two figures (BR-3): \
+             {with_cost:#?}\ncost report:\n{report}"
+        );
+    }
+
+    assert_no_row_on_screen(&seen, "the running tool");
+}
+
+/// **REQ-621 AC-6 / BR-11 — a daemon that has gone quiet is named as quiet; a
+/// tool that is simply slow is not.**
+///
+/// Both legs are here because they are one rule. A wedged daemon has to look
+/// different from a slow model, and the way the first draft of BR-11 said that
+/// — replace the phase with `stalled` — would have relabelled every
+/// forty-second test suite as a stall at fifteen seconds, which is the noise
+/// that makes a real one easy to miss (ADR-621-5, LESSON-628). So the annotation
+/// is added to the phase the daemon **last reported** and `tool_running` is
+/// exempt, and a leg that asserted only the first half would pass against the
+/// draft this REQ corrected.
+///
+/// Leg A — `@delay-ms 16500`, 1.5 s past the quiet bound: the row keeps saying
+/// `waiting on`, appends how long the daemon has been silent, stops its spinner
+/// on a constant glyph across every stalled frame, and drops the annotation
+/// the moment real text arrives.
+///
+/// Leg B — a `shell` call running `sleep 16`, a second past the same bound: the
+/// row counts and says nothing about silence at any point, because the daemon
+/// publishes nothing while a tool runs and the tool's own elapsed counter is
+/// the honest signal.
+///
+/// The leg costs about thirty-three seconds of wall clock, once, in a suite
+/// whose window is sixty per wait. That is the accepted price of a bound that
+/// can only be crossed by waiting (ADR-621-6): every assertion is still on
+/// state reached, never on a sleep (LESSON-450).
+#[test]
+fn a_silent_daemon_earns_the_stall_annotation_and_a_long_tool_does_not() {
+    // ---- Leg A: the daemon goes quiet before the first byte ----
+    const STALLED_REPLY: &str = "The stalled reply arrives.";
+    let mut quiet =
+        RenderedSession::open(100, &[&format!("@delay-ms 16500\n{STALLED_REPLY}")], &[]);
+    quiet.type_line("go quiet on me");
+
+    assert!(
+        quiet.wait_until(|seen| seen.contains("no word from the daemon for")),
+        "the daemon said nothing for over fifteen seconds and the row never \
+         said so — a wedged daemon must not look like a slow model (BR-11); \
+         transcript:\n{}",
+        quiet.snapshot()
+    );
+    assert!(
+        quiet.wait_for(STALLED_REPLY),
+        "the delayed reply never arrived, so the annotation was never cleared \
+         by a real event; transcript:\n{}",
+        quiet.snapshot()
+    );
+
+    let seen = quiet.snapshot();
+    let reply_at = seen
+        .find(STALLED_REPLY)
+        .unwrap_or_else(|| panic!("the reply is not in the transcript:\n{seen}"));
+    let stalled: Vec<String> = activity_rows(&seen[..reply_at])
+        .into_iter()
+        .filter(|row| row.contains("no word from the daemon for"))
+        .collect();
+
+    assert!(
+        stalled.len() >= 2,
+        "fewer than two stalled frames, so nothing here can say whether the \
+         spinner stopped: {stalled:#?}\ntranscript:\n{seen}"
+    );
+    for row in &stalled {
+        // The phase, still. This is ADR-621-5's whole correction: the row says
+        // what the daemon last reported *and* how long ago, never `stalled`
+        // instead of the phase.
+        assert!(
+            row.contains("waiting on local"),
+            "a stalled row must keep naming the phase the daemon last reported \
+             and merely add the silence to it (BR-11, ADR-621-5); row: \
+             {row:?}\ntranscript:\n{seen}"
+        );
+        assert!(
+            row.contains("no word from the daemon for 1"),
+            "the annotation must say how long the daemon has been silent, and \
+             past a fifteen-second bound that figure opens with a `1`; row: \
+             {row:?}\ntranscript:\n{seen}"
+        );
+        assert!(
+            row.starts_with(STALLED_GLYPH),
+            "a stalled row's spinner must be stopped on the one full-cell glyph \
+             — a stopped row has to read as stopped rather than as a spinner \
+             between frames (BR-11); row: {row:?}\ntranscript:\n{seen}"
+        );
+    }
+    // And the clock kept moving while the spinner did not: a stopped row is
+    // still a counting row, which is what tells "the daemon is quiet" from "the
+    // client is wedged too".
+    assert!(
+        distinct_clocks(&stalled).len() >= 2,
+        "the stalled row stopped counting as well as spinning: {:?} — the \
+         annotation keeps counting until a real event arrives (BR-11); \
+         transcript:\n{seen}",
+        distinct_clocks(&stalled)
+    );
+    // Cleared by the event, not by a timer.
+    assert!(
+        !seen[reply_at..].contains("no word from the daemon"),
+        "the stall annotation outlived the event that refuted it; \
+         transcript:\n{seen}"
+    );
+    assert_no_row_on_screen(&seen, "the stalled turn");
+    drop(quiet);
+
+    // ---- Leg B: a tool runs a second past the same bound ----
+    const TOOL_REPLY: &str = "The long tool turn is done.";
+    let mut slow = RenderedSession::open_with_config(
+        100,
+        &[
+            r#"{"tool": "shell", "arguments": {"command": "sleep 16"}}"#,
+            TOOL_REPLY,
+        ],
+        &[],
+        &local_tier_config(FULL_AND_NO_CONTEXT_OFFER),
+    );
+    slow.type_line("run the long tool");
+
+    assert!(
+        slow.wait_for(TOOL_REPLY),
+        "the long tool turn never finished; transcript:\n{}",
+        slow.snapshot()
+    );
+
+    let seen = slow.snapshot();
+    let rows = activity_rows(&seen);
+    let running: Vec<&String> = rows
+        .iter()
+        .filter(|row| row.contains("running shell: sleep 16"))
+        .collect();
+    // Non-vacuity first: the negative claim below means nothing unless the row
+    // was up for the whole of a window it could have annotated.
+    assert!(
+        running
+            .iter()
+            .any(|row| clocks(row).starts_with("16s") || clocks(row).starts_with("15s")),
+        "the tool row never reached the quiet bound, so this leg never asked \
+         the question it exists to ask: {running:#?}\ntranscript:\n{seen}"
+    );
+    assert!(
+        !seen.contains("no word from the daemon"),
+        "a tool that ran a second past the quiet bound was reported as a stall. \
+         `tool_running` is exempt: the daemon publishes nothing while a tool \
+         runs, so silence there is the expected state, and annotating it is the \
+         noise that makes a real stall easy to miss (BR-11, ADR-621-5); \
+         transcript:\n{seen}"
+    );
+    assert!(
+        !running.iter().any(|row| row.starts_with(STALLED_GLYPH)),
+        "the long tool's spinner stopped, which is the stall reading arriving \
+         by the other half of the same rule: {running:#?}\ntranscript:\n{seen}"
+    );
+    assert_no_row_on_screen(&seen, "the long tool");
+}
+
+/// **REQ-621 AC-7 / BR-5 / BR-12 — every way a turn can end takes the row with
+/// it.**
+///
+/// Three exits, and none of them depends on the daemon sending a final event.
+/// That independence is the point: BR-12 is a rule about the paths nobody
+/// anticipated, and the close-out is on the client's own control flow — the
+/// `P::ENDS_TURN` branch of `Connection::call`, which runs on the `Ok`, on the
+/// RPC error, and on every transport `?` inside the pump (ADR-621-4).
+///
+/// * **A normal result.** The turn is held open long enough for the row to be
+///   animating when the reply arrives, so the withdraw has something to withdraw.
+/// * **An RPC error.** A tier bound to a provider nothing is listening for: the
+///   route is decided and published — so the row is on screen — and then the
+///   call fails and `session/prompt` answers with an error. `prompt failed:`
+///   lands where the row was.
+/// * **The daemon killed mid-turn.** Killed while the row is repainting, which
+///   is the disconnect path: `recv_timeout` reports `Disconnected`, the pump
+///   returns the transport error, and the close-out still runs.
+///
+/// Each leg asserts on the **screen**, not on the transcript. A withdrawn row is
+/// still in the byte stream — the escape tells a terminal to draw over
+/// characters, it does not unsend them — so a `contains` over a transcript finds
+/// the whole animation whichever way the turn ended, and would pass against a
+/// build that never withdrew anything. `common::rendered_screen` replays the
+/// bytes and the claim is made on what is left (see `assert_no_row_on_screen`).
+#[test]
+fn every_exit_erases_the_row() {
+    // ---- Leg 1: a normal result ----
+    const REPLY: &str = "The ordinary turn ended.";
+    let mut ok = RenderedSession::open(100, &[&format!("@delay-ms 1500\n{REPLY}")], &[]);
+    ok.type_line("end normally");
+    assert!(
+        ok.wait_for(REPLY),
+        "the ordinary turn never ended; transcript:\n{}",
+        ok.snapshot()
+    );
+    assert!(
+        ok.wait_until(|seen| seen.ends_with("\x1b[0m ")),
+        "the session never got back to its entry prompt; transcript:\n{}",
+        ok.snapshot()
+    );
+    let seen = ok.snapshot();
+    // Non-vacuity: there was a row to erase. Without this the leg would pass
+    // against a build that drew nothing at all.
+    assert!(
+        seen.contains(REPAINT_OPEN),
+        "the row never animated, so this leg is not asking whether the normal \
+         exit erased one; transcript:\n{seen}"
+    );
+    assert_no_row_on_screen(&seen, "a normal result");
+    drop(ok);
+
+    // ---- Leg 2: an RPC error ----
+    let port = closed_port();
+    let mut failed = RenderedSession::open_with_config(
+        100,
+        &["never reached"],
+        &[],
+        // `reflex` stays local so the classifier duty is served; the turn's own
+        // tiers point at a port nothing is listening on. Every tier names
+        // exactly one provider — the daemon refuses to start on a duplicate
+        // binding — so this is a whole config rather than an appended table.
+        &format!(
+            "[[providers]]\nid = \"local\"\nkind = \"local\"\n\n\
+             [[providers]]\nid = \"gone\"\nkind = \"openai-compatible\"\n\
+             endpoint = \"http://127.0.0.1:{port}/v1/chat/completions\"\n\
+             model = \"gone-model\"\n\n\
+             [[tiers]]\ntier = \"reflex\"\nprovider_id = \"local\"\n\n\
+             [[tiers]]\ntier = \"scan\"\nprovider_id = \"gone\"\n\n\
+             [[tiers]]\ntier = \"build\"\nprovider_id = \"gone\"\n\n\
+             [[tiers]]\ntier = \"think\"\nprovider_id = \"gone\"\n\n"
+        ),
+    );
+    failed.type_line("route me nowhere");
+    // `main::render_turn_failure`'s line, with the `error: ` prefix
+    // `LineKind::Error` gives it: the whole row is the marker, because the claim
+    // below is that the row was taken back *immediately* before this line's
+    // first byte.
+    const FAILURE: &str = "error: prompt failed:";
+    assert!(
+        failed.wait_for(FAILURE),
+        "the turn never failed, so this leg never reached the RPC-error exit; \
+         transcript:\n{}",
+        failed.snapshot()
+    );
+    let seen = failed.snapshot();
+    let failure_at = seen
+        .find(FAILURE)
+        .unwrap_or_else(|| panic!("the failure line is not in the transcript:\n{seen}"));
+    // Non-vacuity, and it is a different shape from leg 1's: a dial to a closed
+    // port fails in milliseconds, so the row here is drawn from the *message*
+    // arm on `route_decided` and never ticks. What matters is that it was on
+    // screen when the error arrived.
+    let before = activity_rows(&seen[..failure_at]);
+    assert!(
+        before
+            .last()
+            .is_some_and(|row| row.contains("waiting on gone gone-model")),
+        "no row was on screen when the turn failed, so this leg is not asking \
+         whether the error path erased one — and the last one there must name \
+         the provider and model `route_decided` reported for the turn, the \
+         unreachable one: {before:#?}\ntranscript:\n{seen}"
+    );
+    assert!(
+        seen[..failure_at].ends_with(WITHDRAW),
+        "the failure line did not land on the row's own line; before it: {:?}",
+        &seen[failure_at.saturating_sub(24)..failure_at]
+    );
+    assert_no_row_on_screen(&seen, "an RPC error");
+    drop(failed);
+
+    // ---- Leg 3: the daemon killed mid-turn ----
+    let mut killed = RenderedSession::open(100, &["@delay-ms 20000\nnever arrives"], &[]);
+    killed.type_line("hold the turn open");
+    // Killed on a state the row itself reached — three repaints, so the row is
+    // demonstrably animating — rather than after an interval chosen by hand
+    // (LESSON-450).
+    assert!(
+        killed.wait_until(|seen| seen.matches(REPAINT_OPEN).count() >= 3),
+        "the row never animated, so there is nothing for the disconnect to \
+         erase; transcript:\n{}",
+        killed.snapshot()
+    );
+    killed.kill_daemon();
+    // The whole row `main` writes when `call` returns through its own transport
+    // `?`, opening prefix included, for the reason the failure marker above
+    // carries one.
+    const CLOSED: &str = "teton: connection to the daemon closed";
+    assert!(
+        killed.wait_for(CLOSED),
+        "the client never noticed the daemon was gone; transcript:\n{}",
+        killed.snapshot()
+    );
+    let seen = killed.snapshot();
+    let closed_at = seen
+        .find(CLOSED)
+        .unwrap_or_else(|| panic!("the disconnect line is not in the transcript:\n{seen}"));
+    assert!(
+        seen[..closed_at].ends_with(WITHDRAW),
+        "the disconnect line did not land on the row's own line, so a killed \
+         daemon leaves the row above the message that explains it; before it: \
+         {:?}",
+        &seen[closed_at.saturating_sub(24)..closed_at]
+    );
+    assert_no_row_on_screen(&seen, "a daemon killed mid-turn");
+}
+
+/// **REQ-621 AC-10 / BR-9 — bytes typed while the row is animating arrive
+/// intact, and no repaint blanks them.**
+///
+/// The row is redrawn eight times a second in the line above the cursor and the
+/// terminal echoes typed characters at the cursor, so this is a claim about two
+/// writers sharing a screen. BR-9 scopes it precisely: what must survive is
+/// **delivery** — the kernel's line buffer is untouched by anything the row
+/// does — and what must not happen is a repaint reaching the line the user is
+/// typing on.
+///
+/// **Intactness is asserted through the client, not through a model.** The
+/// carried line is a slash command the session has no row for, so the client
+/// quotes it straight back — ``unknown command: `/the-carried-line` `` — which
+/// makes the claim about bytes the client read out of the line buffer. A
+/// prompt would have proved only that *some* line arrived.
+///
+/// Two halves, because the return key is what separates them, and they make
+/// **opposite** claims about the same counter:
+///
+/// 1. **Characters during the animation, return after the turn.** The
+///    type-ahead case, and the one where every claim holds at once: the echo
+///    survives verbatim beside an animation that goes on running over it — the
+///    repaints keep coming, because characters alone submit nothing — the line
+///    is delivered intact, and the turn still leaves no row on screen.
+/// 2. **The whole line, return included, during the animation.** Delivery still
+///    holds, and the row *gives up*: from the echoed newline on, not one
+///    repaint byte reaches the terminal, and the echoed line is intact on the
+///    replayed screen.
+///
+/// # Half 2 is a claim about the row stopping, and the earlier wording was wrong
+///
+/// The first pass of this leg said the echoed characters were merely "visually
+/// displaced" and asserted delivery alone. That understated it. Once the
+/// terminal has echoed a newline the cursor has dropped a row under bookkeeping
+/// a canonical-mode client cannot see — no read of ours, no `\n` of ours,
+/// nothing on the wire — so the row is *two* rows above the cursor and every
+/// offset it owns is short by one. The next repaint would therefore have
+/// rewritten the line holding the characters the user just typed, which is the
+/// blanking BR-9 forbids in as many words, and the closing withdraw would have
+/// erased that line outright.
+///
+/// So the pump abandons the row the moment a submitted line is waiting on
+/// stdin (`RowState::abandon`, from the check at the top of the pump loop, which
+/// runs before every read and write of the row): no further repaint, no
+/// withdraw, and the last frame stays where it was. That frame is a bounded,
+/// recorded exception to BR-5 — one row per turn, in a case the user created by
+/// typing over the row — and it is the only outcome here that damages nothing
+/// the user typed.
+///
+/// Half 2 asserts all three parts of that: delivery, **no repaint attempted**
+/// past the newline, and the echo intact on the screen. The last one is a claim
+/// the byte stream cannot make — a repaint that erased the echo would leave the
+/// echo *and* the erasure in the transcript — which is why it is made on
+/// `common::rendered_screen`'s replay. `assert_no_row_on_screen` is deliberately
+/// **not** applied to half 2: the abandoned frame is the recorded exception
+/// above, and asserting its absence would be asserting the damage the exception
+/// exists to avoid.
+///
+/// # What breaks half 2
+///
+/// The two halves falsify each other, which is what makes the negative claim
+/// worth making. Half 1 counts [`REPAINT_MEASURE`] **after** its echo and
+/// requires two or more; half 2 counts it after its echoed newline and requires
+/// zero. Both counters run over the same stretch of the same script — the
+/// difference between them is one `\r` — so a build that abandoned rows it
+/// should have kept reddens half 1, and a build that repainted over a submitted
+/// line reddens half 2. Half 2 also carries the non-vacuity: at least two
+/// repaints *before* the newline, without which its zero would be the zero of a
+/// row that never animated.
+///
+/// The boundary itself was **mutated and observed failing**:
+///
+/// | Mutation | Fails |
+/// |---|---|
+/// | half 2's counter reads the window *before* the newline instead of after it | the zero-repaint claim, `left: 2` against `right: 0` |
+///
+/// So the newline is where the repaints stop, to the byte: two of them arrive
+/// in the stretch the user was typing over and none in the stretch after they
+/// pressed Enter, over one script and one window boundary apart.
+#[test]
+fn typed_bytes_survive_the_animation() {
+    const CARRIED: &str = "/the-carried-line";
+    const QUOTED: &str = "unknown command: `/the-carried-line`";
+    const FIRST: &str = "The first reply lands.";
+
+    // ---- Half 1: characters during the animation, return after the turn ----
+    let mut ahead = RenderedSession::open(100, &[&format!("@delay-ms 3000\n{FIRST}")], &[]);
+    ahead.type_line("hold the turn open");
+    // Typed on a state the row reached, not after an interval: two repaints
+    // means the animation is demonstrably running when these bytes arrive
+    // (LESSON-450).
+    assert!(
+        ahead.wait_until(|seen| seen.matches(REPAINT_OPEN).count() >= 2),
+        "the row never animated, so nothing here would be typed *during* an \
+         animation; transcript:\n{}",
+        ahead.snapshot()
+    );
+    ahead.type_raw(CARRIED);
+
+    assert!(
+        ahead.wait_for(FIRST),
+        "the first turn never finished; transcript:\n{}",
+        ahead.snapshot()
+    );
+    let seen = ahead.snapshot();
+    let first_at = seen
+        .find(FIRST)
+        .unwrap_or_else(|| panic!("the first reply is not in the transcript:\n{seen}"));
+    // Not blanked: the echo is in the stream in one piece, and it is there
+    // *before* the turn ended — so it is an echo from during the animation
+    // rather than the entry prompt's own.
+    let echo_at = seen[..first_at].find(CARRIED).unwrap_or_else(|| {
+        panic!(
+            "the characters typed during the animation were never echoed, or a \
+             repaint blanked them as they arrived — a repaint claims the row \
+             *above* the cursor and must leave the line being typed on alone \
+             (BR-9, ADR-621-3); transcript:\n{seen}"
+        )
+    });
+    // And immediately after a cursor restore, which is where a terminal puts an
+    // echo while a repaint owns the row above: proof the two writers did not
+    // collide, rather than proof they were both present.
+    assert!(
+        seen[..echo_at].ends_with("\x1b[u"),
+        "the echo did not land at the restored cursor; before it: {:?}",
+        &seen[echo_at.saturating_sub(16)..echo_at]
+    );
+    // And the animation went on running over them. Characters alone submit
+    // nothing — stdin is in canonical mode, so the kernel makes no byte
+    // readable until Enter — so the pump's abandon check correctly does not
+    // fire and BR-9's "a repaint never blanks characters the user has echoed"
+    // has to hold with repaints still arriving. This is half 2's counterpart:
+    // the same counter over the same stretch of the same script, and the
+    // opposite answer.
+    assert!(
+        seen[echo_at..].matches(REPAINT_MEASURE).count() >= 2,
+        "the row stopped repainting when characters were typed at it. Nothing \
+         was submitted — there is no newline in the line buffer — so the row is \
+         still the pump's to animate, and abandoning it here would take away \
+         the liveness signal for the rest of a three-second silence (BR-9, \
+         BR-4); repaints after the echo: {}\ntranscript:\n{seen}",
+        seen[echo_at..].matches(REPAINT_MEASURE).count()
+    );
+    // The row's cadence delayed nothing: the return goes in after the turn is
+    // over and the buffered characters are still there to be read.
+    ahead.type_raw("\r");
+    assert!(
+        ahead.wait_for(QUOTED),
+        "the characters typed during the animation never reached the entry loop \
+         — the row must neither consume nor delay input (BR-9); transcript:\n{}",
+        ahead.snapshot()
+    );
+    let seen = ahead.snapshot();
+    assert!(
+        seen.contains(QUOTED),
+        "the carried line reached the entry loop altered: it must arrive as the \
+         next prompt's text byte for byte (BR-9); transcript:\n{seen}"
+    );
+    assert_no_row_on_screen(&seen, "typing ahead during the animation");
+    drop(ahead);
+
+    // ---- Half 2: the whole line, return included, mid-animation ----
+    let mut submitted = RenderedSession::open(100, &[&format!("@delay-ms 3000\n{FIRST}")], &[]);
+    submitted.type_line("hold the turn open");
+    assert!(
+        submitted.wait_until(|seen| seen.matches(REPAINT_OPEN).count() >= 2),
+        "the row never animated; transcript:\n{}",
+        submitted.snapshot()
+    );
+    submitted.type_raw(&format!("{CARRIED}\r"));
+
+    assert!(
+        submitted.wait_for(FIRST),
+        "the first turn never finished; transcript:\n{}",
+        submitted.snapshot()
+    );
+    assert!(
+        submitted.wait_for(QUOTED),
+        "a line submitted while the row was animating never reached the entry \
+         loop, or reached it altered — the row's cadence adds no latency to \
+         input and the kernel's line buffer is untouched by anything it draws \
+         (BR-9); transcript:\n{}",
+        submitted.snapshot()
+    );
+
+    let seen = submitted.snapshot();
+    // The echo of the submitted line, and the newline the terminal echoed after
+    // it. `CARRIED` appears twice in the transcript — once as this echo, once
+    // inside the client's own quote of it — and the echo is the first, because
+    // the quote is written after the line has been read.
+    let echo_at = seen
+        .find(CARRIED)
+        .unwrap_or_else(|| panic!("the submitted line was never echoed; transcript:\n{seen}"));
+    let enter_at = seen[echo_at..]
+        .find('\n')
+        .map(|offset| echo_at + offset + 1)
+        .unwrap_or_else(|| {
+            panic!("the submitted line's echo carries no newline; transcript:\n{seen}")
+        });
+
+    // Non-vacuity, before the negative: the row was demonstrably repainting up
+    // to the moment the line went in.
+    let before = seen[..enter_at].matches(REPAINT_MEASURE).count();
+    assert!(
+        before >= 2,
+        "the row never repainted before the line was submitted, so the zero \
+         below is the zero of an animation that was not running; \
+         transcript:\n{seen}"
+    );
+
+    // (1) Not one repaint attempted past the echoed newline. From that byte on
+    // the row is two rows above the cursor, so a repaint would rewrite the line
+    // holding what the user just typed — the blanking BR-9 forbids — and the
+    // pump gives the row up instead.
+    let after = seen[enter_at..].matches(REPAINT_MEASURE).count();
+    assert_eq!(
+        after, 0,
+        "the pump went on repainting after the user submitted a line. The \
+         echoed newline dropped the cursor a row without anything this client \
+         could observe, so every offset the row owns is short by one and the \
+         next repaint lands on the line the user typed (BR-9); {before} \
+         repaints before the newline and {after} after it; transcript:\n{seen}"
+    );
+
+    // (2) And the echo survived, on the **screen** rather than in the stream: a
+    // repaint that erased it would leave both the echo and the erasure in the
+    // transcript, so only the replay can tell the two apart.
+    let screen = common::rendered_screen(&seen);
+    assert!(
+        screen.iter().any(|row| row.contains(CARRIED)),
+        "the line the user typed is not on the screen: something drew over it \
+         after the terminal echoed it, which is the one outcome worse than a \
+         stale row (BR-9); screen:\n{screen:#?}\ntranscript:\n{seen}"
+    );
+}
+
+/// The two config lines a leg that needs a `shell` call to **ask** carries.
+///
+/// [`FULL_AND_NO_CONTEXT_OFFER`]'s opposite, and the default: `guarded` is the
+/// level a session starts at, and at it a `shell` call is a question standing
+/// between the turn and the row. Written out rather than left implicit so the
+/// leg below varies exactly one thing from the running-tool leg it is the
+/// counterpart of.
+///
+/// `generate = "never"` is here for the same reason it is there — the first
+/// turn of a session inside a project offers to write a `TETON.md` (REQ-613),
+/// and at `guarded` that offer is a *second* permission prompt, which would put
+/// a question the leg is not about in front of the one it is.
+const GUARDED_AND_NO_CONTEXT_OFFER: &str =
+    "[permissions]\ndefault_level = \"guarded\"\n\n[context]\ngenerate = \"never\"\n\n";
+
+/// **REQ-621 BR-1 / AC-11 — the row steps aside for a permission prompt and
+/// comes back the instant it is answered.**
+///
+/// The clause of BR-1 that had no pty leg. `awaiting_permission` is the one
+/// phase that is *not* idle and still draws nothing: the prompt owns the
+/// terminal and its own question is the indication (BR-9, BR-10), and a spinner
+/// repainting the line above a question the user is reading is the second
+/// renderer BR-10 forbids. Until this leg the claim was pinned only at
+/// renderer-unit level, which is the shape BUG-191 is about — AC-11 requires a
+/// real terminal for every TTY claim in the list.
+///
+/// # What the daemon actually does, and why the window starts where it does
+///
+/// The order on screen is **`[running]` line, then the question**. The daemon
+/// publishes `tool_call` (`in_progress`) before it consults the permission
+/// gate, so the client learns a tool has started and moves to `tool_running`
+/// *first*, and only then does the request arrive and take the row back. That
+/// is the producer's own sequence and this leg asserts it as such rather than
+/// asserting the order somebody would have designed (LESSON-544, LESSON-628):
+/// the window the negative claim is made over therefore opens at the
+/// **question's first byte**, not at the tool's, because a row above the
+/// question is the row correctly showing the phase the daemon had reported at
+/// the time.
+///
+/// Four claims:
+///
+/// 1. the question is put at all — the level, not the fixture, decides that,
+///    and without it the rest is a negative claim about a turn that never asked;
+/// 2. no activity row appears from the question's first byte until the answer
+///    goes in — positionally, over a snapshot taken **while the question was
+///    standing**, so this is not a `contains` that would be satisfied by the
+///    animation either side of it;
+/// 3. the row returns after the answer, in `tool_running`, with the title the
+///    daemon composed — BR-1's "the instant the next silent phase begins", and
+///    the non-vacuity for claim (2): a phase that can draw a row, and did not
+///    while the question stood;
+/// 4. the turn completes and the screen carries no residue (BR-5).
+///
+/// # What breaks this test
+///
+/// Claim (3) is the one with teeth and it fails on the property. A pump that
+/// stopped painting on its own clock leaves it with nothing: `sleep 2` publishes
+/// nothing while it runs, so every row in the post-answer window is a tick's.
+/// The mutation recorded on
+/// `the_row_appears_before_the_first_byte_and_withdraws_when_text_streams` — the
+/// `Wake::Tick` arm advancing `row.tick` without calling `paint_row` — reddens
+/// this leg at claim (3) for that reason.
+///
+/// Claim (2) is a negative, so its teeth are in the window boundary, and that
+/// boundary was **mutated and observed failing** too:
+///
+/// | Mutation | Fails |
+/// |---|---|
+/// | the window opens at the `[running]` line instead of the question's first byte | claim (2), reporting the one row it then swallows — `⠋ running shell: sleep 2 · 0s · turn 0s` |
+///
+/// Which is the evidence the window is the right one rather than a wide net: a
+/// row *is* drawn in the stretch between the tool announcing itself and the
+/// question being put, the client takes it back immediately before the
+/// question's first byte, and the leg's negative claim is about the stretch
+/// after that and nothing else.
+#[test]
+fn the_row_steps_aside_for_a_permission_prompt_and_returns_after_the_answer() {
+    const REPLY: &str = "The asked-for tool turn is done.";
+    const RUNNING: &str = " - shell: sleep 2 [running]";
+    const ASKED: &str = "permission requested: shell";
+    // The prompt's own option row, verbatim: `shell` offers no `[p]ermanently`,
+    // so this is the four-way form (REQ-563 BR-4).
+    const OPTIONS: &str = "allow shell? [y]es / [n]o / [a]llow-always / [d]eny-always:";
+    // `LineKind::Prompt`'s prefix, which is what makes the request line's
+    // *first* byte findable — the claim below is about what the row does
+    // immediately before the whole line, not before its text.
+    const PROMPT_MARKER: &str = "? ";
+    let mut session = RenderedSession::open_with_config(
+        100,
+        &[
+            r#"{"tool": "shell", "arguments": {"command": "sleep 2"}}"#,
+            REPLY,
+        ],
+        &[],
+        &local_tier_config(GUARDED_AND_NO_CONTEXT_OFFER),
+    );
+    session.type_line("ask me first");
+
+    // (1) The question, and the option row with it. Waited on rather than
+    // inferred: a prompt that never came times out here instead of being read
+    // out of a partial transcript.
+    assert!(
+        session.wait_for(OPTIONS),
+        "the default level never asked about a `shell` call, so this leg never \
+         reached the phase it is about; transcript:\n{}",
+        session.snapshot()
+    );
+
+    // (2) Snapshotted **while the question is standing** and before a byte of
+    // the answer goes in, so the window below cannot contain anything from
+    // after it.
+    let asking = session.snapshot();
+    let asked_at = asking
+        .find(ASKED)
+        .unwrap_or_else(|| panic!("the request line is not in the transcript:\n{asking}"));
+    let during = activity_rows(&asking[asked_at..]);
+    assert!(
+        during.is_empty(),
+        "an activity row was painted while a permission question was standing. \
+         During `awaiting_permission` the row is withdrawn: the prompt owns the \
+         terminal and its own question is the indication, and a spinner \
+         repainting the line above it is the second renderer BR-10 forbids \
+         (BR-1); rows: {during:#?}\ntranscript:\n{asking}"
+    );
+    // The daemon's own order, asserted rather than assumed: the tool announced
+    // itself first and the question came after it, which is why the window
+    // above opens at the question and not at the tool.
+    assert!(
+        asking
+            .find(RUNNING)
+            .is_some_and(|running_at| running_at < asked_at),
+        "the daemon is expected to publish `tool_call` before it consults the \
+         permission gate, so the `[running]` line precedes the question — if \
+         that changed, the window this leg makes its negative claim over is the \
+         wrong window; transcript:\n{asking}"
+    );
+    // And the row was taken back rather than left above the question: the
+    // question's first byte lands on the row's own line, so the prompt closes
+    // over it with no gap and no residue (BR-5).
+    let row_at = asked_at - PROMPT_MARKER.len();
+    assert!(
+        asking[..asked_at].ends_with(PROMPT_MARKER) && asking[..row_at].ends_with(WITHDRAW),
+        "the question did not land on the row's own line, so the row was left \
+         above a prompt the user is reading instead of withdrawn (BR-1, BR-5); \
+         before it: {:?}",
+        &asking[row_at.saturating_sub(24)..asked_at]
+    );
+
+    // The answer.
+    session.type_line("y");
+    assert!(
+        session.wait_for(REPLY),
+        "the turn never completed after the permission was granted; \
+         transcript:\n{}",
+        session.snapshot()
+    );
+
+    // (3) The row is back, in the phase the daemon reported, with the daemon's
+    // own title — and the window is everything after the snapshot taken while
+    // the question stood, so this is the row *returning* rather than the row
+    // that was up before it.
+    let seen = session.snapshot();
+    let returned = activity_rows(&seen[asking.len()..]);
+    assert!(
+        returned
+            .iter()
+            .any(|row| row.contains("running shell: sleep 2")),
+        "the row did not come back once the permission was answered. BR-1 has \
+         it return the instant the next silent phase begins, and the two \
+         seconds a granted `sleep 2` then spends are exactly the stretch this \
+         REQ exists for; rows: {returned:#?}\ntranscript:\n{seen}"
+    );
+
+    // (4) And the turn left nothing behind.
+    assert_no_row_on_screen(&seen, "a permission prompt mid-turn");
 }

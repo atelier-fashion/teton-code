@@ -24,6 +24,7 @@
 //! prompts, with no socket and no daemon.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use teton_protocol::events;
 use teton_protocol::events::{
@@ -48,6 +49,7 @@ use teton_protocol::methods::{
 };
 use teton_protocol::{Phase, RequestId, SessionId, Tier};
 
+use crate::activity::{TurnActivity, TurnSummary};
 use crate::banner;
 use crate::cost_ui::CostMeter;
 use crate::firstrun;
@@ -154,6 +156,26 @@ pub struct SessionState {
     /// indicator fed only from the idle path would keep animating "model
     /// starting" after a `Ready` that landed mid-turn.
     pub loading: crate::loading::LoadingIndicator,
+    /// The live turn-activity projection (REQ-621 ADR-621-2).
+    ///
+    /// Beside [`Self::loading`] and [`Self::cost`], and for the same reason
+    /// those are here: it is a fold over the event stream, and the state it
+    /// folds into has to be the state the surfaces read. This one is narrower
+    /// than `loading` in one respect worth stating — it describes a **turn**
+    /// rather than the daemon, so only [`SessionState::begin_turn`] can open
+    /// one, and an event that arrives with no turn in flight folds into nothing.
+    ///
+    /// It holds no session fact the daemon lacks (BR-4): every field of it is
+    /// derived from an event the daemon published, or from the client's own
+    /// clock, which is the one thing the daemon cannot report.
+    pub activity: TurnActivity,
+    /// What the last turn spent, for BR-16's one durable line.
+    ///
+    /// Written where the row is closed — the `ENDS_TURN` seam that runs on every
+    /// exit path, including a daemon disconnect (ADR-621-4) — and read by the
+    /// turn arm, so the line and the row report one accumulator rather than two
+    /// tallies that can disagree (AC-13). `None` before the first turn ends.
+    pub last_turn_summary: Option<TurnSummary>,
     /// This session's permission level, once the daemon has been asked
     /// (REQ-560).
     ///
@@ -519,6 +541,37 @@ impl SessionState {
         self.turn_prompt.clear();
         self.turn_prompt.push_str(prompt);
         self.turn_tools.clear();
+        // REQ-621 ADR-621-2: the row's clock starts where the prompt goes on
+        // the wire, which is the one transition the daemon does not announce.
+        //
+        // A turn still open here is a turn that ended by a path the close-out
+        // did not see, and it is closed rather than overwritten for exactly the
+        // reason the three fields above are cleared *here* rather than at turn
+        // end: its cost and its clock must not be lent to the turn about to
+        // start. On every ordinary path the activity is already idle and this
+        // branch does nothing.
+        let now = Instant::now();
+        if self.activity.phase() != crate::activity::Phase::Idle {
+            self.last_turn_summary = Some(self.activity.finish(now));
+        }
+        self.activity.begin(now);
+    }
+
+    /// Fold one event into the turn's activity (REQ-621 ADR-621-2).
+    ///
+    /// A wrapper of two lines, and it exists for the second argument. Whose
+    /// event this is (BR-15) is answered from [`Self::session_id`], and the
+    /// pump — which has a second copy of the same id on its `UiContext` — must
+    /// not be the place that chooses which copy to read. One state, one
+    /// session, one reading: a caller that picked the other copy on a day the
+    /// two had not yet been set together would fold another session's turn into
+    /// this one's row.
+    ///
+    /// Called by the event pump only, immediately before the event is rendered,
+    /// so the row and the durable lines beside it describe the same moment
+    /// (ADR-621-3).
+    pub(crate) fn observe_activity(&mut self, env: &EventEnvelope, now: Instant) {
+        self.activity.observe(env, self.session_id.as_ref(), now);
     }
 
     /// Claim a model proposal, returning `true` the first time only.
@@ -2158,14 +2211,62 @@ fn format_provider_tested(tested: &ProviderTested, elsewhere: Option<&SessionId>
 /// reason: the load window publishes nothing to derive one from, and a figure
 /// would be fabricated). The lifecycle stream's own `benchmark` and `ready`
 /// lines follow this one as they happen, and then the reply.
-fn format_turn_queued(queued: &TurnQueued) -> String {
+pub(crate) fn format_turn_queued(queued: &TurnQueued) -> String {
+    format!(
+        "message queued until {} — it will run as soon as the local tier opens.",
+        tier_warming_clause(queued)
+    )
+}
+
+/// What a `turn_queued` says the tier is doing: `qwen3-coder-30b-a3b finishes
+/// loading`.
+///
+/// **The one place the event's typed `waiting_on` becomes words** (REQ-621
+/// BR-10, BR-2 as amended 2026-09-10). Two surfaces name a held turn — this
+/// module's durable notice above, and the activity row's `held until …` clause
+/// (`activity::held_clause`) — and the daemon supplies neither sentence: the
+/// event carries a model id and an enum, so the *client* composes, which is
+/// what ASSUME-049 records. Two client-side compositions of one event is two
+/// sentences that agree until somebody edits one of them, and the row prints
+/// directly beneath the notice, where a disagreement is not subtle.
+///
+/// Rendered rather than branched on by its callers, for the reason the whole
+/// row exists: the classification is the daemon's, the wording is ours, and
+/// there is exactly one of it.
+pub(crate) fn tier_warming_clause(queued: &TurnQueued) -> String {
     let doing = match queued.waiting_on {
         TierWarming::Installing => "installing",
         TierWarming::Loading => "loading",
     };
+    format!("{} finishes {doing}", queued.model_id)
+}
+
+/// BR-16's one durable line: what the turn just spent, in time and in money.
+///
+/// The row's non-visual read path, and the reason it exists is that the row
+/// itself is TTY-gated: a piped verbose session would otherwise have no way to
+/// recover what a turn was doing or for how long. Emitted whether or not stdout
+/// is a terminal, so a verbose pipe fixture differs from today's by exactly
+/// this line and nothing else (AC-3, AC-13); outside `/verbose` nothing prints
+/// and default piped output stays byte-identical (BR-6).
+///
+/// Every figure is [`crate::activity::TurnSummary`]'s — the accumulator the
+/// frames read — rather than a second tally taken at the end. Two readings of
+/// one turn are two numbers waiting to disagree, and the disagreement would
+/// land on the surface a user checks *because* they distrust what they saw.
+///
+/// Whole seconds, matching the row: sub-second precision on a figure whose
+/// purpose is "was this turn slow, and where" is noise, and the row never had
+/// it. The cost is [`crate::cost_ui::format_usd`]'s exact micro-dollar
+/// rendering, so this line, the row, and the cost meter cannot print three
+/// different amounts for one turn.
+pub(crate) fn format_turn_summary(summary: &TurnSummary) -> String {
     format!(
-        "message queued until {} finishes {doing} — it will run as soon as the local tier opens.",
-        queued.model_id
+        "turn {}s: model {}s, tools {}s, cost {}",
+        summary.total.as_secs(),
+        summary.model.as_secs(),
+        summary.tools.as_secs(),
+        crate::cost_ui::format_usd(summary.cost_micros),
     )
 }
 
@@ -2470,7 +2571,12 @@ fn format_grant_minted(minted: &SessionGrantMinted) -> String {
 /// came from elsewhere, and a notice that guessed "in another session" would be
 /// wrong in precisely the common case (a single-session client, before
 /// `session/create` answers).
-fn other_session<'a>(
+///
+/// Crate-visible because [`crate::activity`] asks the same question of the same
+/// envelope (BR-15), and "whose event is this" must have **one** reading: a
+/// second one would be a second answer, and the two surfaces would eventually
+/// disagree about whether a turn's row belongs to this session.
+pub(crate) fn other_session<'a>(
     ours: Option<&SessionId>,
     theirs: Option<&'a SessionId>,
 ) -> Option<&'a SessionId> {
@@ -10038,6 +10144,121 @@ mod tests {
             "under verbose it reports how many rows are in force: {notice}"
         );
     }
+
+    /// BR-16 / AC-13: the verbose end-of-turn line and the row read **one**
+    /// accumulator. The frame below and the summary beneath it are both taken
+    /// from the same [`TurnActivity`], and the cost text is character-for-character
+    /// the same in both — which is the property the rule is about: a user who
+    /// distrusted what the row showed and piped the session to check must not
+    /// be handed a second, differently-derived set of figures.
+    ///
+    /// Both oracles are literal strings. Computing either from
+    /// [`crate::activity::TurnActivity`]'s own fields would pass against a
+    /// summary that reported zeroes (LESSON-569).
+    #[test]
+    fn the_turn_summary_reads_the_same_accumulator_the_frames_read() {
+        use std::time::Duration;
+
+        let mut state = SessionState::new();
+        state.session_id = Some(SessionId::from("s1"));
+
+        // `begin_turn` arms the row from its own clock — the prompt going on the
+        // wire is the transition, and no daemon event announces it.
+        state.begin_turn("why is the build slow?");
+        assert!(
+            state
+                .activity
+                .frame(std::time::Instant::now(), 0, 120)
+                .is_some(),
+            "begin_turn opens the turn the row describes"
+        );
+
+        // Re-armed at a synthetic instant so every figure below is exact; the
+        // fold is the same one the pump performs.
+        let t0 = std::time::Instant::now();
+        state.activity.begin(t0);
+        let script: Vec<(u64, Event)> = vec![
+            (
+                1,
+                Event::RouteDecided(RouteDecided {
+                    category: None,
+                    tier: Some(Tier::Think),
+                    phase: None,
+                    provider_id: teton_protocol::ProviderId::from("anthropic"),
+                    model: Some("claude-opus-5".to_owned()),
+                    reason: "fixture".to_owned(),
+                    effort: None,
+                    window_tokens: None,
+                    budget_tokens: None,
+                    budget_bytes: None,
+                    bound: None,
+                    spend_ceiling_micro_cents: None,
+                    bound_floored: None,
+                    repo_context_cap: None,
+                }),
+            ),
+            (
+                2,
+                Event::CostRecorded(events::CostRecorded {
+                    record: events::CostRecord {
+                        session_id: SessionId::from("s1"),
+                        phase: None,
+                        category: None,
+                        provider_id: teton_protocol::ProviderId::from("anthropic"),
+                        model: "claude-opus-5".to_owned(),
+                        input_tokens: 100,
+                        output_tokens: 50,
+                        usd_micros: 12_345,
+                        cached_tokens: None,
+                        reasoning_tokens: None,
+                        probe: false,
+                    },
+                }),
+            ),
+            (
+                3,
+                Event::SessionUpdate(events::SessionUpdate {
+                    update: SessionUpdatePayload::ToolCall {
+                        tool_call_id: "c1".to_owned(),
+                        title: "shell: cargo test".to_owned(),
+                        status: ToolCallStatus::InProgress,
+                    },
+                }),
+            ),
+            (
+                8,
+                Event::SessionUpdate(events::SessionUpdate {
+                    update: SessionUpdatePayload::ToolCallUpdate {
+                        tool_call_id: "c1".to_owned(),
+                        status: ToolCallStatus::Completed,
+                    },
+                }),
+            ),
+        ];
+        for (secs, event) in script {
+            state.activity.observe(
+                &envelope(event),
+                state.session_id.as_ref(),
+                t0 + Duration::from_secs(secs),
+            );
+        }
+
+        // What the row showed a second before the turn ended.
+        assert_eq!(
+            state
+                .activity
+                .frame(t0 + Duration::from_secs(9), 0, 200)
+                .as_deref(),
+            Some("⠋ waiting on anthropic claude-opus-5 (think) · 1s · turn 9s · $0.012345")
+        );
+
+        // ...and what the line says about the same turn.
+        let summary = state.activity.finish(t0 + Duration::from_secs(10));
+        assert_eq!(
+            format_turn_summary(&summary),
+            "turn 10s: model 4s, tools 5s, cost $0.012345"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -13152,6 +13373,7 @@ mod key_scan {
     /// not listed here, so the list cannot silently stop covering the crate.
     const CRATE_SOURCES: &[(&str, &str)] = &[
         ("main.rs", include_str!("main.rs")),
+        ("activity.rs", include_str!("activity.rs")),
         ("banner.rs", include_str!("banner.rs")),
         ("cli_rows.rs", include_str!("cli_rows.rs")),
         ("client.rs", include_str!("client.rs")),

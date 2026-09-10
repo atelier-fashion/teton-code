@@ -197,6 +197,18 @@
   the bytes that reach the terminal stay gated. Otherwise the gate that hides the
   feature from users hides it from the test suite too, and the feature ships
   unverified (REQ-556, REQ-560 BR-8, LESSON-481).
+- **A live row is owned by the pump that can wake** — an in-place terminal row
+  is drawn, repainted and withdrawn by exactly one loop: the one that holds the
+  clock and can be woken without the daemon (a timed receive on the channel it
+  already reads). That loop withdraws the row before dispatching anything and
+  redraws it after, so every other writer — a durable tool line, a notice, a
+  permission prompt — prints where the row was and never has to know the row
+  exists. The TTY gate is a property of the surface (`has_live_rows`), never a
+  flag threaded through the callers, and the pump reads it to decide whether to
+  wait with a timeout at all: a surface that does not own a terminal's rows
+  keeps the blocking receive, never reaches a tick arm, and so cannot emit a
+  byte it did not emit before. A second owner, or a caller-held gate, is how a
+  row ends up in scrollback (REQ-621 ADR-621-1/ADR-621-3, LESSON-481).
 - **Enablement is collection at the edge, commitment at the core** — a guided
   setup flow holds no server-side step state: clients collect and buffer
   answers (input buffering is not session state), the daemon exposes

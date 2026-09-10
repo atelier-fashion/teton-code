@@ -1,0 +1,104 @@
+{
+  "req": "REQ-621",
+  "branch": "feat/REQ-621-live-turn-activity-line",
+  "startedAt": "2026-09-10T13:52:12Z",
+  "integrationBranch": "main",
+  "completed": false,
+  "currentPhase": 7,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree",
+      "completedAt": "2026-09-10T13:52:12Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-09-10T13:55:10Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect",
+      "completedAt": "2026-09-10T14:06:02Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-09-10T14:07:12Z"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-09-10T15:55:49Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify",
+      "completedAt": "2026-09-10T18:00:39Z"
+    },
+    {
+      "phase": 6,
+      "name": "Create Pull Request",
+      "completedAt": "2026-09-10T18:01:14Z"
+    }
+  ],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-621",
+      "branch": "feat/REQ-621-live-turn-activity-line",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/319",
+      "prNumber": 319,
+      "prCreatedAt": "2026-09-10T13:52:11Z",
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-409",
+      "TASK-410",
+      "TASK-412",
+      "TASK-411",
+      "TASK-413",
+      "TASK-414"
+    ],
+    "failedTasks": [],
+    "tier0": [
+      "TASK-409",
+      "TASK-410",
+      "TASK-412"
+    ]
+  },
+  "conflictsResolved": [],
+  "notes": [
+    "TASK-413 finding: a line submitted mid-animation leaves the last frame on screen (echoed newline scrolls under the \\x1b[1A bookkeeping); delivery intact (BR-9) but BR-5 residue while typing over the row \u2014 carry to Phase 5.",
+    "TASK-414 flake: a_running_tool_shows_its_title_elapsed_and_cost_so_far_beneath_its_running_line failed once in a full pty run (time-derived distinct_clocks>=2 snapshot); carry to Phase 5."
+  ],
+  "phase5": {
+    "fixCommits": [
+      "a6f83bd",
+      "89adf90",
+      "84d93f3"
+    ],
+    "stepD": "correctness/security/architecture/test-audit re-run; all closed after one follow-up fix",
+    "pendingUserQuestion": null,
+    "userDecision": "option 2: accept the recorded BR-5 exception; follow-up BUG-225 opened for raw-mode input handling"
+  }
+}

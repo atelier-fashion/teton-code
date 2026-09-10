@@ -259,6 +259,37 @@ pub use views::BoundaryPosture;
 /// Separator between reply blocks in a `TETON_LOCAL_SCRIPT` file.
 const SCRIPT_SEPARATOR: &str = "---";
 
+/// The first line a reply block may open with to make the stand-in engine hold
+/// the turn open before its first token: `@delay-ms <n>` (REQ-621 ADR-621-6).
+///
+/// Honoured only under the seam master switch — a debug build with
+/// `TETON_TEST_SEAMS=1`, [`test_seams_enabled`] — and streamed verbatim
+/// everywhere else, so a script cannot change meaning outside the seam and a
+/// release build never honours it. See [`ScriptedFileEngine`] for why the
+/// directive exists at all, and [`delay_directive`] for the grammar.
+const SCRIPT_DELAY_DIRECTIVE: &str = "@delay-ms";
+
+/// The longest hold [`SCRIPT_DELAY_DIRECTIVE`] may ask for: one minute.
+///
+/// The count used to be an unbounded `u64` of milliseconds, which is a
+/// half-billion-year hold on the thread serving the turn. Nothing malicious is
+/// needed to reach it — a fixture that means `@delay-ms 16500` and types
+/// `@delay-ms 165000000` asks for a hold no test window can outlast, and the
+/// failure it produces is a suite that hangs rather than one that says what is
+/// wrong. The script file is also *input*: it is read from a path handed in by
+/// the environment, so the size of the number in it is not something the daemon
+/// authored, and a seam that is honoured only in a debug build under a master
+/// switch is still a seam that should not turn a file into an unbounded hold.
+///
+/// A minute is above every leg's need — the longest is 16.5 s, past the
+/// fifteen-second quiet bound (REQ-621 BR-11) — and below the pty suite's own
+/// 60 s per-wait window, so a directive above the cap fails as reply text a
+/// fixture can see rather than as a wait that never returns. Above it the
+/// directive is **malformed**, which means the whole block streams verbatim by
+/// the same rule as `@delay-ms x`: the number is right there in the tokens the
+/// fixture asserts on.
+const MAX_SCRIPT_DELAY_MS: u64 = 60_000;
+
 /// A placeholder a scripted reply may contain to force its continuation to depend
 /// on the **real** tool output of the current turn's context.
 ///
@@ -474,6 +505,22 @@ pub(crate) const DRAFT_CONTRACT_PREFIX_BYTES: usize = 2_048;
 /// which is a property of the fixtures, not of the seam. The contract is a shared
 /// constant on both sides precisely so the recognizer cannot drift away from the
 /// prompt it recognizes.
+///
+/// **A block may also ask to be held open** (REQ-621 ADR-621-6).
+/// [`SCRIPT_DELAY_DIRECTIVE`] as a block's first line — `@delay-ms 250` — makes
+/// [`Engine::complete`] sleep that long before emitting the first token, and
+/// strips the line, so nothing test-visible about the reply changes but its
+/// timing. REQ-621's activity line is a surface that exists only *while a turn
+/// is working*, and its pty legs need a turn that is still working when they
+/// look: without the directive there is no deterministic way to hold one open,
+/// and REQ-556 left the equivalent leg uncovered rather than invent a
+/// production delay to make it possible. This is not that — the directive is
+/// part of the script grammar of a *fixture* engine, and it rides the same
+/// master switch every other test seam rides. A release build never honours it
+/// (it refuses to start at all while the switch is set), and with the seam off
+/// the line is simply the reply's own first line, streamed verbatim — as is a
+/// malformed one (`@delay-ms x`) under the seam. The duty arms answer before
+/// the directive is ever read, so no duty can be delayed by a script.
 pub struct ScriptedFileEngine {
     model_id: String,
     replies: Vec<String>,
@@ -568,11 +615,32 @@ impl Engine for ScriptedFileEngine {
         &self.model_id
     }
 
+    /// Reads the seam master switch **once**, here, through the same predicate
+    /// every other seam in this runtime reads, and hands the answer down.
+    ///
+    /// One spelling of the gate rather than two (LESSON-494): from here down the
+    /// seam is a parameter, which is also what lets the honoured half of
+    /// [`SCRIPT_DELAY_DIRECTIVE`] be tested without a test mutating a
+    /// process-global environment variable that the rest of this suite asserts
+    /// is unset (`attest::tests::the_presence_seam_is_unreachable_without_the_master_switch`).
     fn complete(
         &self,
         prompt: &str,
         params: &GenParams,
         on_token: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<Completion, EngineError> {
+        self.complete_scripted(prompt, params, on_token, test_seams_enabled())
+    }
+}
+
+impl ScriptedFileEngine {
+    /// [`Engine::complete`] with the seam decision passed in rather than read.
+    fn complete_scripted(
+        &self,
+        prompt: &str,
+        params: &GenParams,
+        on_token: &mut dyn FnMut(&str) -> bool,
+        seams: bool,
     ) -> Result<Completion, EngineError> {
         // A duty, not a turn: answered off-script so the block sequence keeps
         // meaning what the fixture author wrote (see the type's docs).
@@ -625,10 +693,25 @@ impl Engine for ScriptedFileEngine {
             scripted_classification().to_owned()
         } else {
             let idx = self.calls.fetch_add(1, Ordering::SeqCst);
-            self.replies
+            let block = self
+                .replies
                 .get(idx)
                 .cloned()
-                .unwrap_or_else(|| "Done.".to_owned())
+                .unwrap_or_else(|| "Done.".to_owned());
+            // REQ-621 ADR-621-6: the block chosen for *this* call — and only a
+            // script block, never one of the duty answers above — may open with
+            // `@delay-ms <n>` and ask the engine to hold the turn open that long
+            // before its first token, so a pty leg can look at a turn that is
+            // still working. Under the seam the line is consumed; off the seam,
+            // or malformed, it is the reply's own first line and streams
+            // verbatim.
+            match seams.then(|| delay_directive(&block)).flatten() {
+                Some((delay, rest)) => {
+                    std::thread::sleep(delay);
+                    rest
+                }
+                None => block,
+            }
         };
         // A reply may quote the current turn's real tool output via the
         // placeholder, so the scripted continuation genuinely depends on the
@@ -658,6 +741,34 @@ impl Engine for ScriptedFileEngine {
         let prompt_tokens = u32::try_from(prompt.split_whitespace().count()).unwrap_or(u32::MAX);
         Ok(Completion::cold(text, prompt_tokens, completion_tokens))
     }
+}
+
+/// The delay a reply block's first line asks for, and the block without it.
+///
+/// The grammar is exactly [`SCRIPT_DELAY_DIRECTIVE`], then whitespace, then a
+/// count of milliseconds no greater than [`MAX_SCRIPT_DELAY_MS`]. Anything else
+/// is `None` and the caller streams the block verbatim: `@delay-ms x`, a
+/// negative or overflowing count, a count above the cap, `@delay-ms250` with no
+/// space, or a directive with no second line to stream after it. A fixture that
+/// mistypes the directive therefore fails on the reply text it asserts — the
+/// directive is right there in the tokens — rather than quietly running without
+/// the delay it asked for, which is the failure that would look like the
+/// surface under test being wrong.
+fn delay_directive(block: &str) -> Option<(Duration, String)> {
+    let (first, rest) = block.split_once('\n')?;
+    let arg = first.strip_prefix(SCRIPT_DELAY_DIRECTIVE)?;
+    if !arg.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let ms: u64 = arg.trim().parse().ok()?;
+    // Above the cap is malformed rather than clamped: a clamp would run a
+    // fixture that asked for something impossible and report success, which is
+    // the one outcome a seam like this must not produce. See
+    // [`MAX_SCRIPT_DELAY_MS`].
+    if ms > MAX_SCRIPT_DELAY_MS {
+        return None;
+    }
+    Some((Duration::from_millis(ms), rest.to_owned()))
 }
 
 /// Which door an offer came through, and what it may do (REQ-613 ADR-6).
@@ -9610,6 +9721,159 @@ provider_id = "on-device"
         assert_eq!(
             engine.complete("p", &params, &mut sink).unwrap().text,
             "Done."
+        );
+    }
+
+    /// REQ-621 AC-11 / ADR-621-6: `@delay-ms` holds a turn open for the pty
+    /// timing legs, and does so **only** under the seam master switch.
+    ///
+    /// Three legs, all of them through the real streaming loop:
+    ///
+    /// 1. **Honoured.** With the seam on, `@delay-ms 250\nhello` streams
+    ///    `hello` and nothing else, no sooner than 250 ms after the call was
+    ///    entered. Both halves matter: the timing is what the pty legs buy, and
+    ///    the stripping is why no test-visible byte changes (the directive must
+    ///    never reach a caller that is asserting on reply text).
+    /// 2. **Seam off.** The ordinary path, taken through [`Engine::complete`]
+    ///    itself rather than the inner method, so what is asserted is the real
+    ///    predicate's answer in a suite that never sets the switch: the
+    ///    directive is just the reply's first line, streamed verbatim and
+    ///    promptly. This is the leg that says a script cannot change meaning
+    ///    outside the seam, and by extension not in a release build, which
+    ///    refuses the switch outright.
+    /// 3. **Malformed under the seam.** `@delay-ms x` is not a delay and is not
+    ///    stripped either — a mistyped directive fails loudly on the text a
+    ///    fixture asserts instead of silently running with no delay.
+    /// 4. **Over the cap.** A count above [`MAX_SCRIPT_DELAY_MS`] is malformed
+    ///    by the same rule, so a script cannot ask for a hold no test window can
+    ///    outlast. The boundary is asserted on [`delay_directive`] directly —
+    ///    the cap is a minute and a leg that proved it by *waiting* one would be
+    ///    a minute of wall clock in a suite that has none to spare — and the
+    ///    over-cap case is then taken through the streaming loop as well, where
+    ///    it must both stream verbatim and not sleep.
+    ///
+    /// **Mutation run.** Changing `delay_directive`'s
+    /// `first.strip_prefix(SCRIPT_DELAY_DIRECTIVE)` to
+    /// `first.strip_prefix("@never-matches")` — a parse that can never match —
+    /// reddens leg 1 at "the directive line must be consumed, not streamed",
+    /// `left: "@delay-ms 250\nhello"` against `right: "hello"`. That assertion
+    /// panics before the timing one is reached, so the ~0 ms hold it would also
+    /// have caught goes unobserved in this run; either half alone is enough to
+    /// fail. Legs 2 and 3 stay green, as they must — they assert the verbatim
+    /// behaviour a never-matching parse also produces, which is why leg 1 is the
+    /// one carrying the claim.
+    ///
+    /// **Second mutation run,** for leg 4: deleting the
+    /// `ms > MAX_SCRIPT_DELAY_MS` guard reddens leg 4's boundary assertion at
+    /// `left: Some((60.001s, "hello"))` against `right: None`, before the
+    /// streaming half of the leg is reached — which is the point of
+    /// asserting the boundary on the grammar function first. An uncapped build
+    /// fails here in microseconds instead of holding the suite for the minute
+    /// the over-cap block would otherwise sleep.
+    #[test]
+    fn the_delay_directive_is_honoured_only_under_the_seam() {
+        /// One leg: stream a one-block script and report what the caller was
+        /// given and how long the call took. `seams: None` goes through the
+        /// real [`Engine::complete`], which reads the master switch itself.
+        fn stream(script: &str, seams: Option<bool>) -> (String, Duration) {
+            let engine = ScriptedFileEngine::from_script("m", script);
+            let params = GenParams::default();
+            let mut tokens = String::new();
+            let started = Instant::now();
+            let completion = {
+                let mut sink = |token: &str| {
+                    tokens.push_str(token);
+                    true
+                };
+                match seams {
+                    Some(seams) => engine.complete_scripted("p", &params, &mut sink, seams),
+                    None => engine.complete("p", &params, &mut sink),
+                }
+                .expect("the scripted engine cannot fail")
+            };
+            let held = started.elapsed();
+            assert_eq!(
+                completion.text, tokens,
+                "the completion must be exactly what the caller was streamed"
+            );
+            (tokens, held)
+        }
+
+        let held_open = format!("{SCRIPT_DELAY_DIRECTIVE} 250\nhello");
+
+        // 1. Honoured under the seam.
+        let (tokens, held) = stream(&held_open, Some(true));
+        assert_eq!(
+            tokens, "hello",
+            "the directive line must be consumed, not streamed"
+        );
+        assert!(
+            held >= Duration::from_millis(250),
+            "the turn was not held: {held:?} elapsed before the reply was complete"
+        );
+
+        // 2. Seam off — the ordinary path, and this suite's own state.
+        assert!(
+            !test_seams_enabled(),
+            "this leg is only meaningful with the master switch off, which is \
+             every run of this suite"
+        );
+        let (tokens, held) = stream(&held_open, None);
+        assert_eq!(
+            tokens, held_open,
+            "off the seam the directive is just the reply's first line"
+        );
+        assert!(
+            held < Duration::from_millis(250),
+            "nothing may sleep off the seam, and {held:?} elapsed"
+        );
+
+        // 3. Malformed under the seam: not a delay, and not stripped.
+        let malformed = format!("{SCRIPT_DELAY_DIRECTIVE} x\nhello");
+        let (tokens, held) = stream(&malformed, Some(true));
+        assert_eq!(
+            tokens, malformed,
+            "a directive that does not parse is reply text, not a delay"
+        );
+        assert!(
+            held < Duration::from_millis(250),
+            "a malformed directive must not sleep, and {held:?} elapsed"
+        );
+
+        // 4. The cap. On the grammar function, because the boundary is a
+        // minute: inclusive at the cap, malformed above it.
+        let at_cap = format!("{SCRIPT_DELAY_DIRECTIVE} {MAX_SCRIPT_DELAY_MS}\nhello");
+        assert_eq!(
+            delay_directive(&at_cap),
+            Some((
+                Duration::from_millis(MAX_SCRIPT_DELAY_MS),
+                "hello".to_owned()
+            )),
+            "the cap is the longest hold a script may ask for, not the first one \
+             it may not"
+        );
+        let over_cap = format!(
+            "{SCRIPT_DELAY_DIRECTIVE} {}\nhello",
+            MAX_SCRIPT_DELAY_MS + 1
+        );
+        assert_eq!(
+            delay_directive(&over_cap),
+            None,
+            "a count above the cap must be malformed rather than clamped — a \
+             clamp would run a fixture that asked for something impossible and \
+             report success"
+        );
+        // And through the streaming loop, where malformed means the whole block
+        // streams verbatim and nothing sleeps.
+        let (tokens, held) = stream(&over_cap, Some(true));
+        assert_eq!(
+            tokens, over_cap,
+            "an over-cap directive is reply text, by the same rule as a \
+             mistyped one"
+        );
+        assert!(
+            held < Duration::from_millis(250),
+            "an over-cap directive must not sleep, and {held:?} elapsed"
         );
     }
 

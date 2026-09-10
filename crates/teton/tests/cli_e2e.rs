@@ -344,6 +344,18 @@ impl TestDaemon {
         self.run_cli_streams(teton, args, "", CliSeams::Off).0
     }
 
+    /// [`Self::run_cli_stdout`] with `stdin` piped in — a driven session's
+    /// **stdout alone** (REQ-621 TASK-413).
+    ///
+    /// The right haystack for a claim about what a piped *turn* writes. BR-6
+    /// says a non-terminal stdout gets not a frame, not an escape and not a
+    /// blank line, and the suite's default capture folds in stderr — where a
+    /// diagnostic that never reached stdout would answer for one that did, in
+    /// both directions.
+    fn run_cli_stdout_with_stdin(&self, teton: &Path, args: &[&str], stdin: &str) -> String {
+        self.run_cli_streams(teton, args, stdin, CliSeams::Off).0
+    }
+
     /// Run `teton <args...>` with `stdin` piped in, so an *interactive* prompt
     /// can be answered by the test the way a user answers it.
     ///
@@ -8638,5 +8650,412 @@ fn teton_context_generate_writes_the_durable_key_and_doctor_reports_both_posture
     assert!(
         doctor_status.success(),
         "a posture advisory must not change doctor's exit status"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-621 — what a piped turn writes, and what verbose mode adds (TASK-413)
+// ---------------------------------------------------------------------------
+
+/// The activity row's own vocabulary: every sentence `activity.rs`'s `frame`
+/// can compose, plus the stall annotation.
+///
+/// Written out rather than imported for the reason `common::ACTIVITY_GLYPHS` is
+/// (LESSON-569), and needed *beside* the glyphs because they answer different
+/// questions. The glyphs catch a row that reached a pipe drawn as a row; these
+/// catch one that reached it some other way — a phase sentence that leaked into
+/// a durable `line()` because a gate was read at the wrong level, which would
+/// emit no escape and no braille and still be the byte-for-byte change BR-6
+/// forbids.
+const ROW_SENTENCES: [&str; 7] = [
+    "preparing turn",
+    "waiting on",
+    "receiving the reply",
+    "running shell:",
+    "held until",
+    "compacting context",
+    "no word from the daemon",
+];
+
+/// The two config lines a piped leg that runs a tool unattended carries.
+///
+/// `full` so the `shell` call runs without a question, and `generate = "never"`
+/// because the first turn of a session inside a project *offers* to write a
+/// `TETON.md` (REQ-613) — an offer the gate grants without asking at `full`, so
+/// a fixture that only meant to allow `sleep 1` would also have the daemon
+/// draft a file into whichever directory `cargo test` ran from.
+const FULL_AND_NO_CONTEXT_OFFER: &str =
+    "[permissions]\ndefault_level = \"full\"\n\n[context]\ngenerate = \"never\"\n\n";
+
+/// **REQ-621 AC-3 / BR-6 — the two turns that raise a row at a terminal write
+/// nothing extra to a pipe.**
+///
+/// The gate is structural rather than conditional, and this leg is what says so
+/// from outside: `Surface::has_live_rows` answers `false` for the surface a
+/// piped run builds, the pump reads it once into `RowState::live`, and answered
+/// `false` it keeps the blocking receive it has always had — so it never
+/// reaches the tick arm, and there is no code path on which a frame could be
+/// composed and then dropped. The two scripts driven here are the ones the pty
+/// suite watches a row animate through: a turn held silent before its first
+/// byte (AC-1) and a turn with a real tool running in the middle of it (AC-2).
+///
+/// Four claims:
+///
+/// 1. both turns ran — without this the rest is a test of an empty string;
+/// 2. no escape byte at all reaches stdout, which is a stronger statement than
+///    "no cursor motion" and is the one BR-6 actually makes ("not a frame, not
+///    an escape, not a blank line");
+/// 3. none of the row's *sentences* reaches it either — the leak that would
+///    carry no escape and still change the bytes;
+/// 4. the durable lines a tool has always printed are exactly where they were
+///    (BR-10: the row composes beside the existing renderers and restates
+///    nothing).
+///
+/// # The rest of AC-3, and how it is asserted
+///
+/// AC-3 also requires every pre-existing non-verbose fixture in this file to
+/// pass byte for byte. That is asserted by **not editing any of them**: they
+/// were written against the pre-REQ binary, they compare rendered output, and
+/// they are green on this branch unchanged. Naming them in a list here would
+/// only add a second place for that claim to rot.
+#[test]
+fn a_piped_turn_emits_no_activity_bytes() {
+    const DELAYED: &str = "The delayed reply arrives.";
+    const TOOL_DONE: &str = "The tool turn is done.";
+    let daemon = TestDaemon::spawn_scripted_with_config(
+        &daemon_bin(),
+        &[
+            // AC-1's script: the turn is silent for a second and a bit, which
+            // at a terminal is a dozen frames.
+            &format!("@delay-ms 1200\n{DELAYED}"),
+            // AC-2's: a real tool, running long enough to be several more.
+            r#"{"tool": "shell", "arguments": {"command": "sleep 1"}}"#,
+            TOOL_DONE,
+        ],
+        FULL_AND_NO_CONTEXT_OFFER,
+    );
+    let teton = teton_bin();
+
+    let piped =
+        daemon.run_cli_stdout_with_stdin(&teton, &[], "hold the turn open\nrun the slow tool\n");
+
+    // (1) Both turns ran.
+    for marker in [DELAYED, TOOL_DONE] {
+        assert!(
+            piped.contains(marker),
+            "the turn ending `{marker}` never ran, so the absences below are \
+             absences of a turn rather than of a row; stdout:\n{piped}\n\
+             daemon log:\n{}",
+            daemon.log()
+        );
+    }
+
+    // (2) Not an escape.
+    assert!(
+        !piped.contains('\x1b'),
+        "a piped turn wrote an escape sequence. BR-6 is not \"no cursor \
+         motion\": with stdout not a terminal the feature emits nothing at all, \
+         which is what makes every fixture in this file still comparable; \
+         stdout:\n{piped:?}"
+    );
+    assert!(
+        !piped.chars().any(|c| common::ACTIVITY_GLYPHS.contains(&c)),
+        "a piped turn wrote a spinner glyph; stdout:\n{piped:?}"
+    );
+
+    // (3) Nor a sentence, by any route.
+    for sentence in ROW_SENTENCES {
+        assert!(
+            !piped.contains(sentence),
+            "a piped turn wrote the activity row's `{sentence}` — a phase \
+             sentence reaching a pipe through a durable line is the same \
+             byte-for-byte change as a frame reaching it (BR-6); stdout:\n{piped}"
+        );
+    }
+
+    // (4) And the lines a tool has always printed are untouched.
+    for line in [" - shell: sleep 1 [running]", " - shell: sleep 1 [done]"] {
+        assert!(
+            piped.contains(line),
+            "the tool's own durable line is gone or changed: the row composes \
+             beside the existing renderers and replaces none of them (BR-10); \
+             expected {line:?}; stdout:\n{piped}"
+        );
+    }
+}
+
+/// **REQ-621 AC-13 / BR-16 — a verbose turn ends with one line saying what it
+/// spent; a quiet one says nothing.**
+///
+/// The row's non-visual read path. Because the row is TTY-gated, a piped
+/// verbose session would otherwise have no way to recover what a turn was doing
+/// or for how long — so this one line is emitted whether or not stdout is a
+/// terminal, and it is the *only* thing a verbose piped fixture gains (AC-3).
+///
+/// The turn is built so all three time figures are non-zero: a `shell` call
+/// running `sleep 2` charges `tools`, and a reply held back a further 1.2 s
+/// charges `model`. A summary of three zeroes would satisfy the shape and prove
+/// nothing about the accumulator, which is what makes the lower bounds below
+/// the substance of the leg (BR-3: measured, never estimated).
+///
+/// `sleep 2` rather than `sleep 1` **because the line reports whole seconds**
+/// (verify, 2026-09-10). The row's figures are truncated, not rounded, so a
+/// one-second tool whose measured phase came in a few milliseconds under a
+/// second charged `tools 0s` and reddened the lower bound below — a flake about
+/// the width of the format rather than about the accumulator. A second of
+/// margin is the fix that keeps the claim ("the accumulator charged real tool
+/// time") instead of weakening it to a shape check.
+///
+/// The cost figure is checked against the session's **own** cost report at the
+/// end of the same run rather than against a literal: the row, this line and the
+/// cost meter read one accumulator and must not be able to print two amounts for
+/// one turn (BR-3, LESSON-544). The run drives exactly one turn, so the
+/// session's total *is* that turn's.
+#[test]
+fn a_verbose_turn_ends_with_one_summary_line() {
+    const LOUD_REPLY: &str = "The verbose turn answered.";
+    const QUIET_REPLY: &str = "The quiet turn answered.";
+    let daemon = TestDaemon::spawn_scripted_with_config(
+        &daemon_bin(),
+        &[
+            r#"{"tool": "shell", "arguments": {"command": "sleep 2"}}"#,
+            &format!("@delay-ms 1200\n{LOUD_REPLY}"),
+            QUIET_REPLY,
+        ],
+        FULL_AND_NO_CONTEXT_OFFER,
+    );
+    let teton = teton_bin();
+
+    let loud = daemon.run_cli_stdout_with_stdin(&teton, &[], "/verbose\nrun and then answer\n");
+    assert!(
+        loud.contains(LOUD_REPLY),
+        "the verbose turn never ran; stdout:\n{loud}\ndaemon log:\n{}",
+        daemon.log()
+    );
+
+    let spent: Vec<&str> = loud
+        .lines()
+        .filter(|line| line.contains("turn ") && line.contains("s: model "))
+        .collect();
+    assert_eq!(
+        spent.len(),
+        1,
+        "a verbose turn must end with **one** line carrying its figures — the \
+         stop reason rides that same line rather than a second one, so a \
+         fixture counting `turn ended` still counts one per turn (BR-16); \
+         found {spent:#?}\nstdout:\n{loud}"
+    );
+    let line = spent[0];
+
+    // The shape, and then the figures. `format_turn_summary`'s own spelling:
+    // `turn <t>s: model <m>s, tools <k>s, cost <$>`.
+    // `rsplit_once`, because on the Ok arm this line opens `turn ended (…) · `
+    // and the figures follow a *second* `turn `; on the failed arm they are the
+    // whole line. Reading from the right parses both without a branch.
+    let figures = line
+        .rsplit_once("turn ")
+        .and_then(|(_, tail)| tail.split_once("s: model "))
+        .and_then(|(total, tail)| {
+            tail.split_once("s, tools ")
+                .map(|(model, tail)| (total, model, tail))
+        })
+        .and_then(|(total, model, tail)| {
+            tail.split_once("s, cost ")
+                .map(|(tools, cost)| (total, model, tools, cost))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the summary line does not carry all four figures in \
+                 `format_turn_summary`'s order — total, model, tools, cost; \
+                 line: {line:?}"
+            )
+        });
+    let (total, model, tools, cost) = figures;
+    let seconds = |name: &str, raw: &str| -> u64 {
+        raw.parse().unwrap_or_else(|_| {
+            panic!("the {name} figure is not a whole number of seconds: {raw:?}; line: {line:?}")
+        })
+    };
+    let (total, model, tools) = (
+        seconds("total", total),
+        seconds("model", model),
+        seconds("tools", tools),
+    );
+
+    // Measured, not zeroes: the turn really did spend a second in a tool and
+    // over a second waiting on a model, and the line has to say so.
+    assert!(
+        tools >= 1,
+        "the turn ran `sleep 2` and the summary charged no tool time, so the \
+         figures are not the accumulator's (BR-3, BR-16); line: {line:?}"
+    );
+    assert!(
+        model >= 1,
+        "the turn's reply was held back 1.2 s and the summary charged no model \
+         time; line: {line:?}"
+    );
+    assert!(
+        total >= model + tools,
+        "the turn's total is less than the phases it is made of, so the three \
+         figures are not readings of one turn; line: {line:?}"
+    );
+
+    // And the cost is the figure the daemon recorded for this turn, in the cost
+    // meter's own formatting.
+    let recorded = loud
+        .lines()
+        .find_map(|line| line.strip_prefix("total: "))
+        .and_then(|tail| tail.split_whitespace().next())
+        .unwrap_or_else(|| panic!("the session printed no cost summary:\n{loud}"));
+    assert_eq!(
+        cost, recorded,
+        "the turn's cost and the session's cost report must be one \
+         accumulator's figure, in one formatting — this is the surface a user \
+         checks *because* they distrusted what the row showed (BR-3); line: \
+         {line:?}\nstdout:\n{loud}"
+    );
+
+    // The negative half, in a session that differs only by the toggle.
+    let quiet = daemon.run_cli_stdout_with_stdin(&teton, &[], "answer quietly\n");
+    assert!(
+        quiet.contains(QUIET_REPLY),
+        "the quiet turn never ran, so its silence is a silence about nothing; \
+         stdout:\n{quiet}\ndaemon log:\n{}",
+        daemon.log()
+    );
+    assert!(
+        !quiet.contains("s: model "),
+        "a turn outside verbose mode printed the summary line, so default piped \
+         output is no longer byte-identical to what it was (BR-6, BR-16); \
+         stdout:\n{quiet}"
+    );
+}
+
+/// A provider nothing is listening for, with the turn's own category bound to
+/// it — the pipe-side twin of `pty_e2e`'s RPC-error exit.
+///
+/// Appended rather than templated, which is why it is a `[[categories]]` row
+/// and not a `[[tiers]]` one: the fixture config already binds every tier to
+/// the scripted local tier and the daemon refuses to start on a duplicate
+/// binding, so a tier row cannot be added. A category override sits *ahead* of
+/// its tier's binding, which is the same route resolution reaching the same
+/// unreachable endpoint by the one door this fixture leaves open.
+///
+/// `edit` is the category because that is the one the fixture's classifier
+/// answers for any freeform prompt (`scripted_classification`), so the turn
+/// under test routes here deterministically while `route` and `redact` stay
+/// pinned to the local tier and every duty keeps working.
+fn unreachable_edit_category(port: u16) -> String {
+    format!(
+        "[[providers]]\nid = \"gone\"\nkind = \"openai-compatible\"\n\
+         endpoint = \"http://127.0.0.1:{port}/v1/chat/completions\"\n\
+         model = \"gone-model\"\n\n\
+         [[categories]]\nname = \"edit\"\nprovider_id = \"gone\"\n\n"
+    )
+}
+
+/// **REQ-621 AC-13 / BR-16 — a verbose turn that *failed* still ends with one
+/// summary line.**
+///
+/// [`a_verbose_turn_ends_with_one_summary_line`] scripts a turn that succeeds,
+/// which leaves the arm the figures matter most on unasserted end-to-end. A
+/// turn that failed after four minutes and a frontier call that was already
+/// paid for is exactly the turn a user wants the numbers from — it is the
+/// scenario in REQ-621's own description, where a user who cannot tell working
+/// from hung kills the process and re-runs it — and `main` composes the line on
+/// that arm through a *different* call site with a different argument
+/// (`turn_end_line(None, …)`, no stop reason, because the daemon reported
+/// none). `session_ui.rs::the_verbose_summary_prints_on_both_arms` pins both
+/// arms at unit level; this is the piped whole-CLI leg for the failing one.
+///
+/// The provocation is the one `pty_e2e::every_exit_erases_the_row` uses for its
+/// RPC-error exit: the route is decided and published, the call to a closed
+/// port fails, and `session/prompt` answers with an error. See
+/// [`unreachable_edit_category`] for why the binding is a category here.
+///
+/// Three claims:
+///
+/// 1. the turn really failed — without this the count below is a count over a
+///    turn that succeeded, which the leg above already covers;
+/// 2. **exactly one** summary line, so the failing arm neither drops the line
+///    nor prints it twice alongside `render_turn_failure`'s own;
+/// 3. it is the failed arm's composition — the figures alone, with no
+///    `turn ended (…)` prefix, because there is no stop reason to name and
+///    inventing one would be a claim about how the turn ended;
+/// 4. and a failed turn *outside* verbose mode prints nothing, in a run that
+///    differs from the first only by the flag. This is claim (2)'s falsifier as
+///    well as BR-6's clause on the error arm.
+///
+/// # What breaks this test
+///
+/// | Mutation | Fails |
+/// |---|---|
+/// | `--verbose` dropped from the run's arguments | claim (2), `left: 0` against `right: 1`, `found []` |
+///
+/// Applied, run, and observed failing (AC-11, LESSON-441). Which is what says
+/// the count is a count of a *gated* line and not of one this build would have
+/// printed anyway — the same claim claim (4) then makes from the other side, in
+/// a run that keeps the failure and drops only the flag.
+#[test]
+fn a_verbose_failed_turn_still_ends_with_the_summary_line() {
+    let daemon = TestDaemon::spawn_scripted_with_config(
+        &daemon_bin(),
+        &["never reached"],
+        &unreachable_edit_category(closed_port()),
+    );
+    let teton = teton_bin();
+
+    let failed = daemon.run_cli_stdout_with_stdin(&teton, &["--verbose"], "route me nowhere\n");
+
+    // (1) The turn failed, by the path this leg is about.
+    assert!(
+        failed.contains("prompt failed:"),
+        "the turn never failed, so this leg never reached the error arm the \
+         summary is being asserted on; stdout:\n{failed}\ndaemon log:\n{}",
+        daemon.log()
+    );
+
+    // (2) One line, and one only.
+    let spent: Vec<&str> = failed
+        .lines()
+        .filter(|line| line.contains("turn ") && line.contains("s: model "))
+        .collect();
+    assert_eq!(
+        spent.len(),
+        1,
+        "a verbose turn that failed must still end with **one** line carrying \
+         its figures — the arm on which they matter most, and the only read \
+         path off a terminal (BR-16); found {spent:#?}\nstdout:\n{failed}"
+    );
+    let line = spent[0];
+
+    // (3) The failed arm's own composition: `render_turn_failure` has already
+    // said what went wrong, so this line adds only the figures.
+    assert!(
+        !line.contains("turn ended ("),
+        "the failed arm named a stop reason. The daemon reported none, and a \
+         line that invented one would be a claim about how the turn ended made \
+         by the client (BR-2); line: {line:?}\nstdout:\n{failed}"
+    );
+    assert!(
+        line.contains("s, tools ") && line.contains("s, cost "),
+        "the summary line does not carry `format_turn_summary`'s figures — one \
+         composition serves both arms so they cannot come to disagree about \
+         what a turn spent (BR-16); line: {line:?}\nstdout:\n{failed}"
+    );
+
+    // (4) The negative half, in a run that differs only by the flag.
+    let quiet = daemon.run_cli_stdout_with_stdin(&teton, &[], "route me nowhere\n");
+    assert!(
+        quiet.contains("prompt failed:"),
+        "the quiet run's turn did not fail, so its silence is a silence about \
+         nothing; stdout:\n{quiet}\ndaemon log:\n{}",
+        daemon.log()
+    );
+    assert!(
+        !quiet.contains("s: model "),
+        "a failed turn outside verbose mode printed the summary line, so \
+         default piped output on the error arm is no longer byte-identical to \
+         what it was (BR-6, BR-16); stdout:\n{quiet}"
     );
 }
