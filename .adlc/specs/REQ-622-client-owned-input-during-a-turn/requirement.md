@@ -107,11 +107,11 @@ _Explicit, testable constraints governing this feature's behavior._
 - [ ] AC-9: **Unhandled keys are inert.** PTY e2e: arrow keys and a function key typed mid-turn echo nothing and change nothing; the next submitted line is exactly what was typed.
 - [ ] AC-10: **The editor is pure.** A unit table maps keystroke sequences to `(pending, queued, echo bytes)` with literal oracles; the mutation "Backspace removes a byte, not a char" is applied and observed red, and recorded (informed by LESSON-569).
 - [ ] AC-11: **Raw-mode refusal falls back honestly.** A unit test with a terminal double that refuses `tcsetattr` shows the turn proceeds, the REQ-621 abandon path is used, and exactly one verbose notice is printed.
-- [ ] AC-14: **A queued line is announced on the row.** PTY e2e: after Enter mid-turn the next frame carries `· 1 queued`; a second Enter makes it `· 2 queued`; the clause is gone after the turn.
-- [ ] AC-15: **Ctrl-D mid-turn is inert.** PTY e2e: Ctrl-D during a delayed turn ends nothing and submits nothing; the turn completes and the entry prompt returns; Ctrl-D at that prompt still ends the session.
-- [ ] AC-16: **A pasted block queues one prompt per line.** PTY e2e: three lines written to the pty in one write during a turn become three queued prompts in order.
-- [ ] AC-12: **Honest legs.** Every PTY leg runs under the harness's binary-freshness guard and every TTY claim above has a real PTY test (informed by BUG-164, BUG-191, LESSON-510).
-- [ ] AC-13: **Closed out.** BUG-225 is marked resolved naming this REQ; REQ-621's BR-5 and BR-9 amendments are marked retired with a dated note; the README describes typing during a turn and the queued-prompt behaviour.
+- [ ] AC-12: **A queued line is announced on the row.** PTY e2e: after Enter mid-turn the next frame carries `· 1 queued`; a second Enter makes it `· 2 queued`; the clause is gone after the turn.
+- [ ] AC-13: **Ctrl-D mid-turn is inert.** PTY e2e: Ctrl-D during a delayed turn ends nothing and submits nothing; the turn completes and the entry prompt returns; Ctrl-D at that prompt still ends the session.
+- [ ] AC-14: **A pasted block queues one prompt per line.** PTY e2e: three lines written to the pty in one write during a turn become three queued prompts in order.
+- [ ] AC-15: **Honest legs.** Every PTY leg runs under the harness's binary-freshness guard and every TTY claim above has a real PTY test (informed by BUG-164, BUG-191, LESSON-510).
+- [ ] AC-16: **Closed out.** BUG-225 is marked resolved naming this REQ; REQ-621's BR-5 and BR-9 amendments are marked retired with a dated note; the README describes typing during a turn and the queued-prompt behaviour.
 
 ## External Dependencies
 
@@ -126,9 +126,9 @@ _Explicit, testable constraints governing this feature's behavior._
 
 ## Open Questions
 
-- [x] OQ-1: Ctrl-D during a turn — **resolved 2026-09-10: ignored** (BR-15, AC-15).
-- [x] OQ-2: Multi-line paste — **resolved 2026-09-10: one queued prompt per line now**; bracketed paste stays out of scope (BR-6, AC-16).
-- [x] OQ-3: Queued count on the row — **resolved 2026-09-10: yes**, a `· N queued` clause (BR-14, AC-14).
+- [x] OQ-1: Ctrl-D during a turn — **resolved 2026-09-10: ignored** (BR-15, AC-13).
+- [x] OQ-2: Multi-line paste — **resolved 2026-09-10: one queued prompt per line now**; bracketed paste stays out of scope (BR-6, AC-14).
+- [x] OQ-3: Queued count on the row — **resolved 2026-09-10: yes**, a `· N queued` clause (BR-14, AC-12).
 
 ## Out of Scope
 
@@ -144,7 +144,7 @@ _Explicit, testable constraints governing this feature's behavior._
 - REQ-621 (spec, score 14): A live activity line while a turn is working
 - BUG-164 (bug, score 11): A targeted e2e run can pass against a stale daemon binary
 - BUG-189 (bug, score 11): Two refusal reasons publish no record, so the session surface never says why
-- BUG-191 (bug, score 11): AC-6 and AC-14 claim a pty leg for the acknowledgment prompt bytes; the pty suite has none
+- BUG-191 (bug, score 11): AC-6 and AC-12 claim a pty leg for the acknowledgment prompt bytes; the pty suite has none
 - LESSON-510 (lesson, score 11): A harness that checked a binary exists has not checked it is the one under test
 - REQ-560 (spec, score 11): Named permission levels and the interactive session status line
 - LESSON-568 (lesson, score 9): An ADR's causal sentence is exactly as unverified as an untested line of code
