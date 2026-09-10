@@ -18,7 +18,9 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
-## [Unreleased]
+## [0.1.34] - 2026-09-10
+
+REQ-620 and the two bugs from the same dogfood session: the shell grammar meets model-written commands, and the over-budget offer tells the truth about the local engine's window.
 
 ### Added
 
