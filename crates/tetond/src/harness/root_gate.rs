@@ -7,6 +7,12 @@
 //! table-driven unit test with no session, no daemon and no filesystem
 //! (conventions.md; architecture.md "Policy is pure, mechanism is gated").
 //!
+//! One test is the exception and says so: the cross-gate differential
+//! ([`tests::the_write_gate_and_the_classifier_agree_on_what_reads_nothing`])
+//! drives the *classifier* as well as this gate, and the classifier walks a
+//! root. It mints a fixture directory for that reason. The production code in
+//! this module is unchanged in its purity.
+//!
 //! # One module, two enforcement points
 //!
 //! BR-4 is one rule that `shell` and `edit` both enforce, and architecture.md's
@@ -101,12 +107,36 @@ pub(crate) fn edit_gate(kind: RootKind) -> WriteVerdict {
 /// two. A redirection is never a first verb — `echo hi > ~/x` has first verb
 /// `echo` — so a single verb rule cannot see it, and a single redirection rule
 /// cannot see `mkdir`.
+///
+/// # One strip, and **both** triggers read its residue (Phase-5 re-verify)
+///
+/// Trigger (a) used to read the raw command, and a *leading* null redirect
+/// therefore shadowed the verb: [`command_position_programs`] takes the first
+/// word of each segment, and in `2>/dev/null rm -rf ~/x` that word is
+/// `2>/dev/null`. Six spellings were `Allowed` at a home root —
+/// `2>/dev/null rm -rf ~/x`, `2>&1 mkdir foo`, `</dev/null git init`,
+/// `ls &>/dev/null rm -f ~/.zshrc`, `ls; >/dev/null mkdir ~/evil` and
+/// `ls 2>&1; 2>&1 rm -rf ~/x` — each of which is exactly the harm BR-4 exists
+/// to stop, reached by prefixing it with a redirect that reads nothing.
+///
+/// So the residue is computed **once**, here, and handed to both triggers. The
+/// redirect words are the words `sh` itself does not take as a command, so the
+/// residue's first word is the word `sh` would run — which is the same argument
+/// REQ-620 BR-5 makes for the classifier, one gate over.
+///
+/// The fail-closed arm below deliberately keeps reading the **raw** command: it
+/// asks "did the tokenizer read anything out of what the user typed", and a
+/// command that is *nothing but* a null redirect (`2>/dev/null`) has a word for
+/// it to find and creates nothing. Reading the residue there would refuse that
+/// command for having stripped to the empty string, which is a tightening
+/// nothing asked for and no transcript carries.
 #[must_use]
 pub(crate) fn write_gate(command: &str, kind: RootKind) -> WriteVerdict {
     if !gates_writes(kind) {
         return WriteVerdict::Allowed;
     }
-    if names_a_write_verb(command) || has_top_level_redirection(command) {
+    let residue = strip_null_redirects(command).residue;
+    if names_a_write_verb(&residue) || residue_carries_redirection(&residue) {
         return WriteVerdict::RefusedNonProject;
     }
     // Fail closed (the REQ's assumption): a non-empty command the tokenizer
@@ -123,6 +153,12 @@ pub(crate) fn write_gate(command: &str, kind: RootKind) -> WriteVerdict {
 ///
 /// Reads **command positions**, not just the first word, so `cd ~ && mkdir foo`
 /// refuses — which is the exact spelling the 2026-09-04 session used.
+///
+/// **`command` here is [`write_gate`]'s residue, not the raw command**, and that
+/// is load-bearing rather than incidental: [`command_position_programs`] is a
+/// whitespace tokenizer, so a leading `2>/dev/null` is a "program" and the real
+/// verb behind it is never read. See [`write_gate`]'s own docs for the six
+/// spellings that shadowed a write that way.
 fn names_a_write_verb(command: &str) -> bool {
     if command_position_programs(command)
         .iter()
@@ -147,7 +183,7 @@ fn names_a_write_verb(command: &str) -> bool {
     })
 }
 
-/// Trigger (b): a `>`, `>>` or `>|` at top level whose target is a **file** —
+/// Trigger (b): a `>` or `<` surviving [`strip_null_redirects`] at top level —
 /// outside single quotes, double quotes and a backslash escape.
 ///
 /// # Two spellings are redirections and are not writes
@@ -212,12 +248,35 @@ fn names_a_write_verb(command: &str) -> bool {
 /// [`tests::the_write_gate_and_the_classifier_agree_on_what_reads_nothing`]
 /// reds on its first row. Drop the `<` disjunct and the differential test reds
 /// on `cat < input`, alone.
+///
+/// # Where the production code asks this, and why the raw-command form is a
+/// test helper
+///
+/// [`write_gate`] does **not** call this: it strips once and asks
+/// [`residue_carries_redirection`], because trigger (a) needs the same residue
+/// and a second strip would be a second wrapper around one recogniser — the
+/// defect M1 removed one level up.
+///
+/// So this function is the *composition* write_gate performs, spelled once for
+/// a reader who has a raw command in hand. It is `#[cfg(test)]` for the reason
+/// [`super::tools::shell_provenance::is_recognised_verb`] is: a second reader of
+/// a rule on the production path is how a gate comes to have two answers
+/// (LESSON-494), and the one place that genuinely wants the raw-command form is
+/// [`tests::the_write_gate_and_the_classifier_agree_on_what_reads_nothing`],
+/// which has to ask this gate's question of exactly the string it asks the
+/// classifier.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn has_top_level_redirection(command: &str) -> bool {
-    let residue = strip_null_redirects(command).residue;
+    residue_carries_redirection(&strip_null_redirects(command).residue)
+}
+
+/// Trigger (b) over an already-stripped command — the production half of
+/// [`has_top_level_redirection`], whose docs carry the rule and its mutations.
+fn residue_carries_redirection(residue: &str) -> bool {
     ['>', '<']
         .into_iter()
-        .any(|needle| top_level_positions(&residue, needle).next().is_some())
+        .any(|needle| top_level_positions(residue, needle).next().is_some())
 }
 
 /// Byte offsets of every top-level occurrence of `needle` in `command`.
@@ -290,6 +349,17 @@ pub(crate) const WRITE_REMEDY: &str = "/cd <name>";
 /// in what they were about to do and not in why they may not, and a message
 /// composed at each point of detection is how two surfaces come to word one
 /// rule two ways (architecture.md, LESSON-557).
+///
+/// # Why it names redirection and not only creation (Phase-5 re-verify)
+///
+/// "Nothing may be created here" was the whole sentence, and it stopped being
+/// true of every refusal the moment trigger (b) started reading `<` as well as
+/// `>`: `cat < input` creates nothing at all and is refused, and a user told
+/// only that nothing may be created would go looking for the write. The gate is
+/// deliberately coarser than "creates a file" — it refuses any redirection it
+/// cannot prove reads nothing — so the sentence says both halves. It stays one
+/// sentence for both tools: `edit` never carries a redirection and simply does
+/// not reach that clause's example.
 #[must_use]
 pub(crate) fn write_refusal(root_display: &str, kind: RootKind) -> String {
     let place = match kind {
@@ -298,8 +368,10 @@ pub(crate) fn write_refusal(root_display: &str, kind: RootKind) -> String {
     };
     format!(
         "refused: this session's root is {root_display} ({place}), not a project, \
-         so nothing may be created here. Ask the user to run `{WRITE_REMEDY}` — \
-         only they can move the root."
+         so nothing may be created here — and a command carrying a redirection \
+         other than to /dev/null is refused whether or not it would create \
+         anything. Ask the user to run `{WRITE_REMEDY}` — only they can move \
+         the root."
     )
 }
 
@@ -392,10 +464,43 @@ fn target_is_the_root(target: &str, root: &Path, home: Option<&Path>) -> bool {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use teton_core::config::DEFAULT_BOUNDARIES;
+    use teton_core::entities::PrivacyBoundary;
+
+    use crate::harness::tools::shell_provenance;
+    use crate::harness::tools::shell_syntax::STRIP_ROWS;
 
     fn home_root() -> (PathBuf, PathBuf) {
         let home = PathBuf::from("/Users/dev");
         (home.clone(), home)
+    }
+
+    /// A **project** root for the cross-gate differential, and the one place
+    /// this module's tests touch a filesystem.
+    ///
+    /// `RootKind::Project` and a non-empty boundary set are both preconditions
+    /// for `shell_provenance::classify` to read the command at all — it answers
+    /// `Unknown` before the grammar on either — so a bare temp dir or an empty
+    /// boundary list would make every row of the differential agree for the
+    /// wrong reason.
+    fn classifier_root(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "teton-rootgate-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        dir
+    }
+
+    fn builtin_boundaries() -> Vec<PrivacyBoundary> {
+        DEFAULT_BOUNDARIES
+            .iter()
+            .map(|g| PrivacyBoundary::builtin(*g))
+            .collect()
     }
 
     /// **BR-4 / AC-3: both triggers refuse, and nothing benign does.**
@@ -407,10 +512,52 @@ mod tests {
     ///
     /// Mutation: drop `mkdir` from `WRITE_VERBS`, or make
     /// `has_top_level_redirection` quote-blind — the corresponding row goes red.
+    ///
+    /// **Mutation (run, red, reverted, Phase-5 re-verify):** hand
+    /// [`names_a_write_verb`] the raw command instead of the residue — **1 test
+    /// red of 2,252**, this one, naming `2>/dev/null rm -rf ~/x`. All **six**
+    /// leading-redirect rows come back `Allowed` under it (measured by probing
+    /// the six directly, since the `assert_eq!` aborts on the first), and the
+    /// must-not-fire row `2>/dev/null ls` is `Allowed` either way. That mutation
+    /// *is* the shipped bug: `command_position_programs` takes `2>/dev/null` as
+    /// the program and the `rm -rf ~/x` behind it was never read.
+    ///
+    /// One test, and that is the finding rather than a shortfall: this is the
+    /// only table that asserts trigger (a)'s **input**. The differential below
+    /// drives rows that name no write verb, so it cannot see this mutation at
+    /// all, and no integration suite runs a `shell` call at a home root.
     #[test]
     fn the_write_gate_refuses_both_triggers_and_nothing_benign() {
         let refused = [
             ("mkdir -p .adlc/context", "the 2026-09-04 command itself"),
+            // Phase-5 re-verify: a null redirect in **command position**
+            // shadowed the verb behind it, because trigger (a) read the raw
+            // command and the tokenizer's "program" was the redirect word.
+            // Every one of these was `Allowed` at a home root.
+            (
+                "2>/dev/null rm -rf ~/x",
+                "a leading redirect shadowing an `rm`",
+            ),
+            (
+                "2>&1 mkdir foo",
+                "a leading duplication shadowing a `mkdir`",
+            ),
+            (
+                "</dev/null git init",
+                "a leading stdin redirect shadowing the two-word form",
+            ),
+            (
+                "ls &>/dev/null rm -f ~/.zshrc",
+                "`&>` mid-command, whose residue separator re-splits the segment",
+            ),
+            (
+                "ls; >/dev/null mkdir ~/evil",
+                "a redirect in a later segment's command position",
+            ),
+            (
+                "ls 2>&1; 2>&1 rm -rf ~/x",
+                "a redirect glued to a separator, then another shadowing the verb",
+            ),
             (
                 "cd ~ && mkdir foo",
                 "a write past a cd, in command position",
@@ -477,6 +624,14 @@ mod tests {
                 "the same, with the separator spaced off",
             ),
             ("ls 2>&1|head", "a duplication glued to a pipe"),
+            // The must-not-fire row for the leading-redirect refusals above: a
+            // redirect in command position is still not a write when the verb
+            // behind it is not one. Without this row the fix "refuse anything
+            // whose first word is a redirect" would pass the table.
+            (
+                "2>/dev/null ls",
+                "a leading redirect in front of an ordinary read",
+            ),
         ];
         for (command, why) in allowed {
             assert_eq!(
@@ -508,42 +663,55 @@ mod tests {
     /// benign rows red here and in
     /// [`tests::the_write_gate_refuses_both_triggers_and_nothing_benign`].
     /// Drop the `<` disjunct — the `cat < input` row reds here, alone.
+    ///
+    /// # It asks the classifier, because it used to ask itself (Phase-5 re-verify)
+    ///
+    /// The second half of this test used to define a local `reads_nothing`
+    /// closure that **re-implemented** [`has_top_level_redirection`] line for
+    /// line — strip, then scan the residue for `>` and `<`. Two spellings of one
+    /// function agree by construction, so the half that was supposed to be the
+    /// differential asserted nothing at all: the wrappers could have drifted
+    /// exactly as M1 found them drifted, and the closure would have drifted with
+    /// them.
+    ///
+    /// So the other reader is now the **actual** other reader. For every row,
+    /// the classifier is run and the question is asked of its verdict: did it
+    /// refuse on [`UnmodelledSyntax::Redirect`]? That must hold **iff** this
+    /// gate sees a redirection, and the rows are driven from
+    /// [`STRIP_ROWS`] — the recogniser's own residue table — so a row added for
+    /// the strip is a row both gates answer for.
+    ///
+    /// **Mutation (run, red, reverted, Phase-5 re-verify):** make
+    /// `first_unmodelled_class` stop mapping `<` to `Redirect` — **5 tests red
+    /// of 2,252**, this one among them, naming `ls</dev/null`: the classifier
+    /// stops refusing it as a redirect while this gate still refuses it as a
+    /// write. (The other four are `shell_provenance`'s own —
+    /// `adversarial_spellings_are_all_unknown`,
+    /// `each_unmodelled_class_names_itself_and_nothing_else`,
+    /// `every_other_redirect_stays_unmodelled` and
+    /// `the_redirect_differential_table`.) Under the old self-referential
+    /// closure this test was **not** among them, which is the whole reason the
+    /// closure had to go: it would have agreed with the gate no matter what the
+    /// classifier had come to think.
     #[test]
     fn the_write_gate_and_the_classifier_agree_on_what_reads_nothing() {
-        // `reads_nothing` is the classifier's own question, asked of the same
-        // residue: nothing the strip left behind still carries a redirect.
-        let reads_nothing = |command: &str| {
-            let residue = strip_null_redirects(command).residue;
-            !['>', '<']
-                .into_iter()
-                .any(|needle| top_level_positions(&residue, needle).next().is_some())
+        let root = classifier_root("gate-differential");
+        let redirect_class = shell_provenance::UnmodelledSyntax::Redirect.reason();
+        // Both readers, on one row. `classify` is the production entry point,
+        // not a re-statement of the gate's own scan.
+        let both = |command: &str| {
+            let verdict = shell_provenance::classify(
+                &root,
+                RootKind::Project,
+                &builtin_boundaries(),
+                Vec::new(),
+                command,
+            );
+            (
+                has_top_level_redirection(command),
+                verdict.reason == redirect_class,
+            )
         };
-
-        let benign = [
-            "ls 2>&1; echo ok",
-            "ls 2>&1|head",
-            "cat x > /dev/null; ls",
-            "ls 2>&1; ls",
-            "ls -la",
-            "cat missing 2>/dev/null",
-            "cat missing 2> /dev/null",
-            "make 2>&1",
-            "cmd >&2",
-            "echo \"2 > 1\"",
-            "echo 'a > b'",
-            "cat .adlc/context/architecture.md 2>/dev/null || echo none",
-        ];
-        for command in benign {
-            assert!(
-                reads_nothing(command),
-                "`{command}` leaves no redirect in the residue"
-            );
-            assert_eq!(
-                write_gate(command, RootKind::Home),
-                WriteVerdict::Allowed,
-                "`{command}` reads nothing, so it is not a write"
-            );
-        }
 
         // The tightenings, recorded rather than papered over: each is a write
         // now and was not before REQ-620, and each is the *safe* way for this
@@ -557,11 +725,47 @@ mod tests {
             ),
             ("cat < input", "a `<` the old scan never looked for"),
         ];
-        for (command, why) in tightened {
-            assert!(
-                !reads_nothing(command),
-                "`{command}` still carries a redirect ({why})"
+
+        let rows = STRIP_ROWS
+            .iter()
+            .map(|(command, _, _)| *command)
+            .chain(tightened.iter().map(|(command, _)| *command));
+        for command in rows {
+            let (gate_sees_a_redirect, classifier_refused_a_redirect) = both(command);
+            assert_eq!(
+                gate_sees_a_redirect, classifier_refused_a_redirect,
+                "`{command}`: the write gate says redirection={gate_sees_a_redirect} and the \
+                 classifier says redirect-class={classifier_refused_a_redirect}. One recogniser, \
+                 one answer — this is the M1 drift, one level out"
             );
+        }
+
+        // The gate's verdicts on the same rows, which the iff above does not
+        // pin: an agreed "there is a redirection here" still has to *refuse*.
+        let benign = [
+            "ls 2>&1; echo ok",
+            "ls 2>&1|head",
+            "cat x > /dev/null; ls",
+            "ls 2>&1; ls",
+            "ls -la",
+            "cat missing 2>/dev/null",
+            "cat missing 2> /dev/null",
+            "make 2>&1",
+            "cmd >&2",
+            "cat .adlc/context/architecture.md 2>/dev/null || echo none",
+        ];
+        for command in benign {
+            assert!(
+                !has_top_level_redirection(command),
+                "`{command}` leaves no redirect in the residue"
+            );
+            assert_eq!(
+                write_gate(command, RootKind::Home),
+                WriteVerdict::Allowed,
+                "`{command}` reads nothing, so it is not a write"
+            );
+        }
+        for (command, why) in tightened {
             assert_eq!(
                 write_gate(command, RootKind::Home),
                 WriteVerdict::RefusedNonProject,
@@ -569,12 +773,36 @@ mod tests {
             );
         }
 
-        // Ordinary writes, so the table cannot pass by calling everything a
-        // write: the benign half above is what stops that, and this half is
-        // what stops the mutation "always answer `reads_nothing`".
-        for command in ["echo hi > notes.md", "cat a >> b", "cat a > /dev/nullx"] {
-            assert!(!reads_nothing(command), "`{command}` is a real redirection");
+        // **The gate-only half.** These two rows are not in the differential
+        // above and must not be: the classifier refuses them on
+        // `UnmodelledSyntax::Quote`, which outranks `Redirect` in
+        // `UNMODELLED_ORDER`, so it never reaches the redirect question and the
+        // iff would hold for a reason that has nothing to do with redirection.
+        // What they assert is this gate's own quote awareness, which
+        // `strip_null_redirects` deliberately does not have (it is
+        // whitespace-word-based, and no word carrying a quote parses as a
+        // `NullRedirect`, so a lift cannot change the residue's quote parity).
+        for command in ["echo \"2 > 1\"", "echo 'a > b'"] {
+            assert!(
+                !has_top_level_redirection(command),
+                "`{command}` has no redirect outside its quotes"
+            );
+            assert_eq!(
+                write_gate(command, RootKind::Home),
+                WriteVerdict::Allowed,
+                "`{command}` is a quoted string, not a redirection"
+            );
         }
+
+        // Ordinary writes, so the table cannot pass by calling everything a
+        // read: the benign half above is what stops the converse.
+        for command in ["echo hi > notes.md", "cat a >> b", "cat a > /dev/nullx"] {
+            assert!(
+                has_top_level_redirection(command),
+                "`{command}` is a real redirection"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// **BR-4: a command the tokenizer reads nothing out of fails closed.**

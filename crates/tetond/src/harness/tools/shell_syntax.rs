@@ -75,8 +75,14 @@
 //! *coverage arriving* rather than behaviour changing: the C2 test is new, and
 //! it spells a command mutations 1–3 each disturb.
 //!
+//! **Mutation 1 re-measured again at the Phase-5 *re*-verify**, which made
+//! `root_gate::write_gate` read this strip's residue for **both** of its
+//! triggers rather than one. Same rule (LESSON-598): the consumer's structure
+//! changed, so the count is re-run and not re-read.
+//!
 //! 1. **[`strip_null_redirects`] made a no-op** (return the command unchanged,
-//!    `lifted: 0`) — **9 red** (was 8 at TASK-405):
+//!    `lifted: 0`) — **13 red of 2,252** (recorded as 9 at the verify, 8 at
+//!    TASK-405):
 //!    [`tests::the_strip_lifts_words_and_leaves_the_separators_standing`], and
 //!    in [`super::shell_provenance`]
 //!    `null_redirects_are_lifted_before_the_scan_and_the_split` (first, on the
@@ -87,12 +93,24 @@
 //!    `the_redirect_differential_table`,
 //!    `a_piped_reader_with_no_path_reads_stdin_not_the_root` (whose
 //!    `ls 2>&1 | head` row stops being a pipeline once the `&` is a separator
-//!    again) and — new at the verify —
-//!    `the_both_streams_form_re_emits_the_separator_it_hides`. Two things
-//!    stayed green and should have: `every_other_redirect_stays_unmodelled`,
-//!    which asserts the refusal a no-op preserves, and `root_gate`'s benign
-//!    table, whose rows are all bare or spaced forms the *gate* now reads
-//!    through this same strip.
+//!    again), `the_both_streams_form_re_emits_the_separator_it_hides`,
+//!    `a_redirect_glued_to_its_verb_is_unknown_and_one_glued_to_a_separator_is_not`
+//!    and `the_toolkit_preamble_shapes_are_rooted_and_the_old_ones_are_not` —
+//!    plus, in [`super::super::root_gate`], **both** of the write gate's
+//!    tables: `the_write_gate_refuses_both_triggers_and_nothing_benign` and
+//!    `the_write_gate_and_the_classifier_agree_on_what_reads_nothing`.
+//!
+//!    The last four are the correction. The 9 was recorded with the sentence
+//!    "`root_gate`'s benign table stayed green … the rows are all bare or
+//!    spaced forms the *gate* now reads through this same strip", and that
+//!    sentence contradicted itself: a gate reading a no-op strip sees the `>`
+//!    in `cat missing 2>/dev/null` and calls it a write, which is what
+//!    `root_gate`'s own mutation note says happens. The prose was reasoned and
+//!    the count was not re-run against the M1 gate. It is now.
+//!
+//!    One thing does stay green and should: `every_other_redirect_stays_unmodelled`,
+//!    which asserts the refusal a no-op preserves. A widening that broke BR-2
+//!    would have to be a different mutation, and it is — mutation 3.
 //! 2. **The whole-word rule dropped** — [`NullRedirect::from_operator`]
 //!    relaxed to accept any operator ending in `>`, so `ls>/dev/null` lifts —
 //!    **4 red** (was 2):
@@ -308,9 +326,13 @@ pub(crate) struct Stripped {
     /// newline would merge two commands into one segment and hand the second
     /// one's verb to the first as an argument.
     pub(crate) residue: String,
-    /// How many **words** were lifted. The spaced form counts two (the
-    /// operator and its `/dev/null`), so this is a work count and not a count
-    /// of redirects.
+    /// How many **words the recogniser consumed**. Not "how many words the
+    /// residue is shorter by" and not "how many redirects were found": the
+    /// spaced form consumes two (the operator and its `/dev/null`) and counts
+    /// two, while [`NullRedirect::BothStreams`] consumes one and puts a `&`
+    /// back, and a redirect glued to a separator consumes one and puts the
+    /// separator back. So it is a work count, and the residue's own length says
+    /// nothing about it.
     ///
     /// Read by nothing that decides a verdict — it exists so a test can assert
     /// the strip fired rather than inferring it from an unchanged residue
@@ -396,6 +418,19 @@ fn strip_line(line: &str, lifted: &mut usize) -> String {
 /// note in the REQ, and mutation 2 below). The longest candidate wins so that
 /// `2>&1` is preferred to any shorter prefix; `2>&11` has no separator after
 /// its parsing prefix and is not peeled at all.
+///
+/// # The peel is **one level deep**, by design
+///
+/// The tail is re-emitted as a single word and is never handed back to
+/// [`strip_line`]'s loop, so a second redirect glued behind the separator is
+/// not peeled: `ls 2>&1;&>/dev/null` peels the `2>&1`, re-emits `;&>/dev/null`
+/// whole, and the residue's surviving `>` makes the command `Unknown` exactly
+/// as it was before REQ-620. That is the module's standing rule rather than a
+/// gap — every miss lands on the old answer — and one level is what the peel
+/// can justify: recursing would mean re-splitting a word `sh` reads as one
+/// token, which is the lexer ADR-614-1 refuses to become. The shape does not
+/// appear in any transcript; the rule is written down so a later reader does
+/// not file it as a defect.
 fn split_glued_redirect(word: &str) -> Option<(NullRedirect, &str)> {
     (1..word.len())
         .rev()

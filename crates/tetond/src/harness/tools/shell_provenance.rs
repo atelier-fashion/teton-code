@@ -143,6 +143,16 @@
 //! word of the segment is a short flag that cannot be recursion; `sed`, `awk`,
 //! `diff`, `cat` and every unrecognised `grep` flag keep the walk.
 //!
+//! **The flag rule covers the filters too** (Phase-5 re-verify). Being named on
+//! the allowlist was at first the *whole* test for everything but `grep`, so
+//! `ls | wc --files0-from -`, `ls | sort --files0-from -` and
+//! `ls | shasum -c -` — each of which reads a list of **paths** off its stdin
+//! and then opens every one — took the exemption. A word starting with `--` now
+//! denies it for every verb on the list, `grep` included, and the two checksum
+//! verbs additionally refuse `-c`. `less` and `more` left the list in the same
+//! pass: a pager takes `:e path` and `!cmd` from the terminal and honours
+//! `LESSOPEN`, and none of that is visible here.
+//!
 //! The widening does not touch the walk, its budget or its skip set, and it
 //! does not reach a `First` segment: `head -5` alone and `ls; head -5` still
 //! read the root, and `cat missing | head` still walks in its *first* segment,
@@ -208,8 +218,12 @@
 //! REQ-620's strip was mutated six ways and the counts live with the
 //! recogniser ([`super::shell_syntax`]'s module docs), because that is the
 //! module that owns the rule. Two results belong here. Making
-//! [`super::shell_syntax::strip_null_redirects`] a no-op reds **eight** tests
-//! in this module and leaves [`tests::every_other_redirect_stays_unmodelled`]
+//! [`super::shell_syntax::strip_null_redirects`] a no-op reds **ten** tests
+//! in this module (re-measured at the Phase-5 re-verify, from eight; the two
+//! that had been missed are
+//! [`tests::a_redirect_glued_to_its_verb_is_unknown_and_one_glued_to_a_separator_is_not`]
+//! and [`tests::the_toolkit_preamble_shapes_are_rooted_and_the_old_ones_are_not`])
+//! and leaves [`tests::every_other_redirect_stays_unmodelled`]
 //! green — correctly, since a no-op preserves exactly the refusal that test
 //! asserts, and a widening that broke BR-2 would have to be a different
 //! mutation. That different mutation is the third: lifting any word carrying
@@ -221,10 +235,20 @@
 //! Making [`reads_only_its_stdin`] answer `true` unconditionally — the
 //! allowlist accepting everything, which is the polarity C1 inverted — turns
 //! **exactly one** test red: [`tests::the_piped_exemption_is_a_closed_allowlist`],
-//! on all sixteen of its must-fire rows. One, because that table is the only
-//! place the piped exemption's *boundary* is asserted;
+//! on the **first** of its must-fire rows. One test, because that table is the
+//! only place the piped exemption's *boundary* is asserted;
 //! [`tests::a_piped_reader_with_no_path_reads_stdin_not_the_root`] asserts the
-//! exemption fires and a mutation that widens it cannot move that.
+//! exemption fires and a mutation that widens it cannot move that. And one
+//! *row*, because the `assert_eq!` aborts the loop — the earlier reading of
+//! this record said "all sixteen of its must-fire rows", which is what the
+//! table would report if it collected failures and is not what a run shows.
+//! Re-measured after the Phase-5 re-verify restructured the function.
+//!
+//! Dropping the `--` guard from the head of [`reads_only_its_stdin`] — the
+//! Phase-5 re-verify's own addition — reds the same one test, on its
+//! `wc --files0-from -` row. `grep`'s long options survive that mutation
+//! through the per-word arm, so the guard's own coverage is exactly the filter
+//! rows.
 
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
@@ -936,8 +960,28 @@ fn split_segments(command: &str) -> Vec<(SegmentPosition, &str)> {
 /// take a `-f script` that can open any path, `diff` needs two operands, and
 /// `cat` names paths rather than patterns, so a `cat` whose file does not exist
 /// is a typo the walk should still account for. All four keep the walk.
+///
+/// # Membership is necessary and not sufficient (Phase-5 re-verify)
+///
+/// Being on this list *used* to be the whole test, and the list was therefore
+/// flag-blind: `ls | wc --files0-from -` and `ls | sort --files0-from -` read a
+/// NUL-separated list of **file names** off stdin and then open every one of
+/// them, and `ls | shasum -c -` reads a checksum list and opens every file it
+/// names. Each took the exemption and came back `rooted` for a command that can
+/// read any file under the root. So [`reads_only_its_stdin`] carries a guard
+/// over the **whole** allowlist — no word may start with `--`, for any verb —
+/// and a `-c` refusal for the two checksum verbs. The verb names below say
+/// which programs *may* qualify; the flags decide whether this call does.
+///
+/// **`less` and `more` are not here** and were, until the same pass. Both are
+/// pagers rather than filters: they take commands from the terminal (`:e path`
+/// opens another file, `!cmd` shells out) and `less` honours `LESSOPEN`, an
+/// environment-set preprocessor that runs on whatever it is handed. Nothing in
+/// this grammar can see any of that, and a pager on the end of a pipe is not a
+/// shape a model writes for output it means to consume — so they keep the walk,
+/// which is the pre-REQ-620 answer for both.
 const PIPED_STDIN_ONLY: &[&str] = &[
-    "head", "tail", "wc", "sort", "uniq", "cut", "nl", "tr", "md5", "shasum", "less", "more",
+    "head", "tail", "wc", "sort", "uniq", "cut", "nl", "tr", "md5", "shasum",
 ];
 
 /// Whether a `Piped` segment's verb reads **nothing but its stdin** — the
@@ -959,13 +1003,30 @@ const PIPED_STDIN_ONLY: &[&str] = &[
 /// been completed by adding rows.)
 ///
 /// So the question is inverted. The exemption is granted only to
-/// [`PIPED_STDIN_ONLY`], plus `grep` and its two aliases when **every** word of
-/// the segment is one of the short flags that cannot mean recursion:
+/// [`PIPED_STDIN_ONLY`], plus `grep` and its two aliases, and in both cases only
+/// when the **flags** agree.
 ///
-/// * no word starts with `--` — every long option is unrecognised, including
-///   the ones nobody has thought of;
-/// * no word is `-d` — `-d recurse` is the `--directories` pair;
-/// * no single-`-` cluster carries `r` or `R` — `-r`, `-R`, `-rn`, `-nR`.
+/// # The long-option guard sits over the whole allowlist (Phase-5 re-verify)
+///
+/// The rule was first written as three `grep`-only clauses, and the verb list
+/// above was consulted with no reference to its arguments at all. That was the
+/// same defect one verb over: `wc --files0-from -` and `sort --files0-from -`
+/// read a NUL-separated list of **file names** off stdin and open every one,
+/// and `shasum -c -` reads a checksum list and opens every file it names. All
+/// three were on the list, all three took the exemption, and all three came
+/// back `Rooted` for a command that reads any file under the root.
+///
+/// So `--` is refused for **every** verb, `grep` included, and the reason is
+/// the same one that inverted the polarity: a long option is a reach nobody has
+/// enumerated, and an allowlist may not pass what it has not read. On top of
+/// that:
+///
+/// * no word is a single-`-` cluster carrying `d`, `r` or `R` for a `grep` —
+///   `-r`, `-R`, `-rn`, `-nR`, `-d recurse`, and (the spelling the first version
+///   missed) `-nd recurse`, `-id skip`, `-drecurse`, where `-d` is *inside* a
+///   cluster rather than a word of its own;
+/// * `shasum` and `md5` refuse `-c`, which is the "verify a checksum list"
+///   mode — the one short flag on this allowlist that opens files.
 ///
 /// Every other content verb, and every `grep` flag this list does not
 /// enumerate, keeps the root walk. A miss is therefore the pre-REQ-620 answer
@@ -973,18 +1034,25 @@ const PIPED_STDIN_ONLY: &[&str] = &[
 /// rule: the classifier may only be more permissive than the old daemon by an
 /// amount it can prove.
 fn reads_only_its_stdin(verb: &str, rest: &[&str]) -> bool {
+    // One guard, over the whole allowlist and before any verb is consulted: a
+    // long option is a reach this grammar has not read, whoever it belongs to.
+    if rest.iter().any(|word| word.starts_with("--")) {
+        return false;
+    }
     if PIPED_STDIN_ONLY.contains(&verb) {
-        return true;
+        // The one short flag on the filter half that opens files: `-c` puts
+        // both checksum verbs into "read this list and verify every path in it".
+        return !(matches!(verb, "shasum" | "md5") && rest.contains(&"-c"));
     }
     if !matches!(verb, "grep" | "egrep" | "fgrep") {
         return false;
     }
     rest.iter().all(|word| {
-        if word.starts_with("--") || *word == "-d" {
-            return false;
-        }
         match word.strip_prefix('-') {
-            Some(flags) => !flags.chars().any(|c| c == 'r' || c == 'R'),
+            // `d` is read inside the cluster, not as a whole word: `-nd recurse`
+            // is `-n -d recurse` to `grep` and was recursion this exemption
+            // granted (Phase-5 re-verify).
+            Some(flags) => !flags.chars().any(|c| matches!(c, 'd' | 'r' | 'R')),
             // A pattern, or any other operand: not a flag, so not recursion.
             None => true,
         }
@@ -3573,19 +3641,33 @@ mod tests {
     ///
     /// The must-not-fire half is the load-bearing half (LESSON-440): the
     /// exemption still has to fire, or BR-4 is not implemented at all. `-i`,
-    /// `-c` and `-n` are the short flags that cannot mean recursion, and
-    /// `head`/`wc`/`sort` are the pure filters the allowlist names directly.
+    /// `-n`, `-c`, `-v`, `-w` and `-H` are the short flags that cannot mean
+    /// recursion, and `head`/`wc`/`sort`/`cut` are the pure filters the
+    /// allowlist names directly.
     ///
-    /// The last two rows of the must-fire table are the tightenings the
-    /// inversion buys and TASK-404 asserted the other way: `--color` is a long
-    /// option this grammar does not enumerate, and `sed` is not a filter — its
-    /// `-f` takes a script that can open any path. Both now walk, which is the
-    /// pre-REQ-620 answer for both.
+    /// Two later rounds of must-fire rows, each a hole in the version above it:
+    ///
+    /// * `--color` and `sed -r` are the tightenings the **inversion** bought and
+    ///   TASK-404 asserted the other way — a long option this grammar does not
+    ///   enumerate, and a verb that is not a filter (`sed -f` takes a script
+    ///   that can open any path).
+    /// * `-nd`, `-id`, `-drecurse` and the three `--files0-from`/`-c` rows are
+    ///   the **Phase-5 re-verify**'s. The first three are `-d` *inside* a
+    ///   cluster, which the "no word is `-d`" clause read as a plain short flag;
+    ///   the others are the flag-blindness of the filter half, where being named
+    ///   on the allowlist was the whole test and `wc --files0-from -` therefore
+    ///   read a list of paths off stdin and opened every one.
     ///
     /// **Mutation (run, red, reverted):** make [`reads_only_its_stdin`] return
-    /// `true` unconditionally — the allowlist accepts everything — and every
-    /// must-fire row here reds, alongside `an_unrecognised_verb_is_unknown…`'s
-    /// neighbour rows staying green. Counts are in the module docs.
+    /// `true` unconditionally — the allowlist accepts everything — and the
+    /// **first** must-fire row here reds. One row, not every row: the
+    /// `assert_eq!` aborts the loop, so what a run reports is the first
+    /// disagreement and not a census. Counts are in the module docs.
+    ///
+    /// **Mutation (run, red, reverted, Phase-5 re-verify):** drop the `--`
+    /// guard from the head of [`reads_only_its_stdin`] — the `wc`/`sort`
+    /// `--files0-from` rows red (`grep`'s long options are still caught by the
+    /// per-word arm, so the guard's own coverage is exactly those rows).
     #[test]
     fn the_piped_exemption_is_a_closed_allowlist() {
         let root = piped_root("piped-allowlist");
@@ -3611,6 +3693,23 @@ mod tests {
             "ls src | sed -r foo",
             "ls src | awk -f prog",
             "ls src | cat missing",
+            // Phase-5 re-verify: `-d` glued into a short cluster. `grep` reads
+            // `-nd recurse` as `-n -d recurse`, and the clause that looked for
+            // the whole word `-d` never saw it.
+            "ls src | grep -nd recurse foo",
+            "ls src | grep -id skip foo",
+            "ls src | grep -drecurse foo",
+            // Phase-5 re-verify: the filter half was flag-blind. Each of these
+            // verbs is on the allowlist, and each of these flags makes it read
+            // a list of **paths** and open every one of them.
+            "ls src | wc --files0-from -",
+            "ls src | sort --files0-from -",
+            "ls src | shasum -c -",
+            // The pagers, dropped from the allowlist in the same pass: `less`
+            // takes `:e path` and `!cmd` from the terminal and honours
+            // `LESSOPEN`, none of which this grammar can see.
+            "ls src | less",
+            "ls src | more",
         ] {
             let v = verdict(&root, command);
             assert_eq!(
@@ -3632,9 +3731,13 @@ mod tests {
             "ls src | grep -i foo",
             "ls src | grep -c foo",
             "ls src | grep -n foo",
+            "ls src | grep -v foo",
+            "ls src | grep -w foo",
+            "ls src | grep -H foo",
             "ls src | head -5",
             "ls src | wc -l",
             "ls src | sort",
+            "ls src | cut -f 2",
         ] {
             let v = verdict(&root, command);
             assert_eq!(
@@ -3718,10 +3821,10 @@ mod tests {
                 "`{verb}` is on the piped allowlist but is not a content verb"
             );
         }
-        for verb in ["sed", "awk", "diff", "cat"] {
+        for verb in ["sed", "awk", "diff", "cat", "less", "more"] {
             assert!(
                 !PIPED_STDIN_ONLY.contains(&verb),
-                "`{verb}` takes a file or a script and must keep the walk"
+                "`{verb}` takes a file, a script or terminal commands and must keep the walk"
             );
         }
     }

@@ -866,8 +866,8 @@ fn is_env_assignment(word: &str) -> bool {
 /// # What this deliberately misses
 ///
 /// Both known limits are **false negatives**, which is the safe direction for
-/// BR-2 — a false negative costs one user the sentence they would have got, a
-/// false positive costs every future reader their trust in it:
+/// REQ-607 BR-2 — a false negative costs one user the sentence they would have
+/// got, a false positive costs every future reader their trust in it:
 ///
 /// - A program reached through indirection (`xargs ssh`, `sudo git`, a script)
 ///   is not seen. Only the outermost word of each segment is.
@@ -881,6 +881,28 @@ fn is_env_assignment(word: &str) -> bool {
 ///   (`GIT_SSH_COMMAND='ssh -v' git push`) is not skipped, because this splits
 ///   on whitespace and cannot tell where the quoted value ends. See
 ///   [`is_env_assignment`].
+///
+/// # "Safe direction" is a claim about **that** caller, and only that one
+///
+/// REQ-607's advisory is offered or withheld, so its false negatives cost a
+/// sentence. [`root_gate::write_gate`](crate::harness::root_gate) is the other
+/// caller and it *gates* on this list, where a false negative is a write that
+/// proceeds at a home root — the opposite direction, and the harm BR-4 exists
+/// to stop. It must therefore not rely on the paragraph above.
+///
+/// It does not. There is one limit this function has that the gate could not
+/// live with — the first word of a segment is whatever whitespace-splitting
+/// found there, and a redirect is a word — so `2>/dev/null rm -rf ~/x` yields
+/// `["2>/dev/null"]` and the `rm` is invisible. That was a real hole and the
+/// gate's own fix is upstream of this function rather than inside it: it strips
+/// null redirects first and passes the **residue** here (Phase-5 re-verify).
+/// The remaining limits — indirection, quoted strings, quoted assignments —
+/// are the ones `root_gate`'s module docs record as the gate's residual and
+/// argue separately, because a `sh -c` refused at a home root would be a far
+/// wider rule than BR-4.
+///
+/// Anything added here that widens the miss set is therefore a change to two
+/// rules with opposite polarities, and it needs a claim for each.
 pub(crate) fn command_position_programs(command: &str) -> Vec<&str> {
     command
         .split(['|', ';', '&', '(', '\n'])
@@ -1182,10 +1204,14 @@ mod tests {
     /// changed, the sweep says the resident prompt moved at all.
     ///
     /// **Mutation (run, red, reverted, Phase-5 verify):** drop
-    /// `other shell syntax` from the paragraph — claim 1b reds three times over
-    /// (`Brace`, `Escape`, `History`), and the two margin sweeps red with it.
-    /// Before 1b existed that edit reddened only the sweeps, which say the
-    /// prompt moved and not that it stopped being true.
+    /// `other shell syntax` from the paragraph — claim 1b reds, and the two
+    /// margin sweeps red with it. Three of `UNMODELLED_ORDER`'s classes lose
+    /// their needle (`Brace`, `Escape`, `History`), but the `assert!` aborts the
+    /// loop, so the failure names the **first** of them and not all three; the
+    /// earlier reading of this record, "reds three times over", described a
+    /// table that collected failures rather than this one. Before 1b existed
+    /// that edit reddened only the sweeps, which say the prompt moved and not
+    /// that it stopped being true.
     #[test]
     fn the_reach_contract_names_every_pinning_class_and_fits_its_budget() {
         /// ADR-620-5's ceiling. The contract is resident in every remote turn's
