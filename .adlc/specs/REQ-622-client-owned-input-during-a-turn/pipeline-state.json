@@ -4,10 +4,11 @@
   "startedAt": "2026-09-10T19:36:27Z",
   "integrationBranch": "main",
   "completed": false,
-  "currentPhase": 2,
+  "currentPhase": 3,
   "completedPhases": [
     0,
-    1
+    1,
+    2
   ],
   "phaseHistory": [
     {
@@ -20,6 +21,11 @@
       "name": "Validate Spec",
       "completedAt": "2026-09-10T19:36:52Z",
       "result": "approved; no blockers; one info: termios named in events/BR-11 mirrors REQ-572 precedent"
+    },
+    {
+      "phase": 2,
+      "name": "Architect",
+      "completedAt": "2026-09-10T19:43:35Z"
     }
   ],
   "repos": {
