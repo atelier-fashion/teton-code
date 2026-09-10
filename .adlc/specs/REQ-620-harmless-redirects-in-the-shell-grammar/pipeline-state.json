@@ -3,14 +3,16 @@
   "branch": "feat/REQ-620-harmless-redirects-in-the-shell-grammar",
   "startedAt": "2026-09-09T20:13:59Z",
   "completed": false,
-  "currentPhase": 6,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
     2,
     3,
     4,
-    5
+    5,
+    6,
+    7
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -43,6 +45,16 @@
       "phase": 5,
       "name": "Verify (6 agents + 4-agent re-verify; fix commits 5d3610a ec16e73 742e5bb f1146fb 1f0c7cc b984ceb)",
       "completedAt": "2026-09-10T00:26:56Z"
+    },
+    {
+      "phase": 6,
+      "name": "Create Pull Request (#316 readied)",
+      "completedAt": "2026-09-10T00:27:41Z"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI (clean diff; 8 checks green)",
+      "completedAt": "2026-09-10T00:32:19Z"
     }
   ],
   "repos": {
