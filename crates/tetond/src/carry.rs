@@ -529,9 +529,16 @@ impl CarriedTurn {
         // of, so this seam cannot disagree with the egress sink about why a
         // session was pinned — and a `shell` result of unknown reach records
         // `unknown_shell`, the one cause `/shell allow` can lift.
-        if let Some(cause) = context_taint_cause(&ctx, &self.boundaries) {
-            if self.taint.try_mark(&self.session_id, cause) {
-                let _ = writeln!(std::io::stderr(), "{}", taint_pin_line(cause));
+        if let Some(pin) = context_taint_cause(&ctx, &self.boundaries) {
+            if self.taint.try_mark(&self.session_id, pin.cause, pin.reason) {
+                // REQ-620 BR-6: the pin's class is *recorded* here and printed
+                // nowhere. This seam is REQ-614's backstop — it fires from
+                // `Drop`, holds no `SessionEvents`, and publishes no
+                // `session_pinned` — so a user learns of the class from the
+                // notice the next turn renders off `SessionTaint::reason`,
+                // never from this line. The line is `taint_pin_line`'s
+                // pre-REQ-620 sentence unchanged.
+                let _ = writeln!(std::io::stderr(), "{}", taint_pin_line(pin.cause));
             }
         }
         // BR-4, at the seam that makes it an invariant of the store rather than

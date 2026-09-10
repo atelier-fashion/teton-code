@@ -3471,7 +3471,7 @@ mod tests {
         let at_default = derive(remote(1_000_000, 0, true));
         assert_eq!(at_default.bound, BudgetBound::RedactScan);
         assert_eq!(at_default.budget_bytes, REDACT_SCANNABLE_CONTEXT_BYTES);
-        assert_eq!(at_default.budget_bytes, 184_265);
+        assert_eq!(at_default.budget_bytes, 183_334);
 
         // A loaded 262,144-token engine: the scan can read eight times as much,
         // so the clamp lands eight times higher.
@@ -3502,7 +3502,7 @@ mod tests {
     #[test]
     fn a_route_inside_the_scan_bound_keeps_its_own_bound() {
         // A 64,000-token window derives 126,000-odd bytes, comfortably inside
-        // the 184,265 bound — the premise is asserted, not assumed, so that a
+        // the 183,334 bound — the premise is asserted, not assumed, so that a
         // change to either figure fails here rather than making the test
         // vacuous by accident.
         let narrow = derive(remote(64_000, 0, true));
@@ -3544,9 +3544,9 @@ mod tests {
         };
         assert_eq!(
             redact_scannable_context_bytes(LOCAL_ENGINE_N_CTX_DEFAULT),
-            184_265
+            183_334
         );
-        assert_eq!(REDACT_SCANNABLE_CONTEXT_BYTES, 184_265);
+        assert_eq!(REDACT_SCANNABLE_CONTEXT_BYTES, 183_334);
         assert_eq!(
             redact_chunk_max_bytes(LOCAL_ENGINE_N_CTX_DEFAULT),
             REDACT_CHUNK_MAX_BYTES
@@ -3828,7 +3828,7 @@ mod tests {
             ),
             (
                 // Words stay window-derived (84,650); bytes 253,952 clamp to
-                // the scannable bound (≈184 KB since REQ-612).
+                // the scannable bound (≈183 KB since REQ-620).
                 "redact on 128k clamps bytes only",
                 remote(128_000, 0, true),
                 84_650,
@@ -3837,13 +3837,14 @@ mod tests {
             ),
             (
                 // usable = 158,976; ×2/3 = 105,984; ×2 = 317,952 > scannable
-                // (184,265) → the clamp applies after the cap and names the
+                // (183,334) → the clamp applies after the cap and names the
                 // bound. **The cap in this row tracks the bound**, which is the
                 // maintenance this row asks for and has had twice: a 60k cap
                 // did it against the 88,196 bound of the 16,384-token engine
                 // window, an 80k cap against 141,224, and REQ-612's raise of
                 // `REDACT_BODY_OVERHEAD_BYTES` took the chunk count 3 → 4 and
-                // the bound to 184,265, which 157,952 sits *under*. A row whose
+                // the bound to 184,265 — REQ-620's 23 → 24 KiB raise then cut
+                // it to 183,334 — which 157,952 sits *under*. A row whose
                 // clamp stops biting does not fail loudly — it silently becomes
                 // a second `UserCap` row — so the cap moves with the bound and
                 // the row keeps proving what it says.
@@ -5135,7 +5136,7 @@ mod tests {
             BudgetBound::DefaultUnknown
         );
         // RedactScan > UserCap: both bite, the clamp is last and names it
-        // (a 160k cap derives 317,952 B, over the 184,265 scannable bound —
+        // (a 160k cap derives 317,952 B, over the 183,334 scannable bound —
         // the same fixture `derivation_table` carries, and it moves with the
         // bound for the reason recorded there).
         assert_eq!(

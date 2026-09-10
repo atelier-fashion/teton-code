@@ -59,6 +59,21 @@ a path position, a backslash, or a segment whose first word is not in the
 known-verb table yields `unknown`. `command_position_programs` is reused for
 segment splitting only — never as the sole basis for a `rooted` verdict.
 
+**REQ-620 amends this list (2026-09-09).** A redirect to `/dev/null` or a
+descriptor duplication is lifted out before the unmodelled scan and the split;
+everything else in the list stands. Two further amendments landed with it. The
+splitter now records the separator that preceded each segment, and a content
+verb in a segment reached through a single `|` that names no existing file is
+scored as reading its stdin — the previous segment's output, already classified
+— rather than the whole root, with recursive `grep` the one exception because
+`grep -r` searches `.` whatever is on its stdin. And the refusal above reports
+the **class** it refused on (quote, substitution, variable, redirect, glob,
+brace, escape, history) rather than one sentence for every character, carried
+to the pin and the CLI notice as an `&'static str` so it can hold no byte of
+the command. The `shell` tool's description states the resulting grammar to the
+model, which is what makes a refusal actionable by the writer of the command
+(REQ-620 BR-1/BR-4/BR-6/BR-7, ADR-620-1..5).
+
 ## ADR-614-2: `rooted` additionally requires a `project` root (OQ-1 resolved: yes)
 
 **Decision.** `classify` takes `RootKind` and returns `unknown` for any root

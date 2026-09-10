@@ -109,7 +109,9 @@ pub fn tool_result_provenance(provenance: &ToolProvenance) -> Provenance {
         // liftable), never in what egress does with the block — which is what
         // makes BR-2's "the narrowing removes nothing from the existing
         // refusal" true by construction rather than by argument.
-        ToolProvenance::Unknown => Provenance::unknown(),
+        // REQ-620 BR-6: the class rides across with the bit, so a pin taken
+        // over this block can name what refused the command.
+        ToolProvenance::Unknown(reason) => Provenance::unknown_because(*reason),
         // REQ-619 verify, C1: unknown **and** these ids, which is a pair the
         // egress `Provenance` has always been able to hold — `sources` beside
         // an `unknown` bit is its own shape. What was missing was a harness
@@ -117,12 +119,12 @@ pub fn tool_result_provenance(provenance: &ToolProvenance) -> Provenance {
         // `Unknown` does; the ids are what `/shell allow` leaves behind when it
         // clears the bit, so the glob still runs against them and a lifted
         // opaque skill expansion that read `secrets/prod.env` is still refused.
-        ToolProvenance::UnknownWith(paths) => {
+        ToolProvenance::UnknownWith(paths, reason) => {
             let mut prov = Provenance::empty();
             for path in paths {
                 prov.merge(&Provenance::tainted_by(path.clone()));
             }
-            prov.mark_unknown();
+            prov.mark_unknown_because(*reason);
             prov
         }
         ToolProvenance::BoundaryTouch => Provenance::boundary_touch(),
@@ -309,7 +311,7 @@ mod tests {
             &text,
             50,
             50 * APPROX_BYTES_PER_TOKEN,
-            &ToolProvenance::Unknown,
+            &ToolProvenance::unknown(),
         )
         .await;
 
@@ -331,7 +333,7 @@ mod tests {
             &oversized(),
             50,
             50 * APPROX_BYTES_PER_TOKEN,
-            &ToolProvenance::Unknown,
+            &ToolProvenance::unknown(),
         )
         .await;
         assert!(out.text.contains("REMOTE SUMMARY"));
@@ -465,7 +467,7 @@ mod tests {
     #[test]
     fn tool_provenance_maps_onto_egress_provenance() {
         assert!(tool_result_provenance(&ToolProvenance::none()).is_empty());
-        assert!(tool_result_provenance(&ToolProvenance::Unknown).is_unknown());
+        assert!(tool_result_provenance(&ToolProvenance::unknown()).is_unknown());
 
         let two = ToolProvenance::Sources(BTreeSet::from([fixture_id("a.rs"), fixture_id("b.rs")]));
         let prov = tool_result_provenance(&two);
@@ -473,7 +475,8 @@ mod tests {
         assert!(!prov.is_unknown());
 
         // REQ-619 verify, C1: the pair crosses as a pair.
-        let mixed = ToolProvenance::UnknownWith(BTreeSet::from([fixture_id("secrets/prod.env")]));
+        let mixed =
+            ToolProvenance::UnknownWith(BTreeSet::from([fixture_id("secrets/prod.env")]), None);
         let prov = tool_result_provenance(&mixed);
         assert!(prov.is_unknown(), "the block still fails closed");
         assert!(
@@ -506,10 +509,10 @@ mod tests {
     /// itself.
     #[test]
     fn a_lift_over_an_unknown_with_sources_keeps_the_files() {
-        let folded =
-            tool_result_provenance(&ToolProvenance::UnknownWith(BTreeSet::from([fixture_id(
-                "secrets/prod.env",
-            )])));
+        let folded = tool_result_provenance(&ToolProvenance::UnknownWith(
+            BTreeSet::from([fixture_id("secrets/prod.env")]),
+            None,
+        ));
         assert!(folded.is_unknown(), "before the lift it fails closed");
 
         let lifted = folded.with_unknown_lifted();
@@ -525,7 +528,7 @@ mod tests {
 
         // The contrast that makes the assertion mean something: a bare
         // `Unknown` has nothing to keep, and its lift is genuinely clean.
-        let bare = tool_result_provenance(&ToolProvenance::Unknown).with_unknown_lifted();
+        let bare = tool_result_provenance(&ToolProvenance::unknown()).with_unknown_lifted();
         assert!(bare.is_empty(), "an opacity with no path behind it clears");
     }
 

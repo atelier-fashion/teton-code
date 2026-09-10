@@ -255,7 +255,7 @@ fn tool_error_sentence(tool: &str, err: &McpError) -> String {
 fn mcp_result_provenance(args: &Value) -> ToolProvenance {
     let provenance = call_provenance(args);
     if provenance.is_unknown() {
-        return ToolProvenance::Unknown;
+        return ToolProvenance::unknown();
     }
     ToolProvenance::paths(provenance.ids().cloned())
 }
@@ -272,7 +272,7 @@ fn mcp_result_provenance(args: &Value) -> ToolProvenance {
 #[must_use]
 fn result_provenance(opaque: bool, args: &Value) -> ToolProvenance {
     if opaque {
-        ToolProvenance::Unknown
+        ToolProvenance::unknown()
     } else {
         mcp_result_provenance(args)
     }
@@ -467,12 +467,12 @@ mod tests {
         // when the call named no path the daemon could see.
         assert_eq!(
             result_provenance(true, &json!({ "record_id": "opaque-123" })),
-            ToolProvenance::Unknown
+            ToolProvenance::unknown()
         );
         // Even an obviously public-looking query fail-closes for an opaque server.
         assert_eq!(
             result_provenance(true, &json!({ "q": "hello" })),
-            ToolProvenance::Unknown
+            ToolProvenance::unknown()
         );
     }
 

@@ -1933,7 +1933,7 @@ fn route_for(bound: BudgetBound, verdict: WindowVerdict) -> (Fixture, Option<Moc
 /// The `RedactScan` cell, and the one fixture here that needs an argument
 /// string.
 ///
-/// The redact clamp is a fixed 184,265 bytes and `SKILL.md` is capped at
+/// The redact clamp is a fixed 183,334 bytes and `SKILL.md` is capped at
 /// 128 KiB by discovery, so no skill **body** can reach past that ceiling on its
 /// own. The expansion is therefore pushed over with `$ARGUMENTS`, which is
 /// bounded only by the RPC frame. The declared window is 100,000 so the
@@ -1947,17 +1947,19 @@ fn route_for(bound: BudgetBound, verdict: WindowVerdict) -> (Fixture, Option<Moc
 /// the scan's chunk count 3 → 4 and the clamp *up* to 184,265, which
 /// 156,001 bytes of expansion no longer clears — and a fixture that stops being
 /// over budget does not fail as a stale number, it fails as a turn that
-/// **succeeds**, which reads as a missing refusal.
+/// **succeeds**, which reads as a missing refusal. REQ-620's 23 → 24 KiB raise
+/// then moved it the other way, to **183,334**, which widens this fixture's
+/// clearance rather than closing it; the figure is left where it is.
 ///
 /// It is squeezed from both sides, which is why the figure is 130,000 rather
 /// than something comfortably large. The expansion must be **over the clamp**
-/// (184,265 B) and still **fit the declared window**, because
+/// (183,334 B) and still **fit the declared window**, because
 /// `each_reachable_window_verdict_is_offered_and_pins_its_own_sentence` uses
 /// this route as its `RedactScan` + `FitsWindow` cell — and the usable window
 /// is 197,952 B, above which the verdict becomes `ExceedsWindow` (or, in the
 /// last 2,048 B, `FitsWindowIntoTheReservation`). 60,001 + 130,000 = 190,001
-/// sits between the two, 5,736 B clear of the clamp and 7,951 B clear of the
-/// window. The word half (44,000 against a 65,984-word budget) stays
+/// sits between the two, 6,667 B clear of the clamp (5,736 until REQ-620's
+/// raise narrowed the clamp) and 7,951 B clear of the window. The word half (44,000 against a 65,984-word budget) stays
 /// deliberately under: the clamp is byte-denominated, so this cell must be over
 /// on bytes alone.
 fn redact_scan_route() -> (Fixture, Option<MockProvider>) {

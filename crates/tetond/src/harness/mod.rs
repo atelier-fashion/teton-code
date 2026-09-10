@@ -118,6 +118,7 @@ pub use completion::{
 pub use context::{
     Anchor, CompactionOutcome, CompactionRecord, ContextBlock, ContextManager, NoopProvenanceHook,
     Provenance, ProvenanceClass, ProvenanceHook, RecordingProvenanceHook, ToolProvenance,
+    UNCLASSIFIED_REACH_REASON,
 };
 pub use digest::DIGEST_DUTY;
 pub use draft::DRAFT_DUTY;

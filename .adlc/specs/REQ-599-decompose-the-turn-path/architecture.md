@@ -252,7 +252,7 @@ table, which do not move.
 | `engine.rs` | 1,405 | probe, installer, engine loaders, `EngineSlot`, `StagedEngines` |
 | `config_document.rs` | 888 | rendering and persisting the config document |
 | `duty.rs` | 731 | the five `*_route` resolvers, `resolve_duty`, `spawn_title_session`, `RedactionGateImpl` |
-| `taint.rs` | 796 | `SessionTaint` and its `TaintCause`, `WebTaintOverride` / `ShellTaintOverride`, `RoutePin`, the lookup seam, `TaintingPrivacySink` |
+| `taint.rs` | 949 | `SessionTaint` and its `TaintCause`, `WebTaintOverride` / `ShellTaintOverride`, `RoutePin`, the lookup seam, `TaintingPrivacySink` |
 | `views.rs` | 592 | `config/get`'s snapshot and the web-setup views |
 | `session.rs` | 491 | **REQ-603.** `session/clear`, `session/set_cwd`, and the root a session stands on — the slice REQ-599 planned as its step 7 and deferred |
 | `provider.rs` | 410 | transport, credentials, connection probe |

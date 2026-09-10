@@ -35,6 +35,7 @@
 //! | verify C1 | an opaque **and** boundary-reading expansion keeps the file, named at the first block | [`a_model_invoked_skill_with_an_opaque_and_a_boundary_preamble_names_the_file_at_the_first_block`] |
 //! | verify C2 | an out-of-root touch is not cancelled by an in-root file beside it | [`a_preamble_touching_a_boundary_outside_the_root_beside_an_in_root_file_is_refused`] |
 //! | verify m1 | the same pair on the **typed** door, named at the first block (BUG-216) | [`a_preamble_that_is_both_opaque_and_boundary_reading_pins_permanently_at_the_first_block`] |
+//! | REQ-620 M5 | a model-invoked skill's **pin** names the class that refused its preamble | [`a_model_invoked_skills_pin_names_the_class_that_refused_its_preamble`] |
 //!
 //! # What AC-8 proves, and what it does not
 //!
@@ -1212,6 +1213,222 @@ fn skill_invoked_carries_each_commands_reach_and_nothing_more() {
     assert!(
         !record.contains(README_LINE),
         "the record must not carry a byte of the command's output: {record}"
+    );
+
+    assert_no_boundary_bytes();
+}
+
+/// The eight `UnmodelledSyntax` classes, each as one preamble command that
+/// carries **that class alone**, beside the sentence it must draw (REQ-620
+/// BR-6).
+///
+/// Written out here rather than read from the daemon's `UnmodelledSyntax` —
+/// this binary drives the shipped `tetond` over a socket, and a table that
+/// asked the classifier what it says would assert nothing about what a client
+/// receives. These are the strings, verbatim, that reached the wire.
+///
+/// The commands are `echo`-shaped and harmless because they really run: the
+/// classifier's verdict is taken before the consent door, but the door opens
+/// and the preamble spawns.
+const CLASS_PREAMBLES: &[(&str, &str)] = &[
+    (
+        "echo 'q'",
+        "the command uses a quoted string this classifier does not model",
+    ),
+    (
+        "echo $(ls)",
+        "the command uses a command substitution this classifier does not model",
+    ),
+    (
+        "echo $HOME",
+        "the command uses a shell variable this classifier does not model",
+    ),
+    (
+        "wc -l < README.md",
+        "the command uses a redirect other than to /dev/null this classifier does not model",
+    ),
+    (
+        "echo *",
+        "the command uses a glob this classifier does not model",
+    ),
+    (
+        "echo {a}",
+        "the command uses a brace expansion this classifier does not model",
+    ),
+    (
+        "echo a\\b",
+        "the command uses a backslash escape this classifier does not model",
+    ),
+    (
+        "echo a!b",
+        "the command uses a history expansion this classifier does not model",
+    ),
+];
+
+/// **AC-6 (the `reach_reason` half).** One preamble per `UnmodelledSyntax`
+/// class, and each `skill_invoked.outcomes[].reach_reason` is that class's
+/// sentence — **verbatim**, at the wire, in one record.
+///
+/// The claim REQ-620 makes is that a reader of this record can tell *which*
+/// byte pinned the turn. Before it, all eight rows said "the command uses shell
+/// syntax this classifier does not model" and a user reading the record learned
+/// only that something was opaque. So the assertion is equality against eight
+/// distinct strings and not a `contains`: eight rows that all said the same
+/// thing would satisfy any weaker check, which is exactly the state this
+/// replaces.
+///
+/// Every row is also `unknown`, which is the half REQ-614 already had and this
+/// must not have moved.
+///
+/// **Mutation (run 2026-09-09, red, reverted):** make
+/// `UnmodelledSyntax::reason` answer one sentence for every class and this test
+/// reds, alone in the binary — on its **first** row, because the collapsed
+/// sentence matches none of the eight rather than seven of them.
+#[test]
+fn each_class_reaches_reach_reason_verbatim() {
+    let provider = mock(Vec::new());
+    let body = std::iter::once("USER-SKILL-BODY-CLASSES\n".to_owned())
+        .chain(
+            CLASS_PREAMBLES
+                .iter()
+                .map(|(command, _)| format!("Probe: !`{command}`\n")),
+        )
+        .collect::<String>();
+    let (_ws, _daemon, mut client, session) =
+        user_skill_fixture("sp-classes", &provider, &[], &[("probe", &body)]);
+
+    let turn = client.skill(&session, "probe", "");
+    assert_eq!(
+        turn["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "{turn}"
+    );
+    client.drain_events(Duration::from_millis(400));
+
+    let invocation = one_invocation(&client);
+    let outcomes = invocation["outcomes"].as_array().unwrap();
+    assert_eq!(
+        outcomes.len(),
+        CLASS_PREAMBLES.len(),
+        "one outcome per preamble: {invocation}"
+    );
+    for (outcome, (command, sentence)) in outcomes.iter().zip(CLASS_PREAMBLES) {
+        assert_eq!(
+            outcome["reach"].as_str(),
+            Some("unknown"),
+            "`{command}` must still be unmodelled: {outcome}"
+        );
+        assert_eq!(
+            outcome["reach_reason"].as_str(),
+            Some(*sentence),
+            "`{command}` should name its own class: {outcome}"
+        );
+    }
+
+    // Eight rows, eight distinct sentences — the property the single pre-REQ-620
+    // sentence failed and a `contains` check would not catch.
+    let seen: std::collections::BTreeSet<&str> = outcomes
+        .iter()
+        .filter_map(|o| o["reach_reason"].as_str())
+        .collect();
+    assert_eq!(
+        seen.len(),
+        CLASS_PREAMBLES.len(),
+        "each class must name itself: {seen:?}"
+    );
+
+    assert_no_boundary_bytes();
+}
+
+/// **REQ-620 BR-6, Phase-5 verify M5: the class reaches `session_pinned.reason`
+/// on the *skill* path, at the wire.**
+///
+/// [`each_class_reaches_reach_reason_verbatim`] above asserts the eight
+/// sentences on `skill_invoked.outcomes[].reach_reason`, which is REQ-619's
+/// surface. The **pin's** reason is a different field on a different event, and
+/// on this path it comes from somewhere else entirely: the expansion's
+/// `ToolProvenance`, folded by `ExpansionProvenance::into_tool_provenance` and
+/// carried through the taint sink. Nothing at the wire asserted it — the two
+/// could have disagreed, or the pin could have carried no reason at all, and
+/// only the unit tests would have noticed.
+///
+/// **Model-invoked** on purpose, and that is the whole point of the row: a
+/// *typed* `/skill` enters as `Provenance::User`, which carries no reason field
+/// (BUG-223, and the REQ's Deferred section), so its pin renders the
+/// pre-REQ-620 notice. A model-invoked skill is a `Tool` block and does carry
+/// it, so this is the skill path on which the claim is true and the one place
+/// it can be proved.
+///
+/// **Mutation (run, red, reverted):** replace the reason in
+/// `ExpansionProvenance::into_tool_provenance` with
+/// `UnknownReach::Unclassified` and the `reason` assertion reds while every
+/// `reach_reason` assertion above stays green — which is exactly the
+/// divergence this test exists to close.
+#[test]
+fn a_model_invoked_skills_pin_names_the_class_that_refused_its_preamble() {
+    const GLOB_CLASS: &str = "the command uses a glob this classifier does not model";
+
+    let provider = mock(vec![MockResponse::ok(openai_turn(
+        "Reaching for the probe skill.",
+        Some(("c1", "skill", r#"{"name":"probe"}"#)),
+        120,
+        20,
+    ))]);
+    let (_ws, _daemon, mut client, session) = user_skill_fixture(
+        "sp-m5",
+        &provider,
+        &[],
+        // A glob, which the classifier refuses as `Glob` — chosen over a quote
+        // because the `Glob` sentence is one no other event in this turn
+        // carries, so a `contains` anywhere could not supply it by accident.
+        &[("probe", "USER-SKILL-BODY-M5\nOut: !`echo *`\n")],
+    );
+
+    let turn = client.prompt(&session, "Use whichever skill fits, then answer.");
+    assert_eq!(
+        turn["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "{turn}"
+    );
+    client.drain_events(Duration::from_millis(400));
+
+    // Fixture: the model's door really did expand the skill, and the preamble
+    // really was refused on the glob. Without both, the pin below would be
+    // asserting nothing about this REQ.
+    assert_eq!(
+        reaches(one_invocation(&client)),
+        vec!["unknown"],
+        "fixture: `echo *` is unmodelled: {:?}",
+        client.event_names()
+    );
+    assert_eq!(
+        one_invocation(&client)["outcomes"][0]["reach_reason"].as_str(),
+        Some(GLOB_CLASS),
+        "fixture: REQ-619's own surface names the class"
+    );
+
+    let pinned = client.events_named("session_pinned");
+    assert_eq!(
+        pinned.len(),
+        1,
+        "a pinned session announces itself once: {:?}",
+        client.event_names()
+    );
+    let pinned = pinned[0];
+    assert_eq!(pinned["cause"].as_str(), Some("unknown_shell"), "{pinned}");
+    assert_eq!(
+        pinned["reason"].as_str(),
+        Some(GLOB_CLASS),
+        "the pin names the class that refused the preamble: {pinned}"
+    );
+    assert_eq!(pinned["liftable"].as_bool(), Some(true), "{pinned}");
+
+    // Only the tool-call turn left; the send carrying the expansion did not.
+    assert_eq!(
+        provider.request_count(),
+        1,
+        "the pinned turn sent nothing: {:?}",
+        client.event_names()
     );
 
     assert_no_boundary_bytes();

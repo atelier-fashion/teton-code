@@ -241,8 +241,8 @@ degrades that provider's health no more than any other duty failure does.
 ## With `[privacy] redact = true`
 
 The scan reads the **whole** outbound body, so a scanned route cannot assemble
-one the scan would refuse: bytes are bounded at 184,265, the word figure stays
-window-derived. The bound is the chunk cap less the body's overhead — which the
-notes raised to 23 KiB, taking the chunk cap 3 → 4, so it *rose* from 141,224
-and a full body costs up to 5 scan calls. Only when `redact` is on, which it is
+one the scan would refuse: bytes are bounded at 183,334, the word figure stays
+window-derived. The bound is the chunk cap less the body's overhead — now 24 KiB,
+which took the chunk cap 3 → 4 on the way up, so a full body costs up to 5 scan
+calls. Only when `redact` is on, which it is
 not by default.

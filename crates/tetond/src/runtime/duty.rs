@@ -952,8 +952,13 @@ mod dispatch {
             cause: teton_protocol::events::BlockCause::Boundary,
         };
 
-        crate::egress::PrivacyEventSink::privacy_block(&sink, None, block.clone());
-        crate::egress::PrivacyEventSink::privacy_block(&sink, Some(SessionId::from("s")), block);
+        crate::egress::PrivacyEventSink::privacy_block(&sink, None, block.clone(), None);
+        crate::egress::PrivacyEventSink::privacy_block(
+            &sink,
+            Some(SessionId::from("s")),
+            block,
+            None,
+        );
 
         assert!(
             taint.is_tainted(&SessionId::from("s")),
@@ -999,6 +1004,7 @@ mod dispatch {
                     action: teton_protocol::events::PrivacyAction::ReroutedToLocal,
                     cause,
                 },
+                None,
             );
             // Whatever the cause, the block is still announced — the pin is
             // a *consequence* of a report, never a replacement for one.
@@ -1371,7 +1377,7 @@ mod dispatch {
         let session = SessionId::from("tainted");
         runtime
             .session_taint
-            .mark(&session, TaintCause::BoundaryHit);
+            .mark(&session, TaintCause::BoundaryHit, None);
 
         let route = runtime
             .dispatch_route(
@@ -1446,7 +1452,7 @@ mod dispatch {
             let session = SessionId::from("tainted");
             runtime
                 .session_taint
-                .mark(&session, TaintCause::BoundaryHit);
+                .mark(&session, TaintCause::BoundaryHit, None);
 
             let route = runtime
                 .dispatch_route(&router, &session, SessionMode::Freeform, None, "anything")
@@ -1594,7 +1600,7 @@ mod dispatch {
 
             runtime
                 .session_taint
-                .mark(&session, TaintCause::BoundaryHit);
+                .mark(&session, TaintCause::BoundaryHit, None);
             assert_eq!(
                 digest_for(&runtime, &session).provider(),
                 Some(LOCAL_PROVIDER_ID),
@@ -1864,7 +1870,7 @@ mod dispatch {
 
             runtime
                 .session_taint
-                .mark(&session, TaintCause::BoundaryHit);
+                .mark(&session, TaintCause::BoundaryHit, None);
             assert_eq!(
                 triage_for(&runtime, &session).provider(),
                 Some(LOCAL_PROVIDER_ID),
@@ -1982,7 +1988,7 @@ mod dispatch {
 
             runtime
                 .session_taint
-                .mark(&session, TaintCause::BoundaryHit);
+                .mark(&session, TaintCause::BoundaryHit, None);
             assert_eq!(
                 shell_for(&runtime, &session).provider(),
                 Some(LOCAL_PROVIDER_ID),
@@ -2367,7 +2373,7 @@ mod dispatch {
 
             runtime
                 .session_taint
-                .mark(&session, TaintCause::BoundaryHit);
+                .mark(&session, TaintCause::BoundaryHit, None);
             let route = title_for(&runtime, &session);
             assert_eq!(
                 route.provider(),
@@ -2952,7 +2958,7 @@ mod dispatch {
 
             runtime
                 .session_taint
-                .mark(&session, TaintCause::BoundaryHit);
+                .mark(&session, TaintCause::BoundaryHit, None);
             assert_eq!(
                 compact_for(&runtime, &bus, &session).provider(),
                 LOCAL_PROVIDER_ID.into(),
@@ -3261,7 +3267,7 @@ mod dispatch {
             let tainted = SessionId::from("tainted");
             runtime
                 .session_taint
-                .mark(&tainted, TaintCause::BoundaryHit);
+                .mark(&tainted, TaintCause::BoundaryHit, None);
 
             let config = runtime.config.lock().expect("config mutex").clone();
             let router = build_router(&config, runtime.local_tier_available(), &BTreeMap::new());

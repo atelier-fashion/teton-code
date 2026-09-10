@@ -8319,10 +8319,15 @@ fn repo_context_reason(state: &RepoContextState) -> Option<String> {
 /// The cause comes from the blocked violation's **path**, exactly as the egress
 /// sink's `cause_of` reads it, because that is the only place the
 /// unknown/boundary distinction survives inspection.
+///
+/// REQ-620 BR-6: the class that explains an `unknown_shell` cause travels back
+/// with it, off the same inspected provenance, so this seam and the egress
+/// sink record the same sentence for the same context. `None` beside a cause
+/// is the ordinary state — a boundary path explains itself.
 pub(crate) fn context_taint_cause(
     ctx: &ContextManager,
     boundaries: &[PrivacyBoundary],
-) -> Option<TaintCause> {
+) -> Option<PinRecord> {
     use crate::egress::provenance::{MALFORMED_PROVENANCE_PATH, UNKNOWN_PROVENANCE_PATH};
     use crate::egress::Inspection;
     if boundaries.is_empty() {
@@ -8337,14 +8342,28 @@ pub(crate) fn context_taint_cause(
         // A boundary set that does not compile is the fail-closed case, and
         // "malformed" is the honest cause: nothing was matched, so no boundary
         // is known to have been crossed — and it must not be liftable.
-        Err(_) => return Some(TaintCause::MalformedProvenance),
+        Err(_) => {
+            return Some(PinRecord {
+                cause: TaintCause::MalformedProvenance,
+                reason: None,
+            })
+        }
     };
     match inspect(&provenance, &matcher, PrivacyAction::ReroutedToLocal) {
         Inspection::Allowed => None,
         Inspection::Blocked(violation) => Some(match violation.path.as_str() {
-            UNKNOWN_PROVENANCE_PATH => TaintCause::UnknownShell,
-            MALFORMED_PROVENANCE_PATH => TaintCause::MalformedProvenance,
-            _ => TaintCause::BoundaryHit,
+            UNKNOWN_PROVENANCE_PATH => PinRecord {
+                cause: TaintCause::UnknownShell,
+                reason: provenance.unknown_reason(),
+            },
+            MALFORMED_PROVENANCE_PATH => PinRecord {
+                cause: TaintCause::MalformedProvenance,
+                reason: None,
+            },
+            _ => PinRecord {
+                cause: TaintCause::BoundaryHit,
+                reason: None,
+            },
         }),
     }
 }
@@ -10433,7 +10452,7 @@ provider_id = "on-device"
         let session = SessionId::from("tainted");
         runtime
             .session_taint
-            .mark(&session, TaintCause::BoundaryHit);
+            .mark(&session, TaintCause::BoundaryHit, None);
 
         let turn_route = futures::executor::block_on(runtime.dispatch_route(
             &router,
@@ -11036,8 +11055,8 @@ provider_id = "on-device"
         let taint = SessionTaint::new();
         let s = SessionId::from("s1");
         assert!(!taint.is_tainted(&s));
-        taint.mark(&s, TaintCause::BoundaryHit);
-        taint.mark(&s, TaintCause::BoundaryHit); // idempotent
+        taint.mark(&s, TaintCause::BoundaryHit, None);
+        taint.mark(&s, TaintCause::BoundaryHit, None); // idempotent
         assert!(taint.is_tainted(&s));
         assert!(!taint.is_tainted(&SessionId::from("other")));
     }
@@ -11067,15 +11086,15 @@ provider_id = "on-device"
         let taint = SessionTaint::new();
         let s = SessionId::from("s1");
         assert!(
-            taint.mark(&s, TaintCause::BoundaryHit),
+            taint.mark(&s, TaintCause::BoundaryHit, None),
             "the first mark is the transition"
         );
         assert!(
-            !taint.mark(&s, TaintCause::BoundaryHit),
+            !taint.mark(&s, TaintCause::BoundaryHit, None),
             "a re-mark owes no second line: one pin, one announcement"
         );
         assert!(
-            taint.mark(&SessionId::from("other"), TaintCause::BoundaryHit),
+            taint.mark(&SessionId::from("other"), TaintCause::BoundaryHit, None),
             "and the announcement is per session, not per daemon"
         );
 
@@ -11128,7 +11147,7 @@ provider_id = "on-device"
 
         // An unknown-provenance shell result taints even with no boundary path.
         let mut ctx_shell = ContextManager::new("sys", 10_000);
-        ctx_shell.push_tool_result_prov("shell", ToolProvenance::Unknown, "cmd output");
+        ctx_shell.push_tool_result_prov("shell", ToolProvenance::unknown(), "cmd output");
         assert!(context_taint_cause(&ctx_shell, &boundaries).is_some());
 
         // A public-only context does not taint.
@@ -11138,6 +11157,74 @@ provider_id = "on-device"
 
         // With no boundaries configured, nothing is sensitive.
         assert!(!context_taint_cause(&ctx, &[]).is_some());
+    }
+
+    /// **REQ-620 BR-6, Phase-5 verify M6: the carry seam's pin carries the
+    /// class too.**
+    ///
+    /// [`context_taint_cause`] is the backstop REQ-614 put on the `Drop` path,
+    /// and it is the *only* seam that pins a session without publishing a
+    /// `session_pinned` event — so nothing at the wire could ever have asserted
+    /// what it records. The class it reads off the inspected provenance was
+    /// therefore unpinned: deleting `provenance.unknown_reason()` from its
+    /// `UNKNOWN_PROVENANCE_PATH` arm broke nothing.
+    ///
+    /// The three rows are the three causes. A boundary hit answers `None`
+    /// because its cause is the path (ADR-620-4), and an unknown nothing
+    /// classified answers `None` because there was nothing to say — which is
+    /// what makes the first row a claim rather than a coincidence.
+    ///
+    /// **Mutation (run, red, reverted):** replace that arm's
+    /// `provenance.unknown_reason()` with `None` — this test reds on the first
+    /// row, alone in the crate's lib suite.
+    #[test]
+    fn a_carried_classified_unknown_pins_with_its_class() {
+        use crate::harness::context::ToolProvenance;
+        use crate::runtime::taint::{PinRecord, TaintCause};
+        const GLOB: &str = "the command uses a glob this classifier does not model";
+
+        let boundaries = vec![PrivacyBoundary {
+            path_glob: "secrets/**".to_owned(),
+            mode: BoundaryMode::LocalOnly,
+            origin: Default::default(),
+        }];
+
+        let mut classified = ContextManager::new("sys", 10_000);
+        classified.push_tool_result_prov(
+            "shell",
+            ToolProvenance::Unknown(Some(GLOB)),
+            "cmd output",
+        );
+        assert_eq!(
+            context_taint_cause(&classified, &boundaries),
+            Some(PinRecord {
+                cause: TaintCause::UnknownShell,
+                reason: Some(GLOB)
+            }),
+            "the class the classifier named reaches the carry seam's pin"
+        );
+
+        let mut unclassified = ContextManager::new("sys", 10_000);
+        unclassified.push_tool_result_prov("mcp", ToolProvenance::unknown(), "cmd output");
+        assert_eq!(
+            context_taint_cause(&unclassified, &boundaries),
+            Some(PinRecord {
+                cause: TaintCause::UnknownShell,
+                reason: None
+            }),
+            "an unknown nothing classified pins with no class"
+        );
+
+        let mut touched = ContextManager::new("sys", 10_000);
+        touched.push_tool_result("read", Some(fixture_id("secrets/prod.env")), "API_KEY=1");
+        assert_eq!(
+            context_taint_cause(&touched, &boundaries),
+            Some(PinRecord {
+                cause: TaintCause::BoundaryHit,
+                reason: None
+            }),
+            "a boundary hit is explained by its path, never by a syntax class"
+        );
     }
 
     // --- REQ-544 M-3: endpoint-bound credential injection ------------------
@@ -12144,7 +12231,7 @@ provider_id = "on-device"
             // A `shell` result of unknown provenance taints the session.
             runtime
                 .session_taint
-                .mark(&session, TaintCause::BoundaryHit);
+                .mark(&session, TaintCause::BoundaryHit, None);
             assert!(runtime.session_taint.is_tainted(&session));
 
             let config = runtime.config.lock().expect("config mutex").clone();
@@ -18148,7 +18235,7 @@ provider_id = \"deepseek\"
             );
             runtime
                 .session_taint
-                .mark(&session_id, TaintCause::BoundaryHit);
+                .mark(&session_id, TaintCause::BoundaryHit, None);
 
             // …and a grant the user gave once, for the session. Earned through a
             // real prompt, which is the non-vacuity leg: the gate demonstrably

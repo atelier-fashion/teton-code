@@ -1,0 +1,162 @@
+{
+  "req": "REQ-620",
+  "branch": "feat/REQ-620-harmless-redirects-in-the-shell-grammar",
+  "startedAt": "2026-09-09T20:13:59Z",
+  "completed": false,
+  "currentPhase": 8,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "integrationBranch": "main",
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree",
+      "completedAt": "2026-09-09T20:13:59Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec (run earlier this session; status approved)",
+      "completedAt": "2026-09-09T20:15:07Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect (run earlier this session; 6 tasks)",
+      "completedAt": "2026-09-09T20:15:07Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-09-09T20:15:07Z"
+    },
+    {
+      "phase": 4,
+      "name": "Implement (TASK-403 1f7c381, TASK-406 1218aaf, TASK-404 b3adedd, TASK-405 8b07987, TASK-407 3b7311b, TASK-408 8671fb8)",
+      "completedAt": "2026-09-09T22:15:58Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify (6 agents + 4-agent re-verify; fix commits 5d3610a ec16e73 742e5bb f1146fb 1f0c7cc b984ceb)",
+      "completedAt": "2026-09-10T00:26:56Z"
+    },
+    {
+      "phase": 6,
+      "name": "Create Pull Request (#316 readied)",
+      "completedAt": "2026-09-10T00:27:41Z"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI (clean diff; 8 checks green)",
+      "completedAt": "2026-09-10T00:32:19Z"
+    }
+  ],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-620",
+      "branch": "feat/REQ-620-harmless-redirects-in-the-shell-grammar",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/316",
+      "prNumber": 316,
+      "prCreatedAt": "2026-09-09T20:11:53Z",
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-403",
+      "TASK-406",
+      "TASK-404",
+      "TASK-405",
+      "TASK-407",
+      "TASK-408"
+    ],
+    "failedTasks": [],
+    "inFlight": []
+  },
+  "conflictsResolved": [],
+  "notes": [
+    "TASK-403 landed 1f7c381. BR-5's 'strip runs after the opaque-verb check' reads against ADR-620-2's strip-first order; observables agree. Reconcile BR-5's wording in TASK-408.",
+    "TASK-406 landed 1218aaf: contract 407 B; REDACT_BODY_OVERHEAD_BYTES 23->24 KiB; REDACT_SCANNABLE_CONTEXT_BYTES 184,265->183,334; margins 105->721 / 152->768; ASSUME-048. Upgrade note for CHANGELOG (TASK-408).",
+    "TASK-404 landed b3adedd. BR-4's 'no path argument' is implemented as 'names no existing file' (paths.is_empty() || !named_an_existing_file), required by its own rows (`git log | grep fix`). Reword BR-4 in TASK-408.",
+    "TASK-405 landed 8b07987. AC-6's 'no event carries command bytes' holds over the non-permitted carriers only (tool_call title and permission_request quote the command by REQ-611 BR-4 design); a typed /skill pin does not carry the class (Provenance::User has no reason field) \u2014 follow-up. Reword AC-6 in TASK-408; file the typed-skill follow-up there.",
+    "TASK-407 landed 3b7311b. AC-10 lives in shell_pin_shape.rs (no doctor fixture in model_identity.rs; doctor is daemon-scoped). AC-1's literal command is discharged at unit level (TASK-403)."
+  ],
+  "phase5": {
+    "agents": [
+      "reflector",
+      "correctness",
+      "quality",
+      "architecture",
+      "test-auditor",
+      "security"
+    ],
+    "prePass": "adlc-read over the origin/main...HEAD diff (54 files); 21 candidates, 18 forwarded, 3 dropped as outside the diff; all 18 refuted or reframed by reviewers",
+    "findings": {
+      "critical": [
+        "C1 reads_tree denylist: grep --directories recurse / --dereference-recursive / abbreviations skip the root walk (correctness, reflector, security)",
+        "C2 &>/dev/null lifted as one word; dash reads & as a separator, hiding a second command (reflector)"
+      ],
+      "major": [
+        "M1 write gate vs classifier wrapper divergence on `ls 2>&1; ls` (architecture, correctness)",
+        "M2 reason plumbing: compaction fold unwrap_or contradicts docs; DroppedProvenance drops the class; fold untested (architecture, quality, test)",
+        "M3 NULL_DEVICE one-home doc claim false (quality)",
+        "M4 is_recognised_verb no negative test (test)",
+        "M5 skill-path pin reason never asserted at the wire (test)",
+        "M6 carry seam reason unpinned (test)"
+      ],
+      "minorCount": 14,
+      "nitCount": 10
+    },
+    "reflectorQuestions": "answered by pipeline rules: emit `&` where &> lifted (conservative on both shells); deny grep exemption on any long option; fix Criticals before merge; toolkit follow-up filed as adlc-toolkit#172 (BUG-224)",
+    "fixPass": "single task-implementer, four commit groups, then Step D re-verify of correctness/architecture/security/test",
+    "fixCommits": {
+      "critical": "5d3610a",
+      "major": "ec16e73",
+      "minor": "742e5bb",
+      "nits": "f1146fb"
+    },
+    "fixDeviations": [
+      "from_bits takes UnknownReach::{No,Unclassified,Because}",
+      "has_top_level_redirection treats top-level < as a redirection (documented tightening)",
+      "peel widened to a redirect glued to a following separator (ls 2>&1|head benign)",
+      "SessionTaint::reason stays pub (read by provenance_egress.rs)",
+      "contract 407->414 B; margins 721->714 / 768->761"
+    ],
+    "stepD": {
+      "agents": [
+        "correctness",
+        "architecture",
+        "security",
+        "test-auditor"
+      ],
+      "priorFindings": "C1, C2, M1-M6 all CONFIRMED FIXED (C1 partially: -d inside a short cluster remained)",
+      "newFindings": [
+        "write gate trigger (a) reads the raw command; a leading null redirect shadows the verb (pre-existing, same class)",
+        "grep -Xd cluster passes the three guards",
+        "filter allowlist flag-blind (wc/sort --files0-from -, shasum -c -)",
+        "cross-gate differential test self-referential",
+        "stale ledger copies in redact.rs and CHANGELOG; changelog behaviour gaps; ADR-620-1/2 not amended"
+      ],
+      "secondPass": "single task-implementer, two commit groups"
+    },
+    "secondPassCommits": {
+      "privacy": "1f0c7cc",
+      "docs": "b984ceb"
+    }
+  }
+}

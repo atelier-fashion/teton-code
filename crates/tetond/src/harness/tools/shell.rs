@@ -96,7 +96,7 @@ use teton_protocol::methods::RootKind;
 use super::{
     opt_str_arg, opt_u64_arg, str_arg, RefinedOutcome, Tool, ToolContext, ToolDuties, ToolOutcome,
 };
-use crate::harness::context::ToolProvenance;
+use crate::harness::context::{ToolProvenance, UnknownReach};
 use crate::harness::digest::tool_result_provenance;
 use crate::harness::root_gate;
 use crate::harness::shell_duty;
@@ -132,6 +132,56 @@ pub(crate) const MAX_OUTPUT_CHARS: usize = 8_000;
 /// same figure, and a second consumer that restated it would be two spellings of
 /// one deadline (LESSON-528).
 pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+
+/// One home for the reach paragraph's **bytes** (REQ-620 BR-7).
+///
+/// The paragraph has to be two things at once: a `pub(crate) const` a test can
+/// read and measure ([`SHELL_REACH_CONTRACT`]), and a `concat!` argument, since
+/// [`SHELL_DESCRIPTION`] is a compile-time constant and `std` has no const
+/// string concatenation. A `macro_rules!` expanding to the literal is what makes
+/// those the same bytes rather than two spellings a later edit can separate —
+/// the alternative, writing the paragraph twice with a test comparing the
+/// copies, is the drift LESSON-446 is about with a guard bolted on afterwards.
+///
+/// Not a `OnceLock` or a leak, for `SkillTool::description`'s reason turned
+/// around: this text is genuinely static — it does not vary with the session
+/// root — so it belongs in the binary, not on the heap once per process.
+macro_rules! reach_contract {
+    () => {
+        "Commands are checked before they run. A command keeps the session on its \
+         current tier when read verbs (ls, cat, grep, git status) name paths in the \
+         session root; `2>/dev/null` and `2>&1` are fine. Quotes, other redirects, \
+         globs, `$`, `~/` paths, other shell syntax, interpreters, network clients, \
+         or an unknown verb pin the rest of the session to the local tier; the pin \
+         is announced and only the user can lift it."
+    };
+}
+
+/// The `shell` tool's description, resident in every remote turn's system
+/// prompt.
+///
+/// A `const` built with `concat!` rather than a literal returned from
+/// [`Tool::description`], because its last sentence group is BR-7's reach
+/// contract and that paragraph has readers of its own — `SHELL_REACH_CONTRACT`,
+/// at the foot of this file, and `completion.rs`'s assertion that the bytes
+/// reach the provider. Both spellings expand `reach_contract!`, so there is one
+/// paragraph and not two.
+const SHELL_DESCRIPTION: &str = concat!(
+    // REQ-615 BR-1. The cwd sentence is **verbatim** and pinned by a
+    // prompt-margin test: LESSON-570's rule is that a prompt sentence must be
+    // true after the REQ ships, and this one is made true by the fresh child
+    // `run_bounded` spawns for every call. It lives beside the tool rather than
+    // only in the environment block because a small model transfers data
+    // reliably and a fact three paragraphs away unreliably (LESSON-532) — and
+    // because the fact the block states is exactly what a `cd … && pwd` result
+    // appears to contradict.
+    "Run a shell command in the session root under a timeout. Use it to verify \
+     changes (build, test, grep). Secrets in the environment are removed. Each \
+     command starts in the session root; `cd` inside a command does not carry to \
+     the next one. Only the user can move the root, with `/cd <path>` — say so \
+     instead of trying. ",
+    reach_contract!()
+);
 
 /// Runs shell commands under a timeout, cwd jail, and composed environment.
 ///
@@ -185,19 +235,11 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        // REQ-615 BR-1. The cwd sentence is **verbatim** and pinned by a
-        // prompt-margin test: LESSON-570's rule is that a prompt sentence must
-        // be true after the REQ ships, and this one is made true by the fresh
-        // child `run_bounded` spawns for every call. It lives beside the tool
-        // rather than only in the environment block because a small model
-        // transfers data reliably and a fact three paragraphs away unreliably
-        // (LESSON-532) — and because the fact the block states is exactly what
-        // a `cd … && pwd` result appears to contradict.
-        "Run a shell command in the session root under a timeout. Use it to \
-         verify changes (build, test, grep). Secrets in the environment are \
-         removed. Each command starts in the session root; `cd` inside a \
-         command does not carry to the next one. Only the user can move the \
-         root, with `/cd <path>` — say so instead of trying."
+        // One `const` (REQ-620 ADR-620-5): the cwd contract and the reach
+        // contract are one string the provider receives, and the reach half has
+        // a second reader — `SHELL_REACH_CONTRACT`, which its own test measures
+        // and `completion.rs` asserts reaches the wire.
+        SHELL_DESCRIPTION
     }
 
     fn input_schema(&self) -> Value {
@@ -324,9 +366,15 @@ impl Tool for ShellTool {
         // The second disjunct is belt and braces: a `BoundaryTouch` that named
         // nothing at all is out-of-root by construction, and stays mapped to
         // the sentinel even if a future arm forgets to set the flag.
+        //
+        // REQ-620 ADR-620-4: the unknown bit and the class that caused it are
+        // one value. `Verdict::unknown_reason` is `Some` exactly when the kind
+        // is `Unknown`, so the pin this provenance later takes names the
+        // syntax class the command was refused on — a quote, a redirect, a
+        // glob — instead of the one sentence every refusal used to share.
         let provenance = ToolProvenance::from_bits(
             verdict.sources.clone(),
-            verdict.kind == shell_provenance::VerdictKind::Unknown,
+            UnknownReach::from_classifier(verdict.unknown_reason()),
             verdict.out_of_root_touch
                 || (verdict.kind == shell_provenance::VerdictKind::BoundaryTouch
                     && verdict.sources.is_empty()),
@@ -818,8 +866,8 @@ fn is_env_assignment(word: &str) -> bool {
 /// # What this deliberately misses
 ///
 /// Both known limits are **false negatives**, which is the safe direction for
-/// BR-2 — a false negative costs one user the sentence they would have got, a
-/// false positive costs every future reader their trust in it:
+/// REQ-607 BR-2 — a false negative costs one user the sentence they would have
+/// got, a false positive costs every future reader their trust in it:
 ///
 /// - A program reached through indirection (`xargs ssh`, `sudo git`, a script)
 ///   is not seen. Only the outermost word of each segment is.
@@ -833,6 +881,28 @@ fn is_env_assignment(word: &str) -> bool {
 ///   (`GIT_SSH_COMMAND='ssh -v' git push`) is not skipped, because this splits
 ///   on whitespace and cannot tell where the quoted value ends. See
 ///   [`is_env_assignment`].
+///
+/// # "Safe direction" is a claim about **that** caller, and only that one
+///
+/// REQ-607's advisory is offered or withheld, so its false negatives cost a
+/// sentence. [`root_gate::write_gate`](crate::harness::root_gate) is the other
+/// caller and it *gates* on this list, where a false negative is a write that
+/// proceeds at a home root — the opposite direction, and the harm BR-4 exists
+/// to stop. It must therefore not rely on the paragraph above.
+///
+/// It does not. There is one limit this function has that the gate could not
+/// live with — the first word of a segment is whatever whitespace-splitting
+/// found there, and a redirect is a word — so `2>/dev/null rm -rf ~/x` yields
+/// `["2>/dev/null"]` and the `rm` is invisible. That was a real hole and the
+/// gate's own fix is upstream of this function rather than inside it: it strips
+/// null redirects first and passes the **residue** here (Phase-5 re-verify).
+/// The remaining limits — indirection, quoted strings, quoted assignments —
+/// are the ones `root_gate`'s module docs record as the gate's residual and
+/// argue separately, because a `sh -c` refused at a home root would be a far
+/// wider rule than BR-4.
+///
+/// Anything added here that widens the miss set is therefore a change to two
+/// rules with opposite polarities, and it needs a claim for each.
 pub(crate) fn command_position_programs(command: &str) -> Vec<&str> {
     command
         .split(['|', ';', '&', '(', '\n'])
@@ -993,6 +1063,50 @@ fn render_output(
     outcome.measuring(raw_output_chars)
 }
 
+/// **The reach grammar, stated to the model** (REQ-620 BR-7, ADR-620-5).
+///
+/// REQ-614's classifier decides, before a command runs, whether everything it
+/// could read is inside the session root, and refuses anything its grammar does
+/// not model — which pins the session to the local tier for the rest of that
+/// session. The model had never been told any of that, so it wrote
+/// `2>/dev/null` from habit and pinned the first agentic turn of every session.
+/// REQ-620's BR-1 and BR-4 teach the grammar the forms that provably read
+/// nothing; this paragraph is the other half, and it is the *best-effort* half
+/// (ASSUME-048): a description steers a model often, not always, which is why
+/// the grammar and not the prose is what makes the pin proportionate.
+///
+/// **Description, not instruction** (REQ-612's framing): every sentence is a
+/// fact about what this daemon does with a command it is handed. None of it
+/// tells the model to act on anything it reads in the repository.
+///
+/// Four hundred and twenty bytes is the ceiling, asserted by
+/// `tests::the_reach_contract_names_every_pinning_class_and_fits_its_budget`
+/// alongside the classes it has to name. The budget is not free: a tool
+/// description is resident in every remote turn's system prompt, and paying for
+/// this one took [`REDACT_BODY_OVERHEAD_BYTES`](crate::egress::redact) from 23
+/// to 24 KiB — the ledger line on that constant is where the arithmetic is.
+///
+/// Every verb the paragraph names is cross-checked against the classifier's own
+/// tables ([`shell_provenance::is_recognised_verb`]) by the same test: a
+/// contract that promised reach for a verb the grammar refuses would teach the
+/// model to pin itself, which is worse than saying nothing (LESSON-542).
+///
+/// **`#[cfg(test)]`, and down here rather than beside [`SHELL_DESCRIPTION`],
+/// for two different reasons.** Test-only because the production path reads the
+/// paragraph through the macro; a second production reader would be a second
+/// spelling of the same bytes, which is what the macro exists to prevent
+/// (the shape [`RECORDED_PROMPT_MARGIN_BYTES`](crate::egress::redact) is
+/// `#[cfg(test)]` for too). Down here because half a dozen source-scan tests cut
+/// this file's production corpus at the **first** column-0 `#[cfg(test)]`
+/// (`the_output_cap_has_exactly_one_home`, `the_verdict_is_computed_before_measurement`,
+/// `child_env::a_childs_environment_has_exactly_one_construction_site`), so one
+/// placed above the `impl` truncates every one of them to the file's opening
+/// lines and they pass on a corpus that contains almost nothing — ASSUME-010's
+/// hazard, met the moment this constant was first written at the top. Run that
+/// mutation before moving it back: it is silent, and it is three green tests.
+#[cfg(test)]
+pub(crate) const SHELL_REACH_CONTRACT: &str = reach_contract!();
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1053,6 +1167,151 @@ mod tests {
                  fact a `cd … && pwd` result appears to contradict:\n{docs}"
             );
         }
+    }
+
+    /// **REQ-620 BR-7 / AC-8: the reach contract names every class that pins,
+    /// fits its budget, and promises reach for nothing the grammar refuses.**
+    ///
+    /// Three claims, and they fail for different reasons on purpose:
+    ///
+    /// 1. **The classes.** A paragraph that has stopped naming `~/` is a
+    ///    paragraph that no longer covers the case the originating transcript
+    ///    pinned on. Folded to ASCII lowercase first, so the prose words are
+    ///    pinned by meaning rather than by where a sentence happens to break;
+    ///    the syntax tokens (`/dev/null`, `2>&1`, `$`, `~/`) fold to themselves.
+    /// 2. **The budget.** 420 bytes, the ceiling ADR-620-5 set and the raise of
+    ///    `REDACT_BODY_OVERHEAD_BYTES` was sized against. Asserted here rather
+    ///    than only in the prompt-margin sweep because the sweep's failure says
+    ///    "the resident prompt moved" about a whole prompt, and this one names
+    ///    the sentence that moved it.
+    /// 3. **The verbs are real.** Every verb the paragraph offers as an example
+    ///    of "ordinary read verbs" is checked against the classifier's own
+    ///    tables. This is the claim with teeth: the paragraph is read by a model
+    ///    that will then write those verbs, so a contract naming a verb
+    ///    `shell_provenance` refuses would teach the model to pin itself —
+    ///    LESSON-542's rule that a grammar taught to the model must be read on
+    ///    every path it can answer through. The list here is typed out rather
+    ///    than parsed out of the prose: a parser over the paragraph would find
+    ///    whatever the paragraph happened to say, which is the thing under test.
+    ///
+    /// **Mutation (run, red, reverted):** shorten `reach_contract!` to drop the
+    /// `` `~/` paths `` clause. Claim 1 goes red naming `~/`; the byte and verb
+    /// claims stay green, which is the discrimination the three-claim split is
+    /// for. It reddens
+    /// `egress::redact::tests::the_total_cap_clears_the_harness_context_budget_with_margin`
+    /// too — the recorded margin moves — and that is the pair working as
+    /// intended rather than a duplicate: this test says *which sentence*
+    /// changed, the sweep says the resident prompt moved at all.
+    ///
+    /// **Mutation (run, red, reverted, Phase-5 verify):** drop
+    /// `other shell syntax` from the paragraph — claim 1b reds, and the two
+    /// margin sweeps red with it. Three of `UNMODELLED_ORDER`'s classes lose
+    /// their needle (`Brace`, `Escape`, `History`), but the `assert!` aborts the
+    /// loop, so the failure names the **first** of them and not all three; the
+    /// earlier reading of this record, "reds three times over", described a
+    /// table that collected failures rather than this one. Before 1b existed
+    /// that edit reddened only the sweeps, which say the prompt moved and not
+    /// that it stopped being true.
+    #[test]
+    fn the_reach_contract_names_every_pinning_class_and_fits_its_budget() {
+        /// ADR-620-5's ceiling. The contract is resident in every remote turn's
+        /// system prompt, so its length is a budget and not a style note.
+        const CONTRACT_MAX_BYTES: usize = 420;
+
+        let folded = SHELL_REACH_CONTRACT.to_ascii_lowercase();
+        for (needle, class) in [
+            (
+                "/dev/null",
+                "a redirect to the null device, which reads nothing",
+            ),
+            ("2>&1", "a descriptor duplication, which reads nothing"),
+            ("quotes", "quoting, which the grammar refuses whole"),
+            ("globs", "wildcards, which the grammar refuses whole"),
+            ("$", "variables and substitution"),
+            ("~/", "a path outside the session root"),
+            (
+                "local tier",
+                "what a pin costs — the rest of the session on the small model",
+            ),
+        ] {
+            assert!(
+                folded.contains(needle),
+                "the reach contract no longer names {class} (`{needle}`), so a model \
+                 reading it cannot avoid that pin:\n{SHELL_REACH_CONTRACT}"
+            );
+        }
+
+        // 1b. **Every** class, driven from the classifier's own enumeration
+        //     rather than from a list typed here (Phase-5 verify). The table
+        //     above was written by hand and named five of the eight: brace
+        //     expansion, backslash escapes and history expansion all pin, none
+        //     of them appeared, and a model reading the paragraph would have
+        //     believed `echo {a,b}` kept its tier. Iterating
+        //     `UNMODELLED_ORDER` makes a ninth class a failing row instead of a
+        //     silent omission.
+        for class in shell_provenance::UNMODELLED_ORDER {
+            let needle = match class {
+                shell_provenance::UnmodelledSyntax::Quote => "quotes",
+                shell_provenance::UnmodelledSyntax::Redirect => "redirects",
+                shell_provenance::UnmodelledSyntax::Glob => "globs",
+                // Both spell themselves with a `$`, and the paragraph has the
+                // room for the character but not for two more clauses.
+                shell_provenance::UnmodelledSyntax::Variable
+                | shell_provenance::UnmodelledSyntax::Substitution => "$",
+                // The three narrow spellings. Naming each would cost more than
+                // the paragraph's whole remaining budget and buy a model
+                // nothing it can act on — "braces" is not a shape it reaches
+                // for by habit the way `2>/dev/null` is. They are covered by
+                // the catch-all clause, which is what makes the sentence honest
+                // rather than merely short.
+                shell_provenance::UnmodelledSyntax::Brace
+                | shell_provenance::UnmodelledSyntax::Escape
+                | shell_provenance::UnmodelledSyntax::History => "other shell syntax",
+            };
+            assert!(
+                folded.contains(needle),
+                "the reach contract does not name {class:?} (looked for `{needle}`). \
+                 Every class in `UNMODELLED_ORDER` pins the session, so a class the \
+                 paragraph does not cover — directly or through its catch-all — is a \
+                 pin the model cannot avoid:\n{SHELL_REACH_CONTRACT}"
+            );
+        }
+
+        assert!(
+            SHELL_REACH_CONTRACT.len() <= CONTRACT_MAX_BYTES,
+            "the reach contract is {} bytes against a {CONTRACT_MAX_BYTES}-byte \
+             ceiling. It is resident in every remote turn's system prompt and the \
+             `REDACT_BODY_OVERHEAD_BYTES` raise was sized against this ceiling — \
+             shorten the paragraph, or make the ceiling case in the redact ledger \
+             and re-measure both prompt-margin sweeps.",
+            SHELL_REACH_CONTRACT.len()
+        );
+
+        for verb in ["ls", "cat", "grep", "git status"] {
+            assert!(
+                SHELL_REACH_CONTRACT.contains(verb),
+                "`{verb}` is cross-checked against the classifier's tables below \
+                 but no longer appears in the contract, so this row is asserting \
+                 nothing about the paragraph:\n{SHELL_REACH_CONTRACT}"
+            );
+            assert!(
+                shell_provenance::is_recognised_verb(verb),
+                "the contract offers `{verb}` as an ordinary read verb, but \
+                 `shell_provenance` does not recognise it — so a model that took \
+                 the contract at its word would pin the session on the first call. \
+                 Either add it to the classifier's tables or take it out of the \
+                 paragraph (LESSON-542)."
+            );
+        }
+
+        assert!(
+            ShellTool::default()
+                .description()
+                .ends_with(SHELL_REACH_CONTRACT),
+            "the contract is no longer the tool description's last sentence group, \
+             so what the provider receives and what this test measures have come \
+             apart"
+        );
     }
 
     /// **REQ-615 BR-2 / AC-2: a `cd`-bearing command carries the cwd note, and
@@ -1211,9 +1470,13 @@ mod tests {
         let ctx = ToolContext::new(&root);
         let out = ShellTool::default().run(&ctx, &json!({ "command": "cat secrets/prod.env" }));
         assert!(!out.is_error, "{}", out.content);
-        assert_eq!(out.provenance, ToolProvenance::Unknown);
+        // REQ-620: the reason travels with the bit, and the classifier's
+        // no-boundary short circuit is a reason like any other — the *bit* is
+        // what BR-9 is about, and it is unchanged.
+        const NO_BOUNDARY: &str = "no privacy boundary is configured";
+        assert_eq!(out.provenance, ToolProvenance::Unknown(Some(NO_BOUNDARY)));
         let out2 = ShellTool::default().run(&ctx, &json!({ "command": "echo hi" }));
-        assert_eq!(out2.provenance, ToolProvenance::Unknown);
+        assert_eq!(out2.provenance, ToolProvenance::Unknown(Some(NO_BOUNDARY)));
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1267,7 +1530,14 @@ mod tests {
         std::fs::write(root.join(".env"), "K=v\n").unwrap();
         let ctx = project_ctx(&root);
         let opaque = ShellTool::default().run(&ctx, &json!({ "command": "echo $(ls)" }));
-        assert_eq!(opaque.provenance, ToolProvenance::Unknown);
+        // REQ-620 BR-6: still `Unknown`, and now saying which class refused it
+        // — `$(` is a command substitution, first of the two the scan sees.
+        assert_eq!(
+            opaque.provenance,
+            ToolProvenance::Unknown(Some(
+                "the command uses a command substitution this classifier does not model"
+            ))
+        );
         // An **in-root** boundary path rides the existing machinery: the result
         // names the real file, and egress blocks on the glob exactly as it does
         // for a `read` of it. `ToolProvenance::BoundaryTouch` is reserved for
@@ -2505,9 +2775,14 @@ search_key_ref = "env:{web_var}"
             "nor the measurement the gate above read"
         );
         assert_eq!(
-            refined.outcome.provenance,
-            ToolProvenance::Unknown,
-            "interpreting a result cannot make its origin knowable"
+            refined.outcome.provenance, raw.provenance,
+            "interpreting a result cannot make its origin knowable — nor change \
+             what the classifier said about it"
+        );
+        assert!(
+            matches!(refined.outcome.provenance, ToolProvenance::Unknown(_)),
+            "fixture: the interpreted result is the unknown one: {:?}",
+            refined.outcome.provenance
         );
         std::fs::remove_dir_all(&root).ok();
     }

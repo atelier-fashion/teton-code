@@ -56,6 +56,7 @@ pub mod projects;
 pub mod read;
 pub mod shell;
 pub mod shell_provenance;
+pub mod shell_syntax;
 pub mod skill;
 pub mod walk;
 pub mod web;
@@ -890,9 +891,19 @@ impl ToolOutcome {
 
     /// Tag this outcome as having indeterminate provenance (fail-closed at
     /// egress) — the `shell` tool, whose touched files cannot be parsed.
+    ///
+    /// The reason is the fixed generic one
+    /// ([`UNCLASSIFIED_REACH_REASON`](super::UNCLASSIFIED_REACH_REASON)),
+    /// because this is the **any-spawn** arm: a tool reaching for it is saying
+    /// it never classified anything, so there is no syntax class to name
+    /// (REQ-620 BR-6). The `shell` tool's own classified refusals do not come
+    /// through here — they carry `Verdict::unknown_reason` through
+    /// [`ToolProvenance::from_bits`].
     #[must_use]
     pub fn with_unknown_provenance(self) -> Self {
-        self.with_provenance(ToolProvenance::Unknown)
+        self.with_provenance(ToolProvenance::Unknown(Some(
+            super::UNCLASSIFIED_REACH_REASON,
+        )))
     }
 }
 

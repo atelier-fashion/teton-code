@@ -523,6 +523,68 @@ pub(crate) const REDACT_ESCAPING_DIVISOR: usize = 10;
 /// pins the family clause to `SESSION_COMMANDS` in both directions, so the next
 /// new family is a red test rather than a silence.
 ///
+/// **Raised 23→24 KiB by REQ-620, and it is the raise ASSUME-043's resolution
+/// predicted.** BR-7 puts the shell tool's reach grammar in that tool's
+/// description — `SHELL_REACH_CONTRACT`, 414 bytes plus the space that joins it
+/// to the cwd contract, so **415** against the 105 this constant had left. The
+/// paragraph tells the model which command shapes pin the session to the local
+/// tier; a paragraph short enough to fit in 105 bytes could not name the seven
+/// classes AC-8 requires, and naming them is the whole of BR-7. Measured before
+/// the raise, the way this ledger asks: the widest prompt went 17,099 →
+/// **17,514** and `spent` 23,447 → **23,862**, which is 310 **over** the 23,552
+/// ceiling — the `spent < REDACT_BODY_OVERHEAD_BYTES` assertion, red before the
+/// floor was consulted, exactly as it was for the REQ-615/REQ-617 collision.
+///
+/// *(407 / 408 / 17,507 / 23,855 / 303 until REQ-620's own Phase-5 verify,
+/// which added "other shell syntax" to the paragraph — brace expansion,
+/// backslash escapes and history expansion all pin and none of them was named
+/// — for a net 7 bytes on both shapes. Re-measured, not reasoned; this copy of
+/// the ledger was the one the re-verify found still carrying the old figures.)*
+///
+/// This is the ceiling being made the case for rather than worked around, which
+/// ASSUME-043 records as the only remaining option: at 105 there was no
+/// sentence's worth of room left to reclaim, and the two REQs that had already
+/// paid for this ceiling's stability with their own words had spelled out what
+/// the next claimant should do. Raised by a whole KiB, once, and re-derived.
+///
+/// **Only one figure below actually moves, and the chunk count is not it:**
+///
+/// ```text
+///   twice a full body      2 × (63,488 + 24,576)     = 176,128 bytes
+///   ÷ REDACT_CHUNK_MAX_BYTES     176,128 / 56,561    =    3.11   (3.08 before)
+///   → REDACT_TOTAL_CAP_CHUNKS                             4      (4 — unmoved)
+///   → REDACT_INPUT_MAX_BYTES     4 × 56,561          = 226,244   (226,244)
+///   → REDACT_SCANNABLE_CONTEXT_BYTES
+///                       (226,244 − 24,576) × 10 / 11 = 183,334   (184,265)
+///   → REDACT_MAX_CHUNKS
+///           (226,244 − 56,561).div_ceil(56,305) + 1  =       5   (5 — unmoved)
+/// ```
+///
+/// The count holds because three chunks stop holding twice a body only above
+/// 21,353 and it was already past that at 23 KiB — REQ-612 spent the move, and
+/// this raise inherits it rather than making a second one. So the cap, the max
+/// chunk count, and therefore the per-send call budget are byte-for-byte what
+/// REQ-612 left.
+///
+/// **The consequence, and it runs the way REQ-587's did rather than REQ-612's:**
+/// [`REDACT_SCANNABLE_CONTEXT_BYTES`] **falls** 184,265 → 183,334, a **931-byte**
+/// cut to every `[privacy] redact = true` route's byte budget — the same 931 a
+/// one-KiB raise cost at REQ-587, because it is `1,024 × 10 / 11` and nothing
+/// else. A cut, not a widening: with the chunk count unmoved there is no extra
+/// window to gain, so the raise comes straight out of the scanned routes'
+/// context. `the_overhead_raise_restates_the_chunk_count_and_the_scannable_bound`
+/// is where that is said out loud, and where the next raise says its own.
+///
+/// **Measured after the raise: margin 105 → 714** ([`RECORDED_PROMPT_MARGIN_BYTES`])
+/// and 152 → **761** on the web-enabled twin
+/// ([`RECORDED_WEB_PROMPT_MARGIN_BYTES`]), the same 47 bytes apart the two
+/// shapes have always been — which is the check that this raise spent the same
+/// bytes on both. 666 bytes of usable room above the 48-byte floor, roomier
+/// than the 685 REQ-612 left only in the sense that a KiB is bigger than a
+/// paragraph; the next REQ should read ASSUME-043 before assuming otherwise.
+/// *(721 / 768 / 673 until this REQ's own Phase-5 verify spent 7 more bytes on
+/// "other shell syntax".)*
+///
 /// `pub(crate)` because the *other* prompt shape has to clear it too and cannot
 /// be built from here: with `[web] tier` above `off` the system prompt carries
 /// the web tool's docs instead of REQ-563's BR-6 opt-in clause, and building
@@ -531,7 +593,7 @@ pub(crate) const REDACT_ESCAPING_DIVISOR: usize = 10;
 /// (`harness::tools::web::tests::the_web_tool_docs_clear_the_outbound_body_overhead`);
 /// this is the number both of them measure against, so the two shapes cannot
 /// come to disagree about the budget.
-pub(crate) const REDACT_BODY_OVERHEAD_BYTES: usize = 23 * 1024;
+pub(crate) const REDACT_BODY_OVERHEAD_BYTES: usize = 24 * 1024;
 
 /// The smallest headroom [`REDACT_BODY_OVERHEAD_BYTES`] may be left with after
 /// the largest system prompt this build produces (REQ-572 verify).
@@ -591,13 +653,25 @@ pub(crate) const MIN_PROMPT_HEADROOM_BYTES: usize = 48;
 /// in the guide's command roster, the family REQ-614 added after that roster
 /// was cut to families. The ledger line is on [`REDACT_BODY_OVERHEAD_BYTES`].
 ///
+/// REQ-620 leaves **714**, 666 usable — and it is the first move of this number
+/// since REQ-612 that came from the *ceiling* rather than from the prompt. The
+/// prompt grew 415 bytes (BR-7's reach contract in the `shell` tool's
+/// description) and the ceiling grew 1,024, which is the whole of the
+/// difference. *(721 / 673 against a 408-byte growth until this REQ's own
+/// Phase-5 verify, which spent 7 more on "other shell syntax".)* Read that as
+/// ASSUME-043 resolving rather than as room returning:
+/// at 105 there was no sentence's worth left to reclaim, and the bytes above
+/// the floor now are a KiB that was bought once, not slack that accumulated.
+/// The ledger line, and the 931 it cost every scanned route, are on
+/// [`REDACT_BODY_OVERHEAD_BYTES`].
+///
 /// # Updating it
 ///
 /// Re-measure, do not reason — that correction is what reasoning about it cost
 /// last time. Add a ledger line to [`REDACT_BODY_OVERHEAD_BYTES`] saying which
 /// REQ spent the bytes, then move this number in the same diff.
 #[cfg(test)]
-pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 105;
+pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 714;
 
 /// The same pin for the **web-enabled** prompt shape measured by
 /// `harness::tools::web::tests::the_web_tool_docs_clear_the_outbound_body_overhead`.
@@ -609,7 +683,7 @@ pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 105;
 /// holds the budget vocabulary, so the two shapes cannot come to disagree about
 /// which constant they are measuring against.
 #[cfg(test)]
-pub(crate) const RECORDED_WEB_PROMPT_MARGIN_BYTES: usize = 152;
+pub(crate) const RECORDED_WEB_PROMPT_MARGIN_BYTES: usize = 761;
 
 /// The gap between the two recorded margins, pinned (REQ-617).
 ///
@@ -643,7 +717,7 @@ const _: () = assert!(
 ///
 /// ```text
 ///   HarnessConfig::context_budget_bytes   63,488 bytes  (turn_loop.rs)
-///   + `REDACT_BODY_OVERHEAD_BYTES`        23,552 bytes  (system prompt, tool
+///   + `REDACT_BODY_OVERHEAD_BYTES`        24,576 bytes  (system prompt, tool
 ///                                                        descriptions, the
 ///                                                        repository-notes
 ///                                                        block, JSON envelope
@@ -652,11 +726,11 @@ const _: () = assert!(
 ///                                                        test below checks it
 ///                                                        against the real
 ///                                                        system prompt)
-///   = the largest ordinary outbound body  87,040 bytes
+///   = the largest ordinary outbound body  88,064 bytes
 ///   × 2 (the margin — a cap that only just clears the body it has to hold is
 ///        one context-budget bump away from being the old collision again)
-///   = 174,080 bytes to clear
-///   ÷ REDACT_CHUNK_MAX_BYTES              174,080 / 56,561 = 3.08
+///   = 176,128 bytes to clear
+///   ÷ REDACT_CHUNK_MAX_BYTES              176,128 / 56,561 = 3.11
 ///   → the next whole chunk up                        4
 /// ```
 ///
@@ -676,6 +750,14 @@ const _: () = assert!(
 /// wider, and a fifth possible model call — is on
 /// [`REDACT_BODY_OVERHEAD_BYTES`], and the re-stating test is the one named
 /// there.
+///
+/// REQ-620's 23→24 KiB raise takes the quotient 3.08→3.11 and the count stays
+/// **four**, which is the older rhythm again: the move that changes this number
+/// has already been made, and a raise landing above 21,353 inherits it. What it
+/// does not inherit is free — with the count unmoved the cap cannot grow, so
+/// the whole KiB comes out of [`REDACT_SCANNABLE_CONTEXT_BYTES`] (−931) rather
+/// than out of a new window. That account is on
+/// [`REDACT_BODY_OVERHEAD_BYTES`] too.
 ///
 /// **REQ-586: the remote budget is bounded by this when the scan applies.**
 /// The arithmetic above runs from the *default* context budget up to the cap;
@@ -697,8 +779,9 @@ const _: () = assert!(
 /// against the real chunker rather than restated, and enforced by
 /// [`scan`](crate::harness::redact::scan) before the first call) — p50 ≤ 10 s
 /// and p95 ≤ 25 s at ADR-8's per-chunk budget, against a context-budget-full
-/// turn's expected **two**, which REQ-612's wider body leaves unchanged
-/// (87,040 bytes is still one stride and a remainder). Five is the number that
+/// turn's expected **two**, which REQ-612's wider body left unchanged and
+/// REQ-620's leaves unchanged again (88,064 bytes is still one stride and a
+/// remainder). Five is the number that
 /// has to stay small because it multiplies that budget, and a cap twice this
 /// size would double the ordinary latency. It no longer multiplies the *worst
 /// case*: the scan as a whole is bounded at one `DUTY_DEADLINE`, not one per
@@ -754,23 +837,25 @@ pub const fn redact_input_max_bytes(n_ctx: u32) -> usize {
 ///
 /// ```text
 ///   REDACT_INPUT_MAX_BYTES              226,244 bytes  (the cap: 4 × 56,561)
-///   − REDACT_BODY_OVERHEAD_BYTES         23,552 bytes  (system prompt, the
+///   − REDACT_BODY_OVERHEAD_BYTES         24,576 bytes  (system prompt, the
 ///                                                       repository-notes
 ///                                                       block, JSON envelope —
 ///                                                       what the body carries
 ///                                                       beyond the context)
-///   = room for the escaped context      202,692 bytes
+///   = room for the escaped context      201,668 bytes
 ///   ÷ (1 + 1/REDACT_ESCAPING_DIVISOR)    × 10 / 11     (the context plus its
 ///                                                       own escaping has to fit
 ///                                                       in that room)
-///   = the scannable context              184,265 bytes
+///   = the scannable context              183,334 bytes
 /// ```
 ///
-/// So a body at the bound is `184,265 + 18,426 (escaping) + 23,552 (overhead) =
+/// So a body at the bound is `183,334 + 18,333 (escaping) + 24,576 (overhead) =
 /// 226,243 ≤ 226,244`: four chunk-widths, up to five chunks with the overlap
 /// ([`REDACT_MAX_CHUNKS`](crate::harness::redact::REDACT_MAX_CHUNKS)) — inside
 /// the envelope REQ-562 measured, and ≈ 2.9× the local context budget
-/// (63,488), which admits every ADLC skill. (Before REQ-612 raised the overhead
+/// (63,488), which admits every ADLC skill. (It read `184,265 + 18,426 +
+/// 23,552 = 226,243` until REQ-620 took the overhead to 24 KiB — the same cap,
+/// 931 fewer bytes of context. Before REQ-612 raised the overhead
 /// this read `141,224 + 14,122 + 14,336 = 169,682 ≤ 169,683`, and on the
 /// 16,384-token engine window `88,196 + 8,819 + 11,264 = 108,279 ≤ 108,280`.)
 ///
@@ -795,7 +880,7 @@ pub const fn redact_input_max_bytes(n_ctx: u32) -> usize {
 /// reads it, and the egress-capture integration tests (the redact bound's own,
 /// AC-6) read the caps the same way from outside the crate. It is the *only*
 /// place the redact chain's arithmetic leaves this module — a second copy of
-/// the number anywhere (TASK-192's one-home grep: `184_265`/`184265` must hit
+/// the number anywhere (TASK-192's one-home grep: `183_334`/`183334` must hit
 /// comments and the one re-stating assertion only) would be the drift
 /// LESSON-446 is about.
 pub const REDACT_SCANNABLE_CONTEXT_BYTES: usize =
@@ -810,7 +895,7 @@ pub const REDACT_SCANNABLE_CONTEXT_BYTES: usize =
 /// is still stated in exactly one expression — that expression now takes the
 /// window as an argument instead of reading it from a literal.
 ///
-/// `184_265`, the figure the one-home grep looks for, is this function at
+/// `183_334`, the figure the one-home grep looks for, is this function at
 /// 32,768 and stays the value of the constant.
 #[must_use]
 pub const fn redact_scannable_context_bytes(n_ctx: u32) -> usize {
@@ -2636,6 +2721,35 @@ mod tests {
     /// **152**, the same 47 bytes looser it always is. The account, and the
     /// guard the bytes bought, is on [`REDACT_BODY_OVERHEAD_BYTES`].
     ///
+    /// **Recorded headroom at REQ-620:** `worst` **17,514** + `escaping` 6,348
+    /// = `spent` **23,862** against an overhead raised 23 → 24 KiB by this REQ,
+    /// leaving a margin of **714**. The opted-in twin is 17,467 / 23,815 /
+    /// **761** and stays the looser of the two by the same 47 bytes it always
+    /// has. REQ-620 spent **415** on both shapes: `SHELL_REACH_CONTRACT` (414
+    /// bytes) and the space joining it to REQ-615's cwd contract, in the `shell`
+    /// tool's description — BR-7's paragraph telling the model which command
+    /// shapes pin the session. Against the 105 this REQ inherited that is 310
+    /// over the ceiling, which is why the ceiling moved; the account is on
+    /// [`REDACT_BODY_OVERHEAD_BYTES`].
+    ///
+    /// *(The contract was 407 bytes and the margins 721 / 768 until REQ-620's
+    /// Phase-5 verify. The paragraph named five of the eight syntax classes
+    /// that pin and left brace expansion, backslash escapes and history
+    /// expansion unmentioned — so a model reading it would have believed
+    /// `echo {a,b}` kept its tier. Adding "other shell syntax" and trimming two
+    /// words elsewhere cost a net **7** bytes on both shapes, re-measured here
+    /// rather than reasoned.)*
+    ///
+    /// **Mutation run for REQ-620** (re-run at the Phase-5 re-verify, since the
+    /// contract had grown 7 bytes since the figure was written). Setting the
+    /// overhead back to `23 * 1024` with the contract in place → red at the
+    /// first assertion, naming a 17,514-byte prompt plus 6,348 of escaping
+    /// against an assumed 23,552: **310** bytes over — 303 before those 7 —
+    /// before the floor or the pin is reached. That is the
+    /// measuring assertion doing its job on a raise the way it did on the
+    /// REQ-615/REQ-617 collision, and it is the reason the recorded figures
+    /// above are measured rather than reasoned.
+    ///
     /// **Mutations run for REQ-612.** Dropping `repo_context` from the config
     /// rows below → red at the block self-check, naming the reason (the sweep
     /// would otherwise measure a 7,939-byte prompt, pass every inequality, and
@@ -2982,7 +3096,9 @@ mod tests {
     ///    **four** again. That is the first time this assertion has caught the
     ///    count actually moving, which is what it was written for: the raise
     ///    that moves it is indistinguishable, from every inequality in the
-    ///    tests above, from the four raises that did not.
+    ///    tests above, from the four raises that did not. REQ-620's 24 KiB
+    ///    takes the quotient to 3.11 and the count stays four — a raise that
+    ///    inherits REQ-612's move rather than making one.
     /// 2. **Every `[privacy] redact = true` route's byte budget moved.**
     ///    [`REDACT_SCANNABLE_CONTEXT_BYTES`] is `(cap − overhead) × 10 / 11`, so
     ///    REQ-587's raise cut it 89,127 → 88,196 (931 bytes off the budget
@@ -2994,13 +3110,23 @@ mod tests {
     ///    by 8,378 had the count held at three, and instead the count went to
     ///    four and the cap gained a whole 56,561-byte window. A wider budget is
     ///    still a *changed* budget — the direction is not the point, the
-    ///    re-statement is.
+    ///    re-statement is. REQ-620 cuts it, 184,265 → **183,334**: with the
+    ///    count unmoved the cap cannot grow, so its one-KiB raise lands on the
+    ///    bound as `1,024 × 10 / 11` — the same 931 REQ-587's raise cost, and
+    ///    the same 931 no inequality above this line can see.
     ///
     /// The literal here is the **assertion**, not a second home for the number
     /// (TASK-192's one-home grep is about the constant's definition, which is
     /// still the expression). Its whole job is to be updated by hand in the
     /// same diff that moves the overhead, so that narrowing a live budget is a
     /// line a reviewer reads.
+    ///
+    /// **Mutation run for REQ-620:** put [`REDACT_BODY_OVERHEAD_BYTES`] back at
+    /// `23 * 1024` and this goes red on the second claim — the bound returns to
+    /// 184,265 and the message names the −931 — while the first stays green,
+    /// because that raise did not move the chunk count. Two claims, two
+    /// failures, and the raise that reddens only one of them is the one this
+    /// test was written to make visible.
     #[test]
     fn the_overhead_raise_restates_the_chunk_count_and_the_scannable_bound() {
         use crate::harness::turn_loop::HarnessConfig;
@@ -3021,14 +3147,14 @@ mod tests {
 
         assert_eq!(
             REDACT_SCANNABLE_CONTEXT_BYTES,
-            184_265,
+            183_334,
             "the scannable bound moved to {REDACT_SCANNABLE_CONTEXT_BYTES}. It is derived, \
              so this is not a bug — it is the *cost*: every `[privacy] redact = true` \
              route's byte budget just changed by {} bytes, and that budget is what BR-7's \
              `bound: redact scan` refusal measures against. Update this figure in the same \
              diff that moved `REDACT_BODY_OVERHEAD_BYTES`, and say in that diff which way \
              the budget went.",
-            184_265i64 - REDACT_SCANNABLE_CONTEXT_BYTES as i64
+            183_334i64 - REDACT_SCANNABLE_CONTEXT_BYTES as i64
         );
     }
 

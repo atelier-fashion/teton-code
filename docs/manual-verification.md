@@ -3865,3 +3865,71 @@ What was missing that the evidence set could supply :
 Anything that hung, aborted, panicked, or crashed   :
 Notes / findings                                    :
 ```
+
+---
+
+# Manual verification runbook — REQ-620 (the command that pinned, cleared)
+
+**One step, by hand, on a remote route.** Everything else in REQ-620 is
+mechanically verified: the differential table pins every redirect form and every
+look-alike, the end-to-end suite asserts that no `session_pinned` is published
+for a cleared command and that the next prompt's own bytes reach a mock
+provider. What no mock settles is the case the REQ was written from — a **real**
+model, on a **real** provider, writing its own first shell call of a session and
+the session staying where it was.
+
+## What this proves that CI does not
+
+| Claim | Proven by CI? | Why not |
+|---|---|---|
+| The 2026-09-09 command classifies `rooted` | **yes** | classifier unit test, fixture roots |
+| No pin, and the next prompt reaches the provider | **yes** | mock provider, bytes asserted |
+| A real model's own first call survives a real session | **no** | the model writes the command, not the test |
+
+## Prerequisites
+
+- The shipped binary or a `--release` build, with `TETON_TEST_SEAMS` unset.
+- A session on a **remote** route (`/model` shows the provider, not the local
+  tier) in a checkout of this repository, with `.adlc/` and
+  `tools/lint-skills/` present.
+- A privacy boundary configured, or the builtin set left on — with no boundary
+  at all nothing pins and the check is vacuous.
+
+## Procedure
+
+1. In a fresh session, run this command through the `shell` tool — it is the
+   2026-09-09 command with its `~/bin` probe (the one out-of-root segment)
+   removed:
+
+   ```
+   ls .adlc/context/architecture.md .adlc/context/conventions.md 2>&1; echo ---; ls .adlc/ 2>/dev/null; echo ---; ls .adlc/partials/ 2>/dev/null | head; echo ---; ls tools/lint-skills/ 2>/dev/null; echo ---; which adlc-read
+   ```
+
+   Expect: the command runs, and **no `session pinned` line appears**. Ask a
+   second question and confirm the turn is still served by the remote provider
+   (`/verbose`'s route line, or `teton doctor`); the route's reason must not
+   mention a pin.
+
+2. The control, in the same session: add `; ls ~/bin/adlc-read 2>/dev/null`
+   back. Expect a pin whose notice names the *path*, not the redirect —
+   `cause: unknown_shell — a path argument resolves outside the session root` —
+   and `/shell allow` to lift it. Without this leg the first step proves
+   nothing: a daemon that had stopped pinning altogether would pass it.
+
+## Sign-off
+
+```
+REQ-620 manual check
+--------------------
+Date / build / commit                               :
+Provider / model the session started on             :
+Boundaries configured (or builtins left on)         : yes / no  <-- must be "yes"
+(1) command ran                                     : yes / no
+(1) `session pinned` line appeared                  : yes / no  <-- must be "no"
+(1) next turn served by the remote provider         : yes / no
+(1) route reason mentioned a pin                    : yes / no  <-- must be "no"
+(2) control pinned                                  : yes / no  <-- must be "yes"
+(2) the notice named an out-of-root path            : yes / no  (verbatim:)
+(2) `/shell allow` lifted it                        : yes / no
+Notes / findings                                    :
+```

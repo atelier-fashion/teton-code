@@ -584,6 +584,24 @@
   remedy. Seven bytes, re-measured 112 → 105 and 159 → 152, 57 usable above
   the floor.
 
+  **REQ-620 is the claimant that raised the ceiling (2026-09-09).** The `shell`
+  tool's description now carries a 414-byte reach contract — 415 with the space
+  joining it to REQ-615's cwd contract, so 310 more than the 105 the chain had
+  left — so `REDACT_BODY_OVERHEAD_BYTES` went 23 → 24 KiB and
+  the four figures below it were re-derived rather than re-reasoned: the chunk
+  count stays 4 (quotient 3.08 → 3.11), the total cap and `REDACT_MAX_CHUNKS`
+  are unmoved, and `REDACT_SCANNABLE_CONTEXT_BYTES` **falls** 184,265 →
+  183,334, so the whole KiB comes off every redact-scanning route's budget
+  rather than out of the chunk count the way REQ-612's raise did. Margins
+  re-measured, not reasoned: 105 → **714** and 152 → **761**, the gap still 47.
+  (721/768 against a 407-byte contract until REQ-620's own Phase-5 verify, which
+  found the paragraph naming five of the eight syntax classes that pin — brace
+  expansion, backslash escapes and history expansion unmentioned — and spent
+  seven more bytes on "other shell syntax" to make the sentence honest.)
+  It also retires the sentence above — the `shell` description now states the
+  grammar the pin enforces, so `/shell allow` is no longer the model's only
+  resident route to it (REQ-620 ADR-620-5, ASSUME-043 resolved, ASSUME-048).
+
 - **A repository-touching act with no human typing a name gets its own gate
   entry point, keyed by the durable root** (REQ-613). Writing a missing
   `TETON.md` is a *daemon* act rather than a tool call, so no tool name is on
@@ -669,6 +687,76 @@
   is higher on each — including the route where the digest cap flips it — rather
   than by a single inequality that a change to either constant would slide past.
   ASSUME-042 holds the open question about the fraction's value.
+
+- **REQ-620 amends ADR-614-1's consequence list (2026-09-09).** REQ-614 made
+  the shell classifier an allowlist grammar: any command carrying one of
+  `' " ` $ \ > < { } ! * ? [` is refused whole, before a verb is read, and an
+  `unknown` shell result pins the session to the local tier until the user
+  types `/shell allow`. That list was written for commands a *user* types. On
+  2026-09-09 the first shell call a remote model made in an `/analyze` turn —
+  six `ls` calls, an `echo` and a `which`, nothing outside the root but a
+  `~/bin` probe — pinned the session for its whole life on a `2>&1`, and the
+  user's next question was answered by the 7B. Three amendments, each provable
+  by the executor's own behaviour, none of them changing the grammar's
+  polarity. **(a)** A redirect to `/dev/null` and a descriptor duplication are
+  lifted out of the command *before* the unmodelled scan and *before* the
+  split, as whole whitespace-delimited words: the scan refuses on `>`, and
+  `2>&1` and `&>/dev/null` carry the `&` the splitter reads as a separator, so
+  a strip that ran second would classify `2>` as a verb. One recogniser serves
+  the write gate and the classifier (`tools/shell_syntax.rs`), because two
+  readings of `2>/dev/null` in one daemon is LESSON-494's shape, and
+  `/dev/null` is consumed by it and never becomes a path token. **One
+  recogniser was not enough, twice over.** Both gates then *wrapped* it and the
+  wrappers disagreed, so the write gate now asks its whole question of the
+  residue: after the strip, does any word still carry a `>` **or a `<`** outside
+  quotes — and does any command-position word of that residue name a write
+  verb. Both tightenings are recorded rather than papered over. The `<` makes
+  `cat < input` a refusal at a home root where it used to run, and its refusal
+  sentence names redirection as well as creation; reading the *raw* command for
+  the verb trigger had let a leading null redirect shadow the verb entirely, so
+  `2>/dev/null rm -rf ~/x` and five kin were allowed, because a whitespace
+  tokenizer takes the redirect word as the program. This gate's two directions
+  are not symmetric — a false "write" costs one refused read, a false "not a
+  write" scaffolds a project into `$HOME` — so it errs toward refusing. In the
+  same family, **`&>/dev/null` lifts to a bare `&`, not to nothing**: `&>` is
+  bash, the executor is `sh -c`, and `dash` reads that `&` as a command
+  separator, so re-emitting it reproduces the parse of the shell that grants the
+  *least* reach. Without it `ls &>/dev/null grep -r SECRET . 1>&2` was one
+  segment whose verb is `ls`, and the recursive `grep` was never verb-checked.
+  **(b)** The
+  splitter now records the separator that preceded each segment, and **only a
+  single `|` makes a segment piped** — an *or* is not a pipe — where a content
+  verb that names no existing file reads its stdin, which the previous segment
+  was already classified on, instead of being scored as a read of the whole
+  root. The exemption is an **allowlist** — a closed set of pure filters
+  (`head`, `wc`, `sort`, …) plus `grep`, and for **either** only when no word
+  starts with `--` and no single-`-` cluster carries `d`, `r` or `R`. The flag
+  rule covering the filters and not only `grep` is the re-verify's correction:
+  membership alone had been the whole test for them, and `wc --files0-from -`,
+  `sort --files0-from -` and `shasum -c -` each read a list of *paths* off
+  stdin and open every one. `less` and `more` left the list in the same pass —
+  a pager takes `:e path` and `!cmd` from the terminal and honours `LESSOPEN`.
+  It shipped at TASK-404
+  as a denylist of the recursive `grep` spellings and REQ-620's own Phase-5
+  verify inverted it: `grep --directories recurse`, `--dir recurse`,
+  `--dereference-recursive` and `--rec` are all recursion GNU grep accepts,
+  none was on the list, and each returned `rooted` for a command that reads
+  every file under the root — a denylist inside an allowlist grammar cannot be
+  completed by adding rows. `sed`, `awk`, `diff`, `cat` and every unenumerated
+  `grep` flag keep the walk. The walk, its budget and its skip set are
+  untouched. **(c)** The unmodelled scan reports the **class** it refused on —
+  quote, substitution, variable, redirect, glob, brace, escape, history, the
+  first present in a fixed order rather than the first in the text — and the
+  sentence rides to the pin and the notice as an explicit
+  `Option<&'static str>` beside the unknown bit (LESSON-653), which is what
+  makes "the reason carries no command byte" a property of the type. Everything
+  else in ADR-614-1's list stands. The fourth seam is the model's: the `shell`
+  tool's description now **states the grammar it is judged by**, because a
+  model that has never seen the grammar cannot avoid writing `2>/dev/null` and,
+  unlike a skill preamble (toolkit BUG-220), its output cannot be rewritten to
+  suit the matcher — paid for by raising the prompt ceiling rather than
+  shortening, recorded on the ledger above (REQ-620 ADR-620-1..6, REQ-614
+  ADR-614-1, LESSON-494, LESSON-623, LESSON-653).
 
 ## ADRs
 

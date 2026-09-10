@@ -79,7 +79,119 @@
 //! the user's home, so a boundary glob written the way REQ-619 taught the
 //! daemon to *mint* reaches a file a shell command named (m2).
 //!
+//! # The redirect widening, and the order it depends on (REQ-620 BR-1)
+//!
+//! [`UNMODELLED`] refuses every command containing `>` or `<`, and that rule
+//! was written for commands a user types. On 2026-09-09 the first shell call a
+//! remote model made in an `/analyze` turn was six `ls` calls, an `echo` and a
+//! `which` — nothing outside the root but a `~/bin` probe — and it pinned the
+//! session for the rest of its life on a `2>&1`. Nothing in that command could
+//! have read a protected byte, and a model that has never seen this grammar
+//! cannot avoid writing the form (REQ-620 Description).
+//!
+//! So [`classify_with_budget`] now runs
+//! [`super::shell_syntax::strip_null_redirects`] **before** the [`UNMODELLED`]
+//! scan and **before** the segment split (ADR-620-2 steps 1–2). Only the
+//! `NullRedirect` entity's forms are lifted, as whole words; every other use of
+//! `>` and `<` refuses the whole command exactly as REQ-614 left it (BR-2).
+//! The order is not a preference:
+//!
+//! - Stripping *after* the unmodelled scan cannot work — the scan refuses on
+//!   the `>` the strip exists to remove.
+//! - Stripping *after* the split cannot work — `2>&1` and `&>/dev/null` contain
+//!   `&`, which the splitter reads as a segment separator, so it would hand
+//!   `2>` to [`classify_segment`] as a verb.
+//!
+//! The widening adds no reach in either direction. A lifted redirect
+//! contributes no path token, so `/dev/null` never reaches [`resolve_token`]
+//! and never matches a boundary glob (BR-3); and it removes none, so
+//! `cat .env 2>/dev/null` is the `BoundaryTouch` it always was (BR-8) and
+//! `python x.py 2>/dev/null` is the opaque-verb `Unknown` it always was (BR-5).
+//! The verdict is still a function of the command's text alone (BR-10) — the
+//! strip is a pure string transform and no redirect's *effect* is consulted.
+//!
+//! # The pipeline widening: a piped reader reads its stdin (REQ-620 BR-4)
+//!
+//! BR-1(d) walks the root whenever a content verb was not handed explicit
+//! files, because "the reach is whatever the verb defaults to" and the default
+//! used to be assumed to be the current directory. For a segment whose stdin is
+//! a pipe that is simply false: `head -5` after a `|` reads the bytes the
+//! previous segment produced, and the previous segment was classified on its
+//! own paths. Walking the root for it is a walk for a read that cannot happen —
+//! and on any repository with a build tree the walk exhausts its budget, so the
+//! verdict was `Unknown` by exhaustion (the REQ's third open question).
+//!
+//! So the splitter records **which separator preceded each segment**
+//! ([`split_segments`], ADR-620-2 step 3). Exactly one `|` makes a segment
+//! [`SegmentPosition::Piped`]; `;`, `&&`, `||`, a lone `&`, `(`, `)` and a
+//! newline all leave it [`SegmentPosition::First`], because after any of those
+//! the segment's stdin is the terminal's. `||` and `&&` are therefore tokenised
+//! **longest-match-first**: REQ-614's byte-wise `split` read `||` as two `|`
+//! separators with an empty segment between them, which is harmless for a
+//! verdict and wrong for a position — an *or* is not a pipe.
+//!
+//! [`classify_segment`] takes the position and, for a `Piped` segment reading
+//! its default source, skips the root walk — but only when the verb is on
+//! [`reads_only_its_stdin`]'s **allowlist**. That polarity is the whole of the
+//! rule. It shipped at TASK-404 as a denylist of the recursive `grep`
+//! spellings, and a denylist inside an allowlist grammar is a machine for
+//! false negatives: `ls | grep --directories recurse SECRET`, `--dir recurse`,
+//! `--dereference-recursive` and `--rec` are all recursion GNU `grep` accepts,
+//! none of them was on the list, and each came back `Rooted` for a command
+//! that reads every file under the root. The exemption is now granted to a
+//! closed set of pure filters (`head`, `wc`, `sort`, …) plus `grep` when every
+//! word of the segment is a short flag that cannot be recursion; `sed`, `awk`,
+//! `diff`, `cat` and every unrecognised `grep` flag keep the walk.
+//!
+//! **The flag rule covers the filters too** (Phase-5 re-verify). Being named on
+//! the allowlist was at first the *whole* test for everything but `grep`, so
+//! `ls | wc --files0-from -`, `ls | sort --files0-from -` and
+//! `ls | shasum -c -` — each of which reads a list of **paths** off its stdin
+//! and then opens every one — took the exemption. A word starting with `--` now
+//! denies it for every verb on the list, `grep` included, and the two checksum
+//! verbs additionally refuse `-c`. `less` and `more` left the list in the same
+//! pass: a pager takes `:e path` and `!cmd` from the terminal and honours
+//! `LESSOPEN`, and none of that is visible here.
+//!
+//! The widening does not touch the walk, its budget or its skip set, and it
+//! does not reach a `First` segment: `head -5` alone and `ls; head -5` still
+//! read the root, and `cat missing | head` still walks in its *first* segment,
+//! on `cat missing`. That is BR-4's stated limit rather than a gap.
+//!
+//! # The refusal names its class (REQ-620 BR-6)
+//!
+//! The [`UNMODELLED`] scan used to answer one sentence — "the command uses
+//! shell syntax this classifier does not model" — for all thirteen characters.
+//! That sentence reaches three surfaces (`skill_invoked.reach_reason`, the
+//! `session_pinned` event, the CLI's pin notice) and told none of their readers
+//! anything they could act on: the model that pinned the 2026-09-09 `/analyze`
+//! session could not learn from it that a `2>&1` was the offending byte, and
+//! the user reading the notice could not either.
+//!
+//! So the scan reports an [`UnmodelledSyntax`] class and the class names the
+//! sentence. The class is the **first present in [`UNMODELLED_ORDER`]**, not
+//! the first to appear in the command: `ls *.rs 'x'` reports the quote, because
+//! a fixed order is the only way the reason is a function of the command rather
+//! than of where a byte happens to fall.
+//!
+//! The sentences stay content-free the way every other reason here does, and
+//! one step harder: [`UnmodelledSyntax::reason`] is a `const fn` over a closed
+//! set, so what reaches an event is chosen at compile time and cannot be
+//! assembled from the command (REQ-619 BR-7, LESSON-624's egress-capture
+//! posture). The class travels onward as an explicit `Option<&'static str>`
+//! beside the unknown bit — [`Verdict::unknown_reason`], then
+//! `ToolProvenance::from_bits`, the egress `Provenance`, the taint sink and
+//! `SessionPinned::reason` — rather than being re-derived at the notice from
+//! the cause word, which would be a second classifier (ADR-620-4, LESSON-653).
+//!
 //! # Mutation record (conventions.md — show the test can fail)
+//!
+//! Swapping [`UNMODELLED_ORDER`] so `Glob` precedes `Quote` turns
+//! [`tests::each_unmodelled_class_names_itself_and_nothing_else`] red on its
+//! precedence row (`ls *.rs 'ZQX9'`) and **nothing else in this crate's lib
+//! suite** — measured, 1 of 2,237: the eight per-class rows are each
+//! single-class by construction, so the order is only observable where two
+//! classes meet. Run 2026-09-09, red, reverted.
 //!
 //! Inverting the fallthrough in [`classify_segment`] so an unrecognised verb
 //! yields `Rooted` turns **exactly one** test red:
@@ -102,6 +214,41 @@
 //! [`tests::the_scan_does_not_inherit_the_discovery_walks_skip_set`] and
 //! [`tests::a_truncated_scan_is_unknown_never_rooted`] red — two, because the
 //! default budget also stops the starved-scan fixture from truncating.
+//!
+//! REQ-620's strip was mutated six ways and the counts live with the
+//! recogniser ([`super::shell_syntax`]'s module docs), because that is the
+//! module that owns the rule. Two results belong here. Making
+//! [`super::shell_syntax::strip_null_redirects`] a no-op reds **ten** tests
+//! in this module (re-measured at the Phase-5 re-verify, from eight; the two
+//! that had been missed are
+//! [`tests::a_redirect_glued_to_its_verb_is_unknown_and_one_glued_to_a_separator_is_not`]
+//! and [`tests::the_toolkit_preamble_shapes_are_rooted_and_the_old_ones_are_not`])
+//! and leaves [`tests::every_other_redirect_stays_unmodelled`]
+//! green — correctly, since a no-op preserves exactly the refusal that test
+//! asserts, and a widening that broke BR-2 would have to be a different
+//! mutation. That different mutation is the third: lifting any word carrying
+//! `>` or `<` reds `every_other_redirect_stays_unmodelled` *and* REQ-614's own
+//! [`tests::adversarial_spellings_are_all_unknown`], on `cat <src/main.rs`.
+//! One widening, both suites — which is the evidence that the REQ-614 grammar
+//! is still the thing being widened rather than replaced.
+//!
+//! Making [`reads_only_its_stdin`] answer `true` unconditionally — the
+//! allowlist accepting everything, which is the polarity C1 inverted — turns
+//! **exactly one** test red: [`tests::the_piped_exemption_is_a_closed_allowlist`],
+//! on the **first** of its must-fire rows. One test, because that table is the
+//! only place the piped exemption's *boundary* is asserted;
+//! [`tests::a_piped_reader_with_no_path_reads_stdin_not_the_root`] asserts the
+//! exemption fires and a mutation that widens it cannot move that. And one
+//! *row*, because the `assert_eq!` aborts the loop — the earlier reading of
+//! this record said "all sixteen of its must-fire rows", which is what the
+//! table would report if it collected failures and is not what a run shows.
+//! Re-measured after the Phase-5 re-verify restructured the function.
+//!
+//! Dropping the `--` guard from the head of [`reads_only_its_stdin`] — the
+//! Phase-5 re-verify's own addition — reds the same one test, on its
+//! `wc --files0-from -` row. `grep`'s long options survive that mutation
+//! through the per-word arm, so the guard's own coverage is exactly the filter
+//! rows.
 
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
@@ -113,6 +260,7 @@ use teton_core::entities::PrivacyBoundary;
 use teton_core::provenance_id::{ProvenanceError, ProvenanceId};
 use teton_protocol::methods::RootKind;
 
+use super::shell_syntax::strip_null_redirects;
 use super::walk::{self, WalkBudget, WalkPolicy};
 use super::{canonical_through_existing_ancestor, lexical_normalize, under_denied_prefix};
 
@@ -193,6 +341,22 @@ pub struct Verdict {
 }
 
 impl Verdict {
+    /// [`Self::reason`], but only for an `Unknown` verdict — the shape
+    /// [`ToolProvenance::from_bits`](crate::harness::ToolProvenance::from_bits)
+    /// takes (REQ-620 ADR-620-4).
+    ///
+    /// `Some(reason)` **is** the unknown bit and its cause at once, which is
+    /// what stops a caller from passing one without the other. A `Rooted` or
+    /// `BoundaryTouch` verdict answers `None`: neither is opaque, and a
+    /// boundary touch's cause is the path, already named by `privacy_block`.
+    #[must_use]
+    pub fn unknown_reason(&self) -> Option<&'static str> {
+        match self.kind {
+            VerdictKind::Unknown => Some(self.reason),
+            VerdictKind::Rooted | VerdictKind::BoundaryTouch => None,
+        }
+    }
+
     fn unknown(reason: &'static str) -> Self {
         Self {
             kind: VerdictKind::Unknown,
@@ -238,26 +402,6 @@ impl Verdict {
     }
 }
 
-/// What the tokens seen so far proved about a boundary — the state that used to
-/// be a bare `saw_boundary` local in each of [`classify`] and
-/// [`classify_segment`] (REQ-619 verify, C2 and H1).
-///
-/// Two changes ride on making it a value the segment classifier **shares with
-/// its caller** rather than recomputes:
-///
-/// - `out_of_root` is the evidence [`Verdict::out_of_root_touch`] carries, and
-///   it can only be observed in the token loop that matched the glob.
-/// - `any` is now set the moment a token matches, so an `Unknown` returned
-///   *later in the same segment* — a denied prefix, a dirty subtree, an
-///   unresolvable token — no longer discards it. Before, the segment-level
-///   precedence rule ("a boundary touch outranks an unknown") held between
-///   segments and silently failed within one: `cat ~/.ssh/id_rsa /tmp/x` was
-///   `Unknown`, which `/shell allow` lifts.
-///
-/// Carrying `any` across segments is deliberate and cannot loosen a verdict:
-/// the caller already answers `BoundaryTouch` for the whole command once any
-/// segment touched, so a later segment that short-circuits on it only skips
-/// work whose answer could not have changed the result.
 /// The environment one segment is classified in: the session root, the compiled
 /// glob set, the directories no tool may read, the scan budget, and the user's
 /// home.
@@ -279,6 +423,26 @@ struct Scope<'a> {
     home: Option<&'a Path>,
 }
 
+/// What the tokens seen so far proved about a boundary — the state that used to
+/// be a bare `saw_boundary` local in each of [`classify`] and
+/// [`classify_segment`] (REQ-619 verify, C2 and H1).
+///
+/// Two changes ride on making it a value the segment classifier **shares with
+/// its caller** rather than recomputes:
+///
+/// - `out_of_root` is the evidence [`Verdict::out_of_root_touch`] carries, and
+///   it can only be observed in the token loop that matched the glob.
+/// - `any` is now set the moment a token matches, so an `Unknown` returned
+///   *later in the same segment* — a denied prefix, a dirty subtree, an
+///   unresolvable token — no longer discards it. Before, the segment-level
+///   precedence rule ("a boundary touch outranks an unknown") held between
+///   segments and silently failed within one: `cat ~/.ssh/id_rsa /tmp/x` was
+///   `Unknown`, which `/shell allow` lifts.
+///
+/// Carrying `any` across segments is deliberate and cannot loosen a verdict:
+/// the caller already answers `BoundaryTouch` for the whole command once any
+/// segment touched, so a later segment that short-circuits on it only skips
+/// work whose answer could not have changed the result.
 #[derive(Debug, Default)]
 struct BoundaryEvidence {
     /// Some path argument matched a boundary glob.
@@ -396,6 +560,179 @@ const UNMODELLED: &[char] = &[
     '\'', '"', '`', '$', '\\', '>', '<', '{', '}', '!', '*', '?', '[',
 ];
 
+/// Which of [`UNMODELLED`]'s shapes refused a command (REQ-620 BR-6).
+///
+/// The `UnmodelledSyntax` entity. One sentence per class rather than one
+/// sentence for all of them, because the single sentence — "the command uses
+/// shell syntax this classifier does not model" — told a user, and a model,
+/// nothing they could act on: the model that pinned the 2026-09-09 `/analyze`
+/// session could not tell from it that a `2>&1` was the offending byte, and
+/// nor could the user reading the pin notice.
+///
+/// # Content-free by construction
+///
+/// [`Self::reason`] is a `const fn` returning a `&'static str` from a closed
+/// set, so the sentence a class names is fixed at compile time and cannot be
+/// assembled from the command. That is the whole of BR-6's second clause
+/// ("and only the class"): it is a property of the type, not a rule a
+/// contributor has to keep. A sentence therefore names the *class* — "a quoted
+/// string" — and never the byte, the position or the word it was found in.
+/// (The `History` sentence used to read "a history expansion (`!`)", which was
+/// the one place that claim was false of its own sentences; the parenthetical
+/// went at the Phase-5 verify.)
+///
+/// # `pub(crate)`, and no ordering derive
+///
+/// Both narrowed at the Phase-5 verify. Nothing outside the crate names this
+/// type — the sentences leave as `&'static str` on a provenance, an event and
+/// a notice, never as a discriminant — and `PartialOrd`/`Ord` implied an order
+/// this type does not have: the only order that means anything here is
+/// [`UNMODELLED_ORDER`], which is a `&[UnmodelledSyntax]` and deliberately not
+/// the declaration order a derive would have exposed. A comparison operator
+/// that silently answered declaration order would be a second, wrong answer to
+/// the question `UNMODELLED_ORDER` exists to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnmodelledSyntax {
+    /// `'` or `"` — a quoted string.
+    Quote,
+    /// A backtick, or `$(` — a command substitution.
+    Substitution,
+    /// `$` not opening a substitution — a shell variable.
+    Variable,
+    /// `>` or `<` that survived [`strip_null_redirects`] — a redirect to
+    /// something other than the null device (REQ-620 BR-2).
+    Redirect,
+    /// `*`, `?` or `[` — a glob.
+    Glob,
+    /// `{` or `}` — a brace expansion.
+    Brace,
+    /// `\` — a backslash escape.
+    Escape,
+    /// `!` — a history expansion.
+    History,
+}
+
+/// The order [`first_unmodelled_class`] reports in.
+///
+/// Fixed, and fixed *here* rather than derived from [`UNMODELLED`]'s order or
+/// from where the character happens to fall in the command, so the reason a
+/// given command draws is a function of the command alone and cannot move when
+/// somebody rewrites the character list. A command carrying a quote and a glob
+/// reports the quote whichever comes first in its text.
+///
+/// The order is severity-of-guessing: the classes at the top are the ones that
+/// would make a lexer of this grammar (quoting, substitution, expansion), and
+/// the ones at the bottom are the narrow spellings.
+pub(crate) const UNMODELLED_ORDER: &[UnmodelledSyntax] = &[
+    UnmodelledSyntax::Quote,
+    UnmodelledSyntax::Substitution,
+    UnmodelledSyntax::Variable,
+    UnmodelledSyntax::Redirect,
+    UnmodelledSyntax::Glob,
+    UnmodelledSyntax::Brace,
+    UnmodelledSyntax::Escape,
+    UnmodelledSyntax::History,
+];
+
+impl UnmodelledSyntax {
+    /// The content-free sentence this class refuses with — the value that rides
+    /// `skill_invoked.reach_reason`, the `session_pinned` event and the CLI's
+    /// pin notice (BR-6).
+    ///
+    /// Eight distinct sentences in one shape, so a reader who has seen one has
+    /// read them all and the class is the only thing that varies.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::Quote => "the command uses a quoted string this classifier does not model",
+            Self::Substitution => {
+                "the command uses a command substitution this classifier does not model"
+            }
+            Self::Variable => "the command uses a shell variable this classifier does not model",
+            Self::Redirect => {
+                "the command uses a redirect other than to /dev/null this classifier does not model"
+            }
+            Self::Glob => "the command uses a glob this classifier does not model",
+            Self::Brace => "the command uses a brace expansion this classifier does not model",
+            Self::Escape => "the command uses a backslash escape this classifier does not model",
+            Self::History => "the command uses a history expansion this classifier does not model",
+        }
+    }
+
+    /// This class's bit in [`first_unmodelled_class`]'s presence set.
+    ///
+    /// Written out rather than taken from `self as u16`. A discriminant is an
+    /// accident of declaration order: a ninth class declared *above* an
+    /// existing one would silently renumber every bit, and a ninth declared
+    /// below would index past a fixed-width set. Spelling the bit makes both
+    /// a compile error instead.
+    const fn bit(self) -> u16 {
+        match self {
+            Self::Quote => 1 << 0,
+            Self::Substitution => 1 << 1,
+            Self::Variable => 1 << 2,
+            Self::Redirect => 1 << 3,
+            Self::Glob => 1 << 4,
+            Self::Brace => 1 << 5,
+            Self::Escape => 1 << 6,
+            Self::History => 1 << 7,
+        }
+    }
+}
+
+/// The first class of [`UNMODELLED`] syntax present in `command`, in
+/// [`UNMODELLED_ORDER`], or `None` when every byte is modelled.
+///
+/// One walk, collecting which classes are present into a bit set, then one
+/// lookup in the order: the alternative — eight walks, short-circuiting on the
+/// first hit — reports the same class and reads as eight rules instead of one.
+/// `$` is the only character whose class depends on its neighbour (`$(` is a
+/// substitution and `$f` a variable), which is why the walk is over a peekable
+/// iterator rather than over [`UNMODELLED`] itself.
+///
+/// Every character in [`UNMODELLED`] maps to exactly one class — asserted by
+/// [`tests::each_unmodelled_class_names_itself_and_nothing_else`], so a
+/// character added to that list without a class here is a compile-green
+/// refusal with no sentence, which this function would otherwise report as
+/// "modelled".
+fn first_unmodelled_class(command: &str) -> Option<UnmodelledSyntax> {
+    // [`UNMODELLED`] is still the definition of "this grammar does not model
+    // it"; the classes below only *explain* which of its characters was found.
+    // Reading the list here rather than letting the arms below stand in for it
+    // is what keeps the two in one relationship instead of two lists that drift
+    // — and it is the early-out for the overwhelmingly common command that
+    // carries none of them.
+    if !command.chars().any(|c| UNMODELLED.contains(&c)) {
+        return None;
+    }
+    let mut present: u16 = 0;
+    let mut chars = command.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let class = match ch {
+            '\'' | '"' => UnmodelledSyntax::Quote,
+            '`' => UnmodelledSyntax::Substitution,
+            '$' => {
+                if chars.peek() == Some(&'(') {
+                    UnmodelledSyntax::Substitution
+                } else {
+                    UnmodelledSyntax::Variable
+                }
+            }
+            '>' | '<' => UnmodelledSyntax::Redirect,
+            '*' | '?' | '[' => UnmodelledSyntax::Glob,
+            '{' | '}' => UnmodelledSyntax::Brace,
+            '\\' => UnmodelledSyntax::Escape,
+            '!' => UnmodelledSyntax::History,
+            _ => continue,
+        };
+        present |= class.bit();
+    }
+    UNMODELLED_ORDER
+        .iter()
+        .copied()
+        .find(|class| present & class.bit() != 0)
+}
+
 /// Classify one `shell` invocation.
 ///
 /// Takes **no exit status and no output** (REQ-614 BR-8): a `pwd` that timed
@@ -470,8 +807,21 @@ fn classify_with_budget(
         return Verdict::unknown("the session root is not a project");
     }
 
-    if command.chars().any(|c| UNMODELLED.contains(&c)) {
-        return Verdict::unknown("the command uses shell syntax this classifier does not model");
+    // REQ-620 ADR-620-2, steps 1 and 2. The strip is **first**, and the order
+    // is the whole correctness argument: stripping after the unmodelled scan
+    // cannot work (the scan refuses on `>`), and stripping after the split
+    // cannot work (the `&` in `2>&1` is a separator, so a splitter that saw it
+    // first would hand `2>` to `classify_segment` as a verb and `1` to the next
+    // segment as one). Everything past this line reads the residue and is
+    // exactly the REQ-614 grammar.
+    let stripped = strip_null_redirects(command);
+    let command = stripped.residue.as_str();
+
+    // REQ-620 BR-6: the scan names the class it refused on rather than
+    // answering one sentence for all eight. The order is
+    // [`UNMODELLED_ORDER`]'s, not the command's.
+    if let Some(class) = first_unmodelled_class(command) {
+        return Verdict::unknown(class.reason());
     }
 
     let matcher = match BoundaryMatcher::new(boundaries) {
@@ -491,11 +841,15 @@ fn classify_with_budget(
     let mut sources = BTreeSet::new();
     let mut evidence = BoundaryEvidence::default();
 
-    for segment in command.split(['|', ';', '&', '(', ')', '\n']) {
+    // ADR-620-2 step 3: the split records the separator that preceded each
+    // segment, because the root-walk rule inside `classify_segment` needs to
+    // know what the segment's stdin is and nothing else in the segment's text
+    // says. Empty segments are skipped exactly as REQ-614 skipped them.
+    for (position, segment) in split_segments(command) {
         if segment.trim().is_empty() {
             continue;
         }
-        match classify_segment(&scope, segment, &mut sources, &mut evidence) {
+        match classify_segment(&scope, position, segment, &mut sources, &mut evidence) {
             SegmentVerdict::Rooted => {}
             // `evidence.any` is already set by the token that matched; the arm
             // is kept so the three outcomes stay enumerated at the caller.
@@ -535,19 +889,190 @@ fn classify_with_budget(
     }
 }
 
+/// What a segment's **stdin** is, which is the only thing the separator before
+/// it tells this grammar (REQ-620 BR-4).
+///
+/// Not "is there a pipe anywhere in the command": `ls | grep foo; head -5` has
+/// a pipe and its third segment is [`Self::First`], because a `;` hands the
+/// next command the terminal's stdin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentPosition {
+    /// The start of the command, or after `;`, `&&`, `||`, a lone `&`, `(`,
+    /// `)` or a newline. Stdin is the terminal's or nothing, so a content verb
+    /// with no explicit file reads the root — REQ-614 BR-1(d), unchanged.
+    First,
+    /// After exactly one `|`. Stdin is the previous segment's stdout, and that
+    /// segment was classified on its own paths.
+    Piped,
+}
+
+/// Split a command into segments, each carrying the position its preceding
+/// separator gave it (ADR-620-2 step 3).
+///
+/// Separators are tokenised **longest-match-first**, which is the whole reason
+/// this replaced REQ-614's `command.split(['|', ';', '&', '(', ')', '\n'])`.
+/// That split saw `||` as two `|` separators with an empty segment between, and
+/// `&&` as two `&`s — invisible in a verdict, since the empty segment is
+/// skipped and both spellings separate, and wrong the moment a segment's
+/// position is read from its separator. An *or* is not a pipe.
+///
+/// Empty segments are returned rather than filtered, so the caller keeps
+/// REQ-614's `trim().is_empty()` skip and this function stays a pure statement
+/// about separators.
+///
+/// Byte indexing is safe here without a char-boundary check: every separator is
+/// ASCII, so no match can begin inside a multi-byte character, and the only
+/// indices this slices at are match positions.
+fn split_segments(command: &str) -> Vec<(SegmentPosition, &str)> {
+    let bytes = command.as_bytes();
+    let mut segments = Vec::new();
+    let mut position = SegmentPosition::First;
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let separator = match bytes[i] {
+            b'|' if bytes.get(i + 1) == Some(&b'|') => Some((2, SegmentPosition::First)),
+            b'&' if bytes.get(i + 1) == Some(&b'&') => Some((2, SegmentPosition::First)),
+            b'|' => Some((1, SegmentPosition::Piped)),
+            b';' | b'&' | b'(' | b')' | b'\n' => Some((1, SegmentPosition::First)),
+            _ => None,
+        };
+        let Some((width, next)) = separator else {
+            i += 1;
+            continue;
+        };
+        segments.push((position, &command[start..i]));
+        position = next;
+        i += width;
+        start = i;
+    }
+    segments.push((position, &command[start..]));
+    segments
+}
+
+/// The verbs whose **only** input, when they were handed no existing file, is
+/// their stdin — the closed allowlist BR-4's piped exemption is drawn over.
+///
+/// Every entry is also in [`READS_CONTENT`] (asserted by
+/// [`tests::the_piped_allowlist_is_a_subset_of_the_content_verbs`]): the
+/// exemption can only ever remove the root walk from a verb that would
+/// otherwise have taken it. What is *not* here is the point — `sed` and `awk`
+/// take a `-f script` that can open any path, `diff` needs two operands, and
+/// `cat` names paths rather than patterns, so a `cat` whose file does not exist
+/// is a typo the walk should still account for. All four keep the walk.
+///
+/// # Membership is necessary and not sufficient (Phase-5 re-verify)
+///
+/// Being on this list *used* to be the whole test, and the list was therefore
+/// flag-blind: `ls | wc --files0-from -` and `ls | sort --files0-from -` read a
+/// NUL-separated list of **file names** off stdin and then open every one of
+/// them, and `ls | shasum -c -` reads a checksum list and opens every file it
+/// names. Each took the exemption and came back `rooted` for a command that can
+/// read any file under the root. So [`reads_only_its_stdin`] carries a guard
+/// over the **whole** allowlist — no word may start with `--`, for any verb —
+/// and a `-c` refusal for the two checksum verbs. The verb names below say
+/// which programs *may* qualify; the flags decide whether this call does.
+///
+/// **`less` and `more` are not here** and were, until the same pass. Both are
+/// pagers rather than filters: they take commands from the terminal (`:e path`
+/// opens another file, `!cmd` shells out) and `less` honours `LESSOPEN`, an
+/// environment-set preprocessor that runs on whatever it is handed. Nothing in
+/// this grammar can see any of that, and a pager on the end of a pipe is not a
+/// shape a model writes for output it means to consume — so they keep the walk,
+/// which is the pre-REQ-620 answer for both.
+const PIPED_STDIN_ONLY: &[&str] = &[
+    "head", "tail", "wc", "sort", "uniq", "cut", "nl", "tr", "md5", "shasum",
+];
+
+/// Whether a `Piped` segment's verb reads **nothing but its stdin** — the
+/// condition BR-4's exemption is granted on.
+///
+/// # The polarity is an allowlist, and that is the whole safety argument
+///
+/// This function used to be `reads_tree`, a **denylist** of the recursive
+/// `grep` spellings, inside a module whose opening paragraph says an allowlist
+/// is the only shape a reach grammar may take. It was the leak that shape
+/// exists to prevent: `ls | grep --directories recurse SECRET`,
+/// `--dir recurse`, `--dereference-recursive` and `--rec` are all spellings GNU
+/// `grep` accepts for recursion, none of them was in the denylist, and each
+/// skipped the root walk and came back `Rooted` for a command that reads every
+/// file under the root. (The doc comment claimed "the forms are the ones GNU
+/// and BSD `grep` accept"; GNU `grep` accepts `--directories=recurse`,
+/// `--dereference-recursive`, and any unambiguous abbreviation of a long
+/// option, so the claim was false as written and the denylist could not have
+/// been completed by adding rows.)
+///
+/// So the question is inverted. The exemption is granted only to
+/// [`PIPED_STDIN_ONLY`], plus `grep` and its two aliases, and in both cases only
+/// when the **flags** agree.
+///
+/// # The long-option guard sits over the whole allowlist (Phase-5 re-verify)
+///
+/// The rule was first written as three `grep`-only clauses, and the verb list
+/// above was consulted with no reference to its arguments at all. That was the
+/// same defect one verb over: `wc --files0-from -` and `sort --files0-from -`
+/// read a NUL-separated list of **file names** off stdin and open every one,
+/// and `shasum -c -` reads a checksum list and opens every file it names. All
+/// three were on the list, all three took the exemption, and all three came
+/// back `Rooted` for a command that reads any file under the root.
+///
+/// So `--` is refused for **every** verb, `grep` included, and the reason is
+/// the same one that inverted the polarity: a long option is a reach nobody has
+/// enumerated, and an allowlist may not pass what it has not read. On top of
+/// that:
+///
+/// * no word is a single-`-` cluster carrying `d`, `r` or `R` for a `grep` —
+///   `-r`, `-R`, `-rn`, `-nR`, `-d recurse`, and (the spelling the first version
+///   missed) `-nd recurse`, `-id skip`, `-drecurse`, where `-d` is *inside* a
+///   cluster rather than a word of its own;
+/// * `shasum` and `md5` refuse `-c`, which is the "verify a checksum list"
+///   mode — the one short flag on this allowlist that opens files.
+///
+/// Every other content verb, and every `grep` flag this list does not
+/// enumerate, keeps the root walk. A miss is therefore the pre-REQ-620 answer
+/// (`Unknown` on a root the walk cannot clear), which is the module's standing
+/// rule: the classifier may only be more permissive than the old daemon by an
+/// amount it can prove.
+fn reads_only_its_stdin(verb: &str, rest: &[&str]) -> bool {
+    // One guard, over the whole allowlist and before any verb is consulted: a
+    // long option is a reach this grammar has not read, whoever it belongs to.
+    if rest.iter().any(|word| word.starts_with("--")) {
+        return false;
+    }
+    if PIPED_STDIN_ONLY.contains(&verb) {
+        // The one short flag on the filter half that opens files: `-c` puts
+        // both checksum verbs into "read this list and verify every path in it".
+        return !(matches!(verb, "shasum" | "md5") && rest.contains(&"-c"));
+    }
+    if !matches!(verb, "grep" | "egrep" | "fgrep") {
+        return false;
+    }
+    rest.iter().all(|word| {
+        match word.strip_prefix('-') {
+            // `d` is read inside the cluster, not as a whole word: `-nd recurse`
+            // is `-n -d recurse` to `grep` and was recursion this exemption
+            // granted (Phase-5 re-verify).
+            Some(flags) => !flags.chars().any(|c| matches!(c, 'd' | 'r' | 'R')),
+            // A pattern, or any other operand: not a flag, so not recursion.
+            None => true,
+        }
+    })
+}
+
 enum SegmentVerdict {
     Rooted,
     BoundaryTouch,
     Unknown(&'static str),
 }
 
-/// One `|`/`;`/`&`-separated segment.
+/// One `|`/`;`/`&`-separated segment, and the stdin its separator gave it.
 ///
 /// **The fallthrough is `Unknown`** — see the module docs. Every verb this does
 /// not recognise, every path form it cannot resolve, every scan that ran out of
 /// budget lands here.
 fn classify_segment(
     scope: &Scope<'_>,
+    position: SegmentPosition,
     segment: &str,
     sources: &mut BTreeSet<ProvenanceId>,
     evidence: &mut BoundaryEvidence,
@@ -782,14 +1307,37 @@ fn classify_segment(
         return SegmentVerdict::BoundaryTouch;
     }
 
-    // BR-1(d): a content-reading verb given no path at all reads whatever is
-    // under the root.
-    // BR-1(d): a content-reading verb reads the root when it names no path at
-    // all, and may read it when none of its tokens named an existing file (see
-    // `named_an_existing_file` above). Either way the root's subtree decides.
+    // BR-1(d): a content-reading verb reads its **default source** when it
+    // names no path at all, and may be reading it when none of its tokens named
+    // an existing file (see `named_an_existing_file` above). This is the
+    // grammar's answer to "was that token a pattern or a path?", which it
+    // refuses to decide with a per-verb option table (ADR-614-1): given at
+    // least one existing file the verb was given explicit files, and given none
+    // its reach is whatever it falls back to.
+    let reads_its_default_source = paths.is_empty() || !named_an_existing_file;
+
+    // REQ-620 BR-4 / ADR-620-3. For a `Piped` segment that default source is
+    // the previous segment's stdout — bytes the previous segment was already
+    // classified on — so the root walk below is a walk for a read that cannot
+    // happen. `reads_only_its_stdin` is the allowlist that grants the
+    // exemption: everything it does not name — `sed`, `awk`, `diff`, `cat`, and
+    // every `grep` flag that could be recursion — keeps the walk.
+    //
+    // The exemption is expressed over the same "was it given explicit files"
+    // question BR-1(d) asks, because that is what BR-4's "no path argument"
+    // means in this module's vocabulary: `git log | grep fix` and
+    // `cat README.md | grep foo` name a *pattern*, not a path, and the REQ
+    // lists both as reading their stdin. A segment that *did* name an existing
+    // file never reaches this line anyway — it was given files, and they are in
+    // `sources`.
+    let reads_stdin_not_the_root = position == SegmentPosition::Piped
+        && reads_its_default_source
+        && reads_only_its_stdin(verb, &rest);
+
     if reads_content
-        && (paths.is_empty() || !named_an_existing_file)
+        && reads_its_default_source
         && !saw_directory
+        && !reads_stdin_not_the_root
         && !subtree_is_boundary_free(
             scope.root,
             scope.denied_prefixes,
@@ -905,11 +1453,56 @@ fn subtree_is_boundary_free(
     !hit && report.truncated_by.is_none() && report.unmintable == 0
 }
 
+/// Whether `phrase` is a verb this grammar recognises as reading names,
+/// contents, or nothing — i.e. one it can classify without falling through to
+/// `Unknown` (REQ-620 TASK-406).
+///
+/// **One reader, and it is a cross-check, not a gate.** Nothing in the
+/// classifier calls this: [`classify_segment`] consults the tables directly and
+/// its fallthrough is what actually makes an unrecognised verb `Unknown`. It
+/// exists so that the model-facing paragraph in
+/// [`SHELL_REACH_CONTRACT`](super::shell::SHELL_REACH_CONTRACT) — which names
+/// example verbs to a model that will then write them — can be held against
+/// these tables by a test in the module that owns the paragraph. A contract
+/// naming a verb this grammar refuses would teach the model to pin itself,
+/// which is worse than a contract that names none (LESSON-542: a grammar taught
+/// to the model must be read on every path it can answer through).
+///
+/// `git <sub>` is accepted as a two-word phrase against [`GIT_NAME_ONLY`],
+/// because that is the shape the contract names (`git status`) and the shape
+/// [`classify_segment`] reads.
+///
+/// `#[cfg(test)]` because the cross-check is its only reader: production code
+/// must go through [`classify_segment`], whose fallthrough is the real gate, and
+/// a second table-reader on the production path is how a grammar comes to have
+/// two answers (LESSON-494).
+#[cfg(test)]
+#[must_use]
+pub(crate) fn is_recognised_verb(phrase: &str) -> bool {
+    let mut words = phrase.split_whitespace();
+    let Some(verb) = words.next() else {
+        return false;
+    };
+    let sub = words.next();
+    if words.next().is_some() {
+        return false;
+    }
+    match (verb, sub) {
+        ("git", Some(sub)) => GIT_NAME_ONLY.contains(&sub),
+        (verb, None) => {
+            READS_NOTHING.contains(&verb)
+                || NAME_ONLY.contains(&verb)
+                || READS_CONTENT.contains(&verb)
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use teton_core::config::DEFAULT_BOUNDARIES;
-    use teton_core::entities::PrivacyBoundary;
+    use teton_core::entities::{BoundaryMode, PrivacyBoundary};
 
     /// A **project** root — ADR-614-2 makes `RootKind::Project` a precondition
     /// for `Rooted`, so a bare temp dir would classify everything `Unknown` and
@@ -1085,6 +1678,18 @@ mod tests {
             "git for-each-ref refs/remotes/origin/feat",
             "which gh && echo installed - auth and network checked at run || echo not installed — branch-only",
             "test -f .adlc/ETHOS.md && echo present || echo absent — run /init",
+            // AC-9's flipped rows, added at the Phase-5 verify: two toolkit
+            // shapes that were `Unknown` before REQ-620 and are `Rooted` now.
+            // The AC says the rows that flip must "say why" — these two are
+            // that, and without them the table asserts only the shapes the
+            // toolkit had already been rewritten to avoid.
+            //
+            // The first is the redirect widening (BR-1): the `2>/dev/null` is
+            // lifted and `cat <path> || echo none` is the grammar it always
+            // was. The second is the pipeline widening (BR-4): `head` after a
+            // `|` reads the previous segment's output, not the root.
+            "cat .adlc/context/architecture.md 2>/dev/null || echo none",
+            "ls .adlc/partials/ | head",
         ] {
             let v = verdict(&root, rewritten);
             assert_eq!(
@@ -1095,15 +1700,43 @@ mod tests {
                 v.reason
             );
         }
-        for old in [
-            r#"test -s .adlc/ETHOS.md && cat .adlc/ETHOS.md || echo "No ethos found — run /init to vendor .adlc/ETHOS.md""#,
-            r#"cat .adlc/context/architecture.md 2>/dev/null || echo "No architecture context found""#,
-            r#"grep -rl 'status: draft\|status: approved' .adlc/specs/*/requirement.md 2>/dev/null | head -20 || echo "No active specs""#,
-            "git diff main --stat || echo No diff available",
-            "cat .adlc/templates/task-template.md || cat ~/.claude/skills/templates/task-template.md || echo none",
+        // The old shapes, still `Unknown` — and the first three **for the
+        // quote**, which is the assertion the Phase-5 verify added. Each of
+        // them also carries a `2>/dev/null` or a glob, so a table asserting
+        // only `Unknown` would have gone on passing had REQ-620's strip
+        // wrongly cleared them: the reason is what says the quote is what is
+        // still refusing the command.
+        for (old, class) in [
+            (
+                r#"test -s .adlc/ETHOS.md && cat .adlc/ETHOS.md || echo "No ethos found — run /init to vendor .adlc/ETHOS.md""#,
+                Some(UnmodelledSyntax::Quote),
+            ),
+            (
+                r#"cat .adlc/context/architecture.md 2>/dev/null || echo "No architecture context found""#,
+                Some(UnmodelledSyntax::Quote),
+            ),
+            (
+                r#"grep -rl 'status: draft\|status: approved' .adlc/specs/*/requirement.md 2>/dev/null | head -20 || echo "No active specs""#,
+                Some(UnmodelledSyntax::Quote),
+            ),
+            // These two carry no unmodelled byte at all: the first is refused
+            // on the `git` subcommand table and the second on a `~/` path
+            // outside the root, so neither has a class to name.
+            ("git diff main --stat || echo No diff available", None),
+            (
+                "cat .adlc/templates/task-template.md || cat ~/.claude/skills/templates/task-template.md || echo none",
+                None,
+            ),
         ] {
             let v = verdict(&root, old);
             assert_eq!(v.kind, VerdictKind::Unknown, "{old:?} should be Unknown");
+            if let Some(class) = class {
+                assert_eq!(
+                    v.reason,
+                    class.reason(),
+                    "{old:?} is refused on its quote, not on its redirect"
+                );
+            }
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2066,5 +2699,1203 @@ mod tests {
             "a boundary file under a normally-pruned directory must still be seen"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Whether `reason` is one of the eight [`UnmodelledSyntax`] sentences.
+    ///
+    /// The accepted redirect forms must carry **none** of them (LESSON-550:
+    /// assert the absence, not the remedy), and "none of the eight" is the
+    /// absence to assert now that the refusal is not one sentence.
+    fn is_unmodelled_reason(reason: &str) -> bool {
+        UNMODELLED_ORDER.iter().any(|c| c.reason() == reason)
+    }
+
+    /// Every `NullRedirect` form the entity names, attached where `sh` allows
+    /// the attached spelling.
+    const NULL_REDIRECTS: &[&str] = &[
+        ">/dev/null",
+        "1>/dev/null",
+        "2>/dev/null",
+        ">>/dev/null",
+        "2>>/dev/null",
+        "&>/dev/null",
+        "</dev/null",
+        "2>&1",
+        "1>&2",
+        ">&2",
+    ];
+
+    /// The same forms in the spaced spelling. Only the operator forms have one
+    /// — a descriptor duplication is one word or it is not this form at all.
+    const SPACED_NULL_REDIRECTS: &[&str] = &[
+        "> /dev/null",
+        "1> /dev/null",
+        "2> /dev/null",
+        ">> /dev/null",
+        "2>> /dev/null",
+        "&> /dev/null",
+        "< /dev/null",
+    ];
+
+    /// Every other use of `>` and `<`, which REQ-620 BR-2 leaves exactly where
+    /// REQ-614 put it, beside the [`UnmodelledSyntax`] class each one refuses
+    /// on. The three `/dev/null`-adjacent rows are LESSON-494's failure mode
+    /// written out: one byte's difference between the gate and the shell that
+    /// runs the command.
+    ///
+    /// The last two rows are why the class is a column rather than a constant.
+    /// `2>$f` carries a redirect **and** a variable and `> "$f"` carries a
+    /// redirect, a variable and a quote; under [`UNMODELLED_ORDER`] they report
+    /// the variable and the quote, because the order is fixed and does not ask
+    /// which byte the reader was thinking about. Both are still `Unknown`,
+    /// which is the half BR-2 is about.
+    const REDIRECT_LOOKALIKES: &[(&str, UnmodelledSyntax)] = &[
+        ("> out.txt", UnmodelledSyntax::Redirect),
+        (">> log", UnmodelledSyntax::Redirect),
+        ("< input", UnmodelledSyntax::Redirect),
+        ("2>/dev/nul", UnmodelledSyntax::Redirect),
+        ("2>/dev/null/x", UnmodelledSyntax::Redirect),
+        ("2>/dev/nullx", UnmodelledSyntax::Redirect),
+        ("2>$f", UnmodelledSyntax::Variable),
+        ("> \"$f\"", UnmodelledSyntax::Quote),
+    ];
+
+    /// The verbs the differential table is run against — one from each of the
+    /// grammar's four tables plus a `git` subcommand, so a regression in the
+    /// strip cannot hide behind a single arm of [`classify_segment`].
+    const REDIRECT_TABLE_VERBS: &[&str] =
+        &["ls", "cat README.md", "git status", "test -s x", "echo hi"];
+
+    /// A project root for the redirect tables: clean of boundary files, holding
+    /// the one file `cat README.md` names.
+    fn redirect_root(tag: &str) -> PathBuf {
+        let root = project_root(tag);
+        std::fs::write(root.join("README.md"), "# fixture\n").unwrap();
+        root
+    }
+
+    /// **BR-1 / BR-10: a null redirect is lifted as a whole word, before the
+    /// unmodelled scan and before the split, and adds no reach.**
+    ///
+    /// The residue rows are the load-bearing half. `2>&1` contains `&`, which
+    /// the splitter reads as a segment separator, so a strip that ran second
+    /// would hand `2>` to [`classify_segment`] as a verb and `1` to the next
+    /// segment as one — and the separators that really are separators have to
+    /// survive the lift as their own words for TASK-404's splitter to see them.
+    ///
+    /// BR-10 is the last pair: the redirect exists precisely because the file
+    /// might not, and the verdict may not move when it appears. The signature
+    /// does most of that work — [`strip_null_redirects`] takes a `&str` and
+    /// nothing else — but the classifier's answer is the property the REQ
+    /// states, so it is the one asserted.
+    ///
+    /// **Mutation (run, re-measured 2026-09-09, red, reverted):** make
+    /// [`strip_null_redirects`](super::shell_syntax::strip_null_redirects) a
+    /// no-op — this reds first of eight, on the `ls 2>&1 && echo ok` residue
+    /// row. Drop the whole-word rule (`from_operator` accepting any operator
+    /// ending in `>`) — this reds, one of two, on the `ls>/dev/null` row.
+    #[test]
+    fn null_redirects_are_lifted_before_the_scan_and_the_split() {
+        // The lift itself: whole words out, separators standing. The rows
+        // are `shell_syntax`'s own (`STRIP_ROWS`), read from one place since
+        // the Phase-5 verify: this table and that one held six rows in common
+        // and had already come to disagree on `ls &>/dev/null || echo no`.
+        for (command, residue, lifted) in super::super::shell_syntax::STRIP_ROWS.iter().copied() {
+            let stripped = strip_null_redirects(command);
+            assert_eq!(
+                stripped.residue, residue,
+                "`{command}` should strip to `{residue}`"
+            );
+            assert_eq!(
+                stripped.lifted, lifted,
+                "`{command}` lifted the wrong count"
+            );
+        }
+
+        let root = redirect_root("lifted");
+        // A form on its own adds nothing and removes nothing: the verdict is
+        // the one the bare command gets.
+        let bare = verdict(&root, "ls");
+        assert_eq!(bare.kind, VerdictKind::Rooted, "{}", bare.reason);
+        for form in NULL_REDIRECTS.iter().chain(SPACED_NULL_REDIRECTS) {
+            let command = format!("ls {form}");
+            let v = verdict(&root, &command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Rooted,
+                "`{command}` should classify exactly as `ls` does ({})",
+                v.reason
+            );
+            assert_eq!(v.reason, bare.reason, "`{command}` reached a different arm");
+            assert!(v.sources.is_empty(), "`{command}` minted a source");
+        }
+
+        // BR-10: from the text alone. The redirect is there because the file
+        // may not exist, and the verdict may not move when it does.
+        let before = verdict(&root, "ls not-yet-there 2>/dev/null");
+        std::fs::write(root.join("not-yet-there"), "now it is\n").unwrap();
+        let after = verdict(&root, "ls not-yet-there 2>/dev/null");
+        assert_eq!(before.kind, VerdictKind::Rooted, "{}", before.reason);
+        assert_eq!(
+            before.kind, after.kind,
+            "the redirect's filesystem effect must not reach the verdict"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **The glued forms, at the verdict rather than at the strip.**
+    ///
+    /// *(Phase-5 verify.)* `shell_syntax`'s own table asserts what the strip
+    /// leaves behind; this asserts what the **classifier** answers, which is
+    /// the value every consumer reads. Two claims, and they point opposite
+    /// ways on purpose:
+    ///
+    /// * A redirect glued to its **verb** (`ls>/dev/null`, `ls>&1`) is a word
+    ///   the recogniser does not accept, so the unmodelled scan sees its `>`
+    ///   and refuses the command on the redirect class — the pre-REQ-620
+    ///   answer, and the REQ's Deferred section says so.
+    /// * A redirect glued to a following **separator** (`ls 2>&1;ls`,
+    ///   `ls 2>&1|head`) *is* peeled, and the command classifies as though the
+    ///   separator had been spaced. That is M1's widening, and it is asserted
+    ///   here because the write gate depends on it: the pre-REQ-620 gate
+    ///   allowed `cmd 2>&1|head` at a home root and the first REQ-620 gate
+    ///   refused it.
+    ///
+    /// **Mutation (run, red, reverted):** delete [`split_glued_redirect`]'s
+    /// call from `strip_line` — **7 red**, this test's second half among them,
+    /// with `root_gate`'s two tables (the benign separator-glued rows and the
+    /// cross-gate differential), `shell_syntax`'s strip table, and three of
+    /// this module's redirect tests. The first half stays green, correctly:
+    /// dropping the peel cannot make a verb-glued form *more* modelled.
+    #[test]
+    fn a_redirect_glued_to_its_verb_is_unknown_and_one_glued_to_a_separator_is_not() {
+        let root = redirect_root("glued");
+
+        for command in ["ls>/dev/null", "ls>&1", "cat README.md>/dev/null"] {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Unknown,
+                "`{command}` is glued to its verb and stays unmodelled ({})",
+                v.reason
+            );
+            assert_eq!(
+                v.reason,
+                UnmodelledSyntax::Redirect.reason(),
+                "`{command}` is refused by the scan on its surviving `>`"
+            );
+        }
+
+        for command in ["ls 2>&1;ls", "ls 2>&1|head", "ls 2>&1; ls"] {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Rooted,
+                "`{command}` peels at the separator and classifies as spaced ({})",
+                v.reason
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **Phase-5 verify, C2: `&>` is bash, and the executor's `sh` may be
+    /// `dash`.**
+    ///
+    /// `dash` is `/bin/sh` on the Linux CI leg, and it reads the `&` of
+    /// `&>/dev/null` as a command separator with the `>/dev/null` attached to
+    /// the command before it. So
+    /// `ls &>/dev/null grep -r SECRET . 1>&2` is **two** commands there, and
+    /// the second is a recursive `grep` over the session root. Lifting the word
+    /// whole made the residue a single segment whose verb was `ls`; the `grep`
+    /// arrived as an argument, met no verb check, and the command came back
+    /// `Rooted` on a root holding a `.env`.
+    ///
+    /// Re-emitting the separator reproduces `dash`'s parse. It is also strictly
+    /// more conservative than `bash`'s, where the same text is one command: a
+    /// separator can only ever split a segment in two, and both halves are
+    /// classified in full.
+    ///
+    /// **Mutation (run, red, reverted):** drop the [`NullRedirect::BothStreams`]
+    /// arm from `NullRedirect::residue_separator` so the form lifts to nothing
+    /// again — this test reds on both assertions, and
+    /// `shell_syntax::tests::the_strip_lifts_words_and_leaves_the_separators_standing`
+    /// reds on its three `&>` residue rows.
+    #[test]
+    fn the_both_streams_form_re_emits_the_separator_it_hides() {
+        let root = piped_root("both-streams");
+        const COMMAND: &str = "ls &>/dev/null grep -r SECRET . 1>&2";
+
+        let residue = strip_null_redirects(COMMAND).residue;
+        let segments: Vec<&str> = split_segments(&residue)
+            .into_iter()
+            .map(|(_, segment)| segment.trim())
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        assert_eq!(
+            segments,
+            vec!["ls", "grep -r SECRET ."],
+            "`&>` must leave the separator `dash` reads it as"
+        );
+
+        let v = verdict(&root, COMMAND);
+        assert_eq!(
+            v.kind,
+            VerdictKind::Unknown,
+            "the second command is a recursive grep over a root holding a .env ({})",
+            v.reason
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **BR-2: every other use of `>` or `<` stays exactly as REQ-614 left it.**
+    ///
+    /// The must-not-fire half of BR-1 (LESSON-440). `2>/dev/nul`,
+    /// `2>/dev/null/x` and `2>/dev/nullx` are the rows that matter: each is one
+    /// byte from a form this grammar now accepts, and each is a real file write
+    /// the classifier cannot prove anything about.
+    ///
+    /// **Mutation (run, re-measured 2026-09-09, red, reverted):** make the
+    /// recogniser non-total — lift any word carrying `>` or `<` — and this
+    /// reds on `ls > out.txt`, which comes back `Rooted`. It is one of seven,
+    /// and REQ-614's own
+    /// [`tests::adversarial_spellings_are_all_unknown`] is another, on
+    /// `cat <src/main.rs`: the same widening reaches both suites, which is what
+    /// makes the recogniser's totality a property and not a comment. A no-op
+    /// strip leaves this test green, correctly — it asserts the refusal a
+    /// no-op preserves.
+    #[test]
+    fn every_other_redirect_stays_unmodelled() {
+        let root = redirect_root("lookalikes");
+        for verb in REDIRECT_TABLE_VERBS {
+            for (lookalike, class) in REDIRECT_LOOKALIKES {
+                let command = format!("{verb} {lookalike}");
+                let v = verdict(&root, &command);
+                assert_eq!(
+                    v.kind,
+                    VerdictKind::Unknown,
+                    "`{command}` must stay unmodelled ({})",
+                    v.reason
+                );
+                assert_eq!(
+                    v.reason,
+                    class.reason(),
+                    "`{command}` should carry {class:?}'s sentence"
+                );
+            }
+        }
+        // A here-doc and a process substitution, named by BR-2 and refused by
+        // the same scan — both on the redirect class, since neither carries a
+        // quote, a substitution or a variable.
+        for exotic in ["cat << EOF", "diff <(ls) <(ls)"] {
+            assert_eq!(
+                verdict(&root, exotic).reason,
+                UnmodelledSyntax::Redirect.reason(),
+                "`{exotic}` must stay unmodelled"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A string that appears **only** in a test command, never in this file's
+    /// sentences, so "the reason carries no byte of the command" can be
+    /// asserted rather than reasoned about (LESSON-624's egress-capture
+    /// posture, applied to a reason instead of a payload).
+    const COMMAND_MARKER: &str = "ZQX9";
+
+    /// One command per [`UnmodelledSyntax`] class, each carrying **that class
+    /// alone** plus [`COMMAND_MARKER`].
+    ///
+    /// Single-class on purpose: a row that carried two would assert the
+    /// precedence rule instead of the class-to-sentence mapping, and the
+    /// precedence is asserted separately below where a mutation to
+    /// [`UNMODELLED_ORDER`] can be seen to move it.
+    const ONE_PER_CLASS: &[(&str, UnmodelledSyntax)] = &[
+        ("ls 'ZQX9'", UnmodelledSyntax::Quote),
+        ("ls $(echo ZQX9)", UnmodelledSyntax::Substitution),
+        ("ls $ZQX9", UnmodelledSyntax::Variable),
+        ("ls > ZQX9", UnmodelledSyntax::Redirect),
+        ("ls ZQX9*", UnmodelledSyntax::Glob),
+        ("ls {ZQX9}", UnmodelledSyntax::Brace),
+        ("ls ZQX9\\x", UnmodelledSyntax::Escape),
+        ("ls ZQX9!", UnmodelledSyntax::History),
+    ];
+
+    /// One command per **adjacent** pair of [`UNMODELLED_ORDER`], carrying
+    /// exactly those two classes and answering the earlier one.
+    ///
+    /// Seven rows for eight entries. Adjacency is what makes the table a pin on
+    /// the whole order: any single transposition of the order moves exactly one
+    /// of these rows, whereas a table of far-apart pairs is cleared by
+    /// transpositions in between (Phase-5 verify — the two precedence rows this
+    /// replaced left `Brace`/`Escape` free to swap with nothing going red).
+    const ADJACENT_PAIRS: &[(&str, UnmodelledSyntax)] = &[
+        // Quote > Substitution
+        ("echo \"x\" `y`", UnmodelledSyntax::Quote),
+        // Substitution > Variable
+        ("echo $(x) $y", UnmodelledSyntax::Substitution),
+        // Variable > Redirect
+        ("echo $x > y", UnmodelledSyntax::Variable),
+        // Redirect > Glob
+        ("echo > y *", UnmodelledSyntax::Redirect),
+        // Glob > Brace
+        ("echo * {a,b}", UnmodelledSyntax::Glob),
+        // Brace > Escape
+        ("echo {a} \\x", UnmodelledSyntax::Brace),
+        // Escape > History
+        ("echo \\x !y", UnmodelledSyntax::Escape),
+    ];
+
+    /// **BR-6 / AC-6: eight classes, eight distinct sentences, each naming only
+    /// its own class — and none of them naming the command.**
+    ///
+    /// Four claims, and each is a different way the refusal could go wrong:
+    ///
+    /// 1. **The mapping.** Each single-class command draws its own class's
+    ///    sentence. A table rather than eight asserts, so a class added to the
+    ///    enum without a row here is a missing row rather than a silent gap.
+    /// 2. **Distinctness.** Eight sentences, eight distinct strings. Two
+    ///    classes sharing a sentence would be the pre-REQ-620 defect in
+    ///    miniature — a reason that does not tell the reader which byte to fix.
+    /// 3. **Precedence.** `ls *.rs 'ZQX9'` holds a glob *before* a quote in the
+    ///    text and reports the quote, because [`UNMODELLED_ORDER`] decides and
+    ///    the command's byte order does not. The `$…>` row proves the order is
+    ///    read past its first entry.
+    /// 4. **Content-freeness.** No sentence contains [`COMMAND_MARKER`], and no
+    ///    sentence contains the command that produced it. The `&'static str`
+    ///    type is what makes this true; the assertion is what makes it *stay*
+    ///    true if somebody ever reaches for `format!`.
+    ///
+    /// The totality row is the fifth thing and belongs here rather than in its
+    /// own test: [`UNMODELLED`] is the list [`classify_with_budget`] no longer
+    /// reads, so a character added to it with no arm in
+    /// [`first_unmodelled_class`] would be a *refusal that stopped happening*.
+    ///
+    /// **Mutation (run, red, reverted):** swap [`UNMODELLED_ORDER`] so `Glob`
+    /// precedes `Quote` — this reds on claim 3's first row (`ls *.rs 'ZQX9'`
+    /// reports the glob) and on nothing else in the workspace, because the
+    /// per-class rows are single-class by construction and every other suite
+    /// asserts a `kind` rather than a sentence.
+    ///
+    /// **Re-measured at the Phase-5 verify, over every adjacent transposition:**
+    /// `Quote`↔`Substitution`, `Glob`↔`Brace`, `Brace`↔`Escape` and
+    /// `Escape`↔`History` were each swapped in turn and each reds **1**, this
+    /// test, on its own [`ADJACENT_PAIRS`] row. Before those rows existed the
+    /// `Brace`↔`Escape` swap reddened **nothing at all** — two precedence
+    /// asserts pinned two comparisons and left the rest of the order free.
+    #[test]
+    fn each_unmodelled_class_names_itself_and_nothing_else() {
+        let root = redirect_root("classes");
+
+        // 1. The mapping, through the classifier rather than through
+        //    `first_unmodelled_class` alone — the sentence has to reach a
+        //    `Verdict`, which is what every consumer reads.
+        for (command, class) in ONE_PER_CLASS {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Unknown,
+                "`{command}` must stay unmodelled ({})",
+                v.reason
+            );
+            assert_eq!(
+                v.reason,
+                class.reason(),
+                "`{command}` should carry {class:?}'s sentence"
+            );
+            assert_eq!(
+                v.unknown_reason(),
+                Some(class.reason()),
+                "an Unknown verdict's reason is the one that rides the pin: `{command}`"
+            );
+        }
+        assert_eq!(
+            ONE_PER_CLASS.len(),
+            UNMODELLED_ORDER.len(),
+            "one command per class, so a new class cannot ship untested"
+        );
+
+        // 2. Eight distinct sentences.
+        let sentences: BTreeSet<&str> = UNMODELLED_ORDER.iter().map(|c| c.reason()).collect();
+        assert_eq!(
+            sentences.len(),
+            UNMODELLED_ORDER.len(),
+            "each class must name itself, not share a sentence: {sentences:?}"
+        );
+
+        // 3. Precedence: the order decides, not the command's byte order.
+        assert_eq!(
+            verdict(&root, "ls *.rs 'ZQX9'").reason,
+            UnmodelledSyntax::Quote.reason(),
+            "a command with a quote and a glob reports the quote"
+        );
+        assert_eq!(
+            verdict(&root, "ls $ZQX9 > out").reason,
+            UnmodelledSyntax::Variable.reason(),
+            "a variable outranks a redirect"
+        );
+        // ... and every **adjacent** pair of the order, so the order is pinned
+        // along its whole length rather than at two points (Phase-5 verify).
+        // Two rows left seven of the eight entries free to move: swapping
+        // `Brace` and `Escape` reddened nothing at all.
+        //
+        // Each command carries exactly the two classes its row names, so the
+        // assertion is about which of *those two* wins and nothing else — and
+        // an adjacent pair is the only comparison that can distinguish two
+        // orders that differ by one transposition.
+        for (command, expected) in ADJACENT_PAIRS {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.reason,
+                expected.reason(),
+                "`{command}` holds two classes and {expected:?} comes first in \
+                 UNMODELLED_ORDER ({})",
+                v.reason
+            );
+        }
+        assert_eq!(
+            ADJACENT_PAIRS.len(),
+            UNMODELLED_ORDER.len() - 1,
+            "one row per adjacent pair, so a ninth class cannot ship with its \
+             position unasserted"
+        );
+
+        // 4. Content-freeness: the reason names the class and nothing the
+        //    command said.
+        for (command, _) in ONE_PER_CLASS {
+            let reason = verdict(&root, command).reason;
+            assert!(
+                !reason.contains(COMMAND_MARKER),
+                "`{command}`'s reason carried a byte planted in the command: {reason}"
+            );
+            assert!(
+                !reason.contains(command),
+                "`{command}`'s reason quoted the command: {reason}"
+            );
+        }
+
+        // 5. Totality: every character `UNMODELLED` refuses on has a class, so
+        //    the scan cannot silently stop refusing one.
+        for ch in UNMODELLED {
+            let probe = format!("ls x{ch}");
+            assert!(
+                first_unmodelled_class(&probe).is_some(),
+                "`{ch}` is in UNMODELLED with no class in `first_unmodelled_class`, \
+                 so a command carrying it would be read as fully modelled"
+            );
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **BR-3: `/dev/null` in a lifted redirect is not a path token.**
+    ///
+    /// LESSON-623's seam read the other way round — a path that is *not* a file
+    /// access must not be scored as one. The assertion is a differential on one
+    /// boundary glob that matches the device: named as a redirect target it
+    /// contributes nothing, named as an argument it is a touch. A test that only
+    /// checked the redirect form would pass against a classifier that never ran
+    /// the matcher at all.
+    ///
+    /// **Mutation (run, red, reverted):** stop consuming the spaced form's
+    /// `/dev/null` follower (drop the `words.next()` in `strip_line`'s spaced
+    /// arm) — this reds on `cat README.md > /dev/null` as a `BoundaryTouch`,
+    /// one of four. That is BR-3's failure mode exactly: the device left in
+    /// the residue, resolved as a path, and scored against a glob.
+    #[test]
+    fn dev_null_is_never_a_path_token() {
+        let root = redirect_root("devnull");
+        // A user glob that matches the device, so a `/dev/null` that reached
+        // path resolution would be visible as a boundary touch rather than as
+        // a silent no-op.
+        let mut boundaries = builtins();
+        boundaries.push(PrivacyBoundary::user("**/null", BoundaryMode::LocalOnly));
+
+        for form in NULL_REDIRECTS.iter().chain(SPACED_NULL_REDIRECTS) {
+            let command = format!("cat README.md {form}");
+            let v = verdict_full(&root, None, &boundaries, Vec::new(), &command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Rooted,
+                "`{command}` must not score the device as a file ({})",
+                v.reason
+            );
+            assert!(
+                !v.out_of_root_touch,
+                "`{command}` recorded an out-of-root touch"
+            );
+            assert!(
+                v.sources.iter().all(|id| !id.as_str().contains("null")),
+                "`{command}` minted an id for the device"
+            );
+            assert!(
+                !strip_null_redirects(&command).residue.contains("/dev/"),
+                "`{command}` left the device in the residue"
+            );
+        }
+
+        // The differential: the same bytes as an *argument* are a path token,
+        // and the glob finds them.
+        let v = verdict_full(&root, None, &boundaries, Vec::new(), "cat /dev/null");
+        assert_eq!(
+            v.kind,
+            VerdictKind::BoundaryTouch,
+            "the device named as an argument is an ordinary path ({})",
+            v.reason
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **BR-5 / AC-7: an opaque verb with a null redirect is still `Unknown`,
+    /// with the opaque-verb reason.**
+    ///
+    /// The REQ's BR-5 sentence orders the strip *after* the opaque-verb check;
+    /// ADR-620-2 orders it first, and the two agree on every observable,
+    /// because lifting a redirect cannot turn an unrecognised verb into a
+    /// recognised one. This test is what pins that: it asserts the *reason*,
+    /// not just the kind, so a `curl` that started refusing as "unmodelled
+    /// syntax" instead of "a network client" would red here even though the
+    /// verdict is the same.
+    ///
+    /// **Mutation (run, red, reverted):** make
+    /// [`strip_null_redirects`](super::shell_syntax::strip_null_redirects) a
+    /// no-op and this reds on `python x.py 2>/dev/null` — not on the kind,
+    /// which stays `Unknown`, but on the *reason*, which becomes the unmodelled
+    /// sentence. A test asserting only the kind would have passed.
+    #[test]
+    fn an_opaque_verb_with_a_null_redirect_is_still_unknown() {
+        let root = redirect_root("opaque");
+        for command in [
+            "python x.py 2>/dev/null",
+            "curl example.com >/dev/null 2>&1",
+            "sh -c ls 2>/dev/null",
+            "cargo build 2>&1 | head",
+        ] {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Unknown,
+                "`{command}` must pin ({})",
+                v.reason
+            );
+            assert_eq!(
+                v.reason, "the command runs an interpreter, build tool or network client",
+                "`{command}` should refuse on the verb, not on the redirect"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **BR-8: a redirect never hides a boundary read.**
+    ///
+    /// The strip runs before any verb is read, so the boundary path is still
+    /// resolved by [`classify_segment`] and BUG-216's precedence — a touch
+    /// outranks an unknown — is untouched. Two boundary sets, because the
+    /// builtin `**/.env` and a user glob reach the matcher by different
+    /// spellings, and both orders of the redirect, because `sh` accepts a
+    /// leading one and a model writes both.
+    ///
+    /// **Mutation (run, red, reverted):** make
+    /// [`strip_null_redirects`](super::shell_syntax::strip_null_redirects) a
+    /// no-op — this reds on `cat .env 2>/dev/null`, which comes back as the
+    /// unmodelled `Unknown` a `/shell allow` would lift rather than the
+    /// permanent touch it is.
+    #[test]
+    fn a_redirect_never_hides_a_boundary_read() {
+        let root = redirect_root("boundary");
+        std::fs::write(root.join(".env"), "SECRET=1\n").unwrap();
+        std::fs::create_dir_all(root.join("secrets")).unwrap();
+        std::fs::write(root.join("secrets/prod.env"), "TOKEN=2\n").unwrap();
+
+        // The builtin `**/.env`, which needs no configuration to be in force.
+        for command in [
+            "cat .env 2>/dev/null",
+            "2>/dev/null cat .env",
+            "cat .env 2>&1",
+            "cat .env </dev/null",
+        ] {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::BoundaryTouch,
+                "`{command}` must still be a touch ({})",
+                v.reason
+            );
+        }
+
+        // A user glob, over the path AC-3 names. `**/.env` does not reach
+        // `secrets/prod.env`, so this row would pass vacuously without it.
+        let mut boundaries = builtins();
+        boundaries.push(PrivacyBoundary::user("secrets/**", BoundaryMode::LocalOnly));
+        for command in [
+            "cat secrets/prod.env 2>/dev/null",
+            "2>/dev/null cat secrets/prod.env",
+        ] {
+            let v = verdict_full(&root, None, &boundaries, Vec::new(), command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::BoundaryTouch,
+                "`{command}` must still be a touch ({})",
+                v.reason
+            );
+        }
+        assert_eq!(
+            verdict_full(
+                &root,
+                None,
+                &builtins(),
+                Vec::new(),
+                "cat secrets/prod.env 2>/dev/null"
+            )
+            .kind,
+            VerdictKind::Rooted,
+            "must not fire: without the glob that covers it, the same read is an ordinary one"
+        );
+
+        // BUG-216's precedence, through a strip: a touch outranks an unknown
+        // even when the unknown is in a later segment.
+        let v = verdict(&root, "cat .env 2>/dev/null && python x.py");
+        assert_eq!(
+            v.kind,
+            VerdictKind::BoundaryTouch,
+            "a touch outranks an opaque verb ({})",
+            v.reason
+        );
+
+        // Must not fire: an ordinary read with the same redirect is clean.
+        let v = verdict(&root, "cat README.md 2>/dev/null");
+        assert_eq!(v.kind, VerdictKind::Rooted, "{}", v.reason);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **AC-1: the 2026-09-09 command, which pinned a session on a `2>&1`.**
+    ///
+    /// The command is the REQ's Description verbatim. Six `ls` calls, three
+    /// `echo`s, a `which`, and nothing outside the root but the final `~/bin`
+    /// probe — so without that segment it is `Rooted`, and with it the reason
+    /// names the path, not the redirect. That last distinction is the whole
+    /// point of AC-1: a user told "a redirect pinned your session" would delete
+    /// the redirect and pin again on the next turn.
+    ///
+    /// **Mutation (run, red, reverted):** make
+    /// [`strip_null_redirects`](super::shell_syntax::strip_null_redirects) a
+    /// no-op — the first assertion reds with "the command uses shell syntax
+    /// this classifier does not model", which is the 2026-09-09 pin verbatim
+    /// and the behaviour this REQ exists to end.
+    #[test]
+    fn the_2026_09_09_command_is_rooted_without_its_home_probe() {
+        let root = project_root("2026-09-09");
+        let home = fixture_home("2026-09-09");
+        std::fs::create_dir_all(root.join(".adlc/context")).unwrap();
+        std::fs::create_dir_all(root.join(".adlc/partials")).unwrap();
+        std::fs::write(root.join(".adlc/context/architecture.md"), "arch\n").unwrap();
+        std::fs::write(root.join(".adlc/context/conventions.md"), "conv\n").unwrap();
+
+        let without_the_probe = "ls .adlc/context/architecture.md .adlc/context/conventions.md 2>&1; echo ---; ls .adlc/ 2>/dev/null; echo ---; ls .adlc/partials/ 2>/dev/null | head; echo ---; ls tools/lint-skills/ 2>/dev/null; echo ---; which adlc-read";
+        let v = verdict_with_home(&root, &home, without_the_probe);
+        assert_eq!(
+            v.kind,
+            VerdictKind::Rooted,
+            "the command that pinned the 2026-09-09 session reads nothing outside the root ({})",
+            v.reason
+        );
+
+        let with_the_probe = format!("{without_the_probe}; ls ~/bin/adlc-read 2>/dev/null");
+        let v = verdict_with_home(&root, &home, &with_the_probe);
+        assert_eq!(
+            v.kind,
+            VerdictKind::Unknown,
+            "the `~/bin` probe is still outside the root ({})",
+            v.reason
+        );
+        assert_eq!(
+            v.reason, "a path argument resolves outside the session root",
+            "the reason must name the path, not the redirect"
+        );
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// **AC-2: the differential table.**
+    ///
+    /// One fixture, three halves. Every accepted form — attached and spaced —
+    /// on five verbs, each `Rooted` and each carrying *none* of the unmodelled
+    /// sentence (LESSON-550: assert the absence, not the remedy). Every
+    /// look-alike on the same five verbs, each `Unknown` with that sentence.
+    /// And the `&`-bearing forms beside the separators they must not be
+    /// mistaken for: `2>&1` and `&>/dev/null` are lifted whole, while `&&`,
+    /// `||`, `;` and a lone `&` still separate segments.
+    ///
+    /// The `ls & frobnicate` row is the must-not-fire one and it is why the
+    /// separator rows are not vacuous: `ls & ls` would pass against a splitter
+    /// that had stopped splitting on `&` entirely, because both halves are the
+    /// same benign verb. An unrecognised verb after the `&` proves a second
+    /// segment was classified.
+    ///
+    /// **Mutation (run, red, reverted):** make
+    /// [`strip_null_redirects`](super::shell_syntax::strip_null_redirects) a
+    /// no-op and this reds on `ls >/dev/null`; make the recogniser non-total
+    /// (lift any word carrying `>` or `<`) and it reds on `ls > /dev/null`
+    /// resolving the device outside the root; leave the spaced form's follower
+    /// in place and it reds again. Three of the four mutations in
+    /// [`super::shell_syntax`]'s record reach this table, which is what a
+    /// differential table is for.
+    #[test]
+    fn the_redirect_differential_table() {
+        let root = redirect_root("differential");
+
+        for verb in REDIRECT_TABLE_VERBS {
+            for form in NULL_REDIRECTS.iter().chain(SPACED_NULL_REDIRECTS) {
+                let command = format!("{verb} {form}");
+                let v = verdict(&root, &command);
+                assert_eq!(
+                    v.kind,
+                    VerdictKind::Rooted,
+                    "`{command}` should be Rooted ({})",
+                    v.reason
+                );
+                assert!(
+                    !is_unmodelled_reason(v.reason),
+                    "`{command}` should not carry any refusal it was cleared of ({})",
+                    v.reason
+                );
+            }
+            for (lookalike, class) in REDIRECT_LOOKALIKES {
+                let command = format!("{verb} {lookalike}");
+                let v = verdict(&root, &command);
+                assert_eq!(
+                    v.kind,
+                    VerdictKind::Unknown,
+                    "`{command}` should be Unknown ({})",
+                    v.reason
+                );
+                assert_eq!(v.reason, class.reason(), "`{command}`");
+            }
+        }
+
+        // The `&`-bearing forms beside the separators they must not be mistaken
+        // for.
+        for command in [
+            "ls 2>&1 && echo ok",
+            "ls &>/dev/null || echo no",
+            "ls 2>&1; ls",
+            "ls 2>&1 | head",
+            "ls & ls",
+        ] {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Rooted,
+                "`{command}` should be Rooted ({})",
+                v.reason
+            );
+        }
+
+        // Must not fire: a lone `&` is still a separator, so the word after it
+        // is still read as a verb.
+        let v = verdict(&root, "ls & frobnicate");
+        assert_eq!(
+            v.kind,
+            VerdictKind::Unknown,
+            "a lone `&` must still start a segment ({})",
+            v.reason
+        );
+        assert_eq!(
+            v.reason, "the command's verb is not one this classifier recognises",
+            "the second segment's verb is what should have refused"
+        );
+        assert_eq!(
+            strip_null_redirects("ls & frobnicate").lifted,
+            0,
+            "a lone `&` is not a redirect"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The reason a segment that reads the root carries once the walk **hits**.
+    /// Asserting it rather than the bare `Unknown` is what keeps the piped rows
+    /// below from passing because the fixture happened to be refused for some
+    /// other reason.
+    const READS_THE_ROOT_REASON: &str =
+        "the command reads the root and it could hold a protected file";
+
+    /// A project root the boundary walk **hits**: it holds a `.env`, which
+    /// `DEFAULT_BOUNDARIES` matches. It also holds the one file the piped rows
+    /// name explicitly.
+    ///
+    /// LESSON-485 — a fixture that cannot reach the discriminating state is not
+    /// a test. Without the `.env` every row below would be `Rooted`, the
+    /// `Rooted` rows for the reason they claim and the `Unknown` rows for no
+    /// reason at all, and deleting the whole of BR-4 would leave the test green.
+    fn piped_root(tag: &str) -> PathBuf {
+        let root = project_root(tag);
+        std::fs::write(root.join(".env"), "SECRET=1\n").unwrap();
+        std::fs::write(root.join("README.md"), "# fixture\n").unwrap();
+        root
+    }
+
+    /// **BR-4 / AC-5: a content verb after a `|` reads its stdin, and after
+    /// anything else it still reads the root.**
+    ///
+    /// The two halves are the rule; either alone is not. A piped `head -5` has
+    /// no file to read but the bytes `ls src` produced, and `ls src` was
+    /// classified — so walking the root for it is a walk for a read that cannot
+    /// happen, and on this fixture it is a walk that *finds something*. The
+    /// second half is the must-not-fire one (LESSON-440) and it is where the
+    /// separator table earns its keep: `;`, `&&`, `||` and a lone `&` all hand
+    /// the next command the terminal's stdin, so `ls || head -5` is a `First`
+    /// segment reading the root even though the command contains two `|` bytes.
+    ///
+    /// `git log | grep fix` names a token, `fix`, and it is still a stdin read:
+    /// `fix` is a *pattern*, and BR-1(d) already answers "pattern or path?" with
+    /// "did any token name an existing file" rather than a per-verb option table
+    /// (ADR-614-1). The REQ lists this command and `cat README.md | grep foo`
+    /// among the reads-its-stdin shapes for that reason.
+    ///
+    /// **Mutation (run, red, reverted):** make [`split_segments`] return
+    /// [`SegmentPosition::Piped`] for every separator — this reds here, on
+    /// `ls; head -5` coming back `Rooted`, and in
+    /// [`tests::only_a_single_pipe_makes_the_next_segment_piped`]. Two, and no
+    /// more: the first segment of a command has no separator before it, so
+    /// `head -5` alone is `First` under the mutation too and cannot catch it.
+    #[test]
+    fn a_piped_reader_with_no_path_reads_stdin_not_the_root() {
+        let root = piped_root("piped");
+
+        for command in [
+            "ls src | head -5",
+            "ls src | wc -l",
+            "git log | grep fix",
+            "cat README.md | grep foo",
+            // The residue of a stripped redirect is still a pipe (TASK-403).
+            "ls src 2>/dev/null | head -5",
+            // Two pipes: both readers are piped.
+            "ls src | grep foo | wc -l",
+        ] {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Rooted,
+                "`{command}` reads the previous segment's output, not the root ({})",
+                v.reason
+            );
+        }
+
+        // The other half: after anything but a single `|`, stdin is the
+        // terminal's and BR-1(d) is unchanged. The first row is the vacuity
+        // floor — it proves the walk on this fixture *hits*, so the rows above
+        // are `Rooted` by the exemption and not by a clean tree.
+        for command in [
+            "head -5",
+            "ls; head -5",
+            "ls && head -5",
+            "ls || head -5",
+            "ls & head -5",
+            "ls\nhead -5",
+        ] {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Unknown,
+                "`{command}` runs `head` on the terminal's stdin ({})",
+                v.reason
+            );
+            assert_eq!(
+                v.reason, READS_THE_ROOT_REASON,
+                "`{command}` should be refused by the root walk"
+            );
+        }
+
+        // BR-4's stated limit, not a gap: the exemption is about the piped
+        // segment, and `cat missing` is the *first* one.
+        let v = verdict(&root, "cat missing | head");
+        assert_eq!(
+            v.kind,
+            VerdictKind::Unknown,
+            "`cat missing` walks in its own right ({})",
+            v.reason
+        );
+        assert_eq!(v.reason, READS_THE_ROOT_REASON);
+
+        // And a boundary is not hidden by a pipe: BUG-216's precedence holds.
+        let v = verdict(&root, "cat .env | head -5");
+        assert_eq!(
+            v.kind,
+            VerdictKind::BoundaryTouch,
+            "a protected file named before the pipe is still a touch ({})",
+            v.reason
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **BR-4's exemption is a closed allowlist, and everything off it walks.**
+    ///
+    /// *(Phase-5 verify, C1. This test shipped at TASK-404 as
+    /// `recursive_grep_reads_the_tree_whatever_its_stdin`, asserting a
+    /// **denylist** of the recursive `grep` spellings. The first four must-fire
+    /// rows below are the spellings that denylist missed: GNU `grep` accepts
+    /// `--directories recurse`, its `--dir` abbreviation,
+    /// `--dereference-recursive`, and `--rec` for `--recursive`, and each of
+    /// them came back `Rooted` for a command that reads every file under a root
+    /// holding a `.env`. A denylist inside an allowlist grammar cannot be
+    /// completed by adding rows, so the question was inverted.)*
+    ///
+    /// The must-not-fire half is the load-bearing half (LESSON-440): the
+    /// exemption still has to fire, or BR-4 is not implemented at all. `-i`,
+    /// `-n`, `-c`, `-v`, `-w` and `-H` are the short flags that cannot mean
+    /// recursion, and `head`/`wc`/`sort`/`cut` are the pure filters the
+    /// allowlist names directly.
+    ///
+    /// Two later rounds of must-fire rows, each a hole in the version above it:
+    ///
+    /// * `--color` and `sed -r` are the tightenings the **inversion** bought and
+    ///   TASK-404 asserted the other way — a long option this grammar does not
+    ///   enumerate, and a verb that is not a filter (`sed -f` takes a script
+    ///   that can open any path).
+    /// * `-nd`, `-id`, `-drecurse` and the three `--files0-from`/`-c` rows are
+    ///   the **Phase-5 re-verify**'s. The first three are `-d` *inside* a
+    ///   cluster, which the "no word is `-d`" clause read as a plain short flag;
+    ///   the others are the flag-blindness of the filter half, where being named
+    ///   on the allowlist was the whole test and `wc --files0-from -` therefore
+    ///   read a list of paths off stdin and opened every one.
+    ///
+    /// **Mutation (run, red, reverted):** make [`reads_only_its_stdin`] return
+    /// `true` unconditionally — the allowlist accepts everything — and the
+    /// **first** must-fire row here reds. One row, not every row: the
+    /// `assert_eq!` aborts the loop, so what a run reports is the first
+    /// disagreement and not a census. Counts are in the module docs.
+    ///
+    /// **Mutation (run, red, reverted, Phase-5 re-verify):** drop the `--`
+    /// guard from the head of [`reads_only_its_stdin`] — the `wc`/`sort`
+    /// `--files0-from` rows red (`grep`'s long options are still caught by the
+    /// per-word arm, so the guard's own coverage is exactly those rows).
+    #[test]
+    fn the_piped_exemption_is_a_closed_allowlist() {
+        let root = piped_root("piped-allowlist");
+
+        for command in [
+            // The four spellings the denylist missed (C1).
+            "ls src | grep --directories recurse foo",
+            "ls src | grep --dir recurse foo",
+            "ls src | grep --dereference-recursive foo",
+            "ls src | grep --rec foo",
+            // The spellings it did carry.
+            "ls src | grep -d recurse foo",
+            "ls src | grep -r foo",
+            "ls src | grep -rn foo",
+            "ls src | grep -nR foo",
+            "ls src | grep --recursive foo",
+            "ls src | egrep -R foo",
+            "ls src | fgrep -r foo",
+            // The tightenings: an unenumerated long option, and a verb that is
+            // not a filter.
+            "ls src | grep --color foo",
+            "ls src | grep -d skip foo",
+            "ls src | sed -r foo",
+            "ls src | awk -f prog",
+            "ls src | cat missing",
+            // Phase-5 re-verify: `-d` glued into a short cluster. `grep` reads
+            // `-nd recurse` as `-n -d recurse`, and the clause that looked for
+            // the whole word `-d` never saw it.
+            "ls src | grep -nd recurse foo",
+            "ls src | grep -id skip foo",
+            "ls src | grep -drecurse foo",
+            // Phase-5 re-verify: the filter half was flag-blind. Each of these
+            // verbs is on the allowlist, and each of these flags makes it read
+            // a list of **paths** and open every one of them.
+            "ls src | wc --files0-from -",
+            "ls src | sort --files0-from -",
+            "ls src | shasum -c -",
+            // The pagers, dropped from the allowlist in the same pass: `less`
+            // takes `:e path` and `!cmd` from the terminal and honours
+            // `LESSOPEN`, none of which this grammar can see.
+            "ls src | less",
+            "ls src | more",
+        ] {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Unknown,
+                "`{command}` is off the allowlist and keeps the root walk ({})",
+                v.reason
+            );
+            // Not merely `Unknown`: `Unknown` **by the walk**. A row refused by
+            // the unmodelled scan or by an unrecognised verb would pass this
+            // table while saying nothing about the allowlist.
+            assert_eq!(
+                v.reason, READS_THE_ROOT_REASON,
+                "`{command}` should be refused by the root walk"
+            );
+        }
+
+        for command in [
+            "ls src | grep -i foo",
+            "ls src | grep -c foo",
+            "ls src | grep -n foo",
+            "ls src | grep -v foo",
+            "ls src | grep -w foo",
+            "ls src | grep -H foo",
+            "ls src | head -5",
+            "ls src | wc -l",
+            "ls src | sort",
+            "ls src | cut -f 2",
+        ] {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Rooted,
+                "must not fire: `{command}` reads its stdin ({})",
+                v.reason
+            );
+        }
+
+        // The exemption is about the *walk*, not about the position: a `First`
+        // recursive grep was `Unknown` before this REQ and still is.
+        assert_eq!(
+            verdict(&root, "grep -r foo").reason,
+            READS_THE_ROOT_REASON,
+            "an unpiped recursive grep is unchanged"
+        );
+
+        // `.` is a **path** in this grammar, not a regex, so a piped
+        // `grep -c .` names the root directory explicitly and is refused by
+        // BR-1(d)'s directory scan before the allowlist is consulted at all.
+        // Recorded here rather than left as a surprising row in either table.
+        assert_eq!(
+            verdict(&root, "ls src | grep -c .").reason,
+            "a directory the command reads could hold a protected file",
+            "`.` names the root, and a named directory is scanned"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **[`is_recognised_verb`] has a must-not-fire half.**
+    ///
+    /// *(Phase-5 verify, M4.)* Its only caller —
+    /// [`super::shell::tests::the_reach_contract_is_one_paragraph_the_description_and_the_test_share`]
+    /// — asks it about four verbs the contract names and asserts `true` for
+    /// each. A function that answered `true` for everything would pass that
+    /// cross-check exactly as it does now, and the cross-check exists to catch
+    /// a contract offering the model a verb the grammar refuses. So the
+    /// negative half is asserted here, where the tables are.
+    ///
+    /// The `git` rows are the shape that needs its own claim: `git status` is a
+    /// two-word phrase read against [`GIT_NAME_ONLY`], and a bare `git` and a
+    /// `git commit` are both false — the first names no subcommand, the second
+    /// names one that reads content.
+    #[test]
+    fn an_unrecognised_verb_is_not_a_recognised_one() {
+        for phrase in ["ls", "cat", "grep", "git status", "echo", "test"] {
+            assert!(
+                is_recognised_verb(phrase),
+                "`{phrase}` is in one of this module's permissive tables"
+            );
+        }
+        for phrase in [
+            "python",
+            "curl",
+            "git commit",
+            "git",
+            "frobnicate",
+            "",
+            "git status --short",
+            "bin/ls",
+        ] {
+            assert!(
+                !is_recognised_verb(phrase),
+                "`{phrase}` is not a verb this classifier recognises"
+            );
+        }
+    }
+
+    /// The allowlist can only ever *remove* a walk a content verb would have
+    /// taken — so every entry has to be a content verb.
+    ///
+    /// A name here that [`READS_CONTENT`] does not carry would be a row with no
+    /// effect at all (a `NAME_ONLY` or `READS_NOTHING` verb never reaches the
+    /// walk), which is the shape a later author mistakes for coverage.
+    #[test]
+    fn the_piped_allowlist_is_a_subset_of_the_content_verbs() {
+        for verb in PIPED_STDIN_ONLY {
+            assert!(
+                READS_CONTENT.contains(verb),
+                "`{verb}` is on the piped allowlist but is not a content verb"
+            );
+        }
+        for verb in ["sed", "awk", "diff", "cat", "less", "more"] {
+            assert!(
+                !PIPED_STDIN_ONLY.contains(&verb),
+                "`{verb}` takes a file, a script or terminal commands and must keep the walk"
+            );
+        }
+    }
+
+    /// The splitter, on its own: only a single `|` pipes.
+    ///
+    /// REQ-614's `split(['|', ';', '&', '(', ')', '\n'])` read `||` as two `|`
+    /// separators around an empty segment. The verdict could not tell — the
+    /// empty segment is skipped and both spellings separate — so this is the
+    /// unit that says the two-character separators are one token each, at the
+    /// level where the difference is observable.
+    ///
+    /// **Mutation (run, red, reverted):** return [`SegmentPosition::Piped`] for
+    /// every separator and this reds on the `a || b` row, alongside
+    /// [`tests::a_piped_reader_with_no_path_reads_stdin_not_the_root`].
+    #[test]
+    fn only_a_single_pipe_makes_the_next_segment_piped() {
+        use SegmentPosition::{First, Piped};
+
+        assert_eq!(
+            split_segments("a | b"),
+            vec![(First, "a "), (Piped, " b")],
+            "a single `|` pipes"
+        );
+        assert_eq!(
+            split_segments("a || b"),
+            vec![(First, "a "), (First, " b")],
+            "an `or` is not a pipe, and it is one separator, not two"
+        );
+        assert_eq!(
+            split_segments("a && b"),
+            vec![(First, "a "), (First, " b")],
+            "an `and` is one separator, not two"
+        );
+        for (command, expected) in [
+            ("a", vec![(First, "a")]),
+            ("a ; b", vec![(First, "a "), (First, " b")]),
+            ("a & b", vec![(First, "a "), (First, " b")]),
+            ("a\nb", vec![(First, "a"), (First, "b")]),
+            (
+                "a | b | c",
+                vec![(First, "a "), (Piped, " b "), (Piped, " c")],
+            ),
+            // A pipe after an `or`: the `or` ends a segment as `First` and the
+            // `|` that follows pipes the one after it.
+            (
+                "a || b | c",
+                vec![(First, "a "), (First, " b "), (Piped, " c")],
+            ),
+            // Subshell parens separate and never pipe; the empty and
+            // whitespace-only segments they leave are the caller's
+            // `trim().is_empty()` skip.
+            (
+                "(a) | b",
+                vec![(First, ""), (First, "a"), (First, " "), (Piped, " b")],
+            ),
+            // A trailing separator leaves an empty last segment, carrying the
+            // position it would have given a segment that was there.
+            ("a |", vec![(First, "a "), (Piped, "")]),
+            // Must not fire, and the premise is what is being recorded
+            // (Phase-5 verify): a **leading** `|` makes the first segment
+            // empty and the second `Piped`, which would exempt `head -5` from
+            // the root walk on a command that reads nothing at all. It is safe
+            // because `sh` rejects `| head -5` outright — there is no producer,
+            // so nothing runs and there is nothing to leak. The row exists so
+            // that premise is written down rather than assumed: were the
+            // executor ever to accept the form, this is the segment that would
+            // need a `First`.
+            ("| head -5", vec![(First, ""), (Piped, " head -5")]),
+        ] {
+            assert_eq!(split_segments(command), expected, "`{command}`");
+        }
     }
 }

@@ -70,6 +70,10 @@ const TOOL_SOURCES: &[(&str, &str)] = &[
         "shell_provenance.rs",
         include_str!("../src/harness/tools/shell_provenance.rs"),
     ),
+    (
+        "shell_syntax.rs",
+        include_str!("../src/harness/tools/shell_syntax.rs"),
+    ),
     ("skill.rs", include_str!("../src/harness/tools/skill.rs")),
     ("walk.rs", include_str!("../src/harness/tools/walk.rs")),
     ("web.rs", include_str!("../src/harness/tools/web.rs")),
@@ -508,14 +512,16 @@ fn every_content_surfacing_tool_has_a_boundary_test() {
 
     // Floors first: a scan that has gone blind must fail rather than agree with
     // an empty claim (BUG-159).
-    // REQ-614 raised this from 12 to 13 (`shell_provenance.rs`). The equality —
-    // rather than a `>=` floor — is deliberate: it makes *adding* a tool source
-    // file a change someone has to look at, which is how a new file that should
-    // have carried a boundary test gets noticed. `shell_provenance.rs` declares
-    // no `impl Tool for`, so the derived set below is unchanged by it.
+    // REQ-614 raised this from 12 to 13 (`shell_provenance.rs`); REQ-620 raised
+    // it to 14 (`shell_syntax.rs`, the null-redirect recogniser both the write
+    // gate and the classifier read). The equality — rather than a `>=` floor —
+    // is deliberate: it makes *adding* a tool source file a change someone has
+    // to look at, which is how a new file that should have carried a boundary
+    // test gets noticed. Neither file declares an `impl Tool for`, so the
+    // derived set below is unchanged by them.
     assert_eq!(
         TOOL_SOURCES.len(),
-        13,
+        14,
         "the embedded source list changed; the scan below is no longer the module's shape"
     );
     for (file, text) in TOOL_SOURCES {

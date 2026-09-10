@@ -73,7 +73,7 @@ use teton_protocol::events::{
 use teton_protocol::methods::{project_skill_trust_key, RootKind};
 use tokio::runtime::Handle;
 
-use super::super::context::ToolProvenance;
+use super::super::context::{ToolProvenance, UnknownReach};
 use super::super::permissions::{PermissionGate, SkillConsent};
 use super::super::render;
 use super::{ResultDisposition, Tool, ToolContext, ToolOutcome, ToolRegistry};
@@ -1404,7 +1404,21 @@ pub fn roster_provenance(
     // unnameable row no longer discards the ids of the rows beside it: a mixed
     // roster is `UnknownWith`, so a `/shell allow` over it still has the other
     // skill files to match globs against (C1).
-    ToolProvenance::from_bits(ids, unknown, boundary_touch)
+    //
+    // REQ-620 BR-6: the generic reason, because this opacity is a *mint*
+    // failure rather than a classified command — no `UnmodelledSyntax` class
+    // describes "a skill file with no repo-relative identity", and inventing
+    // one here would put a sentence about shell syntax on a pin no command
+    // caused.
+    ToolProvenance::from_bits(
+        ids,
+        if unknown {
+            UnknownReach::Because(crate::harness::UNCLASSIFIED_REACH_REASON)
+        } else {
+            UnknownReach::No
+        },
+        boundary_touch,
+    )
 }
 
 /// The registry row a refusal's record describes, or `None` when nothing of

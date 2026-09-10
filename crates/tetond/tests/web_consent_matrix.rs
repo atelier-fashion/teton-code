@@ -1521,7 +1521,7 @@ fn only_the_client_rpc_can_lift_the_restriction() {
     // Now the restriction exists, and the RPC lifts it.
     runtime
         .session_taint()
-        .mark(&session, tetond::runtime::TaintCause::BoundaryHit);
+        .mark(&session, tetond::runtime::TaintCause::BoundaryHit, None);
     let result = runtime.web_override(
         &WebOverrideParams {
             session_id: session.clone(),

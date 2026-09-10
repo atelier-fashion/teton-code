@@ -66,7 +66,7 @@ use tetond::harness::{
     ToolRegistry,
 };
 use tetond::repo_context::{RepoContextBlock, RepoContextState};
-use tetond::runtime::{ClientPresence, DaemonRuntime, SessionTaint, WebTaintOverride};
+use tetond::runtime::{ClientPresence, DaemonRuntime, SessionTaint, TaintCause, WebTaintOverride};
 use tetond::sessions::SessionRegistry;
 use tetond::skills::RealFs;
 
@@ -237,10 +237,36 @@ async fn drive_scripted_turn(
 ) {
     // Turn 1: the tool call. Turn 2 carries its result, and on a boundary read
     // is refused before it can.
-    let transport = CaptureSse::with_bodies(vec![
-        sse_turn("Reading the config.", Some(tool)),
-        sse_turn("should never send", None),
-    ]);
+    drive_bodies(
+        repo,
+        session_id,
+        vec![
+            sse_turn("Reading the config.", Some(tool)),
+            sse_turn("should never send", None),
+        ],
+        ctx,
+    )
+    .await
+}
+
+/// [`drive_scripted_turn`] over an arbitrary script of provider bodies.
+///
+/// Extracted at REQ-620 TASK-407 so a fixture can drive a **second user
+/// prompt** — a turn with no tool call at all — through the same loop, the same
+/// choke point and the same boundaries as the tool-call turn above. The
+/// two-body script is the only thing `drive_scripted_turn` adds, and every
+/// existing caller reaches this through it unchanged.
+async fn drive_bodies(
+    repo: &std::path::Path,
+    session_id: &SessionId,
+    bodies: Vec<String>,
+    ctx: &mut ContextManager,
+) -> (
+    Result<tetond::harness::TurnOutcome, HarnessError>,
+    Vec<Vec<u8>>,
+    Vec<teton_protocol::events::PrivacyBlock>,
+) {
+    let transport = CaptureSse::with_bodies(bodies);
     let capture = transport.clone();
 
     let bus = Arc::new(EventBus::new());
@@ -816,6 +842,321 @@ async fn teton_docs_touches_no_repo_file_and_leaves_the_next_remote_turn_free() 
             "boundary content reached egress through a tool that reads no files"
         );
     }
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+// ---------------------------------------------------------------------------
+// REQ-620 — a null redirect clears, and never clears a boundary read
+// ---------------------------------------------------------------------------
+
+/// The 2026-09-09 shape, reduced to the two forms the transcript actually
+/// tripped on: a redirect to `/dev/null` and a descriptor duplication, either
+/// side of a `&&` the grammar must still read as a separator.
+///
+/// Not the whole command from the requirement's Description: that command's
+/// classification is a *grammar* claim and is asserted where the grammar lives
+/// (`shell_provenance::the_2026_09_09_command_is_rooted_without_its_home_probe`,
+/// AC-1, landed by TASK-403, including the `ls ~/bin/adlc-read` segment that
+/// keeps it `unknown` for a reason that is a path and not a redirect). What
+/// this file owes is the *consequence* — no pin, and the next prompt's bytes on
+/// the wire — and a two-segment command reaches it with nothing incidental in
+/// the way.
+const CLEARED_COMMAND: &str = r#"{"command":"ls src 2>/dev/null && echo ok 2>&1"}"#;
+
+/// The second prompt's own bytes, so "it reached the provider" is a claim about
+/// *this* prompt rather than about any request having left (LESSON-650).
+///
+/// A presence marker, not an egress-leak marker: prompts reach a provider by
+/// design, and the leak marker this file guards stays where LESSON-624 puts it
+/// — in `secrets/prod.env`'s bytes, written by [`temp_repo`] and never in a
+/// command, an argument or a prompt.
+const SECOND_PROMPT: &str = "Summarize the listing (redirect-clear-probe-7731).";
+
+/// A boundary read wearing the same redirect the cleared command wears, so the
+/// two tests below differ in the *path* and in nothing else.
+const BOUNDARY_COMMAND: &str = r#"{"command":"cat secrets/prod.env 2>/dev/null"}"#;
+
+/// The same read behind the **other** BR-1 form (Phase-5 verify).
+///
+/// A descriptor duplication is a different arm of the recogniser from a write
+/// to the null device — and, unlike it, the word carries an `&`, the byte the
+/// classifier's splitter reads as a segment separator. So a strip that lifted
+/// it wrongly would not merely fail to strip: it would hand `2>` to the segment
+/// classifier as a *verb* and the boundary path to a segment that no longer has
+/// a content verb in front of it. Only the `/dev/null` form was driven at the
+/// wire; this is the one whose failure mode is a re-segmentation.
+const BOUNDARY_COMMAND_DUPLICATION: &str = r#"{"command":"cat secrets/prod.env 2>&1"}"#;
+
+/// **BR-9 + AC-4, at the wire.** The model's first `shell` call carries a
+/// redirect to `/dev/null` and a descriptor duplication. Nothing pins, and the
+/// **next prompt's own bytes** reach the provider.
+///
+/// This is the charter-level outcome of the whole REQ, asserted the way
+/// LESSON-550 and LESSON-650 require: the *absence* of the pin and the
+/// *presence* of the bytes, never the classifier's return value. Before REQ-620
+/// this fixture pinned on the first `2>&1` — `unknown` by the grammar,
+/// `unknown_shell` at the commit — and the second prompt was refused at the
+/// choke point before a byte left, which is exactly the 2026-09-09 session's
+/// complaint.
+///
+/// Both readers of the one verdict are exercised, which is what makes this
+/// BR-9 rather than two coincidences (ADR-620-6):
+///
+/// - the **router's** reader, as the pin the commit seam takes —
+///   `SessionTaint::cause` after `CarriedTurn::commit`, the same value
+///   `RoutePin` answers from and the same value `session_pinned` is published
+///   from (`TaintingPrivacySink` is `pub(super)`, so the daemon-published event
+///   is asserted where a client can see it: `e2e::shell_pin_shape`);
+/// - the **choke point's** reader, as the second turn's request leaving with
+///   the first turn's `shell` result still in the carried conversation. A
+///   result the grammar had refused would be blocked here whatever the taint
+///   state said.
+///
+/// Two captured requests on turn 1 (the tool call, and the send carrying its
+/// result) and one on turn 2 (the second prompt) — three in total, counted per
+/// turn because each turn drives its own capture transport.
+///
+/// **Inversion (run 2026-09-09, red, restored):** with
+/// `shell_syntax::strip_null_redirects` made a no-op — returning the command
+/// unchanged with `lifted: 0` — this test fails at turn 1 with
+/// `Err(Remote(PrivacyBlocked(Boundary)))` where `Ok` was asserted: the residue
+/// still carries `>`, the unmodelled scan refuses the whole command on the
+/// redirect class, and the second prompt never gets a chance to leave. Both
+/// tests in this section red under that mutation (the other at its
+/// `blocks[0].path`), and 20 of the file's 22 stay green.
+#[tokio::test]
+async fn a_null_redirect_does_not_pin_and_the_next_prompt_reaches_the_provider() {
+    let repo = temp_repo();
+    let sessions = SessionRegistry::new();
+    let session_id = sessions
+        .create(SessionMode::Freeform, None, None)
+        .expect("a freeform session needs no phase")
+        .session_id;
+    let taint = Arc::new(SessionTaint::new());
+
+    // Turn 1 — the prompt and the model's redirect-bearing `shell` call.
+    let mut first = CarriedTurn::begin(
+        &sessions,
+        &session_id,
+        scripted_system(),
+        &scripted_config(),
+        Arc::clone(&taint),
+        boundaries(),
+        PROMPT,
+        std::collections::BTreeSet::new(),
+        false,
+        false,
+        None,
+    );
+    let (result, first_captured, blocks) = drive_scripted_turn(
+        &repo,
+        &session_id,
+        ("c1", "shell", CLEARED_COMMAND),
+        first.ctx_mut(),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "AC-4: a command whose only unmodelled bytes are null redirects must not \
+         be refused, got {result:?}"
+    );
+    assert!(
+        blocks.is_empty(),
+        "AC-4: nothing was refused, so nothing is announced as refused: {blocks:?}"
+    );
+    assert_eq!(
+        first_captured.len(),
+        2,
+        "the tool-call turn and the send carrying its result both left"
+    );
+    let provenance = context_provenance(first.ctx());
+    assert!(
+        !provenance.is_unknown(),
+        "AC-4: the stripped command is provable, so its result is not opaque: {:?}",
+        provenance.sources().collect::<Vec<_>>()
+    );
+
+    // The commit seam — the router's reader of the verdict.
+    first.commit();
+    assert_eq!(
+        taint.cause(&session_id),
+        None,
+        "BR-9: no `session_pinned` is publishable because nothing pinned — the \
+         cause the event is built from is absent"
+    );
+    assert_eq!(
+        taint.reason(&session_id),
+        None,
+        "and no syntax class was recorded, because none refused anything"
+    );
+
+    // Turn 2 — a second prompt on the session turn 1 left behind. Its own bytes
+    // are what must reach the provider.
+    let mut second = CarriedTurn::begin(
+        &sessions,
+        &session_id,
+        scripted_system(),
+        &scripted_config(),
+        Arc::clone(&taint),
+        boundaries(),
+        SECOND_PROMPT,
+        std::collections::BTreeSet::new(),
+        false,
+        false,
+        None,
+    );
+    let (result, second_captured, blocks) = drive_bodies(
+        &repo,
+        &session_id,
+        vec![sse_turn("Listed src; done.", None)],
+        second.ctx_mut(),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "AC-4: the next prompt must not be refused, got {result:?}"
+    );
+    assert!(
+        blocks.is_empty(),
+        "AC-4: and nothing is blocked: {blocks:?}"
+    );
+    assert_eq!(
+        second_captured.len(),
+        1,
+        "one request per prompt turn: the second prompt's"
+    );
+    assert!(
+        contains_bytes(&second_captured[0], SECOND_PROMPT),
+        "AC-4: the provider received *this prompt's* bytes, not merely some \
+         request (LESSON-650)"
+    );
+    second.commit();
+    assert_eq!(
+        taint.cause(&session_id),
+        None,
+        "and the session is still unpinned after the second turn"
+    );
+
+    assert_no_boundary_bytes(&first_captured);
+    assert_no_boundary_bytes(&second_captured);
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// **BR-8 + AC-3, at the wire.** The same redirect on a command that reads a
+/// boundary file changes nothing about the verdict: `cat secrets/prod.env
+/// 2>/dev/null` is a boundary touch, the send carrying it is refused naming the
+/// file, and the session pins **permanently**. Driven for **both** BR-1 forms
+/// since the Phase-5 verify — the null-device write and the descriptor
+/// duplication — because they are different arms of the recogniser and the
+/// second is the one whose word carries the splitter's separator byte.
+///
+/// The must-not-fire twin of the test above (LESSON-440), and the reason the
+/// widening is a widening rather than a hole: the two commands differ in their
+/// path and in nothing else, and they land on opposite sides. The leak marker
+/// lives only in `secrets/prod.env`'s bytes (LESSON-624) — never in the
+/// command, whose text a permission request and a tool-call title legitimately
+/// quote.
+///
+/// The pin's *shape* is asserted through the same three values
+/// `session_pinned_payload` is built from — cause, `liftable`, and the
+/// class `reason` — because the type that publishes the event is `pub(super)`
+/// and cannot be reached from an integration test. The event itself is asserted
+/// on what a client received, in
+/// `e2e::shell_pin_shape::shell_allow_does_not_lift_a_boundary_hit_behind_a_redirect`,
+/// which also drives the `/shell allow` refusal (BR-8's second half).
+///
+/// **Inversion (run 2026-09-09, red, restored):** with `strip_null_redirects`
+/// made a no-op this test reds at the *first* claim — the provenance is
+/// `unknown` with an empty source set — and would have redded again at
+/// `blocks[0].path`, which comes back `<unknown-provenance>`. Note what the
+/// mutation does **not** do: the turn is blocked either way and nothing leaks,
+/// because a strip that lifts nothing can only make the grammar more
+/// suspicious. So the red here is the *report* degrading, not the guarantee —
+/// which is the shape BR-8 predicts, and the reason the widening mutation
+/// (lift any word carrying `>` or `<`) is the one recorded with the recogniser
+/// as the hole-opening direction.
+#[tokio::test]
+async fn a_redirect_does_not_hide_a_boundary_read() {
+    // Both BR-1 forms on one path, because they are different arms of the
+    // recogniser with different failure modes — see
+    // [`BOUNDARY_COMMAND_DUPLICATION`].
+    boundary_read_is_not_hidden_by(BOUNDARY_COMMAND).await;
+    boundary_read_is_not_hidden_by(BOUNDARY_COMMAND_DUPLICATION).await;
+}
+
+async fn boundary_read_is_not_hidden_by(command: &'static str) {
+    let repo = temp_repo();
+    let sessions = SessionRegistry::new();
+    let session_id = sessions
+        .create(SessionMode::Freeform, None, None)
+        .expect("a freeform session needs no phase")
+        .session_id;
+    let taint = Arc::new(SessionTaint::new());
+
+    let mut turn = CarriedTurn::begin(
+        &sessions,
+        &session_id,
+        scripted_system(),
+        &scripted_config(),
+        Arc::clone(&taint),
+        boundaries(),
+        PROMPT,
+        std::collections::BTreeSet::new(),
+        false,
+        false,
+        None,
+    );
+    let (result, captured, blocks) =
+        drive_scripted_turn(&repo, &session_id, ("c1", "shell", command), turn.ctx_mut()).await;
+
+    // The verdict: a boundary touch that names the file, not an opaque refusal
+    // and not a pass.
+    let provenance = context_provenance(turn.ctx());
+    assert!(
+        !provenance.is_unknown(),
+        "BR-8: the path is still resolved through the redirect, so the block \
+         names it: {:?}",
+        provenance.sources().collect::<Vec<_>>()
+    );
+    assert!(
+        provenance.contains(CANONICAL_ID),
+        "BR-8: `{CANONICAL_ID}` is what the command read: {:?}",
+        provenance.sources().collect::<Vec<_>>()
+    );
+    assert_blocked_and_clean(&result, &captured, &blocks);
+    assert_eq!(
+        blocks[0].path, CANONICAL_ID,
+        "AC-3: the refusal names the boundary file the redirect did not hide"
+    );
+
+    // Zero further provider calls: the tool-call turn's request is the only one
+    // that left, and the send carrying the file's bytes never happened.
+    assert_eq!(
+        captured.len(),
+        1,
+        "AC-3: nothing leaves after the block: {captured:?}"
+    );
+
+    // The pin, in the three values `session_pinned` is published from.
+    turn.commit();
+    assert_eq!(
+        taint.cause(&session_id),
+        Some(TaintCause::BoundaryHit),
+        "AC-3: a boundary read pins with the permanent cause, whatever the \
+         command's redirects were"
+    );
+    assert!(
+        !TaintCause::BoundaryHit.liftable(),
+        "AC-3: and no command lifts it — `liftable: false` on the event"
+    );
+    assert_eq!(
+        taint.reason(&session_id),
+        None,
+        "BR-6's must-not-fire half: a pin whose cause is a path carries no \
+         syntax class, because the block beside it already names the file"
+    );
+
+    assert_no_boundary_bytes(&captured);
     std::fs::remove_dir_all(&repo).ok();
 }
 
