@@ -43,11 +43,13 @@ Ok and Err when `state.verbose`.
 |------|------|----------|-------------|
 | BR-1 | test-case | `crates/teton/src/client.rs::tests::the_row_is_present_in_a_silent_phase_and_withdrawn_while_streaming` | yes |
 | BR-4 | test-case | `crates/teton/src/client.rs::tests::the_pump_ticks_while_the_daemon_is_silent` | no |
+| BR-4 | test-case | `crates/teton/src/client.rs::tests::a_plain_surface_never_enters_the_tick_arm` | yes |
 | BR-5 | test-case | `crates/teton/src/client.rs::tests::a_durable_line_prints_where_the_row_was` | no |
 | BR-6 | test-case | `crates/teton/src/client.rs::tests::a_plain_surface_never_enters_the_tick_arm` | yes |
-| BR-9 | test-case | `crates/teton/src/client.rs::tests::the_tick_arm_adds_no_latency_to_a_queued_message` | no |
+| BR-9 | test-case | `crates/teton/src/client.rs::tests::the_tick_arm_adds_no_latency_to_a_queued_message` | yes |
 | BR-10 | test-case | `crates/teton/src/client.rs::tests::a_durable_line_prints_where_the_row_was` | no |
 | BR-12 | test-case | `crates/teton/src/client.rs::tests::every_ends_turn_exit_withdraws_the_row` | no |
+| BR-12 | test-case | `crates/teton/src/client.rs::tests::a_non_turn_method_never_draws_or_withdraws` | yes |
 | BR-14 | structural-check | `crates/teton-protocol/src/lib.rs::tests::protocol_version_is_pinned` (unchanged, asserted green) | no |
 | BR-16 | test-case | `crates/teton/src/main.rs::tests::the_verbose_summary_prints_on_both_arms` | yes |
 | AC-5 | test-case | `crates/teton/src/client.rs::tests::phases_follow_events_through_the_real_dispatch` | no |
