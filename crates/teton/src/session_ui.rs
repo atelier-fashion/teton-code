@@ -2211,15 +2211,34 @@ fn format_provider_tested(tested: &ProviderTested, elsewhere: Option<&SessionId>
 /// reason: the load window publishes nothing to derive one from, and a figure
 /// would be fabricated). The lifecycle stream's own `benchmark` and `ready`
 /// lines follow this one as they happen, and then the reply.
-fn format_turn_queued(queued: &TurnQueued) -> String {
+pub(crate) fn format_turn_queued(queued: &TurnQueued) -> String {
+    format!(
+        "message queued until {} — it will run as soon as the local tier opens.",
+        tier_warming_clause(queued)
+    )
+}
+
+/// What a `turn_queued` says the tier is doing: `qwen3-coder-30b-a3b finishes
+/// loading`.
+///
+/// **The one place the event's typed `waiting_on` becomes words** (REQ-621
+/// BR-10, BR-2 as amended 2026-09-10). Two surfaces name a held turn — this
+/// module's durable notice above, and the activity row's `held until …` clause
+/// (`activity::held_clause`) — and the daemon supplies neither sentence: the
+/// event carries a model id and an enum, so the *client* composes, which is
+/// what ASSUME-049 records. Two client-side compositions of one event is two
+/// sentences that agree until somebody edits one of them, and the row prints
+/// directly beneath the notice, where a disagreement is not subtle.
+///
+/// Rendered rather than branched on by its callers, for the reason the whole
+/// row exists: the classification is the daemon's, the wording is ours, and
+/// there is exactly one of it.
+pub(crate) fn tier_warming_clause(queued: &TurnQueued) -> String {
     let doing = match queued.waiting_on {
         TierWarming::Installing => "installing",
         TierWarming::Loading => "loading",
     };
-    format!(
-        "message queued until {} finishes {doing} — it will run as soon as the local tier opens.",
-        queued.model_id
-    )
+    format!("{} finishes {doing}", queued.model_id)
 }
 
 /// BR-16's one durable line: what the turn just spent, in time and in money.

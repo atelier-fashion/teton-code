@@ -131,11 +131,24 @@ the sanitizer, never by the caller).
   from a constructor flag, so the wiring is assertable without a terminal;
   `Bare` keeps the defaults and pins them (the existing
   `a_surface_that_does_not_override_repaint_emits_nothing` gains a sibling).
-- Typing during a turn: the terminal echoes typed characters at the cursor,
-  which sits at the start of the row's line. A repaint of the row rewrites
-  that line (`\r\x1b[K`), so echoed characters are visually displaced while the
-  row animates and reappear when the line is read — the kernel's line buffer
-  is untouched (AC-10 asserts delivery, which is the property BR-9 states).
+- Typing during a turn — **corrected 2026-09-10 at verify**, where the original
+  bullet was found to describe only half of it. The terminal echoes typed
+  characters into the row *below* the activity row, which is where the cursor
+  sits after `line()` drew it. A repaint saves and restores the cursor, so a
+  line typed and **not** submitted is only visually displaced while the row
+  animates and reappears when the line is read — the kernel's line buffer is
+  untouched (AC-10 asserts delivery, which is the property BR-9 states).
+  A line **submitted** mid-turn is the case the bullet missed: `ECHO` is on for
+  the length of a turn, so pressing Enter echoes a newline and the cursor drops
+  a line under bookkeeping a canonical-mode client cannot see. The row is now
+  *two* above the cursor, `repaint_row_above(1)` would rewrite the line holding
+  what the user typed and `withdraw_row_above(1)` would erase it, and no offset
+  correction is available (the client cannot know how many rows the echo
+  wrapped onto). So the pump **abandons** the row for the rest of the turn the
+  moment `prompt::stdin_ready(ZERO)` reports a line waiting and `typed_input`
+  says stdin is a terminal: no repaint, no withdraw, and that last frame is
+  left in scrollback — the bounded BR-5 exception now recorded in the spec, and
+  the only option here that does not damage something the user typed.
 
 ### ADR-621-4: Every turn exit closes the row at the `ENDS_TURN` seam
 
@@ -156,6 +169,34 @@ cooperation — the seam runs on the client's own control flow, including
 **Consequences.** The summary line is emitted whether or not stdout is a
 terminal (BR-16), so the verbose piped fixtures gain exactly one line
 (AC-3, AC-13). Non-verbose piped output is untouched.
+
+**Amended 2026-09-10 at verify.** The close-out landed as **two parts in two
+places**, and this ADR described one block on the branch. The implementation is
+right and the ADR was not:
+
+- the **withdraw** is hoisted *above* `if P::ENDS_TURN` and guarded by
+  `row.visible` and nothing else. That guard is already exact — only a turn can
+  open the projection, so only a turn can have a row to take back — and it means
+  BR-12 does not rest on the argument that no non-turn call can be in flight
+  during a turn. That argument is true today by this client's synchrony, and it
+  is precisely the kind of reachability claim BR-12 exists not to depend on;
+- the **summary** stays on the `ENDS_TURN` branch, because it must ask: a
+  `/cost` that called `finish` would report a turn nobody ran and overwrite the
+  last real one.
+
+There is a **second, defensive close-out** at `SessionState::begin_turn`: a turn
+still found open when the next prompt goes on the wire ended by a path neither
+site saw, and it is closed there rather than overwritten, so its cost and its
+clock are not lent to the turn about to start (ADR-621-2). It runs on no
+ordinary path.
+
+Both are pinned by source region rather than by argument —
+`client.rs::tests::the_rows_close_out_straddles_the_ends_turn_branch`, the same
+mechanism `only_the_event_pump_declares_a_block_over` uses on the fence. The
+mutation that motivated it: moving the withdraw onto the branch reddens that
+one test and **nothing else in 828**, because every behavioural test drives
+either a turn (where the branch is taken and the withdraw still runs) or a
+non-turn call that never draws a row.
 
 ### ADR-621-5: A stall keeps the last phase and annotates it; a running tool is exempt
 

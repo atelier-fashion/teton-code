@@ -151,7 +151,20 @@ pub trait Surface {
     /// that is not a terminal — including any future one. A surface with no
     /// cursor has no row to repaint, so silence is the correct behaviour rather
     /// than something each implementor must remember to add.
-    fn repaint_row_above(&mut self, _rows_up: usize, _kind: LineKind, _text: &str) {}
+    ///
+    /// **Returns whether the bytes were written and flushed** (REQ-621 BR-13).
+    /// A terminal can refuse a write — a closed pty on a detached session, a
+    /// full pipe, an `EIO` from a window that has gone away — and the caller's
+    /// whole geometry rests on the assumption that its last paint landed: a
+    /// row it believes is on screen is a row it will keep repainting and will
+    /// finally try to withdraw, one row above wherever the cursor now is. So
+    /// the failure is *reported* rather than swallowed, and the pump answers it
+    /// by giving up the row for the rest of the turn. The default answer is
+    /// `false` for the same reason the body is empty: a surface that wrote
+    /// nothing has not written the row.
+    fn repaint_row_above(&mut self, _rows_up: usize, _kind: LineKind, _text: &str) -> bool {
+        false
+    }
 
     /// Take back the row `rows_up` above the cursor: step up, clear it, and
     /// leave the cursor at column 0 of the row just cleared (REQ-621
@@ -178,6 +191,19 @@ pub trait Surface {
     /// that is not a terminal — including any future one. A surface with no
     /// cursor has no row to take back, so silence is the correct behaviour
     /// rather than something each implementor must remember to add.
+    ///
+    /// **Returns whether the bytes were written and flushed** (REQ-621 BR-13),
+    /// for the reason spelled out on [`Surface::repaint_row_above`]: a caller
+    /// that cannot tell a cleared row from a refused write goes on believing
+    /// it owns a row somebody else is now writing over. `false` from the
+    /// default, which has written nothing.
+    ///
+    /// **Nothing may be held when this moves the cursor.** `rows_up` is
+    /// counted from where the cursor is, and held markdown rows have not
+    /// scrolled the frame yet — so an implementation flushes first and the
+    /// offset is measured after, or the count is short by however many rows the
+    /// flush was going to add. `PlainSurface` asserts that in debug builds
+    /// rather than only writing it down here.
     // This carried a `#[cfg_attr(not(test), expect(dead_code, …))]` until the
     // pump called it, chosen over an `allow` for the reason written out at
     // [`PlainSurface::with_markdown`]: an `allow` would have gone on being
@@ -185,7 +211,9 @@ pub trait Surface {
     // the `expect` *became* the warning the moment the pump reached the verb,
     // and `-D warnings` made deleting it a condition of landing that wiring.
     // The caller is `client.rs`'s turn pump, which owns the row (ADR-621-3).
-    fn withdraw_row_above(&mut self, _rows_up: usize) {}
+    fn withdraw_row_above(&mut self, _rows_up: usize) -> bool {
+        false
+    }
 
     /// Whether this surface can carry a row that is drawn, repainted in place
     /// and then withdrawn — an animation the reader watches, rather than a line
@@ -1029,7 +1057,12 @@ impl<W: Write> Surface for PlainSurface<W> {
     /// is deliberately untouched: the cursor ends where it began, so the
     /// bookkeeping that keeps a later `line()` from colliding with streamed
     /// output is still accurate.
-    fn repaint_row_above(&mut self, rows_up: usize, kind: LineKind, text: &str) {
+    ///
+    /// Reports whether the bytes reached the terminal (BR-13). Both halves are
+    /// checked, because either failing leaves the row somewhere other than
+    /// where the caller believes it is: `write!` puts the escapes in the
+    /// buffer, and the `flush` is what puts them on the screen.
+    fn repaint_row_above(&mut self, rows_up: usize, kind: LineKind, text: &str) -> bool {
         // Same rule as `line()`, for the same reason (BR-8): a repaint moves the
         // cursor over rows that are already on screen, and buffered text is text
         // that is not on screen yet. Emitting first also keeps `rows_up`
@@ -1045,11 +1078,12 @@ impl<W: Write> Surface for PlainSurface<W> {
         // not a different rule — [`defused`] is what `line()` uses too, for the
         // reason written there.
         let single_row = defused(text);
-        let _ = write!(
+        write!(
             self.out,
             "\x1b[s\x1b[{rows_up}A\r\x1b[K{prefix}{single_row}\x1b[u"
-        );
-        let _ = self.out.flush();
+        )
+        .and_then(|()| self.out.flush())
+        .is_ok()
     }
 
     /// Step up, clear the row, and stop. The cursor is left on the cleared row,
@@ -1065,9 +1099,15 @@ impl<W: Write> Surface for PlainSurface<W> {
     /// than trusting every future caller to ask first. BR-6 says the piped path
     /// emits *not a frame, not an escape, not a blank line* — the cheapest way
     /// to mean that is for the bytes to be unreachable, not merely unrequested.
-    fn withdraw_row_above(&mut self, rows_up: usize) {
+    ///
+    /// Reports whether the bytes reached the terminal (BR-13) —
+    /// [`Surface::repaint_row_above`]'s rule, for its reason. A surface that
+    /// refused the row on its own gate reports `false` too: nothing was
+    /// written, which is the honest answer to "is that row gone", and the only
+    /// caller that can reach this verb at all is one the gate answered `true`.
+    fn withdraw_row_above(&mut self, rows_up: usize) -> bool {
         if !self.live_rows {
-            return;
+            return false;
         }
 
         // `repaint_row_above`'s rule, for its reason (REQ-592 BR-8): held text
@@ -1077,11 +1117,29 @@ impl<W: Write> Surface for PlainSurface<W> {
         // is measured from where the cursor now is.
         self.emit_pending();
 
+        // The flush above is what makes `rows_up` count from the row the caller
+        // measured it against, and this is that claim as a check rather than as
+        // a paragraph: after `emit_pending` there is nothing left to scroll the
+        // frame, so an offset chosen before this line is still the right offset
+        // after it. A future edit that moved the flush below the cursor motion
+        // — or added a second buffer nobody drained — would be counting from a
+        // row the reader has not been shown, and the row this verb clears would
+        // be somebody else's line.
+        debug_assert!(
+            self.markdown
+                .as_ref()
+                .is_none_or(|state| state.pending.is_empty() && state.table.is_empty()),
+            "withdraw_row_above moved the cursor with text still held: the offset \
+             is short by the rows that text is about to scroll in"
+        );
+
         // No `\x1b[s` / `\x1b[u` pair, unlike the repaint: the cursor is meant
         // to end up here.
-        let _ = write!(self.out, "\x1b[{rows_up}A\r\x1b[K");
-        let _ = self.out.flush();
+        let written = write!(self.out, "\x1b[{rows_up}A\r\x1b[K")
+            .and_then(|()| self.out.flush())
+            .is_ok();
         self.at_line_start = true;
+        written
     }
 
     /// The constructor's answer, unchanged since construction: only
@@ -1172,6 +1230,18 @@ pub(crate) struct RecordingSurface {
     /// rather than a terminal, so the TTY-gated path is reachable from a test
     /// with no terminal in sight (ADR-621-3).
     live_rows: bool,
+    /// Whether the two row verbs report their bytes as **not** written
+    /// (REQ-621 BR-13).
+    ///
+    /// A flag rather than a failing `Write`, because the two answer different
+    /// questions. `PlainSurface` over a writer that returns `Err` is what pins
+    /// the *reporting* — and `render.rs` tests it there — but a surface whose
+    /// every write fails cannot record the verbose line BR-13 requires the
+    /// client to print, so the failure would be unobservable at the seam that
+    /// has to react to it. Here the row verbs fail and `line` still records,
+    /// which is the terminal this rule is actually about: one that took the
+    /// prose and refused the cursor motion.
+    failing_rows: bool,
 }
 
 #[cfg(test)]
@@ -1187,6 +1257,20 @@ impl RecordingSurface {
     pub fn with_live_rows() -> Self {
         Self {
             live_rows: true,
+            ..Self::default()
+        }
+    }
+
+    /// A recorder that claims live rows and then **refuses** every row verb,
+    /// for BR-13's path: a terminal that will not take the row's bytes.
+    ///
+    /// The attempt is still recorded. What the caller did and what the terminal
+    /// took are two facts, and a recorder that dropped the call could not tell
+    /// "the pump stopped painting" from "the pump never painted".
+    pub fn with_failing_rows() -> Self {
+        Self {
+            live_rows: true,
+            failing_rows: true,
             ..Self::default()
         }
     }
@@ -1229,13 +1313,15 @@ impl Surface for RecordingSurface {
         self.calls.push(Rendered::Fragment(text.to_owned()));
     }
 
-    fn repaint_row_above(&mut self, rows_up: usize, kind: LineKind, text: &str) {
+    fn repaint_row_above(&mut self, rows_up: usize, kind: LineKind, text: &str) -> bool {
         self.calls
             .push(Rendered::Repaint(rows_up, kind, text.to_owned()));
+        !self.failing_rows
     }
 
-    fn withdraw_row_above(&mut self, rows_up: usize) {
+    fn withdraw_row_above(&mut self, rows_up: usize) -> bool {
         self.calls.push(Rendered::Withdraw(rows_up));
+        !self.failing_rows
     }
 
     fn has_live_rows(&self) -> bool {
@@ -1465,6 +1551,100 @@ mod tests {
         );
     }
 
+    /// **REQ-621 BR-13, at the seam that knows.** A row verb reports whether
+    /// its bytes reached the terminal, so the one caller whose geometry depends
+    /// on that — the pump, which believes a row is one above the cursor
+    /// precisely because its last paint landed — can stop believing it.
+    ///
+    /// Both halves of the write are checked, and the test says so by failing
+    /// each separately: `write!` puts the escapes in the buffer and `flush` is
+    /// what puts them on the screen, and a caller told `true` by a surface that
+    /// only buffered them is a caller told the wrong thing.
+    ///
+    /// The default answer is pinned here too. `false` is the honest report from
+    /// a surface that wrote nothing, and it is what makes BR-13 hold for a
+    /// future front-end that implements neither verb: the pump gives the row up
+    /// rather than animating into a surface that is silently dropping it.
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** return `true`
+    /// unconditionally from `PlainSurface::repaint_row_above` (`let _ =
+    /// write!(..); let _ = flush(); true`). **1 red of 828**, this test, on the
+    /// failing-writer legs — and nothing else in the suite notices, because the
+    /// client's own BR-13 test drives a recording surface. This is the only
+    /// place the production writer's report is asserted at all. Reverted with
+    /// the same edit.
+    #[test]
+    fn a_row_verb_reports_whether_its_bytes_landed() {
+        /// A writer that refuses `write` (`kind` chooses which half fails).
+        struct Refusing {
+            on_write: bool,
+        }
+        impl Write for Refusing {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.on_write {
+                    Err(std::io::Error::other("the pty is gone"))
+                } else {
+                    Ok(buf.len())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.on_write {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other("the pty is gone"))
+                }
+            }
+        }
+
+        // A writer that takes the bytes: both verbs report the row landed.
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut surface = PlainSurface::with_markdown(&mut buf, false, 80);
+            assert!(
+                surface.repaint_row_above(1, LineKind::Activity, "⠋ preparing turn"),
+                "a repaint whose bytes were written and flushed reports so"
+            );
+            assert!(surface.withdraw_row_above(1), "and so does a withdraw");
+        }
+        assert!(!buf.is_empty(), "the fixture really did write something");
+
+        // A writer that refuses either half: both verbs report the row did not.
+        for on_write in [true, false] {
+            let mut surface = PlainSurface::with_markdown(Refusing { on_write }, false, 80);
+            assert!(
+                !surface.repaint_row_above(1, LineKind::Activity, "⠋ preparing turn"),
+                "a repaint that could not reach the terminal must not report \
+                 success (failing on_write={on_write})"
+            );
+            assert!(
+                !surface.withdraw_row_above(1),
+                "and neither must a withdraw (failing on_write={on_write})"
+            );
+        }
+
+        // The defaults, which is what a surface that owns no cursor answers.
+        struct Bare;
+        impl Surface for Bare {
+            fn line(&mut self, _kind: LineKind, _text: &str) {}
+            fn fragment(&mut self, _text: &str) {}
+        }
+        let mut bare = Bare;
+        assert!(
+            !bare.repaint_row_above(1, LineKind::Activity, "⠋ preparing turn"),
+            "a surface that wrote nothing has not written the row"
+        );
+        assert!(!bare.withdraw_row_above(1), "nor taken one back");
+
+        // ...and the gate is the other reason a `PlainSurface` says `false`: a
+        // piped one refuses the verb before it reaches a writer at all.
+        let mut piped: Vec<u8> = Vec::new();
+        assert!(
+            !PlainSurface::new(&mut piped).withdraw_row_above(1),
+            "a surface with no live rows has no row to report gone"
+        );
+        assert!(piped.is_empty(), "and it wrote nothing doing it");
+    }
+
     /// REQ-621 BR-8 / ADR-621-3. The withdraw is not a raw cursor move: it goes
     /// through the surface, and the surface owes the reader everything it is
     /// still holding **before** it moves the cursor over rows already on screen
@@ -1476,10 +1656,17 @@ mod tests {
     /// Mutation observed red (re-run 2026-09-10 over the widened suite):
     /// deleting the `self.emit_pending()` call from
     /// `PlainSurface::withdraw_row_above` reddens **this test and no other** —
-    /// 1 of the 126 `render` tests, and 0 of `pty_e2e`'s 28. The held paragraph
+    /// 1 of the 127 `render` tests, and 0 of `pty_e2e`'s 28. The held paragraph
     /// then never reaches the writer at all — the output is the bare
     /// `\x1b[1A\r\x1b[K` — so the row the pump is told to take back is not the
     /// row it drew, and the reader loses a sentence to a cursor move.
+    ///
+    /// Since the verify pass the failure arrives as the verb's own
+    /// `debug_assert!` rather than as this test's byte comparison, and it
+    /// arrives naming the defect: *"withdraw_row_above moved the cursor with
+    /// text still held: the offset is short by the rows that text is about to
+    /// scroll in"*. The assertion is what a release build loses, so the byte
+    /// oracle below stays: the assert says why, the bytes say what.
     ///
     /// That the pty legs stay green is a fact about their fixtures, not a
     /// reprieve: the pump withdraws the row *before* the reply's first byte and

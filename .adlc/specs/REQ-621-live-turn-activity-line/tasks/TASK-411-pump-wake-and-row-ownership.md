@@ -47,12 +47,39 @@ Ok and Err when `state.verbose`.
 | BR-5 | test-case | `crates/teton/src/client.rs::tests::a_durable_line_prints_where_the_row_was` | no |
 | BR-6 | test-case | `crates/teton/src/client.rs::tests::a_plain_surface_never_enters_the_tick_arm` | yes |
 | BR-9 | test-case | `crates/teton/src/client.rs::tests::the_tick_arm_adds_no_latency_to_a_queued_message` | yes |
+| BR-9 | test-case | `crates/teton/src/client.rs::tests::a_submitted_line_abandons_the_row_and_never_paints_over_it` (added at verify: the "a repaint never blanks characters the user has echoed" clause had no test, and could not have held — see the note below) | no |
+| BR-13 | test-case | `crates/teton/src/client.rs::tests::a_failed_paint_hides_the_row_and_says_so_in_verbose` (added at verify: the row verbs swallowed their write errors, so the pump could not act on one) | no |
 | BR-10 | test-case | `crates/teton/src/client.rs::tests::a_durable_line_prints_where_the_row_was` | no |
 | BR-12 | test-case | `crates/teton/src/client.rs::tests::every_ends_turn_exit_withdraws_the_row` | no |
 | BR-12 | test-case | `crates/teton/src/client.rs::tests::a_non_turn_method_never_draws_or_withdraws` | yes |
 | BR-14 | structural-check | `crates/teton-protocol/src/lib.rs::tests::this_build_advertises_only_the_version_its_types_can_read` (unchanged, asserted green — the row's original name, `protocol_version_is_pinned`, is not a test that exists; this is the pin on the version bound, and no protocol source was touched) | no |
 | BR-16 | test-case | `crates/teton/src/main.rs::tests::the_verbose_summary_prints_on_both_arms` | yes |
-| AC-5 | test-case | `crates/teton/src/client.rs::tests::phases_follow_events_through_the_real_dispatch` | no |
+| AC-5 | test-case | `crates/teton/src/client.rs::tests::phases_follow_events_through_the_real_dispatch` (rebuilt at verify: each envelope is now `serde_json::to_value(EventEnvelope::new(seq, session, Event::X(typed payload)))` — the daemon's own construction and serialization — where it had been a `json!` literal, which is the LESSON-544 shape the row this line sits on was supposed to rule out) | no |
+| AC-5 | test-case | `crates/teton/src/client.rs::tests::the_rows_close_out_straddles_the_ends_turn_branch` (added at verify: ADR-621-4's two-part close-out, pinned by source region) | no |
+
+## Verify-pass corrections (2026-09-10)
+
+Five findings landed against this task's code, each with a test and a recorded
+mutation:
+
+1. **BR-9's second clause was not implemented.** `ECHO` stays on for the length
+   of a turn, so a line the user *submits* mid-turn moves the cursor a row down
+   and the next `repaint_row_above(1)` overwrites the line holding their echoed
+   characters. The pump now abandons the row — `RowState::abandon`, no withdraw
+   — the moment `prompt::stdin_ready(ZERO)` reports a line waiting and
+   `typed_input` says stdin is a terminal. ADR-621-3's typing bullet and BR-5
+   and BR-9 in the spec are amended to the real behaviour.
+2. **BR-13 was implemented as zero.** `Surface::repaint_row_above` and
+   `withdraw_row_above` now return whether their bytes were written and
+   flushed; the pump answers `false` by hiding the row for the rest of the turn
+   and, under `/verbose`, printing one `LineKind::Info` line.
+3. **AC-5 was overclaimed.** See the table above.
+4. **ADR-621-4 had drifted** from the code (the withdraw is hoisted above the
+   `ENDS_TURN` branch, and the ADR said it sat on it). The ADR is amended and
+   the two-part close-out is region-checked.
+5. **The width was read once per call**, so a turn that outlived a resize fitted
+   every later row to a window that no longer existed. It is re-read when a row
+   is *drawn* and not on a repaint (`RowState::width` says why those differ).
 
 ## Technical Notes
 

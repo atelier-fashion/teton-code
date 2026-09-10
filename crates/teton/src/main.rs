@@ -864,8 +864,17 @@ fn next_interactive_line(
                 // the top rule whether or not a web row precedes it, so the
                 // offset is unchanged — but the row *count* is not, and it is
                 // what `erase` takes back.
-                ctx.surface
-                    .repaint_row_above(STATUS_ROWS_ABOVE_CURSOR, LineKind::Notice, &line);
+                // The write report is deliberately dropped here (REQ-621
+                // BR-13, which is the activity row's rule). This animation is
+                // REQ-556's, it owns no geometry beyond the frame it redraws
+                // every interval, and the entry loop's next event tears that
+                // frame down and rebuilds it — so there is nothing for a failed
+                // paint to corrupt and nothing this loop would do differently.
+                let _ = ctx.surface.repaint_row_above(
+                    STATUS_ROWS_ABOVE_CURSOR,
+                    LineKind::Notice,
+                    &line,
+                );
                 status_rows = usize::from(ctx.state.web.is_engaged()) + 1;
             }
         }

@@ -224,34 +224,94 @@ struct RowState {
     /// Which animation frame the row is showing. Advanced by a `Tick` only: a
     /// redraw after a durable line is not an animation step.
     tick: u64,
-    /// The surface width the row is fitted to, read once per call beside
-    /// [`Self::live`].
+    /// The surface width the row is currently fitted to.
     ///
-    /// A turn is a few seconds and a resize mid-turn is rare; re-reading it per
-    /// frame would be a `TIOCGWINSZ` eight times a second for the whole of
-    /// every turn, and the row is one line whose only failure on a stale width
-    /// is a truncation a character early.
+    /// **Re-read each time a row is drawn, and never on a repaint.** The two
+    /// stale-width failures are not the same size. Between two frames of one
+    /// row a resize costs a truncation a column early, and re-reading there
+    /// would be a `TIOCGWINSZ` eight times a second for the whole of every
+    /// turn. Between two *rows* — and every durable line the turn prints puts
+    /// one row away and brings another back — a stale width fits the new row to
+    /// a window that no longer exists, and a row wider than the terminal is
+    /// hard-wrapped into a second row `withdraw_row_above(1)` cannot clear
+    /// (BR-5). So the query is paid once per drawn row, which is where it buys
+    /// something.
     width: usize,
+    /// Where a drawn row's width comes from.
+    ///
+    /// [`crate::prompt::terminal_width`] in production. A field rather than a
+    /// direct call so a test can resize a terminal it does not have: under
+    /// `cargo test` `STDOUT_FILENO` is whichever terminal the developer happens
+    /// to be sitting in, so a literal oracle over a real query would be
+    /// asserting that terminal's truncation (the reason [`Self::at_width`]
+    /// exists at all).
+    measure_width: fn() -> usize,
+    /// Whether a line the user has **submitted** is waiting to be read on
+    /// stdin (BR-9).
+    ///
+    /// Consulted through a field for [`Self::measure_width`]'s reason and one
+    /// sharper one: `cargo test` runs with stdin on `/dev/null`, where `poll`
+    /// reports readable-at-EOF immediately, so the production answer inside a
+    /// test build is a permanent "the user just pressed Enter" — every row in
+    /// the suite abandoned before its second frame. [`Self::new`] therefore
+    /// installs `|| false` under `cfg(test)`, and the one test that means
+    /// "Enter was pressed" says so by setting this hook.
+    line_waiting: fn() -> bool,
 }
 
 impl RowState {
     /// The row's state at the start of a call: nothing drawn, gate and width
     /// taken from the surface.
     fn new(surface: &dyn Surface) -> Self {
-        let live = surface.has_live_rows();
+        // A fn pointer either way, and the annotation is what lets the two
+        // arms coerce to one. `|| false` under test is not a convenience: see
+        // the field.
+        let line_waiting: fn() -> bool = if cfg!(test) { || false } else { line_submitted };
         Self {
-            live,
+            live: surface.has_live_rows(),
             visible: false,
             tick: 0,
-            // Asked only when there is a row to fit. The query is an `ioctl` on
-            // `STDOUT_FILENO`, and every non-turn RPC comes through here too —
-            // some thirty of them — with nothing to measure.
-            width: if live {
-                crate::prompt::terminal_width()
-            } else {
-                0
-            },
+            // Not asked here. The query is an `ioctl` on `STDOUT_FILENO`, every
+            // non-turn RPC comes through this constructor too — some thirty of
+            // them — with nothing to measure, and a width read now would be a
+            // width from before the first frame anyway. `paint_row` asks when
+            // it has a row to fit.
+            width: 0,
+            measure_width: crate::prompt::terminal_width,
+            line_waiting,
         }
+    }
+
+    /// Give up the row for the rest of this call, leaving the screen exactly as
+    /// it is (REQ-621 BR-9, added at verify).
+    ///
+    /// **Why a row is ever abandoned rather than withdrawn.** The row's whole
+    /// geometry is the sentence "it is one row above the cursor", and that
+    /// sentence is true only while nothing but this loop moves the cursor. A
+    /// submitted line moves it: stdin is in canonical mode for the whole of a
+    /// turn with `ECHO` on, so the terminal — not this process — echoes the
+    /// user's characters into the row below the row, and echoes a newline when
+    /// they press Enter. The cursor drops a line under bookkeeping a
+    /// canonical-mode client cannot see (there is no read, no `\n` of ours, and
+    /// nothing on the wire), and from that moment the row is *two* above the
+    /// cursor.
+    ///
+    /// So both verbs are now wrong, and wrong in the way that matters:
+    /// `repaint_row_above(1)` would rewrite the line holding the characters the
+    /// user just typed — the blanking BR-9 forbids in as many words — and
+    /// `withdraw_row_above(1)` would erase that line outright, which is worse
+    /// than a stale row by any measure. Writing nothing leaves the last frame
+    /// in scrollback: a bounded, recorded exception to BR-5 (requirement BR-5,
+    /// amended 2026-09-10), one row per turn, and the only option here that
+    /// does not damage something the user typed.
+    ///
+    /// Dropping `live` as well as `visible` is what makes it "for the rest of
+    /// the turn": the pump reads `live` to decide whether to wait with a
+    /// timeout at all, so an abandoned row also stops the ticking it can no
+    /// longer paint with.
+    fn abandon(&mut self) {
+        self.visible = false;
+        self.live = false;
     }
 
     /// A row over a live surface at a **fixed** width, for a test whose oracle
@@ -264,13 +324,40 @@ impl RowState {
     /// pump. The fit itself is `activity.rs`'s to test, and it is tested there.
     #[cfg(test)]
     fn at_width(width: usize) -> Self {
+        set_test_width(width);
         Self {
             live: true,
             visible: false,
             tick: 0,
             width,
+            // The same answer a redraw will get, so a fixture's rows are all
+            // fitted to one width unless the test resizes on purpose
+            // (`set_test_width`).
+            measure_width: test_width,
+            line_waiting: || false,
         }
     }
+}
+
+/// Whether a line the user has **submitted** is waiting to be read (BR-9).
+///
+/// `poll` with a zero timeout — the same non-blocking question the entry loop
+/// asks once a frame — so consulting it costs the pump no latency, which is
+/// BR-9's first clause and not something to spend on its second.
+///
+/// **At a terminal, "stdin has something" is "a line was submitted".** The
+/// session leaves stdin in canonical mode, so the kernel makes no byte readable
+/// until Enter; the readable descriptor *is* the event that moved the cursor
+/// out from under the row (see [`RowState::abandon`]). Asked only where
+/// `UiContext::typed_input` says this process's stdin is a terminal: a piped or
+/// closed stdin reports readable at EOF, and reading that as a keystroke would
+/// abandon a row nobody typed over.
+///
+/// EOF, an `EINTR`, or a `poll` error are all folded into the same answer the
+/// entry loop takes them as, because the consequence here is the same either
+/// way: at worst one row is given up a little early.
+fn line_submitted() -> bool {
+    crate::prompt::stdin_ready(Duration::ZERO)
 }
 
 /// Make what is on screen match the frame the projection would draw now
@@ -298,19 +385,63 @@ fn paint_row(row: &mut RowState, ctx: &mut UiContext, now: Instant) {
     if !row.live {
         return;
     }
+    // A row about to be **drawn** is fitted to the terminal as it is now, and a
+    // repaint keeps the width its row was drawn at — see [`RowState::width`]
+    // for why those are different decisions. Skipped while the projection is
+    // idle, which is every non-turn RPC pumping through this loop: the query is
+    // an `ioctl` and an idle projection has no row to fit. That is a cost
+    // guard and not a second answer to "is there a row" — the frame below is
+    // still the only thing that decides (ADR-621-1).
+    if !row.visible && ctx.state.activity.phase() != crate::activity::Phase::Idle {
+        row.width = (row.measure_width)();
+    }
     match ctx.state.activity.frame(now, row.tick, row.width) {
         Some(text) if row.visible => {
-            ctx.surface.repaint_row_above(1, LineKind::Activity, &text);
+            if !ctx.surface.repaint_row_above(1, LineKind::Activity, &text) {
+                hide_after_a_failed_write(row, ctx);
+            }
         }
         Some(text) => {
             ctx.surface.line(LineKind::Activity, &text);
             row.visible = true;
         }
         None if row.visible => {
-            ctx.surface.withdraw_row_above(1);
+            // Marked gone whatever the verb reports. A withdraw that failed
+            // leaves a row on screen this loop has no way to reach — the bytes
+            // that would have cleared it are the bytes that did not land — and
+            // going on believing it is ours would put the next repaint over
+            // whatever is there now.
+            let cleared = ctx.surface.withdraw_row_above(1);
             row.visible = false;
+            if !cleared {
+                hide_after_a_failed_write(row, ctx);
+            }
         }
         None => {}
+    }
+}
+
+/// BR-13: a terminal that would not take the row's bytes costs the turn its
+/// row, and nothing else.
+///
+/// **Never fatal, never silent** — the rule has two halves and the second is
+/// the one that is easy to leave out. The row is given up for the rest of the
+/// call (the state [`RowState::abandon`] leaves, reached for a different
+/// reason), and in verbose mode one durable line says so. Silence would make a
+/// write failure indistinguishable from a daemon that went quiet, which is
+/// exactly the ambiguity BR-11's stall annotation exists to remove — a user
+/// watching a stopped row would read "the daemon is wedged" from a fact about
+/// their terminal.
+///
+/// One line, not one per frame: `abandon` is what makes that structural rather
+/// than a counter, since the next paint returns before it reaches a verb.
+fn hide_after_a_failed_write(row: &mut RowState, ctx: &mut UiContext) {
+    row.abandon();
+    if ctx.state.verbose {
+        ctx.surface.line(
+            LineKind::Info,
+            "activity row: terminal write failed; hidden for the rest of the turn",
+        );
     }
 }
 
@@ -537,7 +668,13 @@ impl Connection {
         // (BR-5). `row` dies at the end of this function, so there is nothing
         // left to mark as gone.
         if row.visible {
-            ctx.surface.withdraw_row_above(1);
+            // The report is BR-13's and there is nothing left here to do with
+            // it: the call is returning, `row` dies at the end of this
+            // function, and a verbose notice about a row that is already out of
+            // scope would be news about nothing. A write that failed while the
+            // turn was running has already said so, at the site that could
+            // still act on it.
+            let _ = ctx.surface.withdraw_row_above(1);
         }
         if P::ENDS_TURN {
             ctx.surface.end_block();
@@ -583,6 +720,35 @@ impl Connection {
             } else {
                 Wake::Message(self.recv()?)
             };
+            // **BR-9, ahead of everything that reads or writes the row.** A
+            // line submitted while the row was animating has moved the cursor
+            // a row down, so every offset the row owns is now short by one and
+            // the next paint would land on the line the user typed. The row is
+            // abandoned rather than repainted or withdrawn — the reasoning is
+            // written out at [`RowState::abandon`], including why the frame it
+            // leaves in scrollback is the cheaper failure.
+            //
+            // Here rather than in each arm below, because it is not only the
+            // paints that would be wrong: the withdraw-before-dispatch and
+            // `call`'s own close-out would each erase that line on their way
+            // out, and this runs before both on every wake, including the one
+            // that carries the response.
+            // **BR-9, ahead of everything that reads or writes the row.** A
+            // line submitted while the row was animating has moved the cursor
+            // a row down, so every offset the row owns is now short by one and
+            // the next paint would land on the line the user typed. The row is
+            // abandoned rather than repainted or withdrawn — the reasoning is
+            // written out at [`RowState::abandon`], including why the frame it
+            // leaves in scrollback is the cheaper failure.
+            //
+            // Here rather than in each arm below, because it is not only the
+            // paints that would be wrong: the withdraw-before-dispatch and
+            // `call`'s own close-out would each erase that line on their way
+            // out, and this runs before both on every wake, including the one
+            // that carries the response.
+            if row.live && ctx.typed_input && (row.line_waiting)() {
+                row.abandon();
+            }
             let message = match wake {
                 // The daemon said nothing for a frame. Advance the animation
                 // *after* the paint, so a row's first frame is the cycle's
@@ -603,8 +769,11 @@ impl Connection {
             // always prints where the row was, and the row comes back beneath
             // it a few lines below.
             if row.visible {
-                ctx.surface.withdraw_row_above(1);
+                let cleared = ctx.surface.withdraw_row_above(1);
                 row.visible = false;
+                if !cleared {
+                    hide_after_a_failed_write(row, ctx);
+                }
             }
             match message {
                 Incoming::Response(resp) => {
@@ -1307,6 +1476,33 @@ struct TimedReceive {
     ticks: std::cell::Cell<u64>,
 }
 
+// The width `RowState::at_width` installs, so a test can resize a terminal it
+// does not have (REQ-621, verify).
+//
+// Down here with `TimedReceive` and for its reason: a column-zero
+// `#[cfg(test)]` above the production code truncates what every source sweep
+// over this file can see. (A `//` comment rather than a doc comment because
+// rustdoc does not document what a macro invocation produces.)
+#[cfg(test)]
+thread_local! {
+    static TEST_WIDTH: std::cell::Cell<usize> = const { std::cell::Cell::new(80) };
+}
+
+/// The test terminal's current width — [`RowState::measure_width`]'s answer
+/// under `cfg(test)`.
+#[cfg(test)]
+fn test_width() -> usize {
+    TEST_WIDTH.with(std::cell::Cell::get)
+}
+
+/// Resize the test terminal. The next row **drawn** is fitted to `width`; a row
+/// already on screen keeps the width it was drawn at, which is the asymmetry
+/// [`RowState::width`] describes and the one a resize test is about.
+#[cfg(test)]
+fn set_test_width(width: usize) {
+    TEST_WIDTH.with(|cell| cell.set(width));
+}
+
 /// The socket-pair fixture both test constructors are built on.
 ///
 /// Separate from [`Connection::scripted`] because the event tests in this module
@@ -1366,13 +1562,18 @@ fn route_response(pending: &Id, resp_id: &Id, has_error: bool) -> RespRoute {
 /// that it owns `ours` (REQ-568 AC-8, ADR-E). Pure, like [`route_response`],
 /// so the rule is readable on its own.
 ///
+/// `pub(crate)` since REQ-621's verify pass: the activity row is a projection
+/// of what this session *rendered*, so [`crate::activity::TurnActivity::observe`]
+/// folds on this same predicate rather than on a second one that agrees today
+/// (BR-15).
+///
 /// Daemon-scoped envelopes (`None` — model download progress, daemon lifetime)
 /// always render, including while `ours` is still `None`: the window before
 /// `session/create` answers is exactly where first-run consent speaks, and a
 /// client that went quiet there would download 18 GiB in silence. A
 /// session-scoped envelope renders only when it names our session, so a client
 /// without one renders nothing session-scoped — none of it is its own.
-fn should_render(
+pub(crate) fn should_render(
     envelope_session: Option<&teton_protocol::SessionId>,
     ours: Option<&teton_protocol::SessionId>,
 ) -> bool {
@@ -2888,6 +3089,109 @@ mod tests {
         );
     }
 
+    /// **ADR-621-4's close-out, pinned where it actually lives** — the same
+    /// mechanism `only_the_event_pump_declares_a_block_over` uses on the fence,
+    /// and for the reason that test states: a rule held in place by arithmetic
+    /// can be relocated anywhere in the file while the arithmetic still adds up
+    /// ([[LESSON-547]], [[LESSON-568]]).
+    ///
+    /// The close-out is **two parts in two places**, which is the drift this
+    /// pass found in the ADR: the withdraw is hoisted *above* `if P::ENDS_TURN`
+    /// and the summary is on the branch. The ADR described one block on the
+    /// branch, and the difference is load-bearing in both directions:
+    ///
+    /// - the **withdraw** is guarded by `row.visible` and by nothing else, so
+    ///   it does not need to ask what kind of method just finished. Putting it
+    ///   on the `ENDS_TURN` branch would make BR-12 rest on the argument that
+    ///   no non-turn call can be in flight during a turn — true today by this
+    ///   client's synchrony, and exactly the kind of reachability claim BR-12
+    ///   exists to not depend on;
+    /// - the **summary** is a turn's figures, so it must ask: a `/cost` that
+    ///   called `finish` would report a turn nobody ran and overwrite the last
+    ///   real one.
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** move the withdraw
+    /// onto the branch (`if P::ENDS_TURN { if row.visible { … } …`). **1 red of
+    /// 828**, this test — and *nothing else*, which is the whole point of a
+    /// region check: every behavioural test in the suite drives either a turn
+    /// (where the branch is taken and the withdraw still runs) or a non-turn
+    /// call that never draws a row, so the rule can be broken without a single
+    /// assertion noticing. Reverted with the same edit.
+    ///
+    /// The second site is `SessionState::begin_turn`, which closes a turn still
+    /// found open when the next prompt goes on the wire — the defensive path for
+    /// a turn that ended by a route neither of these two saw. It is asserted
+    /// here rather than trusted, because a fallback nobody checks is a fallback
+    /// that has already been deleted once.
+    #[test]
+    fn the_rows_close_out_straddles_the_ends_turn_branch() {
+        let sources = crate::status::scan::production_sources();
+
+        fn region<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
+            let at = src
+                .find(start)
+                .unwrap_or_else(|| panic!("this sweep's anchor is gone: {start:?}"));
+            let len = src[at..]
+                .find(end)
+                .unwrap_or_else(|| panic!("{end:?} no longer follows {start:?}"));
+            &src[at..at + len]
+        }
+
+        let source = |name: &str| {
+            sources
+                .iter()
+                .find(|(rel, _)| rel == name)
+                .map(|(_, src)| crate::status::scan::code_only(src))
+                .unwrap_or_else(|| panic!("{name} is a production source"))
+        };
+        let client = source("client.rs");
+
+        // Between the pump's return and the branch: the withdraw, guarded by
+        // the row's own visibility.
+        let before_the_branch = region(
+            &client,
+            "let outcome = self.pump_until_answered(params, ctx, &mut row);",
+            "if P::ENDS_TURN {",
+        );
+        assert!(
+            before_the_branch.contains("if row.visible {")
+                && before_the_branch.contains("ctx.surface.withdraw_row_above(1)"),
+            "BR-12's withdraw runs on the way out of **every** call, guarded by \
+             the row's own visibility — not by what kind of method just \
+             finished. On the `ENDS_TURN` branch it would hold only for as long \
+             as no non-turn RPC can be in flight during a turn, which is a \
+             property of today's control flow and not a rule: {before_the_branch}"
+        );
+
+        // On the branch: the summary, and nothing about the row.
+        let on_the_branch = region(&client, "if P::ENDS_TURN {", "fn pump_until_answered<");
+        assert!(
+            on_the_branch.contains("ctx.state.activity.finish(Instant::now())"),
+            "BR-16's figures are a *turn's*, so they are read where the method \
+             says a turn just ended: {on_the_branch}"
+        );
+        assert!(
+            !on_the_branch.contains("withdraw_row_above"),
+            "the withdraw must not have drifted back onto the branch: \
+             {on_the_branch}"
+        );
+
+        // And the defensive second site, in the one place that opens a turn.
+        let session_ui = source("session_ui.rs");
+        assert!(
+            region(
+                &session_ui,
+                "pub(crate) fn begin_turn(",
+                "pub(crate) fn observe_activity(",
+            )
+            .contains("self.last_turn_summary = Some(self.activity.finish(now))"),
+            "a turn still open when the next prompt goes on the wire ended by a \
+             path the close-out did not see; it is closed here rather than \
+             overwritten, so its cost and its clock are not lent to the turn \
+             about to start (ADR-621-2)"
+        );
+    }
+
     /// A dropped daemon is reported by the next `call`, not by a drain — a
     /// disconnected channel here must read as "nothing more queued" rather than
     /// failing a session that is otherwise fine.
@@ -3449,6 +3753,24 @@ mod tests {
         ))
     }
 
+    /// The wire JSON the daemon's bus emits for `event` in session `session`.
+    ///
+    /// `EventEnvelope::new(seq, session_id, event)` is the call `tetond`'s
+    /// broadcast makes, verbatim, and `to_value` is the serialization the
+    /// socket writer performs on the result — so a fixture built here is the
+    /// producer's own bytes rather than a second author's guess at them
+    /// (LESSON-544). The typed payload is the point: a field that changes shape
+    /// changes here too, and a literal that quietly stopped populating one
+    /// cannot be written.
+    fn published(seq: u64, session: &str, event: teton_protocol::events::Event) -> Value {
+        serde_json::to_value(teton_protocol::events::EventEnvelope::new(
+            seq,
+            Some(teton_protocol::SessionId::from(session)),
+            event,
+        ))
+        .expect("the protocol's own envelope serializes")
+    }
+
     /// The `session/prompt` refusal a fixture's daemon answers with.
     fn turn_refused(id: i64) -> Incoming {
         Incoming::Response(Response::failure(
@@ -3761,6 +4083,324 @@ mod tests {
         );
     }
 
+    /// **BR-9's second clause, and BR-5's one recorded exception.** A line the
+    /// user has **submitted** mid-turn takes the row out for the rest of the
+    /// turn rather than painting over what they typed.
+    ///
+    /// The geometry is the whole of it. `ECHO` stays on for the length of a
+    /// turn, so the terminal — not this process — echoes the user's characters
+    /// into the row below the activity row, and echoes a newline when they
+    /// press Enter. The cursor drops a line that no bookkeeping here can see,
+    /// and from that moment `repaint_row_above(1)` rewrites *the line holding
+    /// what they typed* and `withdraw_row_above(1)` erases it outright. Neither
+    /// is acceptable, and no offset correction is available: the row is already
+    /// unreachable, since a client in canonical mode cannot know how many rows
+    /// the echo wrapped onto.
+    ///
+    /// So the row is abandoned, the last frame stays in scrollback — the
+    /// bounded BR-5 exception this pass recorded in the spec — and every
+    /// durable line the rest of the turn prints still prints.
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** delete the abandon
+    /// block from `pump_until_answered`. **1 red of 828**, this test, on the
+    /// sequence, which becomes
+    ///
+    /// ```text
+    /// [Line(Activity, "⠋ preparing turn · 0s · turn 0s"),
+    ///  Repaint(1, Activity, "⠋ preparing turn · 0s · turn 0s"),
+    ///  Repaint(1, Activity, "⠙ preparing turn · 0s · turn 0s"),
+    ///  Withdraw(1),
+    ///  Line(Tool, "shell: cargo test [running]"),
+    ///  Line(Activity, "⠹ running shell: cargo test · 0s · turn 0s"),
+    ///  Repaint(1, Activity, "⠹ running shell: cargo test · 0s · turn 0s"),
+    ///  Repaint(1, Activity, "⠸ running shell: cargo test · 0s · turn 0s"),
+    ///  Withdraw(1)]
+    /// ```
+    ///
+    /// — four repaints and two withdraws, every one of them aimed a row above
+    /// where the pump believes the cursor is, which at a real terminal is the
+    /// user's own line six times over. That it is the *only* red is the
+    /// measure of the gap: every other row test runs with `line_waiting`
+    /// answering `false`, which is what a user who is not typing looks like,
+    /// and no leg at a real terminal types *and* submits while a row is up.
+    /// Reverted with the same targeted edit.
+    #[test]
+    fn a_submitted_line_abandons_the_row_and_never_paints_over_it() {
+        let mut surface = RecordingSurface::with_live_rows();
+        let mut state = SessionState::new();
+        let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+        let mut row = RowState::at_width(80);
+        let mut ctx = turn_ctx!(surface, state, prompter);
+
+        // A row on screen, drawn the way the pump draws one.
+        paint_row(&mut row, &mut ctx, Instant::now());
+        assert!(row.visible, "the fixture has a row to lose");
+
+        // The user types and presses Enter. From here on stdin has a line
+        // waiting and the cursor is one row lower than the pump thinks.
+        row.line_waiting = || true;
+
+        let (mut conn, tx, _peer) = test_connection();
+        conn.delay_replies_by_ticks(2);
+        tx.send(wire_event(serde_json::json!({
+            "session_id": "s1",
+            "seq": 3,
+            "event": "session_update",
+            "update": {
+                "kind": "tool_call",
+                "tool_call_id": "c1",
+                "title": "shell: cargo test",
+                "status": "in_progress",
+            },
+        })))
+        .expect("queue");
+        tx.send(turn_answered(1)).expect("queue");
+        conn.pump_until_answered(turn_params(), &mut ctx, &mut row)
+            .expect("the response arrives")
+            .expect("the daemon answered");
+
+        assert_eq!(
+            surface.calls,
+            vec![
+                // The frame that was already on screen when Enter was pressed.
+                // It stays there: the exception BR-5 now records.
+                Rendered::Line(
+                    LineKind::Activity,
+                    "⠋ preparing turn · 0s · turn 0s".to_owned()
+                ),
+                // And the turn goes on writing what belongs in the log.
+                Rendered::Line(LineKind::Tool, "shell: cargo test [running]".to_owned()),
+            ],
+            "no repaint and no withdraw may follow a submitted line"
+        );
+        assert!(
+            !row.live && !row.visible,
+            "the row is given up for the rest of the turn, not for one frame"
+        );
+    }
+
+    /// **BR-13.** A terminal that will not take the row's bytes costs the turn
+    /// its row and nothing else — and says so in verbose mode.
+    ///
+    /// Both halves are the rule. A row abandoned in silence is
+    /// indistinguishable from a daemon that has gone quiet, which is the
+    /// ambiguity BR-11's annotation exists to remove: the user would read "the
+    /// daemon is wedged" off a fact about their terminal. And the turn itself
+    /// is untouched — the response still arrives, still returns, and the
+    /// summary is still read.
+    ///
+    /// The surface here takes `line` and refuses the row verbs, which is the
+    /// terminal this rule is about; `render.rs` pins that `PlainSurface`
+    /// actually reports a failed `write!`/`flush` as `false`
+    /// (`a_row_verb_reports_whether_its_bytes_landed`), and the trait's default
+    /// answer is pinned beside it. Together those are BR-13 end to end.
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** ignore the report
+    /// in `paint_row` (`let _ = ctx.surface.repaint_row_above(1,
+    /// LineKind::Activity, &text);` in place of the `if !…` block). **1 red of
+    /// 828**, this test, on the repaint count — two repaints instead of one,
+    /// `row.live` still true, and no verbose line: the row painting on into a
+    /// terminal that has stopped taking it, which is BR-13 implemented as
+    /// zero. Reverted with the same targeted edit.
+    #[test]
+    fn a_failed_paint_hides_the_row_and_says_so_in_verbose() {
+        for verbose in [false, true] {
+            let (mut conn, tx, _peer) = test_connection();
+            conn.delay_replies_by_ticks(3);
+            tx.send(turn_answered(1)).expect("queue");
+
+            let mut surface = RecordingSurface::with_failing_rows();
+            let mut state = SessionState::new();
+            state.verbose = verbose;
+            let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+            let mut row = RowState::at_width(80);
+            let mut ctx = turn_ctx!(surface, state, prompter);
+            let answered = conn
+                .pump_until_answered(turn_params(), &mut ctx, &mut row)
+                .expect("a refused row must not fail the turn");
+
+            assert!(
+                answered.is_ok(),
+                "the turn itself is untouched (verbose {verbose})"
+            );
+            assert_eq!(
+                surface
+                    .calls
+                    .iter()
+                    .filter(|call| matches!(call, Rendered::Repaint(..)))
+                    .count(),
+                1,
+                "one repaint is attempted, refused, and never attempted again \
+                 (verbose {verbose}): {:?}",
+                surface.calls
+            );
+            assert!(
+                !row.live,
+                "the row is abandoned for the rest of the turn (verbose {verbose})"
+            );
+            assert_eq!(
+                surface.any_line_contains(
+                    LineKind::Info,
+                    "activity row: terminal write failed; hidden for the rest of the turn"
+                ),
+                verbose,
+                "the failure is recorded in verbose output and nowhere else \
+                 (verbose {verbose}): {:?}",
+                surface.calls
+            );
+        }
+    }
+
+    /// A row **drawn** after a resize is fitted to the terminal as it is now.
+    ///
+    /// The width was read once per call until this pass, which is right for the
+    /// frames of one row — a resize between two of them costs a truncation a
+    /// column early, and re-reading would be a `TIOCGWINSZ` eight times a
+    /// second for the whole of every turn — and wrong between two *rows*. Every
+    /// durable line a turn prints puts one row away and brings another back, so
+    /// a turn that outlives a resize would go on fitting new rows to a window
+    /// that no longer exists, and a row wider than the terminal is hard-wrapped
+    /// into a second row the withdraw cannot clear (BR-5).
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** delete the
+    /// `row.width = (row.measure_width)();` line from `paint_row`. **2 red**:
+    /// this test, on the second row still being fitted to the 60-column
+    /// terminal that is now 24 columns wide, and
+    /// `every_ends_turn_exit_withdraws_the_row`, which drives the real `call`
+    /// — `RowState::new` no longer measures at construction, so with the
+    /// re-read gone its rows are fitted to zero columns and never drawn at all.
+    /// The second red is the honest shape of the change: the measurement moved
+    /// from the constructor to the draw, and deleting it there leaves nothing
+    /// measuring anywhere. Reverted with the same edit.
+    #[test]
+    fn a_row_drawn_after_a_resize_is_fitted_to_the_new_width() {
+        let mut surface = RecordingSurface::with_live_rows();
+        let mut state = SessionState::new();
+        let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+        let mut row = RowState::at_width(60);
+        let mut ctx = turn_ctx!(surface, state, prompter);
+        // A route, so the sentence is long enough for a narrow terminal to cut.
+        ctx.state.observe_activity(
+            &teton_protocol::events::EventEnvelope::new(
+                1,
+                Some(teton_protocol::SessionId::from("s1")),
+                teton_protocol::events::Event::RouteDecided(teton_protocol::events::RouteDecided {
+                    category: None,
+                    tier: Some(teton_protocol::Tier::Think),
+                    phase: None,
+                    provider_id: teton_protocol::ProviderId::from("anthropic"),
+                    model: Some("claude-opus-5".to_owned()),
+                    reason: "fixture".to_owned(),
+                    effort: None,
+                    window_tokens: None,
+                    budget_tokens: None,
+                    budget_bytes: None,
+                    bound: None,
+                    spend_ceiling_micro_cents: None,
+                    bound_floored: None,
+                    repo_context_cap: None,
+                }),
+            ),
+            Instant::now(),
+        );
+
+        paint_row(&mut row, &mut ctx, Instant::now());
+        // The pump withdraws before every durable line, so the next frame of
+        // this turn is a fresh draw rather than a repaint.
+        row.visible = false;
+        set_test_width(24);
+        paint_row(&mut row, &mut ctx, Instant::now());
+
+        let drawn: Vec<&str> = surface
+            .calls
+            .iter()
+            .filter_map(|call| match call {
+                Rendered::Line(LineKind::Activity, text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(drawn.len(), 2, "two rows were drawn: {:?}", surface.calls);
+        assert!(
+            crate::markdown::display_width(drawn[0]) > 23,
+            "the first row used the whole of the wide terminal: {:?}",
+            drawn[0]
+        );
+        assert!(
+            crate::markdown::display_width(drawn[1]) <= 23,
+            "the second row is fitted to the terminal as it is now: {:?}",
+            drawn[1]
+        );
+    }
+
+    /// A reset event stream, arriving while the row is up: the row comes down,
+    /// the notice prints where it was, and the row comes back beneath it.
+    ///
+    /// `Incoming::Lagged` is the third arm of the pump's message match and the
+    /// only one that renders without an envelope, so it is the arm most easily
+    /// left out of the row's discipline — a notice printed under a live row
+    /// would be scrolled away by the next repaint, and the row would be left in
+    /// the log (BR-5, BR-10).
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** gate the
+    /// withdraw-before-dispatch on the message being an event
+    /// (`if row.visible && matches!(message, Incoming::Event(_))`), so the lag
+    /// arm keeps its row. **4 red**: this test, plus
+    /// `a_durable_line_prints_where_the_row_was`,
+    /// `a_permission_question_owns_the_terminal_…` and
+    /// `the_pump_ticks_while_the_daemon_is_silent`, which lose the withdraw
+    /// that takes the row back on the *response*. Those three are why the
+    /// shared block is right; this test is why the block has to be shared, and
+    /// it is the only one of the four that fails on the lag arm itself.
+    #[test]
+    fn a_reset_event_stream_prints_where_the_row_was() {
+        let (mut conn, tx, _peer) = test_connection();
+        conn.delay_replies_by_ticks(1);
+        tx.send(Incoming::Lagged(RpcError::new(
+            error_code::INTERNAL_ERROR,
+            "the client fell 42 events behind",
+        )))
+        .expect("queue");
+        tx.send(turn_answered(1)).expect("queue");
+
+        let mut surface = RecordingSurface::with_live_rows();
+        let mut state = SessionState::new();
+        let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+        let mut row = RowState::at_width(80);
+        let mut ctx = turn_ctx!(surface, state, prompter);
+        conn.pump_until_answered(turn_params(), &mut ctx, &mut row)
+            .expect("the response arrives")
+            .expect("the daemon answered");
+
+        assert_eq!(
+            surface.calls,
+            vec![
+                Rendered::Line(
+                    LineKind::Activity,
+                    "⠋ preparing turn · 0s · turn 0s".to_owned()
+                ),
+                Rendered::Withdraw(1),
+                Rendered::Line(
+                    LineKind::Error,
+                    "event stream lagged and was reset: the client fell 42 events behind"
+                        .to_owned()
+                ),
+                Rendered::Line(
+                    LineKind::Activity,
+                    "⠙ preparing turn · 0s · turn 0s".to_owned()
+                ),
+                // The tick that precedes the response, in place as always.
+                Rendered::Repaint(
+                    1,
+                    LineKind::Activity,
+                    "⠙ preparing turn · 0s · turn 0s".to_owned()
+                ),
+                Rendered::Withdraw(1),
+            ],
+            "the lag notice belongs in the log; the row is what moves"
+        );
+        assert!(!row.visible);
+    }
+
     /// **BR-4's and BR-6's benign path.** With no live rows the pump keeps the
     /// blocking receive it has always had, so it **never enters the tick arm**
     /// — not once, not to find nothing to draw.
@@ -4009,13 +4649,50 @@ mod tests {
     /// **AC-5.** Every event the row consumes moves the phase, driven through
     /// the real pump and the real `dispatch_event`.
     ///
-    /// The envelopes are deserialized from the wire JSON the daemon's own
-    /// publisher emits, not built as struct literals, so a payload that changed
-    /// shape fails here rather than passing against a value nothing produces
-    /// (LESSON-544). Each step is a whole `pump_until_answered` — the send, the
-    /// receive, the fold, the dispatch, the response — so the *order* the pump
-    /// does those things in is under test too: fold before render, which is what
-    /// keeps the row and the durable line beside it describing one moment.
+    /// **Each envelope is the daemon's own serialization of the daemon's own
+    /// type.** `published` below builds `EventEnvelope::new(seq, session,
+    /// Event::X(..))` — the exact call `tetond`'s bus makes
+    /// (`broadcast.rs`) — from the protocol's typed payload structs, and then
+    /// serializes it. So a payload that changed shape cannot leave this fixture
+    /// describing a value nothing produces: a field renamed on the wire is
+    /// renamed in the fixture with it, and a field the daemon stopped sending
+    /// stops arriving here. Hand-written `json!` literals were what this test
+    /// carried until REQ-621's verify pass, and they are the LESSON-544 shape
+    /// exactly — a `"tier"` key that quietly became `"tier_band"` would have
+    /// left every literal deserializing with no tier at all, the row losing the
+    /// only name BR-2 lets it print, and this test green throughout.
+    ///
+    /// It is deliberately still a **serialization**, deserialized back through
+    /// `wire_event`, rather than a typed envelope handed straight to the pump:
+    /// the client's real input is bytes, and the round trip is the seam.
+    ///
+    /// Each step is a whole `pump_until_answered` — the send, the receive, the
+    /// fold, the dispatch, the response — so the *order* the pump does those
+    /// things in is under test too: fold before render, which is what keeps the
+    /// row and the durable line beside it describing one moment.
+    ///
+    /// **Which of these events a real daemon also drives into the row**, since
+    /// this test is the whole of AC-5 for four of them. The pty legs
+    /// (`pty_e2e.rs`) run the scripted engine against the real daemon and reach
+    /// `route_decided`, `tool_call`, `tool_call_update` and `cost_recorded` that
+    /// way. They cannot reach `prefill_progress` (no local model loads under
+    /// the scripted engine), `context_compacted` (no context grows large
+    /// enough), `turn_queued` (no tier warms) or `permission_request` (the
+    /// fixtures grant at `full` so nothing asks) — so for those four this is the
+    /// only test that drives the phase from the producer's own payload, which is
+    /// why the fixture had to stop being a literal.
+    ///
+    /// **Mutation, applied and observed (2026-09-10):** add a field the daemon
+    /// publishes to a payload the row reads — `#[serde(default)] pub attempt:
+    /// u32` on `RouteDecided`. The fixture below **stops compiling** (`E0063:
+    /// missing field attempt`, at this test and at five sibling payload
+    /// constructions), which is a payload that changed shape failing at the
+    /// fixture, loudly. The `json!` literal it replaced named five of
+    /// `RouteDecided`'s fourteen fields and would have gone on compiling and
+    /// passing: serde fills a defaulted field from nothing, and this test
+    /// asserts phases, so the row quietly losing a field it is allowed to print
+    /// is invisible to it. That asymmetry is the finding. Reverted with the
+    /// same edit.
     ///
     /// The permission step asserts the restore rather than the phase, because
     /// the pump answers the question inside the same step: what the row must do
@@ -4024,6 +4701,8 @@ mod tests {
     #[test]
     fn phases_follow_events_through_the_real_dispatch() {
         use crate::activity::Phase;
+        use teton_protocol::events::{self, Event};
+        use teton_protocol::{ProviderId, Tier};
 
         let mut surface = RecordingSurface::new();
         let mut state = SessionState::new();
@@ -4040,54 +4719,93 @@ mod tests {
         let script: Vec<(&str, Value, Phase)> = vec![
             (
                 "route_decided",
-                serde_json::json!({
-                    "session_id": "s1", "seq": 1, "event": "route_decided",
-                    "provider_id": "anthropic", "model": "claude-opus-5",
-                    "tier": "think", "reason": "fixture",
-                }),
+                published(
+                    1,
+                    "s1",
+                    Event::RouteDecided(events::RouteDecided {
+                        category: None,
+                        tier: Some(Tier::Think),
+                        phase: None,
+                        provider_id: ProviderId::from("anthropic"),
+                        model: Some("claude-opus-5".to_owned()),
+                        reason: "fixture".to_owned(),
+                        effort: None,
+                        window_tokens: None,
+                        budget_tokens: None,
+                        budget_bytes: None,
+                        bound: None,
+                        spend_ceiling_micro_cents: None,
+                        bound_floored: None,
+                        repo_context_cap: None,
+                    }),
+                ),
                 Phase::AwaitingModel,
             ),
             (
                 // The daemon's own fraction: the phase is `awaiting_model`
                 // making progress, not a phase of its own (BR-3).
                 "prefill_progress",
-                serde_json::json!({
-                    "session_id": "s1", "seq": 2, "event": "prefill_progress",
-                    "tokens_done": 4096, "tokens_total": 32768,
-                    "tokens_per_second": 512.0,
-                }),
+                published(
+                    2,
+                    "s1",
+                    Event::PrefillProgress(events::PrefillProgress {
+                        tokens_done: 4_096,
+                        tokens_total: 32_768,
+                        tokens_per_second: 512.0,
+                    }),
+                ),
                 Phase::AwaitingModel,
             ),
             (
                 // Being billed is not a thing the turn is *doing*.
                 "cost_recorded",
-                serde_json::json!({
-                    "session_id": "s1", "seq": 3, "event": "cost_recorded",
-                    "record": {
-                        "session_id": "s1", "provider_id": "anthropic",
-                        "model": "claude-opus-5", "input_tokens": 100,
-                        "output_tokens": 50, "usd_micros": 12_345,
-                    },
-                }),
+                published(
+                    3,
+                    "s1",
+                    Event::CostRecorded(events::CostRecorded {
+                        record: events::CostRecord {
+                            session_id: teton_protocol::SessionId::from("s1"),
+                            phase: None,
+                            category: None,
+                            provider_id: ProviderId::from("anthropic"),
+                            model: "claude-opus-5".to_owned(),
+                            input_tokens: 100,
+                            output_tokens: 50,
+                            usd_micros: 12_345,
+                            cached_tokens: None,
+                            reasoning_tokens: None,
+                            probe: false,
+                        },
+                    }),
+                ),
                 Phase::AwaitingModel,
             ),
             (
                 "agent_message_chunk",
-                serde_json::json!({
-                    "session_id": "s1", "seq": 4, "event": "session_update",
-                    "update": { "kind": "agent_message_chunk", "text": "the finding is" },
-                }),
+                published(
+                    4,
+                    "s1",
+                    Event::SessionUpdate(events::SessionUpdate {
+                        update: events::SessionUpdatePayload::AgentMessageChunk {
+                            text: "the finding is".to_owned(),
+                        },
+                    }),
+                ),
                 Phase::Streaming,
             ),
             (
                 "tool_call",
-                serde_json::json!({
-                    "session_id": "s1", "seq": 5, "event": "session_update",
-                    "update": {
-                        "kind": "tool_call", "tool_call_id": "c1",
-                        "title": "shell: cargo test", "status": "in_progress",
-                    },
-                }),
+                published(
+                    5,
+                    "s1",
+                    Event::SessionUpdate(events::SessionUpdate {
+                        update: events::SessionUpdatePayload::ToolCall {
+                            tool_call_id: "c1".to_owned(),
+                            title: "shell: cargo test".to_owned(),
+                            status: events::ToolCallStatus::InProgress,
+                        },
+                    }),
+                ),
                 Phase::ToolRunning,
             ),
             (
@@ -4095,57 +4813,83 @@ mod tests {
                 // there is no "model request issued" event, and BR-14 needed
                 // none.
                 "tool_call_update",
-                serde_json::json!({
-                    "session_id": "s1", "seq": 6, "event": "session_update",
-                    "update": {
-                        "kind": "tool_call_update", "tool_call_id": "c1",
-                        "status": "completed",
-                    },
-                }),
+                published(
+                    6,
+                    "s1",
+                    Event::SessionUpdate(events::SessionUpdate {
+                        update: events::SessionUpdatePayload::ToolCallUpdate {
+                            tool_call_id: "c1".to_owned(),
+                            status: events::ToolCallStatus::Completed,
+                        },
+                    }),
+                ),
                 Phase::AwaitingModel,
             ),
             (
                 "context_compacted",
-                serde_json::json!({
-                    "session_id": "s1", "seq": 7, "event": "context_compacted",
-                    "kept_bytes": 4096, "dropped_bytes": 2048,
-                    "summarized_bytes": 512, "anchor_bytes": 128,
-                    "dropped_blocks": [], "provider_id": "anthropic",
-                    "fallback": false,
-                }),
+                published(
+                    7,
+                    "s1",
+                    Event::ContextCompacted(events::ContextCompacted {
+                        kept_bytes: 4_096,
+                        dropped_bytes: 2_048,
+                        summarized_bytes: 512,
+                        anchor_bytes: 128,
+                        dropped_blocks: Vec::new(),
+                        dropped_blocks_omitted: 0,
+                        provider_id: Some("anthropic".to_owned()),
+                        fallback: false,
+                    }),
+                ),
                 Phase::Compacting,
             ),
             (
                 "turn_queued",
-                serde_json::json!({
-                    "session_id": "s1", "seq": 8, "event": "turn_queued",
-                    "turn_id": "t1", "model_id": "qwen3-coder-30b-a3b",
-                    "waiting_on": "loading",
-                }),
+                published(
+                    8,
+                    "s1",
+                    Event::TurnQueued(events::TurnQueued {
+                        turn_id: teton_protocol::TurnId::from("t1"),
+                        model_id: "qwen3-coder-30b-a3b".to_owned(),
+                        waiting_on: events::TierWarming::Loading,
+                    }),
+                ),
                 Phase::Held,
             ),
             (
                 // BR-1: the question owns the terminal, the pump answers it,
                 // and the phase it interrupted comes back.
                 "permission_request",
-                serde_json::json!({
-                    "session_id": "s1", "seq": 9, "event": "permission_request",
-                    "request_id": "r1", "tool_name": "shell",
-                    "options": [{
-                        "option_id": "reject_once", "label": "Reject once",
-                        "kind": "reject_once",
-                    }],
-                }),
+                published(
+                    9,
+                    "s1",
+                    Event::PermissionRequest(events::PermissionRequest {
+                        request_id: teton_protocol::RequestId::from("r1"),
+                        tool_name: "shell".to_owned(),
+                        description: None,
+                        subject: None,
+                        options: vec![events::PermissionOption {
+                            option_id: "reject_once".to_owned(),
+                            label: "Reject once".to_owned(),
+                            kind: events::PermissionOptionKind::RejectOnce,
+                        }],
+                    }),
+                ),
                 Phase::Held,
             ),
             (
                 // BR-15 / AC-9: another session's event on the daemon-wide bus
                 // changes nothing here.
                 "another session's chunk",
-                serde_json::json!({
-                    "session_id": "s2", "seq": 10, "event": "session_update",
-                    "update": { "kind": "agent_message_chunk", "text": "not ours" },
-                }),
+                published(
+                    10,
+                    "s2",
+                    Event::SessionUpdate(events::SessionUpdate {
+                        update: events::SessionUpdatePayload::AgentMessageChunk {
+                            text: "not ours".to_owned(),
+                        },
+                    }),
+                ),
                 Phase::Held,
             ),
         ];

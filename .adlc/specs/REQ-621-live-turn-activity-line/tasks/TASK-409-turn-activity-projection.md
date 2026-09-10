@@ -47,11 +47,36 @@ onto `SessionState` and arm it in `begin_turn`.
 | BR-3 | test-case | `crates/teton/src/activity.rs::tests::the_frame_table` | no |
 | BR-7 | test-case | `crates/teton/src/activity.rs::tests::the_frame_table` | no |
 | BR-11 | test-case | `crates/teton/src/activity.rs::tests::a_stall_annotates_the_last_phase_and_a_running_tool_is_exempt` | yes |
+| BR-5 | test-case | `crates/teton/src/activity.rs::tests::the_row_is_fitted_to_what_the_terminal_will_receive` (added at verify: the fit measured the row *before* the surface's defuse, so a title of control bytes measured 0 columns and drew 225) | no |
+| BR-10 | test-case | `crates/teton/src/activity.rs::tests::the_held_row_and_the_queued_notice_cannot_disagree` (added at verify; BR-2 amended, ASSUME-049) | no |
 | BR-15 | test-case | `crates/teton/src/activity.rs::tests::another_sessions_event_changes_nothing` | yes |
+| BR-15 | test-case | `crates/teton/src/activity.rs::tests::the_fold_reads_the_session_the_way_the_render_does` (added at verify: the fold read the session with `other_session` where the render reads it with `should_render`) | yes |
+| AC-8 | test-case | `crates/teton/src/activity.rs::tests::a_tool_call_that_arrives_finished_is_not_running` (added at verify: the `tool_call` arm ignored the event's `status`) | yes |
 | BR-16 | test-case | `crates/teton/src/session_ui.rs::tests::the_turn_summary_reads_the_same_accumulator_the_frames_read` | no |
 | AC-4 | test-case | `crates/teton/src/activity.rs::tests::the_frame_advances_with_the_tick` | no |
 | AC-8 | test-case | `crates/teton/src/activity.rs::tests::no_phase_is_invented` | yes |
 | AC-9 | test-case | `crates/teton/src/activity.rs::tests::another_sessions_event_changes_nothing` | yes |
+
+## Verify-pass corrections (2026-09-10)
+
+Five findings landed in `activity.rs`, each with a test and a recorded
+mutation. Four are in the table above; the fifth has no rule of its own:
+
+- **`frame` measured the wrong string.** The fit ran on the composed row, and
+  the surface defuses every row it writes — each control and display-steering
+  character becomes a one-column space — so a tool title of control bytes
+  measured zero columns and drew 225 against a width of 80, and a title
+  carrying `\n` or `\t` broke or jumped the row. The row is now defused before
+  it is measured, and one column is left unspent so a full row never touches
+  the last cell. `fit` itself is unchanged and still does no I/O.
+- **A `tool_call` with a terminal initial status** entered `tool_running`.
+- **The fold and the render read the session differently** (BR-15).
+- **The held sentence was composed twice** (BR-2, BR-10, ASSUME-049).
+- **A second `permission_request` before the first was answered** recorded
+  `awaiting_permission` as the phase to restore, which would have left the row
+  absent for the rest of the turn while the projection insisted a question was
+  on screen. One guard, one test
+  (`a_second_permission_request_does_not_become_the_phase_to_restore`).
 
 ## Technical Notes
 

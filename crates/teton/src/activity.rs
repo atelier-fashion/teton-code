@@ -49,7 +49,7 @@
 //!
 //! | Mutation | Fails |
 //! |---|---|
-//! | `frame` ignores its `tick` (`SPINNER[0]` for every frame) | `the_frame_advances_with_the_tick`, and with it `the_frame_table` and `a_stall_annotates_the_last_phase_and_a_running_tool_is_exempt` — 3 red of the 10 here, and **0 of `pty_e2e`'s 28** (re-run 2026-09-10 against the widened suite) |
+//! | `frame` ignores its `tick` (`SPINNER[0]` for every frame) | `the_frame_advances_with_the_tick`, and with it `the_frame_table` and `a_stall_annotates_the_last_phase_and_a_running_tool_is_exempt` — 3 red of the 15 here, and **0 of `pty_e2e`'s 28** (re-run 2026-09-10 at verify, over the five tests that pass added then) |
 //!
 //! Two of those three are collateral and the third is the point: the table and
 //! the stall test carry literal spinner glyphs, so they fail on a frozen
@@ -72,13 +72,14 @@ use std::time::{Duration, Instant};
 
 use teton_protocol::events::{
     thousands, Event, EventEnvelope, PrefillProgress, RouteDecided, SessionUpdatePayload,
-    TierWarming, ToolCallStatus, TurnQueued,
+    ToolCallStatus, TurnQueued,
 };
 use teton_protocol::SessionId;
 
+use crate::client::should_render;
 use crate::cost_ui::format_usd;
 use crate::markdown::{char_display_width, display_width};
-use crate::session_ui::other_session;
+use crate::session_ui::tier_warming_clause;
 
 /// How long this turn may go without a daemon event before the row says so
 /// (BR-11: the quiet bound is 15 seconds).
@@ -225,10 +226,18 @@ impl TurnActivity {
     /// Fold one event into the turn's activity.
     ///
     /// Takes the whole envelope so that `session_id` and `event` are read
-    /// together, and asks [`other_session`] rather than taking a second reading
-    /// of whose event this is: another session's event changes nothing (BR-15),
-    /// and an event naming no session counts as ours — unknown is no evidence
-    /// of elsewhere, which is the reading the reply accumulator already takes.
+    /// together, and asks [`should_render`] — **the predicate the render path
+    /// itself uses** — rather than taking a second reading of whose event this
+    /// is: another session's event changes nothing (BR-15), and an event naming
+    /// no session counts as ours, since unknown is no evidence of elsewhere.
+    ///
+    /// One predicate, not two that agree today. The row is a projection of what
+    /// the session *rendered*, so an envelope the pump will not render must not
+    /// move the row either; the two readings differed on exactly one input —
+    /// a session-scoped event arriving before this client owns a session, which
+    /// [`other_session`] called ours and `dispatch_event` dropped — and a row
+    /// naming a phase from a turn the user never saw a line of is the failure
+    /// BR-15 is about.
     ///
     /// Every arm is one of the spec's consumed events. Everything else — the
     /// notices, the lifecycle stages, another client attaching — leaves the
@@ -237,7 +246,7 @@ impl TurnActivity {
     /// daemon-scoped heartbeat published while the turn is wedged does not
     /// refute.
     pub fn observe(&mut self, env: &EventEnvelope, own_session: Option<&SessionId>, now: Instant) {
-        if other_session(own_session, env.session_id.as_ref()).is_some() {
+        if !should_render(env.session_id.as_ref(), own_session) {
             return;
         }
         if self.phase == Phase::Idle {
@@ -255,10 +264,23 @@ impl TurnActivity {
                 SessionUpdatePayload::AgentMessageChunk { .. } => {
                     self.enter(Phase::Streaming, now);
                 }
-                SessionUpdatePayload::ToolCall { title, .. } => {
-                    self.enter(Phase::ToolRunning, now);
-                    self.detail = Some(title.clone());
-                }
+                // The status is **read**, not assumed. A `tool_call` may arrive
+                // already finished — a tool the daemon refused, one answered
+                // from a cache, one that failed before it ran — and calling
+                // that `tool_running` would put a row on screen naming a tool
+                // that is not running, which is the client inventing a phase
+                // the daemon did not report (BR-2, AC-8). A finished one means
+                // what a `tool_call_update` of the same status means: the model
+                // is composing its next step.
+                SessionUpdatePayload::ToolCall { title, status, .. } => match status {
+                    ToolCallStatus::Pending | ToolCallStatus::InProgress => {
+                        self.enter(Phase::ToolRunning, now);
+                        self.detail = Some(title.clone());
+                    }
+                    ToolCallStatus::Completed | ToolCallStatus::Failed => {
+                        self.enter(Phase::AwaitingModel, now);
+                    }
+                },
                 // A finished tool means the model is composing the next step —
                 // there is no event for "model request issued", and by
                 // construction the next thing the daemon can send is a chunk, a
@@ -276,7 +298,16 @@ impl TurnActivity {
             Event::PermissionRequest(_) => {
                 let interrupted = self.phase;
                 self.enter(Phase::AwaitingPermission, now);
-                self.resume_after_permission = Some(interrupted);
+                // A second request arriving before the first is answered must
+                // not make `awaiting_permission` the phase to come back *to*:
+                // the pump answers each question in turn, and a restore to a
+                // phase that draws nothing would leave the row absent for the
+                // rest of the turn while the projection insisted a question was
+                // on screen. The first request's memory is the one worth
+                // keeping, so a repeat leaves it alone.
+                if interrupted != Phase::AwaitingPermission {
+                    self.resume_after_permission = Some(interrupted);
+                }
             }
             Event::TurnQueued(queued) => {
                 self.enter(Phase::Held, now);
@@ -330,7 +361,9 @@ impl TurnActivity {
     /// boundary by the display-width measurement `markdown.rs` owns — a row
     /// measured in bytes or `char`s would exceed the width for CJK content and
     /// be hard-wrapped by the terminal into two rows, which is residue the
-    /// withdraw cannot clear.
+    /// withdraw cannot clear. The row is **defused before it is measured**, and
+    /// one column of `width` is left unspent; both are that same rule reaching
+    /// the two ways a row still got past the fit — see the fit itself below.
     ///
     /// No ellipsis is appended to a truncated row: the marker would cost a
     /// column of the sentence to state something the missing text already says.
@@ -389,7 +422,25 @@ impl TurnActivity {
                 quiet.as_secs()
             ));
         }
-        let fitted = fit(&row, width);
+        // **Measured on the text the terminal will actually receive**, which is
+        // not the text composed above. Every row goes out through
+        // [`crate::render::Surface::line`] or `repaint_row_above`, and both
+        // defuse it first: each control and display-steering character becomes
+        // a one-column space ([`crate::render::defused`]). So a tool title of
+        // 200 control bytes measures **zero** columns here and 200 there, and a
+        // `\n` or a `\t` inside one measures nothing and then breaks or jumps
+        // the row. In every case the terminal hard-wraps the row into a second
+        // row, which `withdraw_row_above(1)` cannot clear (BR-5) and which
+        // `repaint_row_above(1)` then paints one row short of, over the line the
+        // user is typing into (BR-9). Defusing *before* the fit is what makes
+        // the two measurements one measurement; the surface's own defuse is
+        // then idempotent.
+        //
+        // One column is held back so a full row never touches the last cell.
+        // A terminal that autowraps on the final column takes the wrap the
+        // moment a row is exactly its width, which is the same lost row by the
+        // other door.
+        let fitted = fit(&crate::render::defused(&row), width.saturating_sub(1));
         // A row with no columns is not a row: painting an empty line would leave
         // exactly the blank residue BR-5 forbids.
         (!fitted.is_empty()).then_some(fitted)
@@ -502,17 +553,20 @@ fn route_clause(route: &RouteDecided) -> String {
 
 /// The held-turn clause a `turn_queued` contributes.
 ///
-/// Branched on the event's typed `waiting_on` rather than on prose, so this and
-/// [`crate::session_ui`]'s durable notice are two presentations of **one**
-/// classification and cannot come to disagree about which transient state the
-/// tier is in (LESSON-456). No countdown: the load window publishes nothing to
-/// derive one from (BR-3).
+/// **Composed by [`tier_warming_clause`], which the session's own `turn_queued`
+/// notice also composes with**, so this row and that line are two presentations
+/// of *one* sentence rather than two sentences about one event (BR-10, BR-2 as
+/// amended 2026-09-10). The classification — which of the two transient states
+/// the tier is in — is branched on the event's typed `waiting_on` in that one
+/// function and nowhere else, which is what makes "they cannot come to
+/// disagree" a property of the code rather than of the reviewer (LESSON-456).
+///
+/// What the row adds is the frame around it: the notice announces a queued
+/// message once, the row says *this is what the turn is doing right now*, and
+/// the two lead-ins are the whole of the difference. No countdown either way:
+/// the load window publishes nothing to derive one from (BR-3).
 fn held_clause(queued: &TurnQueued) -> String {
-    let doing = match queued.waiting_on {
-        TierWarming::Installing => "installing",
-        TierWarming::Loading => "loading",
-    };
-    format!("held until {} finishes {doing}", queued.model_id)
+    format!("held until {}", tier_warming_clause(queued))
 }
 
 /// The prefill clause a `prefill_progress` contributes.
@@ -535,6 +589,16 @@ fn prefill_clause(progress: &PrefillProgress) -> String {
 /// character counted as one column but drawn as two makes the row exceed the
 /// terminal, and the terminal then hard-wraps it into a second row the withdraw
 /// does not clear.
+///
+/// **Called on already-defused text, and on nothing else.** The two
+/// measurements this function makes disagree about a control character — the
+/// `str` width charges a C0 byte one column, the per-`char` loop charges it
+/// none — and the surface will turn each of them into a space regardless. The
+/// caller ([`TurnActivity::frame`]) defuses first, which makes that
+/// disagreement unreachable rather than merely unlikely; there is deliberately
+/// no defuse here, because a function that both transformed and measured its
+/// argument would be doing the caller's job at the caller's expense (no I/O,
+/// no terminal, and nothing but arithmetic).
 fn fit(row: &str, width: usize) -> String {
     if display_width(row) <= width {
         return row.to_owned();
@@ -558,7 +622,7 @@ mod tests {
 
     use teton_protocol::events::{
         ContextCompacted, CostRecord, CostRecorded, PermissionOption, PermissionOptionKind,
-        PermissionRequest, SessionTitled, SessionUpdate,
+        PermissionRequest, SessionTitled, SessionUpdate, TierWarming,
     };
     use teton_protocol::{ProviderId, RequestId, Tier, TurnId};
 
@@ -611,11 +675,17 @@ mod tests {
     }
 
     fn tool_call(title: &str) -> Event {
+        tool_call_with(ToolCallStatus::InProgress, title)
+    }
+
+    /// A `tool_call` carrying an arbitrary initial status — the shape a tool
+    /// that never ran arrives in.
+    fn tool_call_with(status: ToolCallStatus, title: &str) -> Event {
         Event::SessionUpdate(SessionUpdate {
             update: SessionUpdatePayload::ToolCall {
                 tool_call_id: "c1".to_owned(),
                 title: title.to_owned(),
-                status: ToolCallStatus::InProgress,
+                status,
             },
         })
     }
@@ -903,12 +973,15 @@ mod tests {
                 ),
             ),
             (
+                // Nineteen columns at a width of twenty: the last cell is left
+                // unspent, so a terminal that autowraps on the final column has
+                // nothing to wrap (verify, 2026-09-10).
                 "a row wider than the terminal is cut on a character boundary",
                 folded(t0, &[(1, full_route())]),
                 at(t0, 2),
                 0,
                 20,
-                Some("⠋ waiting on anthrop"),
+                Some("⠋ waiting on anthro"),
             ),
             (
                 "a row with no columns is not a row",
@@ -1037,7 +1110,7 @@ mod tests {
 
     /// AC-4: the row must actually move. **Mutation (re-run 2026-09-10 over the
     /// widened suite):** `frame` ignoring its `tick` — `SPINNER[0]` in place of
-    /// `SPINNER[(tick % SPINNER.len() as u64) as usize]` — reddens 3 of the 10
+    /// `SPINNER[(tick % SPINNER.len() as u64) as usize]` — reddens 3 of the 15
     /// tests in this module and **none** of `pty_e2e`'s 28. This test is the one
     /// that fails on the property, on its distinct-frames assertion;
     /// `the_frame_table` and
@@ -1195,6 +1268,270 @@ mod tests {
             Some("⠋ preparing turn · 2s · turn 2s")
         );
         assert_eq!(activity.finish(at(t0, 22)).cost_micros, 0);
+    }
+
+    /// **BR-5 / BR-9: the fit measures the text the terminal will receive.**
+    ///
+    /// Every row is written through a [`crate::render::Surface`] verb, and both
+    /// verbs defuse first: each control and display-steering character becomes
+    /// a one-column space. A fit measured before that transform is measuring a
+    /// different string — and the two measurements this module uses do not even
+    /// agree with each other about a control byte, since `display_width`'s
+    /// `str` path charges a C0 one column and its `char` path charges it none.
+    /// The consequence is a row wider than the terminal, hard-wrapped into a
+    /// second row: `withdraw_row_above(1)` clears the wrong one and leaves the
+    /// other in scrollback (BR-5), and `repaint_row_above(1)` paints one row
+    /// short, over the line the user is typing into (BR-9).
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** fit the pre-defuse
+    /// row — `fit(&row, width.saturating_sub(1))` in place of
+    /// `fit(&crate::render::defused(&row), width.saturating_sub(1))`. **1 red
+    /// of 828**, this test, reporting `225 columns at a width of 80` on a row
+    /// of 200 control bytes; the reviewer who found this measured 232 from
+    /// their own `fit(.., 80)` fixture, which is the same defect at a different
+    /// title length.
+    ///
+    /// **Second mutation, also applied and observed red:** spend the last
+    /// column (`fit(&crate::render::defused(&row), width)`). **3 red** — this
+    /// test's CJK and emoji sweeps, `the_frame_table`'s twenty-column row, and
+    /// `client.rs`'s `a_row_drawn_after_a_resize_is_fitted_to_the_new_width`.
+    /// Reverted with the same targeted edits.
+    #[test]
+    fn the_row_is_fitted_to_what_the_terminal_will_receive() {
+        let t0 = Instant::now();
+
+        // A title of 200 control bytes: zero columns before the defuse, 200
+        // after it. The daemon composes the tool title, and a title is model-
+        // proposed argument text — this is the shape that arrives, not one
+        // invented for the test.
+        let hostile = folded(
+            t0,
+            &[(1, full_route()), (1, tool_call(&"\x01".repeat(200)))],
+        );
+        let row = hostile.frame(at(t0, 2), 0, 80).expect("visible");
+        assert!(
+            display_width(&row) <= 79,
+            "{} columns at a width of 80: {row:?}",
+            display_width(&row)
+        );
+        assert_eq!(
+            crate::render::defused(&row),
+            row,
+            "the surface's own defuse must have nothing left to change — \
+             otherwise the row that was measured is not the row that is written"
+        );
+
+        // A newline and a tab in the title: the newline is a row this verb does
+        // not own, and the tab jumps the cursor by more than its one `char`.
+        let broken = folded(
+            t0,
+            &[
+                (1, full_route()),
+                (1, tool_call("cargo test\n\tand the second row")),
+            ],
+        );
+        let row = broken.frame(at(t0, 2), 0, 80).expect("visible");
+        assert!(
+            !row.contains('\n'),
+            "a row with a newline in it is two: {row:?}"
+        );
+        assert!(display_width(&row) <= 79, "{row:?}");
+
+        // A CJK title against every width around the boundary. Each glyph is
+        // two columns, so an odd remaining column has to be left unspent rather
+        // than filled with half a character — and the row is a `String`, so a
+        // cut inside one would not have compiled.
+        let wide = folded(t0, &[(1, full_route()), (1, tool_call(&"字".repeat(40)))]);
+        for width in 4_usize..40 {
+            let row = wide.frame(at(t0, 2), 0, width).expect("visible");
+            assert!(
+                display_width(&row) < width,
+                "{} columns at a width of {width}: {row:?}",
+                display_width(&row)
+            );
+        }
+
+        // ...and the same for an emoji title, which is two columns per glyph by
+        // a different route through the width table.
+        let emoji = folded(t0, &[(1, full_route()), (1, tool_call(&"🚀".repeat(40)))]);
+        for width in 4_usize..40 {
+            let row = emoji.frame(at(t0, 2), 0, width).expect("visible");
+            assert!(display_width(&row) < width, "at {width}: {row:?}");
+        }
+    }
+
+    /// **BR-2 / AC-8: a `tool_call` that arrives already finished never ran.**
+    ///
+    /// The initial status is read rather than assumed. A tool the daemon
+    /// refused, answered from a cache, or failed before starting arrives as a
+    /// `tool_call` with a terminal status, and a row saying `running shell: …`
+    /// over it would be the client naming a phase the daemon did not report —
+    /// and one the user can see is not happening.
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** restore the
+    /// unconditional arm (`self.enter(Phase::ToolRunning, now)` for every
+    /// status). Only this test fails, on the first `assert_eq!`. Reverted with
+    /// the same edit.
+    #[test]
+    fn a_tool_call_that_arrives_finished_is_not_running() {
+        let t0 = Instant::now();
+        for status in [ToolCallStatus::Completed, ToolCallStatus::Failed] {
+            let done = folded(
+                t0,
+                &[
+                    (1, full_route()),
+                    (2, tool_call_with(status, "shell: cargo test")),
+                ],
+            );
+            assert_eq!(done.phase(), Phase::AwaitingModel, "{status:?}");
+            assert_eq!(
+                done.frame(at(t0, 3), 0, 120).as_deref(),
+                Some("⠋ waiting on anthropic claude-opus-5 (think) · 1s · turn 3s"),
+                "{status:?} names no running tool"
+            );
+        }
+        for status in [ToolCallStatus::Pending, ToolCallStatus::InProgress] {
+            let running = folded(
+                t0,
+                &[
+                    (1, full_route()),
+                    (2, tool_call_with(status, "shell: cargo test")),
+                ],
+            );
+            assert_eq!(running.phase(), Phase::ToolRunning, "{status:?}");
+            assert_eq!(
+                running.frame(at(t0, 3), 0, 120).as_deref(),
+                Some("⠋ running shell: cargo test · 1s · turn 3s"),
+                "{status:?} is a tool the daemon has started"
+            );
+        }
+    }
+
+    /// **BR-15: the fold reads whose event this is exactly as the render does.**
+    ///
+    /// The row is a projection of what the session *rendered*, so an envelope
+    /// the pump will not render must not move the row either. The two readings
+    /// differed on one input — a session-scoped event arriving before this
+    /// client owns a session, which `other_session` counted as ours and
+    /// `dispatch_event` dropped — and a row naming a phase from a turn the user
+    /// never saw a line of is precisely what BR-15 is about.
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** put the old
+    /// predicate back (`if other_session(own_session, env.session_id.as_ref())
+    /// .is_some() { return; }`). Only this test fails: the tool call folds and
+    /// the row names a tool from somebody else's session. Reverted with the
+    /// same edit.
+    #[test]
+    fn the_fold_reads_the_session_the_way_the_render_does() {
+        let t0 = Instant::now();
+        let theirs = EventEnvelope::new(1, Some(SessionId::from("theirs")), tool_call("shell: rm"));
+
+        // No session of our own yet: `should_render` says this is not ours to
+        // paint, so it is not ours to fold.
+        let mut early = TurnActivity::default();
+        early.begin(t0);
+        early.observe(&theirs, None, at(t0, 1));
+        assert_eq!(early.phase(), Phase::Preparing);
+        assert_eq!(
+            early.frame(at(t0, 2), 0, 120).as_deref(),
+            Some("⠋ preparing turn · 2s · turn 2s")
+        );
+
+        // And the two answers the predicate does share are unchanged: a
+        // different session is theirs, no session at all is ours.
+        let mut ours_turn = TurnActivity::default();
+        ours_turn.begin(t0);
+        ours_turn.observe(&theirs, Some(&ours()), at(t0, 1));
+        assert_eq!(ours_turn.phase(), Phase::Preparing);
+        ours_turn.observe(
+            &EventEnvelope::new(2, None, tool_call("shell: cargo build")),
+            Some(&ours()),
+            at(t0, 1),
+        );
+        assert_eq!(ours_turn.phase(), Phase::ToolRunning);
+    }
+
+    /// **BR-10: the held row and the queued notice are one composition.**
+    ///
+    /// The daemon supplies neither sentence — `turn_queued` carries a model id
+    /// and an enum — so the client composes, and two client-side compositions
+    /// of one event are two sentences that agree until somebody edits one of
+    /// them. The row prints directly beneath the notice, where that is not a
+    /// subtle failure. Recorded as ASSUME-049.
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** give `held_clause`
+    /// its own `match` over `waiting_on` again with the two arms swapped — the
+    /// shape a duplicated composition actually rots into. **3 red**: this test
+    /// on both variants, and `detail_comes_only_from_the_event_that_carried_it`
+    /// and `the_frame_table` as collateral, on the literal held sentences they
+    /// carry. The collateral is worth naming: those two would catch a *swap*,
+    /// and would not catch the row and the notice drifting apart in any way
+    /// that left both readable — a second lead-in, a renamed model, a dropped
+    /// clause — which is what this one is for. Reverted with the same edit.
+    #[test]
+    fn the_held_row_and_the_queued_notice_cannot_disagree() {
+        for (warming, word) in [
+            (TierWarming::Loading, "loading"),
+            (TierWarming::Installing, "installing"),
+        ] {
+            let Event::TurnQueued(event) = queued(warming) else {
+                unreachable!("the fixture builds a turn_queued");
+            };
+            let clause = crate::session_ui::tier_warming_clause(&event);
+            let row = held_clause(&event);
+            let notice = crate::session_ui::format_turn_queued(&event);
+
+            assert!(
+                row.contains(word) && row.contains("qwen3-coder-30b-a3b"),
+                "the row names the model and which state it is in: {row}"
+            );
+            assert!(
+                notice.contains(word) && notice.contains("qwen3-coder-30b-a3b"),
+                "and so does the notice: {notice}"
+            );
+            assert!(
+                row.ends_with(&clause) && notice.contains(&clause),
+                "both are presentations of one clause ({clause}): {row} / {notice}"
+            );
+        }
+    }
+
+    /// A second permission request, arriving before the first is answered, does
+    /// not make `awaiting_permission` the phase to come back **to**.
+    ///
+    /// The pump answers each question in turn, so the second answer restores
+    /// what the second request interrupted — and if that were recorded as
+    /// `awaiting_permission`, the restore would put the row into a phase that
+    /// draws nothing and the turn would run to its end with no row at all while
+    /// the projection insisted a question was on screen.
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** drop the
+    /// `if interrupted != Phase::AwaitingPermission` guard. Only this test
+    /// fails, on the phase after the first answer. Reverted with the same edit.
+    #[test]
+    fn a_second_permission_request_does_not_become_the_phase_to_restore() {
+        let t0 = Instant::now();
+        let mut activity = folded(
+            t0,
+            &[
+                (1, full_route()),
+                (3, tool_call("shell: cargo test")),
+                (4, permission()),
+                (5, permission()),
+            ],
+        );
+        assert_eq!(activity.phase(), Phase::AwaitingPermission);
+
+        activity.permission_answered(at(t0, 9));
+        assert_eq!(
+            activity.phase(),
+            Phase::ToolRunning,
+            "the tool is still running, and it is what the questions interrupted"
+        );
+        assert_eq!(
+            activity.frame(at(t0, 10), 0, 120).as_deref(),
+            Some("⠋ running shell: cargo test · 1s · turn 10s")
+        );
     }
 
     /// BR-7's whole point, as an executable claim: none of the above
