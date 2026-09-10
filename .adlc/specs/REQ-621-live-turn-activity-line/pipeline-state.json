@@ -4,12 +4,13 @@
   "startedAt": "2026-09-10T13:52:12Z",
   "integrationBranch": "main",
   "completed": false,
-  "currentPhase": 4,
+  "currentPhase": 5,
   "completedPhases": [
     0,
     1,
     2,
-    3
+    3,
+    4
   ],
   "phaseHistory": [
     {
@@ -31,6 +32,11 @@
       "phase": 3,
       "name": "Validate Architecture & Tasks",
       "completedAt": "2026-09-10T14:07:12Z"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-09-10T15:55:49Z"
     }
   ],
   "repos": {
@@ -53,8 +59,24 @@
   ],
   "phase4": {
     "currentTask": null,
-    "completedTasks": [],
-    "failedTasks": []
+    "completedTasks": [
+      "TASK-409",
+      "TASK-410",
+      "TASK-412",
+      "TASK-411",
+      "TASK-413",
+      "TASK-414"
+    ],
+    "failedTasks": [],
+    "tier0": [
+      "TASK-409",
+      "TASK-410",
+      "TASK-412"
+    ]
   },
-  "conflictsResolved": []
+  "conflictsResolved": [],
+  "notes": [
+    "TASK-413 finding: a line submitted mid-animation leaves the last frame on screen (echoed newline scrolls under the \\x1b[1A bookkeeping); delivery intact (BR-9) but BR-5 residue while typing over the row \u2014 carry to Phase 5.",
+    "TASK-414 flake: a_running_tool_shows_its_title_elapsed_and_cost_so_far_beneath_its_running_line failed once in a full pty run (time-derived distinct_clocks>=2 snapshot); carry to Phase 5."
+  ]
 }
