@@ -49,6 +49,15 @@ pub enum LineKind {
     BannerTitle,
     /// A secondary banner line, subordinate to the title (the working directory).
     BannerMeta,
+    /// The live turn-activity row: what the turn is doing right now, redrawn in
+    /// place while it runs and taken back before anything durable prints
+    /// (REQ-621 ADR-621-3).
+    ///
+    /// The one **transient** class. Every other kind here names a line the
+    /// reader can scroll back to; this one is withdrawn rather than left behind
+    /// (BR-5), which is why the trait needs a verb for un-drawing a row and not
+    /// just for redrawing one.
+    Activity,
 }
 
 impl LineKind {
@@ -68,6 +77,12 @@ impl LineKind {
             LineKind::BannerArt => Some("36"),
             LineKind::BannerTitle => Some("1"),
             LineKind::BannerMeta => Some("2"),
+            // Dim, and `BannerMeta`'s "2" for `BannerMeta`'s reason: the row is
+            // scaffolding around the turn's real output, not part of it. It is
+            // also the one line on screen that is about to be taken back, so
+            // drawing it at full weight would give the most temporary thing on
+            // the terminal the most attention.
+            LineKind::Activity => Some("2"),
             _ => None,
         }
     }
@@ -137,6 +152,62 @@ pub trait Surface {
     /// cursor has no row to repaint, so silence is the correct behaviour rather
     /// than something each implementor must remember to add.
     fn repaint_row_above(&mut self, _rows_up: usize, _kind: LineKind, _text: &str) {}
+
+    /// Take back the row `rows_up` above the cursor: step up, clear it, and
+    /// leave the cursor at column 0 of the row just cleared (REQ-621
+    /// ADR-621-3).
+    ///
+    /// [`Surface::repaint_row_above`]'s counterpart, and a verb of its own
+    /// rather than a repaint with an empty string because **a repainted empty
+    /// row is still a row**. The live activity row must not reach scrollback
+    /// (BR-5), so what the pump needs — at the end of a turn, and ahead of
+    /// every durable line it prints while one is running — is the row gone.
+    ///
+    /// **The cursor is deliberately not restored**, which is the whole
+    /// difference from `repaint_row_above`. That verb saves and restores
+    /// because the row it redraws sits above text the user is typing. This one
+    /// is removing a row so that something else can be written where it was, so
+    /// leaving the cursor on the cleared row is the point: the caller's next
+    /// `line()` lands there instead of one row lower, and no blank gap is left
+    /// behind to be the residue this verb exists to avoid.
+    ///
+    /// `rows_up` comes from the caller for `repaint_row_above`'s reason: frame
+    /// geometry is the caller's knowledge, the cursor is the surface's.
+    ///
+    /// **Defaults to a no-op**, which is BR-6's guarantee for every surface
+    /// that is not a terminal — including any future one. A surface with no
+    /// cursor has no row to take back, so silence is the correct behaviour
+    /// rather than something each implementor must remember to add.
+    // Unused in a non-test build until the event pump calls it, which is the
+    // next task of this requirement (ADR-621-1). Suppressed as an `expect`
+    // rather than an `allow` for the reason written out at
+    // [`PlainSurface::with_markdown`]: an `allow` would go on being correct
+    // once the caller lands and would sit here forever, whereas this attribute
+    // *becomes* the warning the moment the pump calls the verb, and `-D
+    // warnings` makes deleting it a condition of landing that wiring.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the caller is the next task"))]
+    fn withdraw_row_above(&mut self, _rows_up: usize) {}
+
+    /// Whether this surface can carry a row that is drawn, repainted in place
+    /// and then withdrawn — an animation the reader watches, rather than a line
+    /// they scroll back to (REQ-621 ADR-621-3).
+    ///
+    /// **The TTY gate, held as a property of the surface rather than threaded
+    /// through the callers.** The event pump reads this to decide whether to
+    /// wait on its channel with a timeout at all (ADR-621-1): answered `false`
+    /// it keeps the blocking `recv()` it has always had, never reaches a tick
+    /// arm, and so cannot emit a byte it did not emit before. That is how BR-6's
+    /// byte-identical piped output holds by construction instead of by a
+    /// conditional at each site that draws — the same trade
+    /// [`PlainSurface::with_markdown`] makes for the renderer (REQ-592 ADR-1).
+    ///
+    /// **Defaults to `false`.** A surface that has not said it can take a row
+    /// back must not be given one, so a new implementor that never names this
+    /// method inherits the silent answer rather than the animated one.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the caller is the next task"))]
+    fn has_live_rows(&self) -> bool {
+        false
+    }
 
     /// Emit anything the surface is still holding, and **touch no block state**
     /// (REQ-592 BR-8).
@@ -324,6 +395,21 @@ pub struct PlainSurface<W: Write> {
     color: bool,
     /// The markdown renderer, or `None` for the raw pass-through path.
     markdown: Option<MarkdownState>,
+    /// Whether this surface may carry a live row — one that is drawn, repainted
+    /// in place, and then withdrawn (REQ-621 ADR-621-3).
+    ///
+    /// Its own field rather than a read of `markdown.is_some()`, which it
+    /// currently tracks exactly, because the two are answers to different
+    /// questions. Markdown is "lay this prose out"; this is "there is a
+    /// terminal here whose rows can be taken back". A future surface over a
+    /// terminal that renders no markdown wants the second without the first,
+    /// and deriving one from the other would quietly hand it neither.
+    ///
+    /// Read only through [`Surface::has_live_rows`], which nothing outside the
+    /// tests calls yet — see the note on that method for why the suppression is
+    /// an `expect`.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the reader is the next task"))]
+    live_rows: bool,
 }
 
 impl<W: Write> PlainSurface<W> {
@@ -339,18 +425,22 @@ impl<W: Write> PlainSurface<W> {
     /// never need to know.
     ///
     /// Renders no markdown: assistant text is passed through defused and
-    /// otherwise untouched, which is what every non-terminal target wants.
+    /// otherwise untouched, which is what every non-terminal target wants. It
+    /// carries no live row either (REQ-621 BR-6) — colour is a property of the
+    /// target, never a claim to own the target's rows.
     pub fn with_color(out: W, color: bool) -> Self {
         Self {
             out,
             at_line_start: true,
             color,
             markdown: None,
+            live_rows: false,
         }
     }
 
     /// Wraps `out` in a surface that renders assistant text as markdown at
-    /// `width` columns, styling it when `color` (REQ-592 BR-3..BR-6).
+    /// `width` columns, styling it when `color` (REQ-592 BR-3..BR-6), and that
+    /// carries live rows (REQ-621 BR-6).
     ///
     /// The third constructor rather than a flag on the second, because the two
     /// answers are independent and one of them is not about colour: a terminal
@@ -385,6 +475,13 @@ impl<W: Write> PlainSurface<W> {
                 table: Vec::new(),
                 fence: false,
             }),
+            // The one constructor that answers [`Surface::has_live_rows`] with
+            // `true` (REQ-621 ADR-621-3), and for the reason written above: it
+            // is chosen at the one place that knows stdout is a terminal. The
+            // live row's TTY gate is therefore the same gate the renderer's is,
+            // decided once, at construction, rather than re-derived by the
+            // pump.
+            live_rows: true,
         }
     }
 
@@ -400,6 +497,10 @@ impl<W: Write> PlainSurface<W> {
             LineKind::Info => "",
             LineKind::Error => "error: ",
             LineKind::BannerArt | LineKind::BannerTitle | LineKind::BannerMeta => "",
+            // No prefix: the frame composes its own leading glyph — the spinner
+            // (ADR-621-2) — so a `>> ` here would shift the animation one
+            // column right of where a repaint of the same row puts it.
+            LineKind::Activity => "",
         }
     }
 }
@@ -838,8 +939,18 @@ impl<W: Write> Surface for PlainSurface<W> {
         // hand a fetched page a debug-build panic through the guard itself. The
         // constraint this places on a future styled class is the flip side: do
         // not tag untrusted text with one.
+        //
+        // `Activity` is styled and exempt, which is that flip side arriving by
+        // a third route: the row's text is composed by this binary, but it
+        // *interpolates* strings from outside — the daemon's tool title, which
+        // carries model-proposed arguments, and a provider/model name (REQ-621
+        // ADR-621-2). So an ESC reaching it is `Prompt`'s hostile input rather
+        // than a caller reaching for SGR by hand, and a panic here would be the
+        // guard handing a fetched page a debug-build crash. `defused` below is
+        // what holds for it, in every build — BR-13: painting the row is never
+        // fatal to the turn.
         debug_assert!(
-            kind.sgr().is_none() || !text.contains('\x1b'),
+            kind.sgr().is_none() || kind == LineKind::Activity || !text.contains('\x1b'),
             "{kind:?} is styled by the surface; it must not carry its own escapes \
              (they will be neutralized into visible debris): {text:?}"
         );
@@ -945,6 +1056,45 @@ impl<W: Write> Surface for PlainSurface<W> {
         let _ = self.out.flush();
     }
 
+    /// Step up, clear the row, and stop. The cursor is left on the cleared row,
+    /// so `at_line_start` is set: that is where the caller's next write lands,
+    /// and a `line()` that thought it was mid-row would open with a newline and
+    /// leave the blank gap this verb exists to close.
+    ///
+    /// **Gated on `live_rows`, where [`Surface::repaint_row_above`] above is
+    /// not.** The asymmetry is deliberate and it is the newer half that is
+    /// right. When the repaint verb landed (REQ-556) the surface did not know
+    /// whether it was a terminal, so the gate had to sit at its callers; the
+    /// surface holds that answer now, so this verb refuses on its own rather
+    /// than trusting every future caller to ask first. BR-6 says the piped path
+    /// emits *not a frame, not an escape, not a blank line* — the cheapest way
+    /// to mean that is for the bytes to be unreachable, not merely unrequested.
+    fn withdraw_row_above(&mut self, rows_up: usize) {
+        if !self.live_rows {
+            return;
+        }
+
+        // `repaint_row_above`'s rule, for its reason (REQ-592 BR-8): held text
+        // is text that is not on screen yet, and cursor motion counted before
+        // it is emitted counts from a row the reader has not been shown. The
+        // held rows scroll the frame, so they have to do it *before* `rows_up`
+        // is measured from where the cursor now is.
+        self.emit_pending();
+
+        // No `\x1b[s` / `\x1b[u` pair, unlike the repaint: the cursor is meant
+        // to end up here.
+        let _ = write!(self.out, "\x1b[{rows_up}A\r\x1b[K");
+        let _ = self.out.flush();
+        self.at_line_start = true;
+    }
+
+    /// The constructor's answer, unchanged since construction: only
+    /// [`PlainSurface::with_markdown`] builds a surface that owns a terminal's
+    /// rows (REQ-621 BR-6).
+    fn has_live_rows(&self) -> bool {
+        self.live_rows
+    }
+
     /// The held rows, and nothing else — the same [`Self::emit_pending`] a
     /// mid-stream `line()` runs, exposed for a caller that has no row of its own.
     ///
@@ -1008,6 +1158,12 @@ pub(crate) enum Rendered {
     /// "redrew a row in place", which is exactly the distinction ADR-556-4 is
     /// about.
     Repaint(usize, LineKind, String),
+    /// A `withdraw_row_above(rows_up)` call — recorded distinctly from
+    /// `Repaint` because the two make opposite claims about scrollback: one
+    /// leaves a row on screen, the other takes it back. A recorder that could
+    /// not tell them apart could not assert the absence of residue, which is
+    /// the property REQ-621 BR-5 is about.
+    Withdraw(usize),
 }
 
 /// A [`Surface`] that records every call instead of writing bytes. Test-only.
@@ -1016,13 +1172,27 @@ pub(crate) enum Rendered {
 pub(crate) struct RecordingSurface {
     /// Every render call, in order.
     pub calls: Vec<Rendered>,
+    /// The answer this recorder gives to [`Surface::has_live_rows`]. A flag
+    /// rather than a terminal, so the TTY-gated path is reachable from a test
+    /// with no terminal in sight (ADR-621-3).
+    live_rows: bool,
 }
 
 #[cfg(test)]
 impl RecordingSurface {
-    /// A fresh recorder.
+    /// A fresh recorder. Answers [`Surface::has_live_rows`] with `false`, like
+    /// the piped surface it stands in for.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A recorder that claims live rows, for a test that has to drive the
+    /// pump's TTY-gated path (ADR-621-3) without a terminal to gate on.
+    pub fn with_live_rows() -> Self {
+        Self {
+            live_rows: true,
+            ..Self::default()
+        }
     }
 
     /// The concatenation of every fragment written (the streamed assistant text).
@@ -1031,7 +1201,7 @@ impl RecordingSurface {
             .iter()
             .filter_map(|c| match c {
                 Rendered::Fragment(t) => Some(t.as_str()),
-                Rendered::Line(..) | Rendered::Repaint(..) => None,
+                Rendered::Line(..) | Rendered::Repaint(..) | Rendered::Withdraw(_) => None,
             })
             .collect()
     }
@@ -1066,6 +1236,14 @@ impl Surface for RecordingSurface {
     fn repaint_row_above(&mut self, rows_up: usize, kind: LineKind, text: &str) {
         self.calls
             .push(Rendered::Repaint(rows_up, kind, text.to_owned()));
+    }
+
+    fn withdraw_row_above(&mut self, rows_up: usize) {
+        self.calls.push(Rendered::Withdraw(rows_up));
+    }
+
+    fn has_live_rows(&self) -> bool {
+        self.live_rows
     }
 }
 
@@ -1258,6 +1436,116 @@ mod tests {
             bare.0.is_empty(),
             "the default repaint must be a no-op: {:?}",
             bare.0
+        );
+    }
+
+    /// REQ-621 BR-6 / ADR-621-3. The TTY gate the event pump reads is a
+    /// property of the surface, and exactly one constructor sets it: the one
+    /// `main.rs` picks when stdout is a terminal. A piped session builds one of
+    /// the other two, so it never reaches the pump's tick arm and cannot emit a
+    /// byte it did not emit before.
+    #[test]
+    fn only_the_markdown_surface_has_live_rows() {
+        let mut buf: Vec<u8> = Vec::new();
+        assert!(
+            !PlainSurface::new(&mut buf).has_live_rows(),
+            "the plain constructor is the piped path"
+        );
+        assert!(
+            !PlainSurface::with_color(&mut buf, true).has_live_rows(),
+            "colour is a property of the target, not a claim to own its rows"
+        );
+        assert!(
+            PlainSurface::with_markdown(&mut buf, true, 80).has_live_rows(),
+            "the interactive constructor is the one that owns a terminal's rows"
+        );
+        assert!(
+            !RecordingSurface::new().has_live_rows(),
+            "the recorder defaults to the piped answer"
+        );
+        assert!(
+            RecordingSurface::with_live_rows().has_live_rows(),
+            "and opts in explicitly, so the gated path needs no terminal"
+        );
+    }
+
+    /// REQ-621 BR-8 / ADR-621-3. The withdraw is not a raw cursor move: it goes
+    /// through the surface, and the surface owes the reader everything it is
+    /// still holding **before** it moves the cursor over rows already on screen
+    /// (REQ-592 BR-8). The oracle is the literal byte string rather than a
+    /// re-derivation of it ([[LESSON-569]]) because the property under test is
+    /// an *order*, and a computed expectation would reproduce whatever order
+    /// the code chose.
+    ///
+    /// Mutation observed red: deleting the `self.emit_pending()` call from
+    /// `PlainSurface::withdraw_row_above`. The held paragraph then never
+    /// reaches the writer at all — the output is the bare `\x1b[1A\r\x1b[K` —
+    /// so the row the pump is told to take back is not the row it drew, and the
+    /// reader loses a sentence to a cursor move.
+    #[test]
+    fn withdraw_goes_through_the_seam_after_the_held_rows() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut surface = PlainSurface::with_markdown(&mut buf, false, 40);
+            // No trailing newline, so the renderer is *holding* this row: a
+            // completed line would already have been written and the ordering
+            // question would never arise.
+            surface.fragment("held row");
+            surface.withdraw_row_above(1);
+        }
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "held row\n\x1b[1A\r\x1b[K",
+            "the held row goes out before the cursor moves, and the withdraw \
+             adds nothing but the step-up and the clear"
+        );
+    }
+
+    /// BR-6 twice over, as a claim about bytes: the constructors that do not own
+    /// a terminal answer `false`, and the verb writes nothing for them even when
+    /// a caller asks. "Not a frame, not an escape, not a blank line" is a
+    /// byte-level promise, so it is asserted as one.
+    #[test]
+    fn a_surface_with_no_live_rows_withdraws_nothing() {
+        for color in [false, true] {
+            let mut buf: Vec<u8> = Vec::new();
+            {
+                let mut surface = PlainSurface::with_color(&mut buf, color);
+                surface.fragment("streamed");
+                surface.withdraw_row_above(1);
+            }
+            assert_eq!(
+                String::from_utf8(buf).unwrap(),
+                "streamed",
+                "a withdraw on a surface with no live rows must add no bytes"
+            );
+        }
+    }
+
+    /// BR-6 and BR-13's guarantee for every surface that is not a terminal,
+    /// including future ones — `a_surface_that_does_not_override_repaint_emits_nothing`'s
+    /// sibling for the verb that takes a row back. A new `Surface` implementor
+    /// cannot forget to suppress the live row: silence and `false` are what it
+    /// inherits by not writing either method.
+    #[test]
+    fn a_surface_that_does_not_override_withdraw_emits_nothing() {
+        struct Bare(Vec<String>);
+        impl Surface for Bare {
+            fn line(&mut self, _kind: LineKind, text: &str) {
+                self.0.push(text.to_owned());
+            }
+            fn fragment(&mut self, _text: &str) {}
+        }
+        let mut bare = Bare(Vec::new());
+        bare.withdraw_row_above(1);
+        assert!(
+            bare.0.is_empty(),
+            "the default withdraw must be a no-op: {:?}",
+            bare.0
+        );
+        assert!(
+            !bare.has_live_rows(),
+            "and it must not claim rows it has no way to take back"
         );
     }
 

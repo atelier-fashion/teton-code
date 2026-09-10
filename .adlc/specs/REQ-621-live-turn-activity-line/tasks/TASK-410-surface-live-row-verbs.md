@@ -1,7 +1,7 @@
 ---
 id: TASK-410
 title: "Surface verbs for a live row: withdraw, live-row capability, and the Activity line kind"
-status: draft
+status: complete
 parent: REQ-621
 created: 2026-09-10
 updated: 2026-09-10
@@ -23,12 +23,12 @@ defaults and a test pins that a non-overriding surface emits nothing.
 
 ## Acceptance Criteria
 
-- [ ] `PlainSurface::new` and `with_color` answer `has_live_rows() == false`; `with_markdown` answers `true`
-- [ ] `withdraw_row_above(1)` on a markdown surface writes exactly `\x1b[1A\r\x1b[K` after flushing held rows; on `new`/`with_color` it writes nothing
-- [ ] `LineKind::Activity` styles through the sanitizer table only; `defused` applies to its text
-- [ ] `a_surface_that_does_not_override_withdraw_emits_nothing` pins the default alongside the repaint sibling
-- [ ] Every `match` over `LineKind` compiles without a wildcard being added
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check` clean
+- [x] `PlainSurface::new` and `with_color` answer `has_live_rows() == false`; `with_markdown` answers `true`
+- [x] `withdraw_row_above(1)` on a markdown surface writes exactly `\x1b[1A\r\x1b[K` after flushing held rows; on `new`/`with_color` it writes nothing
+- [x] `LineKind::Activity` styles through the sanitizer table only; `defused` applies to its text
+- [x] `a_surface_that_does_not_override_withdraw_emits_nothing` pins the default alongside the repaint sibling
+- [x] Every `match` over `LineKind` compiles without a wildcard being added
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check` clean
 
 ## Verification
 

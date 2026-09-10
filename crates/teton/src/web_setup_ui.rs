@@ -1205,7 +1205,7 @@ mod tests {
                 .iter()
                 .filter_map(|call| match call {
                     Rendered::Line(_, text) => Some(text.as_str()),
-                    Rendered::Fragment(_) | Rendered::Repaint(..) => None,
+                    Rendered::Fragment(_) | Rendered::Repaint(..) | Rendered::Withdraw(_) => None,
                 })
                 .collect::<Vec<_>>()
                 .join("\n")
