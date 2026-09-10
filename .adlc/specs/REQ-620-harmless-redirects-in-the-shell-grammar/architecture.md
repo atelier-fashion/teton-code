@@ -9,9 +9,11 @@ every widening here is one the executor's own behaviour proves.
 Four seams, one classification.
 
 1. **A null-redirect recogniser with one home.** `root_gate.rs` already reads `2>&1`,
-   `>&2`, `>/dev/null` and `2> /dev/null` as non-writes (`has_top_level_redirection`,
-   lines 155–177) — a second, hand-rolled reading in the classifier would be the two-parser
-   shape LESSON-494 forbids. The recogniser moves to a shared module both gates read.
+   `>&2`, `>/dev/null` and `2> /dev/null` as non-writes (`has_top_level_redirection`) — a
+   second, hand-rolled reading in the classifier would be the two-parser shape LESSON-494
+   forbids. The recogniser moves to a shared module both gates read. *(Line numbers were
+   cited here and went stale within the REQ; symbols are cited instead — the Phase-5
+   re-verify's own note.)*
 2. **Strip, then refuse, then split.** `classify_with_budget` today refuses on any
    unmodelled byte and then splits on `| ; & ( ) \n`. Null redirects contain `>`, `<` and
    `&`, so they must be lifted out of the command *before* both steps, as whole
@@ -59,6 +61,32 @@ returns `None` for everything else, so BR-2's look-alikes (`2>/dev/nul`, `2>/dev
 two words; the recogniser consumes the operator word and the following `/dev/null` word
 together, and an operator word with no such follower is *not* a null redirect (`2> out`).
 
+**Amended at the Phase-5 verify (2026-09-09).** Sharing the recogniser was not enough, and
+then sharing the *wrapper* was not enough either. Three corrections, in the order they were
+found:
+
+- **The gate scans the residue, not positions in the command** (M1). Both gates wrapped
+  `NullRedirect`, and the wrappers disagreed: the write gate widened each top-level `>` to
+  its whitespace word, while the classifier called `strip_null_redirects`, which peels a
+  redirect glued to a following separator. `ls 2>&1; ls` therefore read nothing in the
+  classifier and was a **write** at the gate — a regression against the pre-REQ-620 gate,
+  which allowed it. The question is now asked once, of the residue: *after the strip, does
+  any word still carry a `>` or a `<` outside quotes?*
+- **`<` counts.** That unification makes any top-level `<` a write trigger — `cat < input`
+  is refused at a home root where it used to run. It creates nothing, so the refusal
+  sentence names redirection as well as creation. The gate's two directions are not
+  symmetric (a false "write" costs one refused read; a false "not a write" scaffolds a
+  project into `$HOME`), so the tightening is the safe way to be wrong and is recorded
+  rather than papered over. `cmd>&2` and `cmd >|/dev/null` tighten for the same reason.
+- **Trigger (a) reads the residue too** (the Phase-5 *re*-verify). The verb trigger was
+  still reading the raw command, and `command_position_programs` is a whitespace tokenizer
+  — so in `2>/dev/null rm -rf ~/x` the "program" is the redirect word and the `rm` was
+  never read. Six spellings were allowed at a Home / FilesystemRoot root. The residue is
+  now computed **once** in `write_gate` and handed to both triggers; the residue's first
+  word is the word `sh` itself would run, which is BR-5's argument one gate over. The
+  fail-closed arm keeps reading the raw command, so a command that is *only* a null
+  redirect is not refused for stripping to nothing.
+
 ### ADR-620-2: Strip before the unmodelled check and before the split; the splitter records position
 
 **Decision.** `classify_with_budget` becomes: (1) `strip_null_redirects`; (2) the
@@ -80,6 +108,26 @@ a different, advisory question and REQ-614 already declined to share it. The dif
 table (AC-2) pins `ls 2>&1 && echo ok` (stripped, then split on `&&`) and `ls & ls` (a
 lone `&`, still two segments).
 
+**Amended at the Phase-5 verify (2026-09-09).** Two corrections to what the strip emits,
+both about a character the splitter reads:
+
+- **The peel takes a redirect glued to a following separator** (M1). It first took a
+  trailing *run* of separators only, so `2>&1|head` was not peeled — and once the write
+  gate wrapped the same recogniser, `cmd 2>&1|head` was refused at a home root, which the
+  pre-REQ-620 gate allowed. The head must parse as a redirect **in its entirety** and the
+  tail must begin with a separator character; the tail is re-emitted as its own word so the
+  splitter still sees it. The peel is **one level deep** by design: the tail is not handed
+  back to the loop, so `ls 2>&1;&>/dev/null` peels once and stays `Unknown` on the
+  surviving `>` — every miss lands on the pre-REQ-620 answer.
+- **`&>` re-emits its `&`** (C2). `&>/dev/null` is bash and the executor is `sh -c`, which
+  on the Linux CI leg is `dash`; `dash` reads that `&` as a command separator and the
+  `>/dev/null` as a redirect on the command *before* it. Lifting the word whole made
+  `ls &>/dev/null grep -r SECRET . 1>&2` one segment whose verb is `ls`, and the recursive
+  `grep` was never verb-checked at all. Re-emitting the `&` reproduces `dash`'s parse and is
+  strictly more conservative than bash's, where the same text is one command: a spurious
+  separator can only split a segment in two, and two segments are each classified in full.
+  `NullRedirect::BothStreams` is the only form whose residue is non-empty.
+
 ### ADR-620-3: BR-4 removes the root walk from piped readers; it does not touch the walk
 
 **Decision.** In `classify_segment`, the root-walk condition
@@ -96,9 +144,24 @@ every file under the root. The ADR's own claim that the enumerated forms "are th
 and BSD `grep` accept" was false as written, and the list could not have been completed by
 adding rows. So the question is inverted: `reads_only_its_stdin` is true only for a closed
 set of **pure filters** (`head`, `tail`, `wc`, `sort`, `uniq`, `cut`, `nl`, `tr`, `md5`,
-`shasum`, `less`, `more`) and for `grep`/`egrep`/`fgrep` when **no** word starts with `--`,
-**no** word is `-d`, and **no** single-`-` cluster carries `r` or `R`. Everything else —
-`sed`, `awk`, `diff`, `cat`, and every `grep` flag not enumerated — keeps the walk.
+`shasum`) and for `grep`/`egrep`/`fgrep`, and in both cases only when **no** word starts
+with `--` and **no** single-`-` cluster carries `d`, `r` or `R`. Everything else — `sed`,
+`awk`, `diff`, `cat`, and every `grep` flag not enumerated — keeps the walk.
+
+**Amended again at the Phase-5 re-verify (2026-09-09) — the flag rule covers every verb,
+and two names leave the list.** The inversion above left the *filter* half flag-blind:
+membership was the whole test for everything but `grep`, so `wc --files0-from -`,
+`sort --files0-from -` and `shasum -c -` — each of which reads a list of **paths** off its
+stdin and then opens every one — took the exemption and returned `rooted`. Four
+corrections. **(i)** The `--` guard is hoisted over the whole allowlist, `grep` included:
+a long option is a reach nobody has enumerated, whatever verb it belongs to. **(ii)**
+`shasum` and `md5` additionally refuse `-c`, the one short flag on the filter half that
+opens files. **(iii)** The `-d` clause reads the character *inside* a cluster rather than
+matching the whole word `-d`: `grep -nd recurse` is `-n -d recurse`, and `-nd`, `-id` and
+`-drecurse` were all recursion the exemption granted. **(iv)** `less` and `more` leave the
+list. They are pagers, not filters — `:e path` and `!cmd` come from the terminal and
+`less` honours `LESSOPEN`, none of which this grammar can see — and a pager on the end of
+a pipe is not a shape a model writes for output it means to consume.
 
 **Rationale.** A piped `head -5` reads bytes the previous segment produced and the previous
 segment was classified on its own paths; walking the root for it is a walk for a read that
@@ -110,7 +173,9 @@ decision.
 **Consequences.** `head -5` as a first segment still walks the root and still goes
 `unknown` on a root the walk cannot finish. `cat README.md | grep -r foo` walks, and so now
 do `ls | grep --color foo`, `ls | sed -r foo` and `ls | cat missing`, each of which
-TASK-404 asserted the other way. `ls | grep foo` and `ls | head -5` do not.
+TASK-404 asserted the other way — and, after the re-verify, `ls | grep -nd recurse foo`,
+`ls | wc --files0-from -`, `ls | shasum -c -`, `ls | less` and `ls | more`.
+`ls | grep foo`, `ls | grep -H foo`, `ls | head -5` and `ls | cut -f 2` do not.
 
 ### ADR-620-4: The reason travels on the provenance value, as an explicit bit
 
@@ -119,8 +184,10 @@ TASK-404 asserted the other way. `ls | grep foo` and `ls | head -5` do not.
 unknown bit *and* its cause. The egress `Provenance` carries the same `Option`;
 `TaintingPrivacySink` passes it to `TaintRegistry::mark(session, cause, reason)`; the pin
 publishes `SessionPinned { reason, .. }`; `session_ui::format_session_pinned` renders it
-after the cause. The skill fold (`skill.rs:1407`, `context.rs:2477`) hands the same reason
-it already writes to `reach_reason`.
+after the cause. The skill fold (`skills::provenance::ExpansionProvenance::into_tool_provenance`,
+`ContextManager::compaction_summary`) hands the same reason it already writes to
+`reach_reason`. *(Line numbers were cited here and went stale within the REQ; symbols are
+cited instead.)*
 
 **Rationale.** Three readers (router, choke point, notice) and one writer. Deriving the
 class again at the notice from the cause string would be a second classifier; carrying it

@@ -525,15 +525,21 @@ pub(crate) const REDACT_ESCAPING_DIVISOR: usize = 10;
 ///
 /// **Raised 23→24 KiB by REQ-620, and it is the raise ASSUME-043's resolution
 /// predicted.** BR-7 puts the shell tool's reach grammar in that tool's
-/// description — `SHELL_REACH_CONTRACT`, 407 bytes plus the space that joins it
-/// to the cwd contract, so **408** against the 105 this constant had left. The
+/// description — `SHELL_REACH_CONTRACT`, 414 bytes plus the space that joins it
+/// to the cwd contract, so **415** against the 105 this constant had left. The
 /// paragraph tells the model which command shapes pin the session to the local
 /// tier; a paragraph short enough to fit in 105 bytes could not name the seven
 /// classes AC-8 requires, and naming them is the whole of BR-7. Measured before
 /// the raise, the way this ledger asks: the widest prompt went 17,099 →
-/// **17,507** and `spent` 23,447 → **23,855**, which is 303 **over** the 23,552
+/// **17,514** and `spent` 23,447 → **23,862**, which is 310 **over** the 23,552
 /// ceiling — the `spent < REDACT_BODY_OVERHEAD_BYTES` assertion, red before the
 /// floor was consulted, exactly as it was for the REQ-615/REQ-617 collision.
+///
+/// *(407 / 408 / 17,507 / 23,855 / 303 until REQ-620's own Phase-5 verify,
+/// which added "other shell syntax" to the paragraph — brace expansion,
+/// backslash escapes and history expansion all pin and none of them was named
+/// — for a net 7 bytes on both shapes. Re-measured, not reasoned; this copy of
+/// the ledger was the one the re-verify found still carrying the old figures.)*
 ///
 /// This is the ceiling being made the case for rather than worked around, which
 /// ASSUME-043 records as the only remaining option: at 105 there was no
@@ -569,13 +575,15 @@ pub(crate) const REDACT_ESCAPING_DIVISOR: usize = 10;
 /// context. `the_overhead_raise_restates_the_chunk_count_and_the_scannable_bound`
 /// is where that is said out loud, and where the next raise says its own.
 ///
-/// **Measured after the raise: margin 105 → 721** ([`RECORDED_PROMPT_MARGIN_BYTES`])
-/// and 152 → **768** on the web-enabled twin
+/// **Measured after the raise: margin 105 → 714** ([`RECORDED_PROMPT_MARGIN_BYTES`])
+/// and 152 → **761** on the web-enabled twin
 /// ([`RECORDED_WEB_PROMPT_MARGIN_BYTES`]), the same 47 bytes apart the two
 /// shapes have always been — which is the check that this raise spent the same
-/// bytes on both. 673 bytes of usable room above the 48-byte floor, roomier
+/// bytes on both. 666 bytes of usable room above the 48-byte floor, roomier
 /// than the 685 REQ-612 left only in the sense that a KiB is bigger than a
 /// paragraph; the next REQ should read ASSUME-043 before assuming otherwise.
+/// *(721 / 768 / 673 until this REQ's own Phase-5 verify spent 7 more bytes on
+/// "other shell syntax".)*
 ///
 /// `pub(crate)` because the *other* prompt shape has to clear it too and cannot
 /// be built from here: with `[web] tier` above `off` the system prompt carries
@@ -645,11 +653,13 @@ pub(crate) const MIN_PROMPT_HEADROOM_BYTES: usize = 48;
 /// in the guide's command roster, the family REQ-614 added after that roster
 /// was cut to families. The ledger line is on [`REDACT_BODY_OVERHEAD_BYTES`].
 ///
-/// REQ-620 leaves **721**, 673 usable — and it is the first move of this number
+/// REQ-620 leaves **714**, 666 usable — and it is the first move of this number
 /// since REQ-612 that came from the *ceiling* rather than from the prompt. The
-/// prompt grew 408 bytes (BR-7's reach contract in the `shell` tool's
+/// prompt grew 415 bytes (BR-7's reach contract in the `shell` tool's
 /// description) and the ceiling grew 1,024, which is the whole of the
-/// difference. Read that as ASSUME-043 resolving rather than as room returning:
+/// difference. *(721 / 673 against a 408-byte growth until this REQ's own
+/// Phase-5 verify, which spent 7 more on "other shell syntax".)* Read that as
+/// ASSUME-043 resolving rather than as room returning:
 /// at 105 there was no sentence's worth left to reclaim, and the bytes above
 /// the floor now are a KiB that was bought once, not slack that accumulated.
 /// The ledger line, and the 931 it cost every scanned route, are on
@@ -2730,9 +2740,12 @@ mod tests {
     /// words elsewhere cost a net **7** bytes on both shapes, re-measured here
     /// rather than reasoned.)*
     ///
-    /// **Mutation run for REQ-620.** Setting the overhead back to `23 * 1024`
-    /// with the contract in place → red at the first assertion, 303 bytes over
-    /// the assumption, before the floor or the pin is reached. That is the
+    /// **Mutation run for REQ-620** (re-run at the Phase-5 re-verify, since the
+    /// contract had grown 7 bytes since the figure was written). Setting the
+    /// overhead back to `23 * 1024` with the contract in place → red at the
+    /// first assertion, naming a 17,514-byte prompt plus 6,348 of escaping
+    /// against an assumed 23,552: **310** bytes over — 303 before those 7 —
+    /// before the floor or the pin is reached. That is the
     /// measuring assertion doing its job on a raise the way it did on the
     /// REQ-615/REQ-617 collision, and it is the reason the recorded figures
     /// above are measured rather than reasoned.

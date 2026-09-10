@@ -229,6 +229,22 @@ impl ToolProvenance {
     /// [`UnknownReach::Unclassified`] is what a caller that never ran a
     /// classifier passes when it has an unknown to report and nothing to say
     /// about it.
+    ///
+    /// # The precedence above is vacuous at the sites that skip this function
+    ///
+    /// Four production sites build an unknown [`ToolProvenance`] **directly**
+    /// rather than through here, and reading the order above as a rule they
+    /// obey would be a mistake worth naming (Phase-5 re-verify). They are the
+    /// two MCP arms in `harness/tools/mcp.rs`, the typed-skill
+    /// `CtxProvenance::User` arm and the dropped-provenance fold beside it in
+    /// `harness/completion.rs` (BUG-223), and [`Self::unknown`] itself. None of
+    /// them carries a source set or a boundary bit to weigh: each has one fact,
+    /// "this is unknown", and the variant that holds it. So arms 1, 2 and 4
+    /// cannot arise there and the order decides nothing — which is also why
+    /// those sites are not a second copy of this precedence and do not have to
+    /// be swept when it changes. What they *do* have to keep in step is the
+    /// reason group they belong to, and [`UNCLASSIFIED_REACH_REASON`]'s docs
+    /// hold that list.
     #[must_use]
     pub(crate) fn from_bits(
         sources: BTreeSet<ProvenanceId>,
@@ -302,10 +318,22 @@ pub(crate) enum UnknownReach {
     /// Nothing about the tool's reach was unprovable.
     #[default]
     No,
-    /// Unprovable, and **nothing classified it** — an opaque MCP server, a tool
-    /// that declares itself unknowable, a fold over a block that carried no
-    /// reason. Becomes `ToolProvenance::Unknown(None)`, which renders the
-    /// pin notice exactly as it read before REQ-620.
+    /// Unprovable, and **nothing classified it**. Becomes
+    /// `ToolProvenance::Unknown(None)`, which renders the pin notice exactly as
+    /// it read before REQ-620.
+    ///
+    /// **Exactly one thing produces this variant: the fold.**
+    /// [`ContextManager::compaction_summary`] calls [`Self::from_parts`] with a
+    /// bit it inherited and a reason that may be absent, and that `(true, None)`
+    /// pair is the whole of it (Phase-5 re-verify — this doc used to name "an
+    /// opaque MCP server, a tool that declares itself unknowable" as producers
+    /// too, and neither reaches `UnknownReach` at all). An opaque MCP server
+    /// constructs `ToolProvenance::unknown()` directly in `harness/tools/mcp.rs`
+    /// and a tool that declares itself unknowable calls
+    /// [`ToolOutcome::with_unknown_provenance`](crate::harness::ToolOutcome::with_unknown_provenance),
+    /// which passes [`UNCLASSIFIED_REACH_REASON`] — a *different* answer, and
+    /// one that renders a reason line. That constant's docs hold the full site
+    /// list for both groups and are the one place to read it.
     Unclassified,
     /// Unprovable, and this is the content-free class sentence that refused it
     /// (BR-6).
@@ -367,8 +395,10 @@ impl UnknownReach {
 ///   *about themselves*, where "we did not classify this" is the whole of what
 ///   there is to say and saying it is better than silence:
 ///   [`ToolOutcome::with_unknown_provenance`](crate::harness::ToolOutcome::with_unknown_provenance),
-///   `ToolRegistry::roster_provenance` and
-///   `ExpansionProvenance::into_tool_provenance`.
+///   `harness::tools::skill::roster_provenance` (a free function, not a
+///   `ToolRegistry` method — it takes the registry as an argument; the name was
+///   wrong here until the Phase-5 re-verify) and
+///   `skills::provenance::ExpansionProvenance::into_tool_provenance`.
 /// * **`ToolProvenance::Unknown(None)`** — no reason at all, rendering the
 ///   pre-REQ-620 notice — is what the sites that merely *carry* somebody else's
 ///   unknown produce when that somebody named no class: the two MCP arms in

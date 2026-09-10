@@ -34,11 +34,16 @@ user having asked for it.
   `>/dev/null`, `1>/dev/null`, `2>>/dev/null`, `&>/dev/null`, `</dev/null`,
   `2>&1` and `1>&2`, attached or space-separated, and no others — `> out.txt`,
   `< input`, `2>/dev/nul` and `2>$f` still refuse the whole command. And a
-  content-reading verb after a single `|` that names no existing file
-  (`ls src | head -5`, `git log | grep fix`) is now read as taking its stdin
-  from the previous segment, which was itself classified, instead of being
-  scored as a read of the whole session root; recursive `grep` is the
-  exception, because `grep -r` searches the tree whatever is on its stdin.
+  verb after a single `|` that names no existing file is now read as taking its
+  stdin from the previous segment, which was itself classified, instead of
+  being scored as a read of the whole session root — but only for a **closed
+  list** of pure filters (`head`, `tail`, `wc`, `sort`, `uniq`, `cut`, `nl`,
+  `tr`, `md5`, `shasum`) carrying no long option, and for `grep`/`egrep`/
+  `fgrep` carrying no long option and no short flag that can mean recursion.
+  So `ls src | head -5` and `git log | grep fix` read their stdin, while
+  `ls | grep -r foo`, `ls | grep --directories recurse foo`,
+  `ls | wc --files0-from -`, `ls | sed -r foo`, `ls | cat missing` and every
+  verb and flag not on the list keep the whole-root walk they had before.
   Nothing else widens: quotes, globs, `$`, other redirects, interpreters,
   network clients, paths outside the root and unrecognised verbs pin exactly as
   before, and a boundary read behind a redirect
@@ -72,8 +77,25 @@ user having asked for it.
 
 ### Changed
 
+- **A `shell` command at a home or filesystem root is refused for more
+  redirections than before (REQ-620).** The write gate that stops a model
+  scaffolding a project into `$HOME` now asks one question of the same
+  redirect recogniser the classifier uses, over the command with its
+  reads-nothing redirects removed. Three shapes that used to run there are now
+  refused: `cat < input` (any `<`, which the old scan never looked for),
+  `cmd>&2` and `cmd >|/dev/null` (whole-word forms where the old scan was
+  positional). The two directions of this gate are not symmetric — a wrong
+  "write" costs one refused command at a home root, a wrong "not a write"
+  scaffolds a project into your home folder — so the gate errs toward
+  refusing, and the refusal now says redirection as well as creation. In the
+  other direction, a **write hidden behind a leading redirect** no longer runs:
+  `2>/dev/null rm -rf ~/x`, `2>&1 mkdir foo`, `</dev/null git init` and their
+  kin were allowed, because the gate read the redirect as the program name.
+  Run `/cd <path>` to move the session to a project root, where none of this
+  gate applies.
+
 - **The system-prompt overhead ceiling rises 23 → 24 KiB
-  (`REDACT_BODY_OVERHEAD_BYTES`).** The reach contract above is 407 bytes and
+  (`REDACT_BODY_OVERHEAD_BYTES`).** The reach contract above is 414 bytes and
   the resident prompt had 105 left, so this is the raise REQ-617 said the next
   claimant would have to make rather than shortening its way in. The four
   figures derived from the ceiling were re-derived and re-asserted: the chunk
