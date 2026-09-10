@@ -1,0 +1,54 @@
+{
+  "req": "REQ-621",
+  "branch": "feat/REQ-621-live-turn-activity-line",
+  "startedAt": "2026-09-10T13:52:12Z",
+  "integrationBranch": "main",
+  "completed": false,
+  "currentPhase": 3,
+  "completedPhases": [
+    0,
+    1,
+    2
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree",
+      "completedAt": "2026-09-10T13:52:12Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-09-10T13:55:10Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect",
+      "completedAt": "2026-09-10T14:06:02Z"
+    }
+  ],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-621",
+      "branch": "feat/REQ-621-live-turn-activity-line",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/319",
+      "prNumber": 319,
+      "prCreatedAt": "2026-09-10T13:52:11Z",
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  },
+  "conflictsResolved": []
+}

@@ -1,7 +1,7 @@
 ---
 id: REQ-621
 title: "A live activity line while a turn is working — what the agent is doing, for how long, and that it is still alive"
-status: draft
+status: approved
 deployable: true
 created: 2026-09-10
 updated: 2026-09-10
@@ -59,7 +59,8 @@ client's own clock._
 
 | Entity | Field | Type | Constraints |
 |--------|-------|------|-------------|
-| TurnActivity | phase | enum | required; one of `idle`, `preparing`, `awaiting_model`, `streaming`, `tool_running`, `awaiting_permission`, `held`, `compacting`, `stalled` |
+| TurnActivity | phase | enum | required; one of `idle`, `preparing`, `awaiting_model`, `streaming`, `tool_running`, `awaiting_permission`, `held`, `compacting` |
+| TurnActivity | stalled | boolean | derived; true when `last_event_tick` is older than the quiet bound and the phase is not `tool_running`. An annotation on the phase, never a replacement for it (amended 2026-09-10, ADR-621-5) |
 | TurnActivity | detail | string | optional; the model id and tier band for `awaiting_model` / `streaming`; the daemon-composed tool title for `tool_running`; the daemon's own sentence for `held`. Never composed by the client from raw arguments |
 | TurnActivity | phase_since_tick | number | required; the tick at which the current phase began. Elapsed-in-phase is derived from it |
 | TurnActivity | turn_since_tick | number | required; the tick at which the prompt was submitted. Elapsed-in-turn is derived from it |
@@ -85,7 +86,7 @@ _Consumed (all already on the wire; none changed)._
 | `cost_recorded` | a model call in this turn was billed | the row's amount; adds to `cost_so_far`, phase unchanged |
 | `context_compacted` | the daemon compacted context mid-turn | phase → `compacting` until the next event |
 | `session/prompt` returned, or failed by any path | the turn ended | phase → `idle`; the row is removed |
-| local tick | the client's frame interval elapsed | advances the spinner and the elapsed counters; promotes to `stalled` past the quiet bound |
+| local tick | the client's frame interval elapsed | advances the spinner and the elapsed counters; sets `stalled` past the quiet bound |
 
 _Produced: none required by this spec. If the architecture finds that an
 existing event does not mark one of the transitions above — the most likely
@@ -107,7 +108,7 @@ _Explicit, testable constraints governing this feature's behavior._
 - [ ] BR-8: **Through the `Surface` seam, never direct to stdout.** Every byte the row produces goes through the existing surface abstraction, so a future front-end inherits the row by implementing the same seam and no rendering path bypasses the sanitizer (informed by REQ-556 BR-3, REQ-560 BR-12).
 - [ ] BR-9: **Never blocks, delays, or consumes input.** The row's cadence adds no latency to receiving or rendering daemon events, and text typed while the row is animating is delivered intact to the next prompt; a repaint never blanks characters the user has echoed (informed by REQ-556 BR-4).
 - [ ] BR-10: **No second renderer.** The tool status lines, the prefill bar, the loading indicator, the held-turn notice, and the permission prompt keep their existing rendering. The row composes beside them and never restates their content in a second style (informed by REQ-556 BR-10).
-- [ ] BR-11: **A stall is named, not disguised.** When no daemon event has arrived for longer than the quiet bound, the row's phase becomes `stalled` and its text says how long it has been since the daemon last spoke. It keeps counting; it never returns to a working phase until a real event arrives. A wedged daemon must look different from a slow model (informed by LESSON-450). **The quiet bound is 15 seconds**, and streaming is not exempt: if reply bytes stop mid-stream for longer than the bound, the row returns in the `stalled` phase beneath the partial reply and is withdrawn again when bytes resume.
+- [ ] BR-11: **A stall is named, not disguised.** When no daemon event has arrived for longer than the quiet bound, the row keeps naming the phase the daemon **last reported**, stops its spinner, and appends how long it has been since the daemon last spoke. It keeps counting and the annotation stays until a real event arrives. A wedged daemon must look different from a slow model (informed by LESSON-450, LESSON-628). **The quiet bound is 15 seconds.** Streaming is not exempt: if reply bytes stop mid-stream for longer than the bound, the row returns beneath the partial reply with the annotation and is withdrawn again when bytes resume. `tool_running` **is** exempt: the daemon publishes nothing while a tool runs, so silence there is the expected state and the tool's own elapsed counter is the signal. *(Amended 2026-09-10 at architecture, ADR-621-5: the first draft replaced the phase with `stalled`, which would have relabelled every long-running tool as a stall at 15 s.)*
 - [ ] BR-12: **Every exit path removes the row.** A turn that ends by a normal result, an RPC error, a transport error, a daemon disconnect, or a refused permission leaves no row behind. Termination does not depend on the daemon sending a final event.
 - [ ] BR-13: **A rendering failure is never fatal and never silent.** A terminal error while painting the row abandons the row for the rest of the turn, leaves the turn itself untouched, and is recorded in verbose output (informed by REQ-556 BR-9, REQ-560 BR-13).
 - [ ] BR-14: **Additive on the wire.** No existing method or event changes shape. Any new event this feature needs is additive; `PROTOCOL_VERSION` is unchanged and a client that does not know the event ignores it (informed by REQ-580 BR-8).
@@ -121,9 +122,9 @@ _Explicit, testable constraints governing this feature's behavior._
 - [ ] AC-3: **Piped output is unchanged.** Every existing non-verbose pipe-mode fixture for a scripted turn passes byte-for-byte; every existing verbose fixture differs by exactly BR-16's line and nothing else; and a new fixture that drives the AC-1 and AC-2 scripts with stdout piped produces no indicator bytes.
 - [ ] AC-4: **Frames are pure and the animation can fail.** A unit table maps `(phase, detail, elapsed)` to exact frame strings with no terminal involved. The mutation "the frame ignores its tick" is applied and observed to fail the animation test; the mutation is recorded in the test's doc comment. The oracle does not call the frame function to compute its expectation (informed by REQ-556 AC-8, LESSON-569).
 - [ ] AC-5: **Transitions are driven by the real producer.** For every event the row consumes, a cross-seam test drives the daemon's actual publisher and asserts the row's phase — not a hand-built struct literal alone. Any new event introduced under BR-14 has the same test (informed by LESSON-544).
-- [ ] AC-6: **A stall is named.** PTY e2e: a stub daemon that goes silent mid-turn for longer than the quiet bound causes the row to show the `stalled` wording with seconds since the last event; the wording does not claim any working phase; a subsequent real event returns it to a working phase. A second leg stops the stub mid-stream for longer than the bound and asserts the row returns beneath the partial reply and is withdrawn when bytes resume.
+- [ ] AC-6: **A stall is named.** PTY e2e: a stub daemon that goes silent mid-turn for longer than the quiet bound causes the row to keep its last phase and add the stall annotation with seconds since the last event; the spinner stops; a subsequent real event clears the annotation. A tool that runs longer than the bound never shows the annotation. A second leg stops the stub mid-stream for longer than the bound and asserts the row returns beneath the partial reply and is withdrawn when bytes resume.
 - [ ] AC-7: **No stuck row.** PTY e2e covers each exit path in BR-12 — normal result, RPC error, stub killed mid-turn — and asserts the row is erased and the scrollback carries no residue.
-- [ ] AC-8: **No invented phase.** A scripted event sequence with no `route_decided` never renders a model name; a sequence with no `tool_call` never renders `tool_running`.
+- [ ] AC-8: **No invented phase.** A scripted event sequence with no `route_decided` never renders a model name; a sequence with no `tool_call` never renders `tool_running`; a stall never renders a phase the daemon did not report.
 - [ ] AC-9: **Other sessions are ignored.** Events tagged with a different session id leave the row's phase and counters unchanged.
 - [ ] AC-10: **Typing survives the animation.** PTY e2e: bytes typed while the row is animating arrive intact at the next prompt, and no repaint blanks them.
 - [ ] AC-11: **The e2e legs are honest.** Every PTY leg above runs under the harness's binary-freshness guard so a stale daemon cannot green a leg (informed by BUG-164, LESSON-510), and every TTY claim in this list has a real PTY test, not a renderer-unit stand-in (informed by BUG-191).
@@ -145,7 +146,7 @@ _Explicit, testable constraints governing this feature's behavior._
 
 - [x] OQ-1: Running cost in the row — **resolved 2026-09-10: yes, cost so far**, the exact sum of this turn's `cost_recorded` rows; never a token estimate (BR-3).
 - [x] OQ-2: A stall inside a stream — **resolved 2026-09-10: yes**, streaming is not exempt from the stall rule (BR-11).
-- [x] OQ-3: Quiet bound — **resolved 2026-09-10: 15 seconds** (BR-11).
+- [x] OQ-3: Quiet bound — **resolved 2026-09-10: 15 seconds** (BR-11). At architecture the stall became an annotation on the last reported phase, with `tool_running` exempt (ADR-621-5).
 - [x] OQ-4: Non-visual counterpart — **resolved 2026-09-10: yes**, a verbose-mode end-of-turn timing and cost line (BR-16, AC-13).
 
 ## Out of Scope
