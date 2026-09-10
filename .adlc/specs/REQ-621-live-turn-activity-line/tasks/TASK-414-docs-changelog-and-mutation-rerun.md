@@ -1,7 +1,7 @@
 ---
 id: TASK-414
 title: "Docs, changelog, the architecture-context pattern, and the mutation re-run over the widened suite"
-status: draft
+status: complete
 parent: REQ-621
 created: 2026-09-10
 updated: 2026-09-10
@@ -28,10 +28,10 @@ pattern to the context architecture.
 
 ## Acceptance Criteria
 
-- [ ] README describes every phase sentence the row can show, verbatim from `activity.rs`, and the stall wording
-- [ ] Mutation table in `activity.rs` names the unit test and the pty leg that reddened, with counts, after `cargo build -p tetond -p teton`
-- [ ] `cargo test --workspace --no-fail-fast 2>&1 | grep -c FAILED` is 0
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check` clean
+- [x] README describes every phase sentence the row can show, verbatim from `activity.rs`, and the stall wording
+- [x] Mutation table in `activity.rs` names the unit test and the pty leg that reddened, with counts, after `cargo build -p tetond -p teton`
+- [x] `cargo test --workspace --no-fail-fast 2>&1 | grep -c FAILED` is 0
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check` clean
 
 ## Verification
 

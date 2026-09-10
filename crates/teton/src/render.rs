@@ -1473,11 +1473,21 @@ mod tests {
     /// an *order*, and a computed expectation would reproduce whatever order
     /// the code chose.
     ///
-    /// Mutation observed red: deleting the `self.emit_pending()` call from
-    /// `PlainSurface::withdraw_row_above`. The held paragraph then never
-    /// reaches the writer at all — the output is the bare `\x1b[1A\r\x1b[K` —
-    /// so the row the pump is told to take back is not the row it drew, and the
-    /// reader loses a sentence to a cursor move.
+    /// Mutation observed red (re-run 2026-09-10 over the widened suite):
+    /// deleting the `self.emit_pending()` call from
+    /// `PlainSurface::withdraw_row_above` reddens **this test and no other** —
+    /// 1 of the 126 `render` tests, and 0 of `pty_e2e`'s 28. The held paragraph
+    /// then never reaches the writer at all — the output is the bare
+    /// `\x1b[1A\r\x1b[K` — so the row the pump is told to take back is not the
+    /// row it drew, and the reader loses a sentence to a cursor move.
+    ///
+    /// That the pty legs stay green is a fact about their fixtures, not a
+    /// reprieve: the pump withdraws the row *before* the reply's first byte and
+    /// again before each durable line, which are all line boundaries, so no leg
+    /// there has an unterminated line held at the moment of the withdraw. The
+    /// ordering only shows itself mid-line, which is why the case is
+    /// constructed here — a `fragment` with no newline — rather than waited for
+    /// at a terminal.
     #[test]
     fn withdraw_goes_through_the_seam_after_the_held_rows() {
         let mut buf: Vec<u8> = Vec::new();

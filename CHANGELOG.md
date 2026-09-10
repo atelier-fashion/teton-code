@@ -18,6 +18,50 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [Unreleased]
+
+### Added
+
+- **A turn now says what it is doing while it is doing it (REQ-621).** Most of a
+  turn renders nothing — the stretch before the first reply byte, the stretch
+  while a tool runs, the stretch after a tool result while the model composes
+  its next step — and an unmoving cursor cannot be told from a hang, which made
+  the cheapest read of a slow turn "kill it and start again" on a frontier call
+  that had already been paid for. An interactive session now animates one row
+  beneath the conversation through every silent phase, naming what the daemon
+  last reported: `preparing turn`, `waiting on anthropic claude-opus-5 (think)`
+  (with `· reading context 12,000/40,000` while a local model reads the
+  prompt), `running shell: cargo test`, `held until qwen3-coder-30b-a3b finishes
+  loading`, `compacting context`. Each row carries the phase's seconds and the
+  turn's (`· 4s · turn 12s`) and, once it is non-zero, this turn's cost so far
+  in `/cost`'s own figures. No ETA and no percentage: the daemon publishes
+  nothing to compute one from. The row is withdrawn while reply text streams and
+  while a permission prompt is open — each is its own liveness signal — and
+  erased when the turn ends, so scrollback is unchanged. After **15 seconds**
+  with no daemon event it stops its spinner and appends
+  `· no word from the daemon for 15s`, keeping the phase the daemon last
+  reported rather than relabelling it — a reply that goes quiet mid-sentence
+  brings the row back beneath the partial text as `receiving the reply` — and a
+  running tool is exempt, so a forty-second test suite is not reported as a
+  stall. `/verbose` gains the
+  non-visual read of the same accumulator: one durable
+  `turn 12s: model 4s, tools 5s, cost $0.001234` line as each turn ends.
+
+  **Upgrade note:** nothing is emitted when stdout is not a terminal — not a
+  frame, not an escape, not a blank line — so piped and scripted output is
+  byte-identical to 0.1.34's, with the single exception of the new turn-end line
+  in a `--verbose` session. No wire change: the row is folded from events the
+  daemon already published, and `PROTOCOL_VERSION` stays 2.
+
+- **`@delay-ms <n>` in a scripted reply block (REQ-621).** The scripted engine's
+  script grammar accepts a first line `@delay-ms <n>` in a reply block and holds
+  the block back that long before its first token. It is a **test seam**: it is
+  honoured only in a debug build with `TETON_TEST_SEAMS=1`, the gate the
+  engine's other seams already sit behind, and a release build refuses it. The
+  timing behaviour above has no other deterministic way to hold a turn open at a
+  real terminal, and claiming that coverage without a leg that exercises it is
+  what BUG-191 looked like.
+
 ## [0.1.34] - 2026-09-10
 
 REQ-620 and the two bugs from the same dogfood session: the shell grammar meets model-written commands, and the over-budget offer tells the truth about the local engine's window.

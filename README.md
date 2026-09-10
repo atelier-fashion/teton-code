@@ -63,7 +63,7 @@ prompts:
 | `/model set <name>` | Change the local model (typed input only; asks before an above-RAM-floor pick) |
 | `/clear` | Drop this session's retained conversation; the next prompt starts fresh |
 | `/cd [path]` | Move this session's root — the directory tools are scoped to — and clear the conversation; bare, print the current root |
-| `/verbose` | Toggle routing and turn-end notices for this session |
+| `/verbose` | Toggle routing and turn-end notices for this session — including one `turn 12s: model 4s, tools 5s, cost $0.001234` line as each turn ends |
 | `/effort [level]` | Show, or change, the global reasoning effort |
 | `/permissions [level]` | Show, or change, what this session may run without asking |
 | `/transcript [on\|off]` | Record this session to a file, or stop; bare, print the state and the file's path |
@@ -83,6 +83,43 @@ it. Outside a project — your home folder, `/`, or a
 plain directory — the session says so under the banner, because every search
 then walks all of it and no project's privacy boundaries apply; `/cd <path>`
 moves the root of a live session and starts the conversation fresh.
+
+**A turn says what it is doing.** Most of a turn is silent — the stretch before
+the first reply byte, the stretch while a tool runs, the stretch after a tool
+result while the model composes its next step — and an unmoving cursor cannot be
+told from a hang. So one row animates beneath the conversation for as long as
+the turn is quiet, naming what the daemon last reported: `preparing turn` before
+routing is decided, `waiting on anthropic claude-opus-5 (think)` once it is
+(with `· reading context 12,000/40,000` while a local model reads the prompt),
+`running shell: cargo test` while a tool runs, `held until qwen3-coder-30b-a3b
+finishes loading` while a local tier warms, `compacting context` after a
+mid-turn compaction, and `receiving the reply` in the one case below where it is
+the stream that went quiet. Each row carries the phase's own seconds and the
+turn's — `· 4s · turn 12s` — and, once it is non-zero, this turn's cost so far
+in the same figures `/cost` reports. There is no ETA and no percentage anywhere
+in it: the daemon publishes nothing to compute one from, so a number there would
+be invented.
+
+**The row steps aside, and it names a stall rather than disguising one.** It is
+withdrawn while reply text is streaming — the arriving text is the liveness
+signal — and withdrawn while a permission prompt is on screen, because the
+question owns the terminal and is its own indication. Durable lines
+(`shell: … [running]`, `[done]`, a notice) print exactly where they always did
+and the row moves beneath them, and when the turn ends the row is erased: the
+scrollback you keep is what you would have kept without it. When the daemon has
+said nothing for **15 seconds** the row stops its spinner and appends
+`· no word from the daemon for 15s`, keeping the phase the daemon last reported
+instead of relabelling it — a wedged daemon has to look different from a slow
+model, and a slow model must not be announced as a wedge. That counts a quiet
+stream too, so a reply that stops mid-sentence brings the row back beneath the
+partial text. A **running tool is exempt**: the daemon publishes nothing while a
+tool runs, so silence there is the expected state and the tool's own counter is
+the honest signal — a forty-second test suite is not a stall. None of this
+exists when stdout is not a terminal: a piped or scripted session gets not a
+frame, not an escape, not a blank line. `/verbose` is how the same figures are
+recovered without one — it prints a durable
+`turn 12s: model 4s, tools 5s, cost $0.001234` line as each turn ends, from the
+same accumulator the row was reading.
 
 **Transcripts are off until you ask for one.** Two switches, with two
 lifetimes: `[transcript] enabled = true` in `config.toml` records every session

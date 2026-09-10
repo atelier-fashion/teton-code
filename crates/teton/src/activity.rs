@@ -49,15 +49,24 @@
 //!
 //! | Mutation | Fails |
 //! |---|---|
-//! | `frame` ignores its `tick` (`SPINNER[0]` for every frame) | `the_frame_advances_with_the_tick`, and with it `the_frame_table` and `a_stall_annotates_the_last_phase_and_a_running_tool_is_exempt` — 3 red of the 10 here (2026-09-10) |
+//! | `frame` ignores its `tick` (`SPINNER[0]` for every frame) | `the_frame_advances_with_the_tick`, and with it `the_frame_table` and `a_stall_annotates_the_last_phase_and_a_running_tool_is_exempt` — 3 red of the 10 here, and **0 of `pty_e2e`'s 28** (re-run 2026-09-10 against the widened suite) |
 //!
 //! Two of those three are collateral and the third is the point: the table and
 //! the stall test carry literal spinner glyphs, so they fail on a frozen
 //! animation too, but `the_frame_advances_with_the_tick` is the one that fails
 //! on the *property* — a cycle whose frames are all distinct — rather than on a
-//! glyph that happened to be written down. The count and the pty legs that
-//! reddened with it are rewritten by REQ-621's last test-bearing task, which is
-//! where a number can be honest about the whole suite (LESSON-652).
+//! glyph that happened to be written down.
+//!
+//! The pty legs staying green is the finding, and it is **why this module's
+//! unit tests exist**. A leg at a real terminal checks that the row's first
+//! character is one of the spinner's glyphs and that its *clock clause*
+//! changed — both of which a frozen spinner satisfies — so the animation
+//! itself has no expression at that altitude. Nothing above this module can
+//! tell a moving row from a still one, which is the shape LESSON-481 names: the
+//! property that is invisible to the gated path is the one the pure function
+//! owes a test. The count is rewritten here rather than appended to, by
+//! REQ-621's last test-bearing task, so that one number speaks for the whole
+//! suite (LESSON-652).
 
 use std::time::{Duration, Instant};
 
@@ -1026,10 +1035,16 @@ mod tests {
         );
     }
 
-    /// AC-4: the row must actually move. **Mutation (applied 2026-09-10):**
-    /// `frame` ignoring its `tick` — `SPINNER[0]` in place of
-    /// `SPINNER[(tick % SPINNER.len() as u64) as usize]` — reddened this test on
-    /// the distinct-frames assertion; reverted with the same edit.
+    /// AC-4: the row must actually move. **Mutation (re-run 2026-09-10 over the
+    /// widened suite):** `frame` ignoring its `tick` — `SPINNER[0]` in place of
+    /// `SPINNER[(tick % SPINNER.len() as u64) as usize]` — reddens 3 of the 10
+    /// tests in this module and **none** of `pty_e2e`'s 28. This test is the one
+    /// that fails on the property, on its distinct-frames assertion;
+    /// `the_frame_table` and
+    /// `a_stall_annotates_the_last_phase_and_a_running_tool_is_exempt` fail as
+    /// collateral, on literal glyphs they happen to have written down. No leg at
+    /// a real terminal notices at all — see the module header — so this
+    /// assertion is the animation's only proof. Reverted with the same edit.
     #[test]
     fn the_frame_advances_with_the_tick() {
         let t0 = Instant::now();
