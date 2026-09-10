@@ -42,6 +42,7 @@ use teton_protocol::{
     SessionMode, Tier, TierBindingSource,
 };
 
+mod activity;
 mod banner;
 mod cli_rows;
 mod client;

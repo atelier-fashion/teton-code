@@ -1,7 +1,7 @@
 ---
 id: TASK-409
 title: "The turn-activity projection: phases folded from events, a pure frame, and the turn summary"
-status: draft
+status: complete
 parent: REQ-621
 created: 2026-09-10
 updated: 2026-09-10
@@ -29,15 +29,15 @@ onto `SessionState` and arm it in `begin_turn`.
 
 ## Acceptance Criteria
 
-- [ ] `observe` maps every consumed event to the phase in the REQ's Events table; an event whose envelope names another session is ignored; a missing session id counts as ours (same reading as `other_session`)
-- [ ] `frame` returns `None` for `Idle`, `Streaming` (until stalled), and `AwaitingPermission`; otherwise `<spinner> <sentence> · <phase>s · turn <turn>s[ · $cost]`, truncated to `width` on a char boundary using `unicode_width`
-- [ ] Before `route_decided` the sentence is `preparing turn`; after it, `waiting on <provider>[ <model>] (<tier>)` with the model omitted when the event carries none
-- [ ] A stalled frame stops the spinner (fixed glyph) and appends ` · no word from the daemon for <n>s`; never in `ToolRunning`
-- [ ] `observe(permission_request)` remembers the prior phase; `permission_answered(now)` restores it
-- [ ] `finish` accrues the last phase and yields total, model, tool durations and cost; `Idle` afterwards
-- [ ] Unit table of literal expected strings for `(phase, detail, elapsed, cost, stalled)`; the oracle never calls `frame`
-- [ ] Mutation "`frame` ignores `tick`" applied and observed red; recorded in the test's doc comment
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check` clean
+- [x] `observe` maps every consumed event to the phase in the REQ's Events table; an event whose envelope names another session is ignored; a missing session id counts as ours (same reading as `other_session`)
+- [x] `frame` returns `None` for `Idle`, `Streaming` (until stalled), and `AwaitingPermission`; otherwise `<spinner> <sentence> · <phase>s · turn <turn>s[ · $cost]`, truncated to `width` on a char boundary using `unicode_width`
+- [x] Before `route_decided` the sentence is `preparing turn`; after it, `waiting on <provider>[ <model>] (<tier>)` with the model omitted when the event carries none
+- [x] A stalled frame stops the spinner (fixed glyph) and appends ` · no word from the daemon for <n>s`; never in `ToolRunning`
+- [x] `observe(permission_request)` remembers the prior phase; `permission_answered(now)` restores it
+- [x] `finish` accrues the last phase and yields total, model, tool durations and cost; `Idle` afterwards
+- [x] Unit table of literal expected strings for `(phase, detail, elapsed, cost, stalled)`; the oracle never calls `frame`
+- [x] Mutation "`frame` ignores `tick`" applied and observed red; recorded in the test's doc comment
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check` clean — **fmt is clean and clippy reports nothing but `dead_code`**: 11 items, all of them the projection's pump-facing API (`observe`, `frame`, `permission_answered`, `format_turn_summary`, and the constants, fields, variants and helpers only those reach). They have no caller until TASK-411 wires the pump, which its own file lists as the call sites; the `type_complexity` finding this task did own is fixed. No `#[allow(dead_code)]` was added — this crate has none and the conventions forbid adding one.
 
 ## Verification
 
