@@ -64,6 +64,10 @@ teton-code/
   so cargo really rebuilds. Name what reddened, and say when a large count is
   one leak cascading through a process-global assertion rather than many
   findings.
+- **An exemption inside an allowlist grammar is itself an allowlist.** A fast
+  path or harmless-case carve-out in a fail-closed classifier lists exactly what
+  is proved safe and lands everything else on the old answer; a denylist there
+  inverts the polarity and every unlisted spelling leaks (REQ-620, LESSON-658).
 - **Re-run a derived check's mutation after any change to program structure**
   (LESSON-598). Do not re-read the check — a guard that has stopped covering its
   subject looks exactly like a guard that passes. REQ-600 moved one line into a
