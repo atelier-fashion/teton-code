@@ -145,3 +145,169 @@ fn collect_rs(dir: &Path, consider: &mut impl FnMut(PathBuf)) {
 fn mtime(path: &Path) -> std::io::Result<SystemTime> {
     std::fs::metadata(path)?.modified()
 }
+
+/// Every glyph REQ-621's activity row can open with: the ten spinner frames and
+/// the stalled glyph (`activity.rs`'s `SPINNER` and `STALLED_GLYPH`).
+///
+/// Written out here rather than imported from `activity.rs`, because that is
+/// where they are authored and an oracle reading them from their own definition
+/// would agree with any value it was given (LESSON-569). Shared between the two
+/// e2e suites because they need it for opposite claims — the pty legs find rows
+/// by it, the piped legs assert its total absence (BR-6) — and one list is one
+/// place for a frame the row can draw to be missing from.
+///
+/// Nothing else this binary prints draws braille, so a search for one of these
+/// characters is a search for an activity row.
+pub const ACTIVITY_GLYPHS: [char; 11] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '⠿'];
+
+/// A pty transcript replayed through a terminal, so a claim about what is
+/// **left on screen** is a claim about the screen and not about the stream
+/// (REQ-621 AC-7).
+///
+/// A withdrawn row is still in the byte stream forever — `\x1b[1A\r\x1b[K` does
+/// not delete the characters it scrolled past, it tells a terminal to draw over
+/// them. So "the turn left no row behind" cannot be asserted by searching the
+/// transcript: every frame the row ever painted is in there, and a search finds
+/// the whole animation whether or not the last one was taken back. It has to be
+/// asserted on the *result* of replaying those bytes, which is what this does.
+///
+/// Deliberately small. It answers the sequences the activity row and the entry
+/// frame actually emit — save and restore (`\x1b[s` / `\x1b[u`), cursor up and
+/// down, carriage return, newline, erase-in-line and erase-in-display — and
+/// **skips** every other CSI, which for this suite means the SGR colour runs
+/// that occupy no column. It is not a terminal emulator: there is no scroll
+/// region, no wrap at the right margin, no tab stops, and no character sets. A
+/// row wider than the pty would be hard-wrapped by a real terminal and is not
+/// here, so a leg reading this screen keeps its content inside its window — the
+/// same discipline the `display_rows` helpers in `pty_e2e` keep for the same
+/// reason.
+///
+/// Rows are returned top to bottom with trailing blanks trimmed, so an
+/// assertion can name what a reader would see.
+pub fn rendered_screen(transcript: &str) -> Vec<String> {
+    let mut screen = Screen::default();
+    let mut chars = transcript.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => screen.col = 0,
+            '\n' => {
+                screen.row += 1;
+                screen.col = 0;
+            }
+            '\x1b' if chars.peek() == Some(&'[') => {
+                chars.next();
+                let mut params = String::new();
+                let mut final_byte = None;
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        final_byte = Some(c);
+                        break;
+                    }
+                    params.push(c);
+                }
+                if let Some(final_byte) = final_byte {
+                    screen.csi(final_byte, &params);
+                }
+            }
+            // A two-character escape: its second character is consumed by the
+            // `next` above, and neither moves the cursor.
+            '\x1b' => {
+                chars.next();
+            }
+            // Everything a reader would not see as a column of text. `\x07` is
+            // the bell the prompter rings on a refused key.
+            c if (c as u32) < 0x20 || c == '\x7f' => {}
+            c => screen.put(c),
+        }
+    }
+    screen.rows()
+}
+
+/// The screen [`rendered_screen`] paints onto: rows of characters and a cursor.
+#[derive(Default)]
+struct Screen {
+    rows: Vec<Vec<char>>,
+    row: usize,
+    col: usize,
+    saved: Option<(usize, usize)>,
+}
+
+impl Screen {
+    /// Write one character at the cursor and step right, growing the screen to
+    /// reach it. A write past the end of a row pads with spaces rather than
+    /// wrapping — see [`rendered_screen`] on what this is not.
+    fn put(&mut self, c: char) {
+        while self.rows.len() <= self.row {
+            self.rows.push(Vec::new());
+        }
+        let row = &mut self.rows[self.row];
+        while row.len() <= self.col {
+            row.push(' ');
+        }
+        row[self.col] = c;
+        self.col += 1;
+    }
+
+    /// Apply one CSI sequence, ignoring the ones that paint no column.
+    fn csi(&mut self, final_byte: char, params: &str) {
+        // An omitted parameter is 1 for the cursor moves and 0 for the erases,
+        // which is the ANSI default in both cases.
+        let n = params.parse::<usize>().unwrap_or(0);
+        match final_byte {
+            'A' => self.row = self.row.saturating_sub(n.max(1)),
+            'B' => self.row += n.max(1),
+            'C' => self.col += n.max(1),
+            'D' => self.col = self.col.saturating_sub(n.max(1)),
+            's' => self.saved = Some((self.row, self.col)),
+            'u' => {
+                if let Some((row, col)) = self.saved {
+                    self.row = row;
+                    self.col = col;
+                }
+            }
+            'K' => self.erase_line(n),
+            'J' => self.erase_display(n),
+            _ => {}
+        }
+    }
+
+    /// `\x1b[K` (0, to the end of the row), `\x1b[1K` (to the start) or
+    /// `\x1b[2K` (the whole row).
+    fn erase_line(&mut self, mode: usize) {
+        let Some(row) = self.rows.get_mut(self.row) else {
+            return;
+        };
+        match mode {
+            1 => {
+                for c in row.iter_mut().take(self.col + 1) {
+                    *c = ' ';
+                }
+            }
+            2 => row.clear(),
+            _ => row.truncate(self.col),
+        }
+    }
+
+    /// `\x1b[J` (0, to the end of the screen) or `\x1b[2J` (all of it).
+    fn erase_display(&mut self, mode: usize) {
+        match mode {
+            2 => self.rows.clear(),
+            _ => {
+                self.erase_line(0);
+                self.rows.truncate(self.row + 1);
+            }
+        }
+    }
+
+    fn rows(&self) -> Vec<String> {
+        let mut rows: Vec<String> = self
+            .rows
+            .iter()
+            .map(|row| row.iter().collect::<String>().trim_end().to_owned())
+            .collect();
+        while rows.last().is_some_and(String::is_empty) {
+            rows.pop();
+        }
+        rows
+    }
+}
