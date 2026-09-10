@@ -37,6 +37,7 @@ freshness guard and polls for state (`wait_for` / `wait_until`), never sleeps.
 | rule | kind | artifact | benign_path |
 |------|------|----------|-------------|
 | BR-1 | test-case | `crates/teton/tests/pty_e2e.rs::the_row_appears_before_the_first_byte_and_withdraws_when_text_streams` | yes |
+| BR-1 | test-case | `crates/teton/tests/pty_e2e.rs::the_row_steps_aside_for_a_permission_prompt_and_returns_after_the_answer` | yes |
 | BR-3 | test-case | `crates/teton/tests/pty_e2e.rs::a_running_tool_shows_its_title_elapsed_and_cost_so_far_beneath_its_running_line` | no |
 | BR-5 | test-case | `crates/teton/tests/pty_e2e.rs::every_exit_erases_the_row` | no |
 | BR-6 | test-case | `crates/teton/tests/cli_e2e.rs::a_piped_turn_emits_no_activity_bytes` | yes |
@@ -50,9 +51,12 @@ freshness guard and polls for state (`wait_for` / `wait_until`), never sleeps.
 | AC-5 | test-case | `crates/teton/tests/pty_e2e.rs::a_running_tool_shows_its_title_elapsed_and_cost_so_far_beneath_its_running_line` | no |
 | AC-6 | test-case | `crates/teton/tests/pty_e2e.rs::a_silent_daemon_earns_the_stall_annotation_and_a_long_tool_does_not` | yes |
 | AC-7 | test-case | `crates/teton/tests/pty_e2e.rs::every_exit_erases_the_row` | no |
+| AC-7 | test-case | `crates/teton/tests/common/mod.rs::tests` — the cursor interpreter's own literal oracles (withdraw, repaint save/restore, the three erase modes, cursor-up saturation, a plain transcript) | no |
 | AC-10 | test-case | `crates/teton/tests/pty_e2e.rs::typed_bytes_survive_the_animation` | no |
 | AC-11 | structural-check | `crates/teton/tests/common/mod.rs`: `daemon_bin()` freshness guard on every leg above | no |
+| AC-11 | test-case | `crates/teton/tests/pty_e2e.rs::the_row_steps_aside_for_a_permission_prompt_and_returns_after_the_answer` — the last TTY claim in the list that had only a renderer-unit stand-in (BUG-191) | yes |
 | AC-13 | test-case | `crates/teton/tests/cli_e2e.rs::a_verbose_turn_ends_with_one_summary_line` | yes |
+| AC-13 | test-case | `crates/teton/tests/cli_e2e.rs::a_verbose_failed_turn_still_ends_with_the_summary_line` — the error arm, over a pipe | yes |
 
 ## Technical Notes
 
@@ -117,3 +121,67 @@ byte-identical scrollback does not reach. Both halves are in
 `typed_bytes_survive_the_animation`, with the second asserting delivery only and
 the doc comment saying why. Worth a follow-up if BR-5 is meant to hold while the
 user types over the row; closing it needs the client to track the cursor itself.
+
+**Closed at verify (2026-09-10).** "Visually displaced" understated it: the next
+repaint after the echoed newline would have *overwritten* the line holding the
+characters the user just typed, and the closing withdraw would have erased it.
+The pump now abandons the row the moment a submitted line is waiting on stdin,
+and AC-10's half 2 asserts what that produces. See the verify-fix pass below.
+
+## Implementation notes — verify-fix pass (2026-09-10)
+
+Green: `cargo test -p teton --test pty_e2e --test cli_e2e` — **35 pty** (was 28)
+and **92 pipe** (was 85). The six shared interpreter tests are compiled into
+both binaries, which is +6 in each count; the rest is +1 pty leg and +1 pipe leg.
+`cargo test -p tetond delay_directive` green; `cargo clippy -- -D warnings` and
+`rustfmt` clean over the four files this pass owns.
+
+Seven findings from the Phase-5 test-half review, each with the mutation that
+was **applied, run and observed failing** recorded on the test itself:
+
+1. **MAJOR — the AC-7 cursor interpreter had no tests.** `rendered_screen` is
+   the only thing that tells "the row was withdrawn" from "the row is still on
+   screen", and its users exercise it in the one direction that cannot notice a
+   bug: an interpreter that erased too much reports "no residue" forever. Six
+   literal-oracle cases now sit beside it in `tests/common/mod.rs`. *Mutation:*
+   `erase_line`'s default arm handled as mode 2 (`row.clear()`) → red at
+   `left: []` against `right: ["abc"]`, the other five green.
+2. **MAJOR — no pty leg for the permission step-aside (BR-1, AC-11).**
+   `the_row_steps_aside_for_a_permission_prompt_and_returns_after_the_answer`.
+   The daemon publishes `tool_call` **before** the permission gate, so the order
+   on screen is the `[running]` line, a `running shell: sleep 2` row, the
+   withdraw, then the question — the leg asserts that order as the producer's
+   own and opens its negative window at the question's first byte. *Mutation:*
+   the window opened at the `[running]` line instead → red on the one row it
+   then swallows.
+3. **MINOR — AC-1's and AC-2's `distinct_clocks(...).len() >= 2` were evaluated
+   once, after the turn's own marker** (AC-2's flaked). Both are now
+   `wait_until` polls over the same windows, run *before* the terminal marker is
+   awaited, so the polled condition is the asserted condition (LESSON-450).
+4. **MINOR — `after_done.iter().all(...)` in AC-2 was fragile and vacuous.** Any
+   notice-shaped event in the post-tool window changes the sentence of the
+   frames after it, and `all` is true of an empty window — the state that
+   matters. Now the emptiness check first, then `any`.
+5. **MINOR — AC-13 scripted only a successful turn.**
+   `a_verbose_failed_turn_still_ends_with_the_summary_line` drives the RPC-error
+   provocation over a pipe (`unreachable_edit_category`: a `[[categories]]` row,
+   because the fixture config's tier bindings cannot be duplicated) and asserts
+   exactly one summary line, the failed arm's composition, and nothing at all
+   outside `--verbose`. *Mutation:* `--verbose` dropped → red at `left: 0`
+   against `right: 1`.
+6. **AC-10's prose and half 2.** Prose corrected (see the finding above). Half 1
+   keeps its claims and gains one: the repaints **continue** while characters
+   are typed, because canonical mode makes nothing readable until Enter. Half 2
+   asserts delivery, **zero** `\x1b[s\x1b[1A` past the echoed newline, and the
+   echo intact on the replayed screen; `assert_no_row_on_screen` is deliberately
+   not applied to it, because the abandoned frame is the recorded exception.
+   *Mutation:* half 2's counter read the window before the newline → red at
+   `left: 2` against `right: 0`, which puts the stop at the newline to the byte.
+7. **MINOR (security) — `delay_directive` parsed an unbounded `u64`.** A
+   half-billion-year hold on a turn thread, reachable by a fixture typo, from a
+   script file the environment hands in. Capped at `MAX_SCRIPT_DELAY_MS`
+   (60 s — above the longest leg's 16.5 s, below the pty suite's per-wait
+   window); above it the directive is **malformed** and streams verbatim rather
+   than being clamped. `the_delay_directive_is_honoured_only_under_the_seam`
+   gained leg 4. *Mutation:* the guard deleted → red at
+   `left: Some((60.001s, "hello"))` against `right: None`.

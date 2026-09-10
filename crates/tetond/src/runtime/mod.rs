@@ -269,6 +269,27 @@ const SCRIPT_SEPARATOR: &str = "---";
 /// directive exists at all, and [`delay_directive`] for the grammar.
 const SCRIPT_DELAY_DIRECTIVE: &str = "@delay-ms";
 
+/// The longest hold [`SCRIPT_DELAY_DIRECTIVE`] may ask for: one minute.
+///
+/// The count used to be an unbounded `u64` of milliseconds, which is a
+/// half-billion-year hold on the thread serving the turn. Nothing malicious is
+/// needed to reach it — a fixture that means `@delay-ms 16500` and types
+/// `@delay-ms 165000000` asks for a hold no test window can outlast, and the
+/// failure it produces is a suite that hangs rather than one that says what is
+/// wrong. The script file is also *input*: it is read from a path handed in by
+/// the environment, so the size of the number in it is not something the daemon
+/// authored, and a seam that is honoured only in a debug build under a master
+/// switch is still a seam that should not turn a file into an unbounded hold.
+///
+/// A minute is above every leg's need — the longest is 16.5 s, past the
+/// fifteen-second quiet bound (REQ-621 BR-11) — and below the pty suite's own
+/// 60 s per-wait window, so a directive above the cap fails as reply text a
+/// fixture can see rather than as a wait that never returns. Above it the
+/// directive is **malformed**, which means the whole block streams verbatim by
+/// the same rule as `@delay-ms x`: the number is right there in the tokens the
+/// fixture asserts on.
+const MAX_SCRIPT_DELAY_MS: u64 = 60_000;
+
 /// A placeholder a scripted reply may contain to force its continuation to depend
 /// on the **real** tool output of the current turn's context.
 ///
@@ -725,23 +746,29 @@ impl ScriptedFileEngine {
 /// The delay a reply block's first line asks for, and the block without it.
 ///
 /// The grammar is exactly [`SCRIPT_DELAY_DIRECTIVE`], then whitespace, then a
-/// `u64` count of milliseconds. Anything else is `None` and the caller streams
-/// the block verbatim: `@delay-ms x`, a negative or overflowing count,
-/// `@delay-ms250` with no space, or a directive with no second line to stream
-/// after it. A fixture that mistypes the directive therefore fails on the reply
-/// text it asserts — the directive is right there in the tokens — rather than
-/// quietly running without the delay it asked for, which is the failure that
-/// would look like the surface under test being wrong.
+/// count of milliseconds no greater than [`MAX_SCRIPT_DELAY_MS`]. Anything else
+/// is `None` and the caller streams the block verbatim: `@delay-ms x`, a
+/// negative or overflowing count, a count above the cap, `@delay-ms250` with no
+/// space, or a directive with no second line to stream after it. A fixture that
+/// mistypes the directive therefore fails on the reply text it asserts — the
+/// directive is right there in the tokens — rather than quietly running without
+/// the delay it asked for, which is the failure that would look like the
+/// surface under test being wrong.
 fn delay_directive(block: &str) -> Option<(Duration, String)> {
     let (first, rest) = block.split_once('\n')?;
     let arg = first.strip_prefix(SCRIPT_DELAY_DIRECTIVE)?;
     if !arg.starts_with(char::is_whitespace) {
         return None;
     }
-    Some((
-        Duration::from_millis(arg.trim().parse().ok()?),
-        rest.to_owned(),
-    ))
+    let ms: u64 = arg.trim().parse().ok()?;
+    // Above the cap is malformed rather than clamped: a clamp would run a
+    // fixture that asked for something impossible and report success, which is
+    // the one outcome a seam like this must not produce. See
+    // [`MAX_SCRIPT_DELAY_MS`].
+    if ms > MAX_SCRIPT_DELAY_MS {
+        return None;
+    }
+    Some((Duration::from_millis(ms), rest.to_owned()))
 }
 
 /// Which door an offer came through, and what it may do (REQ-613 ADR-6).
@@ -9717,6 +9744,13 @@ provider_id = "on-device"
     /// 3. **Malformed under the seam.** `@delay-ms x` is not a delay and is not
     ///    stripped either — a mistyped directive fails loudly on the text a
     ///    fixture asserts instead of silently running with no delay.
+    /// 4. **Over the cap.** A count above [`MAX_SCRIPT_DELAY_MS`] is malformed
+    ///    by the same rule, so a script cannot ask for a hold no test window can
+    ///    outlast. The boundary is asserted on [`delay_directive`] directly —
+    ///    the cap is a minute and a leg that proved it by *waiting* one would be
+    ///    a minute of wall clock in a suite that has none to spare — and the
+    ///    over-cap case is then taken through the streaming loop as well, where
+    ///    it must both stream verbatim and not sleep.
     ///
     /// **Mutation run.** Changing `delay_directive`'s
     /// `first.strip_prefix(SCRIPT_DELAY_DIRECTIVE)` to
@@ -9728,6 +9762,14 @@ provider_id = "on-device"
     /// fail. Legs 2 and 3 stay green, as they must — they assert the verbatim
     /// behaviour a never-matching parse also produces, which is why leg 1 is the
     /// one carrying the claim.
+    ///
+    /// **Second mutation run,** for leg 4: deleting the
+    /// `ms > MAX_SCRIPT_DELAY_MS` guard reddens leg 4's boundary assertion at
+    /// `left: Some((60.001s, "hello"))` against `right: None`, before the
+    /// streaming half of the leg is reached — which is the point of
+    /// asserting the boundary on the grammar function first. An uncapped build
+    /// fails here in microseconds instead of holding the suite for the minute
+    /// the over-cap block would otherwise sleep.
     #[test]
     fn the_delay_directive_is_honoured_only_under_the_seam() {
         /// One leg: stream a one-block script and report what the caller was
@@ -9796,6 +9838,42 @@ provider_id = "on-device"
         assert!(
             held < Duration::from_millis(250),
             "a malformed directive must not sleep, and {held:?} elapsed"
+        );
+
+        // 4. The cap. On the grammar function, because the boundary is a
+        // minute: inclusive at the cap, malformed above it.
+        let at_cap = format!("{SCRIPT_DELAY_DIRECTIVE} {MAX_SCRIPT_DELAY_MS}\nhello");
+        assert_eq!(
+            delay_directive(&at_cap),
+            Some((
+                Duration::from_millis(MAX_SCRIPT_DELAY_MS),
+                "hello".to_owned()
+            )),
+            "the cap is the longest hold a script may ask for, not the first one \
+             it may not"
+        );
+        let over_cap = format!(
+            "{SCRIPT_DELAY_DIRECTIVE} {}\nhello",
+            MAX_SCRIPT_DELAY_MS + 1
+        );
+        assert_eq!(
+            delay_directive(&over_cap),
+            None,
+            "a count above the cap must be malformed rather than clamped — a \
+             clamp would run a fixture that asked for something impossible and \
+             report success"
+        );
+        // And through the streaming loop, where malformed means the whole block
+        // streams verbatim and nothing sleeps.
+        let (tokens, held) = stream(&over_cap, Some(true));
+        assert_eq!(
+            tokens, over_cap,
+            "an over-cap directive is reply text, by the same rule as a \
+             mistyped one"
+        );
+        assert!(
+            held < Duration::from_millis(250),
+            "an over-cap directive must not sleep, and {held:?} elapsed"
         );
     }
 
