@@ -18,6 +18,14 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Once;
 
+// The pump's wake interval, imported rather than restated: it is the length of
+// the blocking wait between two empty passes of the raw answer read
+// ([`read_answer_raw`]), and a second copy of the figure here would be a
+// second answer to "how long may that loop sleep" — free to drift from the
+// pump's. It is declared in `client.rs`, beside the loop that waits on it
+// (REQ-621).
+use crate::client::FRAME_INTERVAL;
+use crate::input_editor::{Edit, InputEditor};
 use crate::render::defused;
 
 /// A source of interactive answers.
@@ -68,21 +76,79 @@ pub(crate) fn is_yes(answer: &str) -> bool {
 /// screen that does not go through one. The transform is imported rather than
 /// re-implemented: two sanitizers is one sanitizer plus a gap.
 #[derive(Debug, Default)]
-pub struct StdinPrompter;
+pub struct StdinPrompter {
+    /// The buffer this prompter assembles an answer in while raw mode is
+    /// engaged (REQ-622 ADR-622-2).
+    ///
+    /// **Deliberately not the pump's editor**, and that is the whole of BR-5.
+    /// The pump's editor holds the line the user was part-way through typing
+    /// when the question opened; it is `shelve`d where the question is *drawn*
+    /// (TASK-417) so that nothing typed before that moment can be read as an
+    /// answer. This field is the other half of the same rule, one layer down:
+    /// the prompter reads into a buffer of its own, reset by
+    /// [`read_answer_raw`] at the top of every read, so "a question reads only
+    /// keystrokes typed after it was drawn" is true by construction rather
+    /// than by the pump having remembered to shelve. Threading the pump's
+    /// editor down here would have made it true by *agreement between two
+    /// callers*, which is the shape LESSON-502 warns about.
+    ///
+    /// It is a whole [`InputEditor`] and not a `String` because the assembling
+    /// is the part that must not be duplicated (BR-2): which bytes are one
+    /// character, which byte was a Backspace, which control byte is dropped —
+    /// one implementation, reached by both readers.
+    answer: InputEditor,
+}
 
 impl StdinPrompter {
     /// A new stdin-backed prompter.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
 impl Prompter for StdinPrompter {
+    /// One line, read the way the terminal's current mode requires.
+    ///
+    /// **Two readers, one seam** (REQ-622 BR-2). Between turns the terminal is
+    /// canonical and this is the `read_line` it has always been — byte for
+    /// byte, which is what keeps every piped fixture and every scripted flow
+    /// unchanged (BR-1, AC-7). Inside a turn at a terminal the kernel is no
+    /// longer assembling lines, so a `read_line` here would sit waiting for a
+    /// newline the line discipline will never deliver; the raw branch reads
+    /// the keystrokes itself, through [`Self::answer`], and echoes them into
+    /// the question's own row.
+    ///
+    /// Raw mode is read off the process-wide slot ([`RawMode::is_engaged`])
+    /// rather than handed in, because it is a fact about the terminal and not
+    /// about any one caller — the alternative was a flag threaded through
+    /// nineteen `UiContext` construction sites, eighteen of which would have
+    /// had to guess (ADR-622-2).
     fn ask(&mut self, question: &str) -> Option<String> {
         let mut out = io::stdout();
-        let _ = write!(out, "{}", defused(question));
+        let question = defused(question);
+        let _ = write!(out, "{question}");
         let _ = out.flush();
+        if RawMode::is_engaged() {
+            // The pump's rows are withdrawn and its pending line shelved
+            // before a question is drawn (TASK-417), so from here until this
+            // returns the terminal is the prompter's alone (BR-13).
+            let answered = read_answer_raw(
+                &mut self.answer,
+                &question,
+                &mut out,
+                read_available,
+                || stdin_ready(FRAME_INTERVAL),
+            );
+            // `ECHO` is off, so the user's Enter painted nothing and the cursor
+            // is still at the end of the answer. Without this the next row the
+            // session writes would land beside the question — `ask_secret`'s
+            // reason, one flag word over. Written on the cancel path too: the
+            // cursor is mid-row whichever way the read ended.
+            let _ = writeln!(out);
+            let _ = out.flush();
+            return answered;
+        }
         let mut line = String::new();
         match io::stdin().read_line(&mut line) {
             Ok(0) => None, // EOF
@@ -331,6 +397,19 @@ pub struct FramedStdinPrompter {
     /// drawn *above* the frame (REQ-556's loading indicator). One count serving
     /// both directions strands one of them (REQ-560 BR-11).
     below_rows: usize,
+    /// The buffer an answer is assembled in while raw mode is engaged.
+    ///
+    /// [`StdinPrompter`]'s field twin, for its reasons, and a field of its own
+    /// rather than a shared one because the two prompters are two objects and a
+    /// question is never open at both.
+    ///
+    /// Reachable, and not decoration: the entry frame is only *drawn* between
+    /// turns, but "raw mode is engaged" is a fact about the terminal rather
+    /// than about the caller, and a prompter that reached for `read_line` while
+    /// the kernel had stopped assembling lines would hang rather than fail.
+    /// Both implementors of the seam answer the question explicitly —
+    /// `ask_secret`'s paragraph, applied to the other half of the trait.
+    answer: InputEditor,
 }
 
 impl FramedStdinPrompter {
@@ -342,6 +421,7 @@ impl FramedStdinPrompter {
             color,
             status: None,
             below_rows: 0,
+            answer: InputEditor::default(),
         }
     }
 
@@ -378,10 +458,69 @@ impl FramedStdinPrompter {
         if !self.framed {
             return;
         }
-        let bytes = self.draw_bytes(question);
+        let bytes = self.draw_bytes(question, "");
         let mut out = io::stdout();
         let _ = write!(out, "{bytes}");
         let _ = out.flush();
+    }
+
+    /// Draw the entry frame with `line` already in its input row, then step the
+    /// cursor past the frame as a typed Enter would (REQ-622 ADR-622-5).
+    ///
+    /// What a **queued** line looks like on the way out. A line typed during a
+    /// turn is not printed while the turn runs (BR-4); the one place it is ever
+    /// shown is here, in the frame of the prompt that is about to send it, so
+    /// the user sees what is going out exactly once and in the place they would
+    /// have typed it.
+    ///
+    /// The echo is ours, not the terminal's, and that is the whole of the
+    /// second half: nothing was typed, so nothing was echoed, so the cursor is
+    /// still sitting in the input row at the end of the line — [`Self::erase`]'s
+    /// EOF starting point, and it needs the same two newlines plus
+    /// [`Self::below_rows`]. Getting that wrong does not misplace one row; it
+    /// leaves the next line of output overwriting the frame's bottom rule.
+    pub(crate) fn draw_submitted(&mut self, question: &str, line: &str) {
+        if !self.framed {
+            return;
+        }
+        let bytes = self.submitted_bytes(question, line);
+        let mut out = io::stdout();
+        let _ = write!(out, "{bytes}");
+        let _ = out.flush();
+    }
+
+    /// Exactly what [`Self::draw_submitted`] writes.
+    ///
+    /// Split out for [`Self::draw_bytes`]' reason, which this REQ leans on
+    /// harder than REQ-560 did: a queued line's frame is the *only* place a
+    /// queued line is ever shown, so "shown once, in the input row, with the
+    /// cursor left where Enter would have left it" has to be assertable with no
+    /// terminal in the room (REQ-560 BR-11).
+    fn submitted_bytes(&mut self, question: &str, line: &str) -> String {
+        let mut bytes = self.draw_bytes(question, line);
+        bytes.push_str(&self.advance_bytes(true));
+        bytes
+    }
+
+    /// The question as it reaches the terminal: defused, then tinted.
+    ///
+    /// One transform with two callers — the frame, and the answer row a raw-mode
+    /// read repaints ([`read_answer_raw`]). Two copies of it would be two
+    /// sanitizers, which is one sanitizer plus a gap, and the styling half has
+    /// already been got wrong once in exactly this file (see
+    /// [`Self::draw_bytes`]).
+    fn styled(&self, question: &str) -> String {
+        let question = defused(question);
+        // Styling happens HERE, after defusing, or not at all. A caller
+        // hand-composing SGR into the question hands the sanitizer exactly the
+        // bytes it exists to destroy — the REQ-573 verify pass briefly shipped
+        // that as literal `[36m` debris where the chevron's tint had been. The
+        // seam owns the tint; callers hand in plain text.
+        if self.color {
+            question.replace('›', "\x1b[36m›\x1b[0m")
+        } else {
+            question
+        }
     }
 
     /// Exactly what [`Self::draw`] writes, and the place [`Self::below_rows`] is
@@ -396,18 +535,23 @@ impl FramedStdinPrompter {
     /// exactly the rows it drew, so a question carrying its own `\x1b[…A` or a
     /// bare `\r` would step the cursor somewhere the geometry does not know
     /// about and shred the frame it sits in.
-    fn draw_bytes(&mut self, question: &str) -> String {
-        let question = defused(question);
-        // Styling happens HERE, after defusing, or not at all. A caller
-        // hand-composing SGR into the question hands the sanitizer exactly the
-        // bytes it exists to destroy — the REQ-573 verify pass briefly shipped
-        // that as literal `[36m` debris where the chevron's tint had been. The
-        // seam owns the tint; callers hand in plain text.
-        let question = if self.color {
-            question.replace('›', "\x1b[36m›\x1b[0m")
-        } else {
-            question
-        };
+    ///
+    /// `prefill` is what the input row already holds — `""` for the frame a user
+    /// is about to type into, and a **queued** line for the frame that shows
+    /// what is about to be sent (REQ-622 ADR-622-5). One parameter rather than a
+    /// second composing function, so the frame keeps one geometry: a queued
+    /// line's frame differs from an empty one by the text after the cursor
+    /// escape and by nothing else, which is what makes [`Self::advance_bytes`]'
+    /// count valid for both. It is defused for the question's reason — the
+    /// user's own line is still text a terminal reads as commands.
+    ///
+    /// The input row is still drawn **blank** and the prefill written after the
+    /// cursor has risen into it, rather than composed into that row. The rows
+    /// above and below are measured by the escape this function emits, and a
+    /// prefill composed into the row would put the bottom rule one row further
+    /// down than the count can see the moment it wrapped.
+    fn draw_bytes(&mut self, question: &str, prefill: &str) -> String {
+        let question = self.styled(question);
         let rule = self.rule();
         // Rule, blank input row, rule, then the status row if there is one.
         let mut bytes = format!("{rule}\n\n{rule}\n");
@@ -427,7 +571,7 @@ impl FramedStdinPrompter {
         // one further up per below-row — the count this same call just wrote,
         // which is what keeps the pair matched.
         let up = 2 + self.below_rows;
-        bytes.push_str(&format!("\x1b[{up}A{question}"));
+        bytes.push_str(&format!("\x1b[{up}A{question}{}", defused(prefill)));
         bytes
     }
 
@@ -493,6 +637,15 @@ impl FramedStdinPrompter {
     /// - **EOF** (Ctrl-D) echoed nothing, so the cursor is still in the input
     ///   row — two rows from clear.
     ///
+    /// Two, not three, and REQ-622 is what makes that worth saying: its two new
+    /// callers both take the *second* starting point, and for the same reason
+    /// EOF does rather than for a new one. A queued line
+    /// ([`Self::draw_submitted`]) was painted by us and never typed, and an
+    /// answer read in raw mode had `ECHO` switched off — in both cases the
+    /// terminal echoed no newline, so the cursor is where a keystroke left it
+    /// and not one row down. The parameter is named for the fact rather than
+    /// for the keystroke it used to describe.
+    ///
     /// Both then have to clear [`Self::below_rows`] more, and that is the whole
     /// of REQ-560's stranding hazard: with a status row below the bottom rule,
     /// the pre-REQ single newline would have parked the cursor **on** the status
@@ -500,18 +653,42 @@ impl FramedStdinPrompter {
     /// wider than that output stranded behind it. The count comes from the same
     /// field [`Self::draw_bytes`] set, so the rows stepped over are exactly the
     /// rows written.
-    fn advance_bytes(&self, eof: bool) -> String {
-        let rows = if eof { 2 } else { 1 } + self.below_rows;
+    fn advance_bytes(&self, no_echoed_newline: bool) -> String {
+        let rows = if no_echoed_newline { 2 } else { 1 } + self.below_rows;
         "\n".repeat(rows)
     }
 }
 
 impl Prompter for FramedStdinPrompter {
+    /// The frame, then one line read the way the terminal's mode requires.
+    ///
+    /// The raw branch is [`StdinPrompter::ask`]'s, with the frame around it:
+    /// the answer is assembled by [`Self::answer`] and echoed into the input
+    /// row the frame just drew, and the cursor is then stepped past the frame
+    /// as [`Self::draw_submitted`] steps it — because in raw mode the Enter
+    /// that ended the line painted nothing.
     fn ask(&mut self, question: &str) -> Option<String> {
         if !self.framed {
             return StdinPrompter::new().ask(question);
         }
         self.draw(question);
+        if RawMode::is_engaged() {
+            // The styled question is what is *on* the row, so it is what a
+            // repaint has to put back — the same bytes `draw_bytes` just wrote,
+            // from the same transform.
+            let question = self.styled(question);
+            let mut out = io::stdout();
+            let answered = read_answer_raw(
+                &mut self.answer,
+                &question,
+                &mut out,
+                read_available,
+                || stdin_ready(FRAME_INTERVAL),
+            );
+            let _ = write!(out, "{}", self.advance_bytes(true));
+            let _ = out.flush();
+            return answered;
+        }
         self.read_line()
     }
 
@@ -604,6 +781,141 @@ pub fn read_available(buf: &mut [u8]) -> io::Result<usize> {
             }
         }
     }
+}
+
+/// How many bytes one pass of [`read_answer_raw`] takes from the terminal.
+///
+/// One `read(2)` per pass, so this is the largest paste a single pass can
+/// swallow; anything longer arrives over several passes, which the editor's
+/// partial-byte accumulator already handles.
+const ANSWER_CHUNK: usize = 256;
+
+/// How many consecutive "stdin says it is readable and hands over nothing"
+/// passes [`read_answer_raw`] reads as the end of the descriptor.
+///
+/// The two states `read_available` deliberately does not distinguish have to be
+/// told apart *here*, because this loop is the one place where the difference
+/// matters: a question that keeps waiting on a hung-up terminal never returns,
+/// and a question that treated one interrupted read as EOF would cancel itself
+/// on a stray `SIGWINCH`. `POLLIN` with a zero-byte read is EOF or a signal;
+/// eight of them in a row, with no wall clock spent between (a hung-up
+/// descriptor polls readable immediately), is EOF.
+const READY_BUT_EMPTY_IS_EOF: usize = 8;
+
+/// One answer, read as keystrokes and echoed into the question's own row
+/// (REQ-622 BR-2, BR-3, BR-5).
+///
+/// The prompter's half of ADR-622-2, and the reason it is a free function with
+/// its arguments handed in: the loop — *read, decode, echo, stop at Enter* — is
+/// identical for both prompters, and every terminal fact it needs is a
+/// parameter. `keys` is [`read_available`] in production and a scripted byte
+/// source in a test; `wait` is a [`stdin_ready`] of one frame; `out` is stdout.
+/// So the behaviour that BR-5 is about is assertable with no terminal, no
+/// keyboard and no clock (BR-10).
+///
+/// **The buffer is reset here, at the top, on every read.** That is BR-5 by
+/// construction rather than by discipline: whatever is in `answer` when this is
+/// called — the tail of a previous question, a byte that arrived between the
+/// pump's shelve and the question's first row — is not part of this answer and
+/// is dropped. It is then [`InputEditor::shelve`]d immediately, which is what
+/// makes Enter *hold* the line for [`InputEditor::take_answer`] instead of
+/// pushing it onto the queue: a question's answer must never become a queued
+/// prompt (BR-5, BR-6).
+///
+/// **A byte at a time, stopping at the first Enter.** A paste of three lines
+/// answered at a question is one answer and two lines nobody asked for; pushing
+/// the whole read in one call would leave the second and third lines appended
+/// to the answer in the shelved buffer, because a shelved editor's Enter does
+/// not clear `pending`. Feeding the editor byte by byte lets the loop stop at
+/// the moment the answer is complete and drop the rest of that read — the same
+/// rule [`InputEditor::unshelve`] states for what a question leaves behind.
+///
+/// Returns `None` for a cancel — a read error, or a descriptor at EOF — which
+/// is the contract [`Prompter::ask`] already has.
+fn read_answer_raw(
+    answer: &mut InputEditor,
+    question: &str,
+    out: &mut impl Write,
+    mut keys: impl FnMut(&mut [u8]) -> io::Result<usize>,
+    mut wait: impl FnMut() -> bool,
+) -> Option<String> {
+    *answer = InputEditor::default();
+    answer.shelve();
+    let mut buf = [0u8; ANSWER_CHUNK];
+    let mut empty = 0usize;
+    loop {
+        let read = match keys(&mut buf) {
+            Ok(read) => read,
+            // A failed read mid-question is a cancel, not something to retry:
+            // the caller's `None` path declines the request, which is the safe
+            // answer to every question this prompter asks.
+            Err(_) => return None,
+        };
+        if read == 0 {
+            // Nothing this pass. Block for one frame rather than spin: this is
+            // the same wait the pump uses, so a question open mid-turn costs
+            // one `poll` per interval and no CPU.
+            if wait() {
+                empty += 1;
+                if empty >= READY_BUT_EMPTY_IS_EOF {
+                    return None;
+                }
+            } else {
+                empty = 0;
+            }
+            continue;
+        }
+        empty = 0;
+        for &byte in &buf[..read] {
+            let mut moved = false;
+            let mut complete = false;
+            for edit in answer.push(&[byte]) {
+                match edit {
+                    Edit::Pending => moved = true,
+                    // Enter, against a shelved buffer: the line is this
+                    // question's answer and the queue was left alone.
+                    Edit::Queued(_) => complete = true,
+                    // A dropped control byte or a consumed escape sequence:
+                    // nothing to repaint, and nothing echoed (BR-9).
+                    Edit::Nothing => {}
+                }
+            }
+            if moved {
+                let _ = write!(
+                    out,
+                    "{}",
+                    answer_row_bytes(question, answer.answer_so_far())
+                );
+                let _ = out.flush();
+            }
+            if complete {
+                return Some(answer.take_answer());
+            }
+        }
+    }
+}
+
+/// The question's input row, repainted with `answer` typed into it.
+///
+/// Composed from the **editor's** text rather than from the bytes the reader
+/// happened to hand over, which is BR-2 at the writer: a row painted from raw
+/// input would be a second decoder, and the one that drifted would paint half a
+/// character or echo a Backspace as a glyph.
+///
+/// `\r\x1b[K` then the whole row, rather than an incremental append, because
+/// Backspace has to *remove* a character and the row is the only thing here that
+/// knows how wide the removed one was. `question` arrives already defused (and
+/// tinted, at the framed prompter); the answer is defused here for
+/// [`InputEditor::row`]'s reason — a bidi override is printable UTF-8, so it
+/// reaches the line as an ordinary character and it is the *rendering* that has
+/// to neutralize it.
+///
+/// A question and answer wider than the terminal wrap, and a repaint then lands
+/// on the wrong row: the same line-based cost [`FramedStdinPrompter`] documents
+/// for its own input row, and it goes away with the full-screen surface that
+/// seam exists for.
+fn answer_row_bytes(question: &str, answer: &str) -> String {
+    format!("\r\x1b[K{question}{}", defused(answer))
 }
 
 /// The terminal's column count, or a conservative 80 when stdout is not a
@@ -1135,7 +1447,7 @@ mod tests {
     #[test]
     fn a_frame_with_no_status_row_is_the_frame_it_always_was() {
         let mut p = FramedStdinPrompter::new(true, false);
-        let bytes = p.draw_bytes("> ");
+        let bytes = p.draw_bytes("> ", "");
         assert!(
             bytes.ends_with("\x1b[2A> "),
             "the cursor must rise two rows into the input row: {bytes:?}"
@@ -1151,7 +1463,7 @@ mod tests {
     fn a_status_row_adds_one_row_below_and_one_to_every_matching_count() {
         let mut p = FramedStdinPrompter::new(true, false);
         p.set_status(Some("permissions: guarded".to_owned()));
-        let bytes = p.draw_bytes("> ");
+        let bytes = p.draw_bytes("> ", "");
 
         assert!(
             bytes.contains("permissions: guarded\n"),
@@ -1175,7 +1487,7 @@ mod tests {
     fn the_status_row_is_drawn_below_the_bottom_rule() {
         let mut p = FramedStdinPrompter::new(true, false);
         p.set_status(Some("permissions: plan".to_owned()));
-        let bytes = p.draw_bytes("> ");
+        let bytes = p.draw_bytes("> ", "");
         let rows: Vec<&str> = bytes.split('\n').collect();
         // [top rule][blank input row][bottom rule][status row][cursor escape…]
         assert_eq!(rows.len(), 5, "the frame should be four rows: {rows:?}");
@@ -1191,11 +1503,11 @@ mod tests {
     fn clearing_the_status_row_restores_every_count() {
         let mut p = FramedStdinPrompter::new(true, false);
         p.set_status(Some("permissions: full".to_owned()));
-        let _ = p.draw_bytes("> ");
+        let _ = p.draw_bytes("> ", "");
         assert_eq!(p.below_rows, 1);
 
         p.set_status(None);
-        let bytes = p.draw_bytes("> ");
+        let bytes = p.draw_bytes("> ", "");
         assert!(bytes.ends_with("\x1b[2A> "), "{bytes:?}");
         assert_eq!(p.below_rows, 0);
         assert_eq!(p.advance_bytes(false), "\n");
@@ -1266,7 +1578,7 @@ mod tests {
         // and stays inert.
         let hostile = "  auth header template [Enter for `\x1b[2KX-Evil: {key}\rgotcha`]: ";
         let expected = crate::render::defused(hostile);
-        let bytes = p.draw_bytes(hostile);
+        let bytes = p.draw_bytes(hostile, "");
         let (frame, question) = bytes.split_at(bytes.len() - expected.len());
         assert_eq!(question, expected);
         assert!(
@@ -1289,7 +1601,7 @@ mod tests {
             "  auth header template [Enter for `Authorization: Bearer {key}`]: ",
             "> ",
         ] {
-            let bytes = p.draw_bytes(ordinary);
+            let bytes = p.draw_bytes(ordinary, "");
             assert!(
                 bytes.ends_with(ordinary),
                 "an ordinary question must survive verbatim: {bytes:?}"
@@ -1308,7 +1620,7 @@ mod tests {
     fn the_chevrons_tint_is_applied_after_defusing_at_the_seam() {
         // Colour on: plain " › " in, tinted chevron out.
         let mut tinted = FramedStdinPrompter::new(true, true);
-        let bytes = tinted.draw_bytes(" › ");
+        let bytes = tinted.draw_bytes(" › ", "");
         assert!(
             bytes.contains(" \x1b[36m›\x1b[0m "),
             "the seam must tint the chevron the caller handed in plain: {bytes:?}"
@@ -1316,7 +1628,7 @@ mod tests {
 
         // Colour off: the same question stays plain, and no SGR appears.
         let mut plain = FramedStdinPrompter::new(true, false);
-        let bytes = plain.draw_bytes(" › ");
+        let bytes = plain.draw_bytes(" › ", "");
         assert!(
             bytes.contains(" › ") && !bytes.contains("\x1b[36m"),
             "no colour means no SGR at all: {bytes:?}"
@@ -1325,7 +1637,7 @@ mod tests {
         // A hostile question is defused whether or not the tint applies — the
         // erase and the carriage return die, the chevron still gets its tint.
         let mut hostile = FramedStdinPrompter::new(true, true);
-        let bytes = hostile.draw_bytes("\x1b[2K› \r");
+        let bytes = hostile.draw_bytes("\x1b[2K› \r", "");
         assert!(
             !bytes.contains("\x1b[2K") && !bytes.contains('\r'),
             "defusing must run regardless of styling: {bytes:?}"
@@ -1827,5 +2139,327 @@ mod tests {
                  classifiers: {is_tty} {got} {set}"
             );
         }
+    }
+
+    // ---- REQ-622 BR-2 / BR-5: a question's answer, with no terminal --------
+
+    /// A stand-in for [`read_available`]: the chunks a terminal would have
+    /// handed over, one per pass, then nothing.
+    ///
+    /// Chunks rather than one string, because *where the reads split* is half
+    /// of what [`read_answer_raw`] has to get right — a terminal delivers `é`
+    /// as whatever bytes were ready, and the split is exactly where a decoder
+    /// that assembled per-read rather than per-character would lose the tail.
+    ///
+    /// Exhaustion reports `Ok(0)`, which is what a real stdin with nothing
+    /// waiting reports; paired with a `wait` that says "readable" it drives the
+    /// [`READY_BUT_EMPTY_IS_EOF`] path, so a script that never ends its line
+    /// makes the read *return* rather than hang.
+    ///
+    /// A closure factory, and deliberately not shared with `client.rs`'s
+    /// same-named stand-in: that one is a `fn` pointer, because the pump reaches
+    /// its reader through a field of that type, and this one is a closure
+    /// because the prompter's reader is a parameter. Two shapes for two seams —
+    /// what must not be duplicated is the *decoding*, and that is
+    /// `InputEditor`'s, reached by both.
+    fn scripted_keys(script: &[&[u8]]) -> impl FnMut(&mut [u8]) -> io::Result<usize> {
+        let mut passes: std::collections::VecDeque<Vec<u8>> =
+            script.iter().map(|chunk| chunk.to_vec()).collect();
+        move |buf| {
+            let Some(chunk) = passes.pop_front() else {
+                return Ok(0);
+            };
+            let take = chunk.len().min(buf.len());
+            buf[..take].copy_from_slice(&chunk[..take]);
+            Ok(take)
+        }
+    }
+
+    /// This file's production half, for the region checks below.
+    ///
+    /// [`handler_body`]'s corpus, cut the same way and for the same reason: the
+    /// needles are written in this module, so an uncut corpus would match them
+    /// and pass with the production code containing nothing at all.
+    fn production_source() -> &'static str {
+        const SOURCE: &str = include_str!("prompt.rs");
+        SOURCE
+            .split_once("\n#[cfg(test)]")
+            .map_or(SOURCE, |(before, _)| before)
+    }
+
+    /// REQ-622 BR-2: in raw mode the answer is **assembled by the editor** —
+    /// one reader, one decoder — and echoed by the prompter into the question's
+    /// own row.
+    ///
+    /// The script is the whole claim, because every keystroke in it is one a
+    /// `read_line` could not have handled and a byte-echoing writer could not
+    /// have painted:
+    ///
+    /// - `a`, `b`, then Backspace: the kernel is not implementing Backspace any
+    ///   more, so a reader that merely collected bytes would answer `ab\x7f`;
+    /// - `é` split across two passes: the two halves of one character arrive in
+    ///   separate reads, and a decoder working per-read drops the tail;
+    /// - `ESC [ A`: an arrow key, which must echo **nothing** and change
+    ///   nothing (BR-9) — a passthrough echo would paint `[A` into the answer;
+    /// - `\r\n`: one Enter, not two.
+    ///
+    /// The echo is asserted as one literal covering every repaint in order
+    /// (LESSON-569: the oracle is written out, never recomputed with the
+    /// subject's own expression). Five repaints for five changes to the line,
+    /// and not one for the arrow key or for the held half of the `é`.
+    #[test]
+    fn a_raw_mode_answer_is_read_through_the_editor() {
+        let mut answer = InputEditor::default();
+        let mut echo: Vec<u8> = Vec::new();
+
+        let line = read_answer_raw(
+            &mut answer,
+            "allow? ",
+            &mut echo,
+            scripted_keys(&[b"ab", b"\x7f", &[0xc3], &[0xa9], b"\x1b[A", b"!", b"\r\n"]),
+            || true,
+        );
+
+        assert_eq!(
+            line.as_deref(),
+            Some("aé!"),
+            "the answer is what the editor assembled: Backspace removed a whole \
+             character, the split `é` survived, and the arrow key changed nothing"
+        );
+        assert_eq!(
+            String::from_utf8(echo).expect("the echo is utf-8"),
+            "\r\x1b[Kallow? a\
+             \r\x1b[Kallow? ab\
+             \r\x1b[Kallow? a\
+             \r\x1b[Kallow? aé\
+             \r\x1b[Kallow? aé!",
+            "each change repaints the question's row once, from the editor's \
+             text; a held half-character and a consumed escape sequence repaint \
+             nothing"
+        );
+        assert_eq!(
+            answer.queued_len(),
+            0,
+            "an answer is never a queued prompt (BR-5): the buffer is shelved for \
+             the read, so Enter holds the line for `take_answer` instead of \
+             pushing it onto the queue"
+        );
+
+        // **The wiring, pinned where it lives** ([[LESSON-547]],
+        // [[LESSON-568]]). The behaviour above is `read_answer_raw`'s; that
+        // both `ask`s *reach* it, and reach it off the terminal's own state
+        // rather than off a flag, cannot be driven from a unit test — the other
+        // branch reads the real descriptor 0. So it is asserted about the
+        // source, cut at the first column-zero `#[cfg(test)]` so these needles
+        // cannot match themselves.
+        let source = production_source();
+        let region = |start: &str, end: &str| -> &str {
+            let at = source
+                .find(start)
+                .unwrap_or_else(|| panic!("this sweep's anchor is gone: {start:?}"));
+            let len = source[at..]
+                .find(end)
+                .unwrap_or_else(|| panic!("{end:?} no longer follows {start:?}"));
+            &source[at..at + len]
+        };
+        for (start, end) in [
+            ("impl Prompter for StdinPrompter {", "fn ask_secret"),
+            (
+                "impl Prompter for FramedStdinPrompter {",
+                "/// A credential is never asked for inside the entry frame.",
+            ),
+        ] {
+            let ask = region(start, end);
+            assert!(
+                ask.contains("RawMode::is_engaged()"),
+                "`{start}`'s `ask` must branch on the terminal's own mode — a \
+                 `read_line` against a kernel that has stopped assembling lines \
+                 hangs rather than fails (BR-2)"
+            );
+            assert!(
+                ask.contains("read_answer_raw("),
+                "`{start}`'s raw branch must read through the one answer reader, \
+                 not a second one of its own (ADR-622-2)"
+            );
+        }
+    }
+
+    /// REQ-622 BR-5: a question reads **only** the keystrokes typed after it was
+    /// drawn, and the line the user was part-way through is neither its answer
+    /// nor consumed by it.
+    ///
+    /// Two buffers, which is the mechanism rather than a restatement of the
+    /// rule. The prompter's own buffer is dirtied first — that stands for
+    /// anything that could have got into it before the question's first row was
+    /// painted, the tail of a previous question included — and the read has to
+    /// answer `y` rather than `rm -rf /y`. Meanwhile the *pump's* editor,
+    /// shelved where the question was drawn, comes back verbatim and with an
+    /// untouched queue: the answer read never reaches it.
+    ///
+    /// **The benign path is the dangerous one here.** Every assertion below
+    /// passes against a prompter that shares one buffer with the pump *as long
+    /// as nothing was pending* — which is the common case, and is why the buffer
+    /// is pre-loaded rather than left empty. What this guards against is a
+    /// permission prompt answered `y` by a line the user typed half a second
+    /// before the question they never saw.
+    #[test]
+    fn type_ahead_before_a_question_is_not_its_answer() {
+        // The pump's editor: the user's half-written line, shelved at the moment
+        // the question was drawn (TASK-417).
+        let mut pump = InputEditor::default();
+        pump.push("half a thought".as_bytes());
+        pump.shelve();
+
+        // The prompter's own buffer, dirty.
+        let mut answer = InputEditor::default();
+        answer.push(b"rm -rf /");
+        assert_eq!(
+            answer.answer_so_far(),
+            "rm -rf /",
+            "the fixture is worth nothing unless the buffer really is dirty"
+        );
+
+        let mut echo: Vec<u8> = Vec::new();
+        let line = read_answer_raw(
+            &mut answer,
+            "allow? ",
+            &mut echo,
+            scripted_keys(&[b"y", b"\n"]),
+            || true,
+        );
+
+        assert_eq!(
+            line.as_deref(),
+            Some("y"),
+            "the answer is the keystroke typed after the question, and nothing \
+             that was in the buffer before it"
+        );
+        assert_eq!(
+            String::from_utf8(echo).expect("the echo is utf-8"),
+            "\r\x1b[Kallow? y",
+            "and the row the user reads shows what the caller got — a question \
+             whose row said `rm -rf /y` would be answered blind"
+        );
+
+        pump.unshelve();
+        assert_eq!(
+            pump.answer_so_far(),
+            "half a thought",
+            "the shelved line comes back verbatim: one that came back subtly \
+             different would be worse than one that came back empty"
+        );
+        assert_eq!(
+            pump.queued_len(),
+            0,
+            "and the question consumed nothing from the queue either (BR-5)"
+        );
+    }
+
+    /// REQ-622 BR-5, the other end of the same read: a paste answers **one**
+    /// question and the rest of that read is dropped.
+    ///
+    /// A shelved editor's Enter leaves the line in the buffer for `take_answer`,
+    /// so a reader that pushed a whole read in one call would hand back `yn` —
+    /// the first line's answer with the second line's keystrokes appended, from
+    /// a question the user answered once.
+    #[test]
+    fn a_paste_answers_one_question_and_the_rest_of_that_read_is_dropped() {
+        let mut answer = InputEditor::default();
+        let mut echo: Vec<u8> = Vec::new();
+        let line = read_answer_raw(
+            &mut answer,
+            "allow? ",
+            &mut echo,
+            scripted_keys(&[b"y\nn\n"]),
+            || true,
+        );
+        assert_eq!(line.as_deref(), Some("y"));
+        assert_eq!(answer.queued_len(), 0);
+    }
+
+    /// REQ-622: a descriptor that says it is readable and hands over nothing is
+    /// the end of the input, not a loop to sit in.
+    ///
+    /// The cancel [`Prompter::ask`] already contracts for, reached with no
+    /// terminal and no clock: the scripted source runs dry, the wait claims
+    /// readable every pass, and the read gives up after
+    /// [`READY_BUT_EMPTY_IS_EOF`] of them. The alternative — trusting one
+    /// zero-byte read — would cancel a question on the stray signal
+    /// [`read_available`] maps to `Ok(0)`.
+    #[test]
+    fn an_answer_read_gives_up_on_a_descriptor_that_hands_over_nothing() {
+        let mut answer = InputEditor::default();
+        let mut echo: Vec<u8> = Vec::new();
+        let mut passes = 0usize;
+        let line = read_answer_raw(
+            &mut answer,
+            "allow? ",
+            &mut echo,
+            scripted_keys(&[b"y"]),
+            || {
+                passes += 1;
+                true
+            },
+        );
+        assert_eq!(line, None, "an exhausted descriptor is a cancel");
+        assert_eq!(
+            passes, READY_BUT_EMPTY_IS_EOF,
+            "and it is reached in a bounded number of passes, so the question \
+             returns rather than hangs"
+        );
+        assert_eq!(
+            String::from_utf8(echo).expect("the echo is utf-8"),
+            "\r\x1b[Kallow? y",
+            "what was typed before the descriptor ended was still painted once"
+        );
+    }
+
+    /// REQ-560 BR-11, extended to the one place a queued line is ever shown
+    /// (REQ-622 BR-4, ADR-622-5).
+    ///
+    /// The frame is the same frame: the queued line is written into the input
+    /// row *after* the cursor has risen into it, so the two rules and the status
+    /// row below them are placed by exactly the counts an empty frame uses. What
+    /// differs is the advance — nothing was typed, so the terminal echoed no
+    /// newline, and the cursor needs the same two rows EOF needs. One newline
+    /// here would leave the next line of output sitting on the bottom rule.
+    #[test]
+    fn a_queued_lines_frame_echoes_it_once_and_advances_as_enter_would() {
+        let mut p = FramedStdinPrompter::new(true, false);
+        let rule = p.rule();
+        assert_eq!(
+            p.submitted_bytes("> ", "cargo test"),
+            format!("{rule}\n\n{rule}\n\x1b[2A> cargo test\n\n"),
+            "the line is shown once, in the input row, and the cursor is stepped \
+             past the frame as a typed Enter would have left it"
+        );
+        assert_eq!(p.below_rows, 0);
+
+        // With a status row every count moves together, exactly as for a typed
+        // line.
+        p.set_status(Some("permissions: guarded".to_owned()));
+        let bytes = p.submitted_bytes("> ", "cargo test");
+        assert!(bytes.ends_with("\x1b[3A> cargo test\n\n\n"), "{bytes:?}");
+        assert_eq!(p.below_rows, 1);
+
+        // A queued line is the user's own text, and it is still text a terminal
+        // reads as commands: the row it is echoed into must not be able to move
+        // the cursor out of the frame it is drawn in.
+        let hostile = p.submitted_bytes("> ", "one\x1b[2Atwo\r");
+        assert_eq!(
+            hostile.matches("\x1b[").count(),
+            1,
+            "the frame's own cursor escape is the only escape in it: {hostile:?}"
+        );
+        assert!(!hostile.contains('\r'), "{hostile:?}");
+
+        // With the frame off nothing is written at all — the piped path stays
+        // byte-identical (BR-1, AC-7).
+        let mut piped = FramedStdinPrompter::new(false, false);
+        piped.draw_submitted("> ", "cargo test");
+        assert_eq!(
+            piped.below_rows, 0,
+            "an unframed prompter must not accrue rows to step over"
+        );
     }
 }

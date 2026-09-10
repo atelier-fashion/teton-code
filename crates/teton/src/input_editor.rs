@@ -321,6 +321,26 @@ impl InputEditor {
         std::mem::take(&mut self.pending)
     }
 
+    /// The line in the buffer as it stands, for the caller that has to draw it.
+    ///
+    /// The read-only half of [`Self::take_answer`], and the prompter's echo
+    /// source (ADR-622-2): the row a question's answer is painted into is
+    /// composed from *this* text and not from the bytes the reader happened to
+    /// see, so the assembling — which bytes are one character, which byte was a
+    /// Backspace, which control byte was dropped — keeps exactly one
+    /// implementation (BR-2). A writer that echoed its own input would be a
+    /// second decoder, and the one that drifted would paint half a character.
+    ///
+    /// Deliberately **not** [`Self::row`], which composes the *pump's* pending
+    /// row — marker, defuse and width fit included. A question's answer row is
+    /// the prompter's: it is prefixed by the question rather than by a marker,
+    /// and it is defused at that writer for the same reason this one defuses at
+    /// its own.
+    #[must_use]
+    pub fn answer_so_far(&self) -> &str {
+        &self.pending
+    }
+
     /// Take the oldest queued line, or `None` when the queue is empty.
     ///
     /// Oldest first, one per call: the entry loop drains a single line per
