@@ -69,6 +69,8 @@ the wire._
 | question answered | user answers | `shelved` = false; `pending` shown again |
 | turn ends by any path | result, RPC error, transport error, daemon disconnect | mode → `canonical`; guard restores; `queued` lines submitted in order as the next prompts |
 | Ctrl-C | user types | today's meaning (the session ends); guard restores first; nothing partial is submitted |
+| Ctrl-D | user types during a turn | ignored; it has no meaning until a prompt is open (OQ-1) |
+| line queued | Enter during a turn | the activity row gains a `· N queued` clause while `queued` is non-empty (OQ-3) |
 | process-ending signal | SIGINT, SIGTERM, SIGHUP | guard restores before the process dies |
 | raw mode unavailable | `tcsetattr` fails on a real tty | mode stays `canonical`; today's REQ-621 behaviour (abandon on a submitted line) applies; one verbose notice |
 
@@ -81,7 +83,7 @@ _Explicit, testable constraints governing this feature's behavior._
 - [ ] BR-3: **What the user types is visible, editable, and never overwritten.** Printable characters (assembled from UTF-8, including CJK and emoji), Backspace, and Enter are handled. The pending line is echoed by the client on a row it owns; no activity-row repaint, withdraw, or durable line ever lands on it. REQ-621 BR-9 becomes unconditional.
 - [ ] BR-4: **A submitted line leaves no frame behind.** The activity row is erased cleanly on every turn exit whether or not the user typed. After the turn, scrollback equals today's scrollback plus each queued line shown exactly once where the next prompt echoes it. REQ-621 BR-5's recorded exception is retired (informed by BUG-225, LESSON-659).
 - [ ] BR-5: **Type-ahead is never an answer.** A question opened mid-turn reads only keystrokes typed after it was drawn. Anything pending at that moment is shelved, preserved verbatim, and shown again once the question is answered. A queued line is never consumed by a question either.
-- [ ] BR-6: **Enter queues the next prompt.** Each line submitted during the turn is queued in order and, after the turn ends, submitted as the next prompt exactly as if typed at the entry frame — including slash commands, the REQ-615 `cd` intercept, and every pre-send check the entry path already runs. Nothing is sent to the daemon while the turn is still running.
+- [ ] BR-6: **Enter queues the next prompt.** Each line submitted during the turn is queued in order and, after the turn ends, submitted as the next prompt exactly as if typed at the entry frame — including slash commands, the REQ-615 `cd` intercept, and every pre-send check the entry path already runs. Nothing is sent to the daemon while the turn is still running. A multi-line paste arrives as several Enters and queues one prompt per line; bracketed paste is a later REQ (OQ-2).
 - [ ] BR-7: **The terminal is restored on every exit.** Normal turn end, RPC error, transport error, daemon disconnect, a client panic, and the signals that end the process (SIGINT from Ctrl-C, SIGTERM, SIGHUP) all put the terminal back exactly as it was. The same restoration covers the existing echo-off key prompt, retiring REQ-572's accepted residual. The mechanism adds no second stdin reader and no timer thread.
 - [ ] BR-8: **Ctrl-C keeps its meaning.** It ends the session as it does today; the terminal is restored first and no partial line is submitted.
 - [ ] BR-9: **Unhandled control input is ignored, never echoed, never forwarded.** An escape-prefixed sequence (arrow keys, function keys) is consumed as a unit and dropped; a lone control byte outside the handled set is dropped. Nothing typed can reach the daemon except through BR-6.
@@ -89,6 +91,8 @@ _Explicit, testable constraints governing this feature's behavior._
 - [ ] BR-11: **Failing to enter raw mode fails open to today's behaviour, and says so.** If a real terminal refuses the mode change, the turn runs in canonical mode with REQ-621's abandon-on-submit behaviour, and one verbose notice names it. This is the opposite polarity from the echo-off prompt, which fails closed because it hides a secret; here there is nothing to hide (informed by REQ-572).
 - [ ] BR-12: **No wire change.** No method or event changes; `PROTOCOL_VERSION` is unchanged.
 - [ ] BR-13: **One owner of the terminal during a turn.** The row and the type-ahead echo are painted and withdrawn by the same loop that holds the clock, under REQ-621's withdraw-before-durable-write discipline; every other writer sees both withdrawn (informed by REQ-621 ADR-621-3).
+- [ ] BR-14: **The row says a line is queued.** While `queued` is non-empty the activity row carries a `· N queued` clause with the exact count, so an Enter that registered is visible without waiting for the turn to end; the clause is withdrawn with the row and is subject to REQ-621's fit rule.
+- [ ] BR-15: **Ctrl-D is inert during a turn.** It neither ends the session nor submits anything; EOF keeps its meaning only at an open prompt, as today.
 
 ## Acceptance Criteria
 
@@ -103,6 +107,9 @@ _Explicit, testable constraints governing this feature's behavior._
 - [ ] AC-9: **Unhandled keys are inert.** PTY e2e: arrow keys and a function key typed mid-turn echo nothing and change nothing; the next submitted line is exactly what was typed.
 - [ ] AC-10: **The editor is pure.** A unit table maps keystroke sequences to `(pending, queued, echo bytes)` with literal oracles; the mutation "Backspace removes a byte, not a char" is applied and observed red, and recorded (informed by LESSON-569).
 - [ ] AC-11: **Raw-mode refusal falls back honestly.** A unit test with a terminal double that refuses `tcsetattr` shows the turn proceeds, the REQ-621 abandon path is used, and exactly one verbose notice is printed.
+- [ ] AC-14: **A queued line is announced on the row.** PTY e2e: after Enter mid-turn the next frame carries `· 1 queued`; a second Enter makes it `· 2 queued`; the clause is gone after the turn.
+- [ ] AC-15: **Ctrl-D mid-turn is inert.** PTY e2e: Ctrl-D during a delayed turn ends nothing and submits nothing; the turn completes and the entry prompt returns; Ctrl-D at that prompt still ends the session.
+- [ ] AC-16: **A pasted block queues one prompt per line.** PTY e2e: three lines written to the pty in one write during a turn become three queued prompts in order.
 - [ ] AC-12: **Honest legs.** Every PTY leg runs under the harness's binary-freshness guard and every TTY claim above has a real PTY test (informed by BUG-164, BUG-191, LESSON-510).
 - [ ] AC-13: **Closed out.** BUG-225 is marked resolved naming this REQ; REQ-621's BR-5 and BR-9 amendments are marked retired with a dated note; the README describes typing during a turn and the queued-prompt behaviour.
 
@@ -119,9 +126,9 @@ _Explicit, testable constraints governing this feature's behavior._
 
 ## Open Questions
 
-- [ ] OQ-1: Ctrl-D during a turn — ignore it (recommended: it has no meaning until a prompt is open), or remember it and end the session after the turn as piped EOF does?
-- [ ] OQ-2: A multi-line paste during a turn arrives as several Enters. Queue one prompt per line (the literal reading of BR-6), or detect bracketed paste and queue the block as one prompt? Recommended: one prompt per line now, bracketed paste in a later REQ.
-- [ ] OQ-3: Should the queued line count be visible in the activity row (`· 1 queued`) so the user knows the Enter registered? Recommended: yes, as a clause on the row.
+- [x] OQ-1: Ctrl-D during a turn — **resolved 2026-09-10: ignored** (BR-15, AC-15).
+- [x] OQ-2: Multi-line paste — **resolved 2026-09-10: one queued prompt per line now**; bracketed paste stays out of scope (BR-6, AC-16).
+- [x] OQ-3: Queued count on the row — **resolved 2026-09-10: yes**, a `· N queued` clause (BR-14, AC-14).
 
 ## Out of Scope
 
