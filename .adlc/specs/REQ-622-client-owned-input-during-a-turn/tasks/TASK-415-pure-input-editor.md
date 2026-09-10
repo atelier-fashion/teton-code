@@ -1,7 +1,7 @@
 ---
 id: TASK-415
 title: "The pure input editor: keystroke decoding, the pending row, shelve/unshelve, and the queue"
-status: draft
+status: complete
 parent: REQ-622
 created: 2026-09-10
 updated: 2026-09-10
@@ -27,11 +27,11 @@ on the defused string like `activity::fit`); `shelve` / `unshelve`; `take_next_q
 
 ## Acceptance Criteria
 
-- [ ] A byte table maps sequences to literal `(pending, queued, echo-row)` triples: ASCII, `é` split across two pushes, CJK, an emoji, Backspace over each, Enter, `\r\n` as one Enter, three lines in one push → three queued, `ESC [ A`, `ESC O P`, `0x04`, `0x03` dropped
-- [ ] `shelve` hides `pending`; `push` while shelved edits a fresh buffer the caller reads; `unshelve` restores the original verbatim
-- [ ] `row(width)` never exceeds `width-1` columns on the defused string; CJK tail case
-- [ ] Mutation "Backspace pops a byte, not a char" applied, observed red on the `é`/CJK rows, reverted, recorded
-- [ ] clippy `-D warnings`, fmt clean, no `#[allow]`
+- [x] A byte table maps sequences to literal `(pending, queued, echo-row)` triples: ASCII, `é` split across two pushes, CJK, an emoji, Backspace over each, Enter, `\r\n` as one Enter, three lines in one push → three queued, `ESC [ A`, `ESC O P`, `0x04`, `0x03` dropped
+- [x] `shelve` hides `pending`; `push` while shelved edits a fresh buffer the caller reads; `unshelve` restores the original verbatim
+- [x] `row(width)` never exceeds `width-1` columns on the defused string; CJK tail case
+- [x] Mutation "Backspace pops a byte, not a char" applied, observed red on the `é`/CJK rows, reverted, recorded
+- [x] clippy `-D warnings`, fmt clean, no `#[allow]`
 
 ## Verification
 

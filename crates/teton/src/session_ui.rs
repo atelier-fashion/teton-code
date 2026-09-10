@@ -379,6 +379,24 @@ pub struct SessionState {
     /// it reads — a flag two places could clear would be a refresh that stopped
     /// happening the first time one of them ran.
     skills_stale: bool,
+    /// What the user is typing during a turn, and what they have submitted
+    /// while one runs (REQ-622 ADR-622-2).
+    ///
+    /// Beside [`Self::activity`] because the pump is what feeds it — the tick
+    /// that already asks whether stdin is ready now reads the bytes waiting
+    /// there — and because the row it renders is drawn under the activity row
+    /// by that same owner (ADR-622-4).
+    ///
+    /// **[`SessionState::begin_turn`] does not clear it, and that is the point
+    /// of putting it here rather than on the pump's own state.** A line typed
+    /// during one turn is submitted as the *next* turn's prompt (BR-6), so the
+    /// queue has to be alive at the moment the next turn opens; state cleared
+    /// where a turn begins is state that discards the very lines it exists to
+    /// carry. The three fields `begin_turn` does clear are the turn's own
+    /// record, which must not be lent to the turn about to start — the opposite
+    /// requirement, and the reason the two live in one struct with one sentence
+    /// each about which side of that line they are on.
+    pub input: crate::input_editor::InputEditor,
 }
 
 /// What the session's web capability currently is, for the status row.
@@ -13380,6 +13398,7 @@ mod key_scan {
         ("cost_ui.rs", include_str!("cost_ui.rs")),
         ("effort_ui.rs", include_str!("effort_ui.rs")),
         ("firstrun.rs", include_str!("firstrun.rs")),
+        ("input_editor.rs", include_str!("input_editor.rs")),
         ("keychain.rs", include_str!("keychain.rs")),
         ("loading.rs", include_str!("loading.rs")),
         ("markdown.rs", include_str!("markdown.rs")),
