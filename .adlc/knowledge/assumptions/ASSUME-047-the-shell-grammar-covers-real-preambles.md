@@ -31,3 +31,12 @@ found at verify and written into BR-2: a whole-command grammar short-circuit
 (`>`, `$`, quotes) is `unknown` before any path is examined, and a
 path-qualified verb (`bin/ls`) is deliberately `unknown` (verify H2). The
 rewrite of the toolkit partials to `cat` is the toolkit's follow-up.
+
+## REQ-620 follow-up (2026-09-09)
+
+The gap this assumption left open was measured twice more: every toolkit
+preamble pinned on quoting and redirection (toolkit BUG-220), and a remote
+model's first shell call pinned on `2>&1` (REQ-620's motivation). REQ-620
+closed the redirect and pipeline halves in the grammar; the toolkit rewrote
+its preambles inside it. Status stays `partially-validated`: quoting, globs
+and `~/` paths remain outside the grammar by design.

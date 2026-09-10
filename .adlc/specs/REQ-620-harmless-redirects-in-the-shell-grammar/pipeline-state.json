@@ -2,7 +2,7 @@
   "req": "REQ-620",
   "branch": "feat/REQ-620-harmless-redirects-in-the-shell-grammar",
   "startedAt": "2026-09-09T20:13:59Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -55,6 +56,12 @@
       "phase": 7,
       "name": "PR Cleanup & CI (clean diff; 8 checks green)",
       "completedAt": "2026-09-10T00:32:19Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup (merged d4c5828 via #316; LESSON-658)",
+      "completedAt": "2026-09-10T00:47:37Z",
+      "mergeCommit": "d4c5828"
     }
   ],
   "repos": {
@@ -67,9 +74,10 @@
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/316",
       "prNumber": 316,
       "prCreatedAt": "2026-09-09T20:11:53Z",
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
-      "snapshotPR": null
+      "snapshotPR": null,
+      "mergeCommit": "d4c5828"
     }
   },
   "mergeOrder": [
