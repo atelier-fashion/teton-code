@@ -1,7 +1,7 @@
 ---
 id: REQ-622
 title: "Client-owned input while a turn is working — raw-mode type-ahead the activity row never overwrites, that never answers a question unseen, and a terminal restored on every exit"
-status: draft
+status: approved
 deployable: true
 created: 2026-09-10
 updated: 2026-09-10
