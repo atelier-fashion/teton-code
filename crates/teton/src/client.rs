@@ -15,9 +15,9 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail};
 use serde_json::Value;
@@ -43,6 +43,22 @@ const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const POLL_ATTEMPTS: usize = 50;
 /// Delay between autostart connection attempts.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// One animation frame, and the longest either animating loop waits before it
+/// looks at the world again (REQ-556, REQ-621 ADR-621-1).
+///
+/// Short enough that a lifecycle line lands promptly and an animation reads as
+/// motion; long enough that an idle session is not spinning. It is the frame
+/// interval *and* the wait timeout in both loops that animate — `main.rs`'s
+/// entry loop polls stdin with it, and [`Connection::pump_until_answered`]
+/// waits on this channel with it — so there is one clock, no timer thread and
+/// no `sleep` anywhere in either.
+///
+/// It moved here from `main.rs` when the pump learned to wake: the entry
+/// frame's dots and the turn's activity row are two animations of one session,
+/// and a second constant is how they come to disagree about what a frame is.
+/// The value is unchanged.
+pub(crate) const FRAME_INTERVAL: Duration = Duration::from_millis(120);
 
 /// The rendering + input context threaded through the event pump.
 pub struct UiContext<'a> {
@@ -166,6 +182,157 @@ enum Incoming {
     Lagged(RpcError),
 }
 
+/// What woke the turn pump: something the daemon said, or the clock (REQ-621
+/// ADR-621-1).
+///
+/// The pump's whole difficulty was that it had exactly one of these. A
+/// `session/prompt` blocks on [`Connection::recv`] for the life of the turn, so
+/// during a silent stretch — routing, a provider's queue, a running tool, a
+/// model composing its next step — *nothing runs on the client at all*, and a
+/// user watching an unmoving cursor cannot tell working from hung. A second
+/// reason to wake is the whole mechanism: `Tick` is the client's own clock
+/// arriving, which is the one fact about a turn the daemon cannot report.
+enum Wake {
+    /// The daemon said something.
+    Message(Incoming),
+    /// [`FRAME_INTERVAL`] elapsed with the daemon silent.
+    Tick,
+}
+
+/// The pump's ownership of the one activity row (REQ-621 ADR-621-3).
+///
+/// **Local to a call, never on the state.** The row is drawn, repainted and
+/// withdrawn by exactly one loop — the one that holds the clock — and every
+/// other writer sees it already withdrawn. Held here rather than on
+/// [`SessionState`] so that "is there a row on screen" cannot be read, or
+/// answered, anywhere but the loop that put it there; [`Connection::call`]
+/// owns the value and lends it to the pump, which is what makes BR-12's
+/// close-out reachable from **every** exit path including the pump's own `?`
+/// (ADR-621-4).
+struct RowState {
+    /// Whether this surface can carry a live row at all — the TTY gate,
+    /// [`Surface::has_live_rows`], read **once** per call.
+    ///
+    /// Read once and carried rather than asked at each site, so there is one
+    /// answer per call and one place a mutation of the gate shows up. Answered
+    /// `false` the pump keeps the blocking receive it has always had and this
+    /// row is inert, which is how BR-6's byte-identical piped output holds by
+    /// construction rather than by a conditional at each draw.
+    live: bool,
+    /// Whether the row is on screen right now, one row above the cursor.
+    visible: bool,
+    /// Which animation frame the row is showing. Advanced by a `Tick` only: a
+    /// redraw after a durable line is not an animation step.
+    tick: u64,
+    /// The surface width the row is fitted to, read once per call beside
+    /// [`Self::live`].
+    ///
+    /// A turn is a few seconds and a resize mid-turn is rare; re-reading it per
+    /// frame would be a `TIOCGWINSZ` eight times a second for the whole of
+    /// every turn, and the row is one line whose only failure on a stale width
+    /// is a truncation a character early.
+    width: usize,
+}
+
+impl RowState {
+    /// The row's state at the start of a call: nothing drawn, gate and width
+    /// taken from the surface.
+    fn new(surface: &dyn Surface) -> Self {
+        let live = surface.has_live_rows();
+        Self {
+            live,
+            visible: false,
+            tick: 0,
+            // Asked only when there is a row to fit. The query is an `ioctl` on
+            // `STDOUT_FILENO`, and every non-turn RPC comes through here too —
+            // some thirty of them — with nothing to measure.
+            width: if live {
+                crate::prompt::terminal_width()
+            } else {
+                0
+            },
+        }
+    }
+
+    /// A row over a live surface at a **fixed** width, for a test whose oracle
+    /// is the row's own text (REQ-621 TASK-411).
+    ///
+    /// [`Self::new`] queries `STDOUT_FILENO`, which under `cargo test` is
+    /// whichever terminal the developer happens to be sitting in — a literal
+    /// oracle built on it would be asserting that terminal's truncation, and
+    /// would go red on a narrow one for a reason having nothing to do with the
+    /// pump. The fit itself is `activity.rs`'s to test, and it is tested there.
+    #[cfg(test)]
+    fn at_width(width: usize) -> Self {
+        Self {
+            live: true,
+            visible: false,
+            tick: 0,
+            width,
+        }
+    }
+}
+
+/// Make what is on screen match the frame the projection would draw now
+/// (REQ-621 ADR-621-3).
+///
+/// The row's entire discipline, in one place so the tick arm and the
+/// after-a-message redraw cannot come to disagree:
+///
+/// | frame | on screen | done |
+/// |---|---|---|
+/// | `Some` | nothing | `line` — the row scrolls in beneath whatever was last written |
+/// | `Some` | the row | `repaint_row_above(1, ..)` — in place, so it never accumulates (BR-5) |
+/// | `None` | the row | `withdraw_row_above(1)` — gone without residue, not blanked |
+/// | `None` | nothing | nothing at all |
+///
+/// `repaint_row_above` and `withdraw_row_above` measure from the cursor, and
+/// after `line()` drew the row the cursor is on the row below it — so the row
+/// is always exactly one up while it is visible.
+///
+/// Gated on [`RowState::live`], so a piped surface reaches no verb here at all
+/// (BR-6). Whether there is a row is then the **projection's** decision and
+/// never the method's: a `/cost` pumping through this loop finds the activity
+/// idle and paints nothing (ADR-621-1).
+fn paint_row(row: &mut RowState, ctx: &mut UiContext, now: Instant) {
+    if !row.live {
+        return;
+    }
+    match ctx.state.activity.frame(now, row.tick, row.width) {
+        Some(text) if row.visible => {
+            ctx.surface.repaint_row_above(1, LineKind::Activity, &text);
+        }
+        Some(text) => {
+            ctx.surface.line(LineKind::Activity, &text);
+            row.visible = true;
+        }
+        None if row.visible => {
+            ctx.surface.withdraw_row_above(1);
+            row.visible = false;
+        }
+        None => {}
+    }
+}
+
+/// What one dispatched event did, beyond arriving.
+///
+/// `rendered` was the whole of this and was a bare `bool`; the second field is
+/// what the activity row needs (REQ-621 ADR-621-3). Reported rather than
+/// re-derived: "the phase is `awaiting_permission`" is true of every event that
+/// arrives *while* a question is on screen — a cost row, a lifecycle stage —
+/// so a pump that read the phase instead would restore a question nobody had
+/// answered. Only the arm that actually sent a reply knows.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Dispatched {
+    /// Whether the envelope rendered. An envelope the own-session filter drops
+    /// renders nothing, which is what a caller counting paints is counting.
+    rendered: bool,
+    /// Whether **this** client answered a permission question for it. False on
+    /// the arm that only reports another session's question, which is not ours
+    /// to answer and whose phase we never entered.
+    answered_permission: bool,
+}
+
 /// What one non-blocking drain of the event channel produced (REQ-556 BR-1).
 ///
 /// Deliberately just a count. Lifecycle stages are folded into
@@ -198,6 +365,10 @@ pub struct Connection {
     /// would be a second source of truth for something the daemon states about
     /// itself. `None` until the handshake completes.
     daemon_name: Option<String>,
+    /// The scripted double's hold on the timed receive, and its tally
+    /// (REQ-621 TASK-411). Test-only.
+    #[cfg(test)]
+    timed: TimedReceive,
 }
 
 impl Connection {
@@ -219,6 +390,8 @@ impl Connection {
             writer: stream,
             incoming: rx,
             next_id: 1,
+            #[cfg(test)]
+            timed: TimedReceive::default(),
         })
     }
 
@@ -334,9 +507,46 @@ impl Connection {
         // `?` on the send, on each `recv`, on a result that fails to deserialize,
         // and on a dispatch that could not answer a permission are early returns,
         // and a call written at the bottom of the loop would miss all of them.
-        let outcome = self.pump_until_answered(params, ctx);
+        //
+        // REQ-621 ADR-621-4 hangs the activity row's close-out on this same
+        // branch, and for the same reason: it is the one place that runs on
+        // every way a turn can end. The row's state is **owned here** and lent
+        // to the pump, which is what makes that true of the pump's own early
+        // returns as well — the `?` on the send, on each receive, on a result
+        // that fails to deserialize, on a dispatch that could not answer a
+        // permission, and on the "connection to the daemon closed" a
+        // disconnected channel produces. A `RowState` returned by value would
+        // be lost on all five, and BR-12 is precisely a rule about the paths
+        // nobody anticipated.
+        let mut row = RowState::new(ctx.surface);
+        let outcome = self.pump_until_answered(params, ctx, &mut row);
+        // BR-12, **before either flush and on both branches**. The row's own
+        // visibility is the guard, so this is a no-op wherever there is no row
+        // — which is every non-turn RPC, since only a turn can open the
+        // projection. Unconditional anyway, because the alternative is a
+        // reachability argument ("a non-turn call cannot be in flight during a
+        // turn", true today by this client's synchrony) standing between the
+        // rule and the code, and BR-12 is a rule about the paths nobody
+        // anticipated. ADR-621-4 puts the close-out on the `ENDS_TURN` branch;
+        // the withdraw is hoisted out of it and the summary is not.
+        //
+        // `withdraw_row_above` leaves the cursor on the row it cleared, so
+        // anything either flush still has held lands where the row was rather
+        // than one line below a blank gap — and a turn's scrollback ends up
+        // byte-identical to what it would have been without the row at all
+        // (BR-5). `row` dies at the end of this function, so there is nothing
+        // left to mark as gone.
+        if row.visible {
+            ctx.surface.withdraw_row_above(1);
+        }
         if P::ENDS_TURN {
             ctx.surface.end_block();
+            // BR-16's figures, read from the accumulator the frames read, at
+            // the one seam every exit passes through. `finish` leaves the
+            // activity idle, which is what makes it safe here: a turn that
+            // ended by a path this branch did not expect still reports its own
+            // figures once and lends nothing to the next turn (ADR-621-2).
+            ctx.state.last_turn_summary = Some(ctx.state.activity.finish(Instant::now()));
         } else {
             // A non-turn RPC still pumped events while it waited, so it may well
             // have left a fragment held — nothing may be held across a return
@@ -349,14 +559,54 @@ impl Connection {
     }
 
     /// [`Self::call`]'s body: everything up to the answer, with no flushing.
+    ///
+    /// Also the activity row's one owner while a call is in flight (REQ-621
+    /// ADR-621-3). `row` is lent by [`Self::call`] rather than held here so the
+    /// close-out survives this function's early returns — see the comment on
+    /// that branch.
     fn pump_until_answered<P: RpcMethod>(
         &mut self,
         params: P,
         ctx: &mut UiContext,
+        row: &mut RowState,
     ) -> anyhow::Result<Result<P::Result, RpcError>> {
         let id = self.send(params)?;
         loop {
-            match self.recv()? {
+            // ADR-621-1's gate, and the reason BR-6 holds by construction: with
+            // no live rows this is the blocking receive the pump has always
+            // had, so the piped path never reaches the tick arm below and
+            // cannot emit a byte it did not emit before. Nothing about the
+            // *method* is consulted — a non-turn RPC pumping through here ticks
+            // too, and finds the projection idle with nothing to draw.
+            let wake = if row.live {
+                self.recv_timeout(FRAME_INTERVAL)?
+            } else {
+                Wake::Message(self.recv()?)
+            };
+            let message = match wake {
+                // The daemon said nothing for a frame. Advance the animation
+                // *after* the paint, so a row's first frame is the cycle's
+                // first frame and a redraw between ticks shows the frame the
+                // last tick drew.
+                Wake::Tick => {
+                    paint_row(row, ctx, Instant::now());
+                    row.tick = row.tick.wrapping_add(1);
+                    continue;
+                }
+                Wake::Message(message) => message,
+            };
+            // **Withdraw before anything else writes** — the row's whole
+            // discipline (ADR-621-3), and it is here rather than inside
+            // `dispatch_event` on purpose: the idle drain shares that function
+            // and must never touch a row it does not own. A durable line —
+            // `shell: … [running]`, a notice, a permission question — therefore
+            // always prints where the row was, and the row comes back beneath
+            // it a few lines below.
+            if row.visible {
+                ctx.surface.withdraw_row_above(1);
+                row.visible = false;
+            }
+            match message {
                 Incoming::Response(resp) => {
                     match route_response(&id, &resp.id, resp.error.is_some()) {
                         RespRoute::Match => {
@@ -391,9 +641,35 @@ impl Connection {
                 // Nothing to tear down mid-turn — the entry frame came down
                 // before the prompt was sent — so the render hook is empty here.
                 Incoming::Event(env) => {
-                    self.dispatch_event(&env, ctx, &mut || {})?;
+                    // **Folded before it is rendered** (ADR-621-3). The render
+                    // arms and the row must describe the same moment: a
+                    // `tool_call` that painted its `[running]` line while the
+                    // projection still said `awaiting_model` would put a row
+                    // naming the *previous* phase directly beneath the line
+                    // announcing the new one.
+                    let arrived = Instant::now();
+                    ctx.state.observe_activity(&env, arrived);
+                    let dispatched = self.dispatch_event(&env, ctx, &mut || {})?;
+                    // BR-1: the row stepped aside for the question, and the
+                    // question has been answered — so the phase it interrupted
+                    // comes back. Timed from *now* rather than from `arrived`
+                    // because a permission prompt sits on screen for as long as
+                    // the user takes, and that wait is not the tool running.
+                    //
+                    // Asked of the dispatch rather than derived from the phase:
+                    // an event arriving while the phase is already
+                    // `awaiting_permission` — a cost row, a lifecycle stage —
+                    // would satisfy any phase test and restore a question
+                    // nobody has answered yet.
+                    if dispatched.answered_permission {
+                        ctx.state.activity.permission_answered(Instant::now());
+                    }
+                    paint_row(row, ctx, Instant::now());
                 }
-                Incoming::Lagged(err) => report_lag(&err, ctx.surface),
+                Incoming::Lagged(err) => {
+                    report_lag(&err, ctx.surface);
+                    paint_row(row, ctx, Instant::now());
+                }
             }
         }
     }
@@ -501,12 +777,12 @@ impl Connection {
                     // the caller's frame standing: it painted nothing, so there
                     // is nothing to redraw (REQ-568 AC-8).
                     let is_first = drained.rendered == 0;
-                    let rendered = self.dispatch_event(&env, ctx, &mut || {
+                    let dispatched = self.dispatch_event(&env, ctx, &mut || {
                         if is_first {
                             on_first();
                         }
                     })?;
-                    if rendered {
+                    if dispatched.rendered {
                         drained.rendered += 1;
                     }
                 }
@@ -534,22 +810,24 @@ impl Connection {
     /// `before_render` runs immediately before anything paints, and only if
     /// something is going to — an envelope the filter drops never reaches it.
     /// Returns whether the envelope rendered, so a caller that counts paints
-    /// counts the ones that happened.
+    /// counts the ones that happened, and whether this client answered a
+    /// permission question — see [`Dispatched`].
     fn dispatch_event(
         &mut self,
         env: &teton_protocol::events::EventEnvelope,
         ctx: &mut UiContext,
         before_render: &mut dyn FnMut(),
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<Dispatched> {
         // REQ-568 AC-8: defense in depth atop the daemon-side filter (BR-3),
         // never a substitute for it — the daemon decides who may *see* a
         // session's events, and it is the only place that decision is a control.
         // This drop only keeps a stale or second daemon from painting somebody
         // else's session onto this screen.
         if !should_render(env.session_id.as_ref(), ctx.session_id.as_ref()) {
-            return Ok(false);
+            return Ok(Dispatched::default());
         }
         before_render();
+        let mut answered_permission = false;
         match session_ui::render_event(env, &mut *ctx.surface, &mut *ctx.state) {
             EventOutcome::Rendered => {}
             EventOutcome::Permission(req) if ctx.answer_permissions => {
@@ -596,6 +874,9 @@ impl Connection {
                     ctx.typed_input,
                 );
                 self.send(reply)?;
+                // REQ-621 BR-1: this is the one arm that knows the question is
+                // over, so it is the one arm that says so.
+                answered_permission = true;
             }
             EventOutcome::Permission(req) => {
                 // Not our session to answer — surface it and leave it to the
@@ -684,7 +965,10 @@ impl Connection {
                 );
             }
         }
-        Ok(true)
+        Ok(Dispatched {
+            rendered: true,
+            answered_permission,
+        })
     }
 
     /// Find and answer a proposal that was raised before this client attached.
@@ -803,6 +1087,68 @@ impl Connection {
             .map_err(|_| anyhow!("connection to the daemon closed"))
     }
 
+    /// [`Self::recv`] with a deadline: the next message, or [`Wake::Tick`] when
+    /// `timeout` passed with the daemon silent (REQ-621 ADR-621-1).
+    ///
+    /// **One call, no crate, no second thread, no change to the reader.** The
+    /// channel is a `std::sync::mpsc` receiver and `recv_timeout` is in the
+    /// standard library, so making the *wait* interruptible rather than the read
+    /// is the whole of BR-4's mechanism — the same shape REQ-556 chose for the
+    /// entry loop, which polls stdin with the same interval (ADR-556-1).
+    ///
+    /// A queued message is returned **immediately**: `recv_timeout` consults the
+    /// channel before it consults the clock, so the tick arm adds nothing to the
+    /// latency of receiving or rendering an event (BR-9). There is deliberately
+    /// no `try_recv` ahead of this call — it would be a second read of the same
+    /// fact, and the fast path is already the fast path.
+    ///
+    /// `Disconnected` is mapped to the sentence [`Self::recv`] produces, from
+    /// the same fact: the reader thread is gone. That is what makes BR-12's
+    /// disconnect path fall out of the existing error return rather than needing
+    /// a case of its own — the pump's `?` is the exit, and `call`'s close-out
+    /// runs on it (ADR-621-4).
+    fn recv_timeout(&self, timeout: Duration) -> anyhow::Result<Wake> {
+        // The scripted double's hold — see [`TimedReceive`]. Nothing here in a
+        // non-test build: the field itself does not exist.
+        #[cfg(test)]
+        if let Some(left) = self.timed.owed.get().checked_sub(1) {
+            self.timed.owed.set(left);
+            self.timed.ticks.set(self.timed.ticks.get() + 1);
+            return Ok(Wake::Tick);
+        }
+        match self.incoming.recv_timeout(timeout) {
+            Ok(message) => {
+                // The double's delay is per reply, so the next one is held again.
+                #[cfg(test)]
+                self.timed.owed.set(self.timed.delay_ticks.get());
+                Ok(Wake::Message(message))
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                #[cfg(test)]
+                self.timed.ticks.set(self.timed.ticks.get() + 1);
+                Ok(Wake::Tick)
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(anyhow!("connection to the daemon closed")),
+        }
+    }
+
+    /// Hold every reply this connection answers with for `ticks` frames first
+    /// (REQ-621 TASK-411). Test-only — see [`TimedReceive`].
+    #[cfg(test)]
+    pub(crate) fn delay_replies_by_ticks(&self, ticks: u64) {
+        self.timed.delay_ticks.set(ticks);
+        self.timed.owed.set(ticks);
+    }
+
+    /// How many [`Wake::Tick`]s [`Self::recv_timeout`] has reported.
+    ///
+    /// Zero is the assertion AC-3 rests on: the piped path never entered the
+    /// tick arm, rather than entering it and finding nothing to draw.
+    #[cfg(test)]
+    pub(crate) fn ticks_observed(&self) -> u64 {
+        self.timed.ticks.get()
+    }
+
     /// A `Connection` with no daemon behind it, answering the *n*th request it
     /// is sent with the *n*th scripted result (REQ-582 TASK-169).
     ///
@@ -915,6 +1261,52 @@ pub(crate) fn methods_written(peer: &UnixStream) -> Vec<String> {
         .collect()
 }
 
+/// The scripted connection's control over [`Connection::recv_timeout`]: how
+/// many ticks to make the pump wait for each reply, and how many ticks it has
+/// actually reported (REQ-621 TASK-411).
+///
+/// **Why a seam in the transport rather than a sleeping thread.** BR-1's
+/// contract is an exact sequence — a row drawn, repainted twice, withdrawn —
+/// and the only way to hold a reply for *exactly* three frames is to hold it
+/// deliberately. A test that queued the reply from a thread after
+/// `3 × FRAME_INTERVAL` would assert "about three" and would spend a third of a
+/// second doing it; one that raced the send against the pump's next wait could
+/// tick four times and go red on a busy machine. Held here, the whole thing is
+/// deterministic and costs no wall clock at all.
+///
+/// The tally is not only for the animation tests. AC-3's guarantee is that the
+/// piped path *never enters the tick arm*, and the honest way to assert an arm
+/// was not taken is to count the arm's own entries and find zero — a recording
+/// with no activity row in it would also pass against a pump that woke eight
+/// times a second and simply had nothing to draw.
+///
+/// The same trade the `@delay-ms` script directive makes on the daemon's side
+/// (ADR-621-6): a fixture needs a way to hold a turn open, and inventing a
+/// production delay to make a test possible would be the wrong one.
+///
+/// **It lives down here, not beside [`Connection`], for a reason worth
+/// keeping.** `status::scan::production_sources` truncates each file at its
+/// first *column-zero* `#[cfg(test)]`, so a test-only item declared above the
+/// production code silently shrinks what every source sweep over this file can
+/// see — `only_the_event_pump_declares_a_block_over` counted zero `end_block`
+/// call sites when this sat under the struct, which is the sweep going blind
+/// rather than the rule being broken. Indented `#[cfg(test)]` attributes (the
+/// field on `Connection`, the two accessors, the hold in `recv_timeout`) are
+/// invisible to that search and stay where they belong.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TimedReceive {
+    /// How many ticks to report before *each* reply is handed over. Re-armed
+    /// as each message goes out, so a script of three events with a delay of
+    /// one holds the pump for one frame before each of them — the shape a real
+    /// turn has, rather than one long silence at the front.
+    delay_ticks: std::cell::Cell<u64>,
+    /// How much of the current delay is still owed.
+    owed: std::cell::Cell<u64>,
+    /// Every tick this connection has reported, held or real.
+    ticks: std::cell::Cell<u64>,
+}
+
 /// The socket-pair fixture both test constructors are built on.
 ///
 /// Separate from [`Connection::scripted`] because the event tests in this module
@@ -934,6 +1326,7 @@ fn paired_for_test() -> (Connection, Sender<Incoming>, UnixStream) {
             // daemon version or name to report (REQ-565, REQ-582).
             daemon_version: None,
             daemon_name: None,
+            timed: TimedReceive::default(),
         },
         tx,
         peer,
@@ -1445,7 +1838,7 @@ mod tests {
     use teton_protocol::handshake::HandshakeError;
     use teton_protocol::ProtocolVersion;
 
-    use crate::render::RecordingSurface;
+    use crate::render::{RecordingSurface, Rendered};
 
     /// The rejection a daemon of the given range sends a client of this build —
     /// produced by the protocol's own negotiator rather than hand-built, so the
@@ -2409,9 +2802,13 @@ mod tests {
         // the turn branch: it is the RPC boundary, not the turn boundary, and
         // some thirty of its callers (`/cost`, `/model`, `/config`, the setup
         // flows) are not turns at all.
+        // The anchor gained `&mut row` when the pump took the activity row on
+        // loan from this branch (REQ-621 ADR-621-4). The *region* is what this
+        // sweep asserts, so the anchor moves with the call it names; the
+        // arithmetic above is untouched.
         let call_tail = region(
             &client,
-            "let outcome = self.pump_until_answered(params, ctx);",
+            "let outcome = self.pump_until_answered(params, ctx, &mut row);",
             "fn pump_until_answered<",
         );
         assert!(
@@ -3033,6 +3430,745 @@ mod tests {
 
         // A transport error carries no RpcError at all.
         assert!(!is_shutting_down(&anyhow!("connection reset")));
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-621 ADR-621-1/3/4: the pump wakes, owns the row, closes it out
+    // -----------------------------------------------------------------------
+
+    /// An event envelope deserialized from the daemon's own wire form.
+    ///
+    /// Built by serde from the JSON the bus actually carries rather than as a
+    /// struct literal, so a payload the daemon renamed or stopped sending fails
+    /// here instead of passing against a value no daemon ever emits
+    /// (LESSON-544). The `event` tag is the flattened discriminant the envelope
+    /// documents, which is why these are flat objects.
+    fn wire_event(json: Value) -> Incoming {
+        Incoming::Event(Box::new(
+            serde_json::from_value(json).expect("the protocol's own wire form"),
+        ))
+    }
+
+    /// The `session/prompt` refusal a fixture's daemon answers with.
+    fn turn_refused(id: i64) -> Incoming {
+        Incoming::Response(Response::failure(
+            Id::Number(id),
+            RpcError::new(error_code::INTERNAL_ERROR, "the provider hung up"),
+        ))
+    }
+
+    /// A `UiContext` over `surface` with a turn already open on `state`.
+    ///
+    /// `begin_turn` is the one transition no daemon event announces — the
+    /// prompt going on the wire — and it is what arms the row's clock
+    /// (ADR-621-2). A fixture that skipped it would be testing an idle
+    /// projection, which draws nothing whatever the pump does.
+    macro_rules! turn_ctx {
+        ($surface:ident, $state:ident, $prompter:ident) => {{
+            $state.session_id = Some(teton_protocol::SessionId::from("s1"));
+            $state.begin_turn("why is the build slow?");
+            UiContext {
+                surface: &mut $surface,
+                state: &mut $state,
+                prompter: &mut $prompter,
+                answer_permissions: true,
+                answer_model_proposals: true,
+                auto_accept_model: false,
+                typed_input: true,
+                session_id: Some(teton_protocol::SessionId::from("s1")),
+                skills: crate::slash::SkillSnapshot::empty(),
+            }
+        }};
+    }
+
+    /// **BR-1, both halves.** The row is there through the silent lead-in and
+    /// **gone** for as long as reply text is arriving — the arriving text is the
+    /// liveness signal, and a spinner beneath a streaming answer is a second
+    /// one saying the same thing (BR-10).
+    ///
+    /// Two ticks before each reply, so the second half is a claim and not an
+    /// absence of opportunity: the pump ticks twice *after* the chunk and paints
+    /// nothing either time.
+    ///
+    /// The oracle is a literal sequence of `Rendered` values, spinner glyphs
+    /// and all. Composing the expected rows from `TurnActivity::frame` would
+    /// pass against a pump that drew the wrong verb at the right moment, and
+    /// against a frozen animation (LESSON-569).
+    #[test]
+    fn the_row_is_present_in_a_silent_phase_and_withdrawn_while_streaming() {
+        let (mut conn, tx, _peer) = test_connection();
+        conn.delay_replies_by_ticks(2);
+        tx.send(agent_chunk("the finding is")).expect("queue");
+        tx.send(turn_answered(1)).expect("queue");
+
+        let mut surface = RecordingSurface::with_live_rows();
+        let mut state = SessionState::new();
+        let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+        let mut row = RowState::at_width(80);
+        let mut ctx = turn_ctx!(surface, state, prompter);
+        let answered = conn
+            .pump_until_answered(turn_params(), &mut ctx, &mut row)
+            .expect("the response arrives");
+
+        assert!(answered.is_ok(), "the daemon answered this turn");
+        assert_eq!(
+            surface.calls,
+            vec![
+                Rendered::Line(
+                    LineKind::Activity,
+                    "⠋ preparing turn · 0s · turn 0s".to_owned()
+                ),
+                Rendered::Repaint(
+                    1,
+                    LineKind::Activity,
+                    "⠙ preparing turn · 0s · turn 0s".to_owned()
+                ),
+                Rendered::Withdraw(1),
+                Rendered::Fragment("the finding is".to_owned()),
+            ]
+        );
+        assert!(!row.visible, "the row was withdrawn for the stream");
+        assert_eq!(
+            conn.ticks_observed(),
+            4,
+            "two ticks before each of the two replies"
+        );
+    }
+
+    /// **BR-4.** The row keeps moving while the daemon says nothing at all.
+    ///
+    /// This is the acceptance criterion's own sequence: a reply held for three
+    /// frames records the row being drawn, repainted twice **in place**, and
+    /// then taken back. Before `recv_timeout` the pump sat in
+    /// `mpsc::Receiver::recv()` for the whole of a turn, so nothing ran on the
+    /// client during a silent stretch and the row could not have moved at all —
+    /// the mutation that matters here is reverting the wake, and it reddens on
+    /// the two repaints.
+    ///
+    /// Repaints rather than lines is the load-bearing half: three `Line`s would
+    /// satisfy "it moved" while leaving three rows in scrollback, which is what
+    /// BR-5 forbids.
+    #[test]
+    fn the_pump_ticks_while_the_daemon_is_silent() {
+        let (mut conn, tx, _peer) = test_connection();
+        conn.delay_replies_by_ticks(3);
+        tx.send(turn_answered(1)).expect("queue");
+
+        let mut surface = RecordingSurface::with_live_rows();
+        let mut state = SessionState::new();
+        let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+        let mut row = RowState::at_width(80);
+        let mut ctx = turn_ctx!(surface, state, prompter);
+        conn.pump_until_answered(turn_params(), &mut ctx, &mut row)
+            .expect("the response arrives")
+            .expect("the daemon answered");
+
+        assert_eq!(
+            surface.calls,
+            vec![
+                Rendered::Line(
+                    LineKind::Activity,
+                    "⠋ preparing turn · 0s · turn 0s".to_owned()
+                ),
+                Rendered::Repaint(
+                    1,
+                    LineKind::Activity,
+                    "⠙ preparing turn · 0s · turn 0s".to_owned()
+                ),
+                Rendered::Repaint(
+                    1,
+                    LineKind::Activity,
+                    "⠹ preparing turn · 0s · turn 0s".to_owned()
+                ),
+                Rendered::Withdraw(1),
+            ]
+        );
+        assert_eq!(conn.ticks_observed(), 3);
+    }
+
+    /// **BR-5 / BR-10.** A durable line prints exactly where the row was, and
+    /// the row comes back beneath it.
+    ///
+    /// The tool's own `[running]` line is the thing that must not be pushed
+    /// around: it belongs in the log, the row does not, and the row is the one
+    /// that moves. `withdraw_row_above` leaves the cursor on the row it
+    /// cleared, so the tool line lands there rather than one line below a blank
+    /// gap — which is why the row is *withdrawn* rather than repainted empty.
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** delete the
+    /// withdraw-before-dispatch block in `pump_until_answered`. This fails on
+    /// the sequence — left
+    ///
+    /// ```text
+    /// [Line(Activity, "⠋ preparing turn · 0s · turn 0s"),
+    ///  Line(Tool, "shell: cargo test [running]"),
+    ///  Repaint(1, Activity, "⠙ running shell: cargo test · 0s · turn 0s"),
+    ///  Repaint(1, Activity, "⠙ running shell: cargo test · 0s · turn 0s")]
+    /// ```
+    ///
+    /// against the sequence below. Every failure the rule exists for is in that
+    /// one line: the row is never taken back, so the `[running]` line scrolls in
+    /// *below* it — one activity row left in scrollback per durable line (BR-5)
+    /// — and the repaint that follows rewrites the **tool's** row instead of the
+    /// row's own, so the line the user needed is overwritten by a spinner
+    /// (BR-10). It also reddened `the_row_is_present_in_a_silent_phase_…` (the
+    /// withdraw lands after the fragment) and `the_pump_ticks_while_…` (no
+    /// withdraw at all): 3 red. `every_ends_turn_exit_withdraws_the_row` stayed
+    /// **green**, correctly — its row is taken back by `call`'s close-out, which
+    /// is the second site and the one BR-12 rests on. Reverted with the same
+    /// targeted edit.
+    #[test]
+    fn a_durable_line_prints_where_the_row_was() {
+        let (mut conn, tx, _peer) = test_connection();
+        conn.delay_replies_by_ticks(1);
+        tx.send(wire_event(serde_json::json!({
+            "session_id": "s1",
+            "seq": 3,
+            "event": "session_update",
+            "update": {
+                "kind": "tool_call",
+                "tool_call_id": "c1",
+                "title": "shell: cargo test",
+                "status": "in_progress",
+            },
+        })))
+        .expect("queue");
+        tx.send(turn_answered(1)).expect("queue");
+
+        let mut surface = RecordingSurface::with_live_rows();
+        let mut state = SessionState::new();
+        let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+        let mut row = RowState::at_width(80);
+        let mut ctx = turn_ctx!(surface, state, prompter);
+        conn.pump_until_answered(turn_params(), &mut ctx, &mut row)
+            .expect("the response arrives")
+            .expect("the daemon answered");
+
+        assert_eq!(
+            surface.calls,
+            vec![
+                Rendered::Line(
+                    LineKind::Activity,
+                    "⠋ preparing turn · 0s · turn 0s".to_owned()
+                ),
+                Rendered::Withdraw(1),
+                Rendered::Line(LineKind::Tool, "shell: cargo test [running]".to_owned()),
+                Rendered::Line(
+                    LineKind::Activity,
+                    "⠙ running shell: cargo test · 0s · turn 0s".to_owned()
+                ),
+                Rendered::Repaint(
+                    1,
+                    LineKind::Activity,
+                    "⠙ running shell: cargo test · 0s · turn 0s".to_owned()
+                ),
+                Rendered::Withdraw(1),
+            ]
+        );
+        assert!(!row.visible);
+    }
+
+    /// **BR-1's permission clause.** The question owns the terminal: the row is
+    /// withdrawn before it prints, is **not on screen** while the user reads
+    /// it, and comes back naming the phase the question interrupted.
+    ///
+    /// The restore is the part that needs a test rather than an argument. The
+    /// phase after a permission answer is not derivable from what arrives next
+    /// — the next event may be minutes away, and a tool that was running is
+    /// still running — so `TurnActivity::permission_answered` remembers it, and
+    /// the pump is the one caller that knows the question is over.
+    #[test]
+    fn a_permission_question_owns_the_terminal_and_the_row_returns_to_its_phase() {
+        let (mut conn, tx, _peer) = test_connection();
+        conn.delay_replies_by_ticks(1);
+        tx.send(wire_event(serde_json::json!({
+            "session_id": "s1",
+            "seq": 4,
+            "event": "session_update",
+            "update": {
+                "kind": "tool_call",
+                "tool_call_id": "c1",
+                "title": "shell: cargo test",
+                "status": "in_progress",
+            },
+        })))
+        .expect("queue");
+        tx.send(permission_envelope("shell")).expect("queue");
+        tx.send(turn_answered(1)).expect("queue");
+
+        let mut surface = RecordingSurface::with_live_rows();
+        let mut state = SessionState::new();
+        let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+        let mut row = RowState::at_width(80);
+        let mut ctx = turn_ctx!(surface, state, prompter);
+        conn.pump_until_answered(turn_params(), &mut ctx, &mut row)
+            .expect("the response arrives")
+            .expect("the daemon answered");
+
+        assert_eq!(
+            ctx.state.activity.phase(),
+            crate::activity::Phase::ToolRunning,
+            "the phase the question interrupted is the phase it came back to"
+        );
+        assert!(!row.visible);
+        assert_eq!(
+            surface.calls,
+            vec![
+                // The silent lead-in.
+                Rendered::Line(
+                    LineKind::Activity,
+                    "⠋ preparing turn · 0s · turn 0s".to_owned()
+                ),
+                // The tool starts: row down, the durable line where it was, row
+                // back beneath it naming the tool.
+                Rendered::Withdraw(1),
+                Rendered::Line(LineKind::Tool, "shell: cargo test [running]".to_owned()),
+                Rendered::Line(
+                    LineKind::Activity,
+                    "⠙ running shell: cargo test · 0s · turn 0s".to_owned()
+                ),
+                Rendered::Repaint(
+                    1,
+                    LineKind::Activity,
+                    "⠙ running shell: cargo test · 0s · turn 0s".to_owned()
+                ),
+                // The question. Nothing of the row is between the withdraw and
+                // the question's own line: the prompt reaches a `Prompter`,
+                // which writes straight to stdout and could not have taken a
+                // row back for itself.
+                Rendered::Withdraw(1),
+                Rendered::Line(
+                    LineKind::Prompt,
+                    "permission requested: shell — run `cargo test`".to_owned()
+                ),
+                // Answered — and the row is back on the **tool**, which is what
+                // the turn is still doing. A phase re-derived from the next
+                // event could not have said so: the next event may be minutes
+                // away, and nothing on the wire announces "the question is
+                // over".
+                Rendered::Line(
+                    LineKind::Activity,
+                    "⠹ running shell: cargo test · 0s · turn 0s".to_owned()
+                ),
+                Rendered::Repaint(
+                    1,
+                    LineKind::Activity,
+                    "⠹ running shell: cargo test · 0s · turn 0s".to_owned()
+                ),
+                // And the response takes it back for good.
+                Rendered::Withdraw(1),
+            ]
+        );
+    }
+
+    /// **BR-4's and BR-6's benign path.** With no live rows the pump keeps the
+    /// blocking receive it has always had, so it **never enters the tick arm**
+    /// — not once, not to find nothing to draw.
+    ///
+    /// The tick counter is what makes that a claim rather than a coincidence. A
+    /// recording with no activity row in it would pass just as happily against
+    /// a pump that woke eight times a second on a piped session; zero ticks is
+    /// the property AC-3 rests on, and it is why the gate is read from the
+    /// surface once, into [`RowState::live`], rather than asked at each draw.
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** force
+    /// `RowState::new`'s gate to `true` (`let live = true;` in place of
+    /// `surface.has_live_rows()`). This is the only test in the suite that
+    /// fails — 1 red of 816 — and it fails naming the whole defect:
+    ///
+    /// ```text
+    /// a piped session emits no row, no repaint and no withdraw:
+    /// [Line(Activity, "⠋ preparing turn · 0s · turn 0s"),
+    ///  Repaint(1, Activity, "⠙ preparing turn · 0s · turn 0s"),
+    ///  Repaint(1, Activity, "⠹ preparing turn · 0s · turn 0s"),
+    ///  Withdraw(1)]
+    /// ```
+    ///
+    /// A whole animation, cursor escapes and all, on a surface that never
+    /// claimed it could take a row back. That it is the *only* red is the
+    /// measure of how little else guards BR-6: `PlainSurface` would have
+    /// swallowed the bytes on its own gate, so every pipe fixture in the e2e
+    /// suites stays green while the pump is doing this. Reverted with the same
+    /// targeted edit.
+    #[test]
+    fn a_plain_surface_never_enters_the_tick_arm() {
+        let (mut conn, tx, _peer) = test_connection();
+        conn.delay_replies_by_ticks(3);
+        tx.send(turn_answered(1)).expect("queue");
+
+        let mut surface = RecordingSurface::new();
+        let mut row = RowState::new(&surface);
+        let mut state = SessionState::new();
+        let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+        let mut ctx = turn_ctx!(surface, state, prompter);
+        conn.pump_until_answered(turn_params(), &mut ctx, &mut row)
+            .expect("the response arrives")
+            .expect("the daemon answered");
+
+        assert!(
+            surface.calls.is_empty(),
+            "a piped session emits no row, no repaint and no withdraw: {:?}",
+            surface.calls
+        );
+        assert_eq!(
+            conn.ticks_observed(),
+            0,
+            "the timed receive was never called, so the tick arm is unreachable"
+        );
+
+        // The gate itself, after the behaviour it decides: the answer comes from
+        // the **surface**, so a recorder that claims live rows arms one and a
+        // recorder that does not, does not.
+        assert!(
+            !row.live,
+            "a recorder that claims no live rows must not arm one"
+        );
+        assert!(
+            RowState::new(&RecordingSurface::with_live_rows()).live,
+            "...and one that claims them must: the gate is the surface's answer, \
+             not a constant"
+        );
+    }
+
+    /// **BR-9.** The tick arm adds nothing to the latency of a message that is
+    /// already queued.
+    ///
+    /// `recv_timeout` consults the channel before it consults the clock, so a
+    /// waiting event is returned on the same call that would otherwise have
+    /// timed out — there is deliberately no `try_recv` ahead of it, which would
+    /// be a second read of the same fact. With both replies pre-filled and no
+    /// delay armed, **every** wake is a message and no frame interval is spent:
+    /// zero ticks, and no row was ever drawn because the pump never had a quiet
+    /// moment to draw one in.
+    #[test]
+    fn the_tick_arm_adds_no_latency_to_a_queued_message() {
+        let (mut conn, tx, _peer) = test_connection();
+        tx.send(agent_chunk("straight through")).expect("queue");
+        tx.send(turn_answered(1)).expect("queue");
+
+        let mut surface = RecordingSurface::with_live_rows();
+        let mut state = SessionState::new();
+        let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+        let mut row = RowState::at_width(80);
+        let mut ctx = turn_ctx!(surface, state, prompter);
+        conn.pump_until_answered(turn_params(), &mut ctx, &mut row)
+            .expect("the response arrives")
+            .expect("the daemon answered");
+
+        assert_eq!(
+            conn.ticks_observed(),
+            0,
+            "a queued message must not wait out a frame interval"
+        );
+        assert_eq!(
+            surface.calls,
+            vec![Rendered::Fragment("straight through".to_owned())]
+        );
+    }
+
+    /// **BR-12.** Every way an `ENDS_TURN` call can return leaves no row and a
+    /// summary to read — a normal result, an `RpcError`, and a daemon that went
+    /// away mid-turn.
+    ///
+    /// The three legs exit through **two different sites**, which is the point.
+    /// A response — success or refusal — is a message, so the pump's
+    /// withdraw-before-dispatch takes the row back on its way out. A dropped
+    /// socket is a `?` out of the middle of the pump, and only `call`'s
+    /// close-out runs on it: the row's state is owned there and lent to the
+    /// pump for exactly that reason (ADR-621-4). Termination therefore depends
+    /// on nothing the daemon sends.
+    ///
+    /// The row's text is left as `_` here and pinned literally in the three
+    /// tests above: this leg is about which verbs ran, and it drives the real
+    /// `call`, whose width comes from the terminal the developer happens to be
+    /// in.
+    #[test]
+    fn every_ends_turn_exit_withdraws_the_row() {
+        for (leg, reply) in [
+            ("a normal result", Some(turn_answered(1))),
+            ("an RpcError", Some(turn_refused(1))),
+            ("a dropped socket", None),
+        ] {
+            let (mut conn, tx, _peer) = test_connection();
+            conn.delay_replies_by_ticks(1);
+            match reply {
+                Some(reply) => tx.send(reply).expect("queue"),
+                // The reader thread is gone: `recv_timeout` reports
+                // `Disconnected`, which is the same sentence `recv` produces.
+                None => drop(tx),
+            }
+
+            let mut surface = RecordingSurface::with_live_rows();
+            let mut state = SessionState::new();
+            let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+            let mut ctx = turn_ctx!(surface, state, prompter);
+            let outcome = conn.call(turn_params(), &mut ctx);
+
+            assert!(
+                matches!(
+                    surface.calls.as_slice(),
+                    [Rendered::Line(LineKind::Activity, _), Rendered::Withdraw(1)]
+                ),
+                "{leg} left a row behind: {:?}",
+                surface.calls
+            );
+            assert!(
+                state.last_turn_summary.is_some(),
+                "{leg} must still report what the turn spent (BR-16)"
+            );
+            assert_eq!(
+                state.activity.phase(),
+                crate::activity::Phase::Idle,
+                "{leg} must leave no turn in flight"
+            );
+            match leg {
+                "a dropped socket" => assert_eq!(
+                    outcome.expect_err("the connection is gone").to_string(),
+                    "connection to the daemon closed",
+                    "the timed receive reports a closed channel in the words \
+                     the blocking one does"
+                ),
+                "a normal result" => assert!(outcome.expect("the response arrives").is_ok()),
+                _ => assert!(outcome.expect("the response arrives").is_err()),
+            }
+        }
+    }
+
+    /// **BR-12's benign path.** A non-turn RPC pumping through the same loop on
+    /// the same terminal draws no row at all.
+    ///
+    /// Whether there is a row is the **projection's** decision, never the
+    /// method's (ADR-621-1): a `/cost`, a `/model`, a `config/get` finds the
+    /// activity idle, and an idle projection has no frame. The pump still ticks
+    /// — the surface has live rows and the clock still runs — which is what
+    /// makes the empty recording a statement about the projection rather than
+    /// about the gate, and it is why there is no `P::ENDS_TURN` test anywhere
+    /// near the draw.
+    ///
+    /// It also pins the other half of the close-out: no summary, because no
+    /// turn ended.
+    #[test]
+    fn a_non_turn_method_never_draws_or_withdraws() {
+        let (mut conn, tx, _peer) = test_connection();
+        conn.delay_replies_by_ticks(2);
+        // A real event, dispatched mid-call, so the message path is exercised
+        // too: it folds into an idle projection and changes nothing.
+        tx.send(lifecycle_envelope(
+            "qwen3-coder-30b-a3b",
+            ModelLifecycleStage::Ready,
+        ))
+        .expect("queue");
+        tx.send(Incoming::Response(Response::failure(
+            Id::Number(1),
+            RpcError::new(error_code::METHOD_NOT_FOUND, "no such method"),
+        )))
+        .expect("queue");
+
+        let mut surface = RecordingSurface::with_live_rows();
+        let mut state = SessionState::new();
+        state.session_id = Some(teton_protocol::SessionId::from("s1"));
+        let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+        let mut ctx = UiContext {
+            surface: &mut surface,
+            state: &mut state,
+            prompter: &mut prompter,
+            answer_permissions: true,
+            answer_model_proposals: true,
+            auto_accept_model: false,
+            typed_input: true,
+            session_id: Some(teton_protocol::SessionId::from("s1")),
+            skills: crate::slash::SkillSnapshot::empty(),
+        };
+        let refused = conn
+            .call(methods::ConfigGetParams::default(), &mut ctx)
+            .expect("the response arrives");
+
+        assert!(refused.is_err(), "this fixture's daemon refuses the read");
+        assert!(
+            !surface.calls.iter().any(|call| matches!(
+                call,
+                Rendered::Line(LineKind::Activity, _)
+                    | Rendered::Repaint(_, LineKind::Activity, _)
+                    | Rendered::Withdraw(_)
+            )),
+            "a non-turn RPC drew or withdrew a row: {:?}",
+            surface.calls
+        );
+        assert!(
+            state.last_turn_summary.is_none(),
+            "no turn ended, so there is nothing to report about one"
+        );
+        assert_eq!(
+            conn.ticks_observed(),
+            4,
+            "the pump did tick — twice before each reply — and found nothing to \
+             draw, which is the projection's decision and not the method's"
+        );
+    }
+
+    /// **AC-5.** Every event the row consumes moves the phase, driven through
+    /// the real pump and the real `dispatch_event`.
+    ///
+    /// The envelopes are deserialized from the wire JSON the daemon's own
+    /// publisher emits, not built as struct literals, so a payload that changed
+    /// shape fails here rather than passing against a value nothing produces
+    /// (LESSON-544). Each step is a whole `pump_until_answered` — the send, the
+    /// receive, the fold, the dispatch, the response — so the *order* the pump
+    /// does those things in is under test too: fold before render, which is what
+    /// keeps the row and the durable line beside it describing one moment.
+    ///
+    /// The permission step asserts the restore rather than the phase, because
+    /// the pump answers the question inside the same step: what the row must do
+    /// is come back to the sentence it left (BR-1), and the phase it left is the
+    /// only thing that says which.
+    #[test]
+    fn phases_follow_events_through_the_real_dispatch() {
+        use crate::activity::Phase;
+
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+        let mut row = RowState::new(&surface);
+        let mut ctx = turn_ctx!(surface, state, prompter);
+
+        assert_eq!(
+            ctx.state.activity.phase(),
+            Phase::Preparing,
+            "the prompt is on the wire and the daemon has not answered yet"
+        );
+
+        let script: Vec<(&str, Value, Phase)> = vec![
+            (
+                "route_decided",
+                serde_json::json!({
+                    "session_id": "s1", "seq": 1, "event": "route_decided",
+                    "provider_id": "anthropic", "model": "claude-opus-5",
+                    "tier": "think", "reason": "fixture",
+                }),
+                Phase::AwaitingModel,
+            ),
+            (
+                // The daemon's own fraction: the phase is `awaiting_model`
+                // making progress, not a phase of its own (BR-3).
+                "prefill_progress",
+                serde_json::json!({
+                    "session_id": "s1", "seq": 2, "event": "prefill_progress",
+                    "tokens_done": 4096, "tokens_total": 32768,
+                    "tokens_per_second": 512.0,
+                }),
+                Phase::AwaitingModel,
+            ),
+            (
+                // Being billed is not a thing the turn is *doing*.
+                "cost_recorded",
+                serde_json::json!({
+                    "session_id": "s1", "seq": 3, "event": "cost_recorded",
+                    "record": {
+                        "session_id": "s1", "provider_id": "anthropic",
+                        "model": "claude-opus-5", "input_tokens": 100,
+                        "output_tokens": 50, "usd_micros": 12_345,
+                    },
+                }),
+                Phase::AwaitingModel,
+            ),
+            (
+                "agent_message_chunk",
+                serde_json::json!({
+                    "session_id": "s1", "seq": 4, "event": "session_update",
+                    "update": { "kind": "agent_message_chunk", "text": "the finding is" },
+                }),
+                Phase::Streaming,
+            ),
+            (
+                "tool_call",
+                serde_json::json!({
+                    "session_id": "s1", "seq": 5, "event": "session_update",
+                    "update": {
+                        "kind": "tool_call", "tool_call_id": "c1",
+                        "title": "shell: cargo test", "status": "in_progress",
+                    },
+                }),
+                Phase::ToolRunning,
+            ),
+            (
+                // A finished tool means the model is composing its next step;
+                // there is no "model request issued" event, and BR-14 needed
+                // none.
+                "tool_call_update",
+                serde_json::json!({
+                    "session_id": "s1", "seq": 6, "event": "session_update",
+                    "update": {
+                        "kind": "tool_call_update", "tool_call_id": "c1",
+                        "status": "completed",
+                    },
+                }),
+                Phase::AwaitingModel,
+            ),
+            (
+                "context_compacted",
+                serde_json::json!({
+                    "session_id": "s1", "seq": 7, "event": "context_compacted",
+                    "kept_bytes": 4096, "dropped_bytes": 2048,
+                    "summarized_bytes": 512, "anchor_bytes": 128,
+                    "dropped_blocks": [], "provider_id": "anthropic",
+                    "fallback": false,
+                }),
+                Phase::Compacting,
+            ),
+            (
+                "turn_queued",
+                serde_json::json!({
+                    "session_id": "s1", "seq": 8, "event": "turn_queued",
+                    "turn_id": "t1", "model_id": "qwen3-coder-30b-a3b",
+                    "waiting_on": "loading",
+                }),
+                Phase::Held,
+            ),
+            (
+                // BR-1: the question owns the terminal, the pump answers it,
+                // and the phase it interrupted comes back.
+                "permission_request",
+                serde_json::json!({
+                    "session_id": "s1", "seq": 9, "event": "permission_request",
+                    "request_id": "r1", "tool_name": "shell",
+                    "options": [{
+                        "option_id": "reject_once", "label": "Reject once",
+                        "kind": "reject_once",
+                    }],
+                }),
+                Phase::Held,
+            ),
+            (
+                // BR-15 / AC-9: another session's event on the daemon-wide bus
+                // changes nothing here.
+                "another session's chunk",
+                serde_json::json!({
+                    "session_id": "s2", "seq": 10, "event": "session_update",
+                    "update": { "kind": "agent_message_chunk", "text": "not ours" },
+                }),
+                Phase::Held,
+            ),
+        ];
+
+        // One connection per step, so each step's reply is request id 1.
+        // Correlation is the connection's own counter, and the permission arm
+        // spends one of its ids answering the question — a fixture that derived
+        // the id from the step index would hand step ten a reply for a request
+        // the pump had not made, and the pump would sit waiting for one that
+        // never comes. The phase lives on the state, which outlives them all.
+        for (what, json, expected) in script {
+            let (mut conn, tx, _peer) = test_connection();
+            tx.send(wire_event(json)).expect("queue");
+            tx.send(turn_answered(1)).expect("queue");
+            conn.pump_until_answered(turn_params(), &mut ctx, &mut row)
+                .expect("the response arrives")
+                .expect("the daemon answered");
+            assert_eq!(
+                ctx.state.activity.phase(),
+                expected,
+                "the phase after {what} came through the pump"
+            );
+        }
     }
 }
 

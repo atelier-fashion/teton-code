@@ -557,6 +557,23 @@ impl SessionState {
         self.activity.begin(now);
     }
 
+    /// Fold one event into the turn's activity (REQ-621 ADR-621-2).
+    ///
+    /// A wrapper of two lines, and it exists for the second argument. Whose
+    /// event this is (BR-15) is answered from [`Self::session_id`], and the
+    /// pump — which has a second copy of the same id on its `UiContext` — must
+    /// not be the place that chooses which copy to read. One state, one
+    /// session, one reading: a caller that picked the other copy on a day the
+    /// two had not yet been set together would fold another session's turn into
+    /// this one's row.
+    ///
+    /// Called by the event pump only, immediately before the event is rendered,
+    /// so the row and the durable lines beside it describe the same moment
+    /// (ADR-621-3).
+    pub(crate) fn observe_activity(&mut self, env: &EventEnvelope, now: Instant) {
+        self.activity.observe(env, self.session_id.as_ref(), now);
+    }
+
     /// Claim a model proposal, returning `true` the first time only.
     ///
     /// A client can meet the same proposal twice — once as a broadcast event and

@@ -34,7 +34,7 @@ use teton_protocol::methods::{
     ModelListParams, ModelListResult, ModelSetParams, ModelStatusParams, ModelStatusResult,
     PrivacyBoundaryConfig, PromptTurnParams, ProviderConfig, RepoContextGenerateMode,
     SessionCreateParams, SessionPermissionsParams, SkillInvocation, SkillsPreflightParams,
-    TierBindingConfig,
+    StopReason, TierBindingConfig,
 };
 use teton_protocol::SessionId;
 use teton_protocol::{
@@ -64,7 +64,10 @@ mod status;
 mod uninstall;
 mod web_setup_ui;
 
-use client::{Connection, UiContext};
+// `FRAME_INTERVAL` lives beside the pump that waits on it (REQ-621
+// ADR-621-1): the entry frame's dots and a turn's activity row are two
+// animations of one session, and one clock is what keeps them one animation.
+use client::{Connection, UiContext, FRAME_INTERVAL};
 use keychain::{Cleanup, Keychain, PriorKey};
 use prompt::{FramedStdinPrompter, Prompter, StdinPrompter};
 use render::{stdout_surface, stdout_surface_with_color, LineKind, PlainSurface, Surface};
@@ -774,15 +777,6 @@ pub(crate) fn run_mirrored_command(
     }
 }
 
-/// How long the interactive entry loop waits on stdin before checking the
-/// daemon's event stream and advancing the loading indicator (REQ-556).
-///
-/// Short enough that a lifecycle line lands promptly and an animation reads as
-/// motion; long enough that an idle session is not spinning. This is the
-/// indicator's frame interval as well as the poll timeout — one clock, so there
-/// is no timer thread and no `sleep` anywhere in the loop.
-const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
-
 /// How many rows above the cursor the indicator's row sits while the entry
 /// frame is open: `[status][top rule][input row ← cursor][bottom rule]`.
 ///
@@ -1057,6 +1051,42 @@ const TIER_WARMING_HEADLINE: &str = "model still loading —";
 /// to read the rest: nothing broke and nothing needs fixing, the session is
 /// simply busy and the prompt can be sent again.
 const SESSION_BUSY_HEADLINE: &str = "session busy —";
+
+/// BR-16's one durable line, composed for whichever arm the turn ended through
+/// (REQ-621 ADR-621-4).
+///
+/// One function rather than a `format!` on each arm, for the reason
+/// [`render_turn_failure`] is one function: the arms *are* the behaviour, and
+/// two compositions of one turn's figures are two lines that can come to
+/// disagree about what it spent — on the surface a user checks *because* they
+/// distrusted what the row showed.
+///
+/// The row is TTY-gated, so this is its only read path off a terminal (BR-6):
+/// a piped verbose session recovers what a turn was doing and for how long,
+/// while a piped quiet session stays byte-identical to today's. The stop reason
+/// rides the same line rather than a second one, so a fixture counting
+/// `turn ended` still counts one per turn.
+///
+/// `None` for a turn there is nothing to say about — no reason and no figures —
+/// so the caller prints nothing rather than an empty row.
+fn turn_end_line(
+    stop_reason: Option<StopReason>,
+    summary: Option<&activity::TurnSummary>,
+) -> Option<String> {
+    let spent = summary.map(session_ui::format_turn_summary);
+    match (stop_reason, spent) {
+        (Some(reason), Some(spent)) => Some(format!("turn ended ({reason:?}) · {spent}")),
+        // The line this replaced, kept for a turn whose close-out left no
+        // summary: the stop reason is what the arm actually knows, and
+        // inventing zeroes would be the row's figures claiming a turn took no
+        // time (BR-3).
+        (Some(reason), None) => Some(format!("turn ended ({reason:?}).")),
+        // The failed arm: `render_turn_failure` has already said what went
+        // wrong, so this adds only the figures.
+        (None, Some(spent)) => Some(spent),
+        (None, None) => None,
+    }
+}
 
 /// Render a `prompt/turn` the daemon answered with an error.
 ///
@@ -1511,10 +1541,17 @@ fn run_session(
                     // `/verbose` governs this line and the routing notices from
                     // one source of truth (D-5); the flag only initialises it.
                     if ctx.state.verbose {
-                        ctx.surface.line(
-                            LineKind::Info,
-                            &format!("turn ended ({:?}).", res.stop_reason),
-                        );
+                        // REQ-621 BR-16. The stop reason the daemon reported,
+                        // and what the turn spent — read from the accumulator
+                        // the activity row read, closed out at the `ENDS_TURN`
+                        // seam inside `call` (ADR-621-4). One line, so a
+                        // fixture counting `turn ended` still counts one turn.
+                        if let Some(line) = turn_end_line(
+                            Some(res.stop_reason),
+                            ctx.state.last_turn_summary.as_ref(),
+                        ) {
+                            ctx.surface.line(LineKind::Info, &line);
+                        }
                     } else {
                         // The streamed response may not end in a newline; a blank
                         // line closes it so the next entry frame starts clean.
@@ -1531,6 +1568,20 @@ fn run_session(
                 }
                 Err(err) => {
                     render_turn_failure(&err, ctx.surface);
+                    // REQ-621 BR-16, the arm the figures matter most on: a turn
+                    // that failed after four minutes in a test suite and a
+                    // frontier call that was already paid for is exactly the
+                    // turn a user wants the numbers from. The close-out ran on
+                    // this path too (ADR-621-4), so the summary is there to
+                    // read. No stop reason — the daemon did not report one, and
+                    // `render_turn_failure` has already said what happened.
+                    if ctx.state.verbose {
+                        if let Some(line) =
+                            turn_end_line(None, ctx.state.last_turn_summary.as_ref())
+                        {
+                            ctx.surface.line(LineKind::Info, &line);
+                        }
+                    }
                 }
             }
         }
@@ -9105,6 +9156,96 @@ mod tests {
             renderers, 2,
             "`origin_label` must have exactly one call site plus its definition \
              — a second renderer is a second answer to what protects the user"
+        );
+    }
+
+    /// **REQ-621 BR-16 / AC-13.** The verbose end-of-turn line prints on
+    /// **both** arms of the turn match, carries the figures the row carried,
+    /// and prints on neither arm outside `/verbose`.
+    ///
+    /// The two arms are the point. A turn that ended by an `RpcError` is
+    /// exactly the turn whose numbers matter most — four minutes in a test
+    /// suite and a frontier call that was already paid for — and it is the arm
+    /// that gets forgotten: `hand_off_after_turn` sits on the `Ok` arm alone,
+    /// which is the shape REQ-592's own comment records finding at review.
+    ///
+    /// Both oracles are literal strings. Composing either from `TurnSummary`'s
+    /// fields would pass against a line that reported zeroes, and reporting
+    /// zeroes is precisely how a second tally fails (LESSON-569).
+    ///
+    /// The region check is the other half: a function two arms *could* call is
+    /// not two arms calling it, and there is no runtime value that says which
+    /// arms of an inline `match` inside `run_session` reached this line.
+    #[test]
+    fn the_verbose_summary_prints_on_both_arms() {
+        use std::time::Duration;
+
+        let summary = crate::activity::TurnSummary {
+            total: Duration::from_secs(10),
+            model: Duration::from_secs(4),
+            tools: Duration::from_secs(5),
+            cost_micros: 12_345,
+        };
+
+        // The `Ok` arm: the daemon's stop reason and what the turn spent, on one
+        // line, so a fixture counting `turn ended` still counts one per turn.
+        assert_eq!(
+            turn_end_line(Some(StopReason::EndTurn), Some(&summary)).as_deref(),
+            Some("turn ended (EndTurn) · turn 10s: model 4s, tools 5s, cost $0.012345")
+        );
+
+        // The `Err` arm: no stop reason to report — `render_turn_failure` has
+        // already said what happened — and deliberately no `turn ended`, which
+        // would double every verbose fixture's count of a marker that means
+        // "a turn completed".
+        let failed =
+            turn_end_line(None, Some(&summary)).expect("a failed turn still spent time and money");
+        assert_eq!(failed, "turn 10s: model 4s, tools 5s, cost $0.012345");
+        assert!(
+            !failed.contains("turn ended"),
+            "a refused turn did not end normally, and the pipe fixtures count \
+             the marker that says one did: {failed}"
+        );
+
+        // A turn with neither reason nor figures says nothing at all, rather
+        // than an empty row or a line of invented zeroes (BR-3).
+        assert_eq!(turn_end_line(None, None), None);
+
+        // And a summary the close-out somehow did not leave still reports what
+        // the arm does know.
+        assert_eq!(
+            turn_end_line(Some(StopReason::Refusal), None).as_deref(),
+            Some("turn ended (Refusal).")
+        );
+
+        // Both arms, gated, at the one seam — a source region, because whether
+        // an arm of an inline `match` reached a line is not a runtime fact.
+        const MAIN_RS: &str = include_str!("main.rs");
+        let production = match MAIN_RS.find("\n#[cfg(test)]\nmod tests {") {
+            Some(at) => &MAIN_RS[..at],
+            None => panic!("main.rs must keep its `#[cfg(test)] mod tests` marker"),
+        };
+        let at = production
+            .find("match conn.call(params, &mut ctx)? {")
+            .expect("the turn match is this loop's shape");
+        let turn_match = &production[at..];
+        let turn_match = &turn_match[..turn_match
+            .find("// Session-end cost summary")
+            .expect("the session-end summary follows the turn loop")];
+        assert_eq!(
+            turn_match.matches("turn_end_line(").count(),
+            2,
+            "BR-16's line belongs on both arms of the turn match — the `Ok` arm \
+             and the `Err` arm — and on no third place; a count of one is the \
+             failed turn silently losing its figures"
+        );
+        assert_eq!(
+            turn_match.matches("ctx.state.verbose").count(),
+            2,
+            "and both are gated on the session's own `/verbose` state, not on \
+             the `--verbose` flag, so one source of truth governs this line and \
+             the routing notices (D-5). Outside verbose nothing prints, which is \
+             what keeps default piped output byte-identical (BR-6)"
         );
     }
 }

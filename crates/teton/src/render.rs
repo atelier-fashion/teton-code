@@ -178,14 +178,13 @@ pub trait Surface {
     /// that is not a terminal — including any future one. A surface with no
     /// cursor has no row to take back, so silence is the correct behaviour
     /// rather than something each implementor must remember to add.
-    // Unused in a non-test build until the event pump calls it, which is the
-    // next task of this requirement (ADR-621-1). Suppressed as an `expect`
-    // rather than an `allow` for the reason written out at
-    // [`PlainSurface::with_markdown`]: an `allow` would go on being correct
-    // once the caller lands and would sit here forever, whereas this attribute
-    // *becomes* the warning the moment the pump calls the verb, and `-D
-    // warnings` makes deleting it a condition of landing that wiring.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the caller is the next task"))]
+    // This carried a `#[cfg_attr(not(test), expect(dead_code, …))]` until the
+    // pump called it, chosen over an `allow` for the reason written out at
+    // [`PlainSurface::with_markdown`]: an `allow` would have gone on being
+    // correct once the caller landed and would have sat here forever, whereas
+    // the `expect` *became* the warning the moment the pump reached the verb,
+    // and `-D warnings` made deleting it a condition of landing that wiring.
+    // The caller is `client.rs`'s turn pump, which owns the row (ADR-621-3).
     fn withdraw_row_above(&mut self, _rows_up: usize) {}
 
     /// Whether this surface can carry a row that is drawn, repainted in place
@@ -204,7 +203,6 @@ pub trait Surface {
     /// **Defaults to `false`.** A surface that has not said it can take a row
     /// back must not be given one, so a new implementor that never names this
     /// method inherits the silent answer rather than the animated one.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the caller is the next task"))]
     fn has_live_rows(&self) -> bool {
         false
     }
@@ -405,10 +403,8 @@ pub struct PlainSurface<W: Write> {
     /// terminal that renders no markdown wants the second without the first,
     /// and deriving one from the other would quietly hand it neither.
     ///
-    /// Read only through [`Surface::has_live_rows`], which nothing outside the
-    /// tests calls yet — see the note on that method for why the suppression is
-    /// an `expect`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the reader is the next task"))]
+    /// Read only through [`Surface::has_live_rows`], whose one production
+    /// caller is the turn pump's TTY gate (REQ-621 ADR-621-1).
     live_rows: bool,
 }
 

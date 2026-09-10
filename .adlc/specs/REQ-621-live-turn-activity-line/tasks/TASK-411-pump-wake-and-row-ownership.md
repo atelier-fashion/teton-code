@@ -1,7 +1,7 @@
 ---
 id: TASK-411
 title: "The pump wakes on a timed receive, owns the row, and closes it at the ENDS_TURN seam"
-status: draft
+status: complete
 parent: REQ-621
 created: 2026-09-10
 updated: 2026-09-10
@@ -28,14 +28,14 @@ Ok and Err when `state.verbose`.
 
 ## Acceptance Criteria
 
-- [ ] With a live-row surface and a scripted connection that answers after three ticks, the recording shows `Line(Activity)` then two `Repaint(1, Activity)` then `Withdraw(1)` before the response is returned
-- [ ] With a plain surface the same script records no `Activity` line, no repaint, no withdraw, and the pump used the blocking receive (assert via a counter on the scripted connection: zero timeouts observed)
-- [ ] An event arriving while the row is visible records `Withdraw(1)`, the event's own line, then a fresh `Line(Activity)`
-- [ ] A permission outcome: withdraw, prompt, answer, then the prior phase is restored and redrawn
-- [ ] Every exit of `call` for an `ENDS_TURN` method — Ok, `RpcError`, and a scripted transport drop — leaves `RowState.visible == false` and `state.last_turn_summary.is_some()`
-- [ ] A non-turn method (`ConfigGetParams`) pumping through a live-row surface never draws a row
-- [ ] The BR-16 line prints only when `state.verbose`, on both Ok and Err arms, and reads the summary from `finish`
-- [ ] `cargo test -p teton` green; clippy and fmt clean
+- [x] With a live-row surface and a scripted connection that answers after three ticks, the recording shows `Line(Activity)` then two `Repaint(1, Activity)` then `Withdraw(1)` before the response is returned
+- [x] With a plain surface the same script records no `Activity` line, no repaint, no withdraw, and the pump used the blocking receive (assert via a counter on the scripted connection: zero timeouts observed)
+- [x] An event arriving while the row is visible records `Withdraw(1)`, the event's own line, then a fresh `Line(Activity)`
+- [x] A permission outcome: withdraw, prompt, answer, then the prior phase is restored and redrawn
+- [x] Every exit of `call` for an `ENDS_TURN` method — Ok, `RpcError`, and a scripted transport drop — leaves `RowState.visible == false` and `state.last_turn_summary.is_some()`
+- [x] A non-turn method (`ConfigGetParams`) pumping through a live-row surface never draws a row
+- [x] The BR-16 line prints only when `state.verbose`, on both Ok and Err arms, and reads the summary from `finish`
+- [x] `cargo test -p teton` green; clippy and fmt clean
 
 ## Verification
 
@@ -50,7 +50,7 @@ Ok and Err when `state.verbose`.
 | BR-10 | test-case | `crates/teton/src/client.rs::tests::a_durable_line_prints_where_the_row_was` | no |
 | BR-12 | test-case | `crates/teton/src/client.rs::tests::every_ends_turn_exit_withdraws_the_row` | no |
 | BR-12 | test-case | `crates/teton/src/client.rs::tests::a_non_turn_method_never_draws_or_withdraws` | yes |
-| BR-14 | structural-check | `crates/teton-protocol/src/lib.rs::tests::protocol_version_is_pinned` (unchanged, asserted green) | no |
+| BR-14 | structural-check | `crates/teton-protocol/src/lib.rs::tests::this_build_advertises_only_the_version_its_types_can_read` (unchanged, asserted green — the row's original name, `protocol_version_is_pinned`, is not a test that exists; this is the pin on the version bound, and no protocol source was touched) | no |
 | BR-16 | test-case | `crates/teton/src/main.rs::tests::the_verbose_summary_prints_on_both_arms` | yes |
 | AC-5 | test-case | `crates/teton/src/client.rs::tests::phases_follow_events_through_the_real_dispatch` | no |
 
