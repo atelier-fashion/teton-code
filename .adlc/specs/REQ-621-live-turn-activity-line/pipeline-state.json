@@ -78,5 +78,14 @@
   "notes": [
     "TASK-413 finding: a line submitted mid-animation leaves the last frame on screen (echoed newline scrolls under the \\x1b[1A bookkeeping); delivery intact (BR-9) but BR-5 residue while typing over the row \u2014 carry to Phase 5.",
     "TASK-414 flake: a_running_tool_shows_its_title_elapsed_and_cost_so_far_beneath_its_running_line failed once in a full pty run (time-derived distinct_clocks>=2 snapshot); carry to Phase 5."
-  ]
+  ],
+  "phase5": {
+    "fixCommits": [
+      "a6f83bd",
+      "89adf90",
+      "84d93f3"
+    ],
+    "stepD": "correctness/security/architecture/test-audit re-run; all closed after one follow-up fix",
+    "pendingUserQuestion": "BR-5/BR-9 while typing and submitting over the animating row: accept the recorded bounded exception (abandon on a submitted line, one frame left in scrollback) or open a BUG for raw-mode input handling"
+  }
 }
