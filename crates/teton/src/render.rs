@@ -2197,9 +2197,21 @@ mod tests {
     /// this case the held-line property of `draw_current_row` was pinned only by
     /// a pty leg (`a_reply_streamed_past_a_pending_row_renders_as_it_does_without_one`).
     ///
-    /// Mutation (applied, observed, reverted): `draw_current_row` calling
-    /// `emit_pending()` first reddens this test alone in the unit binary — the
-    /// reply arrives one token per row ahead of each draw.
+    /// Mutation (applied, observed, reverted, 2026-09-11): `self.emit_pending();`
+    /// at the head of each current-row verb in turn, the same edit that was
+    /// measured against the feature branch before this case existed and left
+    /// **0 red of 872** there while reddening 10 of 54 pty legs.
+    ///
+    /// | mutant                              | unit binary      |
+    /// |-------------------------------------|------------------|
+    /// | `draw_current_row` emits first      | **1 red of 874** |
+    /// | `repaint_current_row` emits first   | **1 red of 874** |
+    /// | `withdraw_current_row` emits first  | **1 red of 874** |
+    ///
+    /// This test is the one red every time — the reply arrives one token per
+    /// row ahead of each draw, repaint or clear — and nothing else in the
+    /// binary moves, so the held-line property of all three verbs now rests
+    /// here rather than only on the pty suite. Reverted with the same edit.
     #[test]
     fn a_current_row_holds_what_the_renderer_is_holding() {
         let mut buf: Vec<u8> = Vec::new();
