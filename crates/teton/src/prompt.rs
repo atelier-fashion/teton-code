@@ -1976,6 +1976,22 @@ mod tests {
     /// `sigaction`, so the claim is the kernel's answer and not our own
     /// bookkeeping) and the body, and the body is a negative claim about code
     /// that must *not* be there — hence the source scan.
+    ///
+    /// # What breaks this test (REQ-622 TASK-419)
+    ///
+    /// The mutation below was **applied, rebuilt and observed failing**, not
+    /// reasoned about (LESSON-441, LESSON-568):
+    ///
+    /// | Mutation | Fails |
+    /// |---|---|
+    /// | the `tcsetattr` call is removed from [`restore_and_reraise`] | **4 red of 999** (2026-09-10): this test, on "the handler must put the terminal back", plus the three pty legs that end a session with a signal — `ctrl_c_restores_the_terminal`, `every_exit_restores_the_terminal` (its SIGTERM leg) and `the_key_prompt_survives_ctrl_c_with_echo_on`, each on the flags `stty -a` reads back off their pty. `cli_e2e` stays green, all 97, which is AC-7 arriving as evidence rather than as an argument |
+    ///
+    /// The pair is the point, and it is why the source scan here is not
+    /// redundant with the pty legs. This test fails on the *shape* of the
+    /// handler and would fail on a machine with no pty at all; the pty legs
+    /// fail on what a user's terminal is actually left in. A handler that
+    /// called `tcsetattr` on the wrong descriptor would pass this one and
+    /// redden those, and a suite with no terminal in it would have only this.
     #[test]
     fn the_handler_re_raises_after_restoring() {
         install_restore_handlers();

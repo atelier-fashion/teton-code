@@ -1,7 +1,7 @@
 ---
 id: TASK-419
 title: "PTY legs for type-ahead, questions, every restore path, multi-byte and unhandled keys; pipe fixtures; the retired REQ-621 legs"
-status: draft
+status: complete
 parent: REQ-622
 created: 2026-09-10
 updated: 2026-09-10
@@ -27,10 +27,64 @@ behaviour; retire the abandon unit test to the `Failed` fixture (TASK-417).
 
 ## Acceptance Criteria
 
-- [ ] Every leg polls for state (`wait_for`/`wait_until`), never sleeps; every TTY claim has a pty leg (AC-15)
-- [ ] AC-4/AC-5 compare `icanon`/`echo` from `stty -a` after exit against a capture taken before the session started
-- [ ] Mutation: the handler's restore call removed → `ctrl_c_restores_the_terminal` red (rebuild first); recorded in TASK-416's handler test doc and here
-- [ ] `cargo build -p tetond -p teton` then `cargo test -p teton --test pty_e2e --test cli_e2e` green, twice in a row
+- [x] Every leg polls for state (`wait_for`/`wait_until`), never sleeps; every TTY claim has a pty leg (AC-15)
+- [x] AC-4/AC-5 compare `icanon`/`echo` from `stty -a` after exit against a capture taken before the session started
+- [x] Mutation: the handler's restore call removed → `ctrl_c_restores_the_terminal` red (rebuild first); recorded in TASK-416's handler test doc and here
+- [x] `cargo build -p tetond -p teton` then `cargo test -p teton --test pty_e2e --test cli_e2e` green, twice in a row
+
+## Mutation record
+
+Applied to `crates/teton/src/prompt.rs`, rebuilt, run, and reverted by the same
+targeted edit:
+
+| Mutation | Fails |
+|---|---|
+| the `tcsetattr` call removed from `restore_and_reraise` | **4 red of 999** (2026-09-10): `pty_e2e::ctrl_c_restores_the_terminal`, `pty_e2e::every_exit_restores_the_terminal` (its SIGTERM leg), `pty_e2e::the_key_prompt_survives_ctrl_c_with_echo_on`, and the unit `prompt::tests::the_handler_re_raises_after_restoring`. `cli_e2e` stays green, all 97 |
+
+Only the three legs that end a session with a **signal** redden, which is right:
+the guard's `Drop` covers every other exit, so AC-5's normal, RPC-error,
+disconnect and panic legs stay green under this mutation.
+
+**The first run of this mutation stayed green, and that is the finding.** The
+restore legs spawned the client as the pty's own child, so it was the session
+leader — and a BSD kernel revokes a controlling terminal whose session leader
+exits, handing the device back with the driver's defaults. The readback after
+exit therefore reported `icanon echo` whatever the client had done: an assertion
+that could not fail (LESSON-569). The fix is `pty_e2e`'s `Launch::UnderAShell`,
+which runs the client inside a shell that holds the pty's session open — the
+same shape a user's real terminal has, where the shell owns the session and
+`teton` is a child inside it. The counts above are what the mutation says after
+that fix.
+
+## The two REQ-621 legs: one folded and deleted, one kept and extended
+
+`pty_e2e::typed_bytes_survive_the_animation` is **deleted**. Its subject was
+REQ-621's recorded exception — the abandoned row a submitted line left behind —
+and its half 2 asserted that *no repaint arrives past a submitted line*, which
+is now the wrong claim: the kernel no longer moves the cursor, so the row must
+go on animating. Both halves are folded into
+`a_submitted_line_is_never_overwritten_and_becomes_the_next_prompt`, which makes
+the opposite claim over the same script and adds what the old leg could not ask
+for. **REQ-621's verification table still names it**, so the AC-16 close-out
+task has to mark that row retired.
+
+`pty_e2e::the_row_steps_aside_for_a_permission_prompt_and_returns_after_the_answer`
+is **kept and extended**: its four REQ-621 claims all still hold, and two
+REQ-622 claims are added on the same fixture — the terminal is still raw while
+the question stands (the question reuses the turn's window rather than restoring
+to ask, BR-2), and the answer appears once on the question's own row because the
+client repainted it there with `ECHO` off.
+
+## Defect found, out of scope, filed
+
+A reply **streamed while an unsubmitted pending line is on screen** is broken one
+chunk per row in the durable scrollback (`"One" / "two" / "three"` instead of
+`"One two three"`); with no pending line the same reply renders as one row. Each
+streamed message withdraws the block and redraws it, and `withdraw_row_above`
+leaves the cursor at column 0 of the row it cleared, so a durable fragment does
+not continue on its own row. That is a BR-4 violation in TASK-417's two-row
+block, not in this task's legs; AC-5's ordinary-exit leg was written to read the
+terminal rather than the screen so that it does not depend on it.
 
 ## Verification
 

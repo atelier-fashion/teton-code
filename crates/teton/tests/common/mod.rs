@@ -160,6 +160,193 @@ fn mtime(path: &Path) -> std::io::Result<SystemTime> {
 /// characters is a search for an activity row.
 pub const ACTIVITY_GLYPHS: [char; 11] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '⠿'];
 
+/// Send `sig` to `pid`, reporting whether the kernel accepted it (REQ-622
+/// AC-5).
+///
+/// BR-7 names three signals and two of them cannot be typed: `SIGTERM` is what
+/// a wrapper or an init system sends, and a pty leg has no way to produce one
+/// except by sending it.
+///
+/// `pid` is `kill(2)`'s parameter with `kill(2)`'s meaning, negatives included:
+/// a pty leg's client runs inside a shell's process group (see `pty_e2e`'s
+/// session helper), so `-pgid` is how a signal reaches *the client* rather than
+/// the shell that is holding the terminal open around it — which is also what a
+/// wrapper terminating a foreground job actually does.
+///
+/// The report is returned rather than asserted here: a leg that signalled a
+/// process which had already exited is asking a different question from a leg
+/// whose signal was refused, and only the leg knows which of those it meant.
+pub fn send_signal(pid: libc::pid_t, sig: libc::c_int) -> bool {
+    // SAFETY: `kill` takes two scalars, touches no memory of ours, and reports
+    // failure through its return code, which is what this returns.
+    unsafe { libc::kill(pid, sig) == 0 }
+}
+
+/// The two terminal flags REQ-622 changes, and the only two a leg may compare.
+///
+/// **Not the whole flag word, and not the whole `stty -a` line.** macOS sets the
+/// driver-owned `PENDIN` bit in `c_lflag` when a terminal leaves non-canonical
+/// mode — it means "input is queued for reprocessing", which is exactly what
+/// leaving raw mode arranges — so a session that restored its saved settings
+/// perfectly still reads back a `c_lflag` one bit different from the one it
+/// saved, and an `stty -a` line one token different (`-pendin` becomes
+/// `pendin`). A leg comparing either would be red on macOS for a fact about the
+/// driver rather than about the client.
+///
+/// `ICANON` and `ECHO` are what [`crate::prompt::RawMode`] actually clears
+/// (ADR-622-1 changes those two and `VMIN`/`VTIME`), so they are what BR-7's
+/// "put the terminal back exactly as it found it" is observable as from
+/// outside. The `VMIN`/`VTIME` half is pinned where it is authored, in
+/// `prompt.rs`'s own unit tests, because `stty -a` reports it as `min`/`time`
+/// inside the control-character block and a third field here would be a third
+/// thing to get wrong for no third claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalFlags {
+    /// Canonical mode: the kernel assembles lines and no read returns before a
+    /// newline.
+    pub icanon: bool,
+    /// Echo: the kernel paints every keystroke at the cursor.
+    pub echo: bool,
+}
+
+/// Open a pty's slave side by name, without making it this process's
+/// controlling terminal (REQ-622 AC-4).
+///
+/// Two callers, one reason each, and both are about a descriptor's *lifetime*
+/// rather than about reading anything through it.
+///
+/// [`terminal_flags_on`] needs a fresh one per readback: a `portable_pty` slave
+/// handle stops being a terminal the moment anything has been spawned on it
+/// (the spawn's `pre_exec` closes every descriptor above 2, and the handle the
+/// parent still holds is then a number pointing at whatever was opened next),
+/// so the readback has to reach the device rather than reuse the handle.
+///
+/// A pty leg also has to hold **one** of these open for the length of a
+/// session, because a pty whose last slave descriptor closes is a pty whose
+/// line discipline the kernel is free to reset — and AC-4's whole claim is
+/// about the settings that are still there after the client has exited.
+///
+/// `O_NOCTTY` because a `cargo test` process that happened to be a session
+/// leader without a controlling terminal would otherwise acquire this pty as
+/// one, which is a side effect a test harness has no business having.
+pub fn open_tty(tty: &Path) -> std::fs::File {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(tty)
+        .unwrap_or_else(|e| panic!("open the session's own pty at {}: {e}", tty.display()))
+}
+
+/// Read the terminal settings of the pty at `tty` back by running `stty -a` on
+/// it (REQ-622 AC-4).
+///
+/// **A child process on the same pty, deliberately.** The claim AC-4 makes is
+/// about the state a user's terminal is left in, and the honest instrument for
+/// it is the one a user would reach for: another program, attached to the same
+/// terminal, asked what the settings are. Reading `tcgetattr` on the master
+/// descriptor from inside the test process would be asking the same kernel
+/// object through a different door — true, but it would keep passing if the
+/// client had restored a *copy* rather than the terminal, and it is not what
+/// the AC says.
+///
+/// The child is a plain [`std::process::Command`] with the device as its stdin
+/// rather than a `portable_pty` spawn, and that is not a shortcut. A
+/// `portable_pty` spawn sets the pty as the child's **controlling terminal**,
+/// which — run during a session, which is exactly when the interesting reading
+/// is taken — is a bid to take the terminal away from the client under test.
+/// This one attaches a descriptor and nothing else: no `setsid`, no
+/// `TIOCSCTTY`, no signal-disposition changes, and no bytes written into the
+/// transcript every other assertion in the file reads, because the report comes
+/// back through a pipe instead of through the pty.
+pub fn terminal_flags_on(tty: &Path) -> TerminalFlags {
+    let handle = open_tty(tty);
+    let out = std::process::Command::new("stty")
+        .arg("-a")
+        .stdin(std::process::Stdio::from(handle))
+        .output()
+        .expect("run `stty -a` against the session's own pty");
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "`stty -a` on {} failed ({:?}); it said:\n{text}",
+        tty.display(),
+        out.status
+    );
+    parse_terminal_flags(&text)
+}
+
+/// The `icanon` and `echo` states in one `stty -a` report.
+///
+/// **Token equality, never a substring.** `echo` is a prefix of six other flag
+/// names a terminal reports — `echoe`, `echok`, `echoke`, `echonl`, `echoctl`,
+/// `echoprt` — so a `contains("echo")` is true of every terminal ever made, and
+/// a `contains(" -echo")` is true of one that has `-echoprt` set and `echo`
+/// **on**. That is the failure mode this parser exists to not have: it would
+/// report "echo is off" for a perfectly restored terminal and pass AC-4 only
+/// when AC-4 was violated.
+///
+/// The two layouts are different enough that the parser has to be layout-blind:
+/// BSD `stty` groups the flags into `lflags:`/`iflags:` sections and separates
+/// the control characters with `;`, GNU `stty` prints one long unlabelled run
+/// with `;` after each control character. Splitting on whitespace **and** `;`
+/// and comparing whole tokens reads both without knowing which it has.
+///
+/// Panics when either flag is missing rather than defaulting. A parser that
+/// quietly returned `false` for an absent token would make two runs whose
+/// `stty` never ran at all compare equal — the vacuous pass a normalizing
+/// helper invites (`mask_session_id`'s reason, one file over).
+pub fn parse_terminal_flags(stty: &str) -> TerminalFlags {
+    let mut icanon = None;
+    let mut echo = None;
+    for token in stty.split(|c: char| c.is_whitespace() || c == ';') {
+        match token {
+            "icanon" => icanon = Some(true),
+            "-icanon" => icanon = Some(false),
+            "echo" => echo = Some(true),
+            "-echo" => echo = Some(false),
+            _ => {}
+        }
+    }
+    let (Some(icanon), Some(echo)) = (icanon, echo) else {
+        panic!(
+            "an `stty -a` report names both `icanon` and `echo`, in one polarity \
+             or the other; this one named icanon={icanon:?} echo={echo:?} in:\n{stty}"
+        );
+    };
+    TerminalFlags { icanon, echo }
+}
+
+// ---------------------------------------------------------------------------
+// The keys a pty leg types that are not characters (REQ-622 AC-9, AC-13)
+// ---------------------------------------------------------------------------
+//
+// Written as `&str` rather than `&[u8]` because every one of them is valid
+// UTF-8 and the pty writers in both suites take text — a control byte below
+// 0x80 is its own encoding, and an escape sequence is `ESC` followed by ASCII.
+// Named here rather than inline at each leg so that "an arrow key" is one
+// sequence in one place: a leg that hand-wrote `\x1b[A` and meant `\x1bOA`
+// would be testing a key the decoder handles through a different arm.
+
+/// Ctrl-C — `VINTR`, which the terminal turns into a `SIGINT` because
+/// [`crate::prompt::RawMode`] leaves `ISIG` alone (ADR-622-1, BR-8).
+pub const CTRL_C: &str = "\u{3}";
+/// Ctrl-D — `VEOF`, inert during a turn and end-of-session at a prompt (BR-15).
+pub const CTRL_D: &str = "\u{4}";
+/// The Backspace key, as every terminal this ships to sends it (`DEL`).
+pub const BACKSPACE: &str = "\u{7f}";
+/// The four arrow keys in their `ESC [` (CSI) form — the cursor keys a terminal
+/// sends in its normal mode, consumed as a unit and dropped (BR-9).
+pub const ARROW_UP: &str = "\u{1b}[A";
+pub const ARROW_DOWN: &str = "\u{1b}[B";
+pub const ARROW_RIGHT: &str = "\u{1b}[C";
+pub const ARROW_LEFT: &str = "\u{1b}[D";
+/// `F1`, in its `ESC O` (SS3) form — the other escape shape the decoder knows,
+/// and the reason a leg types a function key as well as an arrow.
+pub const F1: &str = "\u{1b}OP";
+
 /// A pty transcript replayed through a terminal, so a claim about what is
 /// **left on screen** is a claim about the screen and not about the stream
 /// (REQ-621 AC-7).
@@ -348,7 +535,168 @@ impl Screen {
 /// why the erase case has to be here as well.
 #[cfg(test)]
 mod tests {
-    use super::rendered_screen;
+    use super::{parse_terminal_flags, rendered_screen, TerminalFlags};
+
+    /// `stty -a` on a fresh macOS pty in **canonical** mode, captured from a
+    /// real one (Darwin 25.6) and pasted here verbatim.
+    ///
+    /// The whole report and not the `lflags:` line alone, because the parser's
+    /// job is to be layout-blind: the control-character block below carries
+    /// `min` and `time` separated by `;`, and a parser that split on whitespace
+    /// only would read `^C;` as a token.
+    const MACOS_CANONICAL: &str = "speed 9600 baud; 0 rows; 0 columns;\n\
+        lflags: icanon isig iexten echo echoe -echok echoke -echonl echoctl\n\
+        \t-echoprt -altwerase -noflsh -tostop -flusho -pendin -nokerninfo\n\
+        \t-extproc\n\
+        iflags: -istrip icrnl -inlcr -igncr ixon -ixoff ixany imaxbel -iutf8\n\
+        \t-ignbrk brkint -inpck -ignpar -parmrk\n\
+        oflags: opost onlcr -oxtabs -onocr -onlret\n\
+        cflags: cread cs8 -parenb -parodd hupcl -clocal -cstopb -crtscts -dsrflow\n\
+        \t-dtrflow -mdmbuf\n\
+        cchars: discard = ^O; dsusp = ^Y; eof = ^D; eol = <undef>;\n\
+        \teol2 = <undef>; erase = ^?; intr = ^C; kill = ^U; lnext = ^V;\n\
+        \tmin = 1; quit = ^\\; reprint = ^R; start = ^Q; status = ^T;\n\
+        \tstop = ^S; susp = ^Z; time = 0; werase = ^W;\n";
+
+    /// The same terminal with [`crate::prompt::RawMode`] engaged: `-icanon`,
+    /// `-echo`, `min = 0`, `time = 0` — **and `pendin` set**, which is the whole
+    /// reason [`TerminalFlags`] is two fields rather than a flag word.
+    ///
+    /// `pendin` is the driver's, not ours: it says input is queued for
+    /// reprocessing, which is what leaving canonical mode arranges. A leg that
+    /// compared `c_lflag`, or the `lflags:` line, would read this bit as a
+    /// client that failed to restore.
+    const MACOS_RAW: &str = "speed 9600 baud; 0 rows; 0 columns;\n\
+        lflags: -icanon isig iexten -echo echoe -echok echoke -echonl echoctl\n\
+        \t-echoprt -altwerase -noflsh -tostop -flusho pendin -nokerninfo\n\
+        \t-extproc\n\
+        iflags: -istrip icrnl -inlcr -igncr ixon -ixoff ixany imaxbel -iutf8\n\
+        \t-ignbrk brkint -inpck -ignpar -parmrk\n\
+        oflags: opost onlcr -oxtabs -onocr -onlret\n\
+        cflags: cread cs8 -parenb -parodd hupcl -clocal -cstopb -crtscts -dsrflow\n\
+        \t-dtrflow -mdmbuf\n\
+        cchars: discard = ^O; dsusp = ^Y; eof = ^D; eol = <undef>;\n\
+        \teol2 = <undef>; erase = ^?; intr = ^C; kill = ^U; lnext = ^V;\n\
+        \tmin = 0; quit = ^\\; reprint = ^R; start = ^Q; status = ^T;\n\
+        \tstop = ^S; susp = ^Z; time = 0; werase = ^W;\n";
+
+    /// GNU `stty -a`, whose layout shares nothing with the BSD one above: no
+    /// section labels, the control characters first, and the flag names in one
+    /// unlabelled run.
+    ///
+    /// Written out from coreutils' own output shape rather than captured on this
+    /// machine, because this machine is a Mac — and the CI runner that is not is
+    /// exactly the reader this case exists for.
+    const LINUX_CANONICAL: &str = "speed 38400 baud; rows 40; columns 100; line = 0;\n\
+        intr = ^C; quit = ^\\; erase = ^?; kill = ^U; eof = ^D; eol = <undef>;\n\
+        eol2 = <undef>; swtch = <undef>; start = ^Q; stop = ^S; susp = ^Z; rprnt = ^R;\n\
+        werase = ^W; lnext = ^V; discard = ^O; min = 1; time = 0;\n\
+        -parenb -parodd -cmspar cs8 -hupcl -cstopb cread -clocal -crtscts\n\
+        -ignbrk -brkint -ignpar -parmrk -inpck -istrip -inlcr -igncr icrnl ixon -ixoff\n\
+        -iuclc -ixany imaxbel iutf8\n\
+        opost -olcuc -ocrnl onlcr -onocr -onlret -ofill -ofdel nl0 cr0 tab0 bs0 vt0 ff0\n\
+        isig icanon iexten echo echoe echok -echonl -noflsh -xcase -tostop -echoprt\n\
+        echoctl echoke -flusho -extproc\n";
+
+    /// The same GNU report with the mode change applied.
+    const LINUX_RAW: &str = "speed 38400 baud; rows 40; columns 100; line = 0;\n\
+        intr = ^C; quit = ^\\; erase = ^?; kill = ^U; eof = ^D; eol = <undef>;\n\
+        eol2 = <undef>; swtch = <undef>; start = ^Q; stop = ^S; susp = ^Z; rprnt = ^R;\n\
+        werase = ^W; lnext = ^V; discard = ^O; min = 0; time = 0;\n\
+        -parenb -parodd -cmspar cs8 -hupcl -cstopb cread -clocal -crtscts\n\
+        -ignbrk -brkint -ignpar -parmrk -inpck -istrip -inlcr -igncr icrnl ixon -ixoff\n\
+        -iuclc -ixany imaxbel iutf8\n\
+        opost -olcuc -ocrnl onlcr -onocr -onlret -ofill -ofdel nl0 cr0 tab0 bs0 vt0 ff0\n\
+        isig -icanon iexten -echo echoe echok -echonl -noflsh -xcase -tostop -echoprt\n\
+        echoctl echoke -flusho -extproc\n";
+
+    const CANONICAL: TerminalFlags = TerminalFlags {
+        icanon: true,
+        echo: true,
+    };
+    const RAW: TerminalFlags = TerminalFlags {
+        icanon: false,
+        echo: false,
+    };
+
+    /// **REQ-622 AC-4 — the readback parser, against real `stty -a` layouts.**
+    ///
+    /// Both platforms, both modes, as literal oracles: the expectations are
+    /// written out by hand from the reports above and none of them is computed
+    /// by calling anything in this module (LESSON-569). This is the instrument
+    /// AC-4 and AC-5 rest on — a parser that answered "canonical, echoing" for
+    /// every input would green every restore leg in the suite while the client
+    /// left terminals raw — so it is tested against the polarity it has to be
+    /// able to *report*, in both directions, on both layouts.
+    #[test]
+    fn the_stty_parser_reads_both_layouts_in_both_modes() {
+        assert_eq!(parse_terminal_flags(MACOS_CANONICAL), CANONICAL);
+        assert_eq!(parse_terminal_flags(MACOS_RAW), RAW);
+        assert_eq!(parse_terminal_flags(LINUX_CANONICAL), CANONICAL);
+        assert_eq!(parse_terminal_flags(LINUX_RAW), RAW);
+        assert_ne!(
+            parse_terminal_flags(MACOS_CANONICAL),
+            parse_terminal_flags(MACOS_RAW),
+            "a parser that cannot tell the two modes apart cannot fail AC-4"
+        );
+    }
+
+    /// `pendin` moves between the two reports and the comparison does not
+    /// notice — which is the fact the whole helper is shaped around.
+    ///
+    /// macOS sets that bit when a terminal leaves non-canonical mode, so a
+    /// client that restored its saved `termios` byte for byte still reads back
+    /// a `c_lflag` one bit different from the one it saved. The pair below is
+    /// the same terminal before the raw window and after it, differing in
+    /// `pendin` (and in `min`, which the driver also carries) — and AC-4's
+    /// "flags equal" has to be true across it.
+    #[test]
+    fn the_driver_owned_pendin_bit_is_not_part_of_the_comparison() {
+        let restored = MACOS_CANONICAL.replace("-pendin", "pendin");
+        assert!(
+            restored != MACOS_CANONICAL,
+            "the substitution must actually change the report, or this case \
+             compares a string with itself"
+        );
+        assert_eq!(
+            parse_terminal_flags(&restored),
+            parse_terminal_flags(MACOS_CANONICAL),
+            "REQ-622 AC-4 compares `icanon` and `echo`, never the flag word: a \
+             terminal restored on macOS comes back with `pendin` set by the \
+             driver, and a leg that compared everything would be red for a fact \
+             about the kernel"
+        );
+    }
+
+    /// `echo` is a prefix of six other flag names, and the parser must read the
+    /// token rather than the substring.
+    ///
+    /// The trap in both directions, because both are reachable in one real
+    /// report: a terminal with `echo` **on** carries `-echoprt` and `-echonl`
+    /// (so a `contains(" -echo")` says echo is off), and a terminal with `echo`
+    /// **off** carries `echoe`, `echoctl` and `echoke` (so a
+    /// `contains(" echo")` says it is on). Every one of those tokens is in the
+    /// two reports below, arranged so that a substring parser gets the answer
+    /// exactly backwards.
+    #[test]
+    fn the_echo_prefixes_do_not_decide_the_echo_flag() {
+        let on = "lflags: icanon isig echo -echoe -echok -echoke -echonl -echoctl -echoprt";
+        assert_eq!(parse_terminal_flags(on), CANONICAL);
+        let off = "lflags: -icanon isig -echo echoe echok echoke echonl echoctl echoprt";
+        assert_eq!(parse_terminal_flags(off), RAW);
+    }
+
+    /// A report that names neither flag is a failed readback, and it panics.
+    ///
+    /// The alternative — defaulting to `false`, or to the last value seen —
+    /// would make a leg whose `stty` never ran compare its "before" against its
+    /// "after" and find them equal, which is the vacuous pass every normalizing
+    /// helper in this suite is written to refuse.
+    #[test]
+    #[should_panic(expected = "names both `icanon` and `echo`")]
+    fn a_report_missing_a_flag_is_a_failure_and_not_a_default() {
+        parse_terminal_flags("stty: stdin isn't a terminal\n");
+    }
 
     /// Nothing at all, so the "gone" expectations below are comparable.
     fn blank() -> Vec<String> {
