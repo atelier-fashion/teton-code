@@ -4,13 +4,15 @@
   "startedAt": "2026-09-10T19:36:27Z",
   "integrationBranch": "main",
   "completed": false,
-  "currentPhase": 5,
+  "currentPhase": 7,
   "completedPhases": [
     0,
     1,
     2,
     3,
-    4
+    4,
+    5,
+    6
   ],
   "phaseHistory": [
     {
@@ -39,6 +41,16 @@
       "phase": 4,
       "name": "Implement",
       "completedAt": "2026-09-11T00:34:42Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify",
+      "completedAt": "2026-09-11T02:05:06Z"
+    },
+    {
+      "phase": 6,
+      "name": "Create Pull Request",
+      "completedAt": "2026-09-11T02:05:10Z"
     }
   ],
   "repos": {
@@ -87,7 +99,7 @@
     "TASK-420: main::tests::queued_lines_re_enter_ahead_of_the_poll_in_order is order-dependent (process-wide slot, no lock_the_slot) \u2014 Phase 5."
   ],
   "phase5": {
-    "status": "consolidated; fix pass held while peer session local_6dfa7038 edits client.rs/render.rs for the streaming Critical",
+    "status": "complete",
     "findings": [
       "CRITICAL streaming: pending row drawn via line()/withdraw_row_above flushes the held partial reply line -> one chunk per row (BR-4). Fix route (b): block verbs that skip emit_pending and emit no newline (paint current row with cursor at end; clear current row; above-row repaint/withdraw without flush); relax the withdraw debug_assert only on the no-flush path.",
       "MAJOR cursor rests below the block (ADR-622-4 says end of pending row) -> resolved by painting the pending row on the current row",
@@ -102,6 +114,17 @@
       "MINOR add SIGQUIT to the restore set; preserve an inherited SIG_IGN disposition; clamp the prompt.rs test-hook slice; RowState base() helper; bound the main.rs source-order slice; TASK-419 'filed' wording",
       "TESTS: peer's leg a_reply_streamed_past_a_pending_row_renders_as_it_does_without_one (fill its mutation cell); SIGTERM-at-key-prompt leg; resize-with-pending-row leg",
       "FOLLOW-UP: split prompt.rs (terminal_mode.rs) \u2014 not this REQ"
-    ]
+    ],
+    "fixCommits": [
+      "83235fd (peer session, adopted)",
+      "a53e9a6",
+      "2c860a4",
+      "b96cefb",
+      "fabb305",
+      "94aa2cb",
+      "+fmt"
+    ],
+    "stepD": "correctness/security/architecture/test-audit re-run: all prior findings closed; one new Major (flush on the idle drain) + 3 Minor + 1 Low fixed in fabb305",
+    "userQuestions": "none outstanding: the reflector's two questions were settled by the spec (BR-3 editable => cursor at the end; a recorded exception is what this REQ retires => fix, not ship)"
   }
 }
