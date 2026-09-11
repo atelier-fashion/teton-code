@@ -2871,9 +2871,10 @@ struct RenderedSession {
     session: Box<dyn portable_pty::Child + Send + Sync>,
     transcript: Transcript,
     writer: Box<dyn Write + Send>,
-    /// Held open so the writer and the reader thread keep a live master; never
-    /// read directly.
-    _master: Box<dyn portable_pty::MasterPty + Send>,
+    /// Held open so the writer and the reader thread keep a live master, and
+    /// reached for by [`Self::resize`] — which is the one thing only this side
+    /// of the pty can do (REQ-622 BR-3, OQ-4).
+    master: Box<dyn portable_pty::MasterPty + Send>,
     /// The pty's slave device, so a readback can reach the same terminal after
     /// the client has exited (REQ-622 AC-4).
     tty: PathBuf,
@@ -2901,6 +2902,15 @@ struct RenderedSession {
     /// session it is serving.
     _daemon: TestDaemon,
 }
+
+/// How tall every [`RenderedSession`]'s pty is.
+///
+/// Named because [`RenderedSession::resize`] has to hand the height back
+/// unchanged — a `PtySize` is the whole window and there is no "width only"
+/// `ioctl` — so the two places have to agree, and a leg that varies the width
+/// must not accidentally vary the height as well. Deep enough that nothing
+/// these legs draw scrolls.
+const PTY_ROWS: u16 = 40;
 
 /// The daemon config every typed-turn leg here shares, plus `extra`.
 ///
@@ -3036,7 +3046,7 @@ impl RenderedSession {
 
         let pty = native_pty_system()
             .openpty(PtySize {
-                rows: 40,
+                rows: PTY_ROWS,
                 cols,
                 pixel_width: 0,
                 pixel_height: 0,
@@ -3098,7 +3108,7 @@ impl RenderedSession {
             session,
             transcript,
             writer,
-            _master: pty.master,
+            master: pty.master,
             tty,
             _tty_held: tty_held,
             launch,
@@ -3143,6 +3153,27 @@ impl RenderedSession {
     /// `type_raw("\u{3}")` at a call site is a byte nobody recognises.
     fn press(&mut self, key: &str) {
         self.type_raw(key);
+    }
+
+    /// Drag this session's window to `cols` columns.
+    ///
+    /// `TIOCGWINSZ` on the slave reports the master's size, so this is the same
+    /// fact a user's window manager delivers and the same one
+    /// `prompt::terminal_width()` reads — there is no other way to produce it,
+    /// which is why OQ-4's wiring has a pty leg at all.
+    ///
+    /// The row count is [`PTY_ROWS`] in both directions: what these legs vary is
+    /// the width, and a resize that also changed the height would be two facts
+    /// in one gesture.
+    fn resize(&mut self, cols: u16) {
+        self.master
+            .resize(PtySize {
+                rows: PTY_ROWS,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("resize the pty");
     }
 
     /// This pty's `icanon`/`echo` **right now**, read by a child on the same
@@ -5585,6 +5616,105 @@ fn repaints(transcript: &str) -> Vec<(usize, String)> {
     found
 }
 
+/// The bytes both of the **current** row's fallible verbs open with
+/// (`PlainSurface::repaint_current_row` and `withdraw_current_row`).
+///
+/// No cursor save and no step up, unlike [`REPAINT_OPEN`] and [`WITHDRAW`]:
+/// after `a53e9a6` the pending row *is* the row the cursor is on (ADR-622-4),
+/// so it is erased and rewritten where it stands and the caret ends up at the
+/// end of what the user is typing. A withdraw is exactly this and nothing
+/// after it; a repaint is this and then the row — which is why the legs below
+/// count this pair *followed by a row* rather than counting it alone.
+const WITHDRAW_CURRENT: &str = "\r\x1b[K";
+
+/// The SGR `LineKind::Pending` is drawn in — bold.
+///
+/// Written out here rather than imported, for [`ROW_GLYPHS`]' reason
+/// (LESSON-569). Deliberately **not** the activity row's dim `\x1b[2m`: the
+/// pending row is the user's own sentence and is about to be sent, and the
+/// difference is also what lets [`current_row_paints`] report which of the two
+/// rows a write onto the cursor's row was carrying.
+const PENDING_SGR: &str = "\x1b[1m";
+
+/// The bytes `PlainSurface` puts on the wire for one pending row: the class's
+/// SGR, the row, and the reset.
+fn pending_bytes(row: &str) -> String {
+    format!("{PENDING_SGR}{row}\x1b[0m")
+}
+
+/// Every row written onto the row the cursor is on, as the text a reader would
+/// see there.
+///
+/// The pending row is the current row (ADR-622-4), so its three verbs carry no
+/// offset at all: `repaint_current_row` writes [`WITHDRAW_CURRENT`] and then
+/// the styled row, `withdraw_current_row` writes that pair alone, and
+/// `draw_current_row` writes the row where a withdraw has just left the cursor.
+/// What they share — and what nothing else on this screen has — is an erase at
+/// column 0 with **no cursor-up before it**: `repaint_row_above` opens
+/// `\x1b[s\x1b[{n}A` and `withdraw_row_above` opens `\x1b[{n}A`, so an erase a
+/// cursor-up brought the caret to belongs to a row above and is not one of
+/// these.
+///
+/// A *paint* is such an erase immediately followed by an SGR run, which is what
+/// a styled row opens with and what a bare withdraw is not followed by. The
+/// run's parameters are dropped and the text is read to the next escape, so
+/// what comes back is the row's content.
+///
+/// **Both classes are reported, deliberately.** A leg that only looked for the
+/// pending marker could not see the defect this replaces BUG-225 with: under
+/// the old geometry the intrusion was an activity frame claiming offset 1, and
+/// under this one it is an activity frame painted onto the current row — the
+/// row the user's own characters are on — which carries a dim SGR and a spinner
+/// glyph and would be invisible to a marker search.
+fn current_row_paints(transcript: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(hit) = transcript[from..].find(WITHDRAW_CURRENT) {
+        let erase = from + hit;
+        let after = erase + WITHDRAW_CURRENT.len();
+        from = after;
+        if ends_with_cursor_up(&transcript[..erase]) {
+            continue;
+        }
+        let Some(rest) = transcript[after..].strip_prefix("\x1b[") else {
+            continue;
+        };
+        let Some(final_byte) = rest.find(|c: char| !c.is_ascii_digit() && c != ';') else {
+            continue;
+        };
+        if rest.as_bytes()[final_byte] != b'm' {
+            continue;
+        }
+        let text = &rest[final_byte + 1..];
+        let end = text.find('\x1b').unwrap_or(text.len());
+        found.push(text[..end].to_owned());
+    }
+    found
+}
+
+/// Whether `before` ends in a cursor-up (`\x1b[{n}A`).
+///
+/// [`current_row_paints`]' one discriminator, written as a suffix test rather
+/// than as a scan because that is exactly the question: the erase that follows
+/// is the current row's if and only if nothing moved the caret off it first.
+fn ends_with_cursor_up(before: &str) -> bool {
+    let Some(body) = before.strip_suffix('A') else {
+        return false;
+    };
+    let head = body.trim_end_matches(|c: char| c.is_ascii_digit());
+    head.len() < body.len() && head.ends_with("\x1b[")
+}
+
+/// How many columns `row` occupies on screen, for the width claims.
+///
+/// The pty fixtures below are ASCII, so this is a character count — and it is
+/// written as one rather than reached for out of `input_editor.rs`, whose
+/// `display_width` is the function under test on the other side of the same
+/// claim (LESSON-569).
+fn columns(row: &str) -> usize {
+    row.chars().count()
+}
+
 /// Whether replaying `transcript` leaves a row that is exactly `row`.
 ///
 /// Exact equality, never `contains`: what these legs claim about the pending
@@ -5658,10 +5788,15 @@ const RAW: common::TerminalFlags = common::TerminalFlags {
 ///    [`pending_row`]'s marker plus the typed text — drawn by us, on a row we
 ///    own, with `ECHO` off so the kernel painted nothing.
 /// 2. **The activity row goes on animating above it, and never claims its
-///    line.** Every repaint in the window is read with its *offset*: activity
-///    content two rows above the cursor, the pending line one. That pair is
-///    BUG-225's absence stated positively — an activity row repainting at
-///    offset 1 while a pending row is up is the defect, whatever it wrote.
+///    line.** Read off both families of verb, because the pending row is the
+///    row the caret is on (ADR-622-4, `a53e9a6`): every repaint *above* the
+///    cursor claims exactly one row and carries activity content, and every
+///    paint *onto* the cursor's row carries the user's line and never a spinner
+///    frame. That pair is BUG-225's absence stated positively, and it is
+///    stronger than the offsets this leg asserted before the geometry moved —
+///    which said only that an activity frame was not at offset 1, and had
+///    nothing at all to say about the verb that carries no offset to be wrong
+///    about.
 /// 3. **The typed row is intact at every later frame.** Polled, so the claim is
 ///    made repeatedly across the animation rather than once at the end.
 /// 4. **Enter leaves no residue.** After the turn the replayed screen carries
@@ -5673,6 +5808,15 @@ const RAW: common::TerminalFlags = common::TerminalFlags {
 ///    not just the screen.
 ///
 /// # What breaks this test
+///
+/// The offsets in claim (2) were `2` for the activity row and `1` for the
+/// pending row until `a53e9a6` made the pending row the **current** row: the
+/// block no longer parks the caret on a blank line below itself, so the
+/// activity row is one above the cursor with a pending row and without one, and
+/// the pending row is written where the caret already is. Both halves of the
+/// claim were rewritten for that geometry and neither was weakened — the
+/// activity half now pins the offset rather than merely excluding one value,
+/// and the current-row half is new.
 ///
 /// This leg replaces `typed_bytes_survive_the_animation`, whose half 2 asserted
 /// the **opposite** of claim (2): that not one repaint arrives after a
@@ -5687,7 +5831,7 @@ const RAW: common::TerminalFlags = common::TerminalFlags {
 ///
 /// | Mutation | Fails |
 /// |---|---|
-/// | `RESTORE.clear()` is removed from `RawMode`'s `Drop` (`prompt.rs`) | **9 red of 49** in this file, this leg among them, on claim (5). A slot that is never disarmed leaves `RawMode::is_engaged()` permanently `true`, and `queued_for_entry` reads it to decide whether the entry frame may drain — so the line is taken, echoed, queued, and then never sent. The record in `prompt::tests::both_guards_arm_and_clear_the_restore_slot` names all nine |
+/// | `RESTORE.clear()` is removed from `RawMode`'s `Drop` (`prompt.rs`) | **8 red of 54** in this file, this leg among them, on claim (5), and **4 red of 872** in the unit binary (re-run 2026-09-10 at the verify-fix pass). A slot that is never disarmed leaves `RawMode::is_engaged()` permanently `true`, and `queued_for_entry` reads it to decide whether the entry frame may drain — so the line is taken, echoed, queued, and then never sent. The record in `prompt::tests::both_guards_arm_and_clear_the_restore_slot` names every one of them |
 ///
 /// Claims (1) to (4) all stay green under it, which is the shape worth noting:
 /// everything this leg says about the *screen* is true of a build in which the
@@ -5743,45 +5887,69 @@ fn a_submitted_line_is_never_overwritten_and_becomes_the_next_prompt() {
         session.snapshot()
     );
 
-    // (2), the geometric half. Every repaint since the line was typed, read
-    // with the offset it claimed: this is BUG-225 stated as a property rather
-    // than as a symptom.
+    // (2), the geometric half — two claims, one per row of the block, because
+    // after `a53e9a6` the two rows are written by two different families of
+    // verb. This is BUG-225 stated as a property rather than as a symptom.
     let during = session.snapshot();
     // The window opens at the pending row's **first draw**, not at the moment
-    // the bytes were typed, and the difference is the whole of the offsets
-    // below: before that row exists the activity row is alone and correctly
-    // repaints one row above the cursor, and a window that swallowed those
-    // frames would report the correct behaviour as the defect. (A withdraw
-    // takes both rows down together and the redraw uses `draw_row` for both, so
-    // there is no later stretch inside this window where the activity row is
-    // alone again.)
+    // the bytes were typed: before that row exists there is no current row of
+    // ours at all, and the erases the block wrote earlier are a different
+    // claim's. (A withdraw takes both rows down together and the redraw uses
+    // the draw verbs for both, so there is no later stretch inside this window
+    // where the activity row is alone again.)
     let pending_at = during
         .find(&typed_row)
         .unwrap_or_else(|| panic!("the pending row is not in the transcript:\n{during}"));
-    let block = repaints(&during[pending_at..]);
+    let window = &during[pending_at..];
+    // Above the cursor: every repaint is the activity row's, and claims one.
+    // The pending row is the row the cursor is *on*, so the activity row is the
+    // only row above it and `2` — the offset BUG-225's fix reached for while
+    // the block parked the cursor a line below itself — would now rewrite
+    // whatever the session had printed before the block.
+    let block = repaints(window);
     assert!(
         block.len() >= 2,
         "the block was drawn but barely repainted, so the offsets below are \
          a claim about nothing; transcript:\n{during}"
     );
     for (rows_up, text) in &block {
-        if text.starts_with(PENDING_MARKER) {
-            assert_eq!(
-                *rows_up, 1,
-                "the pending row is the bottom of the block and is always one \
-                 row above the cursor; this repaint claimed {rows_up}: \
-                 {text:?}\ntranscript:\n{during}"
-            );
-        } else {
-            assert_eq!(
-                *rows_up, 2,
-                "an activity frame repainted the row the user's own text is on. \
-                 That is BUG-225 exactly: with a pending row beneath it the \
-                 activity row is *two* above the cursor, and a frame written at \
-                 one lands on the line being typed (BR-3, ADR-622-4); \
-                 {text:?}\ntranscript:\n{during}"
-            );
-        }
+        assert_eq!(
+            *rows_up, 1,
+            "a repaint above the cursor claimed {rows_up} rows. With the \
+             pending row under the caret the activity row is *always* exactly \
+             one above it, so any other offset is a frame written onto a line \
+             the block does not own (BR-3, ADR-622-4); {text:?}\n\
+             transcript:\n{during}"
+        );
+        assert!(
+            !text.starts_with(PENDING_MARKER),
+            "the pending row was repainted a row too high — that erases the \
+             activity row and strands the user's own text where it stood. The \
+             user's line is the current row and is written with no offset at \
+             all (ADR-622-4); {text:?}\ntranscript:\n{during}"
+        );
+    }
+    // On the cursor's own row: the user's line is there, and nothing else ever
+    // is. An activity frame painted here is BUG-225 under the new geometry —
+    // the same intrusion, arriving through the verb that carries no offset to
+    // be wrong about — and it would be invisible to a search for the marker,
+    // which is why [`current_row_paints`] reports both classes.
+    let painted = current_row_paints(window);
+    assert!(
+        painted.iter().any(|row| row == &typed_row),
+        "nothing wrote the user's own line onto the row the cursor is on, so \
+         the claim below is a claim about an empty list (ADR-622-4); paints: \
+         {painted:#?}\ntranscript:\n{during}"
+    );
+    for row in &painted {
+        assert!(
+            !row.chars().any(|c| ROW_GLYPHS.contains(&c)),
+            "an activity frame was painted onto the row the user's own text is \
+             on. That is BUG-225 exactly, in the shape the current-row geometry \
+             leaves it: the activity row belongs one line up and is written with \
+             an offset, and anything written here lands on the line being typed \
+             (BR-3, ADR-622-4); {row:?}\ntranscript:\n{during}"
+        );
     }
 
     // Enter, still inside the turn: nothing is sent now (BR-6).
@@ -5861,11 +6029,32 @@ fn a_submitted_line_is_never_overwritten_and_becomes_the_next_prompt() {
 ///
 /// # What breaks this test
 ///
-/// One mutation was applied and observed red here (2026-09-10):
+/// The mutation below was applied, run and observed red, then reverted
+/// (re-run 2026-09-10):
 ///
 /// | Mutation | Fails |
 /// |---|---|
-/// | `PlainSurface::draw_row` delegates to `self.line(kind, text)` (`render.rs`) — the block's draw flushes held text again | **1 red of 50** in this file, this leg, on claim (1): the screen carries `One`, `two`, `three`, `four`, `five.` as five rows and no row equal to the reply. **1 red of 854** in the unit binary, `render::tests::a_live_row_holds_what_the_renderer_is_holding`. Every other leg stays green, which is the point: no earlier leg streamed a reply past a pending row, and the REQ-621 legs stream theirs past no row at all |
+/// | `PlainSurface::draw_current_row` emits the held text ahead of its own write (`self.emit_pending();` at the head of the method, `render.rs`) — the block's draw flushes what the renderer is holding | **10 red of 54** in this file, this leg among them and on claim (1): the screen carries `One`, `two`, `three`, `four`, `five.` as five rows and no row equal to the reply. **0 red of 872** in the unit binary |
+///
+/// **The recorded mutant moved with the geometry, and that is worth saying
+/// plainly.** The cell here used to name `PlainSurface::draw_row` delegating to
+/// `self.line(kind, text)` — the defect `83235fd` fixed. That mutation is now
+/// **green across this whole file**: after `a53e9a6` the pending row is the
+/// current row and goes up through `draw_current_row`, so `draw_row` is reached
+/// only by the activity row, which is not due while a reply streams. A
+/// mutation record that had been left alone would have gone on claiming
+/// coverage the verb no longer has, which is the failure mode LESSON-441 is
+/// about; it was re-run rather than reasoned about, and the replacement names
+/// the flush directly instead of reaching it through `line`.
+///
+/// Two things about the new cell are deliberately recorded rather than tidied
+/// away. Its blast radius is ten legs and not one, because the current-row draw
+/// is the verb *every* typed-line row goes up through now — but this is still
+/// the only leg that fails on the **held** line specifically, which is the
+/// defect it exists for. And the unit binary stays green, where the old mutant
+/// took `render::tests::a_live_row_holds_what_the_renderer_is_holding` with it:
+/// that case asks the question of `draw_row`, and no unit case yet asks it of
+/// `draw_current_row`. These pty legs are what stands under the claim today.
 #[test]
 fn a_reply_streamed_past_a_pending_row_renders_as_it_does_without_one() {
     const REPLY: &str = "One two three four five.";
@@ -5939,13 +6128,24 @@ fn a_reply_streamed_past_a_pending_row_renders_as_it_does_without_one() {
 
     // Non-vacuity. The pending row's first draw precedes the reply's first byte
     // in the transcript, and between that draw and the reply's *last* token the
-    // block was withdrawn after a draw at least twice: `\n` is how a drawn row
-    // ends and `WITHDRAW` is how the next message takes it back, so the pair is
-    // one cycle of the discipline this leg is about, run while the pending row
-    // was due. (A repaint ends in `\x1b[u`, so it cannot be counted here by
-    // mistake.) The window closes on the last token rather than the first so
-    // that the defect — which puts the first token on screen at once — fails on
-    // claim (1) below, and not on this guard.
+    // row was erased and written again at the caret at least twice — which is
+    // the cycle this leg is about, run while the pending row was due.
+    //
+    // Counted on the current row's bytes rather than on `\n{WITHDRAW}`, because
+    // after `a53e9a6` the pending row is the row the cursor is on: it ends in no
+    // newline and it is taken back with [`WITHDRAW_CURRENT`] and no cursor-up at
+    // all, so the pair the old counter looked for is never written while a
+    // pending row is the bottom of the block. What is counted instead is the
+    // erase *followed by the row itself*, which is stricter than the old count
+    // in two ways: it names the row, so a cycle that redrew something else is
+    // not one, and a bare withdraw with nothing after it is not one either.
+    // (Whether the redraw came through `draw_current_row` after a teardown or
+    // through `repaint_current_row` is not a distinction the byte stream makes
+    // — both are the erase and the row — and it is not one this leg needs: what
+    // the defect turned on is that the block's verbs ran at all while the
+    // renderer was holding a partial line.) The window closes on the last token
+    // rather than the first so that the defect — which puts the first token on
+    // screen at once — fails on claim (1) below, and not on this guard.
     let pending_at = seen
         .find(&typed_row)
         .unwrap_or_else(|| panic!("the pending row is not in the transcript:\n{seen}"));
@@ -5960,13 +6160,12 @@ fn a_reply_streamed_past_a_pending_row_renders_as_it_does_without_one() {
     let reply_done = seen
         .find("five.")
         .unwrap_or_else(|| panic!("the reply's last token is not in the transcript:\n{seen}"));
-    let cycles = seen[pending_at..reply_done]
-        .matches(&format!("\n{WITHDRAW}"))
-        .count();
+    let cycle = format!("{WITHDRAW_CURRENT}{}", pending_bytes(&typed_row));
+    let cycles = seen[pending_at..reply_done].matches(&cycle).count();
     assert!(
         cycles >= 2,
-        "the block was taken down and redrawn {cycles} time(s) while the pending \
-         row was up and the reply streamed; fewer than two means the cycle this \
+        "the pending row was erased and written again at the caret {cycles} \
+         time(s) while the reply streamed; fewer than two means the cycle this \
          leg exists to exercise did not run, or the pending row was not kept up \
          through the stream (BR-3); transcript:\n{seen}"
     );
@@ -6790,6 +6989,159 @@ fn the_key_prompt_survives_ctrl_c_with_echo_on() {
     );
 }
 
+/// **REQ-622 AC-5 + AC-6 / BR-7 — `SIGTERM` at the provider-key prompt leaves
+/// echo on too.**
+///
+/// [`the_key_prompt_survives_ctrl_c_with_echo_on`]'s claim, through the one
+/// door that test cannot reach. AC-6 is about the `EchoOff` guard registering
+/// in the same restore slot `RawMode` uses, and a Ctrl-C proves that for the
+/// path `SIGINT` takes; AC-5 is the rule that the *other* endings restore as
+/// well, and every one of its five legs runs at a **raw-mode turn**. So the
+/// key prompt — the one window in this client where the terminal is echo-off
+/// and still canonical — had exactly one signal asked of it, and the signal a
+/// wrapper or an init system actually sends was not it.
+///
+/// The gap is not hypothetical. `RESTORE_SIGNALS` is a list, the handler is
+/// installed once per guard, and `EchoOff` and `RawMode` are two different
+/// guards registering in one slot: a signal missing from the list, or a guard
+/// that armed the slot without arming the handler, would leave a user who was
+/// `kill`ed at the key prompt with a terminal that takes their password and
+/// shows them nothing — the REQ-572 residual, back through a different door.
+///
+/// Three claims, and the first two are what keep the third from being vacuous:
+///
+/// 1. the prompt really is standing with `ECHO` off and `ICANON` on, read off
+///    the terminal by `stty -a` — so the restore below is a restore of
+///    something (the shape [`every_exit_restores_the_terminal`] keeps for the
+///    same reason);
+/// 2. the client dies **of** the signal — `128 + SIGTERM` — rather than
+///    catching it and exiting with a status of its own, which is what
+///    ADR-622-3's restore-then-re-raise says and what a handler that merely
+///    tidied up would get wrong;
+/// 3. `echo` is back on afterwards, compared against this pty's pre-session
+///    capture rather than against a literal.
+///
+/// A group signal, not a pid one, for [`RenderedSession::client_group`]'s
+/// reason: under [`Launch::UnderAShell`] the pty's child is the shell that has
+/// to survive to hold the session open, and a wrapper terminating a foreground
+/// job signals the job's group anyway.
+///
+/// # What breaks this test
+///
+/// The mutation below was applied, run and observed red (2026-09-10), then
+/// reverted:
+///
+/// | Mutation | Fails |
+/// |---|---|
+/// | `SIGTERM` removed from `RESTORE_SIGNALS` (`prompt.rs`) | **2 red of 54** in this file: this leg on claim (3) — `echo: false` against a baseline of `echo: true` — and `every_exit_restores_the_terminal` on its own SIGTERM leg. Claims (1) and (2) stay green under it, which is the shape worth noting: the default disposition kills the process with the same status, so everything about the *exit* is unchanged and the only thing left broken is the terminal |
+#[test]
+fn sigterm_at_the_key_prompt_leaves_echo_on() {
+    // Not a plausible credential, for the reason its Ctrl-C twin names: nothing
+    // here sends it, and a test that types a realistic secret it does not need
+    // is a test that has to justify where the secret went.
+    const AT_THE_KEY_PROMPT: &str = "not-a-key-witness-5Tm";
+    let mut session = RenderedSession::open_outliving_the_client(
+        100,
+        &["a scripted reply."],
+        &[],
+        &local_tier_config(""),
+    );
+
+    let step = |session: &mut RenderedSession, text: &str, until: &str| {
+        session.type_raw(text);
+        assert!(
+            session.wait_for(until),
+            "the walk never reached {until:?}; transcript:\n{}",
+            session.snapshot()
+        );
+    };
+    // The same walk, and it stops in the same place: `/web setup` to the key
+    // step and no further, because the shipped CLI writes a completed setup to
+    // the real login keychain.
+    step(&mut session, "/web setup\r", "tier [1-3");
+    step(&mut session, "3\r", "search endpoint");
+    step(
+        &mut session,
+        "https://api.search.brave.com/res/v1/web/search\r",
+        "does this backend need an API key?",
+    );
+    const ECHOING_WITNESS: &str = "yes-still-echoing-9Ln";
+    step(
+        &mut session,
+        &format!("{ECHOING_WITNESS}\r"),
+        "auth header template",
+    );
+    step(&mut session, "\r", "API key (not shown");
+
+    // (1) The terminal itself, while the prompt is standing.
+    assert_eq!(
+        session.flags(),
+        common::TerminalFlags {
+            icanon: true,
+            echo: false
+        },
+        "the key step clears `ECHO` and leaves canonical mode alone (REQ-572), \
+         and a signal that arrived with echo already on would restore nothing; \
+         transcript:\n{}",
+        session.snapshot()
+    );
+    session.type_raw(AT_THE_KEY_PROMPT);
+    // Waited on through a state the *other* witness reached, so the silence
+    // below is not "the bytes have not arrived yet".
+    assert!(
+        session.wait_until(|seen| seen.contains(ECHOING_WITNESS)),
+        "the terminal echoed nothing at all in this session, so the key \
+         prompt's silence below would prove nothing; transcript:\n{}",
+        session.snapshot()
+    );
+    assert!(
+        !session.snapshot().contains(AT_THE_KEY_PROMPT),
+        "what was typed at the key prompt reached the screen; transcript:\n{}",
+        session.snapshot()
+    );
+
+    // THE SIGNAL. No keyboard produces this one and no `Drop` sees it.
+    assert!(
+        common::send_signal(session.client_group(), libc::SIGTERM),
+        "the client is running and can be signalled"
+    );
+
+    // (2) Dead of the signal, not of a status it chose.
+    assert_eq!(
+        session.wait_for_client_exit(),
+        Some(143),
+        "a SIGTERM at the key prompt must end the session with the signal's own \
+         status — restore, reset the disposition, re-raise (BR-7, ADR-622-3) — \
+         rather than be caught and turned into an exit code; transcript:\n{}",
+        session.snapshot()
+    );
+
+    // (3) The residual is gone, on the one flag this prompt actually changed.
+    let after = session.flags();
+    assert_eq!(
+        after,
+        session.baseline(),
+        "a SIGTERM at the echo-off key prompt left the terminal as the prompt \
+         had it. `EchoOff` registers in the same restore slot `RawMode` does and \
+         the handler replays from that slot, so every signal on the list puts \
+         this back and not only the one a keyboard can send (AC-5, AC-6, \
+         ADR-622-3); transcript:\n{}",
+        session.snapshot()
+    );
+    assert!(
+        after.echo,
+        "the flag this whole leg is about: a user `kill`ed at a password prompt \
+         must not be left typing into a terminal that shows them nothing \
+         (REQ-572's residual, closed by AC-6)"
+    );
+    assert!(
+        !session.snapshot().contains(AT_THE_KEY_PROMPT),
+        "the interrupted key prompt must not print what was typed into it on \
+         its way out; transcript:\n{}",
+        session.snapshot()
+    );
+}
+
 /// **REQ-622 AC-8 / BR-3 — `é`, CJK and an emoji typed mid-turn are echoed once
 /// each, a Backspace removes one whole character, and what the daemon receives
 /// is byte-identical to what was typed.**
@@ -6821,7 +7173,7 @@ fn the_key_prompt_survives_ctrl_c_with_echo_on() {
 ///
 /// | Mutation | Fails |
 /// |---|---|
-/// | `InputEditor::backspace` pops a **byte** rather than a `char` (`input_editor.rs`) | **1 red of 49** here, on claim (2) (re-run 2026-09-10), and **1 red of 853** in the unit binary (`input_editor::tests::the_keystroke_table`). This leg is the pty half of an AC-10 mutation the editor's module predicted no terminal could see: three bytes of the four-byte emoji stay in the line, which is an unprintable row rather than the clean `U+FFFD` the prediction assumed, so the screen does show it |
+/// | `InputEditor::backspace` pops a **byte** rather than a `char` (`input_editor.rs`) | **1 red of 54** here, on claim (2) (re-run 2026-09-10 at the verify-fix pass), and **1 red of 853** in the unit binary (`input_editor::tests::the_keystroke_table`), recorded at TASK-419 against the binary as it stood then — a byte-popping `backspace` spelled over `as_mut_vec` leaves invalid UTF-8 and *aborts* that binary rather than failing it, so the unit half of this cell is left as it was read rather than restated from a run that cannot report a count. This leg is the pty half of an AC-10 mutation the editor's module predicted no terminal could see: three bytes of the four-byte emoji stay in the line, which is an unprintable row rather than the clean `U+FFFD` the prediction assumed, so the screen does show it |
 ///
 /// Claim (2) is the only one of the three that fails under it — claims (1) and
 /// (3) are about a line nothing has edited — which is why the Backspace is in
@@ -7077,6 +7429,330 @@ fn a_queued_line_is_announced_on_the_row() {
         common::rendered_screen(&seen)
     );
     assert_no_row_on_screen(&seen, "a turn with two lines queued into it");
+}
+
+/// **REQ-622 BR-14 / AC-12 — while the reply streams the count moves onto the
+/// pending row's own marker.**
+///
+/// AC-12's other half, and the half a stream is the only way to reach.
+/// [`a_queued_line_is_announced_on_the_row`] asserts the clause the *activity*
+/// row carries, and the activity row is not due for the whole of
+/// `Phase::Streaming` — a reply arriving is its own liveness signal
+/// (ADR-621-1). So an Enter pressed while the model was writing took the
+/// pending row down, printed nothing (BR-4: a queued line is shown once, in the
+/// frame that sends it), and left the user with exactly the feedback a
+/// *swallowed* keystroke gives. `a53e9a6` closed that with a hint on the
+/// pending row's marker — `[1 queued] > ` — and nothing in the suite looked at
+/// it from a terminal.
+///
+/// **The line is queued before the stream, not during it**, and that is the
+/// fixture rather than a compromise. `@delay-ms` holds a turn open before its
+/// *first* token and there is no per-token delay in the script grammar, so the
+/// stretch between the first token and the last is milliseconds and typing into
+/// it would be a race. Queueing during the hold puts the count on the activity
+/// row first, and then the transition this leg is about happens on its own:
+/// the first token arrives, the activity row leaves, and the count has to land
+/// somewhere. That the count *moves* is a stronger claim than that it appears.
+///
+/// Four claims:
+///
+/// 1. **The activity row carries it while it is up** — `· 1 queued`, the clause
+///    AC-12 already pins, here as the state the transition starts from;
+/// 2. **the pending row carries it once the reply streams** — a paint onto the
+///    row the cursor is on whose text is exactly `[1 queued] > `, with an empty
+///    buffer behind it: the hint alone makes a row, because a queued line is
+///    precisely what *empties* the pending line;
+/// 3. **while no activity row is up.** Between that first paint and the reply
+///    reaching the screen not one activity frame is painted — which is both the
+///    "never both at once" rule (`None` means the activity row is carrying the
+///    count) and the proof that the paint happened *during* the stream rather
+///    than after the turn;
+/// 4. **and it is gone afterwards**, with the queued line sent exactly once as
+///    the next prompt.
+///
+/// # What breaks this test
+///
+/// The mutation below was applied, run and observed red (2026-09-10), then
+/// reverted:
+///
+/// | Mutation | Fails |
+/// |---|---|
+/// | `let queued_hint = (!activity_due).then(|| ctx.state.input.queued_len());` becomes `let queued_hint: Option<usize> = None;` (`client.rs`) | **1 red of 54** in this file, this leg alone, on claim (2): `paints: []` — the count reaches no row at all, which is exactly the state an Enter during a stream used to leave the user in. [`a_queued_line_is_announced_on_the_row`] stays green under it, and that is the point — the clause *it* reads is `TurnActivity::frame`'s and not this hint, so the activity row's half of BR-14 cannot see this half go missing |
+#[test]
+fn the_queued_hint_moves_to_the_pending_row_while_the_reply_streams() {
+    // Multi-token, so the stream is a stretch of pump ticks rather than one,
+    // and held open long enough to type into before any of them.
+    const REPLY: &str = "One two three four five.";
+    // The word `queued` is deliberately in **neither** fixture: claim (4)
+    // asserts that nothing on the final screen says it, and a prompt or a reply
+    // carrying the word would be echoed after the turn and fail its own claim.
+    const QUEUED: &str = "the line typed before the stream";
+    const ANSWER: &str = "The line that waited got its answer.";
+    const HINT_ROW: &str = "[1 queued] > ";
+    let mut session =
+        RenderedSession::open(100, &[&format!("@delay-ms 2500\n{REPLY}"), ANSWER], &[]);
+    session.type_line("hold the turn open");
+    assert!(
+        session.wait_until(|seen| seen.matches(REPAINT_OPEN).count() >= 2),
+        "the row never animated, so the Enter below would not be during the \
+         turn; transcript:\n{}",
+        session.snapshot()
+    );
+
+    // (1) The count starts on the activity row, which is where AC-12 pins it.
+    session.type_raw(&format!("{QUEUED}\r"));
+    assert!(
+        session.wait_until(|seen| activity_rows(seen)
+            .iter()
+            .any(|row| row.ends_with("· 1 queued"))),
+        "no activity row said a line was queued, so there is no count here to \
+         move (BR-14); rows: {:#?}\ntranscript:\n{}",
+        activity_rows(&session.snapshot()),
+        session.snapshot()
+    );
+
+    // (2) And lands on the pending row's marker once the activity row leaves.
+    assert!(
+        session.wait_until(|seen| current_row_paints(seen).iter().any(|row| row == HINT_ROW)),
+        "the count never reached the pending row. `TurnActivity::frame` answers \
+         `None` for the whole of `Phase::Streaming`, so without this the Enter \
+         took the pending row down and said nothing at all — which is exactly \
+         what a swallowed keystroke looks like (BR-14); paints: {:#?}\n\
+         transcript:\n{}",
+        current_row_paints(&session.snapshot()),
+        session.snapshot()
+    );
+    assert!(
+        session.wait_for("five."),
+        "the turn never answered; transcript:\n{}",
+        session.snapshot()
+    );
+
+    // (3) The window between the hint's first paint and the reply reaching the
+    // screen. The reply is held by the renderer until the block gets out of its
+    // way (BR-4, `83235fd`), so it lands at the turn's end — which makes
+    // "before the reply" the same window as "while it was streaming", and makes
+    // the emptiness of `activity_rows` here the two-can-never-both-say-it rule.
+    let streamed = session.snapshot();
+    let hint_at = streamed
+        .find(&pending_bytes(HINT_ROW))
+        .unwrap_or_else(|| panic!("the hint row is not in the transcript:\n{streamed}"));
+    let reply_at = streamed
+        .find(REPLY)
+        .unwrap_or_else(|| panic!("the reply is not in the transcript:\n{streamed}"));
+    assert!(
+        hint_at < reply_at,
+        "the hint row was painted only after the reply had reached the screen, \
+         so nothing here says what the row showed *while* the model was \
+         writing; transcript:\n{streamed}"
+    );
+    let during_the_stream = activity_rows(&streamed[hint_at..reply_at]);
+    assert!(
+        during_the_stream.is_empty(),
+        "an activity row was painted while the pending row was carrying the \
+         count. The pump passes the hint only when the activity row is not due, \
+         so the two can never both say it (BR-14); rows: \
+         {during_the_stream:#?}\ntranscript:\n{streamed}"
+    );
+
+    // (4) Sent, once, and nothing left saying `queued`.
+    assert!(
+        session.wait_for(ANSWER),
+        "the queued line never became the next prompt, or the daemon never \
+         answered it (BR-6); transcript:\n{}",
+        session.snapshot()
+    );
+    assert!(
+        session.wait_until(|seen| seen.ends_with("\x1b[0m ")),
+        "the session never got back to its entry prompt; transcript:\n{}",
+        session.snapshot()
+    );
+    let seen = session.snapshot();
+    assert_eq!(
+        screen_rows_with(&seen, "queued"),
+        0,
+        "the hint is part of a row that is taken back, and by now the line has \
+         been sent (BR-14); screen:\n{:#?}",
+        common::rendered_screen(&seen)
+    );
+    assert_eq!(
+        screen_rows_with(&seen, QUEUED),
+        1,
+        "a queued line is printed in exactly one place — the frame of the \
+         prompt that sends it (BR-4); screen:\n{:#?}",
+        common::rendered_screen(&seen)
+    );
+    assert_no_row_on_screen(&seen, "a turn with a line queued into its stream");
+}
+
+/// **REQ-622 BR-3 / OQ-4 — a window dragged narrower mid-turn re-fits the
+/// pending row, and the turn still ends with nothing on screen.**
+///
+/// The door nobody was watching, found in the verify pass. `PlainSurface` holds
+/// its width as a field and the pump re-measures the terminal only when a row
+/// is about to be **drawn** — so a resize that arrived while the pending row was
+/// already up changed nothing, and the row went on being redrawn at the width
+/// the window used to have. A row wider than the window is hard-wrapped by the
+/// terminal into a *second* line, and `withdraw_current_row` erases one: the
+/// half the client does not know it drew stays on screen for the rest of the
+/// session. `a53e9a6` added the missing clause — the width is re-measured when
+/// the activity row **leaves** while a pending row is up, not only when a row
+/// appears — and nothing outside a real terminal can tell whether it is called.
+///
+/// [`a_resized_window_lays_the_next_turn_out_at_the_new_width`] is OQ-4's other
+/// half and cannot reach this one: it resizes **between** turns and asserts on
+/// the next reply's line breaks, which is the renderer's width and not the
+/// block's, and it types nothing during a turn at all.
+///
+/// **The re-fit is the `tail`, which is what makes it observable.** A pending
+/// row keeps the *end* of what was typed (`InputEditor::row`), so the same
+/// buffer at 100 columns and at 40 is two different rows rather than one row
+/// clipped — and the narrow one is a literal here, checked against the fixture
+/// so neither can drift.
+///
+/// Four claims:
+///
+/// 1. at the wide width the row is the marker plus the whole line, and that row
+///    does not fit the narrow window — the precondition without which the rest
+///    proves nothing;
+/// 2. after the drag the row is painted again as the narrow tail;
+/// 3. **and never again wider than the window.** Every paint onto the cursor's
+///    row from the re-fit onward is inside the new width, which is the residue
+///    claim stated where it is actually observable — `rendered_screen`
+///    deliberately does not wrap (see its doc comment), so a hard-wrapped row is
+///    a thing only the painted width can report;
+/// 4. the turn still ends clean: no row on screen and no trace of a line that
+///    was never submitted (BR-4).
+///
+/// # What breaks this test
+///
+/// The mutation below was applied, run and observed red (2026-09-10), then
+/// reverted:
+///
+/// | Mutation | Fails |
+/// |---|---|
+/// | `\|\| (!self.pending_visible && pending_due)` dropped from the re-measure condition in `paint_rows` (`client.rs`) | **1 red of 54** in this file, this leg alone, on claim (2): every paint after the drag is still the wide row and the narrow tail is never written. Nothing else in the suite resizes a window during a turn, so nothing else notices |
+///
+/// **And one mutation this leg does *not* kill, recorded because it is the one
+/// a reader would expect it to** (LESSON-441). `a53e9a6` added a second
+/// re-measure clause — `|| (self.pending_visible && activity_leaves)`, the
+/// width re-read when the activity row *leaves* while the pending row stays up
+/// — and dropping that clause leaves this leg **green**. The reason is the
+/// stream: the token that ends the activity row is a durable write, so
+/// `withdraw_rows` has already set `pending_visible` false on the very tick the
+/// row leaves, and the re-fit arrives through the *first* clause instead. That
+/// clause is reachable from a pty and is what this leg pins; the other is
+/// pinned where it can be, in `client.rs`'s
+/// `a_pending_row_redrawn_when_the_activity_row_leaves_is_refitted`.
+#[test]
+fn a_resize_reflows_the_pending_row_without_residue() {
+    const WIDE: u16 = 100;
+    const NARROW: u16 = 40;
+    const REPLY: &str = "The turn the window was dragged during.";
+    // Typed and never submitted, so the row is up for the whole turn and the
+    // screen afterwards owes nothing to it.
+    const TYPED: &str = "a partial line long enough to outgrow a much narrower window";
+    // `InputEditor::row` keeps the tail that fits `width - 1` columns after the
+    // two-column marker, so at 40 columns that is the last 37 characters.
+    // Written out rather than computed, and tied to the fixture below so it
+    // cannot drift into asserting about a line nobody typed (LESSON-569).
+    const NARROW_TAIL: &str = "ugh to outgrow a much narrower window";
+    assert!(
+        TYPED.ends_with(NARROW_TAIL) && NARROW_TAIL.len() == NARROW as usize - 3,
+        "the narrow oracle must be the tail of the fixture, at the width the \
+         row is fitted to"
+    );
+
+    let mut session = RenderedSession::open(WIDE, &[&format!("@delay-ms 3000\n{REPLY}")], &[]);
+    session.type_line("hold the window open");
+    assert!(
+        session.wait_until(|seen| seen.matches(REPAINT_OPEN).count() >= 2),
+        "the row never animated, so the typing below would not be during the \
+         turn; transcript:\n{}",
+        session.snapshot()
+    );
+    session.type_raw(TYPED);
+
+    // (1) The wide row, and the reason a narrower window is a problem for it.
+    let wide_row = pending_row(TYPED);
+    assert!(
+        columns(&wide_row) > NARROW as usize,
+        "the fixture row must not fit the narrow window, or nothing here has to \
+         be re-fitted"
+    );
+    assert!(
+        session.wait_until(|seen| current_row_paints(seen).iter().any(|row| row == &wide_row)),
+        "the typed line never appeared on a row of its own at the wide width \
+         (BR-3); paints: {:#?}\ntranscript:\n{}",
+        current_row_paints(&session.snapshot()),
+        session.snapshot()
+    );
+
+    // THE DRAG, with the row already on screen — which is the case the missing
+    // clause could not see.
+    session.resize(NARROW);
+
+    // (2) The row comes back inside the new window. Polled for the state rather
+    // than waited out: the re-measure rides the next moment a row is drawn,
+    // which here is the activity row leaving as the first token arrives.
+    let narrow_row = pending_row(NARROW_TAIL);
+    assert!(
+        session.wait_until(|seen| current_row_paints(seen)
+            .iter()
+            .any(|row| row == &narrow_row)),
+        "the pending row was never re-fitted to the narrower window. It is \
+         redrawn at whatever width the block last measured, and a row wider \
+         than the terminal is hard-wrapped into a second line the withdraw \
+         cannot clear (BR-3); paints: {:#?}\ntranscript:\n{}",
+        current_row_paints(&session.snapshot()),
+        session.snapshot()
+    );
+    assert!(
+        session.wait_for(REPLY),
+        "the held turn never answered; transcript:\n{}",
+        session.snapshot()
+    );
+    assert!(
+        session.wait_until(|seen| seen.ends_with("\x1b[0m ")),
+        "the session never got back to its entry prompt; transcript:\n{}",
+        session.snapshot()
+    );
+    let seen = session.snapshot();
+
+    // (3) Nothing wider than the window from the re-fit onward.
+    let refit_at = seen
+        .find(&pending_bytes(&narrow_row))
+        .unwrap_or_else(|| panic!("the re-fitted row is not in the transcript:\n{seen}"));
+    let after: Vec<String> = current_row_paints(&seen[refit_at..])
+        .into_iter()
+        .filter(|row| row.starts_with(PENDING_MARKER))
+        .collect();
+    assert!(
+        !after.is_empty(),
+        "no pending row was painted after the re-fit, so the width claim below \
+         is a claim about an empty list; transcript:\n{seen}"
+    );
+    for row in &after {
+        assert!(
+            columns(row) <= NARROW as usize,
+            "a pending row {} columns wide was painted into a {NARROW}-column \
+             window after the re-fit. The terminal folds it onto a second line \
+             and `withdraw_current_row` erases one, so that half survives the \
+             turn — the residue `rendered_screen` cannot show, because it \
+             deliberately does not wrap; {row:?}\ntranscript:\n{seen}",
+            columns(row)
+        );
+    }
+
+    // (4) And the turn ends clean.
+    assert_no_row_on_screen(&seen, "a turn whose window was dragged narrower");
+    assert_eq!(
+        screen_rows_with(&seen, NARROW_TAIL),
+        0,
+        "a line that was never submitted is shown nowhere after the turn \
+         (BR-4); screen:\n{:#?}",
+        common::rendered_screen(&seen)
+    );
 }
 
 /// **REQ-622 AC-13 / BR-15 — Ctrl-D during a turn does nothing at all, and

@@ -2045,35 +2045,45 @@ mod tests {
     ///
     /// | Mutation | Fails |
     /// |---|---|
-    /// | `RESTORE.clear()` is removed from `RawMode`'s `Drop` | **2 red of 853** in this binary and **9 red of 49** in `pty_e2e` (re-run 2026-09-10 over the finished suite) |
+    /// | `RESTORE.clear()` is removed from `RawMode`'s `Drop` | **4 red of 872** in this binary and **8 red of 54** in `pty_e2e` (re-run 2026-09-10 at the verify-fix pass) |
     ///
     /// This test is the intended red, on `` `RawMode`'s `Drop` must clear the
     /// slot `` (over a pipe) or on the earlier "dropping it must leave the slot
     /// empty" (on a pty, where the real `engage` arms first) — which assertion
     /// fires depends on what descriptor 0 is, and both are this test's.
     ///
-    /// **The other ten reds are the finding, and they were not in the first
-    /// reading of this mutation.** Recorded at TASK-416 as "this test and
-    /// nothing else, 1 of 835", which was true of a suite in which nothing yet
-    /// read the slot. It is now read for a second purpose: a slot that is never
-    /// disarmed leaves [`RawMode::is_engaged`] permanently `true` for the rest
-    /// of the process, and `main.rs`'s `queued_for_entry` consults it to decide
-    /// whether the entry frame may drain the queue. So every line the editor
-    /// took during a turn is **stranded** — never sent, never shown. That is the
-    /// single cause of all nine pty reds
+    /// **The other reds are the finding, and they were not in the first reading
+    /// of this mutation.** Recorded at TASK-416 as "this test and nothing else,
+    /// 1 of 835", which was true of a suite in which nothing yet read the slot.
+    /// It is now read for a second purpose: a slot that is never disarmed leaves
+    /// [`RawMode::is_engaged`] permanently `true` for the rest of the process,
+    /// and `main.rs`'s `queued_for_entry` consults it to decide whether the
+    /// entry frame may drain the queue. So every line the editor took during a
+    /// turn is **stranded** — never sent, never shown. That is the single cause
+    /// of all eight pty reds
     /// (`a_submitted_line_is_never_overwritten_and_becomes_the_next_prompt`,
     /// `queued_lines_become_the_next_prompts_in_order`,
     /// `a_question_never_eats_type_ahead`, `a_queued_line_is_announced_on_the_row`,
-    /// `a_pasted_block_queues_one_prompt_per_line`, `unhandled_keys_are_inert`,
-    /// `multi_byte_input_round_trips`, and — caught by accident, because their
-    /// second prompt is typed while the first turn is still closing out —
-    /// `a_turn_boundary_closes_an_unclosed_fence_at_a_terminal` and
-    /// `a_resized_window_lays_the_next_turn_out_at_the_new_width`, each on "the
-    /// second turn never produced its reply"), and of the second unit red,
+    /// `the_queued_hint_moves_to_the_pending_row_while_the_reply_streams`,
+    /// `a_pasted_block_queues_one_prompt_per_line`, `unhandled_keys_are_inert`
+    /// and `multi_byte_input_round_trips`), and of the unit red
     /// `main::tests::queued_lines_re_enter_ahead_of_the_poll_in_order`. That one
     /// is **collateral and order-dependent**: it passes when run alone and fails
-    /// in both full-suite runs, because the slot is process-wide and it does not
+    /// in a full-suite run, because the slot is process-wide and it does not
     /// take [`lock_the_slot`]. It is named here rather than counted as evidence.
+    ///
+    /// Two figures moved at the verify-fix pass, and both are recorded rather
+    /// than quietly restated. The unit count went from two to **four** with
+    /// `a53e9a6`'s own slot cases — `the_slot_refuses_a_second_guard_and_only_
+    /// its_owner_clears_it` and `an_engage_against_a_held_slot_fails_rather_
+    /// than_changing_the_terminal` both read the arm this mutation leaves set.
+    /// And the two pty legs this record used to name as *accidental* reds —
+    /// `a_turn_boundary_closes_an_unclosed_fence_at_a_terminal` and
+    /// `a_resized_window_lays_the_next_turn_out_at_the_new_width`, each caught
+    /// because its second prompt is typed while the first turn is still closing
+    /// out — **did not reproduce**. They were timing, as the word "accident"
+    /// said, and they are dropped from the list rather than carried as coverage
+    /// nothing can rely on (LESSON-441).
     ///
     /// The property this test owns is still its own: the bookkeeping is what the
     /// signal handler reads, so a guard that stops disarming leaves the handler

@@ -732,6 +732,45 @@ mod tests {
         );
     }
 
+    /// `\r\x1b[K` — the two sequences the **current** row's verbs are made of
+    /// (REQ-622 ADR-622-4), which is the geometry the pending row moved to in
+    /// `a53e9a6`.
+    ///
+    /// The row the cursor is on is repainted with `\r\x1b[K` and the row, and
+    /// withdrawn with `\r\x1b[K` alone: no cursor-up, and no save/restore pair,
+    /// because the cursor is meant to end up at the end of what the user is
+    /// typing. Both halves were already reachable in this interpreter — `\r`
+    /// moves the cursor to column 0 and mode-0 `\x1b[K` truncates there — and
+    /// neither had a case of its own, so every REQ-622 residue claim rested on
+    /// an interpretation nothing checked.
+    ///
+    /// Four oracles, written out by hand from the ANSI definitions
+    /// (LESSON-569): a repaint in place, a withdraw that takes the row off
+    /// screen without touching the row above, a durable line landing **where
+    /// the row was** rather than below it (BR-5's scrollback rule), and a long
+    /// row replaced by a short one — the last is what a `\r` with no erase would
+    /// get wrong, leaving the old row's tail on screen and reporting residue as
+    /// clean text.
+    #[test]
+    fn the_current_row_is_repainted_and_withdrawn_where_the_cursor_is() {
+        assert_eq!(
+            rendered_screen("> hal\r\x1b[K> half"),
+            vec!["> half".to_owned()]
+        );
+        assert_eq!(
+            rendered_screen("above\n> half\r\x1b[K"),
+            vec!["above".to_owned()]
+        );
+        assert_eq!(
+            rendered_screen("above\n> half\r\x1b[Kdurable\n"),
+            vec!["above".to_owned(), "durable".to_owned()]
+        );
+        assert_eq!(
+            rendered_screen("> a much longer thought\r\x1b[K> a"),
+            vec!["> a".to_owned()]
+        );
+    }
+
     /// The three erase-in-line modes, each on the same row with the cursor at
     /// the same column, so the only variable is the mode.
     ///
