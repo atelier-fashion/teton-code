@@ -85,5 +85,23 @@
     "TASK-417 deviations for Phase 5: pending row reuses LineKind::Activity; cursor rests below the block, not at the pending row's end (needs a render.rs verb).",
     "TASK-419 defect for Phase 5 (Major, BR-4): a reply streamed while an unsubmitted pending line is on screen is broken one chunk per row in scrollback \u2014 the two-row block must be withdrawn before fragments, not only before lines. Also: REQ-621 verification table names the deleted typed_bytes_survive_the_animation (TASK-420 retires the row).",
     "TASK-420: main::tests::queued_lines_re_enter_ahead_of_the_poll_in_order is order-dependent (process-wide slot, no lock_the_slot) \u2014 Phase 5."
-  ]
+  ],
+  "phase5": {
+    "status": "consolidated; fix pass held while peer session local_6dfa7038 edits client.rs/render.rs for the streaming Critical",
+    "findings": [
+      "CRITICAL streaming: pending row drawn via line()/withdraw_row_above flushes the held partial reply line -> one chunk per row (BR-4). Fix route (b): block verbs that skip emit_pending and emit no newline (paint current row with cursor at end; clear current row; above-row repaint/withdraw without flush); relax the withdraw debug_assert only on the no-flush path.",
+      "MAJOR cursor rests below the block (ADR-622-4 says end of pending row) -> resolved by painting the pending row on the current row",
+      "MAJOR main::tests::queued_lines_re_enter_ahead_of_the_poll_in_order order-dependent -> lock_the_slot pub(crate), take it",
+      "MAJOR RestoreSlot::store fail closed in release (refuse when armed); ask_secret refuses when RawMode::is_engaged (security)",
+      "MAJOR ADR-622-2 wording: one InputEditor type, two instances (pump's on SessionState, each prompter's fresh answer buffer)",
+      "MAJOR RowState carries four concerns -> extract InputOwnership (guard, owns_input, read_keys, engage/release)",
+      "MINOR LineKind::Pending with its own SGR and no debug_assert carve-out",
+      "MINOR tcflush(TCIFLUSH) at shelve before a question is drawn (BR-5 kernel-queue window)",
+      "MINOR re-measure width when the activity row leaves while the pending row is up",
+      "MINOR queued count invisible while streaming (frame None): pending-row marker carries [N queued] when the activity row is not due",
+      "MINOR add SIGQUIT to the restore set; preserve an inherited SIG_IGN disposition; clamp the prompt.rs test-hook slice; RowState base() helper; bound the main.rs source-order slice; TASK-419 'filed' wording",
+      "TESTS: peer's leg a_reply_streamed_past_a_pending_row_renders_as_it_does_without_one (fill its mutation cell); SIGTERM-at-key-prompt leg; resize-with-pending-row leg",
+      "FOLLOW-UP: split prompt.rs (terminal_mode.rs) \u2014 not this REQ"
+    ]
+  }
 }
