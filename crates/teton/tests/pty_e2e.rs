@@ -5680,6 +5680,16 @@ const RAW: common::TerminalFlags = common::TerminalFlags {
 /// fails on, and claim (5) is what a regression to canonical mode fails on: the
 /// kernel would echo the line at the cursor, no `> ` row would ever be drawn,
 /// and claim (1) would time out first.
+///
+/// One mutation was applied and observed red here (re-run 2026-09-10):
+///
+/// | Mutation | Fails |
+/// |---|---|
+/// | `RESTORE.clear()` is removed from `RawMode`'s `Drop` (`prompt.rs`) | **9 red of 49** in this file, this leg among them, on claim (5). A slot that is never disarmed leaves `RawMode::is_engaged()` permanently `true`, and `queued_for_entry` reads it to decide whether the entry frame may drain — so the line is taken, echoed, queued, and then never sent. The record in `prompt::tests::both_guards_arm_and_clear_the_restore_slot` names all nine |
+///
+/// Claims (1) to (4) all stay green under it, which is the shape worth noting:
+/// everything this leg says about the *screen* is true of a build in which the
+/// line never reaches the daemon. Claim (5) is the one that asks.
 #[test]
 fn a_submitted_line_is_never_overwritten_and_becomes_the_next_prompt() {
     const HELD: &str = "The held turn finally answered.";
@@ -6620,6 +6630,16 @@ fn the_key_prompt_survives_ctrl_c_with_echo_on() {
 /// 2. one Backspace removes the emoji **whole** — four bytes, one character,
 ///    and the row afterwards is exactly the rest;
 /// 3. the line the daemon recorded is byte-for-byte the line that was left.
+///
+/// # What breaks this test
+///
+/// | Mutation | Fails |
+/// |---|---|
+/// | `InputEditor::backspace` pops a **byte** rather than a `char` (`input_editor.rs`) | **1 red of 49** here, on claim (2) (re-run 2026-09-10), and **1 red of 853** in the unit binary (`input_editor::tests::the_keystroke_table`). This leg is the pty half of an AC-10 mutation the editor's module predicted no terminal could see: three bytes of the four-byte emoji stay in the line, which is an unprintable row rather than the clean `U+FFFD` the prediction assumed, so the screen does show it |
+///
+/// Claim (2) is the only one of the three that fails under it — claims (1) and
+/// (3) are about a line nothing has edited — which is why the Backspace is in
+/// this leg at all and not left to the unit table.
 #[test]
 fn multi_byte_input_round_trips() {
     const HELD: &str = "The held turn answered.";

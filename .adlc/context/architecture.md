@@ -209,6 +209,24 @@
   keeps the blocking receive, never reaches a tick arm, and so cannot emit a
   byte it did not emit before. A second owner, or a caller-held gate, is how a
   row ends up in scrollback (REQ-621 ADR-621-1/ADR-621-3, LESSON-481).
+- **A terminal mode change registers its undo where a signal can find it** —
+  every guard that alters `termios` saves the settings it is replacing into one
+  process-wide slot, and one `sigaction` handler restores from that slot and
+  re-raises. A guard whose undo lives only in `Drop` is a guard that lies about
+  Ctrl-C: `Drop` does not run for a process the kernel terminates, so the
+  terminal the user gets back is whatever the guard left. The slot is what makes
+  the claim testable as well as true — it is read by the handler with
+  async-signal-safe calls only, and it is *disarmed after* the restore, never
+  before, so the handler is never holding settings the process no longer owns.
+  The same slot is why the client can ask whether a mode is engaged at all
+  (`RawMode::is_engaged`), which the entry loop reads to decide whether a line
+  the editor queued may be drained: a guard that stops disarming strands every
+  queued line as surely as it strands the terminal. And the claim is only worth
+  the fixture that measures it — a client spawned as a pty's own session leader
+  takes the terminal's settings with it when it exits, so a restore test against
+  such a fixture passes whatever the client did; the session must run under a
+  shell that outlives it (REQ-622 ADR-622-3, retiring REQ-572's accepted
+  residual; LESSON-569).
 - **Enablement is collection at the edge, commitment at the core** — a guided
   setup flow holds no server-side step state: clients collect and buffer
   answers (input buffering is not session state), the daemon exposes

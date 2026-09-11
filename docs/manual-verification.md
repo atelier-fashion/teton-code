@@ -3944,3 +3944,115 @@ Boundaries configured (or builtins left on)         : yes / no  <-- must be "yes
 (2) `/shell allow` lifted it                        : yes / no
 Notes / findings                                    :
 ```
+
+---
+
+# Manual verification runbook — REQ-622 (typing during a turn, on your own terminal)
+
+**Two things by hand, on the terminal you actually use.** The pty suite covers
+the rest: type-ahead, the queue, the `· N queued` clause, multi-byte input,
+unhandled keys, a question that must not eat a pending line, and the terminal
+flags read back after Ctrl-C, SIGTERM, a disconnect and a panic. What a pty
+harness cannot settle is what your **own** terminal emulator and your **own**
+shell do afterwards, and the one failure mode users report is exactly that: a
+shell left silent after an interrupt.
+
+## What this proves that CI does not
+
+| Claim | Proven by CI? | Why not |
+|---|---|---|
+| The flags on the pty equal the pre-session capture | **yes** | `stty -a` from a child on the same pty, every exit path |
+| Backspace removes one character, not one byte | **yes** | the editor's unit table, plus the AC-8 pty leg |
+| A question is answered only by keys typed after it | **yes** | `a_question_never_eats_type_ahead` |
+| **Your** shell is usable after Ctrl-C — prompt back, keys echoing | **no** | the harness reads two flags on a pty it made; it does not use the terminal afterwards |
+| The typed row reads correctly in your emulator at your font and width | **no** | the harness replays a cursor model, not a font |
+
+## Prerequisites
+
+- A `--release` build or the shipped binary, started from an ordinary
+  interactive shell in a real terminal emulator (not an IDE's embedded pane, and
+  not through `script`/`tmux` for the first pass — try those as a second pass if
+  you use them daily).
+- A route slow enough that a turn stays open for several seconds. A remote
+  provider on a long question is the easiest; a local tier still loading works
+  too.
+- A second terminal window, for the SIGTERM leg.
+
+## Procedure
+
+### 1. Type during a turn, and queue a line
+
+1. Send a prompt whose answer takes a while.
+2. While the activity row animates, type `what did that cost?` — **do not press
+   Enter yet.** Expect: your line on its own row *beneath* the animating row,
+   each character appearing once, the row still animating under it. Watch for a
+   few seconds: nothing the row does may touch your line.
+3. Backspace over the last few characters, then retype them. Expect: one
+   keypress removes one character, and nothing is left behind.
+4. Type ` 語🎉` at the end, then Backspace twice. Expect: the emoji goes whole on
+   the first press and `語` whole on the second — never half a character, never a
+   `<?>`-style replacement glyph.
+5. Press **Enter**. Expect: the row gains `· 1 queued`, and nothing is sent yet.
+   Press Enter again on a second line; expect `· 2 queued`.
+6. Let the turn finish. Expect: the activity row is **gone without a trace** — no
+   leftover spinner frame anywhere in the scrollback — and each queued line
+   appears once, at the prompt that sends it, each getting its own reply and its
+   own `/verbose` cost line.
+
+### 2. Ctrl-C, and the shell afterwards
+
+1. Start a slow turn. While it runs, type half a line — enough that you can see
+   Teton echoing it — and press **Ctrl-C**.
+2. Expect: the session ends, and nothing partial was sent.
+3. **The check that matters:** at the shell prompt you are returned to, type
+   `echo hello` and press Enter. Expect: the characters appear as you type them
+   and the command runs. A terminal left in raw mode shows nothing as you type;
+   one left with echo off shows nothing but still runs the command. If either
+   happens, `stty sane` will recover it — record that it was needed.
+4. Repeat with **Ctrl-C at the provider-key prompt** (`/provider add …`, or
+   `teton provider add …`, up to the point where it asks for the key echo-off).
+   This is REQ-572's retired residual and the same check applies: `echo hello`
+   must echo afterwards.
+
+### 3. SIGTERM from another window
+
+1. Start a slow turn. From the second window, `pkill -TERM -f 'teton$'` (or
+   `kill -TERM <pid>` against the client, **not** `tetond`).
+2. Expect: the client exits, and the shell it was running in is usable — the
+   same `echo hello` check.
+3. `kill -9` is **not** part of this: SIGKILL cannot be handled and the terminal
+   is expected to need `stty sane`. Named here so a `-9` result is not read as a
+   failure.
+
+### 4. Piped, unchanged
+
+`echo 'hello' | teton --verbose 2>&1 | cat` — expect the same output as 0.1.34's:
+no frames, no escapes, no blank lines, and no change in behaviour. If you have a
+0.1.34 binary to hand, diff the two.
+
+## Sign-off
+
+```
+REQ-622 manual check
+--------------------
+Date / build / commit                               :
+Terminal emulator / shell / TERM                    :
+Route the slow turn ran on                          :
+(1) typed line appeared beneath the animating row   : yes / no
+(1) the row ever overwrote or erased the typed line : yes / no  <-- must be "no"
+(1) Backspace removed one character each press      : yes / no
+(1) emoji and CJK removed whole                     : yes / no
+(1) `· 1 queued` then `· 2 queued` appeared         : yes / no
+(1) anything sent before the turn ended             : yes / no  <-- must be "no"
+(1) activity glyph left in scrollback afterwards    : yes / no  <-- must be "no"
+(1) each queued line shown once, own reply          : yes / no
+(2) Ctrl-C ended the session                        : yes / no
+(2) partial line was sent                           : yes / no  <-- must be "no"
+(2) `echo hello` echoed afterwards                  : yes / no
+(2) `stty sane` was needed                          : yes / no  <-- must be "no"
+(2) same, after Ctrl-C at the key prompt            : yes / no
+(3) SIGTERM: shell usable afterwards                : yes / no
+(4) piped output unchanged from 0.1.34              : yes / no / not compared
+Anything that hung, aborted, panicked, or crashed   :
+Notes / findings                                    :
+```

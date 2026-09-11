@@ -47,21 +47,23 @@
 //!
 //! | Mutation | Fails |
 //! |---|---|
-//! | Backspace pops a **byte** rather than a `char` | `the_keystroke_table` — **1 red of 838** in this binary's suite (2026-09-10), and inside it **only the three multi-byte rows**: one Backspace over `é`, over a CJK ideograph, and over an emoji each leave `U+FFFD` where the line should be empty |
+//! | Backspace pops a **byte** rather than a `char` | **1 red of 853** in this binary's suite and **1 red of 49** in `pty_e2e` (re-run 2026-09-10 over the finished suite). Unit: `the_keystroke_table`, and inside it **only the three multi-byte rows** — one Backspace over `é`, over a CJK ideograph, over an emoji — each leaving `U+FFFD` where the line should be empty; it fails on the `é` row first. Pty: `multi_byte_input_round_trips`, on the emoji, where three bytes of a four-byte character stay in the line |
 //!
 //! Every ASCII row stayed green, and that is the finding rather than a footnote:
 //! a keystroke table written only in ASCII would have passed this mutation
 //! whole, because ASCII is the one alphabet in which a byte and a character are
-//! the same thing. The pty legs cannot see it either — they land in TASK-419 and
-//! observe what a terminal drew, and a terminal draws a replacement character
-//! as willingly as a letter — so the property belongs to the pure function
-//! (LESSON-481). The count is re-run at verify (TASK-420) rather than left as
-//! this task's reading (LESSON-652).
+//! the same thing.
 //!
-//! `mod input_editor` is declared `pub` in `main.rs` for as long as the pump
-//! (TASK-417) and the prompter (TASK-418) have not landed: this crate is a
-//! binary, so a `pub` item in a private module that only tests reach is dead
-//! code, and an `#[allow]` is not a tool this codebase uses.
+//! **The re-run corrected this record's own claim about the pty legs.** Written
+//! before TASK-419 landed, it predicted the terminal could not see this at all —
+//! a terminal draws a replacement character as willingly as a letter. Half of
+//! that is right and half was wrong: the emoji case leaves a *truncated* four-byte
+//! sequence rather than a clean `U+FFFD`, which is an unprintable row and a
+//! prompt that cannot be sent, so the AC-8 leg does catch it. The 48 other pty
+//! legs stay green, which is the half that held — the ASCII ones cannot see it,
+//! and the three-row granularity inside the table is still the unit's alone
+//! (LESSON-481). A prediction re-run rather than left standing is why this
+//! paragraph is a finding instead of a plausible sentence (LESSON-652).
 
 use crate::markdown::display_width;
 use crate::render::defused;
@@ -496,11 +498,14 @@ impl InputEditor {
     ///
     /// **Mutation (AC-10), applied and observed red:** popping a byte instead —
     /// `String::from_utf8_lossy(&bytes[..bytes.len() - 1])` over
-    /// `self.pending.as_bytes()` — leaves `U+FFFD` behind for every multi-byte
-    /// character, so one Backspace over `é` yields a replacement character
-    /// rather than an empty line. **1 red of 838**, `the_keystroke_table`, on
-    /// its `é`, CJK and emoji rows and on none of its ASCII ones; reverted with
-    /// the same edit. The module's table has the reading.
+    /// `self.pending.as_bytes()` — cuts a multi-byte character apart, so one
+    /// Backspace over `é` yields a replacement character rather than an empty
+    /// line. Re-run 2026-09-10 over the finished suite: **1 red of 853** in this
+    /// binary (`the_keystroke_table`, on its `é`, CJK and emoji rows and none of
+    /// its ASCII ones) and **1 red of 49** in `pty_e2e`
+    /// (`multi_byte_input_round_trips`, on the emoji). Reverted with the same
+    /// edit. The module's table has the reading, including the prediction the
+    /// re-run corrected.
     fn backspace(&mut self) -> Edit {
         if self.pending.pop().is_some() {
             Edit::Pending

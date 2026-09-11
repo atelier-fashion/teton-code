@@ -150,6 +150,18 @@ the sanitizer, never by the caller).
   left in scrollback — the bounded BR-5 exception now recorded in the spec, and
   the only option here that does not damage something the user typed.
 
+  **Retired 2026-09-10 by REQ-622 (ADR-622-1, ADR-622-4).** Every sentence in
+  this bullet from "`ECHO` is on for the length of a turn" onward is conditional
+  on the client leaving the terminal in canonical mode, and REQ-622 stops doing
+  that: inside a turn the client holds the terminal in raw mode, echoes the
+  pending line itself on a second row it owns beneath the activity row, and
+  therefore knows exactly where the cursor is. There is no unobservable
+  bookkeeping left to lose the geometry to, so `RowState::abandon` is gone, the
+  row animates past a submitted line, and it is withdrawn cleanly at every turn
+  exit. The bullet's diagnosis stands and is why REQ-622 exists — it is the
+  mitigation that is retired, not the analysis. BUG-225 is resolved on the same
+  date.
+
 ### ADR-621-4: Every turn exit closes the row at the `ENDS_TURN` seam
 
 **Decision.** `Connection::call` already captures the pump's outcome and

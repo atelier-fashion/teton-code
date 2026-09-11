@@ -49,12 +49,7 @@ mod client;
 mod cost_ui;
 mod effort_ui;
 mod firstrun;
-// `pub` only until the pump (TASK-417) and the prompter (TASK-418) reach them:
-// this crate is a binary, so a `pub` item in a private module that only tests
-// call is dead code, and an `#[allow]` is not a tool this codebase uses. Both
-// declarations go back to `mod` when REQ-622's last consumer lands (TASK-420) —
-// they are a lint scope, not an interface.
-pub mod input_editor;
+mod input_editor;
 mod keychain;
 mod loading;
 mod markdown;
@@ -64,7 +59,7 @@ mod provider_setup_ui;
 mod provider_test_ui;
 mod render;
 mod service;
-pub mod session_ui;
+mod session_ui;
 mod slash;
 mod status;
 mod uninstall;

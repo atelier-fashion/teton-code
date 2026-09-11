@@ -62,6 +62,71 @@ user having asked for it.
   real terminal, and claiming that coverage without a leg that exercises it is
   what BUG-191 looked like.
 
+- **You can type while a turn is working, and Teton owns what you type
+  (REQ-622).** Until now the terminal stayed in canonical mode for the length of
+  a turn: the kernel assembled your line, echoed it wherever the cursor happened
+  to be, and handed it to whatever read stdin next. That cost two things. A line
+  submitted mid-turn moved the cursor under bookkeeping the client could not see,
+  so the activity row had to be abandoned and its last frame stayed in scrollback
+  (BUG-225). And a line typed before a permission prompt opened was still sitting
+  in the kernel's buffer when the prompt read — so it could be consumed as the
+  answer to a question you never saw. An interactive session now takes the
+  terminal out of canonical mode for the length of the turn and reads the
+  keystrokes itself. Your line is echoed by Teton on a row it owns, beneath the
+  activity row, where no repaint or withdraw can reach it; Backspace removes one
+  **character**, not one byte, so `é`, CJK and emoji all edit correctly; Enter
+  **queues** the line as the next prompt and the row says so with a `· N queued`
+  clause. Nothing is sent while the turn is still running. When the turn ends
+  each queued line is submitted in order, exactly as if typed at the prompt —
+  slash commands, the `/cd` intercept and every pre-send check included — and is
+  shown once, in the frame that sends it. A pasted block queues one prompt per
+  line. A question that opens mid-turn sets your pending line aside, is answered
+  only by keys typed after it was drawn, and gives the line back verbatim
+  afterwards. Ctrl-D is inert during a turn and keeps its meaning at the prompt;
+  arrow and function keys are consumed whole and dropped.
+
+  **Upgrade note:** with stdin or stdout not a terminal, nothing changes — no
+  termios call is made at all, and piped and scripted output stays byte-identical.
+  If a real terminal refuses the mode change, the turn runs exactly as it did in
+  0.1.34 and one `--verbose` notice names it: the feature fails open, because
+  there is nothing here to hide. No wire change; `PROTOCOL_VERSION` stays 2.
+
+### Fixed
+
+- **A line submitted while the activity row animated no longer leaves the row's
+  last frame in scrollback (BUG-225).** REQ-621 shipped this as a recorded,
+  bounded exception, because a canonical-mode client cannot see the cursor move
+  when the kernel echoes a newline and the only safe move was to stop painting.
+  REQ-622 removes the cause rather than the symptom — the kernel is no longer
+  echoing — so the row keeps animating beneath what you typed and is erased
+  cleanly when the turn ends. Scrollback after a turn you typed during is what it
+  would have been had you typed nothing, plus each queued line shown once where
+  the prompt echoes it.
+
+- **Ctrl-C at the provider-key prompt no longer leaves your terminal with echo
+  off (REQ-572's accepted residual).** The key prompt turns echo off so the key
+  is never on screen, and restored it on the way out — but a `Drop` does not run
+  for a process the kernel terminates, so an interrupt left the terminal silent
+  and you had to type `stty sane` blind. Every guard that changes the terminal
+  now registers its undo in one process-wide slot, and a signal handler restores
+  from that slot and re-raises, so SIGINT, SIGTERM and SIGHUP all hand the
+  terminal back as it was found. REQ-572 accepted the residual on the grounds
+  that its window was one prompt long; a raw window that lasts a whole turn could
+  not, which is why it is fixed here.
+
+### Changed
+
+- **The PTY test harness runs the client under a shell that outlives it.** Not a
+  user-visible change, recorded because it is the reason the restore claims above
+  are believable. A client spawned as the pty's own session leader takes the
+  terminal's settings with it when it exits: a BSD kernel revokes a controlling
+  terminal whose session leader dies and hands the device back with the driver's
+  defaults, so the flags read afterwards are the kernel's answer and not the
+  client's. The first run of the "remove the restore" mutation against the old
+  fixture stayed **green** for exactly that reason — an assertion that could not
+  fail. Under a shell that holds the terminal open, the same mutation turns four
+  legs red.
+
 ## [0.1.34] - 2026-09-10
 
 REQ-620 and the two bugs from the same dogfood session: the shell grammar meets model-written commands, and the over-budget offer tells the truth about the local engine's window.
