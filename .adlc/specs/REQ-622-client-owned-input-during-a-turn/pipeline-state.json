@@ -3,8 +3,8 @@
   "branch": "feat/REQ-622-client-owned-input-during-a-turn",
   "startedAt": "2026-09-10T19:36:27Z",
   "integrationBranch": "main",
-  "completed": false,
-  "currentPhase": 7,
+  "completed": true,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
@@ -12,7 +12,9 @@
     3,
     4,
     5,
-    6
+    6,
+    7,
+    8
   ],
   "phaseHistory": [
     {
@@ -51,6 +53,19 @@
       "phase": 6,
       "name": "Create Pull Request",
       "completedAt": "2026-09-11T02:05:10Z"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-09-11T11:23:23Z",
+      "ciTip": "b1018ae (rebased onto #322)"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup",
+      "completedAt": "2026-09-11T11:23:23Z",
+      "mergeCommit": "b82e7a9",
+      "pr": "https://github.com/atelier-fashion/teton-code/pull/323"
     }
   ],
   "repos": {
@@ -63,7 +78,7 @@
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/323",
       "prNumber": 323,
       "prCreatedAt": "2026-09-10T19:36:26Z",
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }
@@ -96,7 +111,8 @@
     "TASK-415 made `mod input_editor`/`mod session_ui` pub as a dead-code stopgap \u2014 TASK-420 reverts. TASK-416: macOS sets PENDIN leaving non-canonical mode; TASK-419 compares ICANON/ECHO/VMIN/VTIME only.",
     "TASK-417 deviations for Phase 5: pending row reuses LineKind::Activity; cursor rests below the block, not at the pending row's end (needs a render.rs verb).",
     "TASK-419 defect for Phase 5 (Major, BR-4): a reply streamed while an unsubmitted pending line is on screen is broken one chunk per row in scrollback \u2014 the two-row block must be withdrawn before fragments, not only before lines. Also: REQ-621 verification table names the deleted typed_bytes_survive_the_animation (TASK-420 retires the row).",
-    "TASK-420: main::tests::queued_lines_re_enter_ahead_of_the_poll_in_order is order-dependent (process-wide slot, no lock_the_slot) \u2014 Phase 5."
+    "TASK-420: main::tests::queued_lines_re_enter_ahead_of_the_poll_in_order is order-dependent (process-wide slot, no lock_the_slot) \u2014 Phase 5.",
+    "Wrapup: LESSON-660; BUG-225 resolved in-branch (TASK-420); peer session's fix adopted as 83235fd; close-out via chore/REQ-622-wrapup from origin/main; worktree .worktrees/REQ-622 removed."
   ],
   "phase5": {
     "status": "complete",
@@ -126,5 +142,6 @@
     ],
     "stepD": "correctness/security/architecture/test-audit re-run: all prior findings closed; one new Major (flush on the idle drain) + 3 Minor + 1 Low fixed in fabb305",
     "userQuestions": "none outstanding: the reflector's two questions were settled by the spec (BR-3 editable => cursor at the end; a recorded exception is what this REQ retires => fix, not ship)"
-  }
+  },
+  "terminal": "merged"
 }
