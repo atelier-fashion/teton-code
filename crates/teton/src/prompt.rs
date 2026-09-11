@@ -1237,6 +1237,10 @@ const SLOT_EMPTY: u8 = 0;
 const SLOT_RAW: u8 = 1;
 /// An [`EchoOff`] guard holds the slot.
 const SLOT_ECHO_OFF: u8 = 2;
+/// A guard is between claiming the slot and publishing its `termios`: the
+/// handler treats this as empty (nothing valid to restore yet) and a second
+/// `store` treats it as taken.
+const SLOT_ARMING: u8 = 3;
 
 /// One saved `termios` and a word saying who owes it, readable from a signal
 /// handler.
@@ -1322,12 +1326,17 @@ impl RestoreSlot {
     /// by ignoring the answer.
     #[must_use]
     fn store(&self, saved: &libc::termios, owner: u8) -> bool {
-        // A plain load and a store rather than a compare-exchange, and the
-        // difference does not matter here: the only writers are guards on this
-        // process's main thread (a `Prompter` and the event pump both run
-        // there), so there is no second thread to lose a race with. What this
-        // is defending against is a *code path*, not a thread.
-        if self.armed_by() != SLOT_EMPTY {
+        // Claim first, with a compare-exchange, so single ownership is a
+        // property of the word and not an argument about threads (verify,
+        // Step D): the claim parks the slot in `SLOT_ARMING`, which the handler
+        // reads as "nothing valid to restore" and a second `store` reads as
+        // taken. The `termios` is written under that claim and the owner is
+        // published last.
+        if self
+            .owner
+            .compare_exchange(SLOT_EMPTY, SLOT_ARMING, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
             return false;
         }
         // SAFETY: at most one guard holds the slot at a time — the check above
@@ -1414,7 +1423,7 @@ const RESTORE_SIGNALS: [libc::c_int; 4] =
 /// blocked while its own handler runs, so the `raise` is delivered as the
 /// handler returns and the mask is lifted.
 extern "C" fn restore_and_reraise(sig: libc::c_int) {
-    if RESTORE.armed_by() != SLOT_EMPTY {
+    if matches!(RESTORE.armed_by(), SLOT_RAW | SLOT_ECHO_OFF) {
         // SAFETY: `owner` is not `SLOT_EMPTY`, which is published only after
         // the cell has been written, so it holds an initialised `termios`;
         // `tcsetattr` reads it through the pointer and writes only the

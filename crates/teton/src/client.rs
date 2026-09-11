@@ -463,6 +463,7 @@ impl InputOwnership {
             InputVerdict::Raw => {
                 self.engaged = true;
                 self.guard = handover.guard;
+                ctx.state.input.set_owned(true);
                 // BR-14's count is **seeded** here and not only updated on an
                 // Enter, because the queue outlives a turn: it is drained one
                 // line per pass of the entry loop (ADR-622-5), so a second line
@@ -759,9 +760,14 @@ impl RowState {
         // row the withdraw cannot clear, which is the failure [`Self::width`]
         // is written against arriving by the one door nobody watched.
         let activity_leaves = self.activity_visible && !activity_due;
+        // ...and once a second while any row is up (verify, Step D): a resize
+        // during a tick-only stretch — the model thinking, nothing arriving —
+        // would otherwise repaint at the old width until the next message.
+        let periodic = self.tick % 8 == 0 && (self.activity_visible || self.pending_visible);
         if (!self.activity_visible && activity_due)
             || (!self.pending_visible && pending_due)
             || (self.pending_visible && activity_leaves)
+            || periodic
         {
             self.width = (self.measure_width)();
         }
@@ -902,6 +908,13 @@ impl RowState {
     /// rather than a counter, since the next paint returns before it reaches a
     /// verb.
     fn hide_after_a_failed_write(&mut self, ctx: &mut UiContext) {
+        // The pending row is the cursor's own row, so a notice written now
+        // would land on the user's text and drag the held paragraph with it
+        // (`line` emits what is held). Clear the row first; a clear that also
+        // fails leaves the cursor where it is, which is no worse.
+        if self.pending_visible {
+            let _ = ctx.surface.withdraw_current_row();
+        }
         self.abandon();
         if ctx.state.verbose {
             ctx.surface.line(
@@ -1111,7 +1124,14 @@ fn around_a_question<'a, T>(
     // which a keystroke can be neither in the editor nor aimed at a question the
     // user can see. BR-5 says a question reads only what was typed after it was
     // drawn; the shelve says that of the editor, and this says it of the kernel.
-    crate::prompt::discard_type_ahead();
+    //
+    // Only while the pump owns the input (verify, Step D): `dispatch_event` is
+    // shared with the idle drain, where the terminal is canonical and the
+    // kernel's queue *is* the line the user is typing at the entry prompt —
+    // echoed, unsubmitted, and theirs. Flushing there would eat it.
+    if ctx.state.input.is_owned() {
+        crate::prompt::discard_type_ahead();
+    }
     let answered = ask(ctx);
     ctx.state.input.unshelve();
     answered
@@ -1391,6 +1411,7 @@ impl Connection {
         // that follows will read in. `release_raw` says why this is explicit
         // rather than left to the drop a few lines later.
         row.release_raw();
+        ctx.state.input.set_owned(false);
         if P::ENDS_TURN {
             ctx.surface.end_block();
             // BR-16's figures, read from the accumulator the frames read, at
@@ -6101,6 +6122,7 @@ mod tests {
         let mut state = SessionState::new();
         let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
         let mut ctx = turn_ctx!(surface, state, prompter);
+        ctx.state.input.set_owned(true);
         ctx.state.input.push(b"half a thought");
 
         let before = crate::prompt::type_ahead_flushes();
@@ -6125,6 +6147,27 @@ mod tests {
             crate::prompt::type_ahead_flushes(),
             before + 1,
             "once per question, not once per byte"
+        );
+    }
+
+    /// The benign half of the rule above (LESSON-440): a question that opens
+    /// while the pump does **not** own the input — the idle drain at a
+    /// canonical entry prompt — flushes nothing, because the kernel's queue is
+    /// then the user's own unsubmitted line. Mutation: dropping the
+    /// `is_owned` gate reddens this test alone.
+    #[test]
+    fn a_question_outside_a_raw_turn_flushes_nothing() {
+        let mut surface = RecordingSurface::with_live_rows();
+        let mut state = SessionState::new();
+        let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+        let mut ctx = turn_ctx!(surface, state, prompter);
+        let before = crate::prompt::type_ahead_flushes();
+        let seen = around_a_question(&mut ctx, |_| crate::prompt::type_ahead_flushes());
+        assert_eq!(seen, before, "no flush inside the question");
+        assert_eq!(
+            crate::prompt::type_ahead_flushes(),
+            before,
+            "and none after it"
         );
     }
 

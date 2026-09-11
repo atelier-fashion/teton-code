@@ -391,7 +391,12 @@ impl TurnActivity {
     /// [`crate::client::RowState::width`] exists to avoid.
     #[must_use]
     pub fn has_row(&self, now: Instant) -> bool {
-        let Some(last_event) = self.last_event else {
+        // The same three facts `frame` needs, so the two can never disagree:
+        // a `true` here with a `None` frame would hide BR-14's count in both
+        // places at once (verify, Step D).
+        let (Some(_), Some(_), Some(last_event)) =
+            (self.turn_started, self.phase_since, self.last_event)
+        else {
             return false;
         };
         let stalled = now.saturating_duration_since(last_event) >= STALL_AFTER

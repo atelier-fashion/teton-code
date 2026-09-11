@@ -174,6 +174,12 @@ pub struct InputEditor {
     /// character work. That boundary is where the [`Self::backspace`] mutation
     /// lands.
     pending: String,
+    /// Whether the pump currently owns the terminal's input for this editor
+    /// (raw mode engaged for a turn). Set by the pump at engage and release; it
+    /// is what lets a seam the pump does not reach — `around_a_question` on the
+    /// idle drain — tell a raw-mode question from a canonical one, where the
+    /// kernel's own line is the user's draft and must not be flushed.
+    owned: bool,
     /// Lines submitted during the turn, oldest first.
     ///
     /// Drained one per entry-loop iteration by [`Self::take_next_queued`]
@@ -401,6 +407,18 @@ impl InputEditor {
     #[must_use]
     pub fn queued_len(&self) -> usize {
         self.queued.len()
+    }
+
+    /// Whether the pump owns the terminal's input right now (raw mode for a
+    /// turn). See the field.
+    #[must_use]
+    pub fn is_owned(&self) -> bool {
+        self.owned
+    }
+
+    /// The pump's engage/release hand-off for the flag above.
+    pub fn set_owned(&mut self, owned: bool) {
+        self.owned = owned;
     }
 
     /// Decode one byte, in whatever state the last one left behind.
