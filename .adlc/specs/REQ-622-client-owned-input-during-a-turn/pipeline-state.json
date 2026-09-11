@@ -4,12 +4,13 @@
   "startedAt": "2026-09-10T19:36:27Z",
   "integrationBranch": "main",
   "completed": false,
-  "currentPhase": 4,
+  "currentPhase": 5,
   "completedPhases": [
     0,
     1,
     2,
-    3
+    3,
+    4
   ],
   "phaseHistory": [
     {
@@ -33,6 +34,11 @@
       "name": "Validate Architecture & Tasks",
       "completedAt": "2026-09-10T19:43:54Z",
       "advisory": "benign-path stem false positives on AC-4 'flags' and AC-14 'block' (nouns, not detectors)"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-09-11T00:34:42Z"
     }
   ],
   "repos": {
@@ -54,14 +60,30 @@
     "teton-code"
   ],
   "phase4": {
-    "currentTask": "TASK-415",
-    "completedTasks": [],
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-415",
+      "TASK-416",
+      "TASK-417",
+      "TASK-418",
+      "TASK-419",
+      "TASK-420"
+    ],
     "failedTasks": [],
     "tier0": [
       "TASK-415",
       "TASK-416"
+    ],
+    "tier1": [
+      "TASK-417",
+      "TASK-418"
     ]
   },
   "conflictsResolved": [],
-  "notes": []
+  "notes": [
+    "TASK-415 made `mod input_editor`/`mod session_ui` pub as a dead-code stopgap \u2014 TASK-420 reverts. TASK-416: macOS sets PENDIN leaving non-canonical mode; TASK-419 compares ICANON/ECHO/VMIN/VTIME only.",
+    "TASK-417 deviations for Phase 5: pending row reuses LineKind::Activity; cursor rests below the block, not at the pending row's end (needs a render.rs verb).",
+    "TASK-419 defect for Phase 5 (Major, BR-4): a reply streamed while an unsubmitted pending line is on screen is broken one chunk per row in scrollback \u2014 the two-row block must be withdrawn before fragments, not only before lines. Also: REQ-621 verification table names the deleted typed_bytes_survive_the_animation (TASK-420 retires the row).",
+    "TASK-420: main::tests::queued_lines_re_enter_ahead_of_the_poll_in_order is order-dependent (process-wide slot, no lock_the_slot) \u2014 Phase 5."
+  ]
 }
