@@ -2191,6 +2191,38 @@ mod tests {
         );
     }
 
+    /// The same question asked of the **current-row** family (a53e9a6): a
+    /// pending row drawn onto the cursor's row, repainted in place, and cleared,
+    /// five times across a streamed reply, must leave the reply whole. Without
+    /// this case the held-line property of `draw_current_row` was pinned only by
+    /// a pty leg (`a_reply_streamed_past_a_pending_row_renders_as_it_does_without_one`).
+    ///
+    /// Mutation (applied, observed, reverted): `draw_current_row` calling
+    /// `emit_pending()` first reddens this test alone in the unit binary — the
+    /// reply arrives one token per row ahead of each draw.
+    #[test]
+    fn a_current_row_holds_what_the_renderer_is_holding() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut surface = PlainSurface::with_markdown(&mut buf, false, 40);
+            for token in ["One ", "two ", "three ", "four ", "five."] {
+                surface.fragment(token);
+                surface.draw_current_row(LineKind::Pending, "> typed");
+                assert!(surface.repaint_current_row(LineKind::Pending, "> typed a"));
+                assert!(surface.withdraw_current_row());
+            }
+            surface.end_block();
+        }
+        let held = String::from_utf8(buf).unwrap();
+        let cycle = "> typed\r\x1b[K> typed a\r\x1b[K";
+        assert_eq!(
+            held,
+            format!("{}One two three four five.\n", cycle.repeat(5)),
+            "five cycles on the cursor's own row, and the reply once, whole, \
+             where the last clear left the cursor: {held:?}"
+        );
+    }
+
     /// BR-6 twice over, as a claim about bytes: the constructors that do not own
     /// a terminal answer `false`, and the verb writes nothing for them even when
     /// a caller asks. "Not a frame, not an escape, not a blank line" is a
