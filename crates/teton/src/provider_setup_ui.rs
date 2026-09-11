@@ -1635,7 +1635,12 @@ mod tests {
                 .iter()
                 .filter_map(|call| match call {
                     Rendered::Line(_, text) => Some(text.as_str()),
-                    Rendered::Fragment(_) | Rendered::Repaint(..) | Rendered::Withdraw(_) => None,
+                    Rendered::Fragment(_)
+                    | Rendered::Repaint(..)
+                    | Rendered::Withdraw(_)
+                    | Rendered::DrawCurrent(..)
+                    | Rendered::RepaintCurrent(..)
+                    | Rendered::WithdrawCurrent => None,
                 })
                 .collect::<Vec<_>>()
                 .join("\n")

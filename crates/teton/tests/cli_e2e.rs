@@ -9059,3 +9059,235 @@ fn a_verbose_failed_turn_still_ends_with_the_summary_line() {
          what it was (BR-6, BR-16); stdout:\n{quiet}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REQ-622 AC-7 — a piped session is untouched (TASK-419)
+// ---------------------------------------------------------------------------
+
+/// Run `teton` with its stdin held **open** between two writes, so a line can
+/// be sent while a turn is still in flight (REQ-622 AC-7).
+///
+/// Every other runner in this file writes the whole of stdin and closes it, and
+/// for every other test that is right: the CLI's behaviour does not depend on
+/// *when* a line arrives. This one is about exactly that — BR-1 says a piped
+/// session behaves as it does today, and "today" means the kernel holds a line
+/// typed during a turn until the entry loop reads it, with no client in front
+/// of it.
+///
+/// `second` goes in once `mid_turn` has appeared on stdout, so the write lands
+/// while the first turn is demonstrably still working; the pipe is then closed,
+/// which is what ends the session loop. Returns stdout and stderr joined, like
+/// [`TestDaemon::run_cli_capture`].
+fn run_with_a_line_sent_mid_turn(
+    daemon: &TestDaemon,
+    teton: &Path,
+    first: &str,
+    mid_turn: &str,
+    second: &str,
+) -> String {
+    let mut command = Command::new(teton);
+    command
+        .env("XDG_RUNTIME_DIR", &daemon.runtime_dir)
+        .env("XDG_DATA_HOME", daemon.root.join("d"))
+        .env("TETON_CONFIG", daemon.root.join("config.toml"))
+        .env("TETON_REPO_ROOT", &daemon.root)
+        .env_remove("TETON_PROVIDER_KEY")
+        .env_remove("TETON_TEST_SEAMS")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn teton with a live stdin");
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    stdin
+        .write_all(first.as_bytes())
+        .expect("write the first line");
+    stdin.flush().ok();
+
+    // A reader thread, because stdout has to be watched *while* stdin is still
+    // open: `wait_with_output` would block until the process exited, and the
+    // process is waiting for the second line.
+    let mut out = child.stdout.take().expect("piped stdout");
+    let seen: std::sync::Arc<std::sync::Mutex<String>> =
+        std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let sink = std::sync::Arc::clone(&seen);
+    let pump = std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        while let Ok(n) = std::io::Read::read(&mut out, &mut chunk) {
+            if n == 0 {
+                break;
+            }
+            sink.lock()
+                .expect("stdout mutex")
+                .push_str(&String::from_utf8_lossy(&chunk[..n]));
+        }
+    });
+
+    // Polled, never slept (LESSON-450): the second line goes in on a state the
+    // session reached.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut reached = false;
+    while Instant::now() < deadline {
+        if seen.lock().expect("stdout mutex").contains(mid_turn) {
+            reached = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    // Cloned out before the assertion, so a failure does not panic while
+    // holding the lock the reader thread needs — a poisoned mutex turns one
+    // clear failure into two confusing ones.
+    let so_far = seen.lock().expect("stdout mutex").clone();
+    assert!(
+        reached,
+        "the session never reached {mid_turn:?}, so the second line would not \
+         have been written during a turn; stdout so far:\n{so_far}"
+    );
+    stdin
+        .write_all(second.as_bytes())
+        .expect("write the mid-turn line");
+    stdin.flush().ok();
+    drop(stdin);
+
+    let status = child.wait().expect("teton exits");
+    pump.join().expect("the stdout reader thread");
+    let mut stderr = String::new();
+    if let Some(mut err) = child.stderr.take() {
+        let _ = std::io::Read::read_to_string(&mut err, &mut stderr);
+    }
+    let mut combined = seen.lock().expect("stdout mutex").clone();
+    assert!(
+        status.success(),
+        "the piped session must end cleanly; stdout:\n{combined}\nstderr:\n{stderr}"
+    );
+    combined.push_str(&stderr);
+    combined
+}
+
+/// **REQ-622 AC-7 / BR-1 — a piped session never leaves canonical mode, and its
+/// output is byte-for-byte what it was.**
+///
+/// The gate, from the side that must not change. `RowState::engage_input` asks
+/// three questions before it touches the terminal — is this a method that ends
+/// a turn, does the surface carry live rows (stdout), is stdin a terminal — and
+/// a piped session fails the last two, so `tcsetattr` is never reached at all
+/// (ADR-622-1). This leg is what says that gate is wired to the real edges
+/// rather than merely written down.
+///
+/// # What a pipe can and cannot witness, stated plainly
+///
+/// A pipe has no `ICANON` bit and no `ECHO` bit, so "no `tcsetattr` happened"
+/// is **not directly observable** here the way it is at a pty, where
+/// [`crate::pty_e2e`]'s legs read the flags back with `stty`. Adding a
+/// production counter to make it observable would be shipping a seam for a test
+/// to read, which this codebase declines to do for exactly the reason it
+/// declines the others (`slash::test_seams_allowed`'s polarity rule).
+///
+/// So the claim is made from the two directions a pipe *can* see, and they are
+/// between them tight enough that no build which entered raw mode could pass
+/// both:
+///
+/// 1. **Nothing the client-owned input path draws is here.** No activity glyph,
+///    no pending-row marker, no queued clause, and not one escape byte in the
+///    whole of stdout — a client that had taken the input would be echoing what
+///    it read, because with `ECHO` cleared nothing else would.
+/// 2. **A line written during a turn behaves exactly as it does today.** It is
+///    held by the kernel until the entry loop reads it, and it becomes the next
+///    prompt — and the whole transcript is **byte-identical** to the same
+///    session with both lines written up front. That is the strongest form of
+///    "piped is untouched" available: if anything in this REQ had reached a
+///    piped session, the timing of a write would have changed something about
+///    its output, and the two runs would differ.
+///
+/// The structural half — that the gate is three conjoined conditions and that
+/// `NoTerminal` is a different verdict from `Failed` — is `prompt.rs`'s
+/// `classify_raw_fails_open` and `client.rs`'s own unit tests, where it is
+/// authored.
+#[test]
+fn a_piped_stdin_session_never_enters_raw_mode() {
+    const HELD: &str = "The held turn answered.";
+    const NEXT: &str = "The second line got its answer.";
+    const FIRST_PROMPT: &str = "run a slow tool";
+    const SECOND_PROMPT: &str = "sent while the turn was working";
+    // A tool, not a `@delay-ms` block, and for a reason a pipe forces: the
+    // second line has to be written while the turn is **demonstrably** running,
+    // and a piped session prints nothing at all between the banner and the
+    // reply — it does not echo what it was given. A running tool does print,
+    // and `sleep 2` then holds the turn open for the write (LESSON-450: a state
+    // to wait on, rather than an interval to hope through).
+    //
+    // `full` is what lets the call run unattended; `generate = "never"` keeps
+    // REQ-613's `TETON.md` offer — which `full` would grant without asking —
+    // out of a fixture that only meant to allow one `sleep`.
+    const RUNNING: &str = "[running]";
+    let replies = [
+        r#"{"tool": "shell", "arguments": {"command": "sleep 2"}}"#,
+        HELD,
+        NEXT,
+    ];
+    let config = "[permissions]\ndefault_level = \"full\"\n\n[context]\ngenerate = \"never\"\n\n";
+    let daemon = TestDaemon::spawn_scripted_with_config(&daemon_bin(), &replies, config);
+    let teton = teton_bin();
+
+    let staged = run_with_a_line_sent_mid_turn(
+        &daemon,
+        &teton,
+        &format!("{FIRST_PROMPT}\n"),
+        RUNNING,
+        &format!("{SECOND_PROMPT}\n"),
+    );
+
+    // (1) Nothing this REQ or REQ-621 draws reached the pipe.
+    for glyph in common::ACTIVITY_GLYPHS {
+        assert!(
+            !staged.contains(glyph),
+            "an activity row reached a pipe (REQ-621 BR-6); output:\n{staged}"
+        );
+    }
+    assert!(
+        !staged.contains("> sent while") && !staged.contains("queued"),
+        "a piped session drew the client-owned input path — the pending row or \
+         its queued clause — which only a session that took the terminal would \
+         have (BR-1); output:\n{staged}"
+    );
+    assert!(
+        !staged.contains('\x1b'),
+        "a piped session emitted an escape byte. Not a frame, not an escape, \
+         not a blank line: the piped path is byte-comparable output and stays \
+         that way (REQ-556 BR-2, REQ-621 BR-6); output:\n{staged}"
+    );
+
+    // (2a) The mid-turn line behaved as today: held by the kernel, then read.
+    for marker in [HELD, NEXT] {
+        assert!(
+            staged.contains(marker),
+            "{marker:?} is missing, so the second line never became the next \
+             prompt; output:\n{staged}"
+        );
+    }
+    let held_at = staged.find(HELD).expect("asserted above");
+    let next_at = staged.find(NEXT).expect("asserted above");
+    assert!(
+        held_at < next_at,
+        "the line written during the turn must be answered after it, not \
+         interleaved with it; output:\n{staged}"
+    );
+
+    // (2b) And byte-identical to the same session written all at once. A second
+    // daemon, so the session id differs by design — which is what
+    // `mask_session_id` normalizes, and the only difference it is allowed to
+    // hide (it panics rather than pass a transcript with no banner in it).
+    let control_daemon = TestDaemon::spawn_scripted_with_config(&daemon_bin(), &replies, config);
+    let control = control_daemon.run_cli_with_stdin(
+        &teton,
+        &[],
+        &format!("{FIRST_PROMPT}\n{SECOND_PROMPT}\n"),
+    );
+    assert_eq!(
+        mask_session_id(&staged, "the staged run"),
+        mask_session_id(&control, "the control run"),
+        "the same two lines produced different output depending on *when* the \
+         second one was written. A piped session has no client-owned input \
+         path, so the timing of a write cannot reach its output — AC-7's \
+         'behaves as today' in the only form a pipe can state it"
+    );
+}

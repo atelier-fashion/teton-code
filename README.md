@@ -121,6 +121,32 @@ recovered without one — it prints a durable
 `turn 12s: model 4s, tools 5s, cost $0.001234` line as each turn ends, from the
 same accumulator the row was reading.
 
+**You can type while a turn is working.** The line you type appears on its own
+row beneath the activity row, echoed by Teton rather than by the terminal, and
+nothing the row does ever lands on it. Backspace edits it — one keypress removes
+one character, whether that character is `a` or `語` or an emoji. Press Enter and
+the line is **queued** as the next prompt: nothing is sent while the turn is
+still running, the row gains a `· N queued` clause so you can see the Enter
+registered, and when the turn ends each queued line is sent in order exactly as
+if you had typed it at the prompt — slash commands, `/cd`, and every check the
+normal path runs included. Each queued line becomes its own turn, with its own
+reply and its own cost line, and it is shown once, at the prompt that sends it.
+A block pasted during a turn arrives as several lines and queues one prompt per
+line.
+
+A question that opens mid-turn — a permission prompt, a model proposal — **never
+takes what you had already typed as its answer.** Your partial line is set aside
+before the question is drawn, the question is answered only by what you type
+after it appears, and your line comes back on its row afterwards, exactly as you
+left it. Ctrl-C still ends the session, with the terminal handed back the way it
+was found — that is now true of every exit, including the key prompt that turns
+echo off. Ctrl-D does nothing during a turn; it ends the session only at the
+prompt, as before. Arrow keys and function keys are ignored: they print nothing
+and change nothing, and the line you submit is exactly the line you typed. None
+of this applies to a piped or scripted session — with stdin or stdout not a
+terminal, Teton never touches the terminal's settings and behaves exactly as it
+did before.
+
 **Transcripts are off until you ask for one.** Two switches, with two
 lifetimes: `[transcript] enabled = true` in `config.toml` records every session
 created afterwards, and `/transcript on` / `/transcript off` switch the session

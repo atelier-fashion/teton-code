@@ -49,6 +49,7 @@ mod client;
 mod cost_ui;
 mod effort_ui;
 mod firstrun;
+mod input_editor;
 mod keychain;
 mod loading;
 mod markdown;
@@ -785,6 +786,28 @@ pub(crate) fn run_mirrored_command(
 /// `FramedStdinPrompter::draw`'s, and this must move if that does.
 const STATUS_ROWS_ABOVE_CURSOR: usize = 2;
 
+/// The queued line this iteration of the entry loop may re-enter, if any
+/// (REQ-622 ADR-622-5).
+///
+/// Split out of [`next_interactive_line`] so BR-6's *timing* — the half that
+/// says nothing typed during a turn reaches the daemon while that turn is still
+/// running — is assertable with no terminal, no daemon and no poll to fall
+/// through into. The guard is not defensive decoration: `take_next_queued`
+/// removes the line from the queue, so a drain that ran while raw mode was
+/// engaged would not merely be early, it would take the line out of the queue
+/// and hand it to a caller that is not the entry loop.
+///
+/// `raw_engaged` is a parameter rather than a read of
+/// [`prompt::RawMode::is_engaged`] here, for the reason every terminal fact in
+/// this binary is a parameter one layer in (REQ-560 BR-8): the one call site is
+/// the edge and passes the real answer.
+fn queued_for_entry(state: &mut SessionState, raw_engaged: bool) -> Option<String> {
+    if raw_engaged {
+        return None;
+    }
+    state.input.take_next_queued()
+}
+
 /// Wait for the next line an interactive user types, rendering anything the
 /// daemon says in the meantime (REQ-556 BR-1).
 ///
@@ -793,6 +816,14 @@ const STATUS_ROWS_ABOVE_CURSOR: usize = 2;
 /// before it renders and redrawn afterwards — otherwise the notice would land
 /// in the input row and shred it. Nothing queued means no teardown at all, so
 /// an idle session does not flicker once per interval.
+///
+/// **A line typed during the last turn comes back here, above the poll**
+/// (REQ-622 BR-6, ADR-622-5). It is returned exactly as a typed line would be,
+/// so it flows on through `slash::classify`, the REQ-615 `cd` intercept, the
+/// skill dispatcher and every pre-send check with no second code path — which
+/// is the whole reason the drain is at the poll and not at the dispatcher. One
+/// line per call, so each queued prompt is its own turn with its own hand-off
+/// and its own cost line rather than a batch that shares one.
 ///
 /// `None` on EOF (Ctrl-D), which the caller turns into the same post-loop
 /// session-end path `/quit` takes (REQ-555 BR-6).
@@ -813,6 +844,22 @@ fn next_interactive_line(
     // many rows that added, which is what `erase` needs to take back.
     let mut status_rows = paint_status(ctx, *tick);
     resync_terminal_width(entry, ctx);
+    // The drain, **ahead of the poll**. A line the user typed during the last
+    // turn is already a line; making it wait behind `stdin_ready` would hold it
+    // until the user touched the keyboard again or the daemon said something.
+    //
+    // It is shown here and nowhere else (BR-4): the turn printed nothing for it,
+    // and this frame — the prompt that is about to send it — is where the user
+    // sees what is going out. `draw_submitted` leaves the cursor where a typed
+    // Enter would have, so what follows is byte-for-byte the typed-line path.
+    //
+    // No second width read on this path, unlike the `stdin_ready` arm below:
+    // that one exists because a frame drawn *before* the wait can be stale by
+    // the time a line arrives, and here `resync_terminal_width` ran one line ago.
+    if let Some(line) = queued_for_entry(ctx.state, prompt::RawMode::is_engaged()) {
+        entry.draw_submitted(entry_prompt, &line);
+        return Ok(Some(line));
+    }
     entry.draw(entry_prompt);
     loop {
         if prompt::stdin_ready(FRAME_INTERVAL) {
@@ -9255,6 +9302,236 @@ mod tests {
              the `--verbose` flag, so one source of truth governs this line and \
              the routing notices (D-5). Outside verbose nothing prints, which is \
              what keeps default piped output byte-identical (BR-6)"
+        );
+    }
+
+    // ---- REQ-622 BR-6: a queued line re-enters at the poll ----------------
+
+    /// The `UiContext` the entry loop is driven with here.
+    ///
+    /// An interactive shape with a recorder for a screen: `typed_input` true,
+    /// because the queue only ever holds lines a person typed, and a recorder
+    /// with no live rows because what this fixture is about is *which line comes
+    /// back and when*, not what a terminal painted.
+    fn entry_ctx<'a>(
+        surface: &'a mut RecordingSurface,
+        state: &'a mut SessionState,
+        prompter: &'a mut ScriptedPrompter,
+    ) -> UiContext<'a> {
+        UiContext {
+            surface,
+            state,
+            prompter,
+            answer_permissions: true,
+            answer_model_proposals: true,
+            auto_accept_model: false,
+            typed_input: true,
+            session_id: None,
+            skills: slash::SkillSnapshot::empty(),
+        }
+    }
+
+    /// REQ-622 BR-6 / ADR-622-5: the lines typed during a turn come back at the
+    /// entry loop **in order, one per call, ahead of the poll** — and nothing
+    /// durable is printed for them.
+    ///
+    /// Driven through the real `next_interactive_line` with a scripted
+    /// connection and a pre-loaded editor, because the ordering claim is about
+    /// that function and not about the queue: `InputEditor` hands lines back
+    /// oldest-first whatever the caller does, and the failure mode BR-6 names is
+    /// a caller that drains them all into one turn, or drains them behind the
+    /// poll where they wait for the next keystroke.
+    ///
+    /// **The prompter is unframed on purpose.** The frame's bytes — the queued
+    /// line shown once in the input row, the cursor stepped past it as Enter
+    /// would — are asserted where they are composed and where a count can see
+    /// them, in `prompt.rs`
+    /// (`a_queued_lines_frame_echoes_it_once_and_advances_as_enter_would`).
+    /// There is no terminal here, so a framed prompter would write escapes into
+    /// the test's own output and assert nothing extra.
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** move the drain from
+    /// above `entry.draw(entry_prompt)` to inside the loop, below the
+    /// `stdin_ready` arm. **1 red of 853**, this test and nothing else. It fails
+    /// on the first assertion — the poll reaches `read_line` on a stdin at EOF,
+    /// so the queued line comes back as `None` rather than as `cargo test` —
+    /// and its source-order assertion below is red under the same mutant
+    /// (`drain < poll` becomes false), which is the half that fires whatever
+    /// descriptor 0 happens to be. Reverted with the same edit.
+    ///
+    /// **Two defects in this test itself, found at the verify pass and fixed
+    /// here.**
+    ///
+    /// It was **order-dependent**. `next_interactive_line` asks
+    /// `RawMode::is_engaged()`, which is read off one process-wide slot
+    /// (ADR-622-3), and this test took no lock — so any sibling arming a guard
+    /// on another thread could make the drain refuse and turn the first
+    /// assertion red for a reason that has nothing to do with the queue.
+    /// `both_guards_arm_and_clear_the_restore_slot` names it as collateral in
+    /// its own mutation record: *"passes when run alone and fails in both
+    /// full-suite runs, because the slot is process-wide and it does not take
+    /// `lock_the_slot`."* It takes it now — which is what made that function
+    /// `pub(crate)`.
+    ///
+    /// And the source-order slice was **unbounded**: `&production[at..]` ran to
+    /// the end of the production text, so `drain < poll` was a claim about
+    /// whichever `queued_for_entry(` and `stdin_ready(FRAME_INTERVAL)` came
+    /// first *anywhere* below this signature rather than about this function.
+    ///
+    /// **Recorded honestly: no mutation distinguishes the two today**
+    /// ([[LESSON-568]] asks for a named mutation; "none yet" is the answer when
+    /// the failure is not reachable). The drift was constructed and run
+    /// (2026-09-10): delete the drain from `next_interactive_line` and add a
+    /// `queued_for_entry(` call to `resync_terminal_width` below it. **1 red of
+    /// 872 either way** — bounded, the `.expect` fails on the drain that is no
+    /// longer in this function; unbounded, it finds the decoy, which sits below
+    /// the poll, so `drain < poll` is false and the same assertion fires by a
+    /// different route. It cannot be fooled while the poll is the last of the
+    /// two in this function, and it is. What the bound buys is that this stays
+    /// true when it stops being: split `next_interactive_line`, or add a second
+    /// drain-and-poll pair beneath it, and an unbounded `find` starts answering
+    /// about the wrong pair with nothing to say so.
+    #[test]
+    fn queued_lines_re_enter_ahead_of_the_poll_in_order() {
+        // `next_interactive_line` asks `RawMode::is_engaged()`, which is read
+        // off one **process-wide** slot (ADR-622-3) — so this test's answer can
+        // be falsified by any other test that happens to be arming a guard at
+        // the same instant, and `cargo test` runs them in parallel threads. It
+        // was order-dependent until it took the slot's lock, which is the same
+        // lock `prompt.rs`'s own guard tests take (REQ-622, verify).
+        let _slot = prompt::lock_the_slot();
+
+        let (mut conn, _peer) = Connection::scripted(&[]);
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = ScriptedPrompter::new(&[]);
+
+        // Two lines typed while the last turn was running, oldest first.
+        state.input.push(b"cargo test\n");
+        state.input.push(b"/cost\n");
+        assert_eq!(state.input.queued_len(), 2);
+
+        let mut entry = FramedStdinPrompter::new(false, false);
+        let mut tick = 0u64;
+        {
+            let mut ctx = entry_ctx(&mut surface, &mut state, &mut prompter);
+            for expected in ["cargo test", "/cost"] {
+                let line = next_interactive_line("> ", &mut entry, &mut conn, &mut ctx, &mut tick)
+                    .expect("draining the queue asks the daemon nothing and cannot fail");
+                assert_eq!(
+                    line.as_deref(),
+                    Some(expected),
+                    "queued lines re-enter oldest first, one per call"
+                );
+            }
+        }
+        assert_eq!(
+            state.input.queued_len(),
+            0,
+            "one line per call, and the queue is empty once it has been drained"
+        );
+
+        // BR-4: nothing durable was printed for either line. The one place a
+        // queued line is ever shown is the frame of the prompt about to send it,
+        // which is the prompter's bytes and not a surface row — a `line()` here
+        // would put it in scrollback twice.
+        let rendered = format!("{:?}", surface.calls);
+        assert!(
+            !rendered.contains("cargo test") && !rendered.contains("/cost"),
+            "a queued line reaches the screen through the entry frame only: {rendered}"
+        );
+
+        // Nothing is sent while the turn is still running (BR-6). The guard is
+        // asserted here rather than by driving a raw-engaged
+        // `next_interactive_line`, which would fall through to a blocking poll:
+        // what matters is that the line is still *in the queue* afterwards,
+        // because `take_next_queued` removes it.
+        state.input.push(b"one more\n");
+        assert_eq!(queued_for_entry(&mut state, true), None);
+        assert_eq!(
+            state.input.queued_len(),
+            1,
+            "a drain refused mid-turn must leave the line queued, not consume it"
+        );
+        assert_eq!(
+            queued_for_entry(&mut state, false).as_deref(),
+            Some("one more")
+        );
+
+        // **And it is above the poll, not below it** ([[LESSON-547]],
+        // [[LESSON-568]]). The behavioural assertion above depends on what
+        // descriptor 0 is under `cargo test` — at a terminal a drain moved below
+        // the poll still returns the line, one frame late. Source order is the
+        // half of ADR-622-5 that holds on every machine.
+        const MAIN_RS: &str = include_str!("main.rs");
+        let production = match MAIN_RS.find("\n#[cfg(test)]\nmod tests {") {
+            Some(at) => &MAIN_RS[..at],
+            None => panic!("main.rs must keep its `#[cfg(test)] mod tests` marker"),
+        };
+        let at = production
+            .find("fn next_interactive_line(")
+            .expect("the entry loop's reader");
+        // **Bounded to the function**, not to the rest of the file (REQ-622,
+        // verify). An unbounded slice makes `drain < poll` a claim about
+        // whichever `queued_for_entry(` and `stdin_ready(FRAME_INTERVAL)` come
+        // first *anywhere below here* — so a drain deleted from this function
+        // entirely could still satisfy it from a later one, which is the
+        // ordering assertion passing over the mutation it exists to catch. A
+        // `\n}\n` is the closing brace at column 0: nothing nested reaches
+        // column 0, so the first one after the signature ends this function.
+        let body = &production[at..];
+        let body = &body[..body
+            .find("\n}\n")
+            .expect("the entry loop's reader has a closing brace")];
+        let drain = body
+            .find("queued_for_entry(")
+            .expect("the entry loop drains the queue");
+        let poll = body
+            .find("if prompt::stdin_ready(FRAME_INTERVAL)")
+            .expect("the entry loop polls stdin");
+        assert!(
+            drain < poll,
+            "the drain runs **before** the poll (ADR-622-5): below it, a line \
+             already typed waits for the next keystroke or the next event"
+        );
+    }
+
+    /// REQ-622 BR-6: a queued slash line takes the typed-line path, classifier
+    /// included.
+    ///
+    /// The point of re-entering above `slash::classify` rather than beside the
+    /// dispatcher: `/cost` typed during a turn has to *run* afterwards, not
+    /// reach the model as five characters of prose. Asserted at the classifier
+    /// because that is the seam the whole path hangs off — the `cd` intercept,
+    /// skill dispatch, the CLI mirror and the REQ-581 turn record are all
+    /// downstream of it, and a queued line that classified as a command is a
+    /// queued line that meets every one of them (AC-2's pty leg is TASK-419's).
+    #[test]
+    fn a_queued_slash_line_reaches_the_classifier_as_a_command() {
+        let mut state = SessionState::new();
+        state.input.push(b"/cost\n");
+        let line = queued_for_entry(&mut state, false).expect("the queued line");
+        assert_eq!(line, "/cost");
+
+        let skills = slash::SkillSnapshot::empty();
+        match slash::classify(line.trim(), &skills) {
+            slash::Input::Command { name, args } => {
+                assert_eq!(name, "cost");
+                assert_eq!(args, "");
+            }
+            other => panic!("a queued `/cost` must classify as a command: {other:?}"),
+        }
+
+        // And an ordinary line still classifies as a prompt, so the arm above is
+        // the classifier reading the line rather than the queue implying it.
+        state.input.push(b"cargo test\n");
+        let line = queued_for_entry(&mut state, false).expect("the queued line");
+        assert!(
+            matches!(
+                slash::classify(line.trim(), &skills),
+                slash::Input::Prompt(_)
+            ),
+            "a queued prose line is a prompt"
         );
     }
 }

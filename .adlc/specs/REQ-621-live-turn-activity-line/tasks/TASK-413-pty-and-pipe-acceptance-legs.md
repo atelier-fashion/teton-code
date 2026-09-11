@@ -41,7 +41,7 @@ freshness guard and polls for state (`wait_for` / `wait_until`), never sleeps.
 | BR-3 | test-case | `crates/teton/tests/pty_e2e.rs::a_running_tool_shows_its_title_elapsed_and_cost_so_far_beneath_its_running_line` | no |
 | BR-5 | test-case | `crates/teton/tests/pty_e2e.rs::every_exit_erases_the_row` | no |
 | BR-6 | test-case | `crates/teton/tests/cli_e2e.rs::a_piped_turn_emits_no_activity_bytes` | yes |
-| BR-9 | test-case | `crates/teton/tests/pty_e2e.rs::typed_bytes_survive_the_animation` | no |
+| BR-9 | test-case | ~~`crates/teton/tests/pty_e2e.rs::typed_bytes_survive_the_animation`~~ — **retired 2026-09-10 by REQ-622**; the leg is deleted and its subject folded into `pty_e2e::a_submitted_line_is_never_overwritten_and_becomes_the_next_prompt` (REQ-622 AC-1), which makes the opposite claim over the same script now that the row is never abandoned | no |
 | BR-11 | test-case | `crates/teton/tests/pty_e2e.rs::a_silent_daemon_earns_the_stall_annotation_and_a_long_tool_does_not` | yes |
 | BR-12 | test-case | `crates/teton/tests/pty_e2e.rs::every_exit_erases_the_row` | no |
 | BR-16 | test-case | `crates/teton/tests/cli_e2e.rs::a_verbose_turn_ends_with_one_summary_line` | yes |
@@ -52,7 +52,7 @@ freshness guard and polls for state (`wait_for` / `wait_until`), never sleeps.
 | AC-6 | test-case | `crates/teton/tests/pty_e2e.rs::a_silent_daemon_earns_the_stall_annotation_and_a_long_tool_does_not` | yes |
 | AC-7 | test-case | `crates/teton/tests/pty_e2e.rs::every_exit_erases_the_row` | no |
 | AC-7 | test-case | `crates/teton/tests/common/mod.rs::tests` — the cursor interpreter's own literal oracles (withdraw, repaint save/restore, the three erase modes, cursor-up saturation, a plain transcript) | no |
-| AC-10 | test-case | `crates/teton/tests/pty_e2e.rs::typed_bytes_survive_the_animation` | no |
+| AC-10 | test-case | ~~`crates/teton/tests/pty_e2e.rs::typed_bytes_survive_the_animation`~~ — **retired 2026-09-10 by REQ-622**, folded into `pty_e2e::a_submitted_line_is_never_overwritten_and_becomes_the_next_prompt` (REQ-622 AC-1), which adds what this leg could not ask for: that the line comes back as the next prompt | no |
 | AC-11 | structural-check | `crates/teton/tests/common/mod.rs`: `daemon_bin()` freshness guard on every leg above | no |
 | AC-11 | test-case | `crates/teton/tests/pty_e2e.rs::the_row_steps_aside_for_a_permission_prompt_and_returns_after_the_answer` — the last TTY claim in the list that had only a renderer-unit stand-in (BUG-191) | yes |
 | AC-13 | test-case | `crates/teton/tests/cli_e2e.rs::a_verbose_turn_ends_with_one_summary_line` | yes |

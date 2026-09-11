@@ -198,6 +198,22 @@ pub struct TurnActivity {
     tool_time: Duration,
     /// The phase a permission request interrupted, restored when it is answered.
     resume_after_permission: Option<Phase>,
+    /// How many lines the user has submitted during this turn and not yet had
+    /// sent (REQ-622 BR-14).
+    ///
+    /// **Told, never folded.** Every other field here comes from an event the
+    /// daemon published; this one comes from the pump's keyboard, which is the
+    /// one fact about a turn no daemon can report — the same reason
+    /// [`Self::begin`] exists and takes `now` from its caller. It is a count
+    /// rather than the lines themselves because the row may say *how many* and
+    /// must never say *what*: the queued text is the user's, it belongs to
+    /// [`crate::input_editor::InputEditor`], and a copy of it here would be a
+    /// second store to keep in step with the one that will be sent.
+    ///
+    /// Cleared by [`Self::begin`] and [`Self::finish`] with everything else,
+    /// which is what makes the clause a claim about *this* turn: a queue
+    /// drained into the next turn's prompt is no longer waiting.
+    queued: usize,
 }
 
 impl TurnActivity {
@@ -343,6 +359,22 @@ impl TurnActivity {
         }
     }
 
+    /// How many lines are queued for after this turn (REQ-622 BR-14).
+    ///
+    /// Set by the pump from the count [`crate::input_editor::Edit::Queued`]
+    /// carries, so the clause and the queue cannot disagree: the editor owns
+    /// the lines and reports its own length, and this module never counts
+    /// anything itself. A setter rather than an increment for that reason — an
+    /// increment would be a second tally, and the two would part company the
+    /// first time a line was drained.
+    ///
+    /// Takes no `now`, alone among the mutators here: an Enter is not a phase
+    /// change and must not touch the phase clock. The user submitting a line
+    /// says nothing at all about what the turn is doing.
+    pub fn set_queued(&mut self, queued: usize) {
+        self.queued = queued;
+    }
+
     /// What the daemon last reported this turn to be doing.
     #[must_use]
     pub fn phase(&self) -> Phase {
@@ -359,7 +391,12 @@ impl TurnActivity {
     /// [`crate::client::RowState::width`] exists to avoid.
     #[must_use]
     pub fn has_row(&self, now: Instant) -> bool {
-        let Some(last_event) = self.last_event else {
+        // The same three facts `frame` needs, so the two can never disagree:
+        // a `true` here with a `None` frame would hide BR-14's count in both
+        // places at once (verify, Step D).
+        let (Some(_), Some(_), Some(last_event)) =
+            (self.turn_started, self.phase_since, self.last_event)
+        else {
             return false;
         };
         let stalled = now.saturating_duration_since(last_event) >= STALL_AFTER
@@ -441,6 +478,19 @@ impl TurnActivity {
         // the turn ends.
         if self.cost_micros != 0 {
             row.push_str(&format!(" · {}", format_usd(self.cost_micros)));
+        }
+        // REQ-622 BR-14: an Enter that registered is visible without waiting
+        // for the turn to end. The pending row it came from is withdrawn the
+        // moment the line is queued, so without this clause the only feedback
+        // for a submitted line would be its own disappearance — which is what
+        // a swallowed keystroke looks like too.
+        //
+        // Ahead of the stall annotation and behind the cost, because the stall
+        // clause keeps the last word for the reason written below. Subject to
+        // the same fit as every other clause: on a terminal too narrow for it
+        // the row loses its tail rather than its shape (BR-14).
+        if self.queued != 0 {
+            row.push_str(&format!(" · {} queued", self.queued));
         }
         // Last, so the phase, its clock and the turn's clock read in the same
         // places they do on a healthy row — a reader comparing two frames is
@@ -818,6 +868,19 @@ mod tests {
         activity
     }
 
+    /// A turn awaiting the model with `lines` submitted and waiting (REQ-622
+    /// BR-14).
+    ///
+    /// The count arrives the way the pump delivers it — one
+    /// [`TurnActivity::set_queued`] with the editor's own length — rather than
+    /// by writing the field, so the table's rows are asserting the seam the
+    /// client actually uses.
+    fn queued_lines(t0: Instant, lines: usize) -> TurnActivity {
+        let mut activity = folded(t0, &[(1, full_route())]);
+        activity.set_queued(lines);
+        activity
+    }
+
     /// BR-2: every word of detail in the row came from the event that carried
     /// it. The provider, model and tier are `route_decided`'s; the tool
     /// sentence is the title the daemon composed, not a second reading of the
@@ -1004,6 +1067,68 @@ mod tests {
                     "⠋ waiting on anthropic claude-opus-5 (think) · reading context 1,200/4,096 · \
                      1s · turn 2s",
                 ),
+            ),
+            // REQ-622 BR-14: the queued clause, its count, its absence, and its
+            // place in the row. The count is the editor's own `queued_len` as
+            // the pump reported it, so these rows are also the oracle for "the
+            // clause and the queue cannot disagree" — a row composed from
+            // anything the row itself counted would pass against a tally that
+            // had drifted.
+            (
+                "one line submitted during the turn",
+                queued_lines(t0, 1),
+                at(t0, 2),
+                0,
+                120,
+                Some("⠋ waiting on anthropic claude-opus-5 (think) · 1s · turn 2s · 1 queued"),
+            ),
+            (
+                "a second Enter is a second line, not a second clause",
+                queued_lines(t0, 2),
+                at(t0, 2),
+                0,
+                120,
+                Some("⠋ waiting on anthropic claude-opus-5 (think) · 1s · turn 2s · 2 queued"),
+            ),
+            (
+                "an empty queue adds no clause",
+                queued_lines(t0, 0),
+                at(t0, 2),
+                0,
+                120,
+                Some("⠋ waiting on anthropic claude-opus-5 (think) · 1s · turn 2s"),
+            ),
+            (
+                // The order of the two optional clauses, pinned: cost is the
+                // turn's and comes first, the queue is the keyboard's and comes
+                // after it. Both sit ahead of the stall annotation, which keeps
+                // the last word so the counters do not move on a stalled row.
+                "cost and a queued line, in that order",
+                {
+                    let mut activity = folded(t0, &[(1, full_route()), (1, cost(12_345))]);
+                    activity.set_queued(1);
+                    activity
+                },
+                at(t0, 2),
+                0,
+                120,
+                Some(
+                    "⠋ waiting on anthropic claude-opus-5 (think) · 1s · turn 2s · $0.012345 · \
+                     1 queued",
+                ),
+            ),
+            (
+                // BR-14's last clause: the queued notice is *subject to* the fit
+                // and does not escape it. A clause appended after the fit would
+                // put this row at twenty-nine columns on a twenty-column
+                // terminal, hard-wrap it into a second row, and leave residue
+                // `withdraw_row_above` cannot clear.
+                "a queued clause is cut with the rest of the row",
+                queued_lines(t0, 1),
+                at(t0, 2),
+                0,
+                20,
+                Some("⠋ waiting on anthro"),
             ),
             (
                 // Nineteen columns at a width of twenty: the last cell is left
@@ -1289,12 +1414,50 @@ mod tests {
         assert_eq!(activity.finish(at(t0, 12)), TurnSummary::default());
     }
 
+    /// **REQ-622 BR-14: a spent turn's queue reaches no later row.**
+    ///
+    /// `finish` and `begin` both clear the count by resetting the whole struct,
+    /// which is [`TurnActivity::begin`]'s rule and the reason it is written as
+    /// a reset rather than as a list of fields: a turn that ended by a path
+    /// nobody anticipated must not lend its queue to the next one, any more
+    /// than its cost or its clock. The queue itself belongs to the editor and
+    /// survives the turn on purpose — the lines are about to be sent — so the
+    /// pump tells the *next* turn its own count, and this row starts at none.
+    #[test]
+    fn a_finished_turns_queued_count_is_not_the_next_turns() {
+        let t0 = Instant::now();
+        let mut activity = queued_lines(t0, 2);
+        assert_eq!(
+            activity.frame(at(t0, 2), 0, 120).as_deref(),
+            Some("⠋ waiting on anthropic claude-opus-5 (think) · 1s · turn 2s · 2 queued"),
+            "the fixture has a clause to lose"
+        );
+
+        // A queued line is not a turn figure, so the summary says nothing
+        // about it — the count is the keyboard's, and BR-16's figures are the
+        // turn's.
+        let spent = activity.finish(at(t0, 3));
+        assert_eq!(spent.total, Duration::from_secs(3));
+        assert_eq!(spent.cost_micros, 0, "a submitted line costs nothing");
+
+        activity.begin(at(t0, 4));
+        assert_eq!(
+            activity.frame(at(t0, 4), 0, 120).as_deref(),
+            Some("⠋ preparing turn · 0s · turn 0s")
+        );
+    }
+
     /// A turn armed over a spent one inherits nothing — not its cost, not its
     /// phase, not its clock.
     #[test]
     fn a_new_turn_inherits_nothing_from_the_last_one() {
         let t0 = Instant::now();
         let mut activity = folded(t0, &[(1, full_route()), (2, cost(500_000))]);
+        // REQ-622 BR-14, isolated on `begin`: the lines that were waiting have
+        // been drained into the prompts that follow — this turn is one of them
+        // — so a clause still saying they are waiting would be the row
+        // reporting the last turn's keyboard.
+        activity.set_queued(3);
         activity.begin(at(t0, 20));
         assert_eq!(
             activity.frame(at(t0, 22), 0, 120).as_deref(),
