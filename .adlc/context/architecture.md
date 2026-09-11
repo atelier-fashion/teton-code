@@ -208,7 +208,12 @@
   wait with a timeout at all: a surface that does not own a terminal's rows
   keeps the blocking receive, never reaches a tick arm, and so cannot emit a
   byte it did not emit before. A second owner, or a caller-held gate, is how a
-  row ends up in scrollback (REQ-621 ADR-621-1/ADR-621-3, LESSON-481).
+  row ends up in scrollback (REQ-621 ADR-621-1/ADR-621-3, LESSON-481). **The
+  row's verbs hold what the renderer holds**: a live row is drawn
+  (`Surface::draw_row`), repainted and withdrawn without emitting a partial
+  streamed line, which goes out where the row was, by the durable write or the
+  turn's end that follows the withdraw — a row that flushed on its way in ended
+  the streamed line at every token that arrived while it was up (REQ-622 BR-4).
 - **A terminal mode change registers its undo where a signal can find it** —
   every guard that alters `termios` saves the settings it is replacing into one
   process-wide slot, and one `sigaction` handler restores from that slot and
@@ -1081,7 +1086,9 @@ ownership sweep in that file:
 
 The split is the whole point. The reason `end_block()` exists is not the
 buffered tail — every arm of the turn loop writes through `line()`, which emits
-the pending buffer before claiming its row. It is that **only `end_block()`
+the pending buffer before claiming its row (the live block's own verbs are the
+one exception and hold instead, since the block is gone again before anything
+durable is written — REQ-622 BR-4). It is that **only `end_block()`
 clears the fence**, and an unclosed fence otherwise renders every later line of
 every later turn verbatim. But clearing the fence is a *turn-boundary* act: at a
 mid-turn pause it re-flows a resumed code block mid-token. So a pause needs the

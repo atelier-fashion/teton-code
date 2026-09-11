@@ -233,7 +233,7 @@ struct RowState {
     /// Whether the **pending** row — what the user is typing — is on screen,
     /// always the bottom row of the block and always one above the cursor.
     ///
-    /// A row cannot be inserted above one already drawn ([`Surface::line`]
+    /// A row cannot be inserted above one already drawn ([`Surface::draw_row`]
     /// appends at the cursor), so a change in the activity row's *presence*
     /// while this row is up takes both rows down and redraws them in order.
     /// That reflow is in [`Self::paint_rows`] and is the reason the two
@@ -590,7 +590,7 @@ impl RowState {
     /// | activity | pending | done |
     /// |---|---|---|
     /// | `Some`, on screen | unchanged | `repaint_row_above(2 or 1, ..)` — in place |
-    /// | `Some`, not on screen | — | `line` — the row scrolls in beneath whatever was last written |
+    /// | `Some`, not on screen | — | `draw_row` — the row scrolls in beneath whatever was last written |
     /// | `None`, on screen | taken down first | `withdraw_row_above(1)` — gone without residue |
     /// | `Some` ⇄ `None` | on screen | pending withdrawn, then both drawn in order |
     ///
@@ -601,6 +601,15 @@ impl RowState {
     /// activity row is then the **projection's** decision and never the
     /// method's: a `/cost` pumping through this loop finds the activity idle
     /// and paints nothing (ADR-621-1).
+    ///
+    /// **Both rows are drawn with [`Surface::draw_row`], never `line`** (REQ-622
+    /// BR-4). A durable line flushes whatever the renderer is holding ahead of
+    /// itself, which is right for a durable line and wrong for a row this loop
+    /// is about to take back: the block is redrawn after every streamed token,
+    /// so a draw that flushed ended the streamed line at every token — a reply
+    /// typed past came out one word per row where the same reply with nothing
+    /// typed was one. The held line goes out where the block was, by the
+    /// durable write or the turn's end that follows the next withdraw.
     fn paint_rows(&mut self, ctx: &mut UiContext, now: Instant) {
         if !self.live {
             return;
@@ -662,14 +671,14 @@ impl RowState {
                     return;
                 }
             } else {
-                // The one write here that reports nothing: `line` is the seam
-                // every durable write shares and is infallible by signature, so
-                // a draw whose bytes did not land still marks the row visible.
-                // That is the asymmetry BR-13 leaves — the fallible verbs are
-                // the two that move the cursor — and it self-corrects on the
-                // next tick: a stdout that dropped the draw drops the repaint
-                // too, and *that* verb reports it.
-                ctx.surface.line(LineKind::Activity, &text);
+                // The one write here that reports nothing: `draw_row` has
+                // `line`'s signature — the seam every durable write shares,
+                // infallible — so a draw whose bytes did not land still marks
+                // the row visible. That is the asymmetry BR-13 leaves — the
+                // fallible verbs are the two that move the cursor — and it
+                // self-corrects on the next tick: a stdout that dropped the
+                // draw drops the repaint too, and *that* verb reports it.
+                ctx.surface.draw_row(LineKind::Activity, &text);
                 self.activity_visible = true;
             }
         }
@@ -681,7 +690,7 @@ impl RowState {
                     self.hide_after_a_failed_write(ctx);
                 }
             } else {
-                ctx.surface.line(LineKind::Activity, &text);
+                ctx.surface.draw_row(LineKind::Activity, &text);
                 self.pending_visible = true;
             }
         }
@@ -1331,6 +1340,12 @@ impl Connection {
             // own. A durable line — `shell: … [running]`, a notice, a
             // permission question — therefore always prints where the block
             // was, and the block comes back beneath it a few lines below.
+            //
+            // A streamed token is not a durable line. What the renderer is
+            // holding stays held across the withdraw and the redraw — the
+            // block's verbs hold, `Surface::draw_row` — so a reply streamed
+            // past a pending row reaches the screen in the rows it would have
+            // had with no block at all (REQ-622 BR-4).
             if !row.withdraw_rows(ctx) {
                 row.hide_after_a_failed_write(ctx);
             }

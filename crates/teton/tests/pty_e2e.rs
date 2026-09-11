@@ -5435,6 +5435,8 @@ fn the_row_steps_aside_for_a_permission_prompt_and_returns_after_the_answer() {
 //   AC-12 → `a_queued_line_is_announced_on_the_row`
 //   AC-13 → `ctrl_d_mid_turn_is_inert`
 //   AC-14 → `a_pasted_block_queues_one_prompt_per_line`
+//   BR-4, a reply streamed past a pending row (not an AC; the defect found
+//   at review) → `a_reply_streamed_past_a_pending_row_renders_as_it_does_without_one`
 //
 // AC-7's leg is in `cli_e2e.rs`, where a pipe is the fixture rather than the
 // blind spot. AC-10 and AC-11 are unit claims by construction — a pure editor
@@ -5750,7 +5752,7 @@ fn a_submitted_line_is_never_overwritten_and_becomes_the_next_prompt() {
     // below: before that row exists the activity row is alone and correctly
     // repaints one row above the cursor, and a window that swallowed those
     // frames would report the correct behaviour as the defect. (A withdraw
-    // takes both rows down together and the redraw uses `line` for both, so
+    // takes both rows down together and the redraw uses `draw_row` for both, so
     // there is no later stretch inside this window where the activity row is
     // alone again.)
     let pending_at = during
@@ -5822,6 +5824,190 @@ fn a_submitted_line_is_never_overwritten_and_becomes_the_next_prompt() {
         "the one place it is shown must be the entry frame's input row, so the \
          user sees what is going out where they would have typed it \
          (ADR-622-5); screen:\n{:#?}",
+        common::rendered_screen(&seen)
+    );
+}
+
+/// **REQ-622 BR-3 / BR-4 / BR-13 — a reply streamed while a pending row is up
+/// renders exactly as it does with nothing typed.**
+///
+/// The defect this leg was written against. Every streamed token wakes the
+/// pump, which takes the block down before the token is dispatched and draws it
+/// again afterwards (ADR-622-4, the withdraw-before-durable-write rule). Under
+/// REQ-621 alone that cycle never ran mid-stream — the activity row is not due
+/// while text is streaming — so nothing had ever asked what a draw or a
+/// withdraw does to the line the renderer is still *holding* (a markdown
+/// surface holds a partial line until a newline completes it, REQ-592). The
+/// pending row **is** due mid-stream, and the surface's answer was to emit the
+/// held partial line ahead of each of its own verbs: `One two three four five.`
+/// reached the screen as five rows, one per token, while the same reply with
+/// nothing typed reached it as one. That is scrollback the turn would not have
+/// had without the typing — BR-4's "today's scrollback plus each queued line"
+/// broken by a line that was never even queued — and BR-13's one owner painting
+/// over a stream it does not own.
+///
+/// Two sessions, one reply, and the claim is that they agree:
+///
+/// 1. **With a line typed and left unsubmitted** before the first token, the
+///    reply is one row of the replayed screen, and that row is the reply.
+/// 2. **With nothing typed**, the same session script gives the same row.
+///
+/// Non-vacuity, in the typed session, and both halves are needed: the pending
+/// row was drawn *before* the reply's first byte reached the transcript, and
+/// the block came down and went back up at least twice between those two
+/// points — so the withdraw/draw cycle the defect lived in demonstrably ran
+/// with the pending row up. Without the second half a build that stopped
+/// drawing the pending row during a stream would pass claim (1) trivially.
+///
+/// # What breaks this test
+///
+/// One mutation was applied and observed red here (2026-09-10):
+///
+/// | Mutation | Fails |
+/// |---|---|
+/// | `PlainSurface::draw_row` delegates to `self.line(kind, text)` (`render.rs`) — the block's draw flushes held text again | **1 red of 50** in this file, this leg, on claim (1): the screen carries `One`, `two`, `three`, `four`, `five.` as five rows and no row equal to the reply. **1 red of 854** in the unit binary, `render::tests::a_live_row_holds_what_the_renderer_is_holding`. Every other leg stays green, which is the point: no earlier leg streamed a reply past a pending row, and the REQ-621 legs stream theirs past no row at all |
+#[test]
+fn a_reply_streamed_past_a_pending_row_renders_as_it_does_without_one() {
+    const REPLY: &str = "One two three four five.";
+    // Typed and never submitted, so the row is up for the whole stream and no
+    // queued line is ever echoed — the screen after the turn owes nothing to
+    // the typing at all. No word of the reply in it, so a row is either the
+    // reply's or the typing's.
+    const TYPED: &str = "typed but not sent";
+    let script = format!("@delay-ms 1500\n{REPLY}");
+
+    // ---- The control: nothing typed.
+    let reply_row = {
+        let mut control = RenderedSession::open(100, &[&script], &[]);
+        control.type_line("stream past nothing");
+        // Waited for by its last token rather than by the whole reply: the
+        // defect's transcript never contains the reply as one string.
+        assert!(
+            control.wait_for("five."),
+            "the control turn never answered; transcript:\n{}",
+            control.snapshot()
+        );
+        assert!(
+            control.wait_until(|seen| seen.ends_with("\x1b[0m ")),
+            "the control session never got back to its entry prompt; transcript:\n{}",
+            control.snapshot()
+        );
+        let seen = control.snapshot();
+        let rows: Vec<String> = common::rendered_screen(&seen)
+            .into_iter()
+            .filter(|row| row.contains("five."))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![REPLY.to_owned()],
+            "with nothing typed the reply is one row and it is the reply — the \
+             oracle the typed session is held to; screen:\n{:#?}",
+            common::rendered_screen(&seen)
+        );
+        rows.into_iter().next().expect("one row, asserted above")
+    };
+
+    // ---- The case: a line typed before the first token and never sent.
+    let mut session = RenderedSession::open(100, &[&script], &[]);
+    session.type_line("stream past a pending row");
+    assert!(
+        session.wait_until(|seen| seen.matches(REPAINT_OPEN).count() >= 2),
+        "the row never animated, so the typing below would not be during the \
+         turn; transcript:\n{}",
+        session.snapshot()
+    );
+    session.type_raw(TYPED);
+    let typed_row = pending_row(TYPED);
+    assert!(
+        session.wait_until(|seen| screen_carries(seen, &typed_row)),
+        "the typed line never appeared on a row of its own (BR-3); screen:\n{:#?}\n\
+         transcript:\n{}",
+        common::rendered_screen(&session.snapshot()),
+        session.snapshot()
+    );
+    assert!(
+        session.wait_for("five."),
+        "the turn never answered; transcript:\n{}",
+        session.snapshot()
+    );
+    assert!(
+        session.wait_until(|seen| seen.ends_with("\x1b[0m ")),
+        "the session never got back to its entry prompt; transcript:\n{}",
+        session.snapshot()
+    );
+    let seen = session.snapshot();
+
+    // Non-vacuity. The pending row's first draw precedes the reply's first byte
+    // in the transcript, and between that draw and the reply's *last* token the
+    // block was withdrawn after a draw at least twice: `\n` is how a drawn row
+    // ends and `WITHDRAW` is how the next message takes it back, so the pair is
+    // one cycle of the discipline this leg is about, run while the pending row
+    // was due. (A repaint ends in `\x1b[u`, so it cannot be counted here by
+    // mistake.) The window closes on the last token rather than the first so
+    // that the defect — which puts the first token on screen at once — fails on
+    // claim (1) below, and not on this guard.
+    let pending_at = seen
+        .find(&typed_row)
+        .unwrap_or_else(|| panic!("the pending row is not in the transcript:\n{seen}"));
+    let reply_at = seen
+        .find("One")
+        .unwrap_or_else(|| panic!("the reply is not in the transcript:\n{seen}"));
+    assert!(
+        pending_at < reply_at,
+        "the reply's first byte reached the screen before the pending row was \
+         drawn, so nothing here was streamed past a pending row; transcript:\n{seen}"
+    );
+    let reply_done = seen
+        .find("five.")
+        .unwrap_or_else(|| panic!("the reply's last token is not in the transcript:\n{seen}"));
+    let cycles = seen[pending_at..reply_done]
+        .matches(&format!("\n{WITHDRAW}"))
+        .count();
+    assert!(
+        cycles >= 2,
+        "the block was taken down and redrawn {cycles} time(s) while the pending \
+         row was up and the reply streamed; fewer than two means the cycle this \
+         leg exists to exercise did not run, or the pending row was not kept up \
+         through the stream (BR-3); transcript:\n{seen}"
+    );
+
+    // (1) One row, and it is the reply. The defect's screen is five rows here —
+    // `One`, `two`, `three`, `four`, `five.` — because each token's withdraw
+    // and redraw of the block flushed the partial line the renderer was holding
+    // as a finished row of its own.
+    let rows: Vec<String> = common::rendered_screen(&seen)
+        .into_iter()
+        .filter(|row| row.contains("five."))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![REPLY.to_owned()],
+        "a reply streamed past a pending row must reach the screen as the one \
+         row it is with nothing typed; the block's draw and withdraw hold what \
+         the renderer holds (BR-4, BR-13); screen:\n{:#?}",
+        common::rendered_screen(&seen)
+    );
+    assert_eq!(
+        screen_rows_with(&seen, "One"),
+        1,
+        "the reply's first token is on more than one row, so a held partial \
+         line was flushed by the block; screen:\n{:#?}",
+        common::rendered_screen(&seen)
+    );
+    // (2) The same row the control produced.
+    assert_eq!(
+        rows[0], reply_row,
+        "the two sessions rendered the reply differently, and the only thing \
+         that differed between them was a line typed and never sent (BR-4)"
+    );
+    // And the typing left nothing behind: the pending row was taken back with
+    // the block, and an unsubmitted line is echoed nowhere (BR-4).
+    assert_no_row_on_screen(&seen, "a turn with a line typed and left unsubmitted");
+    assert_eq!(
+        screen_rows_with(&seen, TYPED),
+        0,
+        "a line that was never submitted is shown nowhere after the turn \
+         (BR-4); screen:\n{:#?}",
         common::rendered_screen(&seen)
     );
 }

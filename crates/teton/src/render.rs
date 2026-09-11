@@ -134,6 +134,34 @@ pub trait Surface {
     /// assistant output, which arrives as a sequence of chunks.
     fn fragment(&mut self, text: &str);
 
+    /// Draw one live row at the cursor — a row its owner will repaint in place
+    /// and take back with [`Surface::withdraw_row_above`] — **holding whatever
+    /// the surface is holding** (REQ-622 BR-4, BR-13).
+    ///
+    /// [`Surface::line`] with one difference, and the difference is the verb's
+    /// reason to exist. A durable line owns its row for good, so the text the
+    /// renderer is still holding — a streamed line no newline has completed
+    /// yet (REQ-592) — goes out ahead of it, or the screen reads in the wrong
+    /// order (BR-8). A live row is gone again before anything durable is
+    /// written: the pump withdraws the block ahead of every durable write and
+    /// redraws it after (REQ-621 ADR-621-3, REQ-622 ADR-622-4). Emitting the
+    /// held text ahead of a live row therefore ends a line the stream had not
+    /// ended — and the block is redrawn after every streamed token, so a reply
+    /// streamed while a pending row was up reached the screen one token per
+    /// row where the same reply with nothing typed was one row. Held text
+    /// stays held across a live row's draw, its repaints and its withdraw, and
+    /// is written where the block was by the durable write — or the turn's
+    /// [`Surface::end_block`] — that follows the withdraw.
+    ///
+    /// **Defaults to [`Surface::line`]**, which is right for every surface
+    /// that holds nothing: a recording double sees the same call a durable
+    /// line makes, and a surface with no cursor writes the row as it writes
+    /// any line. Only a surface that both holds text and owns live rows has
+    /// the two verbs disagree, and there is one of those.
+    fn draw_row(&mut self, kind: LineKind, text: &str) {
+        self.line(kind, text);
+    }
+
     /// Repaint one row `rows_up` above the cursor **in place**, leaving the
     /// cursor exactly where it was (REQ-556 ADR-556-4).
     ///
@@ -198,12 +226,15 @@ pub trait Surface {
     /// it owns a row somebody else is now writing over. `false` from the
     /// default, which has written nothing.
     ///
-    /// **Nothing may be held when this moves the cursor.** `rows_up` is
-    /// counted from where the cursor is, and held markdown rows have not
-    /// scrolled the frame yet — so an implementation flushes first and the
-    /// offset is measured after, or the count is short by however many rows the
-    /// flush was going to add. `PlainSurface` asserts that in debug builds
-    /// rather than only writing it down here.
+    /// **Held text stays held.** A partial streamed line the renderer has not
+    /// emitted yet (REQ-592) is not on screen, so it counts for nothing in
+    /// `rows_up` and this verb leaves it exactly where it is — as does
+    /// [`Surface::repaint_row_above`], and [`Surface::draw_row`] is the draw
+    /// that matches. The held line is written where the row was, by the
+    /// durable write or the turn's `end_block` that follows the withdraw
+    /// (REQ-622 BR-4). Emitting it here instead ended a streamed line at every
+    /// token that arrived while a row was up, which is the defect the pending
+    /// row made visible.
     // This carried a `#[cfg_attr(not(test), expect(dead_code, …))]` until the
     // pump called it, chosen over an `allow` for the reason written out at
     // [`PlainSurface::with_markdown`]: an `allow` would have gone on being
@@ -507,6 +538,57 @@ impl<W: Write> PlainSurface<W> {
             // pump.
             live_rows: true,
         }
+    }
+
+    /// One row and its newline, styled by class: the bytes [`Surface::line`]
+    /// and [`Surface::draw_row`] share, so the two cannot drift apart in
+    /// anything but what they do *before* the row.
+    ///
+    /// The styling wraps the *defused* text and is drawn from
+    /// [`LineKind::sgr`], never from the argument — so a caller cannot colour a
+    /// line by embedding escapes in its string, and a fetched page cannot
+    /// either. The reset is unconditional, so no styled line can leak its
+    /// attribute onto the row below.
+    fn write_line(&mut self, kind: LineKind, text: &str) {
+        // A styled class is composed by this binary from fixed strings, so an
+        // ESC in its text is not an attack — it is a caller reaching for SGR by
+        // hand, which is the bug this styling table replaced: `defused` would
+        // eat the ESC and print the bare `[36m` to the user. Silent cosmetic
+        // debris is exactly the kind of thing that ships, so fail loudly in
+        // development instead.
+        //
+        // Deliberately *not* a check on every class. `Prompt` and `Diff` carry
+        // model-composed and file-derived text, where an escape is the hostile
+        // input the guard exists to neutralize (REQ-563) — asserting there would
+        // hand a fetched page a debug-build panic through the guard itself. The
+        // constraint this places on a future styled class is the flip side: do
+        // not tag untrusted text with one.
+        //
+        // `Activity` is styled and exempt, which is that flip side arriving by
+        // a third route: the row's text is composed by this binary, but it
+        // *interpolates* strings from outside — the daemon's tool title, which
+        // carries model-proposed arguments, and a provider/model name (REQ-621
+        // ADR-621-2). So an ESC reaching it is `Prompt`'s hostile input rather
+        // than a caller reaching for SGR by hand, and a panic here would be the
+        // guard handing a fetched page a debug-build crash. `defused` below is
+        // what holds for it, in every build — BR-13: painting the row is never
+        // fatal to the turn.
+        debug_assert!(
+            kind.sgr().is_none() || kind == LineKind::Activity || !text.contains('\x1b'),
+            "{kind:?} is styled by the surface; it must not carry its own escapes \
+             (they will be neutralized into visible debris): {text:?}"
+        );
+
+        // Close any open streamed line first so the row starts clean.
+        if !self.at_line_start {
+            let _ = writeln!(self.out);
+        }
+        let body = defused(text);
+        let _ = match kind.sgr().filter(|_| self.color) {
+            Some(sgr) => writeln!(self.out, "\x1b[{sgr}m{}{body}\x1b[0m", Self::prefix(kind)),
+            None => writeln!(self.out, "{}{body}", Self::prefix(kind)),
+        };
+        self.at_line_start = true;
     }
 
     /// The prefix shown for a line class. Cosmetic only — tests assert on the
@@ -944,59 +1026,49 @@ impl<W: Write> PlainSurface<W> {
 }
 
 impl<W: Write> Surface for PlainSurface<W> {
-    /// The styling wraps the *defused* text and is drawn from
-    /// [`LineKind::sgr`], never from the argument — so a caller cannot colour a
-    /// line by embedding escapes in its string, and a fetched page cannot either.
-    /// The reset is unconditional, so no styled line can leak its attribute onto
-    /// the row below.
+    /// A durable line: everything the renderer is holding, then the row. The
+    /// styling and the escape guard are [`Self::write_line`]'s, shared with
+    /// [`Surface::draw_row`].
     fn line(&mut self, kind: LineKind, text: &str) {
-        // A styled class is composed by this binary from fixed strings, so an
-        // ESC in its text is not an attack — it is a caller reaching for SGR by
-        // hand, which is the bug this styling table replaced: `defused` would
-        // eat the ESC and print the bare `[36m` to the user. Silent cosmetic
-        // debris is exactly the kind of thing that ships, so fail loudly in
-        // development instead.
-        //
-        // Deliberately *not* a check on every class. `Prompt` and `Diff` carry
-        // model-composed and file-derived text, where an escape is the hostile
-        // input the guard exists to neutralize (REQ-563) — asserting there would
-        // hand a fetched page a debug-build panic through the guard itself. The
-        // constraint this places on a future styled class is the flip side: do
-        // not tag untrusted text with one.
-        //
-        // `Activity` is styled and exempt, which is that flip side arriving by
-        // a third route: the row's text is composed by this binary, but it
-        // *interpolates* strings from outside — the daemon's tool title, which
-        // carries model-proposed arguments, and a provider/model name (REQ-621
-        // ADR-621-2). So an ESC reaching it is `Prompt`'s hostile input rather
-        // than a caller reaching for SGR by hand, and a panic here would be the
-        // guard handing a fetched page a debug-build crash. `defused` below is
-        // what holds for it, in every build — BR-13: painting the row is never
-        // fatal to the turn.
-        debug_assert!(
-            kind.sgr().is_none() || kind == LineKind::Activity || !text.contains('\x1b'),
-            "{kind:?} is styled by the surface; it must not carry its own escapes \
-             (they will be neutralized into visible debris): {text:?}"
-        );
-
         // A line owns its row, so anything the renderer is still holding goes
         // out ahead of it (REQ-592 BR-8) — otherwise a notice arriving mid-turn
         // prints above a sentence the reader has not been shown yet, and the
         // screen reads in the wrong order. Inert without a renderer, and it
-        // leaves the surface at the start of a row, so the close below is
-        // unchanged for both paths.
+        // leaves the surface at the start of a row, so the close inside
+        // `write_line` is unchanged for both paths.
         self.emit_pending();
+        self.write_line(kind, text);
+    }
 
-        // Close any open streamed line first so the notice starts clean.
-        if !self.at_line_start {
-            let _ = writeln!(self.out);
-        }
-        let body = defused(text);
-        let _ = match kind.sgr().filter(|_| self.color) {
-            Some(sgr) => writeln!(self.out, "\x1b[{sgr}m{}{body}\x1b[0m", Self::prefix(kind)),
-            None => writeln!(self.out, "{}{body}", Self::prefix(kind)),
-        };
-        self.at_line_start = true;
+    /// A live row: the row, and nothing held goes out ahead of it (REQ-622
+    /// BR-4) — the whole of the difference from [`Surface::line`], written out
+    /// on the trait.
+    ///
+    /// Two invariants asserted rather than handled, because on the one surface
+    /// that reaches this verb they hold by construction and handling them would
+    /// be code for a case that cannot arrive. Only [`Self::with_markdown`]
+    /// answers `has_live_rows`, so a live row is only ever drawn over a
+    /// renderer; and a renderer never leaves the cursor mid-row — every byte it
+    /// emits goes through [`Self::write_row`], newline included — so the row
+    /// beneath which this one is drawn is always complete, and taking the row
+    /// back leaves the cursor at the start of an empty row where the held line
+    /// will land whole. A surface that streamed fragments straight to the
+    /// terminal *and* owned live rows would need to remember the column the
+    /// open fragment reached and put the cursor back there after the withdraw;
+    /// none exists, and this assertion is what says so rather than a paragraph
+    /// nobody checks.
+    fn draw_row(&mut self, kind: LineKind, text: &str) {
+        debug_assert!(
+            self.live_rows,
+            "draw_row on a surface with no live rows: the pump's TTY gate is \
+             read once per call, and it answered no"
+        );
+        debug_assert!(
+            self.at_line_start,
+            "draw_row with an open row on screen: a live surface holds partial \
+             lines rather than streaming them, so the cursor is never mid-row here"
+        );
+        self.write_line(kind, text);
     }
 
     /// Streamed assistant text, defused on the way out.
@@ -1063,13 +1135,12 @@ impl<W: Write> Surface for PlainSurface<W> {
     /// where the caller believes it is: `write!` puts the escapes in the
     /// buffer, and the `flush` is what puts them on the screen.
     fn repaint_row_above(&mut self, rows_up: usize, kind: LineKind, text: &str) -> bool {
-        // Same rule as `line()`, for the same reason (BR-8): a repaint moves the
-        // cursor over rows that are already on screen, and buffered text is text
-        // that is not on screen yet. Emitting first also keeps `rows_up`
-        // measuring from the row the caller believes it is measuring from —
-        // scrolling the frame *after* the offset was chosen is what would put
-        // the indicator somewhere else.
-        self.emit_pending();
+        // Nothing held goes out here (REQ-622 BR-4). Held text is not on
+        // screen, so it has no bearing on `rows_up`; and this verb runs with a
+        // live row up, so emitting it *would* scroll the frame out from under
+        // the row being repainted — the failure the old flush-first rule was
+        // written against, arriving through the flush itself. The reasoning is
+        // written out once, at `withdraw_row_above`.
 
         let prefix = Self::prefix(kind);
         // A repaint claims exactly one row, and the cursor restore assumes it: a
@@ -1110,28 +1181,18 @@ impl<W: Write> Surface for PlainSurface<W> {
             return false;
         }
 
-        // `repaint_row_above`'s rule, for its reason (REQ-592 BR-8): held text
-        // is text that is not on screen yet, and cursor motion counted before
-        // it is emitted counts from a row the reader has not been shown. The
-        // held rows scroll the frame, so they have to do it *before* `rows_up`
-        // is measured from where the cursor now is.
-        self.emit_pending();
-
-        // The flush above is what makes `rows_up` count from the row the caller
-        // measured it against, and this is that claim as a check rather than as
-        // a paragraph: after `emit_pending` there is nothing left to scroll the
-        // frame, so an offset chosen before this line is still the right offset
-        // after it. A future edit that moved the flush below the cursor motion
-        // — or added a second buffer nobody drained — would be counting from a
-        // row the reader has not been shown, and the row this verb clears would
-        // be somebody else's line.
-        debug_assert!(
-            self.markdown
-                .as_ref()
-                .is_none_or(|state| state.pending.is_empty() && state.table.is_empty()),
-            "withdraw_row_above moved the cursor with text still held: the offset \
-             is short by the rows that text is about to scroll in"
-        );
+        // Held text stays held (REQ-622 BR-4). It is not on screen, so
+        // `rows_up` — counted from the cursor to a row that *is* — owes it
+        // nothing; and the row above the cursor is the one `draw_row` put
+        // there, which held too. This verb used to emit the held line first, on
+        // the argument that cursor motion must not be counted from a row the
+        // reader has not been shown — but the held line was never shown and
+        // never moved the cursor, and emitting it here ended a streamed line at
+        // every token that arrived while a pending row was up: `One two three
+        // four five.` reached the screen as five rows. What the held line waits
+        // for is the durable write, or the turn's `end_block`, that follows
+        // this withdraw — both land where the block was, which is where the
+        // line would have gone with no block at all.
 
         // No `\x1b[s` / `\x1b[u` pair, unlike the repaint: the cursor is meant
         // to end up here.
@@ -1645,52 +1706,83 @@ mod tests {
         assert!(piped.is_empty(), "and it wrote nothing doing it");
     }
 
-    /// REQ-621 BR-8 / ADR-621-3. The withdraw is not a raw cursor move: it goes
-    /// through the surface, and the surface owes the reader everything it is
-    /// still holding **before** it moves the cursor over rows already on screen
-    /// (REQ-592 BR-8). The oracle is the literal byte string rather than a
-    /// re-derivation of it ([[LESSON-569]]) because the property under test is
-    /// an *order*, and a computed expectation would reproduce whatever order
-    /// the code chose.
+    /// REQ-622 BR-4, retiring the REQ-621 test that stood here. That test
+    /// pinned the opposite order — the held row emitted *before* the cursor
+    /// moved — on the argument that cursor motion must not be counted from a
+    /// row the reader has not been shown. But a held row has not been shown
+    /// and has not moved the cursor either: `rows_up` is counted from the
+    /// cursor to the live row above it, which is on screen, and the held text
+    /// is nowhere in that arithmetic. What the flush-first order did do was end
+    /// a streamed line at every message that arrived while a row was up — and
+    /// with REQ-622's pending row up for the whole of a stream, that was every
+    /// token. The old test's own record explains why nothing caught it: "the
+    /// pump withdraws the row before the reply's first byte and again before
+    /// each durable line, which are all line boundaries" — true until a row was
+    /// due mid-stream. The pty leg that saw it is
+    /// `a_reply_streamed_past_a_pending_row_renders_as_it_does_without_one`.
     ///
-    /// Mutation observed red (re-run 2026-09-10 over the widened suite):
-    /// deleting the `self.emit_pending()` call from
-    /// `PlainSurface::withdraw_row_above` reddens **this test and no other** —
-    /// 1 of the 127 `render` tests, and 0 of `pty_e2e`'s 28. The held paragraph
-    /// then never reaches the writer at all — the output is the bare
-    /// `\x1b[1A\r\x1b[K` — so the row the pump is told to take back is not the
-    /// row it drew, and the reader loses a sentence to a cursor move.
-    ///
-    /// Since the verify pass the failure arrives as the verb's own
-    /// `debug_assert!` rather than as this test's byte comparison, and it
-    /// arrives naming the defect: *"withdraw_row_above moved the cursor with
-    /// text still held: the offset is short by the rows that text is about to
-    /// scroll in"*. The assertion is what a release build loses, so the byte
-    /// oracle below stays: the assert says why, the bytes say what.
-    ///
-    /// That the pty legs stay green is a fact about their fixtures, not a
-    /// reprieve: the pump withdraws the row *before* the reply's first byte and
-    /// again before each durable line, which are all line boundaries, so no leg
-    /// there has an unterminated line held at the moment of the withdraw. The
-    /// ordering only shows itself mid-line, which is why the case is
-    /// constructed here — a `fragment` with no newline — rather than waited for
-    /// at a terminal.
+    /// The oracle is the literal byte string, for the reason the old test gave
+    /// ([[LESSON-569]]): the property is an *order*, and a computed expectation
+    /// would reproduce whatever order the code chose. The held row goes out
+    /// where the cleared row was, by the flush that follows.
     #[test]
-    fn withdraw_goes_through_the_seam_after_the_held_rows() {
+    fn a_withdraw_leaves_the_held_row_held() {
         let mut buf: Vec<u8> = Vec::new();
         {
             let mut surface = PlainSurface::with_markdown(&mut buf, false, 40);
-            // No trailing newline, so the renderer is *holding* this row: a
-            // completed line would already have been written and the ordering
-            // question would never arise.
+            // No trailing newline, so the renderer is *holding* this row.
             surface.fragment("held row");
             surface.withdraw_row_above(1);
+            surface.end_block();
         }
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            "held row\n\x1b[1A\r\x1b[K",
-            "the held row goes out before the cursor moves, and the withdraw \
-             adds nothing but the step-up and the clear"
+            "\x1b[1A\r\x1b[Kheld row\n",
+            "the withdraw is nothing but the step-up and the clear, and the held \
+             row lands where the cleared row was, by the flush that follows"
+        );
+    }
+
+    /// REQ-622 BR-4 / BR-13, the defect in the small. A reply streamed one
+    /// token at a time while a pending row is up: each token arrives with the
+    /// block withdrawn, is held, and the block is drawn again beneath and
+    /// repainted once before the next token — and the line must reach the
+    /// screen exactly as it would with no block at all: once, whole, where the
+    /// block was, when the turn ends. `draw_row` is the verb that makes it so.
+    /// The same sequence through `line` is the second assertion, which is what
+    /// the pump did until REQ-622 and what the pty leg saw as five rows: a
+    /// durable line flushes what is held, and that is right for a durable
+    /// line.
+    #[test]
+    fn a_live_row_holds_what_the_renderer_is_holding() {
+        fn stream(draw: fn(&mut PlainSurface<&mut Vec<u8>>, &str)) -> String {
+            let mut buf: Vec<u8> = Vec::new();
+            {
+                let mut surface = PlainSurface::with_markdown(&mut buf, false, 40);
+                for token in ["One ", "two ", "three ", "four ", "five."] {
+                    surface.fragment(token);
+                    draw(&mut surface, "> typed");
+                    surface.repaint_row_above(1, LineKind::Activity, "> typed a");
+                    surface.withdraw_row_above(1);
+                }
+                surface.end_block();
+            }
+            String::from_utf8(buf).unwrap()
+        }
+        let cycle = "> typed\n\x1b[s\x1b[1A\r\x1b[K> typed a\x1b[u\x1b[1A\r\x1b[K";
+        let held = stream(|surface, row| surface.draw_row(LineKind::Activity, row));
+        assert_eq!(
+            held,
+            format!("{}One two three four five.\n", cycle.repeat(5)),
+            "five cycles of draw, repaint and withdraw, and the reply once, \
+             whole, where the last withdraw left the cursor: {held:?}"
+        );
+        let flushed = stream(|surface, row| surface.line(LineKind::Activity, row));
+        assert!(
+            flushed.starts_with("One\n> typed\n") && flushed.contains("\x1b[Ktwo\n> typed\n"),
+            "a durable line flushes the held token ahead of itself, so the same \
+             stream drawn through `line` is one row per token — the defect, and \
+             the reason the block has a verb of its own: {flushed:?}"
         );
     }
 
@@ -2263,22 +2355,28 @@ mod tests {
         );
     }
 
-    /// A repaint moves the cursor over rows that are already on screen, so
-    /// buffered text — which is not on screen — goes out ahead of it (BR-8).
-    /// Emitting first is also what keeps `rows_up` measuring from the row the
-    /// caller chose it against.
+    /// REQ-622 BR-4. A repaint runs with a live row on screen, and buffered
+    /// text is text that is *not* on screen: it stays held, and goes out only
+    /// once the row is gone and something durable — or the turn's end — writes
+    /// where the row was. Emitting it here would scroll the frame out from
+    /// under the row being repainted, and it is what used to end a streamed
+    /// line at every tick that fell mid-token while a pending row was up.
+    /// (Until REQ-622 this test pinned the opposite order.)
     #[test]
-    fn a_repaint_emits_the_pending_buffer_before_moving_the_cursor() {
+    fn a_repaint_leaves_the_pending_buffer_held() {
         let mut buf = Vec::new();
         {
             let mut surface = PlainSurface::with_markdown(&mut buf, false, 80);
             surface.fragment("partially streamed");
             surface.repaint_row_above(2, LineKind::Notice, "model starting..");
+            surface.end_block();
         }
         let out = String::from_utf8(buf).unwrap();
-        assert!(
-            out.starts_with("partially streamed\n\x1b[s"),
-            "the buffered row must be on screen before the cursor is saved: {out:?}"
+        assert_eq!(
+            out, "\x1b[s\x1b[2A\r\x1b[K>> model starting..\x1b[upartially streamed\n",
+            "the repaint is the save, the move, the clear, the row and the \
+             restore, and the buffered row is still the renderer's to emit \
+             afterwards: {out:?}"
         );
     }
 
