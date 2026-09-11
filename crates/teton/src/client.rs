@@ -763,7 +763,7 @@ impl RowState {
         // ...and once a second while any row is up (verify, Step D): a resize
         // during a tick-only stretch — the model thinking, nothing arriving —
         // would otherwise repaint at the old width until the next message.
-        let periodic = self.tick % 8 == 0 && (self.activity_visible || self.pending_visible);
+        let periodic = self.tick.is_multiple_of(8) && (self.activity_visible || self.pending_visible);
         if (!self.activity_visible && activity_due)
             || (!self.pending_visible && pending_due)
             || (self.pending_visible && activity_leaves)
