@@ -53,11 +53,31 @@ pub enum LineKind {
     /// place while it runs and taken back before anything durable prints
     /// (REQ-621 ADR-621-3).
     ///
-    /// The one **transient** class. Every other kind here names a line the
-    /// reader can scroll back to; this one is withdrawn rather than left behind
-    /// (BR-5), which is why the trait needs a verb for un-drawing a row and not
-    /// just for redrawing one.
+    /// One of the two **transient** classes. Every durable kind here names a
+    /// line the reader can scroll back to; this one is withdrawn rather than
+    /// left behind (BR-5), which is why the trait needs a verb for un-drawing a
+    /// row and not just for redrawing one.
     Activity,
+    /// The live **pending** row: the line the user is typing during a turn,
+    /// drawn beneath the activity row and left as the row the cursor sits on
+    /// (REQ-622 ADR-622-4).
+    ///
+    /// A class of its own rather than a second use of [`LineKind::Activity`],
+    /// and the difference is not cosmetic. The activity row is the client
+    /// talking about the turn; this row is the *user's own text*, echoed back
+    /// by the client because the kernel no longer does it. They are drawn by
+    /// different verbs, at different places in the block, and — since a verb
+    /// takes the class rather than the row's identity — a recorder or a future
+    /// pane that could not tell them apart could not assert which row it was
+    /// looking at.
+    ///
+    /// Its text is the editor's [`crate::input_editor::InputEditor::row`],
+    /// which has already been through [`defused`]; so it is a **styled class
+    /// with no carve-out** in the escape guard, unlike `Activity`, whose text
+    /// interpolates a daemon-supplied tool title. If an escape ever reaches
+    /// this class, something upstream stopped defusing and the debug build
+    /// should say so.
+    Pending,
 }
 
 impl LineKind {
@@ -72,6 +92,11 @@ impl LineKind {
     /// indistinguishable from the ones a fetched page tries to smuggle through.
     /// So the surface authors the escape itself, from a fixed table, after the
     /// text has been defused.
+    ///
+    /// **Exhaustive, with no `_` arm** (REQ-622, verify). A wildcard here made
+    /// "unstyled" the default a new class fell into silently; every variant now
+    /// states its answer, so adding one is a decision the compiler asks for
+    /// rather than a table it quietly extends.
     fn sgr(self) -> Option<&'static str> {
         match self {
             LineKind::BannerArt => Some("36"),
@@ -83,7 +108,19 @@ impl LineKind {
             // drawing it at full weight would give the most temporary thing on
             // the terminal the most attention.
             LineKind::Activity => Some("2"),
-            _ => None,
+            // Bold, and deliberately **not** the activity row's dim: this row
+            // is the user's own sentence and the row their cursor is resting
+            // on. Drawing what somebody is typing fainter than everything
+            // around it is the one place on this screen where "temporary"
+            // is the wrong reading — the text is going to be sent.
+            LineKind::Pending => Some("1"),
+            LineKind::Notice
+            | LineKind::Tool
+            | LineKind::Diff
+            | LineKind::Prompt
+            | LineKind::Cost
+            | LineKind::Info
+            | LineKind::Error => None,
         }
     }
 }
@@ -160,6 +197,67 @@ pub trait Surface {
     /// the two verbs disagree, and there is one of those.
     fn draw_row(&mut self, kind: LineKind, text: &str) {
         self.line(kind, text);
+    }
+
+    /// Draw the block's **bottom** row at the cursor and leave the cursor at
+    /// its end — no trailing newline (REQ-622 ADR-622-4).
+    ///
+    /// [`Surface::draw_row`] draws a row and steps past it, so the cursor ends
+    /// up on the blank row *below* the block; that is right for the activity
+    /// row, which the client is only talking over. It is wrong for the pending
+    /// row, which is the line the user is typing: ADR-622-4 says the cursor
+    /// rests at the end of that row, because a terminal draws its caret where
+    /// the cursor is and a caret parked a row below the text is a caret that
+    /// says "type here" about the wrong row.
+    ///
+    /// Holding is [`Surface::draw_row`]'s rule, for its reason (BR-4): this is
+    /// a live row, gone again before anything durable is written.
+    ///
+    /// **Defaults to doing nothing**, where `draw_row` defaults to `line`. A
+    /// row with no newline after it is not a line and cannot be written as one:
+    /// a surface with no cursor would leave the next line appended to the
+    /// user's half-typed sentence. Only a surface that owns live rows reaches
+    /// this verb at all — the pump's pending row is gated on `owns_input`,
+    /// which is gated on [`Surface::has_live_rows`] — so the default is
+    /// unreachable in production and silence is the honest answer for the
+    /// surfaces that have it.
+    fn draw_current_row(&mut self, kind: LineKind, text: &str) {
+        let _ = (kind, text);
+    }
+
+    /// Repaint the row the cursor is **on**, in place, leaving the cursor at
+    /// its end (REQ-622 ADR-622-4).
+    ///
+    /// [`Surface::repaint_row_above`] without the offset and without the
+    /// `\x1b[s` / `\x1b[u` pair, and the absence of that pair is the point: a
+    /// save/restore exists to put the cursor back where it was, and here it is
+    /// already where it belongs — at the end of the row just written. Carriage
+    /// return, erase to end of line, write. Three bytes of escape rather than
+    /// nine, and no dependence on a terminal's cursor-save register, which some
+    /// multiplexers share between panes.
+    ///
+    /// Reports whether the bytes reached the terminal, [`Surface::
+    /// repaint_row_above`]'s contract for its reason (BR-13). `false` from the
+    /// default, which has written nothing.
+    fn repaint_current_row(&mut self, kind: LineKind, text: &str) -> bool {
+        let _ = (kind, text);
+        false
+    }
+
+    /// Clear the row the cursor is **on** and leave the cursor at its start
+    /// (REQ-622 ADR-622-4).
+    ///
+    /// [`Surface::withdraw_row_above`] with no cursor motion, because there is
+    /// none to make. What it leaves behind is exactly the state the block was
+    /// in before the pending row was drawn — the cursor at column 0 of an empty
+    /// row directly under the activity row — so the offsets the rest of the
+    /// block uses are unchanged by whether a pending row was ever up, and
+    /// `at_line_start` is honest again.
+    ///
+    /// Reports whether the bytes landed. `false` from the default, which has
+    /// written nothing.
+    fn withdraw_current_row(&mut self) -> bool {
+        false
     }
 
     /// Repaint one row `rows_up` above the cursor **in place**, leaving the
@@ -544,12 +642,29 @@ impl<W: Write> PlainSurface<W> {
     /// and [`Surface::draw_row`] share, so the two cannot drift apart in
     /// anything but what they do *before* the row.
     ///
-    /// The styling wraps the *defused* text and is drawn from
-    /// [`LineKind::sgr`], never from the argument — so a caller cannot colour a
-    /// line by embedding escapes in its string, and a fetched page cannot
-    /// either. The reset is unconditional, so no styled line can leak its
-    /// attribute onto the row below.
+    /// The row itself is [`Self::styled_row`]'s, which is also what the
+    /// current-row verbs write — so the four verbs that put a class on this
+    /// surface differ in the cursor and in nothing else.
     fn write_line(&mut self, kind: LineKind, text: &str) {
+        let row = self.styled_row(kind, text);
+
+        // Close any open streamed line first so the row starts clean.
+        if !self.at_line_start {
+            let _ = writeln!(self.out);
+        }
+        let _ = writeln!(self.out, "{row}");
+        self.at_line_start = true;
+    }
+
+    /// One row's bytes — prefix, defused text, and this class's styling — with
+    /// **no newline**: what [`Self::write_line`] puts a newline after, and what
+    /// the two current-row verbs write as-is (REQ-622 ADR-622-4).
+    ///
+    /// Split out so a row drawn as a line and the same row drawn as the row the
+    /// cursor sits on cannot differ in anything but the newline. The escape
+    /// guard lives here for the same reason: it has to hold for every verb that
+    /// puts a styled class on the screen, not only for the one that ends a row.
+    fn styled_row(&self, kind: LineKind, text: &str) -> String {
         // A styled class is composed by this binary from fixed strings, so an
         // ESC in its text is not an attack — it is a caller reaching for SGR by
         // hand, which is the bug this styling table replaced: `defused` would
@@ -573,22 +688,26 @@ impl<W: Write> PlainSurface<W> {
         // guard handing a fetched page a debug-build crash. `defused` below is
         // what holds for it, in every build — BR-13: painting the row is never
         // fatal to the turn.
+        //
+        // `Pending` is styled and **not** exempt (REQ-622, verify). Its text is
+        // the user's own keystrokes, and the editor has already defused them
+        // before composing the row — so unlike `Activity` there is no outside
+        // string interpolated into it, and an ESC arriving here would mean the
+        // editor stopped defusing rather than that a fetched page tried
+        // something. That is a defect to fail loudly on, which is what a
+        // carve-out would have hidden.
         debug_assert!(
             kind.sgr().is_none() || kind == LineKind::Activity || !text.contains('\x1b'),
             "{kind:?} is styled by the surface; it must not carry its own escapes \
              (they will be neutralized into visible debris): {text:?}"
         );
 
-        // Close any open streamed line first so the row starts clean.
-        if !self.at_line_start {
-            let _ = writeln!(self.out);
-        }
         let body = defused(text);
-        let _ = match kind.sgr().filter(|_| self.color) {
-            Some(sgr) => writeln!(self.out, "\x1b[{sgr}m{}{body}\x1b[0m", Self::prefix(kind)),
-            None => writeln!(self.out, "{}{body}", Self::prefix(kind)),
-        };
-        self.at_line_start = true;
+        let prefix = Self::prefix(kind);
+        match kind.sgr().filter(|_| self.color) {
+            Some(sgr) => format!("\x1b[{sgr}m{prefix}{body}\x1b[0m"),
+            None => format!("{prefix}{body}"),
+        }
     }
 
     /// The prefix shown for a line class. Cosmetic only — tests assert on the
@@ -607,6 +726,13 @@ impl<W: Write> PlainSurface<W> {
             // (ADR-621-2) — so a `>> ` here would shift the animation one
             // column right of where a repaint of the same row puts it.
             LineKind::Activity => "",
+            // Nor here, for the same reason one row down: the editor composes
+            // the `> ` marker itself and *measures the row against it*
+            // ([`crate::input_editor::InputEditor::row`]), so a prefix added
+            // here would be two columns the fit did not budget for — and a row
+            // wider than the terminal hard-wraps into a second row the withdraw
+            // cannot clear.
+            LineKind::Pending => "",
         }
     }
 }
@@ -1071,6 +1197,66 @@ impl<W: Write> Surface for PlainSurface<W> {
         self.write_line(kind, text);
     }
 
+    /// The block's bottom row, written where the cursor is and **not** ended
+    /// (REQ-622 ADR-622-4). `at_line_start` goes false, which is the honest
+    /// answer and is what the whole block's bookkeeping now rests on: a `line`
+    /// that arrived with this row up would open with a newline rather than
+    /// writing over the user's text.
+    ///
+    /// [`Surface::draw_row`]'s two assertions, for its reasons — and the second
+    /// of them is what says this row is drawn onto a clean row rather than onto
+    /// the end of another one.
+    fn draw_current_row(&mut self, kind: LineKind, text: &str) {
+        debug_assert!(
+            self.live_rows,
+            "draw_current_row on a surface with no live rows: the pump's TTY \
+             gate is read once per call, and it answered no"
+        );
+        debug_assert!(
+            self.at_line_start,
+            "draw_current_row onto an open row: the block draws its bottom row \
+             onto a clean row — either the one a `draw_row` above it just \
+             ended, or the one a withdraw just cleared"
+        );
+        let row = self.styled_row(kind, text);
+        let _ = write!(self.out, "{row}");
+        let _ = self.out.flush();
+        self.at_line_start = false;
+    }
+
+    /// `\r`, erase, write — no `\x1b[s` / `\x1b[u` pair, because the cursor is
+    /// meant to end up at the end of this row and that is where writing it
+    /// leaves it (REQ-622 ADR-622-4).
+    ///
+    /// `at_line_start` is deliberately untouched: it was false when this row
+    /// went up and it is false now.
+    ///
+    /// Both halves of the write are checked, [`Surface::repaint_row_above`]'s
+    /// rule for its reason — `write!` fills the buffer, the `flush` is what
+    /// puts the bytes on the screen.
+    fn repaint_current_row(&mut self, kind: LineKind, text: &str) -> bool {
+        let row = self.styled_row(kind, text);
+        write!(self.out, "\r\x1b[K{row}")
+            .and_then(|()| self.out.flush())
+            .is_ok()
+    }
+
+    /// Erase the row the cursor is on and leave it at column 0.
+    ///
+    /// Gated on `live_rows` and reporting its bytes, both for
+    /// [`Surface::withdraw_row_above`]'s reasons. Held text stays held, also
+    /// for its reason (BR-4).
+    fn withdraw_current_row(&mut self) -> bool {
+        if !self.live_rows {
+            return false;
+        }
+        let written = write!(self.out, "\r\x1b[K")
+            .and_then(|()| self.out.flush())
+            .is_ok();
+        self.at_line_start = true;
+        written
+    }
+
     /// Streamed assistant text, defused on the way out.
     ///
     /// The escapes a fetched page can steer this text into are the same escapes
@@ -1279,6 +1465,18 @@ pub(crate) enum Rendered {
     /// not tell them apart could not assert the absence of residue, which is
     /// the property REQ-621 BR-5 is about.
     Withdraw(usize),
+    /// A `draw_current_row(kind, text)` call — the block's bottom row, drawn
+    /// with the cursor left at its end (REQ-622 ADR-622-4). Recorded
+    /// distinctly from `Line` because that is the whole difference the verb
+    /// exists for: a recorder that folded the two together could not tell a row
+    /// the cursor is resting on from one it has stepped past, which is the
+    /// geometry the pending row's every offset is measured against.
+    DrawCurrent(LineKind, String),
+    /// A `repaint_current_row(kind, text)` call — the same row rewritten in
+    /// place, with no offset, because the cursor is already on it.
+    RepaintCurrent(LineKind, String),
+    /// A `withdraw_current_row()` call. No offset for the same reason.
+    WithdrawCurrent,
 }
 
 /// A [`Surface`] that records every call instead of writing bytes. Test-only.
@@ -1342,7 +1540,12 @@ impl RecordingSurface {
             .iter()
             .filter_map(|c| match c {
                 Rendered::Fragment(t) => Some(t.as_str()),
-                Rendered::Line(..) | Rendered::Repaint(..) | Rendered::Withdraw(_) => None,
+                Rendered::Line(..)
+                | Rendered::Repaint(..)
+                | Rendered::Withdraw(_)
+                | Rendered::DrawCurrent(..)
+                | Rendered::RepaintCurrent(..)
+                | Rendered::WithdrawCurrent => None,
             })
             .collect()
     }
@@ -1385,6 +1588,22 @@ impl Surface for RecordingSurface {
         !self.failing_rows
     }
 
+    fn draw_current_row(&mut self, kind: LineKind, text: &str) {
+        self.calls
+            .push(Rendered::DrawCurrent(kind, text.to_owned()));
+    }
+
+    fn repaint_current_row(&mut self, kind: LineKind, text: &str) -> bool {
+        self.calls
+            .push(Rendered::RepaintCurrent(kind, text.to_owned()));
+        !self.failing_rows
+    }
+
+    fn withdraw_current_row(&mut self) -> bool {
+        self.calls.push(Rendered::WithdrawCurrent);
+        !self.failing_rows
+    }
+
     fn has_live_rows(&self) -> bool {
         self.live_rows
     }
@@ -1422,6 +1641,192 @@ mod tests {
                 out.rfind("\x1b[0m")
             );
         }
+    }
+
+    /// **REQ-622 ADR-622-4, at the bytes: the pending row is the row the cursor
+    /// is on.**
+    ///
+    /// One literal byte string for the whole block, because what is under test
+    /// is an *order and a cursor*, and a computed expectation would reproduce
+    /// whatever order the code chose ([[LESSON-569]]). Read left to right it is
+    /// the activity row **and its newline** — the cursor steps past that row —
+    /// then the pending row with **no** newline, so the terminal's caret is left
+    /// immediately after `l`; then a repaint that is `\r`, erase, rewrite and
+    /// nothing else — no `\x1b[s` / `\x1b[u`, because the cursor is meant to end
+    /// up exactly where writing leaves it; then a withdraw that clears that row
+    /// and leaves the cursor at its start.
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** give
+    /// `PlainSurface::draw_current_row` a trailing newline (`write!` →
+    /// `writeln!`). **1 red of 872** — this test, on the `> hal\r` the oracle
+    /// expects where `> hal\n\r` arrives. At a real terminal the caret would
+    /// then sit on the blank row *below* the sentence the user is typing, and
+    /// every offset above it would be one row short — which is the whole of
+    /// what BUG-225 was. Reverted with the same edit.
+    ///
+    /// **That it is one red and not three is the finding.** Neither
+    /// `a_current_rows_bookkeeping_is_honest` below nor
+    /// `client.rs`'s `the_pending_row_is_the_row_the_cursor_is_on` notices: the
+    /// first asserts the `at_line_start` *field*, which the mutant still sets to
+    /// `false` — the field goes on agreeing with the code and stops agreeing
+    /// with the terminal — and the second records verbs rather than bytes, so a
+    /// `DrawCurrent` that emitted a newline is indistinguishable there from one
+    /// that did not. A recorder cannot see a cursor. This literal byte string is
+    /// the only oracle in the suite that can, which is why it is one.
+    #[test]
+    fn a_current_row_is_drawn_unterminated_and_repainted_where_the_cursor_is() {
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::with_markdown(&mut buf, false, 80);
+            surface.draw_row(LineKind::Activity, "⠋ preparing turn");
+            surface.draw_current_row(LineKind::Pending, "> hal");
+            assert!(surface.repaint_current_row(LineKind::Pending, "> half"));
+            assert!(surface.withdraw_current_row());
+        }
+        assert_eq!(
+            String::from_utf8(buf).expect("utf-8"),
+            "⠋ preparing turn\n> hal\r\x1b[K> half\r\x1b[K",
+        );
+    }
+
+    /// `at_line_start` is the surface's claim about where the cursor is, and the
+    /// current-row verbs are the only ones that can make it false on purpose.
+    ///
+    /// The claim matters because `line()` reads it: a durable line written while
+    /// the pending row is up has to open with a newline rather than writing over
+    /// the user's own text. So this asserts the field **and** the byte that
+    /// depends on it.
+    #[test]
+    fn a_current_rows_bookkeeping_is_honest() {
+        let mut buf = Vec::new();
+        let mut surface = PlainSurface::with_markdown(&mut buf, false, 80);
+        assert!(surface.at_line_start, "a fresh surface is at a row's start");
+
+        surface.draw_current_row(LineKind::Pending, "> half");
+        assert!(
+            !surface.at_line_start,
+            "the cursor is at the end of the user's text, not at a row's start"
+        );
+        surface.repaint_current_row(LineKind::Pending, "> half a");
+        assert!(!surface.at_line_start, "and a repaint leaves it there");
+
+        surface.line(LineKind::Info, "a notice");
+        assert!(surface.at_line_start);
+        drop(surface);
+        let out = String::from_utf8(buf).expect("utf-8");
+        assert!(
+            out.ends_with("\na notice\n"),
+            "a durable line written over a current row opens its own row rather \
+             than appending to what the user is typing: {out:?}"
+        );
+
+        let mut buf = Vec::new();
+        let mut surface = PlainSurface::with_markdown(&mut buf, false, 80);
+        surface.draw_current_row(LineKind::Pending, "> half");
+        assert!(surface.withdraw_current_row());
+        assert!(
+            surface.at_line_start,
+            "the withdraw leaves the cursor at column 0 of the row it cleared, \
+             which is where the activity row's `withdraw_row_above(1)` measures \
+             from"
+        );
+    }
+
+    /// A surface with no cursor **declines** the current row rather than writing
+    /// it as a line (REQ-622 ADR-622-4).
+    ///
+    /// The default is the interesting half. [`Surface::draw_row`] defaults to
+    /// `line`, which is right — a row and a line differ only in who takes the
+    /// row back. A row with no newline after it is a different thing: written
+    /// as a line to a log or a pipe it would leave the next line appended to the
+    /// user's half-typed sentence. So the default writes nothing and the two
+    /// fallible verbs report `false`, and the pump never reaches them because
+    /// the pending row is gated on a surface that answers `has_live_rows`.
+    #[test]
+    fn a_surface_with_no_cursor_declines_the_current_row() {
+        #[derive(Default)]
+        struct Bare(Vec<String>);
+        impl Surface for Bare {
+            fn line(&mut self, _kind: LineKind, text: &str) {
+                self.0.push(text.to_owned());
+            }
+            fn fragment(&mut self, _text: &str) {}
+        }
+
+        let mut bare = Bare::default();
+        bare.draw_row(LineKind::Activity, "a live row");
+        bare.draw_current_row(LineKind::Pending, "> typing");
+        assert!(!bare.repaint_current_row(LineKind::Pending, "> typing on"));
+        assert!(!bare.withdraw_current_row());
+        assert_eq!(
+            bare.0,
+            vec!["a live row".to_owned()],
+            "`draw_row` falls through to `line` and the three current-row verbs \
+             write nothing at all"
+        );
+    }
+
+    /// **REQ-622, verify: `LineKind::Pending` is a class of its own, styled, and
+    /// not the activity row's dim.**
+    ///
+    /// The pending row is the user's own sentence and the row their cursor is
+    /// resting on. Drawn at the activity row's dim it would be the faintest
+    /// thing on a screen that is mostly the model's output, which is exactly
+    /// backwards for the one line on it that the user wrote.
+    #[test]
+    fn the_pending_class_is_styled_and_is_not_the_activity_rows_dim() {
+        let pending = rendered(true, LineKind::Pending, "> half a thought");
+        assert!(
+            pending.starts_with("\x1b[1m") && pending.ends_with("\x1b[0m\n"),
+            "bold, opened and closed: {pending:?}"
+        );
+        assert!(!pending.contains("\x1b[2m"), "and never dim: {pending:?}");
+        assert!(
+            rendered(true, LineKind::Activity, "⠋ preparing turn").contains("\x1b[2m"),
+            "while the row above it still is — the two classes are \
+             distinguishable on the screen and not only in the source"
+        );
+        assert_eq!(
+            rendered(false, LineKind::Pending, "> half a thought"),
+            "> half a thought\n",
+            "and the colour gate is the surface's for this class like every \
+             other: no escape, and no literal `[1m` debris standing in for one"
+        );
+    }
+
+    /// **REQ-622, verify: `Pending` is styled and has *no carve-out* in the
+    /// escape guard.**
+    ///
+    /// [`LineKind::Activity`] is exempt because its text interpolates a
+    /// daemon-supplied tool title, so an ESC reaching it is hostile input the
+    /// guard is meant to neutralize rather than a caller reaching for SGR by
+    /// hand. Nothing outside this binary is interpolated into a pending row:
+    /// the editor composes it from the user's keystrokes and defuses them on
+    /// the way out ([`crate::input_editor::InputEditor::row`]). So an ESC
+    /// arriving here means something upstream stopped defusing — a defect to
+    /// fail loudly on, and the thing a carve-out would have hidden.
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** add `|| kind ==
+    /// LineKind::Pending` to `styled_row`'s `debug_assert`. **1 red of 872**,
+    /// this test, which then renders the escape as visible `[31m` debris
+    /// instead of panicking. Reverted with the same edit.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "must not carry its own escapes")]
+    fn a_pending_row_carrying_an_escape_is_a_defect_not_a_carve_out() {
+        let _ = rendered(true, LineKind::Pending, "> \x1b[31mred");
+    }
+
+    /// The other half of the rule above, so it is a *choice* and not a blanket
+    /// ban: the activity row's carve-out survives, because the string that
+    /// reaches it is partly the daemon's.
+    #[test]
+    fn the_activity_rows_carve_out_survives() {
+        let out = rendered(true, LineKind::Activity, "⠋ running shell: \x1b[31mrm");
+        assert!(
+            !out.contains("\x1b[31m"),
+            "the escape is neutralized rather than panicked on: {out:?}"
+        );
     }
 
     /// The colour gate is the surface's, and when it is shut the styled classes

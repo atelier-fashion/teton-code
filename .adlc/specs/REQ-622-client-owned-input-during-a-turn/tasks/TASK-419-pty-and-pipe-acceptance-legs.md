@@ -75,16 +75,26 @@ the question stands (the question reuses the turn's window rather than restoring
 to ask, BR-2), and the answer appears once on the question's own row because the
 client repainted it there with `ECHO` off.
 
-## Defect found, out of scope, filed
+## Defect found here, fixed, and covered by a leg of its own
 
-A reply **streamed while an unsubmitted pending line is on screen** is broken one
-chunk per row in the durable scrollback (`"One" / "two" / "three"` instead of
-`"One two three"`); with no pending line the same reply renders as one row. Each
+A reply **streamed while an unsubmitted pending line is on screen** was broken
+one chunk per row in the durable scrollback (`"One" / "two" / "three"` instead of
+`"One two three"`); with no pending line the same reply rendered as one row. Each
 streamed message withdraws the block and redraws it, and `withdraw_row_above`
-leaves the cursor at column 0 of the row it cleared, so a durable fragment does
-not continue on its own row. That is a BR-4 violation in TASK-417's two-row
-block, not in this task's legs; AC-5's ordinary-exit leg was written to read the
-terminal rather than the screen so that it does not depend on it.
+flushed what the renderer was holding before it moved the cursor — so a fragment
+the stream had not finished was ended as a finished row at every token. That is a
+BR-4 violation in TASK-417's two-row block rather than in this task's legs; AC-5's
+ordinary-exit leg was written to read the terminal rather than the screen so that
+it does not depend on it.
+
+It is **fixed** (commit `83235fd`): the block's rows are drawn with
+`Surface::draw_row` and repainted and withdrawn without emitting held text, so a
+streamed line stays held across the block's verbs and goes out where the block
+was, on the next durable write or at the turn's `end_block`. The leg that pins it
+is `pty_e2e::a_reply_streamed_past_a_pending_row_renders_as_it_does_without_one`,
+which runs the same reply twice — once with a pending row up and once without —
+and asserts the two scrollbacks are the same shape; it is the BR-4 row added to
+the table below, beside the submitted-line leg that was already there.
 
 ## Verification
 
@@ -93,6 +103,7 @@ terminal rather than the screen so that it does not depend on it.
 | BR-1 | test-case | `crates/teton/tests/cli_e2e.rs::a_piped_stdin_session_never_enters_raw_mode` | yes |
 | BR-3 | test-case | `crates/teton/tests/pty_e2e.rs::a_submitted_line_is_never_overwritten_and_becomes_the_next_prompt` | no |
 | BR-4 | test-case | `crates/teton/tests/pty_e2e.rs::a_submitted_line_is_never_overwritten_and_becomes_the_next_prompt` | no |
+| BR-4 | test-case | `crates/teton/tests/pty_e2e.rs::a_reply_streamed_past_a_pending_row_renders_as_it_does_without_one` | no |
 | BR-5 | test-case | `crates/teton/tests/pty_e2e.rs::a_question_never_eats_type_ahead` | yes |
 | BR-6 | test-case | `crates/teton/tests/pty_e2e.rs::queued_lines_become_the_next_prompts_in_order` | no |
 | BR-7 | test-case | `crates/teton/tests/pty_e2e.rs::every_exit_restores_the_terminal` | no |

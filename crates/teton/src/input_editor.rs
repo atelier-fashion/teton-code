@@ -237,12 +237,25 @@ impl InputEditor {
     /// module's.
     ///
     /// Measured on the **defused** string, with the display width
-    /// `markdown.rs` owns (ASSUME-023), and within `width - 1` for
-    /// [`crate::activity::TurnActivity::frame`]'s two reasons: a CJK character
-    /// counted as one column but drawn as two makes the row exceed the terminal,
-    /// which then hard-wraps it into a second row the withdraw does not clear,
-    /// and the last column is left unspent so the cursor that rests at the row's
-    /// end has somewhere to be.
+    /// `markdown.rs` owns (ASSUME-023), and within `width - 1` for two reasons,
+    /// the second of which is this row's alone.
+    ///
+    /// The first is [`crate::activity::TurnActivity::frame`]'s: a CJK character
+    /// counted as one column but drawn as two makes the row exceed the
+    /// terminal, which then hard-wraps it into a second row the withdraw does
+    /// not clear.
+    ///
+    /// The second is the cursor, and it is a fact about this row and not about
+    /// that one. This row is the row the cursor **is on** (REQ-622 ADR-622-4):
+    /// it is drawn with [`crate::render::Surface::draw_current_row`], which
+    /// writes no trailing newline, so the terminal's caret ends up immediately
+    /// after the last character the user typed — where a caret belongs. A row
+    /// filled to the very last column would put that caret one column past the
+    /// window, and a terminal resolves that either by wrapping to a row this
+    /// block does not own or by parking the caret on top of the last character.
+    /// The reserved column is where the caret sits instead. (The activity row
+    /// above spends no such column and needs none: the cursor has stepped past
+    /// it.)
     ///
     /// The defuse is load-bearing even though [`Self::push`] drops every control
     /// byte: a bidi override is *printable* UTF-8, so `U+202E` typed or pasted
@@ -252,21 +265,45 @@ impl InputEditor {
     /// what the user typed recoverable (LESSON-474): the queued prompt carries
     /// the character, and only its rendering loses it.
     ///
+    /// **`queued_hint`** is BR-14's count, for the moments the activity row is
+    /// not there to carry it (REQ-622, verify). `TurnActivity::frame` answers
+    /// `None` for the whole of `Streaming` — a reply arriving is its own
+    /// feedback (ADR-621-1) — so an Enter pressed while the model was writing
+    /// took the pending row down and said *nothing at all*, which is
+    /// indistinguishable from a swallowed keystroke. `Some(n)` with `n` nonzero
+    /// puts `[n queued] ` ahead of the marker; `Some(0)` and `None` both leave
+    /// the marker alone, and `None` specifically means "the activity row is
+    /// carrying this count", so the two can never both say it. The caller that
+    /// decides which is the pump, which is the only thing that knows whether the
+    /// activity row is due.
+    ///
+    /// A hint is also enough on its own to make a row: a queued line usually
+    /// *empties* the pending buffer, so `[1 queued] > ` with nothing after it is
+    /// exactly the state the user needs to see.
+    ///
     /// `None` covers two cases, and both mean the same thing to the caller
-    /// ("draw no pending row"): an empty line, and a terminal with no room for
-    /// the marker and a column of text.
+    /// ("draw no pending row"): nothing to say — an empty line and no count to
+    /// report — and a terminal with no room for the marker and a column of text.
     #[must_use]
-    pub fn row(&self, width: usize) -> Option<String> {
-        if self.pending.is_empty() {
+    pub fn row(&self, width: usize, queued_hint: Option<usize>) -> Option<String> {
+        let waiting = queued_hint.filter(|n| *n != 0);
+        if self.pending.is_empty() && waiting.is_none() {
             return None;
         }
+        let marker = match waiting {
+            Some(n) => format!("[{n} queued] {MARKER}"),
+            None => MARKER.to_owned(),
+        };
         let budget = width.saturating_sub(1);
-        let marker = display_width(MARKER);
-        if budget <= marker {
+        let marker_width = display_width(&marker);
+        if budget <= marker_width {
             return None;
         }
-        let mut row = String::from(MARKER);
-        row.push_str(&tail_that_fits(&defused(&self.pending), budget - marker));
+        let mut row = marker;
+        row.push_str(&tail_that_fits(
+            &defused(&self.pending),
+            budget - marker_width,
+        ));
         Some(row)
     }
 
@@ -602,6 +639,15 @@ fn tail_that_fits(shown: &str, budget: usize) -> String {
 mod tests {
     use super::*;
 
+    /// One row of [`a_queued_hint_prefixes_the_marker_and_can_make_a_row_by_itself`]:
+    /// what the case is, the bytes that make it, the terminal's width, the
+    /// hint the pump would pass, and the literal row.
+    ///
+    /// A named tuple for [`Case`]'s reason, and because the hint is an
+    /// `Option<usize>` whose two `None`-ish values mean different things — the
+    /// alias is where "which position is the hint" is written down once.
+    type HintCase<'a> = (&'a str, &'a [u8], usize, Option<usize>, Option<&'a str>);
+
     /// One row of [`the_keystroke_table`]: what the case is, the pushes that
     /// make it, and the literal state and row the editor must then show at that
     /// width.
@@ -793,7 +839,7 @@ mod tests {
             assert_eq!(editor.pending, *pending, "{what}: pending");
             let want: Vec<String> = queued.iter().map(|line| (*line).to_owned()).collect();
             assert_eq!(editor.queued, want, "{what}: queued");
-            let drawn = editor.row(*width);
+            let drawn = editor.row(*width, None);
             assert_eq!(drawn.as_deref(), *row, "{what}: row");
             if let Some(drawn) = drawn {
                 assert!(
@@ -824,7 +870,7 @@ mod tests {
 
         editor.shelve();
         assert_eq!(editor.pending, "", "the question reads a fresh buffer");
-        assert_eq!(editor.row(20), None);
+        assert_eq!(editor.row(20, None), None);
 
         // The tail of that half-typed character arrives after the question was
         // drawn. It belongs to the line before the seam, so it neither
@@ -839,7 +885,7 @@ mod tests {
 
         editor.unshelve();
         assert_eq!(editor.pending, "second half", "restored verbatim");
-        assert_eq!(editor.row(20).as_deref(), Some("> second half"));
+        assert_eq!(editor.row(20, None).as_deref(), Some("> second half"));
         assert_eq!(
             editor.take_next_queued().as_deref(),
             Some("first"),
@@ -891,7 +937,7 @@ mod tests {
         );
         assert_eq!(editor.queued_len(), 3);
         assert_eq!(editor.pending, "");
-        assert_eq!(editor.row(20), None);
+        assert_eq!(editor.row(20, None), None);
         assert_eq!(editor.take_next_queued().as_deref(), Some("one"));
         assert_eq!(editor.take_next_queued().as_deref(), Some("two"));
         assert_eq!(editor.take_next_queued().as_deref(), Some("three"));
@@ -920,6 +966,105 @@ mod tests {
         assert_eq!(trailing.pending, "beta");
         assert_eq!(trailing.push(b"\n"), vec![Edit::Queued(2)]);
         assert_eq!(trailing.queued, ["alpha", "beta"]);
+    }
+
+    /// **REQ-622 BR-14, verify: the queued count on the row that is on screen.**
+    ///
+    /// `TurnActivity::frame` answers `None` for the whole of `Streaming`
+    /// (ADR-621-1), so for most of a long answer there is no activity row to
+    /// carry the `· N queued` clause — and an Enter pressed there emptied the
+    /// pending line, took its row down, and said nothing at all. The hint puts
+    /// the count in front of the marker for exactly those moments.
+    ///
+    /// A table of literal rows rather than a predicate, so the *bytes* are the
+    /// oracle: the marker's shape, the space before it, the fit, and the two
+    /// ways of saying "the activity row has this" (`None`) and "there is nothing
+    /// to say" (`Some(0)`), which must be indistinguishable at the row.
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** drop the
+    /// `&& waiting.is_none()` from the early return, so a hint no longer makes a
+    /// row on its own. **2 red of 872** — this test, on the `[1 queued] > ` case
+    /// with an empty buffer, and
+    /// `client::tests::a_line_queued_while_the_reply_streams_is_still_reported`,
+    /// which is the same case arriving through the pump. That case is the
+    /// *common* one, not a corner: Enter is what empties the buffer, so the
+    /// moment there is a count to report is the moment there is nothing else on
+    /// the row. Reverted with the same edit.
+    #[test]
+    fn a_queued_hint_prefixes_the_marker_and_can_make_a_row_by_itself() {
+        // (what, pushes, width, hint, row)
+        let cases: &[HintCase<'_>] = &[
+            (
+                "an Enter with the activity row gone: the count is all there is \
+                 to show, and it is shown",
+                b"ship it\n",
+                40,
+                Some(1),
+                Some("[1 queued] > "),
+            ),
+            (
+                "a second line typed after it, with the first still waiting",
+                b"ship it\nand then",
+                40,
+                Some(1),
+                Some("[1 queued] > and then"),
+            ),
+            (
+                "two waiting",
+                b"one\ntwo\n",
+                40,
+                Some(2),
+                Some("[2 queued] > "),
+            ),
+            (
+                "the activity row is due, so it carries the count and the marker \
+                 stays plain",
+                b"ship it\nand then",
+                40,
+                None,
+                Some("> and then"),
+            ),
+            (
+                "nothing waiting reads exactly like nothing to hint",
+                b"and then",
+                40,
+                Some(0),
+                Some("> and then"),
+            ),
+            (
+                "and with nothing waiting and nothing typed there is still no row",
+                b"",
+                40,
+                Some(0),
+                None,
+            ),
+            (
+                "the prefix is part of the fit: the tail that fits is measured \
+                 against it, not against the bare marker",
+                b"one\n0123456789abcdefghij",
+                24,
+                Some(1),
+                Some("[1 queued] > abcdefghij"),
+            ),
+            (
+                "a terminal with no room for the prefix and a column of text \
+                 draws nothing rather than a wrapped row",
+                b"one\nx",
+                12,
+                Some(1),
+                None,
+            ),
+        ];
+
+        for (what, pushes, width, hint, expected) in cases {
+            let mut editor = InputEditor::default();
+            editor.push(pushes);
+            assert_eq!(
+                editor.row(*width, *hint).as_deref(),
+                *expected,
+                "{what} (width {width}, hint {hint:?})"
+            );
+        }
     }
 
     /// BR-9 and BR-15: an escape-prefixed sequence is consumed as a unit and a
@@ -968,7 +1113,11 @@ mod tests {
             );
             assert_eq!(editor.pending, "keep", "{what}: pending");
             assert_eq!(editor.queued_len(), 0, "{what}: queued");
-            assert_eq!(editor.row(20).as_deref(), Some("> keep"), "{what}: row");
+            assert_eq!(
+                editor.row(20, None).as_deref(),
+                Some("> keep"),
+                "{what}: row"
+            );
             assert_eq!(editor.take_next_queued(), None, "{what}: nothing to send");
         }
     }

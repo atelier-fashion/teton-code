@@ -221,17 +221,30 @@ struct RowState {
     /// construction rather than by a conditional at each draw.
     live: bool,
     /// Whether the **activity** row is on screen right now — the top row of
-    /// the block, so one row above the cursor on its own and two with a
-    /// pending row beneath it (REQ-622 ADR-622-4).
+    /// the block, and **always exactly one row above the cursor** (REQ-622
+    /// ADR-622-4).
     ///
-    /// The offsets are never written at a call site. They are arithmetic over
-    /// this field and [`Self::pending_visible`], and the two places that do it
-    /// are [`Self::paint_rows`] and [`Self::withdraw_rows`]; a third reader
-    /// would be a third opinion about where the cursor is, which is the whole
-    /// of what BUG-225 was.
+    /// One, with a pending row and without, which is the geometry the cursor
+    /// rule buys: the pending row is the row the cursor *sits on* rather than
+    /// a row it has stepped past, so it adds no offset to the row above it.
+    /// This was `2 or 1` until the verify pass, and arithmetic over two
+    /// visibilities is exactly the kind of thing that goes wrong once —
+    /// BUG-225 was a wrong offset and nothing else.
+    ///
+    /// The offset is still never written at a call site: [`Self::paint_rows`]
+    /// and [`Self::withdraw_rows`] are the only two verbs that name one, and a
+    /// third reader would be a third opinion about where the cursor is.
     activity_visible: bool,
-    /// Whether the **pending** row — what the user is typing — is on screen,
-    /// always the bottom row of the block and always one above the cursor.
+    /// Whether the **pending** row — what the user is typing — is on screen.
+    ///
+    /// It is the bottom row of the block and **the row the cursor is on**: it
+    /// is drawn with no trailing newline, so the terminal's caret rests at the
+    /// end of the user's own text, which is where ADR-622-4 says it belongs and
+    /// where anyone who has used a terminal expects it. Its three verbs are
+    /// therefore [`Surface::draw_current_row`],
+    /// [`Surface::repaint_current_row`] and
+    /// [`Surface::withdraw_current_row`] — no offset in any of them, because
+    /// there is no cursor motion to count.
     ///
     /// A row cannot be inserted above one already drawn ([`Surface::draw_row`]
     /// appends at the cursor), so a change in the activity row's *presence*
@@ -239,37 +252,24 @@ struct RowState {
     /// That reflow is in [`Self::paint_rows`] and is the reason the two
     /// visibilities are separate fields rather than a count.
     pending_visible: bool,
-    /// Whether this call reads the keyboard and owns the pending row (BR-1,
-    /// BR-13).
+    /// Whether this call reads the keyboard, and what it holds in order to
+    /// (REQ-622, verify).
     ///
-    /// True exactly when [`Self::engage_input`] took the terminal out of
-    /// canonical mode for this call. It is read, rather than
-    /// [`crate::prompt::RawMode::is_engaged`], everywhere the pump decides
-    /// whether to read bytes or draw a pending row: the process-wide answer is
-    /// the right one for a *question's* reader (ADR-622-2, TASK-418) and the
-    /// wrong one here, because it would still say yes on a nested call that
-    /// never engaged anything and does not own the rows.
+    /// **A companion rather than four more fields here.** The block's own
+    /// state is a geometry — which rows are on screen, at what width, at which
+    /// animation frame — and owning the terminal's input is a different
+    /// concern that merely has the same lifetime: it is taken at the top of a
+    /// call and given back at its close-out, and the block reads exactly one
+    /// bit of it ([`InputOwnership::owns_input`]) to decide whether the bottom
+    /// row is its to draw. Keeping the guard, the two seams into the terminal
+    /// and the verdict in one named value is what lets that bit be a question
+    /// asked of something, rather than a flag the geometry happens to carry.
     ///
-    /// False is REQ-621's world unchanged: the kernel assembles the line, the
-    /// terminal echoes it, and [`Self::abandon`] is the answer to a submitted
-    /// line.
-    owns_input: bool,
-    /// The guard that puts the terminal back, held for the pump's lifetime
-    /// (ADR-622-1, BR-7).
-    ///
-    /// **Held here for `row`'s own reason** (ADR-621-4): [`Connection::call`]
-    /// owns this value and lends it to the pump, so the restore rides every
-    /// way out of the call — the `?` on the send, on each receive, on a result
-    /// that fails to deserialize, on a dispatch that could not answer a
-    /// permission, on a disconnected channel, and on a panic unwinding through
-    /// the pump (AC-5). A guard bound in the pump instead would be dropped on
-    /// all of those too, but a guard returned *by value* would not, and BR-7 is
-    /// precisely a rule about the paths nobody anticipated.
-    ///
-    /// `None` on the canonical path, and `None` under a test hook — see
-    /// [`InputHandover`], which is why the verdict is a separate field from the
-    /// guard.
-    raw: Option<RawMode>,
+    /// Held on the row, and so owned by [`Connection::call`] and lent to the
+    /// pump, for the guard's own reason (ADR-621-4, BR-7): the restore has to
+    /// ride *every* way out of the call, including the ones nobody
+    /// anticipated. See [`InputOwnership::guard`].
+    input: InputOwnership,
     /// Which animation frame the row is showing. Advanced by a `Tick` only: a
     /// redraw after a durable line is not an animation step.
     tick: u64,
@@ -306,11 +306,52 @@ struct RowState {
     /// installs `|| false` under `cfg(test)`, and the one test that means
     /// "Enter was pressed" says so by setting this hook.
     line_waiting: fn() -> bool,
+}
+
+/// One call's hold on the terminal's input (REQ-622 ADR-622-1, BR-1, BR-13).
+///
+/// Extracted from [`RowState`] at REQ-622's verify pass, where the row had
+/// grown two concerns: where its rows are on the screen, and whether this call
+/// is the one reading the keyboard. They share a lifetime and nothing else —
+/// the block is drawn on every live call, the input is taken only by a turn at
+/// a terminal — and only one bit crosses between them
+/// ([`Self::owns_input`], which is what gates the pending row).
+struct InputOwnership {
+    /// Whether this call reads the keyboard and owns the pending row.
+    ///
+    /// True exactly when [`Self::engage_input`] took the terminal out of
+    /// canonical mode for this call. It is read, rather than
+    /// [`crate::prompt::RawMode::is_engaged`], everywhere the pump decides
+    /// whether to read bytes or draw a pending row: the process-wide answer is
+    /// the right one for a *question's* reader (ADR-622-2, TASK-418) and the
+    /// wrong one here, because it would still say yes on a nested call that
+    /// never engaged anything and does not own the rows.
+    ///
+    /// False is REQ-621's world unchanged: the kernel assembles the line, the
+    /// terminal echoes it, and [`RowState::abandon`] is the answer to a
+    /// submitted line.
+    engaged: bool,
+    /// The guard that puts the terminal back, held for the pump's lifetime
+    /// (ADR-622-1, BR-7).
+    ///
+    /// **Held here for `row`'s own reason** (ADR-621-4): [`Connection::call`]
+    /// owns this value and lends it to the pump, so the restore rides every
+    /// way out of the call — the `?` on the send, on each receive, on a result
+    /// that fails to deserialize, on a dispatch that could not answer a
+    /// permission, on a disconnected channel, and on a panic unwinding through
+    /// the pump (AC-5). A guard bound in the pump instead would be dropped on
+    /// all of those too, but a guard returned *by value* would not, and BR-7 is
+    /// precisely a rule about the paths nobody anticipated.
+    ///
+    /// `None` on the canonical path, and `None` under a test hook — see
+    /// [`InputHandover`], which is why the verdict is a separate field from the
+    /// guard.
+    guard: Option<RawMode>,
     /// How this call asks the terminal for its input.
     ///
     /// [`engage_raw_mode`] in production; a scripted verdict under test, for
-    /// [`Self::line_waiting`]'s reason and one sharper one. `cargo test` runs
-    /// with `STDIN_FILENO` on whichever terminal launched it, so a real
+    /// [`RowState::line_waiting`]'s reason and one sharper one. `cargo test`
+    /// runs with `STDIN_FILENO` on whichever terminal launched it, so a real
     /// `tcsetattr` inside a unit test would take the *developer's* terminal
     /// out of canonical mode and — if the test then failed on an assertion,
     /// which is what a test is for — leave it there.
@@ -347,24 +388,19 @@ const RAW_REFUSED: &str = "input: this terminal refused to leave canonical mode;
                            the turn behaves as before, and a submitted line gives up the \
                            activity row";
 
-impl RowState {
-    /// The row's state at the start of a call: nothing drawn, gate and width
-    /// taken from the surface.
-    fn new(surface: &dyn Surface) -> Self {
-        // A fn pointer either way, and the annotation is what lets the two
-        // arms coerce to one. `|| false` under test is not a convenience: see
-        // the field.
-        let line_waiting: fn() -> bool = if cfg!(test) { || false } else { line_submitted };
-        // REQ-622's two hooks, in the same shape and for the same reason one
-        // size up. **Both arms of each `if` are compiled in every build**, which
-        // is not incidental: a `#[cfg(test)]` item cannot be named from an
-        // expression that also has to compile in release, and this is the
-        // constructor [`Connection::call`] uses — so a test that drives the real
-        // `call` has no later moment at which to install a hook the way
-        // [`Self::at_width`] does. The cost is two functions in the shipped
-        // binary that nothing there can reach; the alternative is BR-1's gate
-        // and BR-3's row having no test route that does not involve the
-        // developer's own terminal.
+impl InputOwnership {
+    /// A call that has not taken the terminal, with its two seams installed.
+    ///
+    /// **Both arms of each `if` are compiled in every build**, which is not
+    /// incidental: a `#[cfg(test)]` item cannot be named from an expression
+    /// that also has to compile in release, and this runs inside the
+    /// constructor [`Connection::call`] uses — so a test that drives the real
+    /// `call` has no later moment at which to install a hook the way
+    /// [`RowState::at_width`] does. The cost is two functions in the shipped
+    /// binary that nothing there can reach; the alternative is BR-1's gate and
+    /// BR-3's row having no test route that does not involve the developer's
+    /// own terminal.
+    fn new() -> Self {
         let engage: fn() -> InputHandover = if cfg!(test) {
             scripted_engage
         } else {
@@ -376,23 +412,196 @@ impl RowState {
             crate::prompt::read_available
         };
         Self {
-            live: surface.has_live_rows(),
+            engaged: false,
+            guard: None,
+            engage,
+            read_available,
+        }
+    }
+
+    /// Whether this call reads the keyboard and owns the pending row.
+    ///
+    /// A question asked of this value rather than a field the geometry carries
+    /// — see [`Self::engaged`] for why the answer is this one and not
+    /// [`crate::prompt::RawMode::is_engaged`].
+    fn owns_input(&self) -> bool {
+        self.engaged
+    }
+
+    /// Take the terminal's input for the length of this call, if this is a call
+    /// that should have it (REQ-622 ADR-622-1, BR-1).
+    ///
+    /// Three conditions, and each of them is necessary. **`ends_turn`**,
+    /// because raw mode belongs to a *turn*: the thirty non-turn RPCs this
+    /// struct also serves finish in milliseconds, have no row and no pending
+    /// line, and a `/cost` that flipped the terminal's mode would be a mode
+    /// change with no reader behind it. It is asked of the **method** —
+    /// `P::ENDS_TURN`, declared beside the wire name — and handed in rather
+    /// than re-derived, for [`Connection::call`]'s reason: thirty call sites
+    /// are thirty chances to answer it wrongly, so exactly one place answers
+    /// it. **`at_a_live_surface`** is stdout's half of "at a terminal", read
+    /// once from the surface's own gate and handed in by
+    /// [`RowState::engage_input`]; **`typed_input`** is stdin's, threaded from
+    /// the one edge that reads `IsTerminal`. A piped stdin with a terminal stdout
+    /// therefore never reaches `tcsetattr` at all, which is AC-7 by
+    /// construction rather than by a conditional at each draw.
+    ///
+    /// The three outcomes are not three errors. `NoTerminal` is the ordinary
+    /// piped session and says nothing at all. `Failed` is a real terminal that
+    /// refused: canonical mode stays, [`RowState::abandon`] stays armed, the
+    /// turn runs, and one verbose notice names it (BR-11 — the opposite polarity
+    /// from the key prompt's fail-closed refusal, because there is nothing here
+    /// to hide). `Raw` hands over the guard whose `Drop` is the restore, kept
+    /// on this struct so that **every** way out of the call puts the terminal
+    /// back (BR-7, AC-5) — see [`Self::guard`].
+    fn engage_input(&mut self, ctx: &mut UiContext, ends_turn: bool, at_a_live_surface: bool) {
+        if !(ends_turn && at_a_live_surface && ctx.typed_input) {
+            return;
+        }
+        let handover = (self.engage)();
+        match handover.verdict {
+            InputVerdict::Raw => {
+                self.engaged = true;
+                self.guard = handover.guard;
+                // BR-14's count is **seeded** here and not only updated on an
+                // Enter, because the queue outlives a turn: it is drained one
+                // line per pass of the entry loop (ADR-622-5), so a second line
+                // typed during the last turn is still waiting while this one
+                // runs — and `TurnActivity::begin` has just cleared the count
+                // along with every other figure that must not be inherited. The
+                // editor is asked, rather than a tally kept here, for
+                // `set_queued`'s reason: one store of the lines, one count.
+                ctx.state.activity.set_queued(ctx.state.input.queued_len());
+            }
+            // A session that was never at a terminal on stdin. Nothing was
+            // changed, so there is nothing to say and nothing to undo.
+            InputVerdict::NoTerminal => {}
+            InputVerdict::Failed => {
+                if ctx.state.verbose {
+                    ctx.surface.line(LineKind::Info, RAW_REFUSED);
+                }
+            }
+        }
+    }
+
+    /// Put the terminal back, at the close-out and before the call's last
+    /// durable lines are written (BR-7).
+    ///
+    /// Dropping the guard **is** the restore — `RawMode`'s `Drop` writes the
+    /// saved settings back with `TCSANOW` — so this exists for its *ordering*
+    /// rather than for its effect: the value would be dropped a few lines
+    /// later anyway when `row` goes out of scope. Two reasons to be explicit.
+    /// The rows are withdrawn first, so the terminal is still the terminal the
+    /// pump has been painting while it takes its rows back; and the turn's
+    /// closing lines — the hand-off, the cost line, a refusal — are written in
+    /// canonical mode, which is the mode the entry prompt that follows them
+    /// reads in.
+    ///
+    /// `engaged` goes with it: the input is no longer this call's, and a
+    /// paint after this point must not draw a pending row the pump can no
+    /// longer keep up to date.
+    fn release(&mut self) {
+        self.engaged = false;
+        self.guard = None;
+    }
+
+    /// Read whatever the user has typed since the last look and fold it into
+    /// the editor (BR-2, BR-3).
+    ///
+    /// **The pump is the reader.** This is the whole of REQ-622's first
+    /// direction: the tick that already asked whether stdin had bytes now takes
+    /// them, through the one seam this module names
+    /// ([`crate::prompt::read_available`]), on the thread that has always been
+    /// the single reader of stdin (ADR-556-1). The kernel's line discipline is
+    /// no longer in front of it, so there is still exactly one reader.
+    ///
+    /// Loops until the descriptor has nothing left, because one `read(2)`
+    /// returns one buffer's worth: a pasted block larger than [`KEY_CHUNK`]
+    /// arrives in several reads and must be one paste, not the first 512 bytes
+    /// of one (AC-14). The loop is bounded by what the kernel is holding — a
+    /// look that finds nothing reports zero, which is how it ends.
+    ///
+    /// A read error costs this tick's keystrokes and nothing else. `EINTR` is
+    /// already folded into "nothing waiting" by `read_available`, so what is
+    /// left is a descriptor that has genuinely gone wrong; the next tick asks
+    /// again, and failing a turn over it would be the tradeoff BR-11 rejects at
+    /// the other end of the same seam.
+    ///
+    /// **Only `Queued` is acted on here.** `Pending` and `Nothing` need no
+    /// bookkeeping because [`RowState::paint_rows`] is a *projection* of the
+    /// editor and the activity, and it runs immediately after every read — a "the row
+    /// is stale" flag beside it would be a second opinion about what is on
+    /// screen. A queued line is different in kind: it changes a count on the
+    /// **activity** row (BR-14), and the editor is the only thing that knows
+    /// what that count now is.
+    fn read_keys(&mut self, ctx: &mut UiContext) {
+        if !self.engaged {
+            return;
+        }
+        let mut buf = [0u8; KEY_CHUNK];
+        loop {
+            let read = match (self.read_available)(&mut buf) {
+                Ok(0) | Err(_) => return,
+                // Clamped rather than trusted: production cannot report more
+                // than the buffer it was handed, and a test hook that did would
+                // panic the slice rather than fail an assertion.
+                Ok(read) => read.min(buf.len()),
+            };
+            for edit in ctx.state.input.push(&buf[..read]) {
+                match edit {
+                    Edit::Queued(waiting) => ctx.state.activity.set_queued(waiting),
+                    Edit::Pending | Edit::Nothing => {}
+                }
+            }
+        }
+    }
+}
+
+impl RowState {
+    /// The fields neither constructor has an opinion about.
+    ///
+    /// The five constant fields, in **one** place: `new` and
+    /// [`Self::at_width`] each differ from this in one or three fields and used
+    /// to restate all eight, which is eight chances for the fixture and the
+    /// real constructor to drift — a `pending_visible: true` in one of them
+    /// would be a test fixture that believes a row is on screen before anything
+    /// has been drawn ([[LESSON-547]]: one source of truth for a shape two
+    /// callers share).
+    fn base() -> Self {
+        // A fn pointer either way, and the annotation is what lets the two
+        // arms coerce to one. `|| false` under test is not a convenience: see
+        // the field.
+        let line_waiting: fn() -> bool = if cfg!(test) { || false } else { line_submitted };
+        Self {
+            live: false,
             activity_visible: false,
             pending_visible: false,
-            owns_input: false,
-            raw: None,
+            input: InputOwnership::new(),
             tick: 0,
             // Not asked here. The query is an `ioctl` on `STDOUT_FILENO`, every
             // non-turn RPC comes through this constructor too — some thirty of
             // them — with nothing to measure, and a width read now would be a
-            // width from before the first frame anyway. `paint_row` asks when
+            // width from before the first frame anyway. `paint_rows` asks when
             // it has a row to fit.
             width: 0,
             measure_width: crate::prompt::terminal_width,
             line_waiting,
-            engage,
-            read_available,
         }
+    }
+
+    /// The row's state at the start of a call: nothing drawn, gate and width
+    /// taken from the surface.
+    fn new(surface: &dyn Surface) -> Self {
+        Self {
+            live: surface.has_live_rows(),
+            ..Self::base()
+        }
+    }
+
+    /// Whether this call reads the keyboard and owns the pending row — the one
+    /// bit of [`InputOwnership`] the block's geometry reads (BR-1, BR-13).
+    fn owns_input(&self) -> bool {
+        self.input.owns_input()
     }
 
     /// Give up the rows for the rest of this call, leaving the screen exactly
@@ -440,131 +649,29 @@ impl RowState {
         self.live = false;
     }
 
-    /// Take the terminal's input for the length of this call, if this is a call
-    /// that should have it (REQ-622 ADR-622-1, BR-1).
+    /// Take the terminal's input for the length of this call (REQ-622
+    /// ADR-622-1, BR-1), and hold the guard that gives it back.
     ///
-    /// Three conditions, and each of them is necessary. **`ends_turn`**,
-    /// because raw mode belongs to a *turn*: the thirty non-turn RPCs this
-    /// struct also serves finish in milliseconds, have no row and no pending
-    /// line, and a `/cost` that flipped the terminal's mode would be a mode
-    /// change with no reader behind it. It is asked of the **method** —
-    /// `P::ENDS_TURN`, declared beside the wire name — and handed in rather
-    /// than re-derived, for [`Connection::call`]'s reason: thirty call sites
-    /// are thirty chances to answer it wrongly, so exactly one place answers
-    /// it. **`live`** is stdout's half of "at a terminal", read once from the
-    /// surface's own gate; **`typed_input`** is stdin's, threaded from the one
-    /// edge that reads `IsTerminal`. A piped stdin with a terminal stdout
-    /// therefore never reaches `tcsetattr` at all, which is AC-7 by
-    /// construction rather than by a conditional at each draw.
-    ///
-    /// The three outcomes are not three errors. `NoTerminal` is the ordinary
-    /// piped session and says nothing at all. `Failed` is a real terminal that
-    /// refused: canonical mode stays, [`Self::abandon`] stays armed, the turn
-    /// runs, and one verbose notice names it (BR-11 — the opposite polarity
-    /// from the key prompt's fail-closed refusal, because there is nothing here
-    /// to hide). `Raw` hands over the guard whose `Drop` is the restore, kept
-    /// on this struct so that **every** way out of the call puts the terminal
-    /// back (BR-7, AC-5) — see [`Self::raw`].
+    /// The decision is [`InputOwnership::engage_input`]'s; what the row
+    /// contributes is stdout's half of "at a terminal", which is the gate it
+    /// read once from the surface. Kept as a method on the row so the one
+    /// caller — [`Connection::call`], which alone knows whether the method is
+    /// a turn — has one value to talk to.
     fn engage_input(&mut self, ctx: &mut UiContext, ends_turn: bool) {
-        if !(ends_turn && self.live && ctx.typed_input) {
-            return;
-        }
-        let handover = (self.engage)();
-        match handover.verdict {
-            InputVerdict::Raw => {
-                self.owns_input = true;
-                self.raw = handover.guard;
-                // BR-14's count is **seeded** here and not only updated on an
-                // Enter, because the queue outlives a turn: it is drained one
-                // line per pass of the entry loop (ADR-622-5), so a second line
-                // typed during the last turn is still waiting while this one
-                // runs — and `TurnActivity::begin` has just cleared the count
-                // along with every other figure that must not be inherited. The
-                // editor is asked, rather than a tally kept here, for
-                // `set_queued`'s reason: one store of the lines, one count.
-                ctx.state.activity.set_queued(ctx.state.input.queued_len());
-            }
-            // A session that was never at a terminal on stdin. Nothing was
-            // changed, so there is nothing to say and nothing to undo.
-            InputVerdict::NoTerminal => {}
-            InputVerdict::Failed => {
-                if ctx.state.verbose {
-                    ctx.surface.line(LineKind::Info, RAW_REFUSED);
-                }
-            }
-        }
+        self.input.engage_input(ctx, ends_turn, self.live);
     }
 
     /// Put the terminal back, at the close-out and before the call's last
-    /// durable lines are written (BR-7).
-    ///
-    /// Dropping the guard **is** the restore — `RawMode`'s `Drop` writes the
-    /// saved settings back with `TCSANOW` — so this exists for its *ordering*
-    /// rather than for its effect: the value would be dropped a few lines
-    /// later anyway when `row` goes out of scope. Two reasons to be explicit.
-    /// The rows are withdrawn first, so the terminal is still the terminal the
-    /// pump has been painting while it takes its rows back; and the turn's
-    /// closing lines — the hand-off, the cost line, a refusal — are written in
-    /// canonical mode, which is the mode the entry prompt that follows them
-    /// reads in.
-    ///
-    /// `owns_input` goes with it: the input is no longer this call's, and a
-    /// paint after this point must not draw a pending row the pump can no
-    /// longer keep up to date.
+    /// durable lines are written (BR-7). [`InputOwnership::release`]'s, and
+    /// delegated for [`Self::engage_input`]'s reason.
     fn release_raw(&mut self) {
-        self.owns_input = false;
-        self.raw = None;
+        self.input.release();
     }
 
     /// Read whatever the user has typed since the last look and fold it into
-    /// the editor (BR-2, BR-3).
-    ///
-    /// **The pump is the reader.** This is the whole of REQ-622's first
-    /// direction: the tick that already asked whether stdin had bytes now takes
-    /// them, through the one seam this module names
-    /// ([`crate::prompt::read_available`]), on the thread that has always been
-    /// the single reader of stdin (ADR-556-1). The kernel's line discipline is
-    /// no longer in front of it, so there is still exactly one reader.
-    ///
-    /// Loops until the descriptor has nothing left, because one `read(2)`
-    /// returns one buffer's worth: a pasted block larger than [`KEY_CHUNK`]
-    /// arrives in several reads and must be one paste, not the first 512 bytes
-    /// of one (AC-14). The loop is bounded by what the kernel is holding — a
-    /// look that finds nothing reports zero, which is how it ends.
-    ///
-    /// A read error costs this tick's keystrokes and nothing else. `EINTR` is
-    /// already folded into "nothing waiting" by `read_available`, so what is
-    /// left is a descriptor that has genuinely gone wrong; the next tick asks
-    /// again, and failing a turn over it would be the tradeoff BR-11 rejects at
-    /// the other end of the same seam.
-    ///
-    /// **Only `Queued` is acted on here.** `Pending` and `Nothing` need no
-    /// bookkeeping because [`Self::paint_rows`] is a *projection* of the editor
-    /// and the activity, and it runs immediately after every read — a "the row
-    /// is stale" flag beside it would be a second opinion about what is on
-    /// screen. A queued line is different in kind: it changes a count on the
-    /// **activity** row (BR-14), and the editor is the only thing that knows
-    /// what that count now is.
+    /// the editor (BR-2, BR-3). [`InputOwnership::read_keys`]'s.
     fn read_keys(&mut self, ctx: &mut UiContext) {
-        if !self.owns_input {
-            return;
-        }
-        let mut buf = [0u8; KEY_CHUNK];
-        loop {
-            let read = match (self.read_available)(&mut buf) {
-                Ok(0) | Err(_) => return,
-                // Clamped rather than trusted: production cannot report more
-                // than the buffer it was handed, and a test hook that did would
-                // panic the slice rather than fail an assertion.
-                Ok(read) => read.min(buf.len()),
-            };
-            for edit in ctx.state.input.push(&buf[..read]) {
-                match edit {
-                    Edit::Queued(waiting) => ctx.state.activity.set_queued(waiting),
-                    Edit::Pending | Edit::Nothing => {}
-                }
-            }
-        }
+        self.input.read_keys(ctx);
     }
 
     /// Make what is on screen match the block the two projections would draw
@@ -574,12 +681,12 @@ impl RowState {
     /// it the line the user is typing — and either may be absent. Its whole
     /// discipline is here, in one place, so the tick arm and the
     /// after-a-message redraw cannot come to disagree, and so **no call site
-    /// ever writes a row offset**: with both rows up the activity row is two
-    /// above the cursor and the pending row one, with either alone it is one,
-    /// and that arithmetic is this function's and no one else's (BR-3, BR-13).
+    /// ever writes a row offset**: the pending row is the row the cursor is on
+    /// and the activity row is the one above it, with a pending row and
+    /// without, so the only offset in the block is `1` (BR-3, BR-13).
     ///
     /// It runs in two passes for a reason that is a property of the terminal
-    /// rather than a choice: [`Surface::line`] appends at the cursor, so a row
+    /// rather than a choice: every draw verb appends at the cursor, so a row
     /// cannot be *inserted* above a row already on screen. So the teardown pass
     /// goes bottom-up and the draw pass top-down, and a change in the activity
     /// row's presence while a pending row is up takes the pending row down with
@@ -589,10 +696,16 @@ impl RowState {
     ///
     /// | activity | pending | done |
     /// |---|---|---|
-    /// | `Some`, on screen | unchanged | `repaint_row_above(2 or 1, ..)` — in place |
+    /// | `Some`, on screen | unchanged | `repaint_row_above(1, ..)` — in place |
     /// | `Some`, not on screen | — | `draw_row` — the row scrolls in beneath whatever was last written |
     /// | `None`, on screen | taken down first | `withdraw_row_above(1)` — gone without residue |
     /// | `Some` ⇄ `None` | on screen | pending withdrawn, then both drawn in order |
+    ///
+    /// and the pending row, one line down and one verb over in each case:
+    /// `repaint_current_row` in place, `draw_current_row` at the cursor,
+    /// `withdraw_current_row` to take it back. Every one of them acts on the
+    /// row the cursor is already on, which is what it means for that row to be
+    /// the current one.
     ///
     /// Gated on [`Self::live`], so a piped surface reaches no verb here at all
     /// (REQ-621 BR-6); the pending row is gated on [`Self::owns_input`] as
@@ -625,13 +738,36 @@ impl RowState {
         // `ioctl` on the path where a row is genuinely due, rather than eight
         // times a second through a whole streamed reply.
         let activity_due = ctx.state.activity.has_row(now);
-        let pending_due = self.owns_input && ctx.state.input.row(usize::MAX).is_some();
-        if (!self.activity_visible && activity_due) || (!self.pending_visible && pending_due) {
+        // BR-14's count, on the row that is on screen when the activity row is
+        // not (REQ-622, verify). `frame` answers `None` for the whole of
+        // `Streaming` — a reply arriving is its own feedback, ADR-621-1 — so an
+        // Enter pressed while the model was writing withdrew the pending row
+        // and said nothing at all, which is what a swallowed keystroke looks
+        // like. `None` here means "the activity row is carrying the count", so
+        // the two can never both say it.
+        let queued_hint = (!activity_due).then(|| ctx.state.input.queued_len());
+        let pending_due =
+            self.owns_input() && ctx.state.input.row(usize::MAX, queued_hint).is_some();
+        // A row about to be drawn is fitted to the terminal as it is now, and
+        // the pending row is drawn again whenever the activity row **leaves**
+        // as well as when it appears: a row cannot be inserted above one
+        // already on screen, so either change takes the pending row down and
+        // puts it back (the reflow below). The appearing half is the first
+        // clause; the leaving half had no clause until the verify pass, so a
+        // terminal resized during a turn redrew the pending row at the width it
+        // had before — a row wider than the window, hard-wrapped into a second
+        // row the withdraw cannot clear, which is the failure [`Self::width`]
+        // is written against arriving by the one door nobody watched.
+        let activity_leaves = self.activity_visible && !activity_due;
+        if (!self.activity_visible && activity_due)
+            || (!self.pending_visible && pending_due)
+            || (self.pending_visible && activity_leaves)
+        {
             self.width = (self.measure_width)();
         }
         let activity = ctx.state.activity.frame(now, self.tick, self.width);
-        let pending = if self.owns_input {
-            ctx.state.input.row(self.width)
+        let pending = if self.owns_input() {
+            ctx.state.input.row(self.width, queued_hint)
         } else {
             None
         };
@@ -643,7 +779,12 @@ impl RowState {
         // cannot change while it is on screen.
         let activity_appears_or_leaves = activity.is_some() != self.activity_visible;
         if self.pending_visible && (pending.is_none() || activity_appears_or_leaves) {
-            let cleared = ctx.surface.withdraw_row_above(1);
+            // No offset: the cursor is on this row. What the clear leaves is
+            // the cursor at column 0 of an empty row directly under the
+            // activity row — exactly the state the block was in before the
+            // pending row was ever drawn, which is why the offset above it is
+            // `1` either way.
+            let cleared = ctx.surface.withdraw_current_row();
             self.pending_visible = false;
             if !cleared {
                 self.hide_after_a_failed_write(ctx);
@@ -662,11 +803,11 @@ impl RowState {
         // ---- Draw, top row first.
         if let Some(text) = activity {
             if self.activity_visible {
-                let rows_up = if self.pending_visible { 2 } else { 1 };
-                if !ctx
-                    .surface
-                    .repaint_row_above(rows_up, LineKind::Activity, &text)
-                {
+                // One, with a pending row beneath and without: see
+                // [`Self::activity_visible`]. The repaint's own save/restore
+                // pair is what puts the cursor back on the end of the pending
+                // row afterwards.
+                if !ctx.surface.repaint_row_above(1, LineKind::Activity, &text) {
                     self.hide_after_a_failed_write(ctx);
                     return;
                 }
@@ -685,12 +826,18 @@ impl RowState {
         if let Some(text) = pending {
             if self.pending_visible {
                 // The block's last verb, so a refusal is reported and there is
-                // nothing after it to guard against.
-                if !ctx.surface.repaint_row_above(1, LineKind::Activity, &text) {
+                // nothing after it to guard against. `\r`, erase, write: the
+                // cursor is on this row and is meant to end up back at the end
+                // of it, so there is nothing to save and nothing to restore.
+                if !ctx.surface.repaint_current_row(LineKind::Pending, &text) {
                     self.hide_after_a_failed_write(ctx);
                 }
             } else {
-                ctx.surface.draw_row(LineKind::Activity, &text);
+                // Drawn **without** a trailing newline, which is the whole of
+                // ADR-622-4's cursor rule: the caret stays at the end of what
+                // the user is typing instead of parking on the blank row below
+                // the block.
+                ctx.surface.draw_current_row(LineKind::Pending, &text);
                 self.pending_visible = true;
             }
         }
@@ -702,9 +849,10 @@ impl RowState {
     /// The withdraw-before-anything-else rule, extended from one row to the
     /// block: a durable line — a tool's `[running]`, a notice, a permission
     /// question — always prints where the block was, and the block comes back
-    /// beneath it. Bottom first because `withdraw_row_above` measures from the
-    /// cursor and leaves it on the row it cleared, so each row is one up in
-    /// turn.
+    /// beneath it. Bottom first because both clearing verbs leave the cursor at
+    /// the start of the row they cleared: the pending row is cleared where the
+    /// cursor already is, which puts the cursor on the row directly under the
+    /// activity row, and the activity row is then one up from there.
     ///
     /// Stops at the first refused write and reports it. A withdraw whose bytes
     /// did not land did not move the cursor either, so the offset the second
@@ -720,7 +868,10 @@ impl RowState {
     /// already out of scope.
     fn withdraw_rows(&mut self, ctx: &mut UiContext) -> bool {
         if self.pending_visible {
-            let cleared = ctx.surface.withdraw_row_above(1);
+            // The cursor is on this row, so the clear takes no offset; what it
+            // leaves is the cursor at the start of the row, which is where the
+            // activity row's `withdraw_row_above(1)` measures from.
+            let cleared = ctx.surface.withdraw_current_row();
             self.pending_visible = false;
             if !cleared {
                 self.activity_visible = false;
@@ -773,19 +924,16 @@ impl RowState {
         set_test_width(width);
         Self {
             live: true,
-            activity_visible: false,
-            pending_visible: false,
-            owns_input: false,
-            raw: None,
-            tick: 0,
             width,
             // The same answer a redraw will get, so a fixture's rows are all
             // fitted to one width unless the test resizes on purpose
             // (`set_test_width`).
             measure_width: test_width,
-            line_waiting: || false,
-            engage: scripted_engage,
-            read_available: scripted_keys,
+            // The two seams are the scripted ones already: `InputOwnership::new`
+            // chooses on `cfg!(test)`, so a fixture and the real `call` reach
+            // the same stand-ins by the same route rather than by two lists
+            // that could disagree.
+            ..Self::base()
         }
     }
 
@@ -797,12 +945,13 @@ impl RowState {
     /// a test about the engage itself drives `engage_input` with a scripted
     /// verdict (`a_refused_raw_mode_falls_back_to_abandon_and_says_so`) or
     /// drives the real [`Connection::call`]
-    /// (`raw_mode_is_engaged_only_for_a_turn_at_a_terminal`). [`Self::raw`]
+    /// (`raw_mode_is_engaged_only_for_a_turn_at_a_terminal`).
+    /// [`InputOwnership::guard`]
     /// stays `None` — there is no terminal in the room to restore, and only
     /// `prompt.rs` can build the guard.
     #[cfg(test)]
     fn owning_input(mut self) -> Self {
-        self.owns_input = true;
+        self.input.engaged = true;
         self
     }
 }
@@ -952,6 +1101,17 @@ fn around_a_question<'a, T>(
     ask: impl FnOnce(&mut UiContext<'a>) -> T,
 ) -> T {
     ctx.state.input.shelve();
+    // And the same rule one layer down, where the editor cannot reach (REQ-622,
+    // verify). The shelve accounts for every byte the *pump* has read — and the
+    // pump has just read everything the descriptor was holding, on the tick
+    // immediately before this dispatch, because that is what `read_keys` does:
+    // it loops until the descriptor reports nothing left. So anything still in
+    // the kernel's input queue at this instant arrived in the window between
+    // that read and this question's first row, which is the one span of time in
+    // which a keystroke can be neither in the editor nor aimed at a question the
+    // user can see. BR-5 says a question reads only what was typed after it was
+    // drawn; the shelve says that of the editor, and this says it of the kernel.
+    crate::prompt::discard_type_ahead();
     let answered = ask(ctx);
     ctx.state.input.unshelve();
     answered
@@ -1307,7 +1467,7 @@ impl Connection {
             // `call`'s own close-out would each erase that line on their way
             // out, and this runs before both on every wake, including the one
             // that carries the response.
-            if !row.owns_input && row.live && ctx.typed_input && (row.line_waiting)() {
+            if !row.owns_input() && row.live && ctx.typed_input && (row.line_waiting)() {
                 row.abandon();
             }
             let message = match wake {
@@ -1324,7 +1484,7 @@ impl Connection {
                     // so the terminal is raw and a row is on screen — the state
                     // the signal-free restore path has to survive
                     // (`panic_mid_turn_armed`).
-                    if row.owns_input && row.tick == 1 && panic_mid_turn_armed() {
+                    if row.owns_input() && row.tick == 1 && panic_mid_turn_armed() {
                         panic!(
                             "TETON_TEST_PANIC_MID_TURN: panicking one tick into a raw-mode turn"
                         );
@@ -2994,6 +3154,24 @@ mod tests {
                 },
             }),
         }))
+    }
+
+    /// Move the activity into `Streaming`, where it draws **no row at all**
+    /// (ADR-621-1: arriving text is its own liveness signal).
+    ///
+    /// The one state in which the pending row is on screen with nothing above
+    /// it, which is what the two tests below are about — the reflow when the
+    /// row leaves, and BR-14's count with no row left to carry it. Folded
+    /// through `TurnActivity::observe` from the same envelope the pump would
+    /// hand it, rather than by setting a phase, so the tests cannot be a claim
+    /// about a state the daemon never produces.
+    fn the_reply_starts_streaming(ctx: &mut UiContext, now: Instant) {
+        let Incoming::Event(envelope) = agent_chunk("the finding is") else {
+            unreachable!("agent_chunk builds an event")
+        };
+        ctx.state
+            .activity
+            .observe(&envelope, ctx.session_id.as_ref(), now);
     }
 
     /// The turn request these tests put in flight. The method is the real one —
@@ -5377,10 +5555,11 @@ mod tests {
             assert!(
                 surface.calls.iter().any(|call| matches!(
                     call,
-                    Rendered::Line(LineKind::Activity, text) if text == "> hi"
+                    Rendered::DrawCurrent(LineKind::Pending, text) if text == "> hi"
                 )),
                 "the pump read the keystrokes and drew them on a row of its \
-                 own: {:?}",
+                 own — its own class, and the verb that leaves the cursor at \
+                 the end of what was typed: {:?}",
                 surface.calls
             );
         }
@@ -5624,18 +5803,21 @@ mod tests {
                     LineKind::Activity,
                     "⠋ preparing turn · 0s · turn 0s".to_owned()
                 ),
-                Rendered::Line(LineKind::Activity, "> why".to_owned()),
+                Rendered::DrawCurrent(LineKind::Pending, "> why".to_owned()),
                 // A second keystroke: both rows repainted in place, the
-                // activity row two up and the pending row one.
+                // activity row **one** up — the pending row is the row the
+                // cursor is on, so it adds no offset — and the pending row in
+                // place, with no offset of its own at all.
                 Rendered::Repaint(
-                    2,
+                    1,
                     LineKind::Activity,
                     "⠙ preparing turn · 0s · turn 0s".to_owned()
                 ),
-                Rendered::Repaint(1, LineKind::Activity, "> why not".to_owned()),
-                // A durable line: the whole block comes down, bottom first, and
-                // the tool's line prints where the block was.
-                Rendered::Withdraw(1),
+                Rendered::RepaintCurrent(LineKind::Pending, "> why not".to_owned()),
+                // A durable line: the whole block comes down, bottom first —
+                // the current row cleared where the cursor is, then the row
+                // above it — and the tool's line prints where the block was.
+                Rendered::WithdrawCurrent,
                 Rendered::Withdraw(1),
                 Rendered::Line(LineKind::Tool, "shell: cargo test [running]".to_owned()),
                 // ...and the block comes back beneath it, the user's half-typed
@@ -5644,21 +5826,21 @@ mod tests {
                     LineKind::Activity,
                     "⠹ running shell: cargo test · 0s · turn 0s".to_owned()
                 ),
-                Rendered::Line(LineKind::Activity, "> why not".to_owned()),
+                Rendered::DrawCurrent(LineKind::Pending, "> why not".to_owned()),
                 Rendered::Repaint(
-                    2,
+                    1,
                     LineKind::Activity,
                     "⠹ running shell: cargo test · 0s · turn 0s".to_owned()
                 ),
-                Rendered::Repaint(1, LineKind::Activity, "> why not".to_owned()),
+                Rendered::RepaintCurrent(LineKind::Pending, "> why not".to_owned()),
                 Rendered::Repaint(
-                    2,
+                    1,
                     LineKind::Activity,
                     "⠸ running shell: cargo test · 0s · turn 0s".to_owned()
                 ),
-                Rendered::Repaint(1, LineKind::Activity, "> why not".to_owned()),
+                Rendered::RepaintCurrent(LineKind::Pending, "> why not".to_owned()),
                 // And the response takes the block back for good.
-                Rendered::Withdraw(1),
+                Rendered::WithdrawCurrent,
                 Rendered::Withdraw(1),
             ]
         );
@@ -5671,6 +5853,321 @@ mod tests {
             "and nothing was abandoned: a client that owns the input has no \
              cursor move to miss (BR-4)"
         );
+    }
+
+    /// **REQ-622 ADR-622-4, verify: the pending row is the row the cursor is
+    /// on, and the activity row is exactly one above it.**
+    ///
+    /// ADR-622-4 has said "the cursor rests at the end of the pending row" since
+    /// architecture; the block drew it with a trailing newline and parked the
+    /// cursor on the blank row *below* the whole thing. That is not a cosmetic
+    /// difference at a terminal — the caret is the only thing on screen that
+    /// says where typing goes, and it was pointing at a row nobody owns — and it
+    /// put every offset above it one row further away than it needed to be.
+    ///
+    /// Driven straight through `paint_rows` rather than through the pump, so
+    /// the oracle is the geometry alone: same `now`, same tick, so the activity
+    /// row's text cannot move and the only thing that changes between the two
+    /// passes is what the user typed. The literal sequence is the whole claim
+    /// ([[LESSON-569]]) — the verbs, in order, with their offsets:
+    ///
+    /// * the activity row scrolls in as a **line**, so the cursor steps past it;
+    /// * the pending row is drawn last, as the **current** row;
+    /// * a keystroke repaints the activity row **one** up — not two — and the
+    ///   pending row in place with no offset at all;
+    /// * and the block comes down bottom-first, the current row cleared where
+    ///   the cursor already is.
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** restore the old
+    /// offset arithmetic at the activity repaint (`let rows_up = if
+    /// self.pending_visible { 2 } else { 1 };`). **3 red of 872** — this test,
+    /// `the_pending_row_is_never_painted_over` and
+    /// `a_question_reads_a_fresh_buffer_and_the_pending_line_comes_back`, all
+    /// on `Repaint(2, ..)` where the oracle says `Repaint(1, ..)`; the three are
+    /// the whole of the suite that paints an activity row with a pending row
+    /// beneath it. At a real terminal that repaint
+    /// lands two rows up from a cursor that is only one row down: it rewrites
+    /// whatever sits *above* the activity row — the last durable line of the
+    /// turn — eight times a second. Reverted with the same targeted edit.
+    #[test]
+    fn the_pending_row_is_the_row_the_cursor_is_on() {
+        let mut surface = RecordingSurface::with_live_rows();
+        let mut state = SessionState::new();
+        let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+        let mut row = RowState::at_width(80).owning_input();
+        {
+            let mut ctx = turn_ctx!(surface, state, prompter);
+            let now = Instant::now();
+            ctx.state.input.push(b"why");
+            row.paint_rows(&mut ctx, now);
+            ctx.state.input.push(b" not");
+            row.paint_rows(&mut ctx, now);
+            assert!(row.withdraw_rows(&mut ctx), "both rows came down");
+        }
+
+        assert_eq!(
+            surface.calls,
+            vec![
+                Rendered::Line(
+                    LineKind::Activity,
+                    "⠋ preparing turn · 0s · turn 0s".to_owned()
+                ),
+                Rendered::DrawCurrent(LineKind::Pending, "> why".to_owned()),
+                Rendered::Repaint(
+                    1,
+                    LineKind::Activity,
+                    "⠋ preparing turn · 0s · turn 0s".to_owned()
+                ),
+                Rendered::RepaintCurrent(LineKind::Pending, "> why not".to_owned()),
+                Rendered::WithdrawCurrent,
+                Rendered::Withdraw(1),
+            ]
+        );
+    }
+
+    /// **REQ-622, verify: a pending row redrawn because the activity row
+    /// *left* is fitted to the terminal as it is now.**
+    ///
+    /// [`RowState::width`] states the rule — a row about to be **drawn** is
+    /// measured, a row being repainted is not — and gives the reason: between
+    /// two rows a stale width fits the new row to a window that no longer
+    /// exists, and a row wider than the terminal hard-wraps into a second row
+    /// `withdraw_row_above(1)` cannot clear. The block measured when a row
+    /// *appeared* and nowhere else, so the one door that was not watched was the
+    /// other half of the same reflow: a row cannot be inserted above one already
+    /// on screen, so an activity row **leaving** also takes the pending row down
+    /// and draws it again — and that draw got the width from before the resize.
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** drop the
+    /// `|| (self.pending_visible && activity_leaves)` clause from `paint_rows`'
+    /// width condition. **1 red of 872**, this test: the redrawn row comes back
+    /// as the full `> 0123…xyz` fitted to 80 on a terminal now 24 wide.
+    /// Reverted with the same edit.
+    #[test]
+    fn a_pending_row_redrawn_when_the_activity_row_leaves_is_refitted() {
+        let mut surface = RecordingSurface::with_live_rows();
+        let mut state = SessionState::new();
+        let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+        let mut row = RowState::at_width(80).owning_input();
+        {
+            let mut ctx = turn_ctx!(surface, state, prompter);
+            let now = Instant::now();
+            ctx.state
+                .input
+                .push(b"0123456789abcdefghijklmnopqrstuvwxyz");
+            row.paint_rows(&mut ctx, now);
+
+            // The window narrows, and the reply starts arriving — so the
+            // activity row leaves, which is what takes the pending row down and
+            // puts it back.
+            set_test_width(24);
+            the_reply_starts_streaming(&mut ctx, now);
+            row.paint_rows(&mut ctx, now);
+        }
+
+        assert_eq!(
+            surface.calls,
+            vec![
+                Rendered::Line(
+                    LineKind::Activity,
+                    "⠋ preparing turn · 0s · turn 0s".to_owned()
+                ),
+                Rendered::DrawCurrent(
+                    LineKind::Pending,
+                    "> 0123456789abcdefghijklmnopqrstuvwxyz".to_owned()
+                ),
+                // The reflow: bottom row first, then the row above it, then the
+                // pending row again — **fitted to 24**, so the marker, the
+                // twenty-one columns that fit, and the column the cursor rests
+                // in.
+                Rendered::WithdrawCurrent,
+                Rendered::Withdraw(1),
+                Rendered::DrawCurrent(LineKind::Pending, "> fghijklmnopqrstuvwxyz".to_owned()),
+            ]
+        );
+    }
+
+    /// **REQ-622, verify: BR-14's count survives the one phase that draws no
+    /// activity row.**
+    ///
+    /// `TurnActivity::frame` answers `None` for the whole of `Streaming` — the
+    /// arriving reply is its own liveness signal, and a spinner beneath it would
+    /// be a second one saying the same thing (ADR-621-1). So the row BR-14 hangs
+    /// its `· N queued` clause on is not on screen for most of a long answer,
+    /// and an Enter pressed there took the pending row down and said nothing at
+    /// all — which is precisely what a swallowed keystroke looks like, and the
+    /// ambiguity BR-14 exists to remove.
+    ///
+    /// The count moves to the pending row, and **only** there: the hint is
+    /// `None` whenever the activity row is due, so the two can never both report
+    /// it. That second half is the leg after the stream, where the tool row
+    /// comes back and the marker goes plain again.
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** pass `None` for
+    /// `queued_hint` unconditionally in `paint_rows`. **1 red of 872**, this
+    /// test: nothing is drawn at all after the Enter — no pending row, no
+    /// activity row — which is the defect exactly. Reverted with the same edit.
+    #[test]
+    fn a_line_queued_while_the_reply_streams_is_still_reported() {
+        let mut surface = RecordingSurface::with_live_rows();
+        let mut state = SessionState::new();
+        let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+        let mut row = RowState::at_width(80).owning_input();
+        {
+            let mut ctx = turn_ctx!(surface, state, prompter);
+            let now = Instant::now();
+            the_reply_starts_streaming(&mut ctx, now);
+
+            // Typed and submitted while the answer is arriving.
+            ctx.state.input.push(b"and the tests?");
+            row.paint_rows(&mut ctx, now);
+            ctx.state.input.push(b"\n");
+            ctx.state.activity.set_queued(ctx.state.input.queued_len());
+            row.paint_rows(&mut ctx, now);
+        }
+
+        assert_eq!(
+            surface.calls,
+            vec![
+                // No activity row above it: in `Streaming` there is none.
+                Rendered::DrawCurrent(LineKind::Pending, "> and the tests?".to_owned()),
+                // Enter. The line is gone from the buffer, and the row that is
+                // left says where it went.
+                Rendered::RepaintCurrent(LineKind::Pending, "[1 queued] > ".to_owned()),
+            ]
+        );
+        assert_eq!(state.input.queued_len(), 1);
+    }
+
+    /// The other half of the rule above: with an activity row due, the count is
+    /// the **clause's** and the marker is plain.
+    ///
+    /// Asserted separately because it is the half a hint threaded
+    /// unconditionally would break, and it would break invisibly — two places
+    /// saying "1 queued" reads as two lines waiting.
+    #[test]
+    fn the_queued_count_is_never_reported_twice() {
+        let mut surface = RecordingSurface::with_live_rows();
+        let mut state = SessionState::new();
+        let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+        let mut row = RowState::at_width(80).owning_input();
+        {
+            let mut ctx = turn_ctx!(surface, state, prompter);
+            let now = Instant::now();
+            ctx.state.input.push(b"ship it\n");
+            ctx.state.input.push(b"and then");
+            ctx.state.activity.set_queued(ctx.state.input.queued_len());
+            row.paint_rows(&mut ctx, now);
+        }
+
+        assert_eq!(
+            surface.calls,
+            vec![
+                Rendered::Line(
+                    LineKind::Activity,
+                    "⠋ preparing turn · 0s · turn 0s · 1 queued".to_owned()
+                ),
+                Rendered::DrawCurrent(LineKind::Pending, "> and then".to_owned()),
+            ],
+            "the clause carries the count and the marker stays plain"
+        );
+    }
+
+    /// **REQ-622 BR-5, verify: the kernel's own input queue is discarded at the
+    /// shelve, before the question is drawn.**
+    ///
+    /// The shelve accounts for every byte the **pump** has read, and the pump
+    /// has just read everything the descriptor was holding — `read_keys` loops
+    /// until it reports nothing left. What the shelve cannot account for is what
+    /// arrived in the window between that read and this question's first row:
+    /// those bytes are in the kernel, not in the editor, and the question's
+    /// first `read(2)` would take them as its answer. BR-5 says a question reads
+    /// only what was typed after it was drawn; the shelve says that of the
+    /// editor and the flush says it of the kernel.
+    ///
+    /// Observed **inside** the closure, which is where the ordering claim lives:
+    /// a flush after `ask` returns would be a flush of the answer.
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** delete the
+    /// `crate::prompt::discard_type_ahead()` call from `around_a_question`. **1
+    /// red of 872**, this test, on a tally that never moved — and *only* this
+    /// test, which is the finding: the flush changes no byte any surface
+    /// records and no answer any scripted prompter gives, so nothing else in
+    /// the suite, and nothing a recorder can see at all, is in a position to
+    /// notice it going missing. Reverted with the same edit.
+    #[test]
+    fn a_question_discards_the_kernels_type_ahead_before_it_is_drawn() {
+        let mut surface = RecordingSurface::with_live_rows();
+        let mut state = SessionState::new();
+        let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+        let mut ctx = turn_ctx!(surface, state, prompter);
+        ctx.state.input.push(b"half a thought");
+
+        let before = crate::prompt::type_ahead_flushes();
+        let (flushed, handed_over) = around_a_question(&mut ctx, |ctx| {
+            (
+                crate::prompt::type_ahead_flushes(),
+                ctx.state.input.row(80, None),
+            )
+        });
+        assert_eq!(
+            flushed,
+            before + 1,
+            "the flush runs **before** the prompter is called, which is before \
+             the question has drawn its own row"
+        );
+        assert_eq!(
+            handed_over, None,
+            "and the shelve it follows still happened: the editor the question \
+             reads through is empty"
+        );
+        assert_eq!(
+            crate::prompt::type_ahead_flushes(),
+            before + 1,
+            "once per question, not once per byte"
+        );
+    }
+
+    /// **REQ-622, verify: one constructor and one fixture, one set of constants.**
+    ///
+    /// [`RowState::new`] and [`RowState::at_width`] restated all of the row's
+    /// fields between them, which is a fixture free to disagree with the
+    /// constructor it stands in for — and to disagree silently, since a fixture
+    /// that started life believing a row was already on screen would simply
+    /// skip the first draw. [`RowState::base`] is the one statement of the
+    /// fields neither has an opinion about.
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** set
+    /// `pending_visible: true` in `base`. **27 red of 872** — this test plus
+    /// twenty-six row and pump tests whose first paint then takes the repaint
+    /// branch or opens with a withdraw. The blast radius is the argument for
+    /// the helper: a constant that wrong is caught everywhere, and a constant
+    /// *slightly* wrong in only one of two hand-written constructors is caught
+    /// nowhere, because the fixture and the code it stands in for would agree
+    /// with themselves. Reverted with the same edit.
+    #[test]
+    fn the_fixture_and_the_real_constructor_start_from_one_base() {
+        let piped = RecordingSurface::new();
+        let real = RowState::new(&piped);
+        let fixture = RowState::at_width(80);
+
+        for (what, row) in [("the constructor", &real), ("the fixture", &fixture)] {
+            assert!(!row.activity_visible, "{what} starts with no activity row");
+            assert!(!row.pending_visible, "{what} starts with no pending row");
+            assert!(!row.owns_input(), "{what} starts without the terminal");
+            assert!(
+                row.input.guard.is_none(),
+                "{what} starts holding no restore guard"
+            );
+            assert_eq!(row.tick, 0, "{what} starts at the first animation frame");
+            assert!(!(row.line_waiting)(), "{what} sees no submitted line");
+        }
+        assert!(
+            !real.live,
+            "and the two differ in exactly what they are for: the constructor \
+             takes the gate from the surface it was handed"
+        );
+        assert!(fixture.live, "the fixture claims a live surface");
     }
 
     /// **BR-14 / AC-12: Enter queues the line, the row says so, and nothing
@@ -5712,10 +6209,11 @@ mod tests {
                     LineKind::Activity,
                     "⠋ preparing turn · 0s · turn 0s".to_owned()
                 ),
-                Rendered::Line(LineKind::Activity, "> ship it".to_owned()),
-                // Enter: the pending row goes, and the activity row — now one
-                // above the cursor again — says what happened.
-                Rendered::Withdraw(1),
+                Rendered::DrawCurrent(LineKind::Pending, "> ship it".to_owned()),
+                // Enter: the pending row is cleared where the cursor stands,
+                // and the activity row — which was one above it all along —
+                // says what happened.
+                Rendered::WithdrawCurrent,
                 Rendered::Repaint(
                     1,
                     LineKind::Activity,
@@ -5746,7 +6244,7 @@ mod tests {
         row.engage_input(&mut ctx, true);
         row.paint_rows(&mut ctx, Instant::now());
 
-        assert!(row.owns_input, "the fixture took the terminal");
+        assert!(row.owns_input(), "the fixture took the terminal");
         assert_eq!(
             surface.calls,
             vec![Rendered::Line(
@@ -5806,8 +6304,8 @@ mod tests {
                     surface.calls.as_slice(),
                     [
                         Rendered::Line(LineKind::Activity, _),
-                        Rendered::Line(LineKind::Activity, _),
-                        Rendered::Withdraw(1),
+                        Rendered::DrawCurrent(LineKind::Pending, _),
+                        Rendered::WithdrawCurrent,
                         Rendered::Withdraw(1),
                     ]
                 ),
@@ -5909,27 +6407,27 @@ mod tests {
                     LineKind::Activity,
                     "⠋ preparing turn · 0s · turn 0s".to_owned()
                 ),
-                Rendered::Line(LineKind::Activity, "> why".to_owned()),
+                Rendered::DrawCurrent(LineKind::Pending, "> why".to_owned()),
                 // The tool starts.
-                Rendered::Withdraw(1),
+                Rendered::WithdrawCurrent,
                 Rendered::Withdraw(1),
                 Rendered::Line(LineKind::Tool, "shell: cargo test [running]".to_owned()),
                 Rendered::Line(
                     LineKind::Activity,
                     "⠙ running shell: cargo test · 0s · turn 0s".to_owned()
                 ),
-                Rendered::Line(LineKind::Activity, "> why".to_owned()),
+                Rendered::DrawCurrent(LineKind::Pending, "> why".to_owned()),
                 Rendered::Repaint(
-                    2,
+                    1,
                     LineKind::Activity,
                     "⠙ running shell: cargo test · 0s · turn 0s".to_owned()
                 ),
-                Rendered::Repaint(1, LineKind::Activity, "> why".to_owned()),
+                Rendered::RepaintCurrent(LineKind::Pending, "> why".to_owned()),
                 // The question. Nothing of either row is between the withdraws
                 // and the question's own line: the prompt reaches a `Prompter`,
                 // which writes straight to stdout and could not have taken a
                 // row back for itself.
-                Rendered::Withdraw(1),
+                Rendered::WithdrawCurrent,
                 Rendered::Withdraw(1),
                 Rendered::Line(
                     LineKind::Prompt,
@@ -5941,14 +6439,14 @@ mod tests {
                     LineKind::Activity,
                     "⠹ running shell: cargo test · 0s · turn 0s".to_owned()
                 ),
-                Rendered::Line(LineKind::Activity, "> why".to_owned()),
+                Rendered::DrawCurrent(LineKind::Pending, "> why".to_owned()),
                 Rendered::Repaint(
-                    2,
+                    1,
                     LineKind::Activity,
                     "⠹ running shell: cargo test · 0s · turn 0s".to_owned()
                 ),
-                Rendered::Repaint(1, LineKind::Activity, "> why".to_owned()),
-                Rendered::Withdraw(1),
+                Rendered::RepaintCurrent(LineKind::Pending, "> why".to_owned()),
+                Rendered::WithdrawCurrent,
                 Rendered::Withdraw(1),
             ]
         );
@@ -5966,7 +6464,7 @@ mod tests {
         let seen = around_a_question(&mut ctx, |ctx| {
             // What the prompter is handed: an empty buffer. Anything typed from
             // here is the answer and nothing else is.
-            let fresh = ctx.state.input.row(80);
+            let fresh = ctx.state.input.row(80, None);
             ctx.state.input.push(b"y");
             fresh
         });
@@ -5977,7 +6475,7 @@ mod tests {
              sentence and the question answered by its first character"
         );
         assert_eq!(
-            fresh.input.row(80).as_deref(),
+            fresh.input.row(80, None).as_deref(),
             Some("> half a thought"),
             "and the line comes back verbatim, the answer's stray keystroke \
              discarded rather than merged"
@@ -6065,7 +6563,7 @@ mod tests {
                 "the terminal was asked (verbose {verbose})"
             );
             assert!(
-                !row.owns_input && row.raw.is_none(),
+                !row.owns_input() && row.input.guard.is_none(),
                 "and refused, so this call owns neither the input nor a guard \
                  (verbose {verbose})"
             );
@@ -6125,7 +6623,7 @@ mod tests {
                  {verbose})"
             );
             assert!(
-                state.input.row(80).is_none(),
+                state.input.row(80, None).is_none(),
                 "and nothing was read: the kernel is still assembling the line \
                  (verbose {verbose})"
             );

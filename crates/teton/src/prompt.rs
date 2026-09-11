@@ -161,6 +161,21 @@ impl Prompter for StdinPrompter {
         let mut out = io::stdout();
         let _ = write!(out, "{}", defused(question));
         let _ = out.flush();
+        // **Never read a credential in raw mode** (REQ-622, verify). This
+        // prompter's hidden read is a canonical-mode `read_line`: with `ICANON`
+        // clear the kernel hands bytes over as they arrive and `read_line` would
+        // sit waiting for a newline the line discipline is no longer going to
+        // synthesize — and the guard restoring afterwards would restore the
+        // *raw* settings, because they are what it saved. Unreachable today (a
+        // key prompt is only opened between turns, where nothing is engaged) and
+        // cheap insurance against the day a setup flow is reached from inside
+        // one. The refusal is the echo-off refusal, deliberately: the user-facing
+        // fact is identical — nothing was read, nothing was stored, fix the
+        // terminal — and a second notice for a state that cannot happen would be
+        // a second sentence to keep true.
+        if RawMode::is_engaged() {
+            return refuse_secret(&mut out);
+        }
         // Engaged for exactly the read and restored by the guard's `Drop`, on
         // every path out — including the error one.
         let hidden = match EchoOff::engage() {
@@ -172,13 +187,11 @@ impl Prompter for StdinPrompter {
             // Fail **closed**. Somebody is at a terminal and the terminal would
             // paint every character of the credential into their scrollback.
             // Reading anyway is the failure mode this branch exists to refuse:
-            // it looks exactly like a working prompt and leaks the key.
-            EchoState::Failed => {
-                let _ = writeln!(out);
-                let _ = writeln!(out, "{ECHO_UNAVAILABLE}");
-                let _ = out.flush();
-                return None;
-            }
+            // it looks exactly like a working prompt and leaks the key. It is
+            // also where a restore slot already held by the turn's `RawMode`
+            // arrives, since a refused arm is a refused engage — the backstop
+            // behind the explicit check above.
+            EchoState::Failed => return refuse_secret(&mut out),
         };
         let mut line = String::new();
         let read = io::stdin().read_line(&mut line);
@@ -196,6 +209,20 @@ impl Prompter for StdinPrompter {
             Ok(_) => Some(line.trim_end_matches(['\n', '\r']).to_owned()),
         }
     }
+}
+
+/// The key prompt's fail-closed refusal, written once (REQ-572 AC-5, REQ-622
+/// verify).
+///
+/// A blank line to leave the question's own row, the notice, and `None`. Two
+/// callers reach it — a terminal that would not hide the typing, and a terminal
+/// already in raw mode — and the bytes must be the same for both, because what
+/// the user has to be told is the same: nothing was read and nothing was stored.
+fn refuse_secret(out: &mut impl Write) -> Option<String> {
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{ECHO_UNAVAILABLE}");
+    let _ = out.flush();
+    None
 }
 
 /// Terminal echo, switched off for the life of the guard and restored on drop
@@ -295,8 +322,10 @@ impl EchoOff {
         // themselves, which costs nothing. Arming afterwards would leave a
         // window — short, but exactly the window Ctrl-C lands in — with echo
         // off and no undo anywhere in the process.
-        let guard = got_attrs.then(|| Self::arm(saved));
-        let set_attrs = got_attrs && {
+        let guard = got_attrs.then(|| Self::arm(saved)).flatten();
+        // `guard.is_some()`, not `got_attrs`: [`RawMode::engage`]'s rule for
+        // its reason — a change nothing can undo must not be made.
+        let set_attrs = guard.is_some() && {
             let mut hidden = saved;
             hidden.c_lflag &= !libc::ECHO;
             // TCSAFLUSH: anything typed ahead of the prompt is discarded rather
@@ -331,10 +360,15 @@ impl EchoOff {
     /// then assertable without aiming a `tcsetattr` at descriptor 0 —
     /// which, under `cargo test` from a terminal, is the developer's own
     /// (`both_guards_arm_and_clear_the_restore_slot`).
-    fn arm(saved: libc::termios) -> Self {
+    ///
+    /// `None` when another guard already holds the slot, [`RawMode::arm`]'s
+    /// answer for its reason. Here the caller's mapping is fail-**closed**:
+    /// [`EchoState::Failed`] means the credential is not read at all.
+    fn arm(saved: libc::termios) -> Option<Self> {
         install_restore_handlers();
-        RESTORE.store(&saved, SLOT_ECHO_OFF);
-        Self { saved }
+        RESTORE
+            .store(&saved, SLOT_ECHO_OFF)
+            .then_some(Self { saved })
     }
 }
 
@@ -354,8 +388,9 @@ impl Drop for EchoOff {
         // that are already in effect — a second no-op. Clearing first would
         // leave a window in which the slot says "nothing to put back" while
         // the terminal is still changed, which is the one ordering that loses
-        // the restore this whole mechanism exists to perform.
-        RESTORE.clear();
+        // the restore this whole mechanism exists to perform. Named, for
+        // [`RawMode`]'s reason one guard over.
+        RESTORE.clear(SLOT_ECHO_OFF);
     }
 }
 
@@ -783,6 +818,49 @@ pub fn read_available(buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
+/// Throw away whatever the kernel is still holding on stdin, at the moment a
+/// question is drawn (REQ-622 BR-5).
+///
+/// **The window this closes is the kernel's, not the editor's.** The pump has
+/// just read every byte the descriptor had and folded it into the pending line,
+/// and [`InputEditor::shelve`] has just moved that line aside — so everything
+/// the user legitimately typed is already accounted for and already out of the
+/// way. What can still be sitting in the terminal's input queue is what arrived
+/// in the microseconds between that read and this call: keystrokes aimed at a
+/// question that was not on the screen yet. BR-5 says a question reads only
+/// what was typed after it was drawn, and the shelve alone cannot say that for
+/// those bytes, because they are not in the editor at all — they are in the
+/// kernel, and the question's first `read(2)` would take them.
+///
+/// `TCIFLUSH`: the *input* queue only. The output queue is the turn's own rows
+/// and dropping it would erase the question being asked.
+///
+/// **Ungated, like the shelve it follows.** On a pipe or a closed stdin
+/// `tcflush` fails with `ENOTTY` and does nothing, so a piped session is
+/// byte-identical (BR-1, AC-7); at a terminal in canonical mode — REQ-622's
+/// BR-11 fallback — the kernel's queue is a *line the user submitted before the
+/// question existed*, which is precisely what BR-5 forbids from answering it.
+/// One rule, both modes, no reachability argument standing between the rule and
+/// the code.
+///
+/// Under `cfg(test)` this counts instead of flushing. `cargo test` runs with
+/// `STDIN_FILENO` on whichever terminal launched it, so a real `tcflush` in a
+/// unit test would throw away what the *developer* had typed into their own
+/// shell — [`RawMode`]'s scripted-engage hook, one call over.
+pub(crate) fn discard_type_ahead() {
+    #[cfg(test)]
+    TYPE_AHEAD_FLUSHES.with(|calls| calls.set(calls.get() + 1));
+    #[cfg(not(test))]
+    // SAFETY: `tcflush` takes a descriptor number and a queue selector and
+    // touches nothing this process owns. The result is deliberately unused:
+    // a terminal that will not discard its input queue is the ordinary
+    // `ENOTTY` of a pipe, and there is nothing useful to say about it at the
+    // moment a question is being drawn.
+    unsafe {
+        libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+    }
+}
+
 /// How many bytes one pass of [`read_answer_raw`] takes from the terminal.
 ///
 /// One `read(2)` per pass, so this is the largest paste a single pass can
@@ -845,7 +923,11 @@ fn read_answer_raw(
     let mut empty = 0usize;
     loop {
         let read = match keys(&mut buf) {
-            Ok(read) => read,
+            // Clamped rather than trusted, as `RowState::read_keys` clamps its
+            // own: production cannot report more than the buffer it was handed,
+            // and a test hook that did would panic the slice below rather than
+            // fail an assertion.
+            Ok(read) => read.min(buf.len()),
             // A failed read mid-question is a cancel, not something to retry:
             // the caller's `None` path declines the request, which is the safe
             // answer to every question this prompter asks.
@@ -1062,8 +1144,11 @@ impl RawMode {
         // nothing. Arming afterwards would leave a window — short, but exactly
         // the window Ctrl-C lands in — in which the terminal is raw and
         // nothing in the process knows how to undo it.
-        let guard = got_attrs.then(|| Self::arm(saved));
-        let set_attrs = got_attrs && {
+        let guard = got_attrs.then(|| Self::arm(saved)).flatten();
+        // `guard.is_some()`, not `got_attrs`: an arm the slot refused must not
+        // be followed by a `tcsetattr`, because nothing in the process would
+        // then know how to undo it (REQ-622, verify).
+        let set_attrs = guard.is_some() && {
             let engaged = raw_from(saved);
             // TCSAFLUSH, as at the key prompt: whatever was typed before the
             // turn began is discarded rather than arriving as the first
@@ -1098,10 +1183,14 @@ impl RawMode {
     /// a `tcsetattr` at descriptor 0 — which, under `cargo test` from a
     /// terminal, is the developer's own
     /// (`both_guards_arm_and_clear_the_restore_slot`).
-    fn arm(saved: libc::termios) -> Self {
+    /// `None` when another guard already holds the slot — see
+    /// [`RestoreSlot::store`]. The terminal is **not** changed in that case:
+    /// [`Self::engage`] reads this answer before its `tcsetattr`, so a refused
+    /// arm leaves the terminal exactly as it found it and reports BR-11's
+    /// fail-open `Failed`.
+    fn arm(saved: libc::termios) -> Option<Self> {
         install_restore_handlers();
-        RESTORE.store(&saved, SLOT_RAW);
-        Self { saved }
+        RESTORE.store(&saved, SLOT_RAW).then_some(Self { saved })
     }
 
     /// Whether the terminal is out of canonical mode **right now**.
@@ -1134,8 +1223,9 @@ impl Drop for RawMode {
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const self.saved);
         }
         // Disarmed **after** the restore, never before — `EchoOff`'s `Drop`
-        // says why, and it is the same window.
-        RESTORE.clear();
+        // says why, and it is the same window. Named, so a guard that never
+        // held the slot cannot disarm the one that does.
+        RESTORE.clear(SLOT_RAW);
     }
 }
 
@@ -1210,32 +1300,63 @@ impl RestoreSlot {
         self.owner.load(Ordering::SeqCst)
     }
 
-    /// Arm the slot with the settings a guard has just saved.
-    fn store(&self, saved: &libc::termios, owner: u8) {
-        debug_assert_eq!(
-            self.armed_by(),
-            SLOT_EMPTY,
-            "two terminal guards must never hold the restore slot at once (ADR-622-3): a \
-             question inside a turn reuses the turn's raw mode, and the key prompt is only \
-             reachable between turns"
-        );
-        // SAFETY: at most one guard holds the slot at a time (ADR-622-3,
-        // debug-asserted just above), so this is the only writer; and a
-        // handler reads the cell only after the store below publishes it, so
-        // it cannot observe the write in progress. The write initialises the
-        // cell with a copy of a `termios` the caller owns.
+    /// Arm the slot with the settings a guard has just saved, or refuse
+    /// because another guard already holds it.
+    ///
+    /// **A refusal in every build, not a `debug_assert`** (REQ-622, verify).
+    /// ADR-622-3 says two guards are never engaged at once, and that is true of
+    /// today's control flow — a question inside a turn reuses the turn's raw
+    /// mode, and the key prompt is only reachable between turns. A
+    /// `debug_assert` turned that into "a release build overwrites the first
+    /// guard's saved settings with the second's", which is the one outcome
+    /// nobody would choose: the outer guard's `Drop` would then write back
+    /// settings that were *already changed*, and the user's terminal would be
+    /// left in the inner guard's mode with nothing in the process that knows
+    /// how to undo it. The reachability argument is a reason not to expect
+    /// this, never a reason to make the unexpected case destructive.
+    ///
+    /// The caller maps a refusal to its own fail-open or fail-closed outcome —
+    /// [`RawOutcome::Failed`] and [`EchoState::Failed`] respectively — which is
+    /// the same answer each already gives for a terminal that would not take
+    /// the change. `#[must_use]`, so a future third guard cannot arm the slot
+    /// by ignoring the answer.
+    #[must_use]
+    fn store(&self, saved: &libc::termios, owner: u8) -> bool {
+        // A plain load and a store rather than a compare-exchange, and the
+        // difference does not matter here: the only writers are guards on this
+        // process's main thread (a `Prompter` and the event pump both run
+        // there), so there is no second thread to lose a race with. What this
+        // is defending against is a *code path*, not a thread.
+        if self.armed_by() != SLOT_EMPTY {
+            return false;
+        }
+        // SAFETY: at most one guard holds the slot at a time — the check above
+        // is what makes that true rather than merely intended — so this is the
+        // only writer; and a handler reads the cell only after the store below
+        // publishes it, so it cannot observe the write in progress. The write
+        // initialises the cell with a copy of a `termios` the caller owns.
         unsafe { (*self.saved.get()).write(*saved) };
         // The data first, the flag second, always: a handler that saw the flag
         // before the write landed would read an uninitialised cell.
         self.owner.store(owner, Ordering::SeqCst);
+        true
     }
 
-    /// Disarm the slot.
+    /// Disarm the slot **if `owner` is the guard holding it**.
     ///
     /// The saved settings stay in the cell and simply become unreadable, which
     /// is all "cleared" can mean for a word a handler may only load.
-    fn clear(&self) {
-        self.owner.store(SLOT_EMPTY, Ordering::SeqCst);
+    ///
+    /// The owner check is the other half of [`Self::store`]'s refusal (REQ-622,
+    /// verify): a guard that was refused the slot must not disarm it on the way
+    /// out, or the refusal would have cost the *holder* its restore — a
+    /// `Drop` order away from exactly the residual this mechanism exists to
+    /// close. A compare-exchange rather than a load-then-store so the two halves
+    /// cannot be separated by a later edit.
+    fn clear(&self, owner: u8) {
+        let _ = self
+            .owner
+            .compare_exchange(owner, SLOT_EMPTY, Ordering::SeqCst, Ordering::SeqCst);
     }
 
     /// Whether the slot holds `expected`, field by field — `libc::termios` has
@@ -1261,9 +1382,19 @@ impl RestoreSlot {
 
 /// The signals that end the process and would otherwise end it with the
 /// terminal still changed (BR-7): the Ctrl-C a user presses, the `SIGTERM` a
-/// wrapper or an init system sends, and the `SIGHUP` a closed terminal window
-/// sends.
-const RESTORE_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+/// wrapper or an init system sends, the `SIGHUP` a closed terminal window
+/// sends, and the `SIGQUIT` that is Ctrl-\ on the very keyboard whose mode this
+/// guard has changed.
+///
+/// `SIGQUIT` was added at REQ-622's verify pass and belongs here for the same
+/// reason `SIGINT` does, only more so: it is a *keystroke*, sat under the
+/// user's other hand while they type into a raw terminal, and its default
+/// action is to kill the process — so the one key most likely to be hit by
+/// accident during exactly the state this mechanism guards was the one signal
+/// that left the terminal raw. Every signal here re-raises after restoring, so
+/// `SIGQUIT` still dumps core where the system is configured to.
+const RESTORE_SIGNALS: [libc::c_int; 4] =
+    [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
 
 /// Put the terminal back, then die of the signal that arrived.
 ///
@@ -1323,18 +1454,41 @@ extern "C" fn restore_and_reraise(sig: libc::c_int) {
 /// disposition *inside* it makes one path instead of two: every delivery does
 /// the same three things, and a second Ctrl-C at the prompt behaves exactly
 /// like the first.
+///
+/// **A disposition of `SIG_IGN` is left alone** (REQ-622, verify). A parent that
+/// starts this process with a signal ignored is making a decision *about this
+/// process* that the POSIX `exec` contract carries across deliberately — `nohup`
+/// and every daemon supervisor rely on it — and installing a handler over it
+/// would take that decision away: an ignored `SIGHUP` would start killing a
+/// session that was meant to survive its terminal closing, because this handler
+/// ends by resetting the disposition to `SIG_DFL` and re-raising. The old
+/// disposition is therefore read first, with a null `act`, which is `sigaction`'s
+/// own way of asking. The cost of leaving one alone is nothing: a signal that is
+/// ignored never ends the process, so there is no exit for the terminal to be
+/// left changed across.
 fn install_restore_handlers() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         for sig in RESTORE_SIGNALS {
-            // SAFETY: `sigaction` reads a single owned `sigaction` struct
-            // through the pointer and writes nothing through the null
-            // `oldact`; the handler it installs is a plain `extern "C"` item
-            // in this file. The result is deliberately unused: a process that
-            // cannot install the handler still runs, one residual worse than
-            // one that can, and there is nothing useful to say about it at the
-            // moment a key prompt or a turn is starting.
+            // SAFETY: both calls read and write single owned `sigaction`
+            // structs through pointers and touch nothing else; the handler
+            // installed is a plain `extern "C"` item in this file. The results
+            // are deliberately unused: a process that cannot install the
+            // handler still runs, one residual worse than one that can, and
+            // there is nothing useful to say about it at the moment a key
+            // prompt or a turn is starting.
             unsafe {
+                // Ask first. A null `act` makes this a pure read of the
+                // current disposition, which is the only way to learn that a
+                // parent ignored this signal — and a read that failed leaves
+                // `previous` zeroed, whose `sa_sigaction` is `SIG_DFL`, so the
+                // fallback is to install, which is this function's job.
+                let mut previous: libc::sigaction = std::mem::zeroed();
+                libc::sigaction(sig, std::ptr::null(), &raw mut previous);
+                if previous.sa_sigaction == libc::SIG_IGN {
+                    continue;
+                }
+
                 let mut action: libc::sigaction = std::mem::zeroed();
                 action.sa_sigaction =
                     restore_and_reraise as extern "C" fn(libc::c_int) as libc::sighandler_t;
@@ -1346,6 +1500,59 @@ fn install_restore_handlers() {
             }
         }
     });
+}
+
+// ---- Test-only items ------------------------------------------------------
+//
+// Everything below is `#[cfg(test)]`, and the boundary is load-bearing: the
+// region sweeps in this file cut their corpus at the **first** top-level
+// `#[cfg(test)]` (`production_source`, `handler_body`), so a test-only item
+// placed above this line would silently shorten the production text those
+// sweeps read and let them pass over code they never saw.
+
+/// Serialises the tests that touch the restore slot.
+///
+/// The slot is one process-wide global and `cargo test` runs tests in parallel
+/// threads, so without this two of them would reach for it at once and see each
+/// other's arming — a flake that would look exactly like the bug the slot's own
+/// refusal exists to catch. Production has no such lock and must not have one: a
+/// signal handler may not take a `Mutex` (see [`RestoreSlot`]), which is the
+/// whole reason the slot is an atomic and a cell.
+#[cfg(test)]
+static SLOT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Hold the slot for the length of a test, poisoned or not — a panic in one of
+/// these tests must fail that test, not cascade into the others.
+///
+/// **`pub(crate)`, and lifted out of this file's own `mod tests`** (REQ-622,
+/// verify). Every test that engages a guard needs it, and so does every test
+/// *outside* this file that reads [`RawMode::is_engaged`] — that answer is a
+/// process-wide global, so a test asserting "raw mode is not engaged" is
+/// asserting something another thread's fixture can falsify between the two
+/// instructions. `main.rs`'s queued-line test drives `next_interactive_line`,
+/// which asks exactly that question, and was order-dependent until it took this.
+#[cfg(test)]
+pub(crate) fn lock_the_slot() -> std::sync::MutexGuard<'static, ()> {
+    SLOT_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+// How many times `discard_type_ahead` has been called on this thread.
+//
+// A tally rather than a terminal, for the reason written at the function: the
+// call this test hook stands in for would flush the developer's own shell.
+#[cfg(test)]
+thread_local! {
+    static TYPE_AHEAD_FLUSHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The tally above, readable from `client.rs`'s tests — the caller of
+/// [`discard_type_ahead`] is [`crate::client`]'s one question seam, and that is
+/// where the rule it serves is asserted.
+#[cfg(test)]
+pub(crate) fn type_ahead_flushes() -> usize {
+    TYPE_AHEAD_FLUSHES.with(std::cell::Cell::get)
 }
 
 /// A prompter that replays a fixed list of answers, then returns `None`
@@ -1684,25 +1891,6 @@ mod tests {
     // status and the terminal the process leaves behind are TASK-419's pty
     // legs.
 
-    /// Serialises the tests that arm the restore slot.
-    ///
-    /// The slot is one process-wide global and `cargo test` runs these in
-    /// parallel threads, so without this two of them would reach for it at once
-    /// and trip each other's double-arm assertion — a flake that would look
-    /// exactly like the bug that assertion exists to catch. Production has no
-    /// such lock and must not have one: a signal handler may not take a
-    /// `Mutex` (see [`RestoreSlot`]), which is the whole reason the slot is an
-    /// atomic and a cell.
-    static SLOT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Hold the slot for the length of a test, poisoned or not — a panic in one
-    /// of these tests must fail that test, not cascade into the others.
-    fn lock_the_slot() -> std::sync::MutexGuard<'static, ()> {
-        SLOT_TESTS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     /// The terminal's settings as they are right now, or a zeroed struct when
     /// descriptor 0 is not a terminal.
     ///
@@ -1959,7 +2147,7 @@ mod tests {
         // Then the deterministic half, through `arm` — the function `engage`
         // calls on its success path — so the arming and the clearing are
         // asserted on every machine and not only on the ones with a terminal.
-        let guard = RawMode::arm(saved);
+        let guard = RawMode::arm(saved).expect("an empty slot takes the first guard");
         assert_eq!(RESTORE.armed_by(), SLOT_RAW);
         assert!(
             RESTORE.holds(&saved),
@@ -1979,7 +2167,7 @@ mod tests {
 
         // REQ-572's accepted residual, retired: the key prompt's guard
         // registers in the same slot, so the same handler covers it (AC-6).
-        let guard = EchoOff::arm(saved);
+        let guard = EchoOff::arm(saved).expect("an empty slot takes the first guard");
         assert_eq!(RESTORE.armed_by(), SLOT_ECHO_OFF);
         assert!(RESTORE.holds(&saved));
         assert!(
@@ -1991,6 +2179,283 @@ mod tests {
             RESTORE.armed_by(),
             SLOT_EMPTY,
             "`EchoOff`'s `Drop` must clear the slot"
+        );
+    }
+
+    /// **REQ-622, verify: the slot refuses a second guard in *every* build, and
+    /// a refused guard never disarms the one that holds it.**
+    ///
+    /// ADR-622-3 says two guards are never engaged at once, and that is true of
+    /// today's control flow. It was enforced by a `debug_assert`, which means a
+    /// release build did the one thing nobody would choose: overwrite the first
+    /// guard's saved settings with the second's. The outer guard's `Drop` would
+    /// then write back settings that were *already changed* — the user's
+    /// terminal left in the inner guard's mode, with nothing in the process that
+    /// knows how to undo it, which is the exact residual this whole mechanism
+    /// exists to close. A reachability argument is a reason not to expect a
+    /// case; it is never a reason to make it destructive.
+    ///
+    /// Driven through `arm`/`store` with synthetic settings rather than through
+    /// `engage`, so it holds on a machine with no terminal and cannot leave the
+    /// developer's shell raw.
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** put the refusal back
+    /// as a `debug_assert_eq!` and let the store proceed. **1 red of 872**, this
+    /// test — it panics on the `debug_assert` under `cargo test`, which is the
+    /// honest report that a release build would have carried on and clobbered
+    /// the slot. Reverted with the same edit.
+    #[test]
+    fn the_slot_refuses_a_second_guard_and_only_its_owner_clears_it() {
+        let _slot = lock_the_slot();
+        let mut first = current_termios();
+        // A value the other guard's settings cannot be confused with. Which
+        // flag does not matter — what matters is that `holds` can tell the two
+        // apart, so "the slot still holds the first guard's settings" is a claim
+        // about the bytes and not about a word.
+        first.c_lflag |= libc::ICANON;
+        let mut second = first;
+        second.c_lflag &= !libc::ICANON;
+
+        assert_eq!(RESTORE.armed_by(), SLOT_EMPTY, "the slot starts empty");
+        let held = RawMode::arm(first).expect("an empty slot takes the first guard");
+        assert_eq!(RESTORE.armed_by(), SLOT_RAW);
+        assert!(RESTORE.holds(&first));
+
+        // The second guard is refused, and refused **without touching the
+        // slot** — which is the half that matters, since the first guard's
+        // `Drop` is about to write whatever is in there back to the terminal.
+        assert!(
+            !RESTORE.store(&second, SLOT_ECHO_OFF),
+            "a slot another guard holds must refuse, not overwrite"
+        );
+        assert_eq!(RESTORE.armed_by(), SLOT_RAW);
+        assert!(
+            RESTORE.holds(&first),
+            "and the settings in it are still the holder's"
+        );
+        assert!(
+            EchoOff::arm(second).is_none(),
+            "so `arm` hands back no guard"
+        );
+        assert_eq!(RESTORE.armed_by(), SLOT_RAW);
+
+        // And a guard that was refused must not disarm the one that holds it: a
+        // `Drop` order away from costing the holder its restore entirely.
+        RESTORE.clear(SLOT_ECHO_OFF);
+        assert_eq!(
+            RESTORE.armed_by(),
+            SLOT_RAW,
+            "only the owner clears the slot"
+        );
+
+        drop(held);
+        assert_eq!(RESTORE.armed_by(), SLOT_EMPTY, "the owner's `Drop` does");
+    }
+
+    /// **REQ-622, verify: with the slot already held, an engage fails rather
+    /// than changing a terminal nothing can put back.**
+    ///
+    /// The refusal above, mapped by each caller to the outcome it already has
+    /// for "this terminal would not take the change" — and the two polarities
+    /// are the point. `RawMode` fails **open**: the turn runs in canonical mode
+    /// with one verbose notice (BR-11). `EchoOff` fails **closed**: the
+    /// credential is not read at all, because reading it would paint it into the
+    /// user's scrollback.
+    ///
+    /// The `tcsetattr` is what must not happen, and `engage` reads the arm's
+    /// answer before it: a mode change nothing can undo is worse than no mode
+    /// change.
+    #[test]
+    fn an_engage_against_a_held_slot_fails_rather_than_changing_the_terminal() {
+        let _slot = lock_the_slot();
+        let saved = current_termios();
+        let held = RawMode::arm(saved).expect("an empty slot takes the first guard");
+
+        assert!(
+            matches!(
+                RawMode::engage(),
+                RawOutcome::NoTerminal | RawOutcome::Failed
+            ),
+            "a second raw engage never reports `Raw` against a held slot — and \
+             on a machine with no terminal it never gets that far either"
+        );
+        assert!(
+            matches!(EchoOff::engage(), EchoState::NoTerminal | EchoState::Failed),
+            "and the key prompt's guard is refused the same way, where its own \
+             caller turns the refusal into a declined read"
+        );
+        assert_eq!(
+            RESTORE.armed_by(),
+            SLOT_RAW,
+            "neither attempt disturbed the slot the first guard holds"
+        );
+        drop(held);
+        assert_eq!(RESTORE.armed_by(), SLOT_EMPTY);
+    }
+
+    /// **REQ-622, verify: a credential is never read while the terminal is
+    /// raw.**
+    ///
+    /// Unreachable today — a key prompt is only opened between turns, where
+    /// nothing is engaged — and cheap insurance against the day a setup flow is
+    /// reached from inside one. The failure it forecloses is not subtle: this
+    /// prompter's hidden read is a canonical-mode `read_line`, so with `ICANON`
+    /// clear it would sit waiting for a newline the line discipline is no longer
+    /// going to synthesize, and the echo guard restoring afterwards would
+    /// restore the *raw* settings, because they are what it saved.
+    ///
+    /// Three legs, because the rule has three parts and only one of them is
+    /// reachable through a public function without a terminal. The **bytes** of
+    /// the refusal are asserted directly on [`refuse_secret`]; the **check**, at
+    /// the top of `ask_secret` and ahead of the engage, is a region assertion,
+    /// which is what a rule about *ordering inside a function that reads stdin*
+    /// can be pinned by ([[LESSON-547]]); and the **backstop** is the slot's
+    /// own refusal, asserted just above.
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** delete the
+    /// `if RawMode::is_engaged() { return refuse_secret(&mut out); }` from
+    /// `StdinPrompter::ask_secret`. **1 red of 872**, this test, on the region
+    /// leg. Reverted with the same edit.
+    #[test]
+    fn a_key_prompt_refuses_to_read_while_the_terminal_is_raw() {
+        let mut out = Vec::new();
+        assert_eq!(refuse_secret(&mut out), None, "nothing is read");
+        let written = String::from_utf8(out).expect("utf-8");
+        assert_eq!(
+            written,
+            format!("\n{ECHO_UNAVAILABLE}\n"),
+            "one blank line to leave the question's row, then the notice — the \
+             same bytes both refusals write, because the user-facing fact is the \
+             same: nothing was read and nothing was stored"
+        );
+
+        let source = production_source();
+        let at = source
+            .find("impl Prompter for StdinPrompter {")
+            .expect("the plain prompter");
+        // From `ask_secret` onward, and not from the `impl` — `ask` a few lines
+        // above asks `RawMode::is_engaged()` too, for the opposite purpose (it
+        // *takes* the raw path), so a search across the whole block would find
+        // that one and pass with `ask_secret` unguarded.
+        let body = &source[at..];
+        let secret = body
+            .find("fn ask_secret(")
+            .expect("the plain prompter asks for credentials");
+        let secret_body = &body[secret..];
+        let engage = secret_body
+            .find("EchoOff::engage()")
+            .expect("and hides them with the echo guard");
+        let check = secret_body.find("if RawMode::is_engaged() {").expect(
+            "a credential must not be read in raw mode: a canonical-mode \
+             `read_line` would wait for a newline the line discipline no longer \
+             makes, and the echo guard would restore the raw settings it saved",
+        );
+        assert!(
+            check < engage,
+            "and the check belongs **before** the engage: a mode change made and \
+             then refused is a mode change"
+        );
+    }
+
+    /// **REQ-622, verify: `read_answer_raw` clamps what its reader reports to
+    /// the buffer it handed over.**
+    ///
+    /// `RowState::read_keys` clamps its own for this reason and this test is the
+    /// other half of it: production cannot report more bytes than the slice it
+    /// was given, so the clamp is not about production — it is about the seam.
+    /// A hook that over-reports panics the slice, and a panic inside a read loop
+    /// is a crash rather than a failed assertion, which is a much worse way to
+    /// learn that a test double is wrong.
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** drop the
+    /// `.min(buf.len())`. **1 red of 872**, this test, as a slice-index panic
+    /// (`range end index 1024 out of range for slice of length 256`) rather than
+    /// an assertion. Reverted with the same edit.
+    #[test]
+    fn an_over_reporting_reader_cannot_panic_the_answer_loop() {
+        let mut answer = InputEditor::default();
+        let mut out = Vec::new();
+        let mut passes = 0usize;
+        let answered = read_answer_raw(
+            &mut answer,
+            "? proceed: ",
+            &mut out,
+            |buf| {
+                passes += 1;
+                if passes == 1 {
+                    // A liar: four times the buffer it was handed.
+                    buf[..2].copy_from_slice(b"y\n");
+                    Ok(buf.len() * 4)
+                } else {
+                    Ok(0)
+                }
+            },
+            || false,
+        );
+        assert_eq!(
+            answered.as_deref(),
+            Some("y"),
+            "the answer is read from the bytes that were actually written, and \
+             the over-report costs nothing but the bytes it invented"
+        );
+    }
+
+    /// **REQ-622, verify: a signal a parent set to `SIG_IGN` keeps that
+    /// disposition.**
+    ///
+    /// Ignoring a signal across `exec` is a deliberate part of the POSIX
+    /// contract and the mechanism `nohup` and every daemon supervisor are built
+    /// on: the parent is making a decision *about this process*. Installing a
+    /// handler over it takes that decision away — and takes it away in the worst
+    /// direction, because this handler ends by resetting the disposition to
+    /// `SIG_DFL` and re-raising, so an ignored `SIGHUP` would start **killing**
+    /// a session that was meant to survive its terminal closing. The cost of
+    /// leaving one alone is nothing: a signal that is ignored never ends the
+    /// process, so there is no exit for the terminal to be left changed across.
+    ///
+    /// A region assertion rather than a behavioural one, and the reason is the
+    /// [`Once`]: the installer runs at most once per process and other tests in
+    /// this file have already run it, so there is no second call for a test to
+    /// observe. A subprocess with an ignored signal is the pty suite's to own.
+    ///
+    /// **Mutation, applied and observed red (2026-09-10):** delete the
+    /// `if previous.sa_sigaction == libc::SIG_IGN { continue; }` guard. **1 red
+    /// of 872**, this test. Reverted with the same edit.
+    #[test]
+    fn a_signal_a_parent_ignored_is_left_ignored() {
+        let source = production_source();
+        let at = source
+            .find("fn install_restore_handlers() {")
+            .expect("the installer");
+        let body = &source[at..];
+        // Bounded to the function: a `\n}\n` is a closing brace at column 0, and
+        // nothing nested reaches column 0.
+        let body = &body[..body.find("\n}\n").expect("the installer's brace")];
+
+        let read = body
+            .find("libc::sigaction(sig, std::ptr::null(), &raw mut previous)")
+            .expect(
+                "the installer must read the current disposition first — a null \
+                 `act` is `sigaction`'s own way of asking — or it cannot know \
+                 that a parent ignored this signal",
+            );
+        let skip = body
+            .find("if previous.sa_sigaction == libc::SIG_IGN {")
+            .expect(
+                "and must leave an ignored signal alone: this handler resets to \
+                 `SIG_DFL` and re-raises, so installing over `SIG_IGN` turns a \
+                 signal the parent made harmless into one that kills",
+            );
+        let install = body
+            .find("libc::sigaction(sig, &raw const action, std::ptr::null_mut())")
+            .expect("and otherwise installs the handler");
+        assert!(
+            read < skip && skip < install,
+            "read the disposition, decide, then install — in that order: {body}"
+        );
+        assert!(
+            body[skip..install].contains("continue;"),
+            "the decision has to *skip* this signal, not merely be computed: {body}"
         );
     }
 
@@ -2016,6 +2481,7 @@ mod tests {
     /// | Mutation | Fails |
     /// |---|---|
     /// | the `tcsetattr` call is removed from [`restore_and_reraise`] | **4 red of 999** (2026-09-10): this test, on "the handler must put the terminal back", plus the three pty legs that end a session with a signal — `ctrl_c_restores_the_terminal`, `every_exit_restores_the_terminal` (its SIGTERM leg) and `the_key_prompt_survives_ctrl_c_with_echo_on`, each on the flags `stty -a` reads back off their pty. `cli_e2e` stays green, all 97, which is AC-7 arriving as evidence rather than as an argument |
+    /// | `SIGQUIT` is dropped from [`RESTORE_SIGNALS`] (the state before the verify pass) | **1 red of 872** (2026-09-10): this test, on the length and on the `contains`. Only this one, which is the argument for asserting the *set* and not only the handler: Ctrl-\\ on a raw terminal is one keystroke away from Ctrl-C and there was no leg anywhere that asked about it |
     ///
     /// The pair is the point, and it is why the source scan here is not
     /// redundant with the pty legs. This test fails on the *shape* of the
@@ -2028,7 +2494,17 @@ mod tests {
         install_restore_handlers();
 
         let ours = restore_and_reraise as extern "C" fn(libc::c_int) as libc::sighandler_t;
-        assert_eq!(RESTORE_SIGNALS.len(), 3, "BR-7 names three signals");
+        assert_eq!(
+            RESTORE_SIGNALS.len(),
+            4,
+            "BR-7's three, plus the `SIGQUIT` the verify pass added: it is a \
+             **keystroke** on the very keyboard this guard has put into raw \
+             mode, and its default action kills the process"
+        );
+        assert!(
+            RESTORE_SIGNALS.contains(&libc::SIGQUIT),
+            "and it is `SIGQUIT` specifically that was missing"
+        );
         for sig in RESTORE_SIGNALS {
             // SAFETY: `sigaction` with a null `act` only reads the current
             // disposition, writing it into a single owned struct through

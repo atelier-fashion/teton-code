@@ -78,6 +78,22 @@ property of the terminal (process-global), not a flag threaded through the 19
 clear it (queued lines must survive into the next turn). The AC-10 oracle is a
 table of byte sequences to literal `(pending, queued, echo)` triples.
 
+**Amendment, 2026-09-10 (verify).** "One editor serves two callers" above reads as
+though one `InputEditor` *value* is shared; it is not, and the implementation was
+never that. There is **one `InputEditor` type and two independent instances**: the
+pump's, which lives on `SessionState` and holds the line being typed into the turn
+plus the queue, and each prompter's, a fresh answer buffer created for the life of
+one question (`FramedStdinPrompter::answer`, `StdinPrompter::answer`, reset at the
+top of every `read_answer_raw`). What is shared is the **decoding** — one
+implementation of "which bytes are a character, a Backspace, an Enter, an escape
+sequence to drop" — which is what BR-2's single reader and BR-10's purity are
+actually about. `shelve`/`unshelve` are a hand-off **on the pump's own copy** and
+move nothing between the two instances: `shelve` puts the pump's pending line
+aside so the pump's buffer is empty across the question, `unshelve` puts it back
+verbatim, and whatever the prompter's own buffer holds is discarded rather than
+merged. There is no shared storage anywhere on the path, which is why a question
+cannot be answered by the sentence it interrupted even by accident.
+
 ### ADR-622-3: One restore slot, a `sigaction` handler that restores and re-raises
 
 **Decision.** `prompt.rs` gains a process-wide restore slot: a `static` holding an
@@ -127,6 +143,22 @@ the kernel no longer moves the cursor.
 fallback path only; their tests move to the fallback fixture. `repaint_row_above`
 offsets become 1 or 2 depending on which rows exist — pinned by the block, not
 by arithmetic at call sites.
+
+**Amendment, 2026-09-10 (verify).** Two corrections, both about what the block's
+verbs do rather than about the decision above. First, **the block's rows hold what
+the renderer holds**: they are drawn with `Surface::draw_row` and repainted and
+withdrawn without emitting held text (commit `83235fd`), because the block is
+redrawn after every streamed token and a draw that flushed ended the streamed line
+at each one — a reply typed past came out one token per row. The held line goes
+out where the block was, on the next durable write or the turn's `end_block`.
+Second, **the pending row is the *current* row and not a row above the cursor**:
+it is drawn with no trailing newline (`Surface::draw_current_row`), repainted in
+place with `\r` + erase (`repaint_current_row`) and cleared where the cursor
+already stands (`withdraw_current_row`), so the caret rests at the end of the
+user's own text as this ADR says it does. The consequence for the offsets is that
+they collapse: the activity row is **always exactly one** above the cursor, with a
+pending row beneath it and without, so `1 or 2` becomes `1` and the block's only
+arithmetic disappears.
 
 ### ADR-622-5: Queued lines re-enter at the poll, not at the dispatcher
 

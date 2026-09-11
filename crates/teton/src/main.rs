@@ -9358,8 +9358,49 @@ mod tests {
     /// and its source-order assertion below is red under the same mutant
     /// (`drain < poll` becomes false), which is the half that fires whatever
     /// descriptor 0 happens to be. Reverted with the same edit.
+    ///
+    /// **Two defects in this test itself, found at the verify pass and fixed
+    /// here.**
+    ///
+    /// It was **order-dependent**. `next_interactive_line` asks
+    /// `RawMode::is_engaged()`, which is read off one process-wide slot
+    /// (ADR-622-3), and this test took no lock — so any sibling arming a guard
+    /// on another thread could make the drain refuse and turn the first
+    /// assertion red for a reason that has nothing to do with the queue.
+    /// `both_guards_arm_and_clear_the_restore_slot` names it as collateral in
+    /// its own mutation record: *"passes when run alone and fails in both
+    /// full-suite runs, because the slot is process-wide and it does not take
+    /// `lock_the_slot`."* It takes it now — which is what made that function
+    /// `pub(crate)`.
+    ///
+    /// And the source-order slice was **unbounded**: `&production[at..]` ran to
+    /// the end of the production text, so `drain < poll` was a claim about
+    /// whichever `queued_for_entry(` and `stdin_ready(FRAME_INTERVAL)` came
+    /// first *anywhere* below this signature rather than about this function.
+    ///
+    /// **Recorded honestly: no mutation distinguishes the two today**
+    /// ([[LESSON-568]] asks for a named mutation; "none yet" is the answer when
+    /// the failure is not reachable). The drift was constructed and run
+    /// (2026-09-10): delete the drain from `next_interactive_line` and add a
+    /// `queued_for_entry(` call to `resync_terminal_width` below it. **1 red of
+    /// 872 either way** — bounded, the `.expect` fails on the drain that is no
+    /// longer in this function; unbounded, it finds the decoy, which sits below
+    /// the poll, so `drain < poll` is false and the same assertion fires by a
+    /// different route. It cannot be fooled while the poll is the last of the
+    /// two in this function, and it is. What the bound buys is that this stays
+    /// true when it stops being: split `next_interactive_line`, or add a second
+    /// drain-and-poll pair beneath it, and an unbounded `find` starts answering
+    /// about the wrong pair with nothing to say so.
     #[test]
     fn queued_lines_re_enter_ahead_of_the_poll_in_order() {
+        // `next_interactive_line` asks `RawMode::is_engaged()`, which is read
+        // off one **process-wide** slot (ADR-622-3) — so this test's answer can
+        // be falsified by any other test that happens to be arming a guard at
+        // the same instant, and `cargo test` runs them in parallel threads. It
+        // was order-dependent until it took the slot's lock, which is the same
+        // lock `prompt.rs`'s own guard tests take (REQ-622, verify).
+        let _slot = prompt::lock_the_slot();
+
         let (mut conn, _peer) = Connection::scripted(&[]);
         let mut surface = RecordingSurface::new();
         let mut state = SessionState::new();
@@ -9430,7 +9471,18 @@ mod tests {
         let at = production
             .find("fn next_interactive_line(")
             .expect("the entry loop's reader");
+        // **Bounded to the function**, not to the rest of the file (REQ-622,
+        // verify). An unbounded slice makes `drain < poll` a claim about
+        // whichever `queued_for_entry(` and `stdin_ready(FRAME_INTERVAL)` come
+        // first *anywhere below here* — so a drain deleted from this function
+        // entirely could still satisfy it from a later one, which is the
+        // ordering assertion passing over the mutation it exists to catch. A
+        // `\n}\n` is the closing brace at column 0: nothing nested reaches
+        // column 0, so the first one after the signature ends this function.
         let body = &production[at..];
+        let body = &body[..body
+            .find("\n}\n")
+            .expect("the entry loop's reader has a closing brace")];
         let drain = body
             .find("queued_for_entry(")
             .expect("the entry loop drains the queue");
