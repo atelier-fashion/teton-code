@@ -359,7 +359,7 @@ pub const F1: &str = "\u{1b}OP";
 /// asserted on the *result* of replaying those bytes, which is what this does.
 ///
 /// Deliberately small. It answers the sequences the activity row and the entry
-/// frame actually emit — save and restore (`\x1b[s` / `\x1b[u`), cursor up and
+/// frame actually emit — DEC save and restore (`\x1b7` / `\x1b8`), cursor up and
 /// down, carriage return, newline, erase-in-line and erase-in-display — and
 /// **skips** every other CSI, which for this suite means the SGR colour runs
 /// that occupy no column. It is not a terminal emulator: there is no scroll
@@ -396,8 +396,24 @@ pub fn rendered_screen(transcript: &str) -> Vec<String> {
                     screen.csi(final_byte, &params);
                 }
             }
-            // A two-character escape: its second character is consumed by the
-            // `next` above, and neither moves the cursor.
+            // DEC save and restore — the pair the repaint emits. The SCO pair
+            // (`\x1b[s` / `\x1b[u`) is deliberately **not** answered: a
+            // terminal may ignore it, and one that does turned the rotating
+            // activity row into a column of frames climbing the screen. A
+            // replay that honoured it would call that output correct.
+            '\x1b' if chars.peek() == Some(&'7') => {
+                chars.next();
+                screen.saved = Some((screen.row, screen.col));
+            }
+            '\x1b' if chars.peek() == Some(&'8') => {
+                chars.next();
+                if let Some((row, col)) = screen.saved {
+                    screen.row = row;
+                    screen.col = col;
+                }
+            }
+            // Any other two-character escape: its second character is consumed
+            // by the `next` above, and none moves the cursor.
             '\x1b' => {
                 chars.next();
             }
@@ -445,13 +461,6 @@ impl Screen {
             'B' => self.row += n.max(1),
             'C' => self.col += n.max(1),
             'D' => self.col = self.col.saturating_sub(n.max(1)),
-            's' => self.saved = Some((self.row, self.col)),
-            'u' => {
-                if let Some((row, col)) = self.saved {
-                    self.row = row;
-                    self.col = col;
-                }
-            }
             'K' => self.erase_line(n),
             'J' => self.erase_display(n),
             _ => {}
@@ -714,7 +723,7 @@ mod tests {
         assert_eq!(rendered_screen("row\n\x1b[1A\r\x1b[K"), blank());
     }
 
-    /// `\x1b[s` … `\x1b[u` — a repaint: save, step up, erase, redraw, restore.
+    /// `\x1b7` … `\x1b8` — a repaint: save, step up, erase, redraw, restore.
     ///
     /// The claim is that the new frame replaces the old one **in place** and
     /// the cursor comes back to where it was, so whatever prints next lands
@@ -723,11 +732,11 @@ mod tests {
     #[test]
     fn a_repaint_replaces_the_row_above_and_restores_the_cursor() {
         assert_eq!(
-            rendered_screen("row1\n\x1b[s\x1b[1A\r\x1b[Krow2\x1b[u"),
+            rendered_screen("row1\n\x1b7\x1b[1A\r\x1b[Krow2\x1b8"),
             vec!["row2".to_owned()]
         );
         assert_eq!(
-            rendered_screen("row1\n\x1b[s\x1b[1A\r\x1b[Krow2\x1b[unext"),
+            rendered_screen("row1\n\x1b7\x1b[1A\r\x1b[Krow2\x1b8next"),
             vec!["row2".to_owned(), "next".to_owned()]
         );
     }
