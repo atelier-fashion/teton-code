@@ -8167,18 +8167,29 @@ mod tests {
             onlooker.contains(&session.0),
             "the row itself stays — BR-10 reduces the payload, not the listing: {onlooker}"
         );
+        // The keys are checked on the parsed row, not by substring: a session id
+        // is random base32 and can spell `cwd` by chance (it did, in CI).
+        let row = |response: &str| -> serde_json::Map<String, Value> {
+            let parsed: Value = serde_json::from_str(response).unwrap();
+            parsed["result"]["sessions"][0]
+                .as_object()
+                .unwrap_or_else(|| panic!("one session row: {response}"))
+                .clone()
+        };
+        let seen = row(&onlooker);
         assert!(
-            !onlooker.contains("title") && !onlooker.contains("own words"),
+            !seen.contains_key("title") && !onlooker.contains("own words"),
             "an unattached connection must be shown no title: {onlooker}"
         );
         assert!(
-            !onlooker.contains("cwd") && !onlooker.contains(&jail.display().to_string()),
+            !seen.contains_key("cwd") && !onlooker.contains(&jail.display().to_string()),
             "an unattached connection must be shown no cwd: {onlooker}"
         );
 
         let owner = list(&creator);
+        let whole = row(&owner);
         assert!(
-            owner.contains("own words") && owner.contains("cwd"),
+            whole.contains_key("title") && whole.contains_key("cwd") && owner.contains("own words"),
             "the creator is attached to what it made and sees it whole: {owner}"
         );
 
