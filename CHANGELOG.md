@@ -18,6 +18,27 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [0.1.36] - 2026-09-22
+
+### Fixed
+
+- **The activity line rotates in place instead of printing a new line every
+  frame.** The live row added in 0.1.35 redrew itself by saving the cursor,
+  stepping up a row, and restoring the cursor. It used the SCO save/restore pair
+  (`CSI s` / `CSI u`), which is optional, and a terminal that ignores it never
+  restored. Each frame then landed one row higher than the last, so the spinner
+  climbed the screen and wrote over the scrollback above it. The row now uses
+  the DEC pair (`ESC 7` / `ESC 8`), which every terminal supports. Repainted
+  frames also keep the row's dim styling instead of losing it after the first
+  frame.
+
+### Security
+
+- **`rustls` 0.23.42 → 0.23.45** for
+  [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285): TLS 1.3
+  handshake messages were accepted across encryption-level boundaries (medium).
+  `rustls-webpki` moves to 0.103.15 with it. No configuration change.
+
 ## [0.1.35] - 2026-09-11
 
 ### Added
