@@ -4376,7 +4376,7 @@ const FULL_AND_NO_CONTEXT_OFFER: &str =
 /// withdraw through `\x1b[{n}A\r\x1b[K`, and only a repaint saves the cursor
 /// first. Counting these is therefore counting ticks that painted, which is
 /// what the mutation recorded on the leg below removes.
-const REPAINT_OPEN: &str = "\x1b[s\x1b[1A\r\x1b[K";
+const REPAINT_OPEN: &str = "\x1b7\x1b[1A\r\x1b[K";
 
 /// A repaint's first two escapes: save the cursor, then step up a row.
 ///
@@ -4385,7 +4385,7 @@ const REPAINT_OPEN: &str = "\x1b[s\x1b[1A\r\x1b[K";
 /// Counting the full sequence would miss a build that saved and stepped up and
 /// then erased differently, and stepping up onto the line the user is typing on
 /// is the intrusion, whatever is written next.
-const REPAINT_MEASURE: &str = "\x1b[s\x1b[1A";
+const REPAINT_MEASURE: &str = "\x1b7\x1b[1A";
 
 /// The bytes that take a live row back (`PlainSurface::withdraw_row_above`).
 ///
@@ -4398,7 +4398,7 @@ const WITHDRAW: &str = "\x1b[1A\r\x1b[K";
 ///
 /// A row is found by its opening glyph and read to the first byte that is not
 /// part of it — an escape (the trailing `\x1b[0m` of a `line()` draw, or the
-/// `\x1b[u` of a repaint) or the end of the line. So this reads the row's
+/// `\x1b8` of a repaint) or the end of the line. So this reads the row's
 /// *text*, whichever verb drew it, which is what lets one helper serve the
 /// first-draw, repaint and stall legs alike.
 fn activity_rows(transcript: &str) -> Vec<String> {
@@ -5588,7 +5588,7 @@ fn without_sgr(bytes: &str) -> String {
 /// row's text)*.
 ///
 /// The pair is the point. `PlainSurface::repaint_row_above` writes
-/// `\x1b[s\x1b[{n}A\r\x1b[K{text}\x1b[u`, and with a two-row block the offset
+/// `\x1b7\x1b[{n}A\r\x1b[K{text}\x1b8`, and with a two-row block the offset
 /// says which row was claimed: 2 for the activity row, 1 for the pending row
 /// beneath it. BUG-225 was precisely an activity row claiming offset 1 — the
 /// row the user's own characters were on — so a leg that reads offsets can
@@ -5598,7 +5598,7 @@ fn without_sgr(bytes: &str) -> String {
 /// [`REPAINT_OPEN`] and [`REPAINT_MEASURE`] stay for the legs that only count
 /// repaints; this is for the legs that have to know which row each one was for.
 fn repaints(transcript: &str) -> Vec<(usize, String)> {
-    const OPEN: &str = "\x1b[s\x1b[";
+    const OPEN: &str = "\x1b7\x1b[";
     let mut found = Vec::new();
     let mut rest = transcript;
     while let Some(at) = rest.find(OPEN) {
@@ -5609,7 +5609,7 @@ fn repaints(transcript: &str) -> Vec<(usize, String)> {
             continue;
         };
         let body = &tail[a + 1..];
-        let end = body.find("\x1b[u").unwrap_or(body.len());
+        let end = body.find("\x1b8").unwrap_or(body.len());
         found.push((rows_up, without_sgr(&body[..end])));
         rest = &body[end..];
     }
@@ -5651,7 +5651,7 @@ fn pending_bytes(row: &str) -> String {
 /// `draw_current_row` writes the row where a withdraw has just left the cursor.
 /// What they share — and what nothing else on this screen has — is an erase at
 /// column 0 with **no cursor-up before it**: `repaint_row_above` opens
-/// `\x1b[s\x1b[{n}A` and `withdraw_row_above` opens `\x1b[{n}A`, so an erase a
+/// `\x1b7\x1b[{n}A` and `withdraw_row_above` opens `\x1b[{n}A`, so an erase a
 /// cursor-up brought the caret to belongs to a row above and is not one of
 /// these.
 ///

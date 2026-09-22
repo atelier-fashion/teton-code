@@ -229,7 +229,7 @@ pub trait Surface {
     /// its end (REQ-622 ADR-622-4).
     ///
     /// [`Surface::repaint_row_above`] without the offset and without the
-    /// `\x1b[s` / `\x1b[u` pair, and the absence of that pair is the point: a
+    /// `\x1b7` / `\x1b8` pair, and the absence of that pair is the point: a
     /// save/restore exists to put the cursor back where it was, and here it is
     /// already where it belongs — at the end of the row just written. Carriage
     /// return, erase to end of line, write. Three bytes of escape rather than
@@ -1224,7 +1224,7 @@ impl<W: Write> Surface for PlainSurface<W> {
         self.at_line_start = false;
     }
 
-    /// `\r`, erase, write — no `\x1b[s` / `\x1b[u` pair, because the cursor is
+    /// `\r`, erase, write — no `\x1b7` / `\x1b8` pair, because the cursor is
     /// meant to end up at the end of this row and that is where writing it
     /// leaves it (REQ-622 ADR-622-4).
     ///
@@ -1328,19 +1328,23 @@ impl<W: Write> Surface for PlainSurface<W> {
         // written against, arriving through the flush itself. The reasoning is
         // written out once, at `withdraw_row_above`.
 
-        let prefix = Self::prefix(kind);
         // A repaint claims exactly one row, and the cursor restore assumes it: a
-        // newline here would scroll the frame out from under `\x1b[u` and leave
+        // newline here would scroll the frame out from under `\x1b8` and leave
         // the entry area shredded. That is the sharper consequence, but it is
-        // not a different rule — [`defused`] is what `line()` uses too, for the
-        // reason written there.
-        let single_row = defused(text);
-        write!(
-            self.out,
-            "\x1b[s\x1b[{rows_up}A\r\x1b[K{prefix}{single_row}\x1b[u"
-        )
-        .and_then(|()| self.out.flush())
-        .is_ok()
+        // not a different rule — [`Self::styled_row`] defuses the text exactly
+        // as `line()` does, and styles it the same way, so a repainted row
+        // cannot differ from the row it replaces in anything but its text.
+        let row = self.styled_row(kind, text);
+        // DEC save/restore (`ESC 7` / `ESC 8`), **not** the SCO pair
+        // (`CSI s` / `CSI u`). The SCO pair is optional and a terminal that
+        // ignores it never restores: every repaint left the cursor on the row
+        // it had just written, the next one stepped up from *there*, and a
+        // spinner meant to rotate in place climbed the screen one frame per
+        // row, overwriting the scrollback above it. The DEC pair is the one
+        // VT100 defined and every terminal answers.
+        write!(self.out, "\x1b7\x1b[{rows_up}A\r\x1b[K{row}\x1b8")
+            .and_then(|()| self.out.flush())
+            .is_ok()
     }
 
     /// Step up, clear the row, and stop. The cursor is left on the cleared row,
@@ -1380,7 +1384,7 @@ impl<W: Write> Surface for PlainSurface<W> {
         // this withdraw — both land where the block was, which is where the
         // line would have gone with no block at all.
 
-        // No `\x1b[s` / `\x1b[u` pair, unlike the repaint: the cursor is meant
+        // No `\x1b7` / `\x1b8` pair, unlike the repaint: the cursor is meant
         // to end up here.
         let written = write!(self.out, "\x1b[{rows_up}A\r\x1b[K")
             .and_then(|()| self.out.flush())
@@ -1652,7 +1656,7 @@ mod tests {
     /// the activity row **and its newline** — the cursor steps past that row —
     /// then the pending row with **no** newline, so the terminal's caret is left
     /// immediately after `l`; then a repaint that is `\r`, erase, rewrite and
-    /// nothing else — no `\x1b[s` / `\x1b[u`, because the cursor is meant to end
+    /// nothing else — no `\x1b7` / `\x1b8`, because the cursor is meant to end
     /// up exactly where writing leaves it; then a withdraw that clears that row
     /// and leaves the cursor at its start.
     ///
@@ -1917,13 +1921,13 @@ mod tests {
             surface.line(LineKind::Info, "after");
         }
         let out = String::from_utf8(buf).unwrap();
-        assert!(out.contains("\x1b[s"), "saves the cursor: {out:?}");
+        assert!(out.contains("\x1b7"), "saves the cursor: {out:?}");
         assert!(
             out.contains("\x1b[2A"),
             "steps up to the status row: {out:?}"
         );
         assert!(out.contains("\x1b[K"), "clears only that row: {out:?}");
-        assert!(out.contains("\x1b[u"), "restores the cursor: {out:?}");
+        assert!(out.contains("\x1b8"), "restores the cursor: {out:?}");
         assert!(
             !out.contains("\x1b[J"),
             "must not clear to end of screen — that is the frame teardown this \
@@ -1957,7 +1961,7 @@ mod tests {
             .split("\x1b[K")
             .nth(1)
             .expect("the cleared-row body")
-            .split("\x1b[u")
+            .split("\x1b8")
             .next()
             .expect("up to the cursor restore");
         assert!(
@@ -2174,7 +2178,7 @@ mod tests {
             }
             String::from_utf8(buf).unwrap()
         }
-        let cycle = "> typed\n\x1b[s\x1b[1A\r\x1b[K> typed a\x1b[u\x1b[1A\r\x1b[K";
+        let cycle = "> typed\n\x1b7\x1b[1A\r\x1b[K> typed a\x1b8\x1b[1A\r\x1b[K";
         let held = stream(|surface, row| surface.draw_row(LineKind::Activity, row));
         assert_eq!(
             held,
@@ -2822,7 +2826,7 @@ mod tests {
         }
         let out = String::from_utf8(buf).unwrap();
         assert_eq!(
-            out, "\x1b[s\x1b[2A\r\x1b[K>> model starting..\x1b[upartially streamed\n",
+            out, "\x1b7\x1b[2A\r\x1b[K>> model starting..\x1b8partially streamed\n",
             "the repaint is the save, the move, the clear, the row and the \
              restore, and the buffered row is still the renderer's to emit \
              afterwards: {out:?}"
