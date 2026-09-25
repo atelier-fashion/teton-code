@@ -1,10 +1,11 @@
 ---
 id: BUG-227
 title: "A typed skill refused at a mid-turn reroute says no provider saw a turn one already answered"
-status: open
+status: resolved
 severity: medium
 created: 2026-09-25
 updated: 2026-09-25
+resolved: 2026-09-25
 component: "daemon/harness"
 domain: "harness"
 stack: ["rust", "daemon"]
@@ -137,3 +138,10 @@ default. That belongs in the toolkit, not Teton.
   exception.
 - `crates/tetond/tests/skill_turn.rs`: the typed-reroute test asserts the
   truthful tail and records its mutations.
+
+## Deployment
+
+Merged to `main` as `fe497b6` via
+[#330](https://github.com/atelier-fashion/teton-code/pull/330) on 2026-09-25,
+with all 8 CI checks green on the head commit. There is no deploy target: the
+fix ships in the next tagged release. Lesson: LESSON-661.
