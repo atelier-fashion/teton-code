@@ -1187,7 +1187,9 @@ pub enum SkillFit {
     Fits,
     /// The expansion does not fit. A user-typed `/name` raises this under
     /// `error_code::SKILL_EXPANSION_TOO_LARGE` and sends nothing — `-32023`
-    /// and not `-32022`, because no provider has seen that turn; a
+    /// and not `-32022`, because Teton refused it rather than a provider (and
+    /// before dispatch, no provider has seen that turn; at a mid-turn reroute
+    /// one may have, which [`skill_refit`]'s sentence says — BUG-227); a
     /// model-invoked call renders it as a tool result instead
     /// ([`SkillFit::into_tool_refusal`]).
     TooLarge {
@@ -1320,6 +1322,31 @@ impl SkillCaller {
             }
         }
     }
+
+    /// What did not happen when the refusal comes from the **reroute guard**,
+    /// in a turn the attempt loop had already started (BUG-227).
+    ///
+    /// The user arm cannot reuse [`Self::consequence`] here. That clause is
+    /// true only before `CarriedTurn::begin`. The reroute guard runs after an
+    /// attempt has returned, and by then the route it left may have answered
+    /// several model calls (the privacy arm fires at the egress inspection of
+    /// request *N*, not only of request 1), and a failed provider normally
+    /// received the request whose failure triggered the fallback. What *is*
+    /// true on both arms: the turn ends here, nothing more is sent, and the
+    /// abandon path keeps nothing of it (REQ-567 BR-6).
+    ///
+    /// The model arm is unchanged. Its clause never claimed nothing was sent,
+    /// and BUG-188 already made it relayable at this seam.
+    const fn reroute_consequence(self) -> &'static str {
+        match self {
+            SkillCaller::User => {
+                "This turn was already under way when it moved to this route, so it ends here: \
+                 nothing more is sent and nothing from this turn is kept — a skill expansion is \
+                 carried whole or refused, never shortened into something you did not invoke."
+            }
+            SkillCaller::Model => self.consequence(),
+        }
+    }
 }
 
 /// Measure one skill expansion against the route's **stamped** budget and, if it
@@ -1388,14 +1415,63 @@ pub fn skill_fit(
         caller,
         stage,
         skill,
-        fit,
+        Candidate {
+            fit,
+            body_bytes: expansion.len(),
+        },
         budget,
         provider_id,
-        expansion.len(),
+        &SkillSentence::Refused,
     )
 }
 
-/// The three-way verdict both entry points share (REQ-618 BR-4).
+/// [`skill_fit`] for the **reroute guard** (BUG-227): the same measurement,
+/// closed with [`SkillCaller::reroute_consequence`] instead of the pre-dispatch
+/// clause.
+///
+/// A separate entry point rather than a flag on [`skill_fit`], so that the
+/// pre-dispatch stages cannot come to pass the wrong one: they never name the
+/// reroute, and the reroute guard never names anything else.
+pub fn skill_refit(
+    caller: SkillCaller,
+    stage: SkillStage,
+    skill: &str,
+    system: &str,
+    expansion: &str,
+    budget: &RouteBudget,
+    provider_id: Option<&str>,
+) -> SkillFit {
+    let fit = ContextManager::would_seed_fit(
+        system,
+        expansion,
+        budget.budget_tokens,
+        budget.budget_bytes,
+    );
+    verdict(
+        caller,
+        stage,
+        skill,
+        Candidate {
+            fit,
+            body_bytes: expansion.len(),
+        },
+        budget,
+        provider_id,
+        &SkillSentence::RefusedAtReroute,
+    )
+}
+
+/// One candidate expansion as the estimator saw it: the pair, and the body's
+/// own size that REQ-618 BR-4's room line is drawn against.
+///
+/// A named bundle because the two are one measurement of one expansion, and
+/// because [`verdict`] would otherwise sit past the argument limit.
+struct Candidate {
+    fit: Fit,
+    body_bytes: usize,
+}
+
+/// The three-way verdict every entry point shares (REQ-618 BR-4).
 ///
 /// One function so `skill_fit` and `skill_append_fit` cannot come to disagree
 /// about where the room line is — the failure REQ-587 ADR-2 already had to fix
@@ -1405,28 +1481,24 @@ pub fn skill_fit(
 /// all is refused as not fitting, because that is the true and more useful
 /// sentence; the room question is only interesting about a body that *would*
 /// have been admitted.
+///
+/// `refused` is which refusal tail closes the sentence: the pre-dispatch one,
+/// or the reroute guard's (BUG-227).
 fn verdict(
     caller: SkillCaller,
     stage: SkillStage,
     skill: &str,
-    fit: Fit,
+    candidate: Candidate,
     budget: &RouteBudget,
     provider_id: Option<&str>,
-    body_bytes: usize,
+    refused: &SkillSentence<'_>,
 ) -> SkillFit {
+    let Candidate { fit, body_bytes } = candidate;
     let measured = Measured::of(fit, body_bytes, budget);
     if measured.admits() {
         return SkillFit::Fits;
     }
-    let message = skill_refusal(
-        caller,
-        stage,
-        skill,
-        measured,
-        budget,
-        provider_id,
-        &SkillSentence::Refused,
-    );
+    let message = skill_refusal(caller, stage, skill, measured, budget, provider_id, refused);
     match measured.room {
         Room::Enough => SkillFit::TooLarge { message },
         Room::TooLittle { .. } => SkillFit::NoRoom {
@@ -1579,10 +1651,13 @@ pub fn skill_append_fit(
         caller,
         stage,
         skill,
-        fit,
+        Candidate {
+            fit,
+            body_bytes: expansion.len(),
+        },
         budget,
         provider_id,
-        expansion.len(),
+        &SkillSentence::Refused,
     )
 }
 
@@ -1622,6 +1697,9 @@ pub enum PriorWindowRejection {
 /// * [`Self::Refused`] keeps [`SkillCaller::consequence`] verbatim, including
 ///   the *"no provider saw this turn"* clause that makes `-32023` different
 ///   from `-32022` (AC-3: declining is byte-identical to today's refusal).
+/// * [`Self::RefusedAtReroute`] is the reroute guard's refusal, and closes with
+///   [`SkillCaller::reroute_consequence`]: by then the clause above may be
+///   false (BUG-227).
 /// * [`Self::Offered`] asks, and never refuses (BR-3).
 /// * [`Self::Accepted`] records a send that **happened**, so it must not carry
 ///   the refusal's clause at all — the moment a human proceeds it is false, and
@@ -1630,6 +1708,10 @@ pub enum PriorWindowRejection {
 enum SkillSentence<'a> {
     /// Nothing was sent: nobody was asked, or a human declined.
     Refused,
+    /// The reroute guard refused an expansion the turn was already carrying
+    /// (BUG-227). Earlier attempts may have reached a provider, so this arm
+    /// must not say nothing was sent — see [`SkillCaller::reroute_consequence`].
+    RefusedAtReroute,
     /// BR-3's question, put to a human instead of refusing.
     Offered {
         /// What the route's declared window says about the measurement.
@@ -1663,7 +1745,7 @@ impl SkillSentence<'_> {
     /// the decline arm has to stay byte-identical to it.
     const fn source(&self) -> Option<SkillSource> {
         match self {
-            SkillSentence::Refused => None,
+            SkillSentence::Refused | SkillSentence::RefusedAtReroute => None,
             SkillSentence::Offered { source, .. } | SkillSentence::Accepted { source } => {
                 Some(*source)
             }
@@ -1819,6 +1901,7 @@ pub enum Room {
 fn sentence_tail(caller: SkillCaller, bound: BudgetBound, sentence: &SkillSentence<'_>) -> String {
     match sentence {
         SkillSentence::Refused => caller.consequence().to_owned(),
+        SkillSentence::RefusedAtReroute => caller.reroute_consequence().to_owned(),
         SkillSentence::Offered {
             verdict,
             remedy,
@@ -5970,6 +6053,78 @@ mod tests {
     /// The route stays the derived one on purpose: it is the thing REQ-612
     /// moved, and a synthetic budget here would have kept passing across that
     /// move without noticing it.
+    /// **BUG-227: the reroute guard's typed refusal does not say that no
+    /// provider saw the turn.**
+    ///
+    /// The guard runs after an attempt has returned, and the route it left may
+    /// have answered several model calls already. The reported `/analyze` turn
+    /// had two kimi calls billed before a shell pin rerouted it to local, and
+    /// the refusal still said "Nothing was sent and no provider saw this turn".
+    ///
+    /// Three claims, one per mutation:
+    ///
+    /// * the pre-dispatch sentence is unchanged (REQ-589 AC-3). Pointing
+    ///   `skill_fit` at the reroute tail reddens the first assertion;
+    /// * the reroute sentence drops the clause and says the turn was under way.
+    ///   Pointing `reroute_consequence`'s user arm back at `consequence`
+    ///   reddens the second and third;
+    /// * everything ahead of the tail is the same measurement, and the model
+    ///   arm is byte-identical at both seams. A reroute arm that composed its
+    ///   own figures, or rewrote the model's tail, reddens the last two.
+    #[test]
+    fn a_typed_refusal_at_a_reroute_does_not_say_no_provider_saw_the_turn() {
+        let system = real_system_prompt();
+        let budget = derive(remote(4_096, 0, false));
+        let expansion = corpus_body(60_000);
+        let refused = |fit: SkillFit| match fit {
+            SkillFit::TooLarge { message } | SkillFit::NoRoom { message, .. } => message,
+            SkillFit::Fits => panic!(
+                "non-vacuity: a 60 KB expansion must be refused on this route's \
+                 {} B budget, or there is no sentence to compare",
+                budget.budget_bytes
+            ),
+        };
+        let measure = |caller, refit: bool| {
+            let entry = if refit { skill_refit } else { skill_fit };
+            refused(entry(
+                caller,
+                SkillStage::WithDynamicContext,
+                "analyze",
+                &system,
+                &expansion,
+                &budget,
+                Some("ollama"),
+            ))
+        };
+
+        let before_dispatch = measure(SkillCaller::User, false);
+        let at_reroute = measure(SkillCaller::User, true);
+        assert!(
+            before_dispatch.ends_with(SkillCaller::User.consequence())
+                && before_dispatch.contains("no provider saw this turn"),
+            "the pre-dispatch refusal must keep its clause: {before_dispatch}"
+        );
+        assert!(
+            !at_reroute.contains("no provider saw this turn")
+                && !at_reroute.contains("Nothing was sent"),
+            "a reroute refusal cannot claim nothing was sent: {at_reroute}"
+        );
+        assert!(
+            at_reroute.starts_with("`/analyze`") && at_reroute.contains("already under way"),
+            "it names the typed skill and says the turn was under way: {at_reroute}"
+        );
+        assert_eq!(
+            before_dispatch.strip_suffix(SkillCaller::User.consequence()),
+            at_reroute.strip_suffix(SkillCaller::User.reroute_consequence()),
+            "only the tail differs: the subject, figures and bound are one measurement"
+        );
+        assert_eq!(
+            measure(SkillCaller::Model, false),
+            measure(SkillCaller::Model, true),
+            "the model arm never claimed nothing was sent, so it does not change"
+        );
+    }
+
     #[test]
     fn the_message_says_which_stage_refused() {
         let system = real_system_prompt();
