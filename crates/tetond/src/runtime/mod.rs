@@ -175,7 +175,7 @@ use crate::egress::{
 };
 use crate::grants::ConnectionId;
 use crate::harness::budget::{
-    proposed_window, skill_fit, Measured, OverBudgetOffer, PriorWindowRejection, RebindTarget,
+    proposed_window, skill_refit, Measured, OverBudgetOffer, PriorWindowRejection, RebindTarget,
     RebindWindow, Remedy, Room, RouteBudget, SkillCaller, SkillFit, SkillStage,
 };
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
@@ -7698,7 +7698,10 @@ fn skill_would_not_survive_refit(
             } else {
                 SkillCaller::Model
             };
-            match skill_fit(
+            // `skill_refit`, not `skill_fit`: this guard runs after an attempt
+            // has returned, so the typed caller's pre-dispatch clause ("no
+            // provider saw this turn") may be false here (BUG-227).
+            match skill_refit(
                 caller,
                 SkillStage::WithDynamicContext,
                 name,
@@ -24694,7 +24697,7 @@ provider_id = \"deepseek\"
             let system = "You are Teton Code.";
             let expansion = "word ".repeat(budget.budget_tokens + 1);
             let verdict = || {
-                skill_fit(
+                crate::harness::budget::skill_fit(
                     SkillCaller::User,
                     SkillStage::Body,
                     "analyze",

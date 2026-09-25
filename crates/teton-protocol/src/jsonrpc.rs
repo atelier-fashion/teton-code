@@ -557,6 +557,14 @@ pub mod error_code {
         /// It is raised at two stages that the message tells apart (ADR-11):
         /// before consent, when the body alone does not fit, and after the
         /// dynamic outcomes are folded in, when their output pushed it over.
+        ///
+        /// **One exception to "nothing was dispatched"** (BUG-227): a typed
+        /// expansion the turn is already carrying can be refused by the
+        /// reroute guard, when a privacy pin or a provider fallback moves the
+        /// turn onto a route too small for it. Earlier attempts of that turn
+        /// may have reached a provider, so the message says the turn was
+        /// already under way rather than that nothing was sent. It is still
+        /// Teton refusing and not a provider, which is why the code is the same.
         SKILL_EXPANSION_TOO_LARGE = -32023;
         /// Teton stopped this prompt because it reached the spend ceiling the
         /// user configured (REQ-588 BR-3, architecture ADR-4).

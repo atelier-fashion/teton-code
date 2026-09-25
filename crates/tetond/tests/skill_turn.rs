@@ -5884,6 +5884,13 @@ async fn a_reroute_after_a_committed_model_expansion_relays_the_refusal_and_cont
 /// scripted failure between them. The expansion is the *seed* here rather than a
 /// mid-loop fold, so it is in the refit list from the first line of
 /// `run_prompt_turn` — index 0, below `typed_refit`.
+///
+/// **BUG-227's half.** The guard calls `skill_refit`, whose user tail says the
+/// turn was already under way instead of "no provider saw this turn". Mutations
+/// run 2026-09-25: pointing the guard back at `skill_fit` reddens this test
+/// (1 of the pair), and so does collapsing `reroute_consequence`'s user arm onto
+/// `consequence` (this test and the `budget.rs` unit test; the model sibling
+/// stays green both times, as it should).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reroute_after_a_typed_expansion_still_names_it_as_the_slash_command_the_user_typed() {
     let repo = Tree::new("rerouteu");
@@ -5918,12 +5925,19 @@ async fn a_reroute_after_a_typed_expansion_still_names_it_as_the_slash_command_t
         "the model caller's spelling reached a turn the user typed: {}",
         err.message
     );
-    // The user arm's consequence, which is the clause that makes `-32023`
-    // different from `-32022` and which the model arm cannot borrow.
+    // BUG-227: not the pre-dispatch clause. The non-vacuity check below proves
+    // the provider received the expansion before the fallback, so "Nothing was
+    // sent and no provider saw this turn" would be false here — and this test
+    // used to assert it. The reroute tail says what is true instead.
     assert!(
+        !err.message.contains("no provider saw this turn")
+            && !err.message.contains("Nothing was sent"),
+        "a turn refused at a reroute already reached a provider: {}",
         err.message
-            .contains("Nothing was sent and no provider saw this turn"),
-        "the user arm's consequence must travel with the user's subject: {}",
+    );
+    assert!(
+        err.message.contains("already under way"),
+        "the user arm's reroute consequence must travel with the user's subject: {}",
         err.message
     );
     // Non-vacuity, exactly as the sibling's: the expansion did reach the
