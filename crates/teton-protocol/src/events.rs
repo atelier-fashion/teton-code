@@ -544,7 +544,7 @@ pub struct RouteDecided {
     ///
     /// Carried beside [`Self::budget_tokens`] rather than left to be inferred
     /// from it, because the two are different currencies. A provider declaring
-    /// 1,000,000 tokens derives a 665,984-**word** budget, and a surface that
+    /// 1,000,000 tokens derives a 661,205-**word** budget, and a surface that
     /// prints only the second reads as though the window shrank by a third —
     /// the confusion LESSON-446 records.
     ///

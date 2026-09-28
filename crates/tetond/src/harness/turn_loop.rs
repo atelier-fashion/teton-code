@@ -2584,6 +2584,7 @@ pub async fn run_session_turn_with_pressure_policy(
             dropped_calls,
             cache,
             call_in_text,
+            stopped_at_cap,
             ..
         } = produced;
         // Exactly one prefix-cache event per local turn, emitted here on the
@@ -2664,8 +2665,17 @@ pub async fn run_session_turn_with_pressure_policy(
                     &config.budget,
                     &mut said_it_did_not_fit,
                 );
+                // BUG-229: a reply the output cap cut short did not end, it
+                // ran out. Said with the stop reason the protocol already has
+                // for it, so a reasoning model that spent the cap thinking and
+                // answered nothing reads as truncated rather than as done.
+                let stop_reason = if stopped_at_cap {
+                    StopReason::MaxTokens
+                } else {
+                    StopReason::EndTurn
+                };
                 return Ok(TurnOutcome {
-                    stop_reason: StopReason::EndTurn,
+                    stop_reason,
                     turns,
                     final_text,
                     edited: latches.edited,
@@ -3962,6 +3972,7 @@ mod tests {
                 dropped_calls: 0,
                 cache: None,
                 call_in_text: false,
+                stopped_at_cap: false,
             })
         }
     }
@@ -4033,6 +4044,7 @@ mod tests {
                 dropped_calls: 0,
                 cache: None,
                 call_in_text,
+                stopped_at_cap: false,
             })
         }
     }
@@ -4083,8 +4095,105 @@ mod tests {
                 dropped_calls: 0,
                 cache: None,
                 call_in_text: false,
+                stopped_at_cap: false,
             })
         }
+    }
+
+    /// A source that ends every turn with an empty answer, stopped by
+    /// `stopped_at_cap` — BUG-229's last call when that is `true`.
+    struct EmptyAnswerSource {
+        stopped_at_cap: bool,
+    }
+
+    #[async_trait]
+    impl CompletionSource for EmptyAnswerSource {
+        async fn produce_turn(
+            &mut self,
+            _prompt: &PreparedPrompt,
+            _provenance: &EgressProvenance,
+            _config: &HarnessConfig,
+            _tools: &ToolRegistry,
+            _exposed: &[&str],
+            _on_token: &mut (dyn for<'s> FnMut(&'s str) + Send),
+        ) -> Result<SourceTurn, HarnessError> {
+            Ok(SourceTurn {
+                text: String::new(),
+                decision: TurnDecision::EndTurn {
+                    final_text: String::new(),
+                },
+                usage: TokenUsage {
+                    input_tokens: 40_000,
+                    output_tokens: 1_024,
+                    reasoning_tokens: Some(1_021),
+                },
+                dropped_calls: 0,
+                cache: None,
+                call_in_text: false,
+                stopped_at_cap: self.stopped_at_cap,
+            })
+        }
+    }
+
+    async fn empty_answer_outcome(stopped_at_cap: bool) -> TurnOutcome {
+        let session_id = SessionId::from("bug229");
+        let bus = Arc::new(EventBus::new());
+        let gate = PermissionGate::new(
+            session_id.clone(),
+            PermissionConfig::permissive(),
+            Arc::clone(&bus),
+            Arc::new(PendingPermissions::new()),
+        );
+        let events = SessionEvents::new(Arc::clone(&bus), session_id);
+        let config = HarnessConfig::default();
+        let tools = ToolRegistry::with_builtins();
+        let tool_ctx = ToolContext::new(std::env::temp_dir());
+        let mut hook = NoopProvenanceHook;
+        let mut ctx = ContextManager::new("sys", config.context_budget_tokens)
+            .with_budget_bytes(config.context_budget_bytes);
+        ctx.push_user("analyze this repository");
+        run_session_turn_with_source(
+            &mut EmptyAnswerSource { stopped_at_cap },
+            &tools,
+            &tool_ctx,
+            &gate,
+            &events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &DutyRoute::unresolved("no digest route in this test"),
+            &DutyRoute::unresolved("no compact route in this test"),
+            &ToolDuties {
+                triage: &DutyRoute::unresolved("no triage route in this test"),
+                shell: &DutyRoute::unresolved("no shell route in this test"),
+            },
+        )
+        .await
+        .expect("the turn completes")
+    }
+
+    /// **BUG-229.** A model call that spent its whole output cap reasoning
+    /// answered with nothing, and the loop ended the turn as `EndTurn` — the
+    /// user saw `turn ended (EndTurn)` after a tool result and no reply, and
+    /// the transcript said the turn had finished.
+    ///
+    /// The stop reason is the loop's reading of `stopped_at_cap`, not of the
+    /// empty text: the same empty answer on an ordinary stop still ends as
+    /// `EndTurn`, which is what keeps this from being a heuristic about
+    /// silence.
+    ///
+    /// Mutation: returning `StopReason::EndTurn` unconditionally in the
+    /// end-of-turn arm (the pre-fix code) reddens the first assertion.
+    #[tokio::test]
+    async fn a_turn_whose_answer_ran_out_of_output_ends_as_max_tokens() {
+        assert_eq!(
+            empty_answer_outcome(true).await.stop_reason,
+            StopReason::MaxTokens
+        );
+        assert_eq!(
+            empty_answer_outcome(false).await.stop_reason,
+            StopReason::EndTurn
+        );
     }
 
     /// **BUG-178, through the loop.** A remote provider answered with a native
@@ -4402,6 +4511,7 @@ mod tests {
                     dropped_calls: 0,
                     cache: None,
                     call_in_text: true,
+                    stopped_at_cap: false,
                 }),
                 Some(ScriptedTurn::End) => Ok(SourceTurn {
                     text: "Done.".to_owned(),
@@ -4412,6 +4522,7 @@ mod tests {
                     dropped_calls: 0,
                     cache: None,
                     call_in_text: false,
+                    stopped_at_cap: false,
                 }),
                 None => panic!("the loop asked for turn {call} and the script has no such entry"),
             }
@@ -4909,6 +5020,7 @@ mod tests {
                 dropped_calls: 0,
                 cache: None,
                 call_in_text,
+                stopped_at_cap: false,
             })
         }
     }
@@ -5168,6 +5280,7 @@ mod tests {
                 dropped_calls: 0,
                 cache: None,
                 call_in_text: self.call_in_text,
+                stopped_at_cap: false,
             })
         }
     }
@@ -7955,6 +8068,7 @@ mod tests {
                 dropped_calls: 0,
                 cache: None,
                 call_in_text,
+                stopped_at_cap: false,
             })
         }
     }
@@ -8304,6 +8418,7 @@ mod tests {
                 dropped_calls,
                 cache: None,
                 call_in_text,
+                stopped_at_cap: false,
             })
         }
     }

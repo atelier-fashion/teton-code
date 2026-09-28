@@ -758,7 +758,7 @@ fn ac7_degraded_provider_falls_back_and_completes() {
 }
 
 /// **REQ-586 AC-15b, and what REQ-618 made of it.** A turn assembled against a
-/// 128k primary is re-budgeted for a 32k fallback *before* the fallback's own
+/// 128k primary is re-budgeted for a 40k fallback *before* the fallback's own
 /// `route_decided` — choose route, refit, say so, retry.
 ///
 /// The outcome at the end of that sequence changed. REQ-586 clamped the paste
@@ -778,7 +778,7 @@ fn ac15b_a_turn_refit_for_a_smaller_fallback_never_reaches_it_over_window() {
     //
     // REQ-586 AC-15b: and they declare **different windows**. Before this REQ
     // every route's budget was equal, so the stale seed was invisible; a turn
-    // assembled for a 128k primary and re-sent unchanged to a 32k fallback is
+    // assembled for a 128k primary and re-sent unchanged to a 40k fallback is
     // the 400 BR-1 exists to prevent.
     config.push_str(&remote_provider_block_with_window(
         "flaky",
@@ -790,7 +790,10 @@ fn ac15b_a_turn_refit_for_a_smaller_fallback_never_reaches_it_over_window() {
         "healthy",
         &healthy.openai_endpoint(),
         "deepseek-chat",
-        32_000,
+        // 40,000, not 32,000, since BUG-229: under the 8,192-token remote
+        // reservation 32,000 derives below the 50,000-byte floor and the event
+        // would carry the floor rather than this window's pair.
+        40_000,
     ));
     config.push_str(&tier_block("build", "flaky", Some("healthy")));
 
@@ -864,7 +867,7 @@ fn ac15b_a_turn_refit_for_a_smaller_fallback_never_reaches_it_over_window() {
     );
     assert_eq!(
         event["budget_bytes"].as_u64(),
-        Some((32_000u64 - 1_024) * 2),
+        Some((40_000u64 - u64::from(tetond::harness::budget::REMOTE_GENERATION_RESERVATION)) * 2),
         "the event must carry the pair derived from the *fallback's* window:          {event}"
     );
     assert_eq!(
@@ -881,7 +884,7 @@ fn ac15b_a_turn_refit_for_a_smaller_fallback_never_reaches_it_over_window() {
     // …and the bytes agree with the event, read off the wire rather than off an
     // event. The primary was sent the whole paste. The fallback was sent
     // **nothing at all** — which is the stronger form of the claim REQ-586 made
-    // here: a context assembled for a window four times the fallback's is not
+    // here: a context assembled for a window three times the fallback's is not
     // re-sent to it over-window, and since REQ-618 it is not re-sent shortened
     // either, because a shortened question is not the user's question.
     let sent_to_flaky = String::from_utf8_lossy(&flaky.requests()[0]).into_owned();

@@ -2297,7 +2297,7 @@ async fn a_raise_window_offer_cannot_be_rendered_without_its_risk() {
 /// stand anyway** (REQ-589 review pass).
 ///
 /// The reviewer's construction, driven through a real turn. One provider,
-/// `max_context = 30000` and `context_budget_cap = 10000`, so every leg stamps
+/// `max_context = 40000` and `context_budget_cap = 10000`, so every leg stamps
 /// `bound: user cap` and classifies `RaiseCap`. The legs differ only in the
 /// size of the expansion:
 ///
@@ -2330,7 +2330,11 @@ async fn a_cap_is_only_offered_for_clearing_where_clearing_it_would_help() {
             remote_route(
                 &provider.openai_endpoint(),
                 RECIPE_MODEL,
-                Some(30_000),
+                // 40,000, not 30,000, since BUG-229: under the 8,192-token
+                // remote reservation 30,000 derives a floored pair, and
+                // `clearing_the_cap_clears` rightly refuses a floored window
+                // for both legs — which would leave v5fix nothing to prove.
+                Some(40_000),
                 Some(10_000),
             ),
             sized_body(words, bytes),

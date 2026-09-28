@@ -4362,11 +4362,12 @@ async fn an_expansion_past_the_digest_threshold_is_folded_whole_where_an_ordinar
     // | route | byte half | digest threshold | BR-4's quarter |
     // |---|---|---|---|
     // | no declared window | 33,000 | 23,250 (70%) | 8,250 |
-    // | `max_context = 128000` | 253,952 | 93,000 (37%) | 63,488 |
+    // | `max_context = 128000` | 239,616 | 87,750 (37%) | 59,904 |
     //
-    // The fixture's 100,000 B body is over the 93,000 B threshold on the 128k
+    // (The 128k row under BUG-229's 8,192-token remote reservation.) The
+    // fixture's 100,000 B body is over the 87,750 B threshold on the 128k
     // route — so it really is a body the `digest` duty would have taken — and
-    // over the 63,488 B quarter, which is the point.
+    // over the 59,904 B quarter, which is the point.
     //
     // So an expansion large enough to be digested is, on any route, already
     // large enough to leave the turn no room — and BR-7's bypass, while it
@@ -4397,7 +4398,7 @@ async fn an_expansion_past_the_digest_threshold_is_folded_whole_where_an_ordinar
         let budget = tetond::harness::budget::derive(tetond::harness::BudgetInputs {
             window: 128_000,
             cap: 0,
-            reservation: 1_024,
+            reservation: tetond::harness::budget::REMOTE_GENERATION_RESERVATION,
             is_local: false,
             redact_scan: false,
             provider_id: Some("mock"),
@@ -5504,16 +5505,17 @@ fn measured_words(message: &str) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn what_the_budget_measured_is_the_block_the_turn_carried_on_both_paths() {
     let repo = Tree::new("meas");
-    // Sixty kilobytes: comfortably inside a 128k window's budget (253,952 B)
-    // and comfortably past the floor a one-token window derives, so one fixture
-    // reaches both verdicts. It was twenty while that floor was 2,048 words /
+    // 55 KB: inside a quarter of a 128k window's byte budget (239,616 B since
+    // BUG-229's 8,192-token remote reservation, so 59,904 B) and past the floor
+    // a one-token window derives, so one fixture reaches both verdicts. It was
+    // sixty until that reservation moved the quarter under it. It was twenty while that floor was 2,048 words /
     // 16,384 bytes; REQ-612 raised it to 6,250 / 50,000 and a 20 KiB expansion
     // (5,000 words) started fitting the cramped route too, which took the
     // refusal — and with it the measured side of this comparison — away.
     model_invocable_skill(
         &repo,
         "measured",
-        &format!("Head.\n{}\nTail.\n", filler(60_000)),
+        &format!("Head.\n{}\nTail.\n", filler(55_000)),
     );
 
     // ── the user path ────────────────────────────────────────────────────────
@@ -5523,7 +5525,7 @@ async fn what_the_budget_measured_is_the_block_the_turn_carried_on_both_paths() 
     roomy
         .turn(&session, "", Harness::invoke("measured", ""))
         .await
-        .expect("a 60 KiB expansion fits a 128k window");
+        .expect("a 55 KB expansion fits a 128k window");
     let system = wire_system(&roomy);
     let seeded = message_containing(&roomy, "a command defined in");
 
@@ -5533,7 +5535,7 @@ async fn what_the_budget_measured_is_the_block_the_turn_carried_on_both_paths() 
     let refusal = cramped
         .turn(&cramped_session, "", Harness::invoke("measured", ""))
         .await
-        .expect_err("a 60 KiB expansion cannot fit the floor");
+        .expect_err("a 55 KB expansion cannot fit the floor");
     assert_eq!(refusal.code, error_code::SKILL_EXPANSION_TOO_LARGE);
     assert_eq!(
         measured_words(&refusal.message),
@@ -5794,10 +5796,12 @@ async fn both_callers_project_their_dynamic_outcomes_through_the_one_view() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reroute_after_a_committed_model_expansion_relays_the_refusal_and_continues() {
     let repo = Tree::new("reroute");
-    // 60 KB, not 20: the floor a one-token window derives is 6,250 words /
+    // 55 KB, not 20: the floor a one-token window derives is 6,250 words /
     // 50,000 bytes since REQ-612, and a 20 KB expansion (5,000 words) *fits*
     // it — so the guard had nothing to refuse and the reroute simply succeeded.
-    model_invocable_skill(&repo, "big", &format!("Head.\n{}\nTail.\n", filler(60_000)));
+    // Not 60 either, since BUG-229: the 128k primary's quarter is 59,904 B under
+    // the 8,192-token remote reservation, and 60 KB is refused before it runs.
+    model_invocable_skill(&repo, "big", &format!("Head.\n{}\nTail.\n", filler(55_000)));
     // A roomy primary and a fallback at the floor: the reroute is a *smaller*
     // budget, which is the only shape this guard exists for.
     let h = Harness::with_fallback(128_000, 1);
@@ -5894,8 +5898,9 @@ async fn a_reroute_after_a_committed_model_expansion_relays_the_refusal_and_cont
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reroute_after_a_typed_expansion_still_names_it_as_the_slash_command_the_user_typed() {
     let repo = Tree::new("rerouteu");
-    // 60 KB for the sibling's reason: the floor is 50,000 bytes since REQ-612.
-    model_invocable_skill(&repo, "big", &format!("Head.\n{}\nTail.\n", filler(60_000)));
+    // 55 KB for the sibling's reasons: over the 50,000-byte floor, under the
+    // primary's 59,904-byte quarter.
+    model_invocable_skill(&repo, "big", &format!("Head.\n{}\nTail.\n", filler(55_000)));
     let h = Harness::with_fallback(128_000, 1);
     let session = h.session_at(repo.path());
     h.at_level(&session, PermissionLevel::Full);

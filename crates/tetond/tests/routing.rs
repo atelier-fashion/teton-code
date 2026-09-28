@@ -729,7 +729,10 @@ async fn weak_capability_provider_gets_degraded_harness_profile() {
         derive(BudgetInputs {
             window: degraded().max_context,
             cap: 0,
-            reservation: HarnessConfig::default().gen_params.max_tokens,
+            // The room the request asks for is the room the budget reserved
+            // (BUG-229): a remote route's own `max_tokens`, not the local
+            // default config's.
+            reservation: turn.config.gen_params.max_tokens,
             is_local: false,
             redact_scan: false,
             provider_id: Some("kimi"),
