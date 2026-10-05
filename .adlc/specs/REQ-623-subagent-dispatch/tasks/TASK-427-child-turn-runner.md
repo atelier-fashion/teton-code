@@ -5,7 +5,7 @@ status: draft
 parent: REQ-623
 created: 2026-10-05
 updated: 2026-10-05
-dependencies: ["TASK-422", "TASK-425", "TASK-426"]
+dependencies: ["TASK-425", "TASK-426", "TASK-432"]
 repo: teton-code
 ---
 
@@ -19,7 +19,7 @@ it on `DaemonRuntime` by reusing `resolve_the_route` (with the tier hint), `asse
 (with `ToolSet::Child`, so no `agent` in the registry) and `run_attempts` from
 `runtime/turn.rs`; it skips claim, naming, settle and commit. The child's context is the
 system prompt + `context` + `task`; task+context are admitted whole or the child is
-`refused(over_budget)`. Bounds are stamped before the first model call and echoed. The
+`refused(over_budget)`. Bounds (`max_turns` from `child_max_turns`, clamped to the parent's — the config value arrives on `ChildSpec`, threaded by TASK-428) are stamped before the first model call and echoed. The
 outcome carries the report (bounded, loud marker if cut), the provenance set, turns used,
 route, cost, and exactly one of the eight statuses.
 
@@ -29,15 +29,13 @@ route, cost, and exactly one of the eight statuses.
 - `crates/tetond/src/harness/mod.rs` — export
 - `crates/tetond/src/runtime/child_turn.rs` — new: `impl ChildDispatcher for DaemonRuntime`
 - `crates/tetond/src/runtime/mod.rs` — module, `ToolSet` enum threaded to `build_tools`
-- `crates/tetond/src/runtime/turn.rs` — `resolve_the_route` accepts an optional tier request; `build_tools` takes `ToolSet`; `run_attempts` is callable with a child `HarnessConfig` (`max_turns` from `child_max_turns` clamped to the parent's)
-- `crates/tetond/src/router.rs` — tier-request resolution: binding if configured, else the category's default route, then the boundary pin
-- `crates/tetond/src/harness/permissions.rs` — the gate exposes its ask-await so the deadline can pause around it
+- `crates/tetond/src/runtime/turn.rs` — `resolve_the_route` passes the child's tier request through (TASK-432); `build_tools` takes `ToolSet`; `run_attempts` is callable with a child `HarnessConfig` (`max_turns` from `child_max_turns` clamped to the parent's)
 
 ## Acceptance Criteria
 
 - [ ] A child's first provider request holds system prompt, `context`, `task` and no parent block (inspect the captured request)
 - [ ] `ToolSet::Child` registry contains no `agent`
-- [ ] A `tier: build` request under a Think parent resolves to the Build binding when one exists, else the category default, and the outcome names it; a local-only read mid-child pins the remainder local
+- [ ] The outcome's `route` names what TASK-432's resolver returned for the request; a local-only read mid-child pins the remainder local
 - [ ] `PausableDeadline` does not advance while paused; expiry aborts an in-flight tool and yields `timed_out`
 - [ ] Each of the eight statuses is produced by a unit or integration test in this task or TASK-430 (list which here)
 - [ ] A report of `report_max_bytes + 1` is cut to the bound plus the typed marker; the outcome says `truncated`
@@ -49,7 +47,6 @@ route, cost, and exactly one of the eight statuses.
 |------|------|----------|-------------|
 | BR-1 | test-case | `crates/tetond/src/runtime/child_turn.rs::tests::child_context_is_system_context_task_only` | yes |
 | BR-2 | test-case | `crates/tetond/src/runtime/turn.rs::tests::child_toolset_omits_agent` | yes |
-| BR-6 | test-case | `crates/tetond/src/router.rs::tests::tier_request_binding_default_then_pin` | yes |
 | BR-7 | test-case | `crates/tetond/src/runtime/child_turn.rs::tests::bounds_stamped_before_first_call_and_echoed` | no |
 | BR-9 | test-case | `crates/tetond/src/runtime/child_turn.rs::tests::outcome_carries_provenance_union` | no |
 | BR-10 | test-case | `crates/tetond/src/runtime/child_turn.rs::tests::terminal_status_matrix` | yes |
@@ -57,7 +54,6 @@ route, cost, and exactly one of the eight statuses.
 | BR-5 | test-case | `crates/tetond/src/harness/child.rs::tests::deadline_pauses_during_consent` | yes |
 | AC-2 | test-case | `crates/tetond/src/runtime/child_turn.rs::tests::child_context_is_system_context_task_only` | no |
 | AC-3 | test-case | `crates/tetond/src/runtime/turn.rs::tests::child_toolset_omits_agent` | yes |
-| AC-9 | test-case | `crates/tetond/src/router.rs::tests::tier_request_binding_default_then_pin` | yes |
 | AC-11 | test-case | `crates/tetond/src/runtime/child_turn.rs::tests::bounds_stamped_before_first_call_and_echoed` | no |
 | AC-15 | test-case | `crates/tetond/src/harness/child.rs::tests::report_cut_is_loud` | yes |
 | AC-19 | test-case | `crates/tetond/src/runtime/child_turn.rs::tests::child_shell_starts_in_session_root` | no |

@@ -44,4 +44,5 @@ refuses and never releases.
 
 - Keep the arithmetic a pure function (`split(headroom, n)`, `release(unspent, running)`) and test it table-driven; the `Mutex` wrapper only sequences calls.
 - LESSON-552: the e2e AC-13 test (TASK-430) drives the derivation from the ledger; this task pins the arithmetic.
+- The parent accumulator is `Arc<PromptSpend>` (`teton_core::cost_ceiling`), created once per prompt in `run_prompt_turn` — children are handed the same `Arc`, plus their own.
 - LESSON-557: no new typed outcome — the child's refusal *is* `SpendCeilingReached`, composed by `teton_core::cost_ceiling` as today.

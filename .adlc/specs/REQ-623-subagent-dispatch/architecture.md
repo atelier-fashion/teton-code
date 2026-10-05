@@ -187,8 +187,9 @@ each child `floor(headroom / n)` and records it on `ChildBounds`. A child's
 egress is built with `spend_ceiling = Some(pool.ceiling_of(child))` read
 through an `Arc<SharePool>` **at check time** (so a raised ceiling is seen),
 and its own per-child accumulator. Every child's `CostRecord` **also** adds
-into the parent's accumulator (an `Arc<AtomicU64>` the parent egress already
-owns), so after the call the parent's next model call checks the real
+into the parent's accumulator (the `Arc<teton_core::cost_ceiling::PromptSpend>`
+`run_prompt_turn` creates once per prompt and every `Egress` of that prompt shares,
+`egress/mod.rs:549`), so after the call the parent's next model call checks the real
 headroom on the existing `SpendCeilingReached` path (BR-8's last sentence,
 LESSON-557: both halves exist already — the typed outcome and its arm).
 `SharePool::release(child)` on a child's terminal status splits its unspent
