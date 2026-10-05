@@ -1,7 +1,7 @@
 ---
 id: REQ-623
 title: "Subagent dispatch — an `agent` tool runs bounded child turn-loops and hands their results back to the parent turn"
-status: draft
+status: approved
 deployable: true
 created: 2026-10-05
 updated: 2026-10-05
