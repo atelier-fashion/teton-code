@@ -41,10 +41,15 @@
 //! - [`report`] — per-session / per-phase / per-provider aggregation, the
 //!   per-turn nesting of a turn's children (REQ-623 BR-8), and the AC-4
 //!   savings-vs-frontier estimate (OQ-6), each labeled as an estimate.
+//! - [`share`] — an `agent` call's per-child spend shares (REQ-623 ADR-4): the
+//!   equal split of the prompt's headroom, the release of an ended child's
+//!   unspent share to its running siblings, and the [`ChildSpend`] a child's
+//!   egress checks and pays through.
 
 pub mod ledger;
 pub mod prices;
 pub mod report;
+pub mod share;
 
 // REQ-588: re-exported here so `ledger.rs` can name the accumulator without
 // naming `teton_core`. The duty-path guard in `harness::duty` asserts that the
@@ -67,6 +72,7 @@ pub use prices::{ModelPrice, PriceTable};
 pub use report::{
     ChildTotals, CostReport, GroupTotals, SavingsEstimate, TurnTotals, UnpricedTotals, WebTotals,
 };
+pub use share::{ChildSpend, SharePool};
 
 /// The billing attribution a caller pins to a remote call *at call time*.
 ///
