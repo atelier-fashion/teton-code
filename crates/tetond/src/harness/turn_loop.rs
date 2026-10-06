@@ -807,7 +807,9 @@ impl SessionEvents {
     ///
     /// The child's loop is handed this emitter and runs unchanged. A payload
     /// without the fields (`prefix_cache`, `tool_call_repeated`, …) is
-    /// published exactly as the parent's would be.
+    /// published exactly as the parent's would be — except
+    /// `context_compacted`, which a child's emitter does not publish at all
+    /// (see [`Self::context_compacted`]).
     ///
     /// `permission_request` and `cost_recorded` carry the same two fields but
     /// are built by the permission gate and the cost ledger, not here; they
@@ -1131,7 +1133,18 @@ impl SessionEvents {
     /// The provider is the *duty's*, not the turn's, because it is the duty
     /// that ran — and `None` on the mechanical path, which ran on nothing. The
     /// model is deliberately not carried; see the field's own doc.
+    ///
+    /// **A child's emitter publishes nothing here** (REQ-623). The payload
+    /// carries no `child_id`, so a child's compaction on the shared bus would
+    /// read as the parent's — a client's activity row would say the parent is
+    /// compacting while it merely waits on its children. A child's refit and
+    /// drops are still loud through [`Self::context_pressure`], which is
+    /// stamped; see `harness::child`'s module docs for the other three
+    /// payloads a child suppresses rather than widens.
     pub fn context_compacted(&self, record: &CompactionRecord, provider_id: Option<&str>) {
+        if self.child.is_some() {
+            return;
+        }
         self.bus.publish(
             Some(self.session_id.clone()),
             Event::ContextCompacted(ContextCompacted {

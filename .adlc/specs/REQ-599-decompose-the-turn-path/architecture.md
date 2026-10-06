@@ -247,11 +247,12 @@ table, which do not move.
 
 | module | production | holds |
 |---|---:|---|
-| `mod.rs` | 8,722 | `DaemonRuntime` and everything not yet sliced. Was 10,306 at REQ-599's close; REQ-600 moved the turn path out, REQ-603 the session lifecycle |
-| `turn.rs` | 3,960 | **REQ-600.** `run_prompt_turn` and the fifteen methods only it reaches — the god-impl slice REQ-599 deferred as its step 8 |
+| `mod.rs` | 8,995 | `DaemonRuntime` and everything not yet sliced. Was 10,306 at REQ-599's close; REQ-600 moved the turn path out, REQ-603 the session lifecycle |
+| `turn.rs` | 4,323 | **REQ-600.** `run_prompt_turn` and the fifteen methods only it reaches — the god-impl slice REQ-599 deferred as its step 8. REQ-623 added the two doors a child turn enters the stages by |
+| `child_turn.rs` | 604 | **REQ-623.** The child turn runner: `ChildDispatcher` for the daemon — a child's route, assemble and attempt through `turn.rs`'s stages, its stamped bounds, work clock, eight-way status and outcome |
 | `engine.rs` | 1,405 | probe, installer, engine loaders, `EngineSlot`, `StagedEngines` |
 | `config_document.rs` | 888 | rendering and persisting the config document |
-| `duty.rs` | 731 | the five `*_route` resolvers, `resolve_duty`, `spawn_title_session`, `RedactionGateImpl` |
+| `duty.rs` | 756 | the five `*_route` resolvers, `resolve_duty`, `spawn_title_session`, `RedactionGateImpl` |
 | `taint.rs` | 949 | `SessionTaint` and its `TaintCause`, `WebTaintOverride` / `ShellTaintOverride`, `RoutePin`, the lookup seam, `TaintingPrivacySink` |
 | `views.rs` | 592 | `config/get`'s snapshot and the web-setup views |
 | `session.rs` | 491 | **REQ-603.** `session/clear`, `session/set_cwd`, and the root a session stands on — the slice REQ-599 planned as its step 7 and deferred |

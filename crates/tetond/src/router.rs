@@ -973,6 +973,32 @@ impl Router {
         }
     }
 
+    /// [`Router::resolve_judgment`] for a freeform call that **requests** a
+    /// tier — a child turn's `tier` hint in a freeform session (REQ-623 BR-6).
+    ///
+    /// The category is the classifier's, exactly as for a prompt turn; the
+    /// request then changes only which row serves it, through
+    /// [`Router::resolve_with_tier_request`] — the one place that decision is
+    /// made. `request == None` resolves the same category through the same
+    /// table as [`Router::resolve_judgment`], and the reason is composed the
+    /// same way, so the classification and the resolver both still speak.
+    ///
+    /// Like its structured sibling it holds no privacy pin: the caller checks
+    /// the session's pin first and never reaches here when it holds.
+    #[must_use]
+    pub fn resolve_judgment_with_tier_request(
+        &self,
+        classification: &Classification,
+        request: Option<CoreTier>,
+    ) -> Route {
+        let resolved =
+            self.resolve_with_tier_request(CoreCategory::from(classification.category), request);
+        Route {
+            reason: format!("{} {}", classification.sentence(), resolved.reason),
+            ..resolved
+        }
+    }
+
     /// Force a route to the **local tier**, ignoring the category table
     /// entirely (REQ-544 C-2 / M-1, REQ-558 BR-7).
     ///

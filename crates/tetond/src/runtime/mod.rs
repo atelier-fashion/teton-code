@@ -231,6 +231,7 @@ mod duty;
 mod engine;
 mod provider;
 use provider::*;
+mod child_turn;
 mod session;
 mod taint;
 pub(crate) use taint::*;
@@ -7812,7 +7813,11 @@ pub fn refit_for_reroute(
         return;
     }
     let crate::carry::RebudgetReport { pressure, notes } = conversation.rebudget(next);
-    if let Some((state, block)) = notes {
+    // REQ-623: a child's re-render is the child's prompt, not the session's
+    // notes state — `repo_context_state` names no child, and the parent's last
+    // published triple must stand. The child's refit is still announced below,
+    // through its stamped `context_pressure`.
+    if let (Some((state, block)), None) = (notes, events.child_scope()) {
         let figures = RepoContextFigures::from_render(&state, Some(&block));
         if sessions.claim_repo_context_publish(events.session_id(), figures.triple(), false) {
             events.repo_context_state(figures.into_news(&state));
@@ -10752,6 +10757,7 @@ provider_id = "on-device"
             SessionMode::Freeform,
             None,
             "anything",
+            None,
         ));
         assert_eq!(
             turn_route.reason, turn,
@@ -12531,7 +12537,14 @@ provider_id = "on-device"
             let config = runtime.config.lock().expect("config mutex").clone();
             let router = build_router(&config, true, &BTreeMap::new());
             let route = runtime
-                .dispatch_route(&router, &session, SessionMode::Freeform, None, "anything")
+                .dispatch_route(
+                    &router,
+                    &session,
+                    SessionMode::Freeform,
+                    None,
+                    "anything",
+                    None,
+                )
                 .await;
 
             // REQ-614: the expected sentence now carries the pin's cause. The
@@ -12557,7 +12570,14 @@ provider_id = "on-device"
                 &events,
             );
             let clean_route = runtime
-                .dispatch_route(&router, &clean, SessionMode::Freeform, None, "anything")
+                .dispatch_route(
+                    &router,
+                    &clean,
+                    SessionMode::Freeform,
+                    None,
+                    "anything",
+                    None,
+                )
                 .await;
             assert_ne!(
                 clean_route.reason,
@@ -12655,6 +12675,14 @@ provider_id = "on-device"
                     .build_tools(
                         TurnContext::new(&events, &session, &config, &router, &gate, None),
                         Arc::new(crate::skills::SkillRegistry::default()),
+                        // A prompt turn's registry (REQ-623 BR-2).
+                        crate::runtime::turn::ToolSet::Prompt(crate::runtime::turn::ParentTurn {
+                            turn_id: &teton_protocol::TurnId::from("turn-0"),
+                            sessions: &SessionRegistry::new(),
+                            mode: SessionMode::Freeform,
+                            phase: None,
+                            typed: true,
+                        }),
                     )
                     .await;
 
@@ -12737,6 +12765,14 @@ provider_id = "on-device"
                     .build_tools(
                         TurnContext::new(&events, &session, &snapshot, &router, &gate, None),
                         Arc::new(crate::skills::SkillRegistry::default()),
+                        // A prompt turn's registry (REQ-623 BR-2).
+                        crate::runtime::turn::ToolSet::Prompt(crate::runtime::turn::ParentTurn {
+                            turn_id: &teton_protocol::TurnId::from("turn-0"),
+                            sessions: &SessionRegistry::new(),
+                            mode: SessionMode::Freeform,
+                            phase: None,
+                            typed: true,
+                        }),
                     )
                     .await
                     .get(WEB_TOOL_NAME)
@@ -12756,6 +12792,14 @@ provider_id = "on-device"
                     .build_tools(
                         TurnContext::new(&events, &session, &live, &router, &gate, None),
                         Arc::new(crate::skills::SkillRegistry::default()),
+                        // A prompt turn's registry (REQ-623 BR-2).
+                        crate::runtime::turn::ToolSet::Prompt(crate::runtime::turn::ParentTurn {
+                            turn_id: &teton_protocol::TurnId::from("turn-0"),
+                            sessions: &SessionRegistry::new(),
+                            mode: SessionMode::Freeform,
+                            phase: None,
+                            typed: true,
+                        }),
                     )
                     .await
                     .get(WEB_TOOL_NAME)
@@ -13145,6 +13189,14 @@ max_page_bytes_from_the_future = 4096
                     .build_tools(
                         TurnContext::new(&events, &session, &config, &router, &gate, None),
                         Arc::new(crate::skills::SkillRegistry::default()),
+                        // A prompt turn's registry (REQ-623 BR-2).
+                        crate::runtime::turn::ToolSet::Prompt(crate::runtime::turn::ParentTurn {
+                            turn_id: &teton_protocol::TurnId::from("turn-0"),
+                            sessions: &SessionRegistry::new(),
+                            mode: SessionMode::Freeform,
+                            phase: None,
+                            typed: true,
+                        }),
                     )
                     .await
                     .get(WEB_TOOL_NAME)

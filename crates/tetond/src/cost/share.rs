@@ -61,7 +61,7 @@ use std::task::{Context, Poll};
 
 use futures::Stream;
 use teton_protocol::agent::ChildId;
-use teton_protocol::{ProviderId, SessionId};
+use teton_protocol::{ProviderId, SessionId, TurnId};
 use teton_providers::transport::{ByteStream, TransportError, TransportResponse};
 
 use super::{CostAttribution, CostMeter, PromptSpend};
@@ -256,6 +256,10 @@ pub struct ChildSpend {
     /// parent pays. `None` exactly when the prompt has no ceiling, as it is on
     /// the prompt turn.
     parent: Option<Arc<PromptSpend>>,
+    /// The prompt turn the child runs under, once [`Self::under_turn`] has
+    /// named it (REQ-623 BR-8): every row a choke point built with this spend
+    /// meters is then written under both ids, so `/cost` nests it.
+    parent_turn: Option<TurnId>,
 }
 
 impl ChildSpend {
@@ -268,7 +272,22 @@ impl ChildSpend {
             pool,
             own: Arc::new(PromptSpend::new()),
             parent,
+            parent_turn: None,
         }
+    }
+
+    /// The same spend — same pool, same accumulators — billing its calls to
+    /// the child running under `parent_turn_id` (REQ-623 BR-8, AC-12).
+    ///
+    /// The child runner applies it once, before building any egress, so every
+    /// remote call the child makes — its turn's and its duties' alike — writes
+    /// a row carrying both `child_id` and `parent_turn_id`. Stamped here, at the
+    /// one choke point every such call goes through, rather than at each
+    /// source that builds an attribution (LESSON-501).
+    #[must_use]
+    pub fn under_turn(mut self, parent_turn_id: TurnId) -> Self {
+        self.parent_turn = Some(parent_turn_id);
+        self
     }
 
     /// The child this is.
@@ -341,6 +360,10 @@ impl ChildSpend {
         provider_id: ProviderId,
         attribution: CostAttribution,
     ) -> TransportResponse {
+        let attribution = match &self.parent_turn {
+            Some(turn) => attribution.for_child(self.child.clone(), turn.clone()),
+            None => attribution,
+        };
         let call = Arc::new(PromptSpend::new());
         let metered = meter.meter_response(
             response,
@@ -834,5 +857,62 @@ mod tests {
         while body.next().await.is_some() {}
         assert!(spend.saw_unpriced() && parent.saw_unpriced());
         assert_eq!((spend.spent(), parent.spent()), (0, 0));
+    }
+
+    /// **REQ-623 BR-8 / AC-12: a spend under a turn bills every call it
+    /// meters to the child and its parent turn**, whatever attribution the
+    /// caller built — the child's own turn and its duties alike, because both
+    /// meter through here.
+    ///
+    /// Benign path: a spend never put under a turn leaves the caller's
+    /// attribution exactly as built, so every choke point that is not a
+    /// child's writes the row it always wrote.
+    ///
+    /// Mutation (run 2026-10-05, reverted): dropping the stamp in
+    /// `meter_response` reddens at the second row's `child_id`.
+    #[tokio::test]
+    async fn a_spend_under_a_turn_writes_both_ids_on_every_row() {
+        let ledger = CostLedger::open_in_memory(PriceTable::bundled(), Arc::new(NoopCostSink))
+            .expect("open in-memory ledger");
+        let child = id("audit");
+        let pool = SharePool::new(None, std::slice::from_ref(&child));
+        let plain = ChildSpend::new(child.clone(), pool, None);
+        let billed = plain.clone().under_turn(TurnId::from("turn-9"));
+        for spend in [&plain, &billed] {
+            let response = TransportResponse {
+                status: 200,
+                location: None,
+                body: Box::pin(futures::stream::iter(vec![Ok::<_, TransportError>(
+                    "event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n\n"
+                        .as_bytes()
+                        .to_vec(),
+                )])),
+            };
+            let mut body = spend
+                .meter_response(
+                    &ledger,
+                    response,
+                    Some(SessionId::from("s1")),
+                    ProviderId::from("anthropic"),
+                    CostAttribution::new("claude-fable-5")
+                        .with_category(teton_protocol::Category::Review),
+                )
+                .body;
+            while body.next().await.is_some() {}
+        }
+        let rows = ledger.all_records().expect("read");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            (rows[0].child_id.clone(), rows[0].parent_turn_id.clone()),
+            (None, None),
+            "benign: not under a turn, the caller's attribution stands"
+        );
+        assert_eq!(rows[1].child_id, Some(child));
+        assert_eq!(rows[1].parent_turn_id, Some(TurnId::from("turn-9")));
+        assert_eq!(
+            rows[1].category,
+            Some(teton_protocol::Category::Review),
+            "the ids ride beside the caller's attribution, not over it"
+        );
     }
 }

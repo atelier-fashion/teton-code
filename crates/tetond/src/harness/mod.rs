@@ -18,6 +18,10 @@
 //!   its bound, its window label and the scaled digest thresholds — plus the
 //!   constants those numbers have their one home in. The router is the
 //!   caller; every surface reads the derived [`budget::RouteBudget`].
+//! - [`child`] — what the `agent` tool needs from the runtime to run a child
+//!   turn (REQ-623): the [`child::ChildDispatcher`] seam the runtime implements,
+//!   the per-child [`child::ChildSpec`] and [`child::ChildOutcome`], the
+//!   [`child::PausableDeadline`] work clock, and the report bound.
 //! - [`tools`] — the built-in read/edit/glob/grep/shell tools, each jailed to the
 //!   session root; `edit` is exact-match and refuses ambiguous replacements.
 //! - [`permissions`] — per-tool allow/ask/deny policy, the `permission_request`
@@ -91,6 +95,7 @@
 //!   bounded termination.
 
 pub mod budget;
+pub mod child;
 pub mod compact;
 pub mod completion;
 pub mod context;
@@ -110,6 +115,10 @@ pub mod triage;
 pub mod turn_loop;
 
 pub use budget::{BudgetInputs, RouteBudget};
+pub use child::{
+    bound_report, current_child, ChildAskClock, ChildDispatcher, ChildOutcome, ChildOutcomeSlot,
+    ChildSpec, ChildTaskScope, ChildTurn, PausableDeadline,
+};
 pub use compact::COMPACT_DUTY;
 pub use completion::{
     context_provenance, CompletionSource, LocalEngineSource, RemoteProviderSource, SourceTurn,

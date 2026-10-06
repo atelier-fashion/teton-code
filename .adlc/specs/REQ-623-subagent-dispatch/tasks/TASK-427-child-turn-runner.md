@@ -1,7 +1,7 @@
 ---
 id: TASK-427
 title: "ChildDispatcher and the child turn runner: route → assemble → attempt with bounds, deadline, provenance, and the eight statuses"
-status: draft
+status: complete
 parent: REQ-623
 created: 2026-10-05
 updated: 2026-10-05
@@ -33,13 +33,13 @@ route, cost, and exactly one of the eight statuses.
 
 ## Acceptance Criteria
 
-- [ ] A child's first provider request holds system prompt, `context`, `task` and no parent block (inspect the captured request)
-- [ ] `ToolSet::Child` registry contains no `agent`
-- [ ] The outcome's `route` names what TASK-432's resolver returned for the request; a local-only read mid-child pins the remainder local
-- [ ] `PausableDeadline` does not advance while paused; expiry aborts an in-flight tool and yields `timed_out`
-- [ ] Each of the eight statuses is produced by a unit or integration test in this task or TASK-430 (list which here)
-- [ ] A report of `report_max_bytes + 1` is cut to the bound plus the typed marker; the outcome says `truncated`
-- [ ] Mutations recorded: drop the whole-or-refused check, drop the pause, drop the clamp — name what reddens
+- [x] A child's first provider request holds system prompt, `context`, `task` and no parent block (inspect the captured request) — `child_context_is_system_context_task_only` parses the captured ChatML request: `[system, user]`, the user message is the task verbatim, the system segment is the parent's own captured system prompt followed by the child section carrying `context`
+- [x] `ToolSet::Child` registry contains no `agent` — `child_toolset_omits_agent` (the child's registry is the prompt turn's less `agent` and nothing else; `skill` kept, BR-12)
+- [x] The outcome's `route` names what TASK-432's resolver returned for the request; a local-only read mid-child pins the remainder local — `ChildResult.route` is `route.route_decided()`'s projection of the `dispatch_route` result (pin first, then `resolve_with_tier_request` / the new `resolve_judgment_with_tier_request`); the pin is the prompt turn's own privacy-reroute arm in `run_attempts`, which a child runs unchanged — its end-to-end proof is TASK-430 AC-10
+- [x] `PausableDeadline` does not advance while paused; expiry aborts an in-flight tool and yields `timed_out` — `deadline_pauses_during_consent` (real gate, paused clock), `pauses_nest_and_move_the_wake_time`; `terminal_status_matrix` aborts a model call and a `shell` call in flight (`timed_out` returns before the command's flag is written)
+- [x] Each of the eight statuses is produced by a unit or integration test in this task or TASK-430 (list which here) — all eight here, in `terminal_status_matrix`: `completed`, `refused` (`over_budget`), `turns_exhausted`, `budget_exhausted` (local window refusal), `failed` (engine error, with the code), `timed_out` (model call and `shell` in flight), `spend_exhausted` (remote route, zero share), `cancelled` (runner aborted, outcome left in `ChildOutcomeSlot`). TASK-430 still owes AC-14's eight end to end through the `agent` tool with the parent continuing, plus the `refused` flavour this task cannot produce: a project-skill gate refusal (it reaches a child as a typed tool failure, BR-5, and which child ending counts as `refused` is a rule TASK-430 must pin)
+- [x] A report of `report_max_bytes + 1` is cut to the bound plus the typed marker; the outcome says `truncated` — `report_cut_is_loud`
+- [x] Mutations recorded: drop the whole-or-refused check, drop the pause, drop the clamp — name what reddens. Over the 60 tests matching `child`: whole-or-refused → 1 red (`terminal_status_matrix`, the child ends `budget_exhausted` instead); the pause → 1 red (`deadline_pauses_during_consent`); the clamp → 1 red (`bounds_stamped_before_first_call_and_echoed`). Seventeen more recorded in the tests' doc comments
 
 ## Verification
 

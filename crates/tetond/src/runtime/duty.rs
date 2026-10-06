@@ -404,16 +404,28 @@ impl DaemonRuntime {
     /// not resolve fails the **turn** on the turn path (a config error the user
     /// must fix), but only the **duty** here — a duty is never fatal, and the
     /// failure is reported on the duty's own outcome instead.
+    ///
+    /// ## A child's duty announces nothing (REQ-623)
+    ///
+    /// `route_decided` carries no child id, so a child's duty announcing its
+    /// route would read on the bus as the *parent's* turn moving (TASK-429's
+    /// activity row would flip to the duty's model). A child's duty therefore
+    /// attaches no announcement; it is still routed, scoped and metered exactly
+    /// as a prompt turn's is, and its cost rows carry the child's ids.
     pub(super) fn resolve_duty(
         &self,
         duty: DutyKind,
         route: &crate::router::Route,
         dctx: DutyContext<'_>,
     ) -> DutyRoute {
+        let decided = match dctx.child {
+            Some(_) => None,
+            None => route.route_decided(),
+        };
         self.build_duty_route(duty, route, dctx).announcing(
             dctx.core.events,
             Some(dctx.core.session_id.clone()),
-            route.route_decided(),
+            decided,
         )
     }
 
@@ -450,6 +462,7 @@ impl DaemonRuntime {
                 },
             local_engine,
             prompt_spend,
+            child,
         } = dctx;
         // The category's own name, read off the duty rather than spelled again:
         // two surfaces describing one routing state must not be able to drift.
@@ -541,7 +554,14 @@ impl DaemonRuntime {
             // leaves the choke point exactly as it was — no check, no pricing
             // lookup, no branch.
             .with_optional_spend_ceiling(config.cost.ceiling_micro_cents())
-            .with_prompt_spend(prompt_spend.cloned());
+            .with_prompt_spend(prompt_spend.cloned())
+            // REQ-623 ADR-4 (TASK-426's open question, answered here): a
+            // child's duty is the child's spend. It checks against the child's
+            // share and pays into the prompt's accumulator through the child's
+            // wiring, and its rows carry the child's ids — so a child's
+            // `compact` or `digest` cannot spend past its share on the prompt's
+            // headroom.
+            .with_child_spend(child.map(|c| c.spend.clone()));
         // REQ-562 ADR-1: a remotely-bound duty's prompt is an outbound payload
         // like any other, so it crosses the same gate the turn path's does. It
         // is the same construction for the same reason the boundaries and the
@@ -1142,6 +1162,7 @@ mod dispatch {
                 SessionMode::Freeform,
                 None,
                 "explain the tradeoffs between these two architectures",
+                None,
             )
             .await;
 
@@ -1188,6 +1209,7 @@ mod dispatch {
                     SessionMode::Structured,
                     Some(phase),
                     "explain the tradeoffs between these two architectures",
+                    None,
                 )
                 .await;
 
@@ -1227,6 +1249,7 @@ mod dispatch {
                 SessionMode::Freeform,
                 None,
                 "explain the tradeoffs between these two architectures",
+                None,
             )
             .await;
 
@@ -1275,6 +1298,7 @@ mod dispatch {
                 SessionMode::Freeform,
                 None,
                 "anything at all",
+                None,
             )
             .await;
 
@@ -1335,6 +1359,7 @@ mod dispatch {
                 SessionMode::Freeform,
                 None,
                 "add a retry to the upload helper",
+                None,
             )
             .await;
         assert!(
@@ -1386,6 +1411,7 @@ mod dispatch {
                 SessionMode::Freeform,
                 None,
                 "explain the tradeoffs between these two architectures",
+                None,
             )
             .await;
 
@@ -1455,7 +1481,14 @@ mod dispatch {
                 .mark(&session, TaintCause::BoundaryHit, None);
 
             let route = runtime
-                .dispatch_route(&router, &session, SessionMode::Freeform, None, "anything")
+                .dispatch_route(
+                    &router,
+                    &session,
+                    SessionMode::Freeform,
+                    None,
+                    "anything",
+                    None,
+                )
                 .await;
 
             assert_eq!(
@@ -3878,6 +3911,7 @@ mod dispatch {
                     SessionMode::Structured,
                     Some(CorePhase::Implement),
                     "carry on",
+                    None,
                 )
                 .await;
             assert_eq!(
@@ -3899,6 +3933,7 @@ mod dispatch {
                     SessionMode::Structured,
                     Some(CorePhase::Implement),
                     "carry on",
+                    None,
                 )
                 .await;
             assert_eq!(

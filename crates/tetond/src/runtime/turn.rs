@@ -42,6 +42,8 @@
 
 use super::*;
 
+use crate::harness::child::CountedSource;
+
 /// Where this daemon writes session transcripts, for the config it is handed —
 /// REQ-611 ADR-4, the one place that pairing is spelled.
 ///
@@ -134,11 +136,11 @@ struct ClaimedTurn {
 /// where a tuple stays readable. `system` is lent onward to two stages and is
 /// **not** re-derived by either: REQ-606 deleted a `PreparedAttempts` field
 /// that was a clone of it (see [`DaemonRuntime::prepare_the_attempts`]).
-struct AssembledHarness {
-    tools: ToolRegistry,
-    tool_ctx: ToolContext,
-    stream_events: SessionEvents,
-    system: String,
+pub(super) struct AssembledHarness {
+    pub(super) tools: ToolRegistry,
+    pub(super) tool_ctx: ToolContext,
+    pub(super) stream_events: SessionEvents,
+    pub(super) system: String,
     /// The two pieces `system` was joined from, for a mid-turn reroute to
     /// re-join at a different notes cap (REQ-612 BR-3) — `None` for a turn with
     /// no notes, which is every turn that has nothing to re-render.
@@ -146,7 +148,7 @@ struct AssembledHarness {
     /// It rides beside the finished prompt rather than replacing it because the
     /// ordinary turn never reroutes and must not pay to assemble the string
     /// twice.
-    repo_context: Option<RepoContextCarry>,
+    pub(super) repo_context: Option<RepoContextCarry>,
 }
 
 /// The facts the attempt loop reads and never changes.
@@ -175,15 +177,15 @@ struct AssembledHarness {
 /// `route` is the one to watch: it is *reassigned* by the reroute arms, which
 /// is why [`AttemptState`] owns it and every other bundle borrows it.
 #[derive(Clone, Copy)]
-struct AttemptInputs<'a> {
-    turn_id: &'a teton_protocol::TurnId,
-    phase: Option<ProtoPhase>,
-    tools: &'a ToolRegistry,
-    tool_ctx: &'a ToolContext,
-    stream_events: &'a SessionEvents,
-    refit_system: &'a str,
-    typed_refit: usize,
-    prompt_spend: Option<&'a Arc<teton_core::cost_ceiling::PromptSpend>>,
+pub(super) struct AttemptInputs<'a> {
+    pub(super) turn_id: &'a teton_protocol::TurnId,
+    pub(super) phase: Option<ProtoPhase>,
+    pub(super) tools: &'a ToolRegistry,
+    pub(super) tool_ctx: &'a ToolContext,
+    pub(super) stream_events: &'a SessionEvents,
+    pub(super) refit_system: &'a str,
+    pub(super) typed_refit: usize,
+    pub(super) prompt_spend: Option<&'a Arc<teton_core::cost_ceiling::PromptSpend>>,
     /// The registry, for the one thing a reroute has to ask it: whether the
     /// notes it just re-rendered are news (REQ-612 BR-3, `refit_for_reroute`).
     ///
@@ -191,7 +193,7 @@ struct AttemptInputs<'a> {
     /// four *universal* facts and a duty route has no registry to hand it —
     /// and it is a ninth field here rather than a ninth argument to
     /// `run_attempts`, which is the whole point of the bundle.
-    sessions: &'a SessionRegistry,
+    pub(super) sessions: &'a SessionRegistry,
 }
 
 /// The state the attempt loop carries *across* attempts.
@@ -213,14 +215,21 @@ struct AttemptInputs<'a> {
 /// that each ending would have to remember to update. Collapsing it would also
 /// put `run_attempts` at ten arguments, but the invariant is the reason and the
 /// arithmetic is only the confirmation.
-struct AttemptState {
-    attempts: u32,
-    rerouted_local: bool,
-    withdrew_accepted_expansion: bool,
-    accepted: Option<AcceptedExpansion>,
-    skill_refit: Vec<(String, String, String)>,
-    conversation: CarriedTurn,
-    route: crate::router::Route,
+pub(super) struct AttemptState {
+    pub(super) attempts: u32,
+    pub(super) rerouted_local: bool,
+    pub(super) withdrew_accepted_expansion: bool,
+    pub(super) accepted: Option<AcceptedExpansion>,
+    pub(super) skill_refit: Vec<(String, String, String)>,
+    pub(super) conversation: CarriedTurn,
+    pub(super) route: crate::router::Route,
+    /// The loop's own account of the attempt that completed — set by the
+    /// success arm, `None` until then (REQ-623).
+    ///
+    /// A prompt turn's result is only the stop reason; a child's needs the
+    /// rest — the final text that becomes its report and the model calls it
+    /// made — and the success arm is the one place that holds it.
+    pub(super) finished: Option<crate::harness::TurnOutcome>,
 }
 
 /// What the routing stage decides, before any `TurnContext` exists.
@@ -356,6 +365,58 @@ struct TurnProducts {
     /// The assemble stage's [`RepoContextCarry`], on its way to the guard that
     /// will re-render it if this turn reroutes (REQ-612 BR-3).
     repo_context: Option<RepoContextCarry>,
+}
+
+/// Which registry a turn builds (REQ-623 BR-2) — and, for a prompt turn, the
+/// turn an `agent` call made in it starts its children under.
+///
+/// A parameter of [`DaemonRuntime::build_tools`] and of the assemble stage
+/// above it, never stored. The two arms differ by exactly one tool: the
+/// `agent` tool TASK-428 registers under [`ToolSet::Prompt`] alone, so a
+/// child's registry has everything a prompt turn's has except the means to
+/// dispatch a grandchild.
+#[derive(Clone, Copy)]
+pub(super) enum ToolSet<'a> {
+    /// A prompt turn's registry — every tool, and the `agent` tool whose
+    /// children run under this [`ParentTurn`].
+    Prompt(ParentTurn<'a>),
+    /// A child turn's registry: a prompt turn's, without `agent`. Depth is one
+    /// (BR-2); a child that names `agent` gets the registry's ordinary
+    /// unknown-tool refusal.
+    Child,
+}
+
+impl ToolSet<'_> {
+    /// Whether this turn may raise the REQ-613 repository-notes offer: only a
+    /// prompt the user typed. A skill turn can still be refused before it
+    /// sends anything, and a child's prompt was written by a model.
+    fn may_offer_generation(self) -> bool {
+        matches!(self, ToolSet::Prompt(parent) if parent.typed)
+    }
+}
+
+/// The prompt turn a registry is built for, as a child dispatcher needs it
+/// (REQ-623 ADR-2) — the per-turn facts every child of this turn runs under.
+///
+/// A parameter bundle: borrowed from `run_prompt_turn`'s own locals, read by
+/// [`DaemonRuntime::child_turns`] and by the assemble stage's notes offer.
+#[derive(Clone, Copy)]
+pub(super) struct ParentTurn<'a> {
+    /// The parent turn's id — the `parent_turn_id` every child event, ledger
+    /// row and transcript record carries.
+    pub(super) turn_id: &'a teton_protocol::TurnId,
+    /// The registry the children re-read the session root and skills from,
+    /// under the parent's held claim (LESSON-539).
+    pub(super) sessions: &'a SessionRegistry,
+    /// The session's mode: a child's category comes from the parent's phase in
+    /// a structured session and from its own task in a freeform one.
+    pub(super) mode: SessionMode,
+    /// The parent's phase, for a structured session's category and for cost
+    /// attribution.
+    pub(super) phase: Option<ProtoPhase>,
+    /// Whether the user typed this prompt rather than invoking a skill
+    /// (REQ-613 BR-1's condition — see [`ToolSet::may_offer_generation`]).
+    pub(super) typed: bool,
 }
 
 impl DaemonRuntime {
@@ -559,7 +620,13 @@ impl DaemonRuntime {
                 // would make that sentence true of the turn and false of the
                 // machine, over an offer nobody typed a prompt to reach. The
                 // state stays `Pending`, so the next typed prompt raises it.
-                skill_turn.is_none(),
+                ToolSet::Prompt(ParentTurn {
+                    turn_id: &turn_id,
+                    sessions,
+                    mode,
+                    phase,
+                    typed: skill_turn.is_none(),
+                }),
             )
             .await;
 
@@ -798,7 +865,7 @@ impl DaemonRuntime {
 
         let core_phase = phase.map(to_core_phase);
         let mut route = self
-            .dispatch_route(&router, session_id, mode, core_phase, &routed_text)
+            .dispatch_route(&router, session_id, mode, core_phase, &routed_text, None)
             .await;
 
         // REQ-580 BR-1/BR-3: a turn with nowhere to run *only* because the
@@ -854,7 +921,7 @@ impl DaemonRuntime {
                 // where the classifier now says something settled.
                 let router = self.turn_router(config, session_id);
                 route = self
-                    .dispatch_route(&router, session_id, mode, core_phase, &routed_text)
+                    .dispatch_route(&router, session_id, mode, core_phase, &routed_text, None)
                     .await;
                 router
             }
@@ -976,6 +1043,13 @@ impl DaemonRuntime {
     /// returning a new one, because `route` is rebound on every fallback
     /// reroute and a stage that returned a fresh harness would hand the loop a
     /// second thing to keep in step (`turn_context.rs` ADR-3).
+    ///
+    /// **A child turn assembles here too** (REQ-623 ADR-2), told apart by
+    /// `toolset` and `tctx.child`: its registry has no `agent`, its emitter is
+    /// stamped with its ids, it publishes no `repo_context_state` (the session's
+    /// notes state is the parent's news, and that payload names no child), and
+    /// it never raises the notes offer. A child reaches it through
+    /// [`Self::assemble_child_harness`], which fixes [`ToolSet::Child`].
     async fn assemble_harness(
         self: &Arc<Self>,
         tctx: TurnContext<'_>,
@@ -983,8 +1057,13 @@ impl DaemonRuntime {
         skills: &Arc<SkillRegistry>,
         probed: &ProbedRoot,
         route: &mut crate::router::Route,
-        may_offer_generation: bool,
+        toolset: ToolSet<'_>,
     ) -> AssembledHarness {
+        debug_assert_eq!(
+            matches!(toolset, ToolSet::Child),
+            tctx.child.is_some(),
+            "a child's registry and a child's context come together, or not at all"
+        );
         // `events`, `session_id` and `config` come off the context rather than
         // being passed again beside it — three parameters that were already in
         // the bundle sitting next to them.
@@ -995,7 +1074,7 @@ impl DaemonRuntime {
             // addressee of any consent the `skill` tool raises — it now travels
             // on `tctx` with the rest of the turn's facts (REQ-598). `ConnectionId`
             // is `Copy`, so the seam below still consumes its own.
-            .build_tools(tctx, Arc::clone(skills))
+            .build_tools(tctx, Arc::clone(skills), toolset)
             .await;
         // BUG-147: jail this session's tools to the CLIENT's working directory.
         // The daemon-global `repo_root` is only a fallback for clients that did
@@ -1064,6 +1143,15 @@ impl DaemonRuntime {
         // loop that hold them.
         let stream_events =
             SessionEvents::new(events.clone(), session_id.clone()).with_sink(self.transcript());
+        // REQ-623 ADR-3: a child's emitter is the session's, stamping the
+        // child's two ids into everything it publishes — and the child's loop
+        // is handed it and knows nothing more about being a child.
+        let stream_events = match tctx.child {
+            Some(child) => {
+                stream_events.for_child(child.child_id.clone(), child.parent_turn_id.clone())
+            }
+            None => stream_events,
+        };
 
         // REQ-572 BR-3: the prompt's capability clause reads the same classifier
         // that decides tool exposure — stated here, where both inputs live, so
@@ -1160,7 +1248,14 @@ impl DaemonRuntime {
         let figures = repo_context_figures(&state, cap);
         let triple = figures.triple();
         let event = Event::RepoContextState(figures.into_news(&state));
-        if sessions.claim_repo_context_publish(session_id, triple, state_moved) {
+        // REQ-623: not for a child. The session's notes state is the parent's
+        // news, `repo_context_state` names no child, and a child rendering the
+        // same file at its own route's cap would read on the bus as the
+        // parent's notes having changed. The claim is not taken either, so the
+        // parent's last-published triple stands.
+        if tctx.child.is_none()
+            && sessions.claim_repo_context_publish(session_id, triple, state_moved)
+        {
             events.publish(Some(session_id.clone()), event);
         }
         // REQ-613 BR-1 / ADR-1: **the offer, on the claiming turn only.** After
@@ -1181,7 +1276,7 @@ impl DaemonRuntime {
         // outside every lock (the `set_session_cwd` discipline): the registry
         // mutex is a lock every other session's turn can wait behind, and what
         // this awaits is a person.
-        let state = if may_offer_generation && sessions.claim_generation(session_id) {
+        let state = if toolset.may_offer_generation() && sessions.claim_generation(session_id) {
             let outcome = self
                 .generate_repo_context(
                     tctx.core,
@@ -1610,6 +1705,7 @@ impl DaemonRuntime {
             skill_refit,
             conversation,
             route,
+            finished: None,
         };
 
         (st, typed_refit)
@@ -1629,11 +1725,24 @@ impl DaemonRuntime {
         st: &mut AttemptState,
     ) -> Result<PromptTurnResult, RpcError> {
         'turn: loop {
-            tctx.core.router.emit_route_decided(
-                tctx.core.events,
-                Some(tctx.core.session_id.clone()),
-                &st.route,
-            );
+            // REQ-623: a child announces no `route_decided` — the payload names
+            // no child, so on the shared bus it would read as the parent's turn
+            // moving. The child's route rides `agent_child_started` and its
+            // result instead (see `harness::child`).
+            //
+            // And its turn cap is re-applied on every attempt: a reroute swaps in
+            // the new provider's profile, and BR-7 says the stamped bound is
+            // never raised.
+            match tctx.child {
+                Some(child) => {
+                    st.route.harness.max_turns = st.route.harness.max_turns.min(child.max_turns);
+                }
+                None => tctx.core.router.emit_route_decided(
+                    tctx.core.events,
+                    Some(tctx.core.session_id.clone()),
+                    &st.route,
+                ),
+            }
             let provider_id = st.route.provider_id.clone();
 
             let result = self
@@ -1858,10 +1967,12 @@ impl DaemonRuntime {
                     // written only in this arm left an aborted turn's boundary
                     // content carried into the next prompt with nothing pinning
                     // the session (see [`CarriedTurn::commit_now`]).
-                    break 'turn Ok(PromptTurnResult {
+                    let result = PromptTurnResult {
                         turn_id: inputs.turn_id.clone(),
                         stop_reason: outcome.stop_reason,
-                    });
+                    };
+                    st.finished = Some(outcome);
+                    break 'turn Ok(result);
                 }
                 // REQ-586 BR-2 / ADR-8: the tier answered that the request does
                 // not fit its window. A **typed outcome**, and therefore ahead
@@ -2377,6 +2488,46 @@ impl DaemonRuntime {
             );
         }
         error
+    }
+
+    /// **REQ-623 — the assemble stage, for a child turn** (ADR-2).
+    ///
+    /// The prompt turn's own stage with [`ToolSet::Child`] fixed, so a child
+    /// cannot be handed a registry with `agent` in it. `tctx` must speak for
+    /// the child (`TurnContext::for_child`): the stage stamps the child's
+    /// emitter and suppresses the session news from it.
+    ///
+    /// A `pub(super)` door rather than widening the stage itself, so the turn's
+    /// stage sequence stays one private span in execution order (the
+    /// `skill_turn.rs` ordering suite reads it that way).
+    pub(super) async fn assemble_child_harness(
+        self: &Arc<Self>,
+        tctx: TurnContext<'_>,
+        sessions: &SessionRegistry,
+        skills: &Arc<SkillRegistry>,
+        probed: &ProbedRoot,
+        route: &mut crate::router::Route,
+    ) -> AssembledHarness {
+        self.assemble_harness(tctx, sessions, skills, probed, route, ToolSet::Child)
+            .await
+    }
+
+    /// **REQ-623 — the attempt stage, for a child turn** (ADR-2).
+    ///
+    /// The prompt turn's attempt loop, unchanged: every reroute arm, every
+    /// typed outcome, the privacy reroute that pins the remainder of a child
+    /// local after a `local-only` read. What a child changes is read off
+    /// `tctx.child` inside it — no `route_decided`, the turn cap re-clamped on
+    /// every attempt, every egress on the child's spend — and the outcome the
+    /// success arm leaves in [`AttemptState::finished`]. A child never reaches
+    /// `commit_or_abandon`: its context is dropped, not committed.
+    pub(super) async fn run_child_attempts(
+        self: &Arc<Self>,
+        tctx: TurnContext<'_>,
+        inputs: AttemptInputs<'_>,
+        st: &mut AttemptState,
+    ) -> Result<PromptTurnResult, RpcError> {
+        self.run_attempts(tctx, inputs, st).await
     }
 
     /// The router a prompt turn resolves by, built from the tier and health as
@@ -3075,6 +3226,9 @@ impl DaemonRuntime {
                 },
             gate,
             invoker,
+            // A child never reaches the offer: its task is admitted whole or
+            // refused `over_budget`, with nobody to ask (REQ-623 BR-1).
+            child: _,
         } = tctx;
         let budget = &route.harness.budget;
         let measured = ContextManager::would_seed_fit(
@@ -3527,12 +3681,23 @@ impl DaemonRuntime {
     ///    (ADR-C). A **freeform** turn asks the `route` classifier
     ///    ([`crate::classify`]), which reads the prompt this function never hands
     ///    to the router.
-    /// 3. **The resolver**, through [`Router::resolve`] / [`Router::resolve_judgment`]
-    ///    — the same table, the same precedence, both modes (BR-1).
+    /// 3. **The resolver**, through [`Router::resolve_with_tier_request`] /
+    ///    [`Router::resolve_judgment_with_tier_request`] — the same table, the
+    ///    same precedence, both modes (BR-1).
     ///
     /// The phase is stamped on **after** the decision (BR-11, AC-9): it is a
     /// cost-attribution fact and the resolver never saw it. A freeform session has
     /// no lifecycle position, so it attributes none — it never has (ADR-G).
+    ///
+    /// ## `tier` — a child's request (REQ-623 BR-6)
+    ///
+    /// Requested, routed, pinned — and the order is this function's shape: the
+    /// pin above returns before any category is resolved, so no request can
+    /// lift it; below, the request only changes which row serves the category.
+    /// A prompt turn passes `None`, which both resolvers answer exactly as
+    /// [`Router::resolve`] and [`Router::resolve_judgment`] would — the same
+    /// resolution, so the same route byte for byte (pinned by the router's
+    /// `tier_request_binding_default_then_pin` sweep).
     pub(super) async fn dispatch_route(
         &self,
         router: &Router,
@@ -3540,6 +3705,7 @@ impl DaemonRuntime {
         mode: SessionMode,
         core_phase: Option<CorePhase>,
         prompt: &str,
+        tier: Option<Tier>,
     ) -> crate::router::Route {
         // REQ-614 ADR-614-4: `RoutePin`, not the raw taint bit. The lift is
         // honored here and at the six duty routes by the predicate rather than
@@ -3558,13 +3724,14 @@ impl DaemonRuntime {
         match mode {
             SessionMode::Structured => {
                 let ph = core_phase.unwrap_or(CorePhase::Implement);
-                let mut resolved = router.resolve(category_for_phase(ph));
+                let mut resolved = router.resolve_with_tier_request(category_for_phase(ph), tier);
                 resolved.phase = Some(to_protocol_phase(ph));
                 resolved
             }
-            SessionMode::Freeform => {
-                router.resolve_judgment(&self.classify_freeform(router, prompt).await)
-            }
+            SessionMode::Freeform => router.resolve_judgment_with_tier_request(
+                &self.classify_freeform(router, prompt).await,
+                tier,
+            ),
         }
     }
 
@@ -3640,10 +3807,19 @@ impl DaemonRuntime {
     /// that said the capability was off while the registry it was handed had the
     /// tool in it. One turn, one snapshot — which is also what makes ADR-1's
     /// "the config **is** the flow state" true per turn rather than per read.
+    ///
+    /// ## `toolset` — a prompt turn's registry, or a child's (REQ-623 BR-2)
+    ///
+    /// Everything above is built for both, in the same order. What differs is
+    /// one tool: the `agent` tool, registered under [`ToolSet::Prompt`] only —
+    /// TASK-428 adds that registration in the arm at the end, beside
+    /// `register_skill_tool`, with the [`ParentTurn`] the arm carries. A child
+    /// keeps `skill` (BR-12) and everything else.
     pub(super) async fn build_tools(
         self: &Arc<Self>,
         tctx: TurnContext<'_>,
         skills: Arc<SkillRegistry>,
+        toolset: ToolSet<'_>,
     ) -> ToolRegistry {
         // Destructured to the six names the body already used, rather than
         // reaching through `tctx` at each site: everything below is REQ-571 /
@@ -3660,6 +3836,9 @@ impl DaemonRuntime {
                 },
             gate,
             invoker,
+            // Read through `toolset` instead: a child's registry differs from a
+            // prompt turn's by what it lacks, and the toolset says which.
+            child: _,
         } = tctx;
         // REQ-615 BR-4: the two write-capable built-ins report a refused write
         // to the session that made it. Same emitter shape the projects tool
@@ -3758,6 +3937,17 @@ impl DaemonRuntime {
             tokio::runtime::Handle::current(),
             self.skill_command_timeout_ms,
         );
+        match toolset {
+            // REQ-623 ADR-7: where TASK-428 registers the `agent` tool, behind
+            // `agent.enabled`, with `self.child_turns(tctx, parent)` as its
+            // dispatcher. Nothing is registered here yet, so a prompt turn's
+            // registry is byte-identical to what it was before this REQ.
+            ToolSet::Prompt(_parent) => {}
+            // BR-2: depth is one. Nothing further for a child — in particular
+            // no `agent`, so a child that names it gets the registry's ordinary
+            // unknown-tool refusal.
+            ToolSet::Child => {}
+        }
         tools
     }
 
@@ -3845,6 +4035,11 @@ impl DaemonRuntime {
             if let Some(seam) = self.commitment_attestation() {
                 gate = gate.with_commitment_attestation(seam);
             }
+            // REQ-623 BR-5: a child's deadline covers work, not a human's
+            // answer. The gate is the session's — the parent's and every
+            // child's — so the observer pauses whichever child's task is the
+            // one waiting, and nothing for an ask outside a child.
+            let gate = gate.with_ask_observer(Arc::new(crate::harness::ChildAskClock::default()));
             Arc::new(gate)
         }))
     }
@@ -3914,6 +4109,10 @@ impl DaemonRuntime {
             // needed. `run_one_attempt` took no invoker before this REQ either
             // (BR-1).
             invoker: _,
+            // REQ-623: a child's attempt is billed to the child and paid by the
+            // parent — the egress below takes its spend share, and the local
+            // source writes its rows under the child's ids.
+            child,
         } = tctx;
         let mut hook = NoopProvenanceHook;
 
@@ -3968,8 +4167,14 @@ impl DaemonRuntime {
             AttemptSource::Local(engine, format) => {
                 let mut source = LocalEngineSource::new(engine, format, session_id.clone())
                     .metered(Arc::new(self.ledger.clone()));
+                if let Some(child) = child {
+                    source = source.for_child(child.child_id.clone(), child.parent_turn_id.clone());
+                }
                 return run_session_turn_with_pressure_policy(
-                    &mut source,
+                    // REQ-623: a child's model calls are counted where they are
+                    // made — its `turns_used`, across every attempt. A prompt
+                    // turn's source passes through uncounted.
+                    &mut CountedSource::new(&mut source, child.map(|c| &*c.model_calls)),
                     tools,
                     tool_ctx,
                     gate,
@@ -4037,7 +4242,12 @@ impl DaemonRuntime {
             // leaves the choke point exactly as it was — no check, no pricing
             // lookup, no branch.
             .with_optional_spend_ceiling(config.cost.ceiling_micro_cents())
-            .with_prompt_spend(prompt_spend.cloned());
+            .with_prompt_spend(prompt_spend.cloned())
+            // REQ-623 ADR-4: a child's choke point checks the child's own spend
+            // against its share and pays into the prompt's accumulator too;
+            // its rows carry the child's ids. `None` — every prompt turn —
+            // leaves the choke point as it was.
+            .with_child_spend(child.map(|c| c.spend.clone()));
         // REQ-562 ADR-1/ADR-2: the turn's own outbound payload is scanned here,
         // and only when the user opted in.
         if let Some(gate) = self.redaction_gate(router, config, events, session_id) {
@@ -4071,7 +4281,7 @@ impl DaemonRuntime {
         }
 
         let outcome = run_session_turn_with_pressure_policy(
-            &mut source,
+            &mut CountedSource::new(&mut source, child.map(|c| &*c.model_calls)),
             tools,
             tool_ctx,
             gate,
@@ -4108,5 +4318,114 @@ impl DaemonRuntime {
             );
         }
         outcome
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::testsupport::scratch_root;
+    use super::*;
+
+    use crate::skills::{discover, RealFs};
+
+    /// The names a registry built with `toolset` holds, over a session whose
+    /// root carries one model-invocable skill — so `skill` is registered and a
+    /// child keeping it (BR-12) is a real claim.
+    async fn registry_names(toolset_is_child: bool) -> Vec<String> {
+        let runtime = Arc::new(DaemonRuntime::minimal());
+        let root = scratch_root("toolset", true);
+        std::fs::create_dir_all(root.join(".claude/skills/survey")).unwrap();
+        std::fs::write(
+            root.join(".claude/skills/survey/SKILL.md"),
+            "---\ndescription: survey the tree\n---\n\nSurvey it.\n",
+        )
+        .unwrap();
+        let probed = runtime.session_root_for(Some(&root));
+        let skills = Arc::new(discover(None, &probed.path, probed.view.kind, &RealFs));
+        let config = runtime.config.lock().expect("config mutex").clone();
+        let events = Arc::new(EventBus::new());
+        let sessions = SessionRegistry::new();
+        let session_id = sessions
+            .create(SessionMode::Freeform, None, Some(root))
+            .expect("a session")
+            .session_id;
+        let router = runtime.turn_router(&config, &session_id);
+        let gate = runtime.permission_gate_for(&session_id, &events, &config);
+        let turn_id = teton_protocol::TurnId::from("turn-1");
+        let child = crate::harness::ChildTurn {
+            child_id: teton_protocol::agent::ChildId::new("call-1", "c"),
+            parent_turn_id: turn_id.clone(),
+            max_turns: 12,
+            spend: crate::cost::ChildSpend::new(
+                teton_protocol::agent::ChildId::new("call-1", "c"),
+                crate::cost::SharePool::new(None, &[]),
+                None,
+            ),
+            model_calls: Arc::default(),
+        };
+        let tctx = TurnContext::new(&events, &session_id, &config, &router, &gate, None);
+        let (tctx, toolset) = if toolset_is_child {
+            (tctx.for_child(&child), ToolSet::Child)
+        } else {
+            (
+                tctx,
+                ToolSet::Prompt(ParentTurn {
+                    turn_id: &turn_id,
+                    sessions: &sessions,
+                    mode: SessionMode::Freeform,
+                    phase: None,
+                    typed: true,
+                }),
+            )
+        };
+        runtime
+            .build_tools(tctx, skills, toolset)
+            .await
+            .names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// **BR-2 / AC-3: a child's registry has no `agent` tool — and is
+    /// otherwise the prompt turn's.**
+    ///
+    /// Stated as the only difference the two may have, so the assertion holds
+    /// before TASK-428 registers `agent` under [`ToolSet::Prompt`] and after:
+    /// the child has every tool the prompt turn has except `agent`, `skill`
+    /// included (BR-12), and never `agent`.
+    ///
+    /// Benign path: [`ToolSet::Prompt`] keeps today's registry — nothing this
+    /// task adds reaches it, so it is the child's registry exactly, until
+    /// TASK-428 adds `agent` and nothing else.
+    ///
+    /// # Mutation (run 2026-10-05 over the 60 tests matching `child`, reverted)
+    ///
+    /// - **Register `skill` for prompt turns only** (`register_skill_tool`
+    ///   moved into the `ToolSet::Prompt` arm): 1 red, this test — the prompt
+    ///   turn's registry holds a tool beyond `agent` that the child's lacks.
+    ///
+    /// Until TASK-428 lands the two arms register the same tools, so there is
+    /// no `agent` registration to invert yet; TASK-428 re-runs this with its
+    /// registration moved into the `Child` arm.
+    #[tokio::test]
+    async fn child_toolset_omits_agent() {
+        let prompt = registry_names(false).await;
+        let child = registry_names(true).await;
+        assert!(
+            child.iter().any(|name| name == "skill"),
+            "non-vacuity, and BR-12: the child keeps `skill`: {child:?}"
+        );
+        assert!(
+            !child.iter().any(|name| name == "agent"),
+            "depth is one: a child's registry has no `agent`: {child:?}"
+        );
+        let prompt_without_agent: Vec<&String> =
+            prompt.iter().filter(|name| *name != "agent").collect();
+        assert_eq!(
+            prompt_without_agent,
+            child.iter().collect::<Vec<_>>(),
+            "the child's registry is the prompt turn's, less `agent` and nothing else"
+        );
     }
 }

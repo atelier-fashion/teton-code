@@ -78,6 +78,7 @@ use teton_protocol::SessionId;
 
 use crate::broadcast::EventBus;
 use crate::grants::ConnectionId;
+use crate::harness::child::ChildTurn;
 use crate::harness::permissions::PermissionGate;
 use crate::router::Router;
 
@@ -168,6 +169,18 @@ pub struct TurnContext<'a> {
     ///
     /// `ConnectionId` is `Copy`, so consumers still take their own.
     pub invoker: Option<ConnectionId>,
+    /// The child this turn is, or `None` for a prompt turn (REQ-623).
+    ///
+    /// Set by [`TurnContext::for_child`] and by nothing else, so a prompt turn
+    /// — every turn before REQ-623 — reads `None` and runs exactly as it did.
+    /// The stages a child shares with a prompt turn read it to decide the few
+    /// things that differ: the registry (no `agent`), the emitter (stamped
+    /// with the child's ids), `route_decided` (not published), the turn cap
+    /// (re-clamped on every attempt) and every egress (built with the child's
+    /// spend share). It is minted by the child runner from the child's own
+    /// facts after the parent's claim, so it cannot go stale between a claim
+    /// and this construction point.
+    pub child: Option<&'a ChildTurn>,
 }
 
 /// The duty-routing context: [`TurnCore`] plus the two facts that travel with
@@ -193,6 +206,12 @@ pub struct DutyContext<'a> {
     /// prompt's accumulator would let it spend against a total nobody is
     /// watching any more (REQ-588).
     pub prompt_spend: Option<&'a Arc<PromptSpend>>,
+    /// The child whose duties these are, or `None` for a prompt turn's
+    /// (REQ-623) — carried from [`TurnContext::child`] by
+    /// [`TurnContext::duties`]. A child's duty is built with the child's spend
+    /// share (the parent pays, ADR-4) and announces no `route_decided`, which
+    /// carries no child id and would read as the parent's.
+    pub child: Option<&'a ChildTurn>,
 }
 
 impl<'a> TurnCore<'a> {
@@ -214,6 +233,7 @@ impl<'a> TurnCore<'a> {
             core: self,
             local_engine,
             prompt_spend,
+            child: None,
         }
     }
 }
@@ -238,13 +258,27 @@ impl<'a> TurnContext<'a> {
             },
             gate,
             invoker,
+            child: None,
+        }
+    }
+
+    /// This context, speaking for the child turn `child` (REQ-623).
+    ///
+    /// The one way a context comes to carry a child — see
+    /// [`TurnContext::child`].
+    #[must_use]
+    pub fn for_child(self, child: &'a ChildTurn) -> Self {
+        Self {
+            child: Some(child),
+            ..self
         }
     }
 
     /// The duty context for this turn, given the attempt's one engine-slot read
     /// and its spend accumulator.
     ///
-    /// The gate is dropped rather than carried: see [`DutyContext`].
+    /// The gate is dropped rather than carried: see [`DutyContext`]. The child,
+    /// when this is one, is carried: a child's duties are the child's spend.
     ///
     /// Delegates to [`TurnCore::duties`] rather than building a `DutyContext`
     /// of its own, so there is one place that knows how a duty context is
@@ -255,7 +289,10 @@ impl<'a> TurnContext<'a> {
         local_engine: Option<&'a LocalEngineSlot>,
         prompt_spend: Option<&'a Arc<PromptSpend>>,
     ) -> DutyContext<'a> {
-        self.core.duties(local_engine, prompt_spend)
+        DutyContext {
+            child: self.child,
+            ..self.core.duties(local_engine, prompt_spend)
+        }
     }
 }
 
@@ -280,6 +317,7 @@ impl<'a> DutyContext<'a> {
             },
             local_engine,
             prompt_spend,
+            child: None,
         }
     }
 }
@@ -401,6 +439,10 @@ mod tests {
                 },
             gate: _,
             invoker: _,
+            // REQ-623: minted by the child runner from the child's own facts,
+            // after the parent's claim — nothing in it is read off the session
+            // root, so it cannot go stale between a claim and this point.
+            child: _,
         } = tctx;
     }
 }
