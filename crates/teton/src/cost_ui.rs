@@ -274,6 +274,8 @@ mod tests {
             cached_tokens: None,
             reasoning_tokens: None,
             probe: false,
+            child_id: None,
+            parent_turn_id: None,
         }
     }
 

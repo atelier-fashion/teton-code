@@ -754,6 +754,8 @@ mod tests {
             update: SessionUpdatePayload::AgentMessageChunk {
                 text: text.to_owned(),
             },
+            child_id: None,
+            parent_turn_id: None,
         })
     }
 
@@ -770,6 +772,8 @@ mod tests {
                 title: title.to_owned(),
                 status,
             },
+            child_id: None,
+            parent_turn_id: None,
         })
     }
 
@@ -779,6 +783,8 @@ mod tests {
                 tool_call_id: "c1".to_owned(),
                 status,
             },
+            child_id: None,
+            parent_turn_id: None,
         })
     }
 
@@ -793,6 +799,8 @@ mod tests {
                 label: "Allow once".to_owned(),
                 kind: PermissionOptionKind::AllowOnce,
             }],
+            child_id: None,
+            parent_turn_id: None,
         })
     }
 
@@ -818,6 +826,8 @@ mod tests {
                 cached_tokens: None,
                 reasoning_tokens: None,
                 probe: false,
+                child_id: None,
+                parent_turn_id: None,
             },
         })
     }

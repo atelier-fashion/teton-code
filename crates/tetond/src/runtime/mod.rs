@@ -21099,7 +21099,7 @@ provider_id = \"deepseek\"
             );
             let published = pressure(&mut sub).await;
             assert_eq!(published.len(), 1, "{published:#?}");
-            let event = published[0];
+            let event = published[0].clone();
             assert_eq!(event.kind, ContextPressureKind::RefitOnReroute);
             assert!(event.dropped_blocks > 0, "{event:?}");
             // Both currencies, from the route the turn is moving TO — a client

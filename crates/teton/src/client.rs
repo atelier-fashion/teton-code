@@ -3174,6 +3174,8 @@ mod tests {
                 update: SessionUpdatePayload::AgentMessageChunk {
                     text: text.to_owned(),
                 },
+                child_id: None,
+                parent_turn_id: None,
             }),
         }))
     }
@@ -3227,6 +3229,8 @@ mod tests {
                     label: "Reject once".to_owned(),
                     kind: PermissionOptionKind::RejectOnce,
                 }],
+                child_id: None,
+                parent_turn_id: None,
             }),
         }))
     }
@@ -3698,6 +3702,8 @@ mod tests {
                             label: "Reject once".to_owned(),
                             kind: teton_protocol::events::PermissionOptionKind::RejectOnce,
                         }],
+                        child_id: None,
+                        parent_turn_id: None,
                     },
                 ),
             },
@@ -4244,6 +4250,89 @@ mod tests {
     fn classify_ignores_unknown_notifications_and_junk() {
         assert!(classify(r#"{"jsonrpc":"2.0","method":"mystery","params":{}}"#).is_none());
         assert!(classify("not json at all").is_none());
+    }
+
+    /// **REQ-623 TASK-421: a `tool_started` frame decodes whether or not it
+    /// carries the child stamp.**
+    ///
+    /// Every event reaches this CLI through [`classify`], and an envelope that
+    /// fails to decode there is dropped without a word — so a child id that
+    /// broke decoding would make a child's tool start vanish from the screen,
+    /// which is BUG-226's symptom and what BR-13 forbids. The frames are raw
+    /// JSON-RPC lines, exactly as the socket delivers them, written out by hand
+    /// rather than serialized by the types under test:
+    ///
+    /// - a pre-REQ-623 daemon's `tool_call` (no keys) reads `None`;
+    /// - a child's `tool_call` reads both ids;
+    /// - an `agent_*` event this build knows decodes as itself;
+    /// - an event kind this build does **not** know is skipped, not fatal —
+    ///   the forward-compatible vocabulary rule (REQ-588) still holds with the
+    ///   seven new variants in the enum.
+    ///
+    /// **Mutation (run 2026-10-05):** `#[serde(rename = "child")]` on
+    /// `SessionUpdate::child_id` reds this test on the stamped frame (the key
+    /// is no longer read, and the id decodes `None`) — 1 of 875 in this crate;
+    /// the protocol's own `child_ids_are_optional_and_omitted_when_none` reds
+    /// beside it.
+    #[test]
+    fn classify_decodes_tool_started_with_and_without_child_ids() {
+        use teton_protocol::agent::{ChildId, ChildStatus};
+        use teton_protocol::events::{Event, SessionUpdatePayload};
+        use teton_protocol::TurnId;
+
+        let decode = |raw: &str| match classify(raw) {
+            Some(Incoming::Event(envelope)) => *envelope,
+            _ => panic!("expected an event to decode: {raw}"),
+        };
+
+        let pre = r#"{"jsonrpc":"2.0","method":"event","params":{"session_id":"s1","seq":4,"event":"session_update","update":{"kind":"tool_call","tool_call_id":"c1","title":"read src/lib.rs","status":"in_progress"}}}"#;
+        match decode(pre).event {
+            Event::SessionUpdate(update) => {
+                assert_eq!(update.child_id, None);
+                assert_eq!(update.parent_turn_id, None);
+                assert!(
+                    matches!(
+                        &update.update,
+                        SessionUpdatePayload::ToolCall { tool_call_id, .. } if tool_call_id == "c1"
+                    ),
+                    "{update:?}"
+                );
+            }
+            other => panic!("expected a session_update, got {other:?}"),
+        }
+
+        let post = r#"{"jsonrpc":"2.0","method":"event","params":{"session_id":"s1","seq":5,"event":"session_update","update":{"kind":"tool_call","tool_call_id":"c2","title":"grep TODO","status":"in_progress"},"child_id":"toolu_01/audit-1","parent_turn_id":"turn-3"}}"#;
+        match decode(post).event {
+            Event::SessionUpdate(update) => {
+                assert_eq!(
+                    update.child_id.as_ref().map(ChildId::as_str),
+                    Some("toolu_01/audit-1")
+                );
+                assert_eq!(update.parent_turn_id, Some(TurnId::from("turn-3")));
+                assert!(
+                    matches!(
+                        &update.update,
+                        SessionUpdatePayload::ToolCall { tool_call_id, .. } if tool_call_id == "c2"
+                    ),
+                    "{update:?}"
+                );
+            }
+            other => panic!("expected a session_update, got {other:?}"),
+        }
+
+        let finished = r#"{"jsonrpc":"2.0","method":"event","params":{"session_id":"s1","seq":6,"event":"agent_child_finished","child_id":"toolu_01/audit-1","status":"timed_out","turns_used":3,"cost_micro_cents":900,"report_bytes":0,"truncated":false}}"#;
+        match decode(finished).event {
+            Event::AgentChildFinished(done) => {
+                assert_eq!(done.status, ChildStatus::TimedOut);
+                assert_eq!(done.child_id.as_str(), "toolu_01/audit-1");
+            }
+            other => panic!("expected agent_child_finished, got {other:?}"),
+        }
+
+        assert!(
+            classify(r#"{"jsonrpc":"2.0","method":"event","params":{"session_id":"s1","seq":7,"event":"agent_child_paused","child_id":"toolu_01/audit-1"}}"#).is_none(),
+            "an event kind this build does not know is skipped, not fatal"
+        );
     }
 
     #[test]
@@ -6803,6 +6892,8 @@ mod tests {
                             cached_tokens: None,
                             reasoning_tokens: None,
                             probe: false,
+                            child_id: None,
+                            parent_turn_id: None,
                         },
                     }),
                 ),
@@ -6817,6 +6908,8 @@ mod tests {
                         update: events::SessionUpdatePayload::AgentMessageChunk {
                             text: "the finding is".to_owned(),
                         },
+                        child_id: None,
+                        parent_turn_id: None,
                     }),
                 ),
                 Phase::Streaming,
@@ -6832,6 +6925,8 @@ mod tests {
                             title: "shell: cargo test".to_owned(),
                             status: events::ToolCallStatus::InProgress,
                         },
+                        child_id: None,
+                        parent_turn_id: None,
                     }),
                 ),
                 Phase::ToolRunning,
@@ -6849,6 +6944,8 @@ mod tests {
                             tool_call_id: "c1".to_owned(),
                             status: events::ToolCallStatus::Completed,
                         },
+                        child_id: None,
+                        parent_turn_id: None,
                     }),
                 ),
                 Phase::AwaitingModel,
@@ -6901,6 +6998,8 @@ mod tests {
                             label: "Reject once".to_owned(),
                             kind: events::PermissionOptionKind::RejectOnce,
                         }],
+                        child_id: None,
+                        parent_turn_id: None,
                     }),
                 ),
                 Phase::Held,
@@ -6916,6 +7015,8 @@ mod tests {
                         update: events::SessionUpdatePayload::AgentMessageChunk {
                             text: "not ours".to_owned(),
                         },
+                        child_id: None,
+                        parent_turn_id: None,
                     }),
                 ),
                 Phase::Held,

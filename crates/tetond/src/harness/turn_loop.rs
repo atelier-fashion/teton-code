@@ -801,7 +801,11 @@ impl SessionEvents {
     fn emit(&self, update: SessionUpdatePayload) {
         self.bus.publish(
             Some(self.session_id.clone()),
-            Event::SessionUpdate(SessionUpdate { update }),
+            Event::SessionUpdate(SessionUpdate {
+                update,
+                child_id: None,
+                parent_turn_id: None,
+            }),
         );
     }
 
@@ -1008,6 +1012,8 @@ impl SessionEvents {
                 // measured. Never composed here: a call site that wrote `true`
                 // would be asserting the invariant rather than reporting it.
                 anchors_intact: report.anchors_intact,
+                child_id: None,
+                parent_turn_id: None,
             }),
         );
     }
@@ -3977,6 +3983,7 @@ mod tests {
         while let Some(env) = sub.try_recv() {
             if let Event::SessionUpdate(SessionUpdate {
                 update: SessionUpdatePayload::AgentMessageChunk { text },
+                ..
             }) = &env.event
             {
                 out.push_str(text);

@@ -858,7 +858,7 @@ fn pressure_events(
     events
         .iter()
         .filter_map(|e| match &e.event {
-            Event::ContextPressure(cp) => Some(*cp),
+            Event::ContextPressure(cp) => Some(cp.clone()),
             _ => None,
         })
         .collect()

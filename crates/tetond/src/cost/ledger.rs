@@ -301,6 +301,8 @@ impl LedgerRow {
             cached_tokens: self.cached_tokens,
             reasoning_tokens: self.reasoning_tokens,
             probe: self.probe,
+            child_id: None,
+            parent_turn_id: None,
         }
     }
 }

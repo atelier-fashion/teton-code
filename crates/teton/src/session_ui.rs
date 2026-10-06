@@ -1393,6 +1393,17 @@ pub fn render_event(
             }
             EventOutcome::Rendered
         }
+        // REQ-623: the subagent dispatch family draws no line of its own here.
+        // A call already renders as the `agent` tool's own start and finish;
+        // its children's progress belongs to the activity line and `/cost`,
+        // not to a notice per event (BR-13).
+        Event::AgentCallStarted(_)
+        | Event::AgentChildStarted(_)
+        | Event::AgentChildConsentRequested(_)
+        | Event::AgentChildShareReleased(_)
+        | Event::AgentChildFinished(_)
+        | Event::AgentCallFinished(_)
+        | Event::AgentCallRefused(_) => EventOutcome::Rendered,
     }
 }
 
@@ -5512,6 +5523,8 @@ mod tests {
             update: SessionUpdatePayload::AgentMessageChunk {
                 text: text.to_owned(),
             },
+            child_id: None,
+            parent_turn_id: None,
         })
     }
 
@@ -5890,6 +5903,8 @@ mod tests {
                     title: "read src/main.rs".to_owned(),
                     status: ToolCallStatus::Pending,
                 },
+                child_id: None,
+                parent_turn_id: None,
             })),
             &mut surface,
             &mut state,
@@ -5900,6 +5915,8 @@ mod tests {
                     tool_call_id: "c1".to_owned(),
                     status: ToolCallStatus::Completed,
                 },
+                child_id: None,
+                parent_turn_id: None,
             })),
             &mut surface,
             &mut state,
@@ -5923,6 +5940,8 @@ mod tests {
                     old_text: Some("fn a() {}".to_owned()),
                     new_text: "fn a() { 1 }".to_owned(),
                 },
+                child_id: None,
+                parent_turn_id: None,
             })),
             &mut surface,
             &mut state,
@@ -5945,6 +5964,8 @@ mod tests {
                         status: PlanEntryStatus::InProgress,
                     }],
                 },
+                child_id: None,
+                parent_turn_id: None,
             })),
             &mut surface,
             &mut state,
@@ -5971,6 +5992,8 @@ mod tests {
                     cached_tokens: None,
                     reasoning_tokens: None,
                     probe: false,
+                    child_id: None,
+                    parent_turn_id: None,
                 },
             })),
             &mut surface,
@@ -6002,6 +6025,8 @@ mod tests {
                     kind: PermissionOptionKind::RejectOnce,
                 },
             ],
+            child_id: None,
+            parent_turn_id: None,
         }
     }
 
@@ -6097,6 +6122,8 @@ mod tests {
                 bound: BudgetBound::LocalEngine,
                 bound_floored: false,
                 anchors_intact: true,
+                child_id: None,
+                parent_turn_id: None,
             }))
         };
 
@@ -6140,6 +6167,8 @@ mod tests {
                 bound,
                 bound_floored: false,
                 anchors_intact: true,
+                child_id: None,
+                parent_turn_id: None,
             })
         };
 
@@ -6253,6 +6282,8 @@ mod tests {
                 bound: BudgetBound::UserCap,
                 bound_floored,
                 anchors_intact: true,
+                child_id: None,
+                parent_turn_id: None,
             })
         };
         assert_eq!(
@@ -8857,6 +8888,8 @@ mod tests {
                     title: "shell: teton policy set-tier think kimi".to_owned(),
                     status: ToolCallStatus::Pending,
                 },
+                child_id: None,
+                parent_turn_id: None,
             })),
             &mut surface,
             &mut state,
@@ -8869,6 +8902,8 @@ mod tests {
                         status: PlanEntryStatus::InProgress,
                     }],
                 },
+                child_id: None,
+                parent_turn_id: None,
             })),
             &mut surface,
             &mut state,
@@ -8983,6 +9018,8 @@ mod tests {
                 title: title.to_owned(),
                 status: ToolCallStatus::Pending,
             },
+            child_id: None,
+            parent_turn_id: None,
         })
     }
 
@@ -10230,6 +10267,8 @@ mod tests {
                         cached_tokens: None,
                         reasoning_tokens: None,
                         probe: false,
+                        child_id: None,
+                        parent_turn_id: None,
                     },
                 }),
             ),
@@ -10241,6 +10280,8 @@ mod tests {
                         title: "shell: cargo test".to_owned(),
                         status: ToolCallStatus::InProgress,
                     },
+                    child_id: None,
+                    parent_turn_id: None,
                 }),
             ),
             (
@@ -10250,6 +10291,8 @@ mod tests {
                         tool_call_id: "c1".to_owned(),
                         status: ToolCallStatus::Completed,
                     },
+                    child_id: None,
+                    parent_turn_id: None,
                 }),
             ),
         ];
@@ -10416,6 +10459,8 @@ mod skill_tests {
                     kind: PermissionOptionKind::RejectOnce,
                 },
             ],
+            child_id: None,
+            parent_turn_id: None,
         }
     }
 
@@ -14045,6 +14090,8 @@ mod repo_context_generation_tests {
             description: None,
             options: Vec::new(),
             subject: Some(subject(false)),
+            child_id: None,
+            parent_turn_id: None,
         };
         let line = refusal_line(&request, RefusalReason::NoTerminal);
         assert!(

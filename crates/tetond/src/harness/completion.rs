@@ -1677,9 +1677,11 @@ mod tests {
             match &env.event {
                 Event::SessionUpdate(SessionUpdate {
                     update: SessionUpdatePayload::ToolCall { title, .. },
+                    ..
                 }) => titles.push(title.clone()),
                 Event::SessionUpdate(SessionUpdate {
                     update: SessionUpdatePayload::AgentMessageChunk { text },
+                    ..
                 }) => shown.push_str(text),
                 _ => {}
             }

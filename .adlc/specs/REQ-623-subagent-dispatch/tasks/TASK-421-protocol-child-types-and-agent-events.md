@@ -1,7 +1,7 @@
 ---
 id: TASK-421
 title: "Protocol: child types, seven agent events, and child ids on the four scoped payloads"
-status: draft
+status: complete
 parent: REQ-623
 created: 2026-10-05
 updated: 2026-10-05
@@ -27,11 +27,11 @@ stream (architecture "Data model changes").
 
 ## Acceptance Criteria
 
-- [ ] Every `agent_*` event round-trips through serde with its wire name as the spec's event table spells it
-- [ ] `ChildStatus` serializes to the eight lowercase strings in the spec's entity table, and nothing else parses
-- [ ] A `tool_started` JSON with no `child_id` key decodes to `None`; one with it decodes to `Some`; serializing `None` omits the key
-- [ ] The exhaustive `Event::name()` test (if one exists) covers the seven new variants
-- [ ] `cargo test -p teton-protocol -p teton` green
+- [x] Every `agent_*` event round-trips through serde with its wire name as the spec's event table spells it
+- [x] `ChildStatus` serializes to the eight lowercase strings in the spec's entity table, and nothing else parses
+- [x] A `tool_started` JSON with no `child_id` key decodes to `None`; one with it decodes to `Some`; serializing `None` omits the key
+- [x] The exhaustive `Event::name()` test (if one exists) covers the seven new variants
+- [x] `cargo test -p teton-protocol -p teton` green
 
 ## Verification
 

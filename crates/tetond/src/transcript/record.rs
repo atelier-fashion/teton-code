@@ -625,6 +625,8 @@ mod tests {
                 update: SessionUpdatePayload::AgentMessageChunk {
                     text: "hello".to_owned(),
                 },
+                child_id: None,
+                parent_turn_id: None,
             }),
         );
         let line = Line::render(&Record::BusEnvelope(envelope), &session(), 7, at(0), 4096);
@@ -718,6 +720,8 @@ mod tests {
                 update: SessionUpdatePayload::AgentMessageChunk {
                     text: String::new(),
                 },
+                child_id: None,
+                parent_turn_id: None,
             }),
         ));
         assert!(

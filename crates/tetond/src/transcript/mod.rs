@@ -1118,6 +1118,8 @@ mod tests {
                 update: SessionUpdatePayload::AgentMessageChunk {
                     text: text.to_owned(),
                 },
+                child_id: None,
+                parent_turn_id: None,
             }),
         ))
     }

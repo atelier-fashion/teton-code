@@ -3239,6 +3239,8 @@ impl PermissionGate {
             // for a tool call is a tool call, and has no subject.
             subject: addressed.map(|a| a.subject),
             options: options_for(&question),
+            child_id: None,
+            parent_turn_id: None,
         };
 
         match route {
