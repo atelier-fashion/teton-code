@@ -1070,26 +1070,44 @@ where
     };
 
     resolve_row(
-        category, tier, source, primary, fallback, &via, &health, &usable,
+        category,
+        ChosenRow {
+            tier,
+            source,
+            primary,
+            fallback,
+            via: &via,
+        },
+        &health,
+        &usable,
     )
 }
 
 /// The screening half of [`resolve`], once a row has been found: the primary,
 /// then the same row's fallback, then a failure that names both.
 ///
+/// The row a resolution picked, before screening: one bundle for the five
+/// facts [`resolve_row`] reads together, so the screen takes a row rather than
+/// a row's fields spread across its signature (REQ-606 — a bundle, not a
+/// clippy suppression).
+struct ChosenRow<'a> {
+    /// The tier the resolution reports — for a request, the requested one.
+    tier: Tier,
+    source: BindingSource,
+    primary: &'a str,
+    fallback: Option<&'a str>,
+    /// The clause naming the row in the reason sentence.
+    via: &'a str,
+}
+
 /// Split out of [`resolve`] so [`resolve_with_tier_request`] screens a
 /// requested tier's row through **these** sentences and this order rather than
 /// a copy of them — a second screen is the BUG-155 shape (one path screening
 /// providers, another not). `via` is the clause naming the row; `tier` is the
 /// tier the resolution reports, which for a request is the requested one.
-#[allow(clippy::too_many_arguments)]
 fn resolve_row<H, U>(
     category: Category,
-    tier: Tier,
-    source: BindingSource,
-    primary: &str,
-    fallback: Option<&str>,
-    via: &str,
+    row: ChosenRow<'_>,
     health: &H,
     usable: &U,
 ) -> CategoryResolution
@@ -1097,6 +1115,13 @@ where
     H: Fn(&str) -> ProviderHealth,
     U: Fn(&str) -> bool,
 {
+    let ChosenRow {
+        tier,
+        source,
+        primary,
+        fallback,
+        via,
+    } = row;
     match screen(primary, health, usable) {
         Ok(ProviderHealth::Degraded) => CategoryResolution {
             category,
@@ -1206,13 +1231,16 @@ where
         ));
     };
 
+    let via = format!("through the requested '{requested}' tier binding");
     let honoured = resolve_row(
         category,
-        requested,
-        BindingSource::TierInheritance,
-        &row.provider_id,
-        row.fallback_id.as_deref(),
-        &format!("through the requested '{requested}' tier binding"),
+        ChosenRow {
+            tier: requested,
+            source: BindingSource::TierInheritance,
+            primary: &row.provider_id,
+            fallback: row.fallback_id.as_deref(),
+            via: &via,
+        },
         &health,
         &usable,
     );
