@@ -11685,6 +11685,7 @@ provider_id = "on-device"
             transcript: Default::default(),
             context: Default::default(),
             inference: Default::default(),
+            agent: Default::default(),
             pinned_local_model: None,
             effort: teton_core::EffortLevel::default(),
             // The whole point: unset.
@@ -12016,6 +12017,7 @@ provider_id = "on-device"
             transcript: Default::default(),
             context: Default::default(),
             inference: Default::default(),
+            agent: Default::default(),
             pinned_local_model: None,
             effort: teton_core::EffortLevel::default(),
             default_provider: Some("anthropic".to_owned()),
