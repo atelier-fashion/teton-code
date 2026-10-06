@@ -26,6 +26,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use teton_protocol::agent::{AgentRefusal, ChildId, ChildStatus};
 use teton_protocol::events;
 use teton_protocol::events::{
     AttachConsentRequested, BlockCause, BoundaryDefaultsApplied, BudgetBound, CapabilityDeadEnd,
@@ -127,7 +128,12 @@ impl SessionGrants {
 #[derive(Debug, Default)]
 pub struct SessionState {
     /// Tool-call id → human title, so a later `tool_call_update` can be named.
-    tool_titles: HashMap<String, String>,
+    ///
+    /// Keyed by the child the call ran in as well as its id (REQ-623): a
+    /// child's provider mints its own tool-call ids, so `c1` in a child and `c1`
+    /// in the parent are two calls, and a key of the id alone would name one
+    /// with the other's title.
+    tool_titles: HashMap<(Option<ChildId>, String), String>,
     /// Session-scoped permission grants.
     pub grants: SessionGrants,
     /// Cost accumulated from `cost_recorded` events.
@@ -654,7 +660,13 @@ pub fn render_event(
             // (the ADR-9 accumulator), and a record is where "whose session was
             // this" starts to matter — the same reason `context_cleared` reads
             // it below.
-            render_session_update(&su.update, env.session_id.as_ref(), surface, state);
+            render_session_update(
+                &su.update,
+                su.child_id.as_ref(),
+                env.session_id.as_ref(),
+                surface,
+                state,
+            );
             EventOutcome::Rendered
         }
         // REQ-585 BR-12 / ADR-15. Never verbose-gated: *every* invocation
@@ -1393,18 +1405,212 @@ pub fn render_event(
             }
             EventOutcome::Rendered
         }
-        // REQ-623: the subagent dispatch family draws no line of its own here.
-        // A call already renders as the `agent` tool's own start and finish;
-        // its children's progress belongs to the activity line and `/cost`,
-        // not to a notice per event (BR-13).
-        Event::AgentCallStarted(_)
-        | Event::AgentChildStarted(_)
-        | Event::AgentChildConsentRequested(_)
-        | Event::AgentChildShareReleased(_)
-        | Event::AgentChildFinished(_)
-        | Event::AgentCallFinished(_)
-        | Event::AgentCallRefused(_) => EventOutcome::Rendered,
+        // REQ-623 BR-13: the subagent dispatch family. A call already renders
+        // as the `agent` tool's own start and finish, and its running children
+        // are the activity row's clause, so the always-on lines are the two a
+        // user must not miss: a call refused whole, and a child that ended
+        // without completing. Everything else is the bookkeeping `/verbose`
+        // exists for — routes, bounds, shares, the call's tally — in the
+        // `route_decided` line's register.
+        Event::AgentCallRefused(refused) => {
+            surface.line(LineKind::Notice, &format_agent_call_refused(refused));
+            EventOutcome::Rendered
+        }
+        Event::AgentChildFinished(finished) => {
+            if let Some(line) = format_child_finished(finished, state.verbose) {
+                surface.line(LineKind::Notice, &line);
+            }
+            EventOutcome::Rendered
+        }
+        Event::AgentCallStarted(started) => {
+            if state.verbose {
+                surface.line(LineKind::Notice, &format_agent_call_started(started));
+            }
+            EventOutcome::Rendered
+        }
+        Event::AgentChildStarted(started) => {
+            if state.verbose {
+                surface.line(LineKind::Notice, &format_child_started(started));
+            }
+            EventOutcome::Rendered
+        }
+        Event::AgentChildShareReleased(released) => {
+            if state.verbose {
+                surface.line(LineKind::Notice, &format_share_released(released));
+            }
+            EventOutcome::Rendered
+        }
+        Event::AgentCallFinished(finished) => {
+            if state.verbose {
+                surface.line(LineKind::Notice, &format_agent_call_finished(finished));
+            }
+            EventOutcome::Rendered
+        }
+        // The label, not the question. The `permission_request` the gate raises
+        // beside it carries the same `child_id` and is the prompt — labelled
+        // with the child's name by [`resolve_permission`] — so a line here
+        // would be the one question announced twice (AC-7).
+        Event::AgentChildConsentRequested(_) => EventOutcome::Rendered,
     }
+}
+
+/// The name a child is shown under: its id after the first `/`, or the whole id
+/// if it has none (REQ-623 BR-13, AC-7).
+///
+/// The daemon mints a [`ChildId`] as `<call_id>/<name>`, and the call id is
+/// daemon-minted — it is the **name** half that is model-authored and may
+/// itself contain a `/`, which is why the split is at the first one and never
+/// the last. The daemon's `/cost` labels take the same reading
+/// (`tetond::cost::report::child_label`), so a child is called one thing on the
+/// consent prompt, its tool lines, its end-of-run notice and its cost row.
+///
+/// For the surfaces whose event carries only the id. `agent_child_started`
+/// carries the name as a field, and the activity row reads that instead.
+pub(crate) fn child_label(child_id: &ChildId) -> &str {
+    let id = child_id.as_str();
+    id.split_once('/').map_or(id, |(_, name)| name)
+}
+
+/// The prefix a child's streamed line carries — `child audit-1: ` — or nothing
+/// for the parent's own, which is what keeps every pre-REQ-623 line
+/// byte-identical.
+fn child_prefix(child: Option<&ChildId>) -> String {
+    child.map_or_else(String::new, |id| format!("child {}: ", child_label(id)))
+}
+
+/// The verbose line an `agent_call_started` draws: the call and what it is
+/// about to run.
+fn format_agent_call_started(started: &events::AgentCallStarted) -> String {
+    let names: Vec<&str> = started
+        .children
+        .iter()
+        .map(|child| child.name.as_str())
+        .collect();
+    format!(
+        "agent call {}: starting {} child(ren) — {}",
+        started.call_id,
+        started.children.len(),
+        names.join(", ")
+    )
+}
+
+/// The verbose line an `agent_child_started` draws: where the child runs and
+/// the bounds it runs under, as the daemon stamped them (BR-7).
+///
+/// The share is said in the per-prompt ceiling's own formatter, so the line
+/// that names a child's share and the route line that names the prompt's
+/// ceiling cannot come to print one figure two ways.
+fn format_child_started(started: &events::AgentChildStarted) -> String {
+    let bounds = &started.bounds;
+    let mut line = format!(
+        "child {} started on {} · up to {} model call(s) · {} context · {}s deadline",
+        started.name,
+        started.route,
+        bounds.max_turns,
+        bytes_figure(bounds.context_budget_bytes),
+        bounds.deadline_secs,
+    );
+    if let Some(share) = bounds.spend_ceiling_micro_cents {
+        line.push_str(&format!(
+            " · spend share {}",
+            teton_core::cost_ceiling::usd(share)
+        ));
+    }
+    line
+}
+
+/// The verbose line an `agent_child_share_released` draws (BR-8).
+fn format_share_released(released: &events::AgentChildShareReleased) -> String {
+    format!(
+        "child {} released {} of unspent share to {} running sibling(s)",
+        child_label(&released.child_id),
+        teton_core::cost_ceiling::usd(released.released_micro_cents),
+        released.recipients.len(),
+    )
+}
+
+/// The line an `agent_child_finished` draws, if any (BR-10, BR-13).
+///
+/// **One line, always, for a child that did not complete** — its report to the
+/// parent is empty or partial, and a user who sees only the parent's reply
+/// would otherwise have no way to know a part of the work never came back. The
+/// wire status leads, so the line is greppable by the same word the transcript
+/// and the tool result use; the words after it say what that status means.
+///
+/// A completed child draws its line in `/verbose` only — the parent's reply is
+/// the news — and says when its report was cut at the bound (BR-11), since the
+/// parent model read less than the child wrote.
+fn format_child_finished(finished: &events::AgentChildFinished, verbose: bool) -> Option<String> {
+    let name = child_label(&finished.child_id);
+    let calls = finished.turns_used;
+    let ended = match finished.status {
+        ChildStatus::Completed => {
+            if !verbose {
+                return None;
+            }
+            let mut line = format!("child {name} completed after {calls} model call(s)");
+            if finished.truncated {
+                line.push_str(&format!(
+                    " · report cut at the bound ({} in full, in the session transcript)",
+                    bytes_figure(finished.report_bytes)
+                ));
+            }
+            return Some(line);
+        }
+        ChildStatus::Refused => "was refused",
+        ChildStatus::Cancelled => "was cancelled with its parent turn",
+        ChildStatus::TurnsExhausted => "used every model call it was allowed",
+        ChildStatus::BudgetExhausted => "could not fit its context to its budget",
+        ChildStatus::SpendExhausted => "reached its spend share",
+        ChildStatus::TimedOut => "passed its deadline",
+        ChildStatus::Failed => "failed",
+    };
+    Some(format!(
+        "child {name} ended {} — {ended} after {calls} model call(s)",
+        finished.status
+    ))
+}
+
+/// The verbose line an `agent_call_finished` draws: the call's tally.
+fn format_agent_call_finished(finished: &events::AgentCallFinished) -> String {
+    let completed = finished
+        .children
+        .iter()
+        .filter(|child| child.status == ChildStatus::Completed)
+        .count();
+    format!(
+        "agent call {} finished: {completed} of {} child(ren) completed · {} · {:.1}s",
+        finished.call_id,
+        finished.children.len(),
+        teton_core::cost_ceiling::usd(finished.total_cost_micro_cents),
+        // Display only: tenths of a second of a wall clock the daemon measured.
+        finished.elapsed_ms as f64 / 1_000.0,
+    )
+}
+
+/// The line an `agent_call_refused` draws — always, because the model's call
+/// did nothing and the user should know why (BR-3).
+///
+/// The code leads, then the numbers that refused it and the key that sets the
+/// cap, so the line answers "what do I change" without a trip to the docs.
+fn format_agent_call_refused(refused: &events::AgentCallRefused) -> String {
+    let code = refused.refusal.code();
+    let why = match &refused.refusal {
+        AgentRefusal::TooManyChildren { requested, cap } => format!(
+            "{requested} tasks in one call, at most {cap} allowed (agent.max_children_per_call)"
+        ),
+        AgentRefusal::ChildCapReached {
+            started,
+            requested,
+            cap,
+        } => format!(
+            "{started} children already started this turn and {requested} more requested, at \
+             most {cap} per turn (agent.max_children_per_turn)"
+        ),
+        AgentRefusal::DuplicateName { name } => format!("two tasks are named {name}"),
+        AgentRefusal::EmptyTask { index } => format!("the task at index {index} has no text"),
+    };
+    format!("agent call refused ({code}): {why}; no child was started")
 }
 
 /// The verbose line a refused repeat renders (REQ-617 BR-4).
@@ -3068,13 +3274,32 @@ pub(crate) fn web_tier_name(tier: WebTier) -> &'static str {
 ///
 /// `session` is the envelope's — whose turn this chunk belongs to. The bus is
 /// daemon-wide, so it is not necessarily this client's.
+///
+/// **A child's update is the parent's payload with a `child_id`** (REQ-623
+/// ADR-3), and it renders by three rules. Its text chunks are **not** echoed:
+/// they are not the reply the user asked for, a fragment cannot carry a label,
+/// and interleaving two children's tokens into the parent's prose would be
+/// unreadable — the child's report reaches the parent model as the tool result,
+/// its whole text is in the session transcript, and its liveness is the
+/// activity row's children clause. `/verbose` does not change that: verbose
+/// adds bookkeeping lines (a route, a child's start and end), never a second
+/// stream of model prose. Its tool lines, diffs and plans **are** drawn, always,
+/// prefixed `child <name>: ` — a child running `shell` on the user's machine is
+/// exactly what BR-13 means by visible — and every parent line is unchanged.
+/// And nothing a child does reaches the turn's record ([`SessionState::turn_reply`],
+/// [`SessionState::turn_tools`]): the hand-off checks read the parent's own
+/// reply and the parent's own tools, and a record with a child's tools in it
+/// would pair one turn's tools with another conversation's words.
 fn render_session_update(
     update: &SessionUpdatePayload,
+    child: Option<&ChildId>,
     session: Option<&SessionId>,
     surface: &mut dyn Surface,
     state: &mut SessionState,
 ) {
+    let prefix = child_prefix(child);
     match update {
+        SessionUpdatePayload::AgentMessageChunk { .. } if child.is_some() => {}
         SessionUpdatePayload::AgentMessageChunk { text } => {
             // The one writer of the turn accumulator (REQ-579 ADR-9). It is fed
             // from the same chunk that reaches the screen, so what the hand-off
@@ -3102,7 +3327,7 @@ fn render_session_update(
         } => {
             state
                 .tool_titles
-                .insert(tool_call_id.clone(), title.clone());
+                .insert((child.cloned(), tool_call_id.clone()), title.clone());
             // REQ-581 ADR-4's second reader of the turn. Recorded from the same
             // payload that reaches the screen, and only for **our** session, for
             // the reasons the reply accumulator above states: what the predicate
@@ -3113,12 +3338,12 @@ fn render_session_update(
             // daemon composed (`shell: <command>`) and what the user read — a
             // second reading of the arguments here would be a second opinion
             // about what the turn did (LESSON-456).
-            if other_session(state.session_id.as_ref(), session).is_none() {
+            if child.is_none() && other_session(state.session_id.as_ref(), session).is_none() {
                 state.turn_tools.push(title.clone());
             }
             surface.line(
                 LineKind::Tool,
-                &format!("{title} [{}]", status_label(*status)),
+                &format!("{prefix}{title} [{}]", status_label(*status)),
             );
         }
         SessionUpdatePayload::ToolCallUpdate {
@@ -3127,21 +3352,21 @@ fn render_session_update(
         } => {
             let title = state
                 .tool_titles
-                .get(tool_call_id)
+                .get(&(child.cloned(), tool_call_id.clone()))
                 .cloned()
                 .unwrap_or_else(|| tool_call_id.clone());
             surface.line(
                 LineKind::Tool,
-                &format!("{title} [{}]", status_label(*status)),
+                &format!("{prefix}{title} [{}]", status_label(*status)),
             );
         }
         SessionUpdatePayload::Diff {
             path,
             old_text,
             new_text,
-        } => render_diff(path, old_text.as_deref(), new_text, surface),
+        } => render_diff(&prefix, path, old_text.as_deref(), new_text, surface),
         SessionUpdatePayload::Plan { entries } => {
-            surface.line(LineKind::Info, "plan:");
+            surface.line(LineKind::Info, &format!("{prefix}plan:"));
             for entry in entries {
                 surface.line(
                     LineKind::Info,
@@ -3785,10 +4010,19 @@ pub(crate) fn hand_off_after_turn(state: &mut SessionState, surface: &mut dyn Su
 }
 
 /// Render a compact preview of a proposed file change.
-fn render_diff(path: &str, old_text: Option<&str>, new_text: &str, surface: &mut dyn Surface) {
+///
+/// `prefix` is the child label a child's diff is headed with (REQ-623), and
+/// empty for the parent's own.
+fn render_diff(
+    prefix: &str,
+    path: &str,
+    old_text: Option<&str>,
+    new_text: &str,
+    surface: &mut dyn Surface,
+) {
     match old_text {
-        None => surface.line(LineKind::Diff, &format!("± {path} (new file)")),
-        Some(_) => surface.line(LineKind::Diff, &format!("± {path}")),
+        None => surface.line(LineKind::Diff, &format!("{prefix}± {path} (new file)")),
+        Some(_) => surface.line(LineKind::Diff, &format!("{prefix}± {path}")),
     }
     if let Some(old) = old_text {
         for line in old.lines() {
@@ -4016,18 +4250,26 @@ pub fn resolve_permission(
         return resolve_over_budget_offer(req, subject, surface, prompter);
     }
 
+    // REQ-623 AC-7: who is asking. A child's request carries its `child_id`,
+    // and a user answering for three concurrent children has to know which one
+    // wants `shell`; the parent's own request carries none, and every string
+    // below is then exactly what it was before children existed.
+    let asker = req.child_id.as_ref().map(child_label);
+    let by_child = asker.map_or_else(String::new, |name| format!(" by child {name}"));
+    let for_child = asker.map_or_else(String::new, |name| format!(" for child {name}"));
+
     // Session-scoped auto-decisions first — these consume no prompt.
     if grants.is_reject_always(tool) {
         surface.line(
             LineKind::Prompt,
-            &format!("auto-deny {tool} (denied for this session)"),
+            &format!("auto-deny {tool}{for_child} (denied for this session)"),
         );
         return respond(req, deny_outcome(&req.options));
     }
     if grants.is_allow_always(tool) {
         surface.line(
             LineKind::Prompt,
-            &format!("auto-allow {tool} (allowed for this session)"),
+            &format!("auto-allow {tool}{for_child} (allowed for this session)"),
         );
         return respond(req, allow_outcome(&req.options, true));
     }
@@ -4039,7 +4281,7 @@ pub fn resolve_permission(
         .map_or_else(String::new, |d| format!(" — {d}"));
     surface.line(
         LineKind::Prompt,
-        &format!("permission requested: {tool}{description}"),
+        &format!("permission requested{by_child}: {tool}{description}"),
     );
     // REQ-585 ADR-7: what is being consented to, from the typed subject rather
     // than from the key or the description. Nothing renders for a request that
@@ -4052,10 +4294,15 @@ pub fn resolve_permission(
     // nothing. Both the prompt line and the retry hint read this one flag, so
     // they cannot disagree about what is on offer.
     let permanent = permanent_option(&req.options);
+    // The child's name is in the question as well as the heading: the question
+    // is the line the user's eye is on when they answer.
     let question = if permanent.is_some() {
-        format!("  allow {tool}? [y]es / [n]o / [a]llow-always / [p]ermanently / [d]eny-always: ")
+        format!(
+            "  allow {tool}{for_child}? [y]es / [n]o / [a]llow-always / [p]ermanently / \
+             [d]eny-always: "
+        )
     } else {
-        format!("  allow {tool}? [y]es / [n]o / [a]llow-always / [d]eny-always: ")
+        format!("  allow {tool}{for_child}? [y]es / [n]o / [a]llow-always / [d]eny-always: ")
     };
     let retry = if permanent.is_some() {
         "  please answer y, n, a (allow-always), p (enable permanently), or d (deny-always)"
@@ -5536,6 +5783,291 @@ mod tests {
             render_event(&envelope(chunk(text)), &mut surface, &mut state);
         }
         assert_eq!(surface.fragments(), "Hello, world");
+    }
+
+    // ---- REQ-623: children in the session's stream (BR-13) ---------------
+
+    /// The id of the child `name` in the fixtures' one `agent` call.
+    fn child_id(name: &str) -> ChildId {
+        ChildId::new("toolu_01", name)
+    }
+
+    /// A `session_update` from inside the child `name` (ADR-3: the parent's
+    /// payload, stamped).
+    fn from_child(name: &str, update: SessionUpdatePayload) -> Event {
+        Event::SessionUpdate(SessionUpdate {
+            update,
+            child_id: Some(child_id(name)),
+            parent_turn_id: Some(teton_protocol::TurnId::from("turn-3")),
+        })
+    }
+
+    /// A `session_update` from the parent turn itself.
+    fn from_parent(update: SessionUpdatePayload) -> Event {
+        Event::SessionUpdate(SessionUpdate {
+            update,
+            child_id: None,
+            parent_turn_id: None,
+        })
+    }
+
+    /// **REQ-623 BR-13 / ADR-3: a child's stream is labelled where it is drawn
+    /// and never becomes the parent's reply.**
+    ///
+    /// A child's text chunk is not echoed — not as a fragment, not into the
+    /// turn's reply record, and not under `/verbose` either, which adds
+    /// bookkeeping lines and never a second stream of prose. Its tool lines and
+    /// diffs are drawn, prefixed with its name; the parent's are exactly what
+    /// they were. And a child's `c1` is not the parent's `c1`: each update is
+    /// named with its own call's title.
+    ///
+    /// **Mutations, applied and observed red (2026-10-05)** — each **1 red of 880** in the `teton`
+    /// unit suite, this test, and each reverted with the same edit. The e2e
+    /// suites carry no agent events until TASK-430, so they were not run
+    /// under mutation; that task re-runs these and owns the counts (LESSON-652):
+    ///
+    /// | Mutation | Fails on |
+    /// |---|---|
+    /// | drop the child-chunk arm (a child's chunk renders as the parent's) | the fragments carry the child's prose |
+    /// | key `tool_titles` by the call id alone | the parent's update is named with the child's title |
+    /// | record a child's tool title in `turn_tools` | the turn's tools list the child's `read` |
+    #[test]
+    fn a_childs_stream_is_labelled_and_never_the_parents_reply() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        // Verbose on throughout, so "not echoed" is not a claim about a quiet
+        // session only.
+        state.verbose = true;
+        let stream = [
+            from_parent(SessionUpdatePayload::AgentMessageChunk {
+                text: "the answer".to_owned(),
+            }),
+            from_child(
+                "audit-1",
+                SessionUpdatePayload::AgentMessageChunk {
+                    text: "child prose".to_owned(),
+                },
+            ),
+            from_parent(SessionUpdatePayload::ToolCall {
+                tool_call_id: "c1".to_owned(),
+                title: "agent: 2 tasks".to_owned(),
+                status: ToolCallStatus::InProgress,
+            }),
+            from_child(
+                "audit-1",
+                SessionUpdatePayload::ToolCall {
+                    tool_call_id: "c1".to_owned(),
+                    title: "read src/lib.rs".to_owned(),
+                    status: ToolCallStatus::InProgress,
+                },
+            ),
+            from_child(
+                "audit-1",
+                SessionUpdatePayload::ToolCallUpdate {
+                    tool_call_id: "c1".to_owned(),
+                    status: ToolCallStatus::Completed,
+                },
+            ),
+            from_child(
+                "audit-1",
+                SessionUpdatePayload::Diff {
+                    path: "src/lib.rs".to_owned(),
+                    old_text: Some("a".to_owned()),
+                    new_text: "b".to_owned(),
+                },
+            ),
+            from_parent(SessionUpdatePayload::ToolCallUpdate {
+                tool_call_id: "c1".to_owned(),
+                status: ToolCallStatus::Completed,
+            }),
+        ];
+        for event in stream {
+            render_event(&envelope(event), &mut surface, &mut state);
+        }
+
+        assert_eq!(surface.fragments(), "the answer");
+        assert_eq!(state.turn_reply, "the answer");
+        assert_eq!(state.turn_tools, ["agent: 2 tasks"]);
+        assert_eq!(
+            surface.lines_of(LineKind::Tool),
+            [
+                "agent: 2 tasks [running]",
+                "child audit-1: read src/lib.rs [running]",
+                "child audit-1: read src/lib.rs [done]",
+                "agent: 2 tasks [done]",
+            ]
+        );
+        assert_eq!(
+            surface.lines_of(LineKind::Diff),
+            ["child audit-1: ± src/lib.rs", "- a", "+ b"]
+        );
+    }
+
+    /// **REQ-623 BR-13: the agent events draw the lines a user must not miss,
+    /// always, and their bookkeeping under `/verbose` only.**
+    ///
+    /// Always: a call refused whole (the model's call did nothing, BR-3), and a
+    /// child that ended without completing (its part of the work never came
+    /// back) — one line each, the wire code leading. Quiet otherwise: a session
+    /// that dispatches children and gets them all back draws not one line here,
+    /// because the `agent` tool's own start and finish and the activity row
+    /// already said it. The consent label draws nothing in either mode — the
+    /// `permission_request` beside it is the prompt.
+    ///
+    /// **Mutations, applied and observed red (2026-10-05)** — each **1 red of 880** in the `teton`
+    /// unit suite, this test, and each reverted with the same edit. The e2e
+    /// suites carry no agent events until TASK-430, so they were not run
+    /// under mutation; that task re-runs these and owns the counts (LESSON-652):
+    ///
+    /// | Mutation | Fails on |
+    /// |---|---|
+    /// | the refused and finished arms draw nothing (TASK-421's no-op) | the refusal and the `timed_out` line are missing |
+    /// | drop the `verbose` gate on `agent_call_started` | the quiet session draws a line |
+    #[test]
+    fn agent_events_say_what_a_user_must_know() {
+        use teton_protocol::agent::{ChildBounds, ChildRoute};
+        use teton_protocol::events::{
+            AgentCallFinished, AgentCallRefused, AgentCallStarted, AgentChildConsentRequested,
+            AgentChildFinished, AgentChildShareReleased, AgentChildStarted, FinishedChild,
+            PlannedChild, ShareRecipient,
+        };
+
+        let finished = |name: &str, status: ChildStatus, truncated: bool| {
+            Event::AgentChildFinished(AgentChildFinished {
+                child_id: child_id(name),
+                status,
+                turns_used: 3,
+                cost_micro_cents: 30_000,
+                report_bytes: 48_000,
+                truncated,
+            })
+        };
+        let bookkeeping = [
+            Event::AgentCallStarted(AgentCallStarted {
+                call_id: "toolu_01".to_owned(),
+                parent_turn_id: teton_protocol::TurnId::from("turn-3"),
+                children: vec![
+                    PlannedChild {
+                        name: "audit-1".to_owned(),
+                        requested_tier: Some(Tier::Build),
+                    },
+                    PlannedChild {
+                        name: "audit-2".to_owned(),
+                        requested_tier: None,
+                    },
+                ],
+            }),
+            Event::AgentChildStarted(AgentChildStarted {
+                child_id: child_id("audit-1"),
+                parent_turn_id: teton_protocol::TurnId::from("turn-3"),
+                name: "audit-1".to_owned(),
+                route: ChildRoute {
+                    tier: Some(Tier::Build),
+                    provider_id: ProviderId::from("deepseek"),
+                    model: "deepseek-v4-pro".to_owned(),
+                },
+                bounds: ChildBounds {
+                    max_turns: 8,
+                    context_budget_bytes: 64_000,
+                    spend_ceiling_micro_cents: Some(150_000),
+                    deadline_secs: 300,
+                },
+            }),
+            Event::AgentChildConsentRequested(AgentChildConsentRequested {
+                child_id: child_id("audit-1"),
+                name: "audit-1".to_owned(),
+                tool: "shell".to_owned(),
+            }),
+            finished("audit-1", ChildStatus::Completed, true),
+            Event::AgentChildShareReleased(AgentChildShareReleased {
+                child_id: child_id("audit-1"),
+                released_micro_cents: 40_000,
+                recipients: vec![ShareRecipient {
+                    child_id: child_id("audit-2"),
+                    new_ceiling_micro_cents: 190_000,
+                }],
+            }),
+            Event::AgentCallFinished(AgentCallFinished {
+                call_id: "toolu_01".to_owned(),
+                children: vec![
+                    FinishedChild {
+                        name: "audit-1".to_owned(),
+                        status: ChildStatus::Completed,
+                    },
+                    FinishedChild {
+                        name: "audit-2".to_owned(),
+                        status: ChildStatus::TimedOut,
+                    },
+                ],
+                total_cost_micro_cents: 90_000,
+                elapsed_ms: 12_345,
+            }),
+        ];
+        let must_know = [
+            finished("audit-2", ChildStatus::TimedOut, false),
+            Event::AgentCallRefused(AgentCallRefused {
+                call_id: "toolu_02".to_owned(),
+                refusal: AgentRefusal::TooManyChildren {
+                    requested: 5,
+                    cap: 4,
+                },
+            }),
+        ];
+        let must_know_lines = [
+            "child audit-2 ended timed_out — passed its deadline after 3 model call(s)",
+            "agent call refused (too_many_children): 5 tasks in one call, at most 4 allowed \
+             (agent.max_children_per_call); no child was started",
+        ];
+
+        // Quiet: the bookkeeping draws nothing; the two that matter draw one
+        // line each.
+        let mut quiet = RecordingSurface::new();
+        let mut state = SessionState::new();
+        for event in bookkeeping.iter().chain(&must_know) {
+            render_event(&envelope(event.clone()), &mut quiet, &mut state);
+        }
+        assert_eq!(quiet.lines_of(LineKind::Notice), must_know_lines);
+
+        // Verbose: the bookkeeping, in the order it arrived, then the same two.
+        let mut verbose = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.verbose = true;
+        for event in bookkeeping.iter().chain(&must_know) {
+            render_event(&envelope(event.clone()), &mut verbose, &mut state);
+        }
+        let mut expected = vec![
+            "agent call toolu_01: starting 2 child(ren) — audit-1, audit-2",
+            "child audit-1 started on build deepseek/deepseek-v4-pro · up to 8 model call(s) · \
+             64 KB context · 300s deadline · spend share $1.50",
+            "child audit-1 completed after 3 model call(s) · report cut at the bound (48 KB in \
+             full, in the session transcript)",
+            "child audit-1 released $0.40 of unspent share to 1 running sibling(s)",
+            "agent call toolu_01 finished: 1 of 2 child(ren) completed · $0.90 · 12.3s",
+        ];
+        expected.extend(must_know_lines);
+        assert_eq!(verbose.lines_of(LineKind::Notice), expected);
+
+        // Every way a child can end without completing draws its one line,
+        // naming the status by its wire spelling, in a quiet session.
+        for status in ChildStatus::ALL {
+            let mut surface = RecordingSurface::new();
+            let mut state = SessionState::new();
+            render_event(
+                &envelope(finished("audit-2", status, false)),
+                &mut surface,
+                &mut state,
+            );
+            let lines = surface.lines_of(LineKind::Notice);
+            if status == ChildStatus::Completed {
+                assert!(lines.is_empty(), "{lines:?}");
+            } else {
+                assert_eq!(lines.len(), 1, "{status}: {lines:?}");
+                assert!(
+                    lines[0].starts_with(&format!("child audit-2 ended {status} — ")),
+                    "{lines:?}"
+                );
+            }
+        }
     }
 
     /// REQ-558: a decision that came through the category chain is labelled by

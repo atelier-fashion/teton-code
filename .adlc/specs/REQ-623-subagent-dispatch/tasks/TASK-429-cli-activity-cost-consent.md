@@ -1,7 +1,7 @@
 ---
 id: TASK-429
 title: "CLI: children on the activity line, per-child /cost rows, child-labelled consent prompts"
-status: draft
+status: complete
 parent: REQ-623
 created: 2026-10-05
 updated: 2026-10-05
@@ -26,10 +26,10 @@ today.
 
 ## Acceptance Criteria
 
-- [ ] Activity line shows `children: audit-1 12s, audit-2 12s` style while two run and drops a finished one
-- [ ] `/cost` shows the parent total and one indented row per child
-- [ ] A consent prompt from a child is labelled with its name; one from the parent is unchanged
-- [ ] Snapshot/golden tests for the three renders; `cargo test -p teton` green
+- [x] Activity line shows `children: audit-1 12s, audit-2 12s` style while two run and drops a finished one
+- [x] `/cost` shows the parent total and one indented row per child
+- [x] A consent prompt from a child is labelled with its name; one from the parent is unchanged
+- [x] Snapshot/golden tests for the three renders; `cargo test -p teton` green
 
 ## Verification
 

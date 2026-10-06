@@ -67,9 +67,28 @@
 //! owes a test. The count is rewritten here rather than appended to, by
 //! REQ-621's last test-bearing task, so that one number speaks for the whole
 //! suite (LESSON-652).
+//!
+//! # Children (REQ-623 BR-13)
+//!
+//! An `agent` call runs child turns while the parent's own phase is the tool
+//! that dispatched them, so the row names them in a clause of its own —
+//! `children: audit-1 12s, audit-2 12s` — folded from `agent_child_started`
+//! and `agent_child_finished` and timed from the client's clock like every
+//! other figure here. Two rules keep it honest. A child's stream is **not** the
+//! parent's: a `session_update` carrying a `child_id` refreshes the stall clock
+//! and moves nothing else, because a child's text chunk folded as the reply
+//! arriving would put the turn in `streaming` and withdraw the row — the
+//! running-and-invisible child BUG-226 was. And the clause is **in** the row,
+//! never a second row: the block's geometry is one activity row above the
+//! pending row (REQ-622 ADR-622-4), so a clause that grew a row would reflow
+//! the line the user is typing into. Past the terminal's width the names give
+//! way to a `+N` count before any later clause is cut. A stream with no agent
+//! events — every daemon before REQ-623 — has no children and renders exactly
+//! as it did.
 
 use std::time::{Duration, Instant};
 
+use teton_protocol::agent::ChildId;
 use teton_protocol::events::{
     thousands, Event, EventEnvelope, PrefillProgress, RouteDecided, SessionUpdatePayload,
     ToolCallStatus, TurnQueued,
@@ -159,6 +178,23 @@ pub struct TurnSummary {
     pub cost_micros: i64,
 }
 
+/// One child of an `agent` call this turn made, while it runs (REQ-623 BR-13).
+///
+/// Everything here is reported or measured, never derived: the id and the name
+/// are `agent_child_started`'s own fields (the event carries the name so a
+/// client can label a child without taking its id apart), and `since` is the
+/// instant the pump handed that event in — the same clock every other figure in
+/// the row reads.
+#[derive(Debug, Clone)]
+struct RunningChild {
+    /// The key `agent_child_finished` names the child by.
+    id: ChildId,
+    /// What the row calls it.
+    name: String,
+    /// When its start was observed.
+    since: Instant,
+}
+
 /// The turn's activity. Cheap to clone, holds no handles, reads no clock.
 #[derive(Debug, Clone, Default)]
 pub struct TurnActivity {
@@ -214,6 +250,15 @@ pub struct TurnActivity {
     /// which is what makes the clause a claim about *this* turn: a queue
     /// drained into the next turn's prompt is no longer waiting.
     queued: usize,
+    /// The children running under this turn's `agent` calls, in the order they
+    /// started (REQ-623 BR-13).
+    ///
+    /// Added by `agent_child_started`, removed by `agent_child_finished` — and,
+    /// as a backstop for a subscriber that lagged past a child's finish, by the
+    /// `agent_call_finished` that lists it. Cleared by [`Self::begin`] and
+    /// [`Self::finish`] with everything else, so a child cannot outlive the
+    /// turn it ran under on the row.
+    children: Vec<RunningChild>,
 }
 
 impl TurnActivity {
@@ -273,6 +318,16 @@ impl TurnActivity {
                 self.route = Some(route_clause(route));
                 self.enter(Phase::AwaitingModel, now);
             }
+            // REQ-623 ADR-3: a child's stream is the session's stream with two
+            // more facts, and this row is the **parent's**. A child's text chunk
+            // is not the parent's reply arriving — folding it as one would put
+            // the turn in `streaming` and withdraw the row for as long as any
+            // child talks, which is the running-and-invisible child BR-13
+            // forbids. A child's tool start is not the parent's tool either: the
+            // parent is running the `agent` call, and that sentence must survive
+            // its children's `read`s. What a child's update does say is that the
+            // daemon is alive on this turn.
+            Event::SessionUpdate(update) if update.child_id.is_some() => self.touch(now),
             Event::SessionUpdate(update) => match &update.update {
                 // `enter` on every chunk, not only the first: the phase clock is
                 // refreshed by each one, so a mid-stream stall measures from the
@@ -342,6 +397,49 @@ impl TurnActivity {
                 self.touch(now);
             }
             Event::ContextCompacted(_) => self.enter(Phase::Compacting, now),
+            // REQ-623 BR-13: the call's running children, from the two events
+            // that bracket each one. Keyed by id, because the id is what
+            // `agent_child_finished` names; a second start for an id already
+            // listed is a repeat, not a second child. None of these is a phase:
+            // the parent is still running the `agent` tool, and its children
+            // are a clause on that sentence.
+            Event::AgentChildStarted(started) => {
+                if !self
+                    .children
+                    .iter()
+                    .any(|child| child.id == started.child_id)
+                {
+                    self.children.push(RunningChild {
+                        id: started.child_id.clone(),
+                        name: started.name.clone(),
+                        since: now,
+                    });
+                }
+                self.touch(now);
+            }
+            Event::AgentChildFinished(finished) => {
+                self.children.retain(|child| child.id != finished.child_id);
+                self.touch(now);
+            }
+            // The backstop. Every child is terminal before its call finishes,
+            // so on a healthy stream this removes nothing — but a subscriber
+            // that lagged past an `agent_child_finished` would otherwise show
+            // that child running until the turn ended. The ids are **minted**
+            // from the call's id and each listed name, never parsed out of the
+            // ids already held ([`ChildId`] is opaque).
+            Event::AgentCallFinished(finished) => {
+                self.children.retain(|child| {
+                    !finished
+                        .children
+                        .iter()
+                        .any(|done| ChildId::new(&finished.call_id, &done.name) == child.id)
+                });
+                self.touch(now);
+            }
+            Event::AgentCallStarted(_)
+            | Event::AgentChildConsentRequested(_)
+            | Event::AgentChildShareReleased(_)
+            | Event::AgentCallRefused(_) => self.touch(now),
             _ => {}
         }
     }
@@ -473,11 +571,14 @@ impl TurnActivity {
             now.saturating_duration_since(phase_since).as_secs(),
             now.saturating_duration_since(turn_started).as_secs(),
         );
+        // The clauses after the clocks, composed apart from the head so the
+        // children clause below can be budgeted against both.
+        let mut tail = String::new();
         // BR-3: shown once it is non-zero, in the cost meter's own formatting. A
         // single-call turn never shows it, because its only cost row arrives as
         // the turn ends.
         if self.cost_micros != 0 {
-            row.push_str(&format!(" · {}", format_usd(self.cost_micros)));
+            tail.push_str(&format!(" · {}", format_usd(self.cost_micros)));
         }
         // REQ-622 BR-14: an Enter that registered is visible without waiting
         // for the turn to end. The pending row it came from is withdrawn the
@@ -490,17 +591,29 @@ impl TurnActivity {
         // the same fit as every other clause: on a terminal too narrow for it
         // the row loses its tail rather than its shape (BR-14).
         if self.queued != 0 {
-            row.push_str(&format!(" · {} queued", self.queued));
+            tail.push_str(&format!(" · {} queued", self.queued));
         }
         // Last, so the phase, its clock and the turn's clock read in the same
         // places they do on a healthy row — a reader comparing two frames is
         // looking for what changed, and moving the counters would hide it.
         if stalled {
-            row.push_str(&format!(
+            tail.push_str(&format!(
                 " · no word from the daemon for {}s",
                 quiet.as_secs()
             ));
         }
+        // REQ-623 BR-13: the running children, straight after the clocks — what
+        // the `agent` call the sentence names is doing — and ahead of the cost,
+        // the queue and the stall clause, which keep their places. Composed
+        // against the same budget the fit below uses, so the names give way to
+        // a `+N` count before any later clause is cut. With no children there is
+        // no clause at all, which is what keeps every pre-REQ-623 row
+        // byte-identical.
+        if !self.children.is_empty() {
+            let clause = self.children_clause(now, &row, &tail, width.saturating_sub(1));
+            row.push_str(&clause);
+        }
+        row.push_str(&tail);
         // **Measured on the text the terminal will actually receive**, which is
         // not the text composed above. Every row goes out through
         // [`crate::render::Surface::line`] or `repaint_row_above`, and both
@@ -546,6 +659,52 @@ impl TurnActivity {
         };
         *self = Self::default();
         summary
+    }
+
+    /// The running-children clause — ` · children: audit-1 12s, audit-2 12s` —
+    /// fitted between `head` and `tail` within `budget` columns (REQ-623 BR-13).
+    ///
+    /// The most names that fit, in start order, then `+N` for the rest; with no
+    /// room for a single name, the count alone. Each candidate is measured as
+    /// the **whole defused row** it would make, which is the measurement
+    /// [`fit`] makes afterwards: a name is model-authored, so it is exactly the
+    /// text that may carry the control bytes and wide glyphs the fit's own
+    /// comment is about, and a clause measured any other way would be a second
+    /// measurement free to disagree with the first. When even the count does
+    /// not fit, it is kept anyway and the fit cuts the row's tail as it cuts any
+    /// other clause — the row loses its end rather than its shape.
+    ///
+    /// Each child's time is its own, from the start this client observed.
+    fn children_clause(&self, now: Instant, head: &str, tail: &str, budget: usize) -> String {
+        let total = self.children.len();
+        let compose = |shown: usize| {
+            let named: Vec<String> = self.children[..shown]
+                .iter()
+                .map(|child| {
+                    format!(
+                        "{} {}s",
+                        child.name,
+                        now.saturating_duration_since(child.since).as_secs()
+                    )
+                })
+                .collect();
+            let mut clause = format!(" · children: {}", named.join(", "));
+            let hidden = total - shown;
+            if hidden != 0 {
+                if shown != 0 {
+                    clause.push_str(", ");
+                }
+                clause.push_str(&format!("+{hidden}"));
+            }
+            clause
+        };
+        (1..=total)
+            .rev()
+            .map(compose)
+            .find(|clause| {
+                display_width(&crate::render::defused(&format!("{head}{clause}{tail}"))) <= budget
+            })
+            .unwrap_or_else(|| compose(0))
     }
 
     /// The `awaiting_model` sentence.
@@ -703,9 +862,11 @@ fn fit(row: &str, width: usize) -> String {
 mod tests {
     use super::*;
 
+    use teton_protocol::agent::{ChildBounds, ChildRoute, ChildStatus};
     use teton_protocol::events::{
-        ContextCompacted, CostRecord, CostRecorded, PermissionOption, PermissionOptionKind,
-        PermissionRequest, SessionTitled, SessionUpdate, TierWarming,
+        AgentCallFinished, AgentChildFinished, AgentChildStarted, ContextCompacted, CostRecord,
+        CostRecorded, FinishedChild, PermissionOption, PermissionOptionKind, PermissionRequest,
+        SessionTitled, SessionUpdate, TierWarming,
     };
     use teton_protocol::{ProviderId, RequestId, Tier, TurnId};
 
@@ -850,6 +1011,52 @@ mod tests {
             dropped_blocks_omitted: 0,
             provider_id: None,
             fallback: true,
+        })
+    }
+
+    /// The id of the child `name` in the fixture's one `agent` call.
+    fn child(name: &str) -> ChildId {
+        ChildId::new("toolu_01", name)
+    }
+
+    /// `agent_child_started` for `name`, as the daemon publishes it.
+    fn child_started(name: &str) -> Event {
+        Event::AgentChildStarted(AgentChildStarted {
+            child_id: child(name),
+            parent_turn_id: TurnId::from("turn-3"),
+            name: name.to_owned(),
+            route: ChildRoute {
+                tier: Some(Tier::Build),
+                provider_id: ProviderId::from("deepseek"),
+                model: "deepseek-v4-pro".to_owned(),
+            },
+            bounds: ChildBounds {
+                max_turns: 8,
+                context_budget_bytes: 64_000,
+                spend_ceiling_micro_cents: None,
+                deadline_secs: 300,
+            },
+        })
+    }
+
+    fn child_finished(name: &str, status: ChildStatus) -> Event {
+        Event::AgentChildFinished(AgentChildFinished {
+            child_id: child(name),
+            status,
+            turns_used: 2,
+            cost_micro_cents: 0,
+            report_bytes: 120,
+            truncated: false,
+        })
+    }
+
+    /// A `session_update` from inside a child — the parent's payload with the
+    /// two stamped ids (REQ-623 ADR-3).
+    fn from_child(name: &str, update: SessionUpdatePayload) -> Event {
+        Event::SessionUpdate(SessionUpdate {
+            update,
+            child_id: Some(child(name)),
+            parent_turn_id: Some(TurnId::from("turn-3")),
         })
     }
 
@@ -1763,6 +1970,192 @@ mod tests {
         assert_eq!(
             activity.frame(at(t0, 10), 0, 120).as_deref(),
             Some("⠋ running shell: cargo test · 1s · turn 10s")
+        );
+    }
+
+    /// **REQ-623 BR-13: the row names the running children, drops a finished
+    /// one, and an old daemon's stream renders exactly as it did.**
+    ///
+    /// Every expectation is a literal (LESSON-569). The benign half is the
+    /// first assertion: a stream with no agent events and no ids — every daemon
+    /// before REQ-623 — draws the row it always drew, which is also the string
+    /// the last assertion returns to once both children have finished.
+    ///
+    /// The widths are arithmetic and the arithmetic is written down. The head
+    /// `⠋ running agent: 3 tasks · 12s · turn 15s` is 41 columns, ` · children: `
+    /// is 13, each `audit-n 12s` is 11, a separator 2, a `, +2` 4. All three
+    /// names make 91 columns; one name and the count 69; the count alone 56.
+    /// So at 80 (79 to spend) one name fits and two (82) do not, and at 60 (59
+    /// to spend) no name fits and the count does.
+    ///
+    /// **Mutations, applied and observed red (2026-10-05)** — each **1 red of 880** in the `teton`
+    /// unit suite, this test, and each reverted with the same edit. The e2e
+    /// suites carry no agent events until TASK-430, so they were not run
+    /// under mutation; that task re-runs these and owns the counts (LESSON-652):
+    ///
+    /// | Mutation | Fails on |
+    /// |---|---|
+    /// | drop the `retain` in the `agent_child_finished` arm | the row after `audit-1` finishes still lists it |
+    /// | drop the child-scoped `session_update` arm (fold a child's stream as the parent's) | the phase after `audit-1`'s chunk is `streaming`, not `tool_running` |
+    /// | compose every name, unbudgeted (`compose(total)` always) | the 80-column row, which the fit then cuts mid-list at `audit-2 12s,` |
+    /// | drop the `agent_call_finished` backstop | the lagged children are still listed after their call finished |
+    #[test]
+    fn children_render_and_clear() {
+        let t0 = Instant::now();
+        let call: [(u64, Event); 2] = [(1, full_route()), (3, tool_call("agent: 2 tasks"))];
+
+        // Benign: no agent events, no ids — the row as it always was.
+        let old_daemon = folded(t0, &call);
+        assert_eq!(
+            old_daemon.frame(at(t0, 15), 0, 120).as_deref(),
+            Some("⠋ running agent: 2 tasks · 12s · turn 15s")
+        );
+
+        // Two children start, and one's text chunk arrives mid-call. It is not
+        // the parent's reply: the phase stays the `agent` tool, so the row is
+        // still drawn rather than withdrawn as though text were streaming.
+        let mut script = call.to_vec();
+        script.extend([
+            (3, child_started("audit-1")),
+            (3, child_started("audit-2")),
+            (
+                9,
+                from_child(
+                    "audit-1",
+                    SessionUpdatePayload::AgentMessageChunk {
+                        text: "found it".to_owned(),
+                    },
+                ),
+            ),
+        ]);
+        let mut two = folded(t0, &script);
+        assert_eq!(
+            two.phase(),
+            Phase::ToolRunning,
+            "a child's chunk is not the reply"
+        );
+        assert!(two.frame(at(t0, 9), 0, 120).is_some(), "the row stays up");
+
+        // The other child's tool start is not the parent's tool either: the
+        // sentence keeps the parent's title and its clock.
+        two.observe(
+            &env(from_child(
+                "audit-2",
+                SessionUpdatePayload::ToolCall {
+                    tool_call_id: "c1".to_owned(),
+                    title: "read src/lib.rs".to_owned(),
+                    status: ToolCallStatus::InProgress,
+                },
+            )),
+            Some(&ours()),
+            at(t0, 10),
+        );
+        assert_eq!(
+            two.frame(at(t0, 15), 0, 120).as_deref(),
+            Some("⠋ running agent: 2 tasks · 12s · turn 15s · children: audit-1 12s, audit-2 12s")
+        );
+
+        // One finishes: it leaves the clause, and its sibling keeps its clock.
+        two.observe(
+            &env(child_finished("audit-1", ChildStatus::Completed)),
+            Some(&ours()),
+            at(t0, 16),
+        );
+        assert_eq!(
+            two.frame(at(t0, 17), 0, 120).as_deref(),
+            Some("⠋ running agent: 2 tasks · 14s · turn 17s · children: audit-2 14s")
+        );
+
+        // The other ends without completing — a terminal status all the same.
+        two.observe(
+            &env(child_finished("audit-2", ChildStatus::TimedOut)),
+            Some(&ours()),
+            at(t0, 18),
+        );
+        assert_eq!(
+            two.frame(at(t0, 19), 0, 120).as_deref(),
+            Some("⠋ running agent: 2 tasks · 16s · turn 19s")
+        );
+
+        // Width-bounded: names give way to `+N`, then the count stands alone.
+        let three = folded(
+            t0,
+            &[
+                (1, full_route()),
+                (3, tool_call("agent: 3 tasks")),
+                (3, child_started("audit-1")),
+                (3, child_started("audit-2")),
+                (4, child_started("audit-3")),
+            ],
+        );
+        assert_eq!(
+            three.frame(at(t0, 15), 0, 120).as_deref(),
+            Some(
+                "⠋ running agent: 3 tasks · 12s · turn 15s · children: audit-1 12s, audit-2 12s, \
+                 audit-3 11s"
+            )
+        );
+        assert_eq!(
+            three.frame(at(t0, 15), 0, 80).as_deref(),
+            Some("⠋ running agent: 3 tasks · 12s · turn 15s · children: audit-1 12s, +2")
+        );
+        assert_eq!(
+            three.frame(at(t0, 15), 0, 60).as_deref(),
+            Some("⠋ running agent: 3 tasks · 12s · turn 15s · children: +3")
+        );
+
+        // The clauses after it keep their place: the names are shed before the
+        // cost is cut. 41 + ` · children: audit-1 12s, +1` (28) + ` · $0.012345`
+        // (12) is 81 columns, at a width of 82.
+        let mut costed = folded(
+            t0,
+            &[
+                (1, full_route()),
+                (3, tool_call("agent: 2 tasks")),
+                (3, child_started("audit-1")),
+                (3, child_started("audit-2")),
+                (5, cost(12_345)),
+            ],
+        );
+        assert_eq!(
+            costed.frame(at(t0, 15), 0, 82).as_deref(),
+            Some(
+                "⠋ running agent: 2 tasks · 12s · turn 15s · children: audit-1 12s, +1 · $0.012345"
+            )
+        );
+
+        // A subscriber that lagged past a child's finish: the call's own
+        // finish, which lists it, takes it off the row.
+        costed.observe(
+            &env(Event::AgentCallFinished(AgentCallFinished {
+                call_id: "toolu_01".to_owned(),
+                children: vec![
+                    FinishedChild {
+                        name: "audit-1".to_owned(),
+                        status: ChildStatus::Completed,
+                    },
+                    FinishedChild {
+                        name: "audit-2".to_owned(),
+                        status: ChildStatus::Completed,
+                    },
+                ],
+                total_cost_micro_cents: 0,
+                elapsed_ms: 12_000,
+            })),
+            Some(&ours()),
+            at(t0, 16),
+        );
+        assert_eq!(
+            costed.frame(at(t0, 17), 0, 120).as_deref(),
+            Some("⠋ running agent: 2 tasks · 14s · turn 17s · $0.012345")
+        );
+
+        // And a new turn inherits no children.
+        let mut next = folded(t0, &[(3, child_started("audit-1"))]);
+        next.begin(at(t0, 20));
+        assert_eq!(
+            next.frame(at(t0, 21), 0, 120).as_deref(),
+            Some("⠋ preparing turn · 1s · turn 1s")
         );
     }
 

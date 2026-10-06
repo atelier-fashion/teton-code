@@ -1816,11 +1816,16 @@ impl Connection {
             }
             EventOutcome::Permission(req) => {
                 // Not our session to answer — surface it and leave it to the
-                // interactive client that owns it.
+                // interactive client that owns it. A child's request says which
+                // child (REQ-623 AC-7) in the words the answering client's
+                // prompt uses; the parent's is the line it always was.
+                let by_child = req.child_id.as_ref().map_or_else(String::new, |child| {
+                    format!(" by child {}", session_ui::child_label(child))
+                });
                 ctx.surface.line(
                     LineKind::Notice,
                     &format!(
-                        "permission requested for tool `{}` in another session",
+                        "permission requested for tool `{}`{by_child} in another session",
                         req.tool_name
                     ),
                 );
@@ -4189,6 +4194,114 @@ mod tests {
             assert_eq!(drained.rendered, usize::from(renders), "{name}: count");
             assert_eq!(teardowns, usize::from(renders), "{name}: teardown");
         }
+    }
+
+    /// **REQ-623 AC-7: a consent prompt from a child names the child; one from
+    /// the parent is unchanged.**
+    ///
+    /// Driven through the real pump ([`Connection::drain_events`] →
+    /// `dispatch_event` → `render_event` → `resolve_permission`) from the
+    /// envelope a daemon publishes, because the label has to survive every one
+    /// of those seams — a `child_id` dropped anywhere between the decode and
+    /// the prompter would leave a user answering "allow shell?" with three
+    /// children running and no way to know which one asked.
+    ///
+    /// Literal on both sides: the heading the surface draws, the question the
+    /// prompter is asked, and — the benign path — the parent's two strings
+    /// exactly as they were before children existed. A name that itself holds a
+    /// `/` keeps it: the split is at the first `/`, after the daemon-minted call
+    /// id, which is the reading the daemon's own `/cost` labels take. And the
+    /// child's question is **answered**, on the wire, under its own request id —
+    /// a label that cost the reply would be worse than no label.
+    ///
+    /// **Mutations, applied and observed red (2026-10-05)** — each **1 red of 880** in the `teton`
+    /// unit suite, this test, and each reverted with the same edit. The e2e
+    /// suites carry no agent events until TASK-430, so they were not run
+    /// under mutation; that task re-runs these and owns the counts (LESSON-652):
+    ///
+    /// | Mutation | Fails on |
+    /// |---|---|
+    /// | `by_child` always empty in `resolve_permission` | the child's heading |
+    /// | `for_child` always empty in `resolve_permission` | the child's question |
+    /// | `child_label` splits at the **last** `/` | the `scan/src` heading |
+    #[test]
+    fn consent_prompt_names_the_child() {
+        use teton_protocol::agent::ChildId;
+        use teton_protocol::events::Event;
+
+        // One permission request through the pump, asked by `child` (or by the
+        // parent, for `None`) and answered `n`. Returns the prompt lines drawn,
+        // the questions asked, and the requests written back to the daemon.
+        let ask = |child: Option<ChildId>| {
+            let (mut conn, tx, peer) = test_connection();
+            let Incoming::Event(mut envelope) = permission_envelope("shell") else {
+                unreachable!("permission_envelope builds an event")
+            };
+            let Event::PermissionRequest(request) = &mut envelope.event else {
+                unreachable!("permission_envelope builds a permission_request")
+            };
+            request.parent_turn_id = child
+                .as_ref()
+                .map(|_| teton_protocol::TurnId::from("turn-3"));
+            request.child_id = child;
+            tx.send(Incoming::Event(envelope)).expect("queue");
+
+            let mut surface = RecordingSurface::new();
+            let mut state = SessionState::new();
+            let mut prompter = crate::prompt::ScriptedPrompter::new(&["n"]);
+            let mut ctx = UiContext {
+                surface: &mut surface,
+                state: &mut state,
+                prompter: &mut prompter,
+                answer_permissions: true,
+                answer_model_proposals: true,
+                auto_accept_model: false,
+                typed_input: true,
+                session_id: None,
+                skills: crate::slash::SkillSnapshot::empty(),
+            };
+            conn.drain_events(&mut ctx, || {}).expect("drain");
+            let lines: Vec<String> = surface
+                .lines_of(LineKind::Prompt)
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            (lines, prompter.questions, requests_written(&peer))
+        };
+
+        // Benign: the parent's ask, byte for byte as before REQ-623.
+        let (lines, questions, replies) = ask(None);
+        assert_eq!(lines, ["permission requested: shell — run `cargo test`"]);
+        assert_eq!(
+            questions,
+            ["  allow shell? [y]es / [n]o / [a]llow-always / [d]eny-always: "]
+        );
+        assert_eq!(replies.len(), 1, "{replies:?}");
+
+        // A child's ask names the child, in the heading and in the question.
+        let (lines, questions, replies) = ask(Some(ChildId::new("toolu_01", "audit-1")));
+        assert_eq!(
+            lines,
+            ["permission requested by child audit-1: shell — run `cargo test`"]
+        );
+        assert_eq!(
+            questions,
+            ["  allow shell for child audit-1? [y]es / [n]o / [a]llow-always / [d]eny-always: "]
+        );
+        assert_eq!(
+            replies.len(),
+            1,
+            "the child's question is answered: {replies:?}"
+        );
+        assert_eq!(replies[0]["method"], "permission/respond", "{replies:?}");
+        assert_eq!(replies[0]["params"]["request_id"], "r1", "{replies:?}");
+
+        // A model-chosen name with a `/` in it is the name, whole.
+        let (lines, _, _) = ask(Some(ChildId::new("toolu_01", "scan/src")));
+        assert_eq!(
+            lines,
+            ["permission requested by child scan/src: shell — run `cargo test`"]
+        );
     }
 
     #[test]
