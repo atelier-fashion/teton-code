@@ -21,6 +21,9 @@
 //!   **and** provider usability injected as closures, mirroring the shape of the
 //!   phase-policy evaluator it replaced (`policy::evaluate`, deleted with its
 //!   last caller — ADR-J).
+//! - [`resolve_with_tier_request`] — [`resolve`] for a call that *requests* a
+//!   tier (REQ-623 BR-6): the requested tier's configured binding, else
+//!   [`resolve`]'s own answer. A request is a hint, never a refusal.
 //!
 //! # Two things this module makes impossible rather than merely forbidden
 //!
@@ -943,7 +946,9 @@ where
 pub enum BindingSource {
     /// A `[[categories]]` row naming this category.
     Override,
-    /// The `[[tiers]]` row of the category's tier.
+    /// The `[[tiers]]` row of the category's tier — or, for a request
+    /// [`resolve_with_tier_request`] honoured, of the requested tier, which
+    /// [`CategoryResolution::tier`] then names (REQ-623 BR-6).
     TierInheritance,
     /// Neither: the category is pinned to the local tier by construction and
     /// consults no binding at all (`route`, `redact` — BR-4, BR-5, ADR-B).
@@ -1064,7 +1069,35 @@ where
         _ => format!("through its '{tier}' tier binding"),
     };
 
-    match screen(primary, &health, &usable) {
+    resolve_row(
+        category, tier, source, primary, fallback, &via, &health, &usable,
+    )
+}
+
+/// The screening half of [`resolve`], once a row has been found: the primary,
+/// then the same row's fallback, then a failure that names both.
+///
+/// Split out of [`resolve`] so [`resolve_with_tier_request`] screens a
+/// requested tier's row through **these** sentences and this order rather than
+/// a copy of them — a second screen is the BUG-155 shape (one path screening
+/// providers, another not). `via` is the clause naming the row; `tier` is the
+/// tier the resolution reports, which for a request is the requested one.
+#[allow(clippy::too_many_arguments)]
+fn resolve_row<H, U>(
+    category: Category,
+    tier: Tier,
+    source: BindingSource,
+    primary: &str,
+    fallback: Option<&str>,
+    via: &str,
+    health: &H,
+    usable: &U,
+) -> CategoryResolution
+where
+    H: Fn(&str) -> ProviderHealth,
+    U: Fn(&str) -> bool,
+{
+    match screen(primary, health, usable) {
         Ok(ProviderHealth::Degraded) => CategoryResolution {
             category,
             tier,
@@ -1088,9 +1121,119 @@ where
             outcome: RouteOutcome::Primary,
         },
         Err(rejected) => resolve_fallback(
-            category, tier, primary, rejected, source, fallback, &health, &usable,
+            category, tier, primary, rejected, source, fallback, health, usable,
         ),
     }
+}
+
+/// Resolve `category` for a call that may **request** a tier (REQ-623 BR-6):
+/// the requested tier's binding when one is configured, else exactly what
+/// [`resolve`] answers for `category`.
+///
+/// Requested, routed, pinned — in that order. This function is the first two;
+/// the session's privacy pin is the caller's, applied **before** any category
+/// is resolved and consulting no binding (REQ-558 BR-7, LESSON-432), so a
+/// request has no path into it and the pin holds whatever was requested.
+///
+/// Pure, like [`resolve`]: no I/O, no clock, no globals, and no state carried
+/// between calls — one caller's request cannot move another caller's route.
+///
+/// # Precedence
+///
+/// 1. `request == None` is [`resolve`], returned verbatim.
+/// 2. A category pinned to the local tier by construction (`redact`, `route`)
+///    stays pinned: a request never lifts a duty off the machine.
+/// 3. The requested tier's row in `configured`, screened for usability and
+///    health exactly as [`resolve`] screens a row (primary, then the same row's
+///    fallback). It **outranks a per-category override** — BR-6 names the
+///    requested tier's binding, and a request that the category's own row could
+///    silently veto would be a request that does nothing.
+/// 4. Otherwise [`resolve`]'s answer for `category`, with a leading sentence
+///    saying the request was not honoured and why.
+///
+/// A request the table cannot honour is **not** a refusal: it resolves to the
+/// route a call of `category` gets with no request, and the resolution says
+/// which it is — [`CategoryResolution::tier`] is the requested tier only when
+/// the requested row served.
+///
+/// # Why two tables
+///
+/// `configured` answers "did the user bind the requested tier" and `table` is
+/// what the category's own route resolves through. The daemon passes its rows
+/// *as configured* for the first and its effective table — with unbound tiers
+/// filled from `default_provider` or the local tier — for the second. Honouring
+/// a fill would send a `think`-category call requesting an unbound `build` to
+/// `default_provider` instead of to its category's route, which is the case
+/// BR-6's "else the default route for the category" exists for.
+#[must_use]
+pub fn resolve_with_tier_request<H, U>(
+    category: Category,
+    request: Option<Tier>,
+    configured: &CategoryTable,
+    table: &CategoryTable,
+    health: H,
+    usable: U,
+) -> CategoryResolution
+where
+    H: Fn(&str) -> ProviderHealth,
+    U: Fn(&str) -> bool,
+{
+    let Some(requested) = request else {
+        return resolve(category, table, health, usable);
+    };
+    // The request was not honoured: the category's own route, prefixed with
+    // the sentence saying so. Everything structural — tier, source, outcome,
+    // fallback — is the default's, so nothing downstream can mistake it for the
+    // requested route.
+    let not_honoured = |why: String| {
+        let default = resolve(category, table, &health, &usable);
+        CategoryResolution {
+            reason: format!("{why} {}", default.reason),
+            ..default
+        }
+    };
+
+    if category.configurable().is_none() {
+        return not_honoured(format!(
+            "The '{requested}' tier was requested, but the '{category}' category is pinned to \
+             the local tier by construction, so the request is not honoured."
+        ));
+    }
+    let Some(row) = configured.tier_binding(requested) else {
+        return not_honoured(format!(
+            "The '{requested}' tier was requested, but no provider is configured for it, so \
+             the '{category}' category takes its default route."
+        ));
+    };
+
+    let honoured = resolve_row(
+        category,
+        requested,
+        BindingSource::TierInheritance,
+        &row.provider_id,
+        row.fallback_id.as_deref(),
+        &format!("through the requested '{requested}' tier binding"),
+        &health,
+        &usable,
+    );
+    if honoured.provider_id.is_none() {
+        return not_honoured(format!(
+            "The '{requested}' tier was requested, but no provider its binding names can serve, \
+             so the '{category}' category takes its default route."
+        ));
+    }
+    // The primary arms already name the request in their `via` clause; the
+    // fallback sentence has no `via`, so it gets the request said up front.
+    if honoured.outcome == RouteOutcome::Fallback {
+        return CategoryResolution {
+            reason: format!(
+                "Through the requested '{requested}' tier binding: {}",
+                honoured.reason
+            ),
+            ..honoured
+        };
+    }
+    honoured
 }
 
 /// The fallback leg: the primary was passed over, so try the fallback from the

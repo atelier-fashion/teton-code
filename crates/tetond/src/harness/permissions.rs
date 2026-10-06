@@ -1734,6 +1734,80 @@ impl PolicySource {
     }
 }
 
+/// Told when an ask starts awaiting a human and when that wait is over, so a
+/// holder can measure the interval (REQ-623 BR-5, ADR-2).
+///
+/// The consumer is a child turn's `PausableDeadline`: BR-5 says time a child
+/// spends parked on a consent prompt does not count against its
+/// `deadline_secs`, and the gate is the only thing that knows when a call has
+/// stopped working and started waiting. A plain timeout around the child cannot
+/// tell the two apart.
+///
+/// ## What brackets the interval, exactly
+///
+/// [`Self::ask_awaiting`] fires once the prompt has been delivered — published,
+/// or handed to its one addressee — and the gate is about to park on the
+/// answer. [`Self::ask_settled`] fires when that park ends, **however** it ends:
+/// an answer, a client gone, or the awaiting call itself dropped (a cancelled
+/// or aborted turn). Every `ask_awaiting` is followed by exactly one
+/// `ask_settled` for the same request id.
+///
+/// Nothing fires for a decision that waited on nobody: a level `allow` or
+/// `deny`, a remembered session grant, or an addressed request with no route
+/// (which asks nobody). Those are not consent waits, and pausing a clock for
+/// them would be a hole in the bound.
+///
+/// ## Where the calls run
+///
+/// Both run synchronously inside the call that is waiting — `ask_awaiting` on
+/// the task that called the gate, `ask_settled` where that call's future
+/// completes or is dropped — so an observer can attribute the interval to its
+/// caller rather than to the session. Concurrent children share one gate
+/// (ADR-5), so a session-wide "is anyone asking" would pause every child for
+/// one child's prompt. Implementations must not block: they run inside the
+/// gate.
+pub trait AskObserver: Send + Sync {
+    /// `request_id`'s prompt for `tool_name` is out, and the gate is now
+    /// awaiting a human's answer.
+    fn ask_awaiting(&self, request_id: &RequestId, tool_name: &str);
+
+    /// The wait [`Self::ask_awaiting`] announced for `request_id` is over.
+    fn ask_settled(&self, request_id: &RequestId);
+}
+
+/// One pending ask, bracketed for an [`AskObserver`]: announced when built,
+/// closed when dropped — so the interval closes on every exit from the await,
+/// including the future being dropped mid-wait, where code after the `.await`
+/// would never run.
+struct AwaitingHuman {
+    observer: Arc<dyn AskObserver>,
+    request_id: RequestId,
+}
+
+impl AwaitingHuman {
+    /// Open the interval, or do nothing at all when no observer is wired —
+    /// the unset hook costs one `None` check on the path that is about to wait
+    /// for a human anyway.
+    fn begin(
+        observer: Option<&Arc<dyn AskObserver>>,
+        request_id: &RequestId,
+        tool_name: &str,
+    ) -> Option<Self> {
+        let observer = Arc::clone(observer?);
+        observer.ask_awaiting(request_id, tool_name);
+        Some(Self {
+            observer,
+            request_id: request_id.clone(),
+        })
+    }
+}
+
+impl Drop for AwaitingHuman {
+    fn drop(&mut self) {
+        self.observer.ask_settled(&self.request_id);
+    }
+}
+
 /// The session-scoped permission authority.
 ///
 /// Publishes prompts to the event bus, awaits answers via [`PendingPermissions`],
@@ -1802,6 +1876,10 @@ pub struct PermissionGate {
     /// the bus is what ADR-7 exists to keep a skill consent off. Such a gate
     /// answers [`SkillConsent::Unanswerable`] and asks nobody.
     addressed: Option<Arc<dyn AddressedPermissionDelivery>>,
+    /// Who is told when an ask starts and stops awaiting a human (REQ-623
+    /// BR-5). `None` on a gate nobody wired one into, which is every gate but
+    /// the daemon's — and then the await path does nothing extra at all.
+    ask_observer: Option<Arc<dyn AskObserver>>,
 }
 
 impl PermissionGate {
@@ -1860,6 +1938,7 @@ impl PermissionGate {
             project_trust_persistence: None,
             commitment_attestation: None,
             addressed: None,
+            ask_observer: None,
         }
     }
 
@@ -1999,6 +2078,18 @@ impl PermissionGate {
     #[must_use]
     pub fn with_addressed_delivery(mut self, route: Arc<dyn AddressedPermissionDelivery>) -> Self {
         self.addressed = Some(route);
+        self
+    }
+
+    /// Tell `observer` when each ask starts and stops awaiting a human
+    /// (REQ-623 BR-5) — see [`AskObserver`] for exactly what brackets the
+    /// interval.
+    ///
+    /// A seam like the others here: filled in where the session's gate is
+    /// built, and absent everywhere else.
+    #[must_use]
+    pub fn with_ask_observer(mut self, observer: Arc<dyn AskObserver>) -> Self {
+        self.ask_observer = Some(observer);
         self
     }
 
@@ -3171,7 +3262,17 @@ impl PermissionGate {
             ),
         }
 
-        match rx.await {
+        // REQ-623 BR-5: the one stretch of this function that waits on a
+        // human, and the only one bracketed for an observer. Everything above
+        // returned without waiting — the level, a grant, an addressee with no
+        // route — so nothing above opens it. Closed by the guard's drop, so a
+        // call abandoned mid-wait closes it too.
+        let answer = {
+            let _awaiting =
+                AwaitingHuman::begin(self.ask_observer.as_ref(), &request_id, tool_name);
+            rx.await
+        };
+        match answer {
             Ok(outcome) => self.interpret(tool_name, outcome, &question, addressee),
             // Client disconnected before answering: deny (never run unapproved).
             // Not a consent decision — nobody decided it — so nothing is
@@ -5217,6 +5318,189 @@ mod tests {
             PermissionDecision::Denied
         );
         assert_eq!(pending.pending_count(), 0);
+    }
+
+    // ---- REQ-623 BR-5: the ask-await hook ----------------------------------
+
+    /// What an [`AskObserver`] was told, in order, with the clock at each call.
+    #[derive(Default)]
+    struct RecordingObserver {
+        calls: Mutex<Vec<(String, RequestId, tokio::time::Instant)>>,
+    }
+
+    impl RecordingObserver {
+        fn calls(&self) -> Vec<(String, RequestId)> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(what, id, _)| (what.clone(), id.clone()))
+                .collect()
+        }
+
+        /// The clock between `id`'s `awaiting` and its `settled`.
+        fn interval(&self, id: &RequestId) -> Option<std::time::Duration> {
+            let calls = self.calls.lock().unwrap();
+            let at = |what: &str| {
+                calls
+                    .iter()
+                    .find(|(w, i, _)| w.starts_with(what) && i == id)
+                    .map(|(_, _, t)| *t)
+            };
+            Some(at("settled")? - at("awaiting")?)
+        }
+    }
+
+    impl AskObserver for RecordingObserver {
+        fn ask_awaiting(&self, request_id: &RequestId, tool_name: &str) {
+            self.calls.lock().unwrap().push((
+                format!("awaiting {tool_name}"),
+                request_id.clone(),
+                tokio::time::Instant::now(),
+            ));
+        }
+
+        fn ask_settled(&self, request_id: &RequestId) {
+            self.calls.lock().unwrap().push((
+                "settled".to_owned(),
+                request_id.clone(),
+                tokio::time::Instant::now(),
+            ));
+        }
+    }
+
+    /// The id of the next prompt the bus carries — bounded, for
+    /// [`answer_next`]'s reason: a prompt that never comes is a red test, not a
+    /// hung one.
+    async fn next_prompt(sub: &mut crate::broadcast::Subscription) -> RequestId {
+        let env = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
+            .await
+            .expect("a prompt must be published — none arrived within the timeout")
+            .expect("a prompt was published");
+        match env.event {
+            Event::PermissionRequest(pr) => pr.request_id,
+            other => panic!("expected permission_request, got {other:?}"),
+        }
+    }
+
+    /// **REQ-623 BR-5 / ADR-2: the hook brackets the time an ask waits on a
+    /// human, and nothing else.**
+    ///
+    /// A child's `PausableDeadline` stops while this interval is open, so the
+    /// two failure directions are both holes. Fire outside a pending ask (a
+    /// level allow, a deny, a remembered grant) and a child's clock stops while
+    /// it is working — the deadline stops bounding work. Fail to close (an
+    /// abandoned call) and a clock stays stopped forever.
+    ///
+    /// The clock is paused, so the 90 seconds nobody answers for are exact:
+    /// the interval the observer measures is the wait, not the test's
+    /// scheduling.
+    ///
+    /// # Mutations
+    ///
+    /// Each reverted after:
+    ///
+    /// - **Drop the guard's `ask_settled`** (empty `Drop::drop`): reddens at
+    ///   the first post-answer assertion — the interval never closes.
+    /// - **Open the interval before the level is consulted** (a `begin` at the
+    ///   top of `settle`): reddens on the benign path — the auto-allowed
+    ///   `read` reports a wait no human was asked for.
+    /// - **Open it after the await** (`begin` below `rx.await`): reddens at
+    ///   "the interval is open while nobody answers" — nothing is reported
+    ///   during the wait.
+    #[tokio::test(start_paused = true)]
+    async fn ask_await_hook_brackets_the_pending_interval() {
+        let mut cfg = PermissionConfig::with_default(PermissionPolicy::Allow);
+        cfg.set("shell", PermissionPolicy::Ask);
+        cfg.set("edit", PermissionPolicy::Ask);
+        cfg.set("delete_everything", PermissionPolicy::Deny);
+        let (bus, pending, gate) = gate(cfg);
+        let observer = Arc::new(RecordingObserver::default());
+        let gate = Arc::new(gate.with_ask_observer(Arc::clone(&observer) as Arc<dyn AskObserver>));
+        let mut sub = bus.subscribe(16);
+
+        // The benign path: the level answers both ways and nobody waits.
+        assert_eq!(
+            gate.authorize("read", None).await,
+            PermissionDecision::Allowed
+        );
+        assert_eq!(
+            gate.authorize("delete_everything", None).await,
+            PermissionDecision::Denied
+        );
+        assert_eq!(
+            observer.calls(),
+            Vec::new(),
+            "a decision the level made waited on nobody and must report no wait"
+        );
+
+        // An ask. The interval opens once the prompt is out …
+        let asking = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            async move { gate.authorize("shell", None).await }
+        });
+        let rid = next_prompt(&mut sub).await;
+        assert_eq!(
+            observer.calls(),
+            vec![("awaiting shell".to_owned(), rid.clone())],
+            "the interval is open while nobody answers"
+        );
+
+        // … and stays open while the human is away.
+        tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+        assert_eq!(pending.pending_count(), 1);
+        assert_eq!(observer.calls().len(), 1, "still waiting, still open");
+
+        assert!(pending.resolve(
+            &rid,
+            PermissionOutcome::Selected {
+                option_id: "allow_always".to_owned()
+            }
+        ));
+        assert_eq!(asking.await.unwrap(), PermissionDecision::Allowed);
+        assert_eq!(
+            observer.calls(),
+            vec![
+                ("awaiting shell".to_owned(), rid.clone()),
+                ("settled".to_owned(), rid.clone()),
+            ],
+            "the answer closes the interval it opened"
+        );
+        assert_eq!(
+            observer.interval(&rid),
+            Some(std::time::Duration::from_secs(90)),
+            "the measured interval is the wait, exactly"
+        );
+
+        // Benign again: the grant just remembered answers with no prompt, so
+        // no wait is reported.
+        assert_eq!(
+            gate.authorize("shell", None).await,
+            PermissionDecision::Allowed
+        );
+        assert_eq!(
+            observer.calls().len(),
+            2,
+            "a remembered grant waits on nobody"
+        );
+
+        // A call abandoned mid-wait — a cancelled or aborted child — still
+        // closes its interval, or the clock it paused would never restart.
+        let abandoned = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            async move { gate.authorize("edit", None).await }
+        });
+        let abandoned_id = next_prompt(&mut sub).await;
+        abandoned.abort();
+        assert!(abandoned.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            observer.calls()[2..],
+            [
+                ("awaiting edit".to_owned(), abandoned_id.clone()),
+                ("settled".to_owned(), abandoned_id),
+            ],
+            "an abandoned wait closes its interval"
+        );
     }
 
     #[tokio::test]
