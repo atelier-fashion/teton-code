@@ -746,8 +746,16 @@ pub struct TurnOutcome {
 ///
 /// `Clone` since REQ-615, because the two write-capable tools each hold one and
 /// the registry builds both from a single emitter. Cloning grants nothing new:
-/// all three fields are handles, and the runtime already constructs several
-/// independent emitters for one session.
+/// three of the fields are handles and the fourth is two ids, and the runtime
+/// already constructs several independent emitters for one session.
+///
+/// # A child turn's emitter (REQ-623 ADR-3)
+///
+/// [`Self::for_child`] returns this same emitter — same bus, same session, same
+/// sink — speaking for one child turn: every payload it makes that has the
+/// `child_id`/`parent_turn_id` fields gets both. The child's loop is handed that
+/// emitter and knows nothing about children; the parent's emitter stamps
+/// nothing.
 #[derive(Clone)]
 pub struct SessionEvents {
     bus: Arc<EventBus>,
@@ -759,6 +767,14 @@ pub struct SessionEvents {
     /// of the turn loop from writing a file: [`Self::new`] never takes one, and
     /// a fixture must go out of its way ([`Self::with_sink`]) to get one.
     sink: Option<Arc<crate::transcript::TranscriptSink>>,
+    /// The child turn this emitter speaks for, or `None` for the parent turn's
+    /// own (REQ-623 ADR-3, BR-13).
+    ///
+    /// Set by [`Self::for_child`] and by nothing else — [`Self::new`] and
+    /// [`Self::with_sink`] leave it `None` — so "this event came from a child" is
+    /// a fact recorded where the event is made rather than re-derived at a later
+    /// seam where the child is gone (LESSON-501).
+    child: Option<crate::transcript::record::ChildScope>,
 }
 
 impl SessionEvents {
@@ -771,6 +787,79 @@ impl SessionEvents {
             bus,
             session_id,
             sink: None,
+            child: None,
+        }
+    }
+
+    /// The same emitter, speaking for one child turn (REQ-623 ADR-3, BR-13).
+    ///
+    /// Same bus, same `session_id`, same transcript sink: a child's events are
+    /// the session's events, and its records land in the session's one file
+    /// (REQ-611 BR-5). What it adds is two facts, stamped into every payload
+    /// this type makes that has the fields —
+    ///
+    /// * every `session_update` the child's loop streams: the `tool_call` a tool
+    ///   start sends, the `tool_call_update` a finish sends, and its
+    ///   `agent_message_chunk`s (all three go through `emit`);
+    /// * its `context_pressure`, so a mid-child refit is attributable (BR-7);
+    /// * the **bodies** of its `tool_call_input` and `tool_result` transcript
+    ///   records, never the line's reserved keys.
+    ///
+    /// The child's loop is handed this emitter and runs unchanged. A payload
+    /// without the fields (`prefix_cache`, `tool_call_repeated`, …) is
+    /// published exactly as the parent's would be.
+    ///
+    /// `permission_request` and `cost_recorded` carry the same two fields but
+    /// are built by the permission gate and the cost ledger, not here; they
+    /// read the pair off the emitter the child was handed, through
+    /// [`Self::child_scope`], rather than minting it again. The `agent_*`
+    /// events are the parent's news and go out through the **parent's**
+    /// emitter (ADR-3), which stamps nothing.
+    ///
+    /// Called on an emitter that already speaks for a child, the new pair
+    /// replaces the old: a child has no `agent` tool, so there is no grandchild
+    /// a nested scope could describe.
+    #[must_use]
+    pub fn for_child(
+        &self,
+        child_id: teton_protocol::agent::ChildId,
+        parent_turn_id: teton_protocol::TurnId,
+    ) -> Self {
+        Self {
+            child: Some(crate::transcript::record::ChildScope {
+                child_id,
+                parent_turn_id,
+            }),
+            ..self.clone()
+        }
+    }
+
+    /// The child turn this emitter speaks for, or `None` for the parent's own
+    /// (REQ-623 ADR-3).
+    ///
+    /// For the emitters that build a child-tagged payload outside this type —
+    /// the permission gate's `permission_request`, the ledger's
+    /// `cost_recorded` — so the ids they stamp are the ones this emitter was
+    /// made with, not a second derivation that could disagree.
+    #[must_use]
+    pub fn child_scope(&self) -> Option<&crate::transcript::record::ChildScope> {
+        self.child.as_ref()
+    }
+
+    /// The pair [`Self::for_child`] recorded, as the two `Option` fields the
+    /// protocol payloads carry — both `Some` or both `None`, never one.
+    fn child_ids(
+        &self,
+    ) -> (
+        Option<teton_protocol::agent::ChildId>,
+        Option<teton_protocol::TurnId>,
+    ) {
+        match self.child.as_ref() {
+            Some(scope) => (
+                Some(scope.child_id.clone()),
+                Some(scope.parent_turn_id.clone()),
+            ),
+            None => (None, None),
         }
     }
 
@@ -798,13 +887,20 @@ impl SessionEvents {
         &self.session_id
     }
 
+    /// Publish one `session_update`, stamped with this emitter's child pair
+    /// when it has one (REQ-623 ADR-3).
+    ///
+    /// The one place a child's tool start, tool finish and text chunk get their
+    /// ids: all three are built by the helpers at the end of this impl and all
+    /// three come through here.
     fn emit(&self, update: SessionUpdatePayload) {
+        let (child_id, parent_turn_id) = self.child_ids();
         self.bus.publish(
             Some(self.session_id.clone()),
             Event::SessionUpdate(SessionUpdate {
                 update,
-                child_id: None,
-                parent_turn_id: None,
+                child_id,
+                parent_turn_id,
             }),
         );
     }
@@ -859,6 +955,7 @@ impl SessionEvents {
                 tool_call_id: tool_call_id.to_owned(),
                 tool: tool.to_owned(),
                 input: input.clone(),
+                child: self.child.clone(),
             },
         ));
     }
@@ -878,6 +975,7 @@ impl SessionEvents {
                 tool_call_id: tool_call_id.to_owned(),
                 status,
                 output: output.to_owned(),
+                child: self.child.clone(),
             },
         ));
     }
@@ -993,6 +1091,7 @@ impl SessionEvents {
         kind: ContextPressureKind,
         budget: &RouteBudget,
     ) {
+        let (child_id, parent_turn_id) = self.child_ids();
         self.bus.publish(
             Some(self.session_id.clone()),
             Event::ContextPressure(ContextPressure {
@@ -1012,8 +1111,9 @@ impl SessionEvents {
                 // measured. Never composed here: a call site that wrote `true`
                 // would be asserting the invariant rather than reporting it.
                 anchors_intact: report.anchors_intact,
-                child_id: None,
-                parent_turn_id: None,
+                // REQ-623 ADR-3: a child's refit names the child.
+                child_id,
+                parent_turn_id,
             }),
         );
     }
@@ -3826,6 +3926,114 @@ mod tests {
     use crate::egress::Provenance as EgressProvenance;
     use crate::harness::context::{NoopProvenanceHook, PreparedPrompt};
     use crate::harness::permissions::{PendingPermissions, PermissionConfig};
+
+    /// **REQ-623 ADR-3 / BR-13.** An emitter from [`SessionEvents::for_child`]
+    /// stamps `child_id` and `parent_turn_id` into every payload it makes that
+    /// has the fields; the parent emitter it was made from stamps neither.
+    ///
+    /// Every helper that reaches `emit` is driven — tool start, tool finish,
+    /// text chunk — plus `context_pressure`, from **both** emitters, onto one
+    /// subscription. "Same bus, same session" is half of ADR-3, so each
+    /// envelope's scope is asserted too, and the parent leg is the benign path:
+    /// a stamp that leaked onto every emitter would pass a child-only test.
+    ///
+    /// **Shown to fail** (mutations, run 2026-10-05, restored): writing
+    /// `child_id: None, parent_turn_id: None` back into `emit` reddens this at
+    /// `child tool_call must carry both ids` — and only this: the transcript
+    /// suite drives the sink hand-offs and `context_pressure`, not `emit`, so
+    /// this test is `emit`'s one guard. The same in `context_pressure` reddens
+    /// it at `child context_pressure must carry both ids` (and both REQ-623
+    /// tests in `tests/transcript.rs`). Making `SessionEvents::new` start from
+    /// a fixed child scope reddens it at `the parent speaks for no child`.
+    #[test]
+    fn session_events_for_child_stamps_and_the_parent_emitter_does_not() {
+        let session_id = SessionId::from("sess-0123456789abcdefghjkmnpqrs");
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe(32);
+        let parent = SessionEvents::new(Arc::clone(&bus), session_id.clone());
+        let child_id = teton_protocol::agent::ChildId::new("call-1", "scan");
+        let turn = teton_protocol::TurnId::from("turn-1");
+        let child = parent.for_child(child_id.clone(), turn.clone());
+
+        assert_eq!(child.session_id(), parent.session_id(), "same session");
+        assert!(
+            parent.child_scope().is_none(),
+            "the parent speaks for no child"
+        );
+        assert_eq!(
+            child
+                .child_scope()
+                .map(|scope| (&scope.child_id, &scope.parent_turn_id)),
+            Some((&child_id, &turn)),
+            "the child emitter carries exactly the pair it was made with"
+        );
+
+        let budget = HarnessConfig::default().budget;
+        let report = PressureReport {
+            dropped_blocks: 1,
+            ..PressureReport::default()
+        };
+        for events in [&parent, &child] {
+            events.tool_started("call-a", "read");
+            events.tool_finished("call-a", true);
+            events.agent_message("hello");
+            events.context_pressure(&report, ContextPressureKind::BlocksDropped, &budget);
+        }
+
+        let mut seen = Vec::new();
+        while let Some(envelope) = sub.try_recv() {
+            assert_eq!(
+                envelope.session_id.as_ref(),
+                Some(&session_id),
+                "a child publishes on the parent's bus, scoped to the parent's session"
+            );
+            seen.push(match envelope.event {
+                Event::SessionUpdate(update) => (
+                    match update.update {
+                        SessionUpdatePayload::ToolCall { .. } => "tool_call",
+                        SessionUpdatePayload::ToolCallUpdate { .. } => "tool_call_update",
+                        SessionUpdatePayload::AgentMessageChunk { .. } => "agent_message_chunk",
+                        other => panic!("no helper here sends {other:?}"),
+                    },
+                    update.child_id,
+                    update.parent_turn_id,
+                ),
+                Event::ContextPressure(pressure) => (
+                    "context_pressure",
+                    pressure.child_id,
+                    pressure.parent_turn_id,
+                ),
+                other => panic!("no helper here publishes {other:?}"),
+            });
+        }
+        let kinds: Vec<&str> = seen.iter().map(|(kind, _, _)| *kind).collect();
+        let one_side = [
+            "tool_call",
+            "tool_call_update",
+            "agent_message_chunk",
+            "context_pressure",
+        ];
+        assert_eq!(
+            kinds,
+            [one_side, one_side].concat(),
+            "four payloads from the parent, then the same four from the child"
+        );
+        let (from_parent, from_child) = seen.split_at(one_side.len());
+        for (kind, child_stamp, turn_stamp) in from_parent {
+            assert_eq!(
+                (child_stamp, turn_stamp),
+                (&None, &None),
+                "parent {kind} must carry neither id"
+            );
+        }
+        for (kind, child_stamp, turn_stamp) in from_child {
+            assert_eq!(
+                (child_stamp.as_ref(), turn_stamp.as_ref()),
+                (Some(&child_id), Some(&turn)),
+                "child {kind} must carry both ids"
+            );
+        }
+    }
 
     /// **REQ-589 AC-3.** The remote refusal's wording is byte-identical to what
     /// REQ-586 shipped, and the local one differs from it in exactly one place.

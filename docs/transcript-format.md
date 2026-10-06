@@ -97,9 +97,22 @@ the record's own fields sit flat beside them in the same object.
 | `truncated` | when a field was cut | always `true` when present |
 | `original_bytes` | with `truncated` | how many bytes the cut field(s) held before the cut |
 
-Those seven names, plus `event`, belong to the line. A record body that carried
-one of them has it dropped rather than emitting the key twice — no record kind
-has such a field today, and the rule is there for the one somebody adds.
+Those seven names, plus `event`, belong to the line, and no record's own fields
+may repeat one — a duplicate key would make the line ambiguous to the very
+parser this format promises works. When a record's fields do include one of
+those names, what happens depends on which:
+
+- `session_id`, `seq` and `event` are a bus envelope's own frame. The line
+  carries the same values (`event` as `kind`), so nothing is lost.
+- Any other — `kind`, `truncated`, `n`, `ts`, `original_bytes` — is the event's
+  own field that happens to share a name with the line's. It is kept, whole,
+  under **`event_fields`**: `context_pressure`'s `kind` is `event_fields.kind`,
+  and `agent_child_finished`'s and `repo_context_state`'s `truncated` is
+  `event_fields.truncated`. The line's own `truncated` still means only that a
+  field on *this line* was cut.
+
+Files written before `event_fields` existed simply lack those values; they were
+dropped.
 
 One line, as it appears in a file (wrapped here, not in the file):
 
@@ -161,8 +174,8 @@ name, and are never published to any client.
 |---|---|---|
 | `transcript_opened` | the file is created for a session — always the first record | `daemon_version`, `root` (the session root, display form), `redact` (the `[privacy] redact` posture at open), `max_record_bytes` (the budget every truncation in this file was measured against), `seq_at_open` |
 | `prompt_submitted` | a prompt is accepted for the session | `turn_id`, `prompt` (the blocks as received — `{"type":"text","text":…}`), `skill` (`{"name":…,"raw_arguments":…}`, only when the line was a `/name`) |
-| `tool_call_input` | the harness dispatches a tool call | `tool_call_id`, `tool`, `input` (as the harness parsed it) |
-| `tool_result` | a tool returns to the harness | `tool_call_id`, `status` (`pending`, `in_progress`, `completed`, `failed`), `output` |
+| `tool_call_input` | the harness dispatches a tool call | `tool_call_id`, `tool`, `input` (as the harness parsed it); `child_id` and `parent_turn_id` when a child turn made the call (see [Child turns](#child-turns-the-agent-tool)) |
+| `tool_result` | a tool returns to the harness | `tool_call_id`, `status` (`pending`, `in_progress`, `completed`, `failed`), `output`; `child_id` and `parent_turn_id` exactly as on the matching `tool_call_input` |
 | `permission_decided` | a permission request is answered | `request_id`, `option_id`, `remembered` |
 | `transcript_gap` | the sink fell behind and dropped records | `dropped`, and `seq_before` / `seq_after` where a bus record on either side of the hole names one |
 | `transcript_resumed` | `/transcript on` after an `off`, in the same session and the same file | `seq_at_resume` |
@@ -182,6 +195,9 @@ envelope's `event` is re-spelled as the line's `kind`, its `session_id` and
 `session_update`, `route_decided`, `cost_recorded`, `privacy_block`,
 `permission_request`, `skill_invoked` and the rest appear under their own names,
 with their own fields, documented by the protocol rather than by this page.
+
+Child turns' records are among them, in the same file — see
+[Child turns](#child-turns-the-agent-tool).
 
 Two things never appear:
 
@@ -212,6 +228,47 @@ classified and proved nothing.
 `reach_reason` is chosen from a fixed set of sentences and can never contain the
 command's text or a byte of its output. The command itself appears once, on
 `command`, bounded, exactly as it did before these fields existed.
+
+## Child turns (the `agent` tool)
+
+When the model calls `agent`, each task runs as a **child turn**: a bounded
+turn of its own under the prompt turn that made the call. A child's records
+are this session's records and go in this session's one file — there is no
+second file per child — interleaved with the parent's and with each other's in
+whatever order they happened. Two **body** fields tell them apart, never a
+line-level key:
+
+| field | value |
+|---|---|
+| `child_id` | the child — `<call_id>/<name>`. Treat it as opaque: the name half is chosen by the model and may itself contain a `/`, so do not split it; the child's name is on its `agent_child_started` record |
+| `parent_turn_id` | the prompt turn the child ran under — the `turn_id` of a `prompt_submitted` earlier in the same file |
+
+Both are present together on every record a child turn makes — its
+`tool_call_input` and `tool_result`, and the bus records its loop streams:
+`session_update` (its tool starts and finishes and its streamed text),
+`context_pressure` and `permission_request`. `cost_recorded` carries them
+inside its `record` object (`record.child_id`, `record.parent_turn_id`), beside
+the rest of the ledger row it projects. Neither is present on a record the
+parent turn made. So a record with no `child_id` is the parent's, and grouping
+by `parent_turn_id` then `child_id` rebuilds the tree.
+
+The call itself is recorded by seven bus record kinds, all published by the
+parent turn:
+
+| `kind` | Written when | Fields |
+|---|---|---|
+| `agent_call_started` | an `agent` call passed validation and its children are about to start | `call_id`, `parent_turn_id`, `children` (`[{ "name", "requested_tier"? }]`, in the order the tasks were given) |
+| `agent_child_started` | a child is about to make its first model call | `child_id`, `parent_turn_id`, `name`, `route` (`{ "tier"?, "provider_id", "model" }`), `bounds` (`{ "max_turns", "context_budget_bytes", "spend_ceiling_micro_cents"?, "deadline_secs" }`) |
+| `agent_child_consent_requested` | a child reached a permission ask at an attended session | `child_id`, `name`, `tool` — the question itself is the `permission_request` beside it, which carries the same `child_id` |
+| `agent_child_share_released` | a child ended with unspent spend share and it was split among its running siblings | `child_id`, `released_micro_cents`, `recipients` (`[{ "child_id", "new_ceiling_micro_cents" }]`) |
+| `agent_child_finished` | a child reached its terminal status | `child_id`, `status` (`completed`, `refused`, `cancelled`, `turns_exhausted`, `budget_exhausted`, `spend_exhausted`, `timed_out`, `failed`), `turns_used`, `cost_micro_cents`, `report_bytes`, and `event_fields.truncated` — whether the report the parent received was cut at `agent.report_max_bytes` |
+| `agent_call_finished` | every child is terminal and the tool result is being returned | `call_id`, `children` (`[{ "name", "status" }]`), `total_cost_micro_cents`, `elapsed_ms` |
+| `agent_call_refused` | the call was refused whole before any child started | `call_id`, `refusal` (`{ "kind": "too_many_children" \| "child_cap_reached" \| "duplicate_name" \| "empty_task", … }` with the numbers that refused it) |
+
+None of them carries a task's text or a child's report. The report reaches the
+parent as the `agent` call's `tool_result`, in full — a report the parent was
+shown cut (`event_fields.truncated: true`) is whole there, subject only to this
+file's own `max_record_bytes`.
 
 ## Truncation is marked, never silent
 
@@ -249,7 +306,7 @@ recorded as the harness received them, which is why `transcript_opened` records
 the redact posture that was in force — so a reader knows what the egress side
 was doing while these bytes were being written.
 
-## Five lines of `jq`
+## Six lines of `jq`
 
 ```sh
 # everything, pretty-printed (jq stops at a partial trailing line, having
@@ -269,4 +326,8 @@ jq -r 'select(.kind == "tool_call_input" or .kind == "tool_result")
 
 # anything the sink had to drop, and anything it had to cut
 jq -c 'select(.kind == "transcript_gap" or .truncated == true)' session.jsonl
+
+# each child turn's tool calls, grouped under the prompt turn that spawned it
+jq -r 'select(.child_id and .kind == "tool_call_input")
+       | "\(.parent_turn_id) \(.child_id) \(.tool)"' session.jsonl
 ```

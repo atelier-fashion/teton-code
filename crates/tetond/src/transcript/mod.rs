@@ -1107,6 +1107,7 @@ mod tests {
             tool_call_id: "call-1".to_owned(),
             status: ToolCallStatus::Completed,
             output: text.to_owned(),
+            child: None,
         })
     }
 

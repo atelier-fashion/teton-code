@@ -30,6 +30,23 @@
 //! | AC-2 | [`one_prompt_one_tool_call_yields_a_complete_file`] |
 //! | AC-8 | [`two_sessions_never_share_a_file_and_daemon_events_appear_in_neither`] |
 //! | AC-18 | [`orderly_shutdown_closes_the_file_and_sigkill_leaves_one_partial_line`] |
+//! | REQ-623 BR-13 | [`child_records_tagged_in_body_not_reserved_keys`] |
+//! | REQ-623 AC-17 | [`one_file_holds_parent_and_children`] |
+//!
+//! ## The two REQ-623 tests, and why they do not spawn the binary
+//!
+//! A child turn needs the `agent` tool and the child runner, which land after
+//! the emitter and the record shapes these two tests are about (REQ-623
+//! TASK-427, TASK-428); until then no prompt can make the shipped daemon start
+//! one. So these build the daemon's **own** transcript plumbing in-process —
+//! the real [`TranscriptSink`] writer thread, a real [`EventBus`] with the sink
+//! installed as its tap exactly as `DaemonRuntime` installs it, and the real
+//! `SessionEvents` with that sink — drive a parent emitter and its
+//! `for_child` emitters through the calls a child's loop makes, and then read
+//! the file with a stock JSON parser, as every other test here does. What they
+//! do not cover is the wiring that hands a child its emitter;
+//! `agent_dispatch.rs::transcript::one_file_parent_and_children` (TASK-430)
+//! re-asserts AC-17 through the binary once it exists.
 //!
 //! BR-5's tap half (a full channel never delays a publish) is a unit test in
 //! `broadcast.rs`, where the bus is: an integration test would have to force the
@@ -47,9 +64,21 @@
 //! its own unit tests; wiring it needs a session end to wire it to.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
+use teton_protocol::agent::{ChildBounds, ChildId, ChildRoute, ChildStatus};
+use teton_protocol::events::{
+    AgentCallFinished, AgentCallStarted, AgentChildFinished, AgentChildStarted,
+    ContextPressureKind, Event, FinishedChild, PlannedChild, ToolCallStatus,
+};
+use teton_protocol::methods::PromptBlock;
+use teton_protocol::{ProviderId, SessionId, TurnId};
+use tetond::broadcast::{EventBus, EventTap};
+use tetond::harness::context::PressureReport;
+use tetond::harness::turn_loop::{HarnessConfig, SessionEvents};
+use tetond::transcript::{NewSession, SinkConfig, TranscriptSink};
 
 #[path = "e2e/harness.rs"]
 mod harness;
@@ -2528,4 +2557,423 @@ fn the_write_fail_after_seam_degrades_the_session_once_and_spares_the_turn() {
         kinds_of(&records)
     );
     assert_well_formed(&records, &session);
+}
+
+// ---------------------------------------------------------------------------
+// REQ-623 BR-13 / AC-17 — child turns in the session's one file
+// ---------------------------------------------------------------------------
+
+/// The session every in-process fixture below records, shaped like one
+/// `crate::sessions` mints so the file name matches the retention pattern.
+const CHILD_FIXTURE_SESSION: &str = "sess-0123456789abcdefghjkmnpqrs";
+
+/// The names a transcript line owns, written out from
+/// `docs/transcript-format.md` rather than read off the sink's own list — an
+/// oracle that called the code under test would prove nothing (LESSON-569).
+const LINE_OWNED_KEYS: [&str; 8] = [
+    "n",
+    "ts",
+    "session_id",
+    "seq",
+    "kind",
+    "event",
+    "truncated",
+    "original_bytes",
+];
+
+/// The line-owned keys present on `record`, sorted.
+fn line_owned_keys_of(record: &Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = record
+        .as_object()
+        .expect("a record is an object")
+        .keys()
+        .map(String::as_str)
+        .filter(|key| LINE_OWNED_KEYS.contains(key))
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+/// The daemon's transcript plumbing, in-process: a real sink and writer
+/// thread, a bus with the sink installed as its tap, one recording session and
+/// that session's parent emitter. See the module doc for why these two tests
+/// are built this way rather than by spawning the binary.
+struct ChildFixture {
+    workspace: Workspace,
+    bus: Arc<EventBus>,
+    sink: Arc<TranscriptSink>,
+    parent: SessionEvents,
+}
+
+impl ChildFixture {
+    fn new(tag: &str) -> Self {
+        let workspace = Workspace::new(tag);
+        let sink = Arc::new(TranscriptSink::spawn(SinkConfig {
+            dir: transcript_dir(&workspace),
+            retain_days: 0,
+            max_record_bytes: 65_536,
+            daemon_version: tetond::version().to_owned(),
+            redact: false,
+        }));
+        let bus = Arc::new(EventBus::new());
+        bus.install_tap(Arc::clone(&sink) as Arc<dyn EventTap>);
+        sink.session_created(NewSession {
+            session_id: Self::session(),
+            root: workspace.repo.display().to_string(),
+            enabled: true,
+            seq_at_open: bus.current_seq(),
+        });
+        let parent = SessionEvents::new(Arc::clone(&bus), Self::session())
+            .with_sink(Some(Arc::clone(&sink)));
+        Self {
+            workspace,
+            bus,
+            sink,
+            parent,
+        }
+    }
+
+    fn session() -> SessionId {
+        SessionId::from(CHILD_FIXTURE_SESSION)
+    }
+
+    /// Publish `event` on the session's bus — what the `agent` tool does
+    /// through the parent's emitter (ADR-3).
+    fn publish(&self, event: Event) {
+        self.bus.publish(Some(Self::session()), event);
+    }
+
+    /// Announce one child-scoped `context_pressure` from `events` — the bus
+    /// record a child's mid-run refit produces (BR-7).
+    fn pressure(events: &SessionEvents) {
+        let report = PressureReport {
+            dropped_blocks: 1,
+            ..PressureReport::default()
+        };
+        events.context_pressure(
+            &report,
+            ContextPressureKind::BlocksDropped,
+            &HarnessConfig::default().budget,
+        );
+    }
+
+    /// Close the session's transcript the way a daemon shutdown does, then
+    /// return every transcript file in the directory and the one file's
+    /// records.
+    async fn finish(self) -> (Vec<PathBuf>, Vec<Value>) {
+        self.sink.shutdown().await;
+        let files = transcript_files(&transcript_dir(&self.workspace));
+        let records = files
+            .first()
+            .map(|path| {
+                let (records, partial) = read_transcript(path);
+                assert_eq!(partial, None, "an orderly close leaves no partial line");
+                records
+            })
+            .unwrap_or_default();
+        (files, records)
+    }
+}
+
+/// The one record of `kind` answering `tool_call_id`.
+fn record_for_call<'a>(records: &'a [Value], kind: &str, tool_call_id: &str) -> &'a Value {
+    let matching: Vec<&Value> = records
+        .iter()
+        .filter(|r| r["kind"] == kind && r["tool_call_id"] == tool_call_id)
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "exactly one {kind} for {tool_call_id}: {:?}",
+        kinds_of(records)
+    );
+    matching[0]
+}
+
+/// **REQ-623 BR-13: a child's records carry `child_id` and `parent_turn_id` in
+/// their bodies, and the line's reserved keys are exactly what every other line
+/// of the same kind carries.** The benign half is the parent's records, made by
+/// the emitter the child's was derived from: they carry neither id.
+///
+/// Three child records: the sink-local `tool_call_input` and `tool_result`,
+/// and a bus-sourced `context_pressure` — the two routes a record takes into
+/// the file, so a stamp that reached only one would fail here.
+/// `context_pressure` also has a payload field named `kind`, which since
+/// REQ-623 is displaced to `event_fields` rather than dropped; the reserved
+/// set must come out the same anyway.
+///
+/// **Shown to fail** (mutations, run 2026-10-05, restored): writing
+/// `child: None` back into `SessionEvents::tool_input` reddens this at `child
+/// tool_call_input carries child_id in its body` (and `tool_result`'s twin at
+/// `child tool_result …`); writing `child_id: None, parent_turn_id: None` back
+/// into `SessionEvents::context_pressure` reddens it at `child context_pressure
+/// carries child_id in its body`. Treating the pair as a line key (adding
+/// `child_id` to `RESERVED_KEYS`) reddens it at the `tool_call_input`
+/// assertion, the id moved off the body into `event_fields`. The benign half:
+/// making `SessionEvents::new` start from a fixed child scope reddens it at
+/// `parent tool_call_input carries neither id`.
+#[tokio::test]
+async fn child_records_tagged_in_body_not_reserved_keys() {
+    let fixture = ChildFixture::new("child-tagged");
+    let child = fixture
+        .parent
+        .for_child(ChildId::new("call-1", "scan"), TurnId::from("turn-1"));
+
+    fixture
+        .parent
+        .tool_input("call-parent", "read", &json!({ "path": "README.md" }));
+    fixture
+        .parent
+        .tool_result("call-parent", ToolCallStatus::Completed, "parent output");
+    ChildFixture::pressure(&fixture.parent);
+    child.tool_input("call-child", "grep", &json!({ "pattern": "todo" }));
+    child.tool_result("call-child", ToolCallStatus::Completed, "child output");
+    ChildFixture::pressure(&child);
+    let (files, records) = fixture.finish().await;
+
+    assert_eq!(files.len(), 1, "one session, one file: {files:?}");
+    assert_well_formed(&records, CHILD_FIXTURE_SESSION);
+
+    let pressures: Vec<&Value> = records
+        .iter()
+        .filter(|r| r["kind"] == "context_pressure")
+        .collect();
+    assert_eq!(pressures.len(), 2, "{:?}", kinds_of(&records));
+    let pairs = [
+        (
+            "tool_call_input",
+            record_for_call(&records, "tool_call_input", "call-parent"),
+            record_for_call(&records, "tool_call_input", "call-child"),
+        ),
+        (
+            "tool_result",
+            record_for_call(&records, "tool_result", "call-parent"),
+            record_for_call(&records, "tool_result", "call-child"),
+        ),
+        // The bus preserves publish order, and the parent's was published first.
+        ("context_pressure", pressures[0], pressures[1]),
+    ];
+    for (kind, from_parent, from_child) in pairs {
+        assert_eq!(
+            from_child["child_id"], "call-1/scan",
+            "child {kind} carries child_id in its body: {from_child}"
+        );
+        assert_eq!(
+            from_child["parent_turn_id"], "turn-1",
+            "child {kind} carries parent_turn_id in its body: {from_child}"
+        );
+        assert_eq!(from_child["kind"], kind, "the line's kind is the record's");
+        let expected: Vec<&str> = if kind == "context_pressure" {
+            vec!["kind", "n", "seq", "session_id", "ts"]
+        } else {
+            vec!["kind", "n", "session_id", "ts"]
+        };
+        assert_eq!(
+            line_owned_keys_of(from_child),
+            expected,
+            "a child {kind}'s reserved keys are any {kind}'s: {from_child}"
+        );
+
+        // Benign: the parent emitter stamps nothing.
+        assert_eq!(
+            (
+                from_parent.get("child_id"),
+                from_parent.get("parent_turn_id")
+            ),
+            (None, None),
+            "parent {kind} carries neither id: {from_parent}"
+        );
+        assert_eq!(
+            line_owned_keys_of(from_parent),
+            expected,
+            "the parent's reserved keys are the child's: {from_parent}"
+        );
+    }
+}
+
+/// **REQ-623 AC-17: the transcript of a session with one `agent` call holds the
+/// parent turn's records and every child's records in one file, each child
+/// record carrying `child_id` and `parent_turn_id`.**
+///
+/// The call the `agent` tool makes, in the order it makes it: the parent's
+/// `prompt_submitted` and its `tool_call_input` for `agent`; `agent_call_started`
+/// through the parent's emitter; per child, `agent_child_started`, the child's
+/// own tool call, result and pressure through its `for_child` emitter, and
+/// `agent_child_finished`; then `agent_call_finished` and the parent's
+/// `tool_result`. Children are run one after the other — this asserts by set
+/// and per-child filter, never cross-child order (LESSON-591), so nothing here
+/// depends on it.
+///
+/// BR-13's "a reader can reconstruct the tree" is asserted as a reader would do
+/// it: every child record's `parent_turn_id` names the turn a
+/// `prompt_submitted` in the same file opened. `agent_child_finished` carries
+/// `child_id` only — the protocol shape (TASK-421): it is the parent's news
+/// about a child, and its child is already placed by `agent_child_started` — and
+/// it must keep its own `truncated` flag, which a reserved key used to erase.
+///
+/// **Shown to fail** (mutations, run 2026-10-05, restored): writing
+/// `child: None` back into `SessionEvents::tool_result` (or `tool_input`, or
+/// the `context_pressure` stamp) reddens this at `alpha's records, all in this
+/// file` — the untagged record falls out of alpha's set; reverting
+/// `Record::body`'s displacement to the pre-REQ-623 drop reddens it at
+/// `alpha's agent_child_finished keeps truncated` (the flag is gone, not
+/// merely `false`); a parent emitter born child-scoped reddens it at `the
+/// agent call itself is the parent's record`.
+#[tokio::test]
+async fn one_file_holds_parent_and_children() {
+    const CALL: &str = "call-agent";
+    const NAMES: [&str; 2] = ["alpha", "beta"];
+
+    let fixture = ChildFixture::new("one-file");
+    let turn = TurnId::from("turn-7");
+    fixture.parent.prompt_submitted(
+        &turn,
+        &[PromptBlock::Text {
+            text: "audit the repo".to_owned(),
+        }],
+        None,
+    );
+    fixture.parent.tool_input(
+        CALL,
+        "agent",
+        &json!({ "tasks": [{ "task": "a", "name": "alpha" }, { "task": "b", "name": "beta" }] }),
+    );
+    fixture.publish(Event::AgentCallStarted(AgentCallStarted {
+        call_id: CALL.to_owned(),
+        parent_turn_id: turn.clone(),
+        children: NAMES
+            .iter()
+            .map(|name| PlannedChild {
+                name: (*name).to_owned(),
+                requested_tier: None,
+            })
+            .collect(),
+    }));
+    for name in NAMES {
+        let child_id = ChildId::new(CALL, name);
+        fixture.publish(Event::AgentChildStarted(AgentChildStarted {
+            child_id: child_id.clone(),
+            parent_turn_id: turn.clone(),
+            name: name.to_owned(),
+            route: ChildRoute {
+                tier: None,
+                provider_id: ProviderId::from("mock"),
+                model: "mock-model".to_owned(),
+            },
+            bounds: ChildBounds {
+                max_turns: 12,
+                context_budget_bytes: 65_536,
+                spend_ceiling_micro_cents: None,
+                deadline_secs: 600,
+            },
+        }));
+        let child = fixture.parent.for_child(child_id.clone(), turn.clone());
+        let call = format!("{name}-call-1");
+        child.tool_input(&call, "read", &json!({ "path": "src/lib.rs" }));
+        child.tool_result(&call, ToolCallStatus::Completed, "fn main() {}");
+        ChildFixture::pressure(&child);
+        fixture.publish(Event::AgentChildFinished(AgentChildFinished {
+            child_id,
+            status: ChildStatus::Completed,
+            turns_used: 2,
+            cost_micro_cents: 0,
+            report_bytes: 40_000,
+            // One cut report and one whole one, so the flag is asserted both ways.
+            truncated: name == "beta",
+        }));
+    }
+    fixture.publish(Event::AgentCallFinished(AgentCallFinished {
+        call_id: CALL.to_owned(),
+        children: NAMES
+            .iter()
+            .map(|name| FinishedChild {
+                name: (*name).to_owned(),
+                status: ChildStatus::Completed,
+            })
+            .collect(),
+        total_cost_micro_cents: 0,
+        elapsed_ms: 5,
+    }));
+    fixture
+        .parent
+        .tool_result(CALL, ToolCallStatus::Completed, "[]");
+    let (files, records) = fixture.finish().await;
+
+    // One session, one file, and the file is whole and one session's.
+    assert_eq!(files.len(), 1, "one session, one file: {files:?}");
+    assert_well_formed(&records, CHILD_FIXTURE_SESSION);
+    assert_eq!(
+        records.last().map(|r| r["kind"].clone()),
+        Some(Value::from("transcript_closed"))
+    );
+
+    // The parent turn's records, carrying no child id.
+    let opened_turn = records
+        .iter()
+        .find(|r| r["kind"] == "prompt_submitted")
+        .and_then(|r| r["turn_id"].as_str())
+        .expect("the parent's prompt is in the file");
+    for parent_record in [
+        record_for_call(&records, "tool_call_input", CALL),
+        record_for_call(&records, "tool_result", CALL),
+    ] {
+        assert_eq!(
+            parent_record.get("child_id"),
+            None,
+            "the agent call itself is the parent's record: {parent_record}"
+        );
+    }
+    for kind in ["agent_call_started", "agent_call_finished"] {
+        assert_eq!(
+            records.iter().filter(|r| r["kind"] == kind).count(),
+            1,
+            "{kind} once: {:?}",
+            kinds_of(&records)
+        );
+    }
+
+    // Every child's records, each carrying both ids, in the same file.
+    for name in NAMES {
+        let child_id = ChildId::new(CALL, name);
+        let mine: Vec<&Value> = records
+            .iter()
+            .filter(|r| r["child_id"] == child_id.as_str())
+            .collect();
+        let mut kinds: Vec<&str> = mine.iter().filter_map(|r| r["kind"].as_str()).collect();
+        kinds.sort_unstable();
+        assert_eq!(
+            kinds,
+            vec![
+                "agent_child_finished",
+                "agent_child_started",
+                "context_pressure",
+                "tool_call_input",
+                "tool_result",
+            ],
+            "{name}'s records, all in this file"
+        );
+        for record in mine.iter().filter(|r| r["kind"] != "agent_child_finished") {
+            assert_eq!(
+                record["parent_turn_id"].as_str(),
+                Some(opened_turn),
+                "{name}'s {} carries parent_turn_id naming the turn this file \
+                 opened: {record}",
+                record["kind"]
+            );
+        }
+        let finished = mine
+            .iter()
+            .find(|r| r["kind"] == "agent_child_finished")
+            .expect("asserted present above");
+        assert_eq!(
+            finished["event_fields"]["truncated"],
+            Value::Bool(name == "beta"),
+            "{name}'s agent_child_finished keeps truncated: {finished}"
+        );
+        assert_eq!(
+            finished.get("truncated"),
+            None,
+            "nothing on the line itself was cut: {finished}"
+        );
+    }
 }

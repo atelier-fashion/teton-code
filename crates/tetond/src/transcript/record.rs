@@ -21,9 +21,29 @@
 //! Every line is one JSON object with `n`, `ts`, `session_id` and `kind`, so a
 //! reader with `serde_json` and no teton code can say what a line is, which
 //! session it belongs to and where it sits in the file. [`Line`] therefore owns
-//! those four names: a record body key that collides with one of them is
-//! dropped rather than allowed to emit the key twice (no record kind or event
-//! has such a field today — the guard is against the one somebody adds).
+//! those four names, and the four more listed at [`RESERVED_KEYS`]: a body may
+//! not emit one, because a duplicate key makes the line ambiguous to exactly
+//! the stock parser BR-14 promises.
+//!
+//! A reserved name in a body is one of two things, and they are not handled
+//! alike. A bus envelope's own frame keys — `session_id`, `seq`, `event` — are
+//! **lifted**: the line carries the same value under its own name, so removing
+//! them from the body loses nothing. Anything else is a payload field that
+//! happens to share a line-owned name — `context_pressure`'s `kind`,
+//! `repo_context_state`'s and `agent_child_finished`'s `truncated` — and that is
+//! **displaced**, kept whole under [`DISPLACED_FIELDS_KEY`] rather than dropped
+//! (REQ-623). Until REQ-623 the second kind was dropped too, which silently
+//! erased whether a child's report had been cut — the one fact BR-11 tells a
+//! reader to come to the transcript for.
+//!
+//! # Child turns (REQ-623 ADR-3, BR-13)
+//!
+//! A child turn's records are the session's records, in the session's one file.
+//! What tells them apart is two **body** fields, `child_id` and
+//! `parent_turn_id` ([`ChildScope`]), on the sink-local `tool_call_input` and
+//! `tool_result` and on the bus records a child streams — never a line-level
+//! key, because the line's names are the contract every reader shares and a
+//! child is not a different kind of line.
 //!
 //! `seq` is present only on bus-sourced records and is **expected to skip**:
 //! it is minted daemon-wide, so other sessions' events interleave in the
@@ -34,6 +54,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde_json::{Map, Value};
+use teton_protocol::agent::ChildId;
 use teton_protocol::events::{EventEnvelope, ToolCallStatus};
 use teton_protocol::methods::{PromptBlock, SkillInvocation};
 use teton_protocol::{RequestId, SessionId, TurnId};
@@ -42,8 +63,9 @@ use teton_protocol::{RequestId, SessionId, TurnId};
 ///
 /// A body may not emit any of these: `session_id` and `seq` are lifted out of a
 /// bus envelope onto the line, `event` is re-spelled as `kind`, and the rest are
-/// the line's own vocabulary. Stripping is the fail-safe direction — a duplicate
-/// key makes the line ambiguous to exactly the stock parser BR-14 promises.
+/// the line's own vocabulary. Removing them from the body is the fail-safe
+/// direction — a duplicate key makes the line ambiguous to exactly the stock
+/// parser BR-14 promises — and [`LIFTED_KEYS`] says which removals lose nothing.
 const RESERVED_KEYS: &[&str] = &[
     "n",
     "ts",
@@ -54,6 +76,29 @@ const RESERVED_KEYS: &[&str] = &[
     "truncated",
     "original_bytes",
 ];
+
+/// The [`RESERVED_KEYS`] a bus envelope carries as **its own frame**, which the
+/// line lifts rather than collides with: `session_id` and `seq` move onto the
+/// line unchanged and `event` is re-spelled as `kind`. The line holds the same
+/// value, so dropping these from the body loses nothing.
+///
+/// Every other reserved name found in a body is a payload's own field and is
+/// displaced to [`DISPLACED_FIELDS_KEY`], never dropped.
+const LIFTED_KEYS: &[&str] = &["session_id", "seq", "event"];
+
+/// Where a body keeps its own fields whose names the line owns (REQ-623).
+///
+/// `agent_child_finished` carries `truncated` — whether the report the parent
+/// received was cut at `agent.report_max_bytes` (REQ-623 BR-11) — and the
+/// line's `truncated` means something else: that *this line* had a field cut at
+/// `max_record_bytes`. Both are true facts with one name. The line keeps the
+/// name; the payload's value moves here, whole, as `event_fields.truncated`.
+/// `context_pressure`'s `kind` and `repo_context_state`'s `truncated` were the
+/// same collision before REQ-623 and are kept the same way.
+///
+/// Nested rather than renamed key by key, so the payload's field names reach
+/// the file unchanged and a reader looks in one place for all of them.
+pub const DISPLACED_FIELDS_KEY: &str = "event_fields";
 
 /// Why a session's transcript stopped (REQ-611 System Model → Events,
 /// `transcript_closed`).
@@ -120,6 +165,26 @@ pub struct PromptSubmitted {
     pub skill: Option<SkillInvocation>,
 }
 
+/// Which child turn a record belongs to (REQ-623 ADR-3, BR-13).
+///
+/// Written into a record's **body** as two fields, `child_id` and
+/// `parent_turn_id`, by flattening — never as line-level keys, which
+/// [`RESERVED_KEYS`] keeps to the vocabulary every line shares. One type for the
+/// pair so that "one without the other" is not a value a record can hold: a
+/// reader rebuilding the tree needs both, and a child id with no parent turn
+/// names a node with nowhere to hang.
+///
+/// Built by [`crate::harness::turn_loop::SessionEvents::for_child`] and nowhere
+/// else (LESSON-501): the emitter a child's loop is handed carries one, and
+/// every record that emitter makes copies it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChildScope {
+    /// The child turn — `<call_id>/<name>`, opaque.
+    pub child_id: ChildId,
+    /// The prompt turn the child ran under.
+    pub parent_turn_id: TurnId,
+}
+
 /// The `tool_call_input` payload: what the harness dispatched.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ToolCallInput {
@@ -131,6 +196,11 @@ pub struct ToolCallInput {
     /// tool call's id, title and status and never its input, so this is not
     /// recoverable from the bus records beside it.
     pub input: Value,
+    /// The child turn that dispatched the call, as the body fields `child_id`
+    /// and `parent_turn_id`; absent — neither key written — for the parent
+    /// turn's own calls (REQ-623 BR-13).
+    #[serde(flatten)]
+    pub child: Option<ChildScope>,
 }
 
 /// The `tool_result` payload: what a tool handed back.
@@ -143,6 +213,10 @@ pub struct ToolResult {
     /// The result text as the harness received it, subject to
     /// `max_record_bytes` (BR-12). This is the field a 1 MiB `read` truncates.
     pub output: String,
+    /// The child turn whose call this answers, exactly as on the matching
+    /// [`ToolCallInput`]; absent for the parent turn's own (REQ-623 BR-13).
+    #[serde(flatten)]
+    pub child: Option<ChildScope>,
 }
 
 /// The `permission_decided` payload: how a `permission/respond` resolved.
@@ -255,7 +329,8 @@ impl Record {
     /// A bus envelope is serialized in its wire form and then relieved of
     /// `session_id`, `seq` and `event`, which the line carries as `session_id`,
     /// `seq` and `kind`. Everything else the envelope had survives byte for
-    /// byte.
+    /// byte — a payload field whose name the line owns survives too, moved
+    /// under [`DISPLACED_FIELDS_KEY`] rather than dropped (REQ-623).
     fn body(&self) -> Map<String, Value> {
         let value = match self {
             Record::Opened(payload) => serde_json::to_value(payload),
@@ -296,8 +371,16 @@ impl Record {
             // sink cannot render must not take the daemon with it.
             _ => Map::new(),
         };
+        let mut displaced = Map::new();
         for key in RESERVED_KEYS {
-            body.remove(*key);
+            if let Some(value) = body.remove(*key) {
+                if !LIFTED_KEYS.contains(key) {
+                    displaced.insert((*key).to_owned(), value);
+                }
+            }
+        }
+        if !displaced.is_empty() {
+            body.insert(DISPLACED_FIELDS_KEY.to_owned(), Value::Object(displaced));
         }
         body
     }
@@ -535,6 +618,7 @@ mod tests {
             tool_call_id: "call-1".to_owned(),
             status: ToolCallStatus::Completed,
             output: "x".repeat(BUDGET),
+            child: None,
         });
         let line = Line::render(&exact, &session(), 1, at(0), BUDGET);
         assert_eq!(
@@ -552,6 +636,7 @@ mod tests {
             tool_call_id: "call-1".to_owned(),
             status: ToolCallStatus::Completed,
             output: "x".repeat(BUDGET + 1),
+            child: None,
         });
         let line = Line::render(&over, &session(), 2, at(0), BUDGET);
         assert_eq!(line.truncated, Some(true), "one byte over must be marked");
@@ -571,6 +656,7 @@ mod tests {
             tool_call_id: "call-1".to_owned(),
             status: ToolCallStatus::Completed,
             output: "x".repeat(1_048_576),
+            child: None,
         });
         let line = Line::render(&huge, &session(), 3, at(0), BUDGET);
         assert_eq!(line.truncated, Some(true));
@@ -646,6 +732,190 @@ mod tests {
             rendered["session_id"], "sess-0123456789abcdefghjkmnpqrs",
             "the line owns session_id; the body's copy is stripped"
         );
+    }
+
+    /// The line-level names every line carries and no body may repeat — the
+    /// set [`Line`] serializes before its flattened body, read off a rendered
+    /// line rather than off [`RESERVED_KEYS`] so the oracle is not the subject.
+    fn reserved_keys_on(line: &Value) -> Vec<&str> {
+        let mut keys: Vec<&str> = line
+            .as_object()
+            .expect("a line is an object")
+            .keys()
+            .map(String::as_str)
+            .filter(|key| {
+                [
+                    "n",
+                    "ts",
+                    "session_id",
+                    "seq",
+                    "kind",
+                    "event",
+                    "truncated",
+                    "original_bytes",
+                ]
+                .contains(key)
+            })
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// REQ-623 BR-11 / BR-13 — a payload field whose name the line owns is
+    /// **displaced** under `event_fields`, not dropped; the envelope's own frame
+    /// keys are lifted and appear nowhere in the body.
+    ///
+    /// `agent_child_finished.truncated` is the case that forced the rule: it
+    /// says the report the parent received was cut, and BR-11 sends the reader
+    /// to the transcript for the whole text — a file that erased the flag would
+    /// leave them unable to tell which children to go and look at. The line's
+    /// own `truncated` must stay absent, because nothing on *this* line was cut:
+    /// two facts with one name, and conflating them is the defect.
+    /// `context_pressure.kind` is the same collision one REQ older, and the
+    /// benign leg is a `session_update`, which collides with nothing and gains
+    /// no `event_fields` at all.
+    ///
+    /// **Shown to fail** (mutation, restored): replacing the displacement in
+    /// [`Record::body`] with the pre-REQ-623 `body.remove(*key)` reddens this
+    /// test at `agent_child_finished keeps its own truncated flag` (and
+    /// `one_file_holds_parent_and_children` in `tests/transcript.rs`).
+    #[test]
+    fn a_payload_field_named_like_a_line_key_is_displaced_not_dropped() {
+        use teton_protocol::agent::ChildStatus;
+        use teton_protocol::events::{
+            AgentChildFinished, BudgetBound, ContextPressure, ContextPressureKind,
+        };
+
+        let finished = Record::BusEnvelope(EventEnvelope::new(
+            9,
+            Some(session()),
+            Event::AgentChildFinished(AgentChildFinished {
+                child_id: ChildId::new("call-1", "scan"),
+                status: ChildStatus::Completed,
+                turns_used: 3,
+                cost_micro_cents: 120,
+                report_bytes: 40_000,
+                truncated: true,
+            }),
+        ));
+        let line = Line::render(&finished, &session(), 4, at(0), 4096);
+        assert_eq!(line.kind, "agent_child_finished");
+        assert_eq!(
+            line.truncated, None,
+            "nothing on this line was cut, so the line's own marker stays absent"
+        );
+        let rendered = serde_json::to_value(&line).expect("a line serializes");
+        assert_eq!(
+            rendered[DISPLACED_FIELDS_KEY]["truncated"],
+            Value::Bool(true),
+            "agent_child_finished keeps its own truncated flag: {rendered}"
+        );
+        assert_eq!(rendered["child_id"], "call-1/scan");
+        assert_eq!(
+            reserved_keys_on(&rendered),
+            vec!["kind", "n", "seq", "session_id", "ts"],
+            "the reserved set is the line's alone: {rendered}"
+        );
+        let displaced = rendered[DISPLACED_FIELDS_KEY]
+            .as_object()
+            .expect("displaced fields are an object");
+        for lifted in LIFTED_KEYS {
+            assert!(
+                !displaced.contains_key(*lifted),
+                "`{lifted}` is the envelope's frame, lifted onto the line, never displaced"
+            );
+        }
+
+        let pressure = Record::BusEnvelope(EventEnvelope::new(
+            10,
+            Some(session()),
+            Event::ContextPressure(ContextPressure {
+                kind: ContextPressureKind::DidNotFit,
+                dropped_blocks: 2,
+                elided_bytes: 0,
+                newest_user_elided: false,
+                budget_tokens: 1_000,
+                budget_bytes: 4_000,
+                bound: BudgetBound::LocalEngine,
+                bound_floored: false,
+                anchors_intact: true,
+                child_id: None,
+                parent_turn_id: None,
+            }),
+        ));
+        let rendered = serde_json::to_value(Line::render(&pressure, &session(), 5, at(0), 4096))
+            .expect("a line serializes");
+        assert_eq!(rendered["kind"], "context_pressure");
+        assert_eq!(
+            rendered[DISPLACED_FIELDS_KEY]["kind"], "did_not_fit",
+            "which pressure it was survives beside the line's kind: {rendered}"
+        );
+
+        // Benign: a payload that collides with nothing gains nothing.
+        let chunk = Record::BusEnvelope(EventEnvelope::new(
+            11,
+            Some(session()),
+            Event::SessionUpdate(SessionUpdate {
+                update: SessionUpdatePayload::AgentMessageChunk {
+                    text: "hi".to_owned(),
+                },
+                child_id: None,
+                parent_turn_id: None,
+            }),
+        ));
+        let rendered = serde_json::to_value(Line::render(&chunk, &session(), 6, at(0), 4096))
+            .expect("a line serializes");
+        assert_eq!(
+            rendered.get(DISPLACED_FIELDS_KEY),
+            None,
+            "no collision, no displaced object: {rendered}"
+        );
+    }
+
+    /// REQ-623 BR-13 — a child-scoped `tool_call_input` writes `child_id` and
+    /// `parent_turn_id` into its body; a parent-scoped one writes neither key.
+    ///
+    /// The unit half of `tests/transcript.rs`'s
+    /// `child_records_tagged_in_body_not_reserved_keys`, at the type: the
+    /// flatten is what puts the pair beside `tool_call_id` rather than under a
+    /// `child` object, and a `None` must write no key at all rather than a
+    /// `null` a reader would have to special-case.
+    ///
+    /// **Shown to fail** (mutation, restored): dropping `#[serde(flatten)]` from
+    /// [`ToolCallInput::child`] reddens this at `child_id sits in the body`.
+    #[test]
+    fn a_child_scope_flattens_into_the_body_and_none_writes_no_key() {
+        let scoped = |child: Option<ChildScope>| {
+            let record = Record::ToolCallInput(ToolCallInput {
+                tool_call_id: "call-7".to_owned(),
+                tool: "grep".to_owned(),
+                input: serde_json::json!({ "pattern": "todo" }),
+                child,
+            });
+            serde_json::to_value(Line::render(&record, &session(), 2, at(0), 4096))
+                .expect("a line serializes")
+        };
+
+        let child = scoped(Some(ChildScope {
+            child_id: ChildId::new("call-1", "scan"),
+            parent_turn_id: TurnId::from("turn-1"),
+        }));
+        assert_eq!(
+            child["child_id"], "call-1/scan",
+            "child_id sits in the body"
+        );
+        assert_eq!(child["parent_turn_id"], "turn-1");
+        assert_eq!(child.get("child"), None, "flattened, not nested: {child}");
+        assert_eq!(
+            reserved_keys_on(&child),
+            vec!["kind", "n", "session_id", "ts"],
+            "a child record's reserved set is every record's: {child}"
+        );
+
+        let parent = scoped(None);
+        assert_eq!(parent.get("child_id"), None, "{parent}");
+        assert_eq!(parent.get("parent_turn_id"), None, "{parent}");
+        assert_eq!(reserved_keys_on(&parent), reserved_keys_on(&child));
     }
 
     /// BR-14 / TASK-367 — every `kind` a [`Record`] can write is described in
@@ -758,6 +1028,62 @@ mod tests {
             .skip(1)
             .filter_map(|arm| arm.split_once('"').map(|(kind, _)| kind.to_owned()))
             .collect()
+    }
+
+    /// REQ-623 — every `agent_*` event the protocol defines is described in
+    /// `docs/transcript-format.md`, because each one is a record kind a
+    /// transcript holds.
+    ///
+    /// The names are read off `teton-protocol`'s own `Event::name` arms, so an
+    /// eighth agent event cannot reach the wire without reaching the document;
+    /// the scan is cut at that file's first column-0 `#[cfg(test)]` and bounded
+    /// to the one function body, and seven is a vacuity floor — a slice that
+    /// stopped matching would otherwise check nothing forever.
+    ///
+    /// **Shown to fail** (mutation, restored): renaming every
+    /// `agent_child_share_released` mention in the document reddens this at
+    /// `` `agent_child_share_released` is a record kind … ``; raising `FLOOR`
+    /// to 8 reddens it at "the scan found 7".
+    #[test]
+    fn every_agent_event_kind_is_documented_in_the_format_doc() {
+        /// The agent events REQ-623 defines; a floor, not a count.
+        const FLOOR: usize = 7;
+        const MARKER: &str = "pub fn name(&self) -> &'static str {";
+
+        let source = include_str!("../../../teton-protocol/src/events.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(before, _)| before);
+        let start = production
+            .find(MARKER)
+            .expect("`Event::name` is the source of truth this scan reads");
+        let body = &production[start..];
+        let end = body
+            .find("\n    }\n")
+            .expect("`Event::name`'s body ends at a column-4 closing brace");
+        let kinds: Vec<&str> = body[..end]
+            .split("=> \"")
+            .skip(1)
+            .filter_map(|arm| arm.split_once('"').map(|(kind, _)| kind))
+            .filter(|kind| kind.starts_with("agent_"))
+            .collect();
+        assert!(
+            kinds.len() >= FLOOR,
+            "the scan found {} agent kind(s) in `Event::name`, fewer than the \
+             {FLOOR} REQ-623 defines — the slice has stopped matching",
+            kinds.len()
+        );
+
+        let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/transcript-format.md");
+        let doc = std::fs::read_to_string(&doc_path).expect("the format document is readable");
+        for kind in kinds {
+            assert!(
+                doc.contains(&format!("`{kind}`")),
+                "`{kind}` is a record kind a transcript holds but is not described in {}",
+                doc_path.display()
+            );
+        }
     }
 
     /// BR-14 — the timestamp is RFC 3339 UTC, and the file stamp is the
