@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -118,10 +118,20 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// depended on it would be asserting a bug. Bodies are always served as
 /// `text/event-stream` regardless of status — no header support (ADR-2), and
 /// the adapters branch on the status code before they look at the body.
+///
+/// ## Held replies (REQ-623 ADR-6)
+///
+/// A response may carry a [`Rendezvous`] ([`Self::rendezvous`],
+/// [`Rendezvous::hold`]): the request it answers is parked until the
+/// rendezvous's count of requests has arrived, then answered. Only
+/// [`MockProvider::start_matching`] serves held replies — it gives every
+/// connection its own thread, so parked requests do not stop it accepting the
+/// ones that release them. Cloning a held response shares its rendezvous.
 #[derive(Clone)]
 pub struct MockResponse {
     pub status: u16,
     pub body: String,
+    hold: Option<Rendezvous>,
 }
 
 impl MockResponse {
@@ -129,6 +139,7 @@ impl MockResponse {
         Self {
             status: 200,
             body: body.into(),
+            hold: None,
         }
     }
 
@@ -148,12 +159,178 @@ impl MockResponse {
         Self {
             status: code,
             body: body.into(),
+            hold: None,
         }
     }
 
     /// A hard client error (used to simulate a flaky provider for AC-7).
     pub fn bad_request() -> Self {
         Self::status_with_body(400, String::new())
+    }
+
+    /// `inner`, held until `n` requests are parked on it, then released to all
+    /// `n` at once (REQ-623 ADR-6).
+    ///
+    /// Shorthand for `Rendezvous::new(n).hold(inner)`. Every request served
+    /// this response — or a clone of it — parks on the same rendezvous, so in a
+    /// [`MockProvider::start_matching`] table one held reply spans several
+    /// entries by cloning it, and as the `default` it holds every unmatched
+    /// request. Build the [`Rendezvous`] yourself when the parked requests
+    /// should each get a different reply, or when the test needs to watch how
+    /// many have arrived.
+    pub fn rendezvous(n: usize, inner: MockResponse) -> Self {
+        Rendezvous::new(n).hold(inner)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Request matching and the rendezvous hold (REQ-623 ADR-6)
+// ---------------------------------------------------------------------------
+
+/// Which request a [`MockProvider::start_matching`] table entry answers: a
+/// substring of the request **body** (e.g. a child's `task` text).
+///
+/// The match is against the raw bytes the client sent — the JSON-encoded
+/// body — so a needle containing a `"` or a newline must be written as it is
+/// escaped on the wire. Plain words and hyphenated markers match as written.
+#[derive(Clone, Debug)]
+pub struct Matcher {
+    needle: String,
+}
+
+impl Matcher {
+    /// Matches a request whose body contains `needle`.
+    pub fn body_contains(needle: impl Into<String>) -> Self {
+        let needle = needle.into();
+        assert!(
+            !needle.is_empty(),
+            "an empty needle matches every request; use the default reply instead"
+        );
+        Self { needle }
+    }
+
+    /// Whether `body` is a request this matcher answers.
+    pub fn matches(&self, body: &[u8]) -> bool {
+        contains(body, self.needle.as_bytes())
+    }
+}
+
+/// How often a parked request re-checks that its provider is still running, so
+/// dropping a [`MockProvider`] with requests parked on an unmet rendezvous
+/// ends their threads instead of leaking them.
+const PARKED_POLL: Duration = Duration::from_millis(20);
+
+/// A counting hold: requests served a reply built from it park until `n` of
+/// them have arrived, and the `n`th arrival releases **every** parked request
+/// at once (REQ-623 ADR-6).
+///
+/// Release is all-or-nothing and unordered — which parked request writes its
+/// reply first is the scheduler's choice, and nothing here promises one
+/// (LESSON-540): assert on the set of replies, never on their order. Once
+/// released the rendezvous stays open; a later arrival passes straight through.
+///
+/// Clones share one count. That is how replies that differ (one per child) all
+/// wait on the same rendezvous: [`Self::hold`] each of them from one
+/// `Rendezvous`.
+#[derive(Clone)]
+pub struct Rendezvous {
+    shared: Arc<RendezvousShared>,
+}
+
+struct RendezvousShared {
+    n: usize,
+    state: Mutex<RendezvousState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct RendezvousState {
+    arrived: usize,
+    released: bool,
+}
+
+impl Rendezvous {
+    /// A rendezvous that releases when `n` requests have parked on it.
+    pub fn new(n: usize) -> Self {
+        assert!(
+            n > 0,
+            "a rendezvous of zero holds nothing; serve the reply plainly"
+        );
+        Self {
+            shared: Arc::new(RendezvousShared {
+                n,
+                state: Mutex::new(RendezvousState::default()),
+                changed: Condvar::new(),
+            }),
+        }
+    }
+
+    /// `reply`, held on this rendezvous.
+    pub fn hold(&self, reply: MockResponse) -> MockResponse {
+        assert!(
+            reply.hold.is_none(),
+            "a reply waits on one rendezvous; this one is already held"
+        );
+        MockResponse {
+            hold: Some(self.clone()),
+            ..reply
+        }
+    }
+
+    /// How many requests have reached this rendezvous — the parked ones plus,
+    /// once it has released, every one it released or passed through.
+    pub fn arrived(&self) -> usize {
+        self.shared.state.lock().unwrap().arrived
+    }
+
+    /// Whether the `n`th request has arrived and the hold is open.
+    pub fn is_released(&self) -> bool {
+        self.shared.state.lock().unwrap().released
+    }
+
+    /// Block until at least `count` requests have arrived, or `timeout`
+    /// passes. Returns whether they arrived — so a test can wait for a request
+    /// to be *parked* (arrived, not released) instead of sleeping on a guess.
+    pub fn wait_arrived(&self, count: usize, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.shared.state.lock().unwrap();
+        while state.arrived < count {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            state = self
+                .shared
+                .changed
+                .wait_timeout(state, deadline - now)
+                .unwrap()
+                .0;
+        }
+        true
+    }
+
+    /// Park the calling connection thread until the rendezvous releases.
+    ///
+    /// Returns `false` — the request goes unanswered — when the provider
+    /// stopped `running` first, so a test that ends with a request parked on an
+    /// unmet rendezvous (the failure this fixture exists to produce) does not
+    /// strand the thread.
+    fn park(&self, running: &AtomicBool) -> bool {
+        let shared = &self.shared;
+        let mut state = shared.state.lock().unwrap();
+        state.arrived += 1;
+        if state.arrived >= shared.n {
+            state.released = true;
+        }
+        // Wakes every parked request (on release) and every `wait_arrived`.
+        shared.changed.notify_all();
+        while !state.released {
+            if !running.load(Ordering::SeqCst) {
+                return false;
+            }
+            state = shared.changed.wait_timeout(state, PARKED_POLL).unwrap().0;
+        }
+        true
     }
 }
 
@@ -302,6 +479,15 @@ impl MockProvider {
         default: MockResponse,
         delay: Duration,
     ) -> Self {
+        assert!(
+            scripted
+                .iter()
+                .chain(std::iter::once(&default))
+                .all(|r| r.hold.is_none()),
+            "a held MockResponse needs MockProvider::start_matching: this server answers one \
+             connection at a time, so a request parked on a rendezvous would stop it accepting \
+             the requests that release it"
+        );
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
@@ -341,6 +527,76 @@ impl MockProvider {
         Self {
             port,
             scripted,
+            default,
+            requests,
+            running,
+            handle: Some(handle),
+        }
+    }
+
+    /// Start a mock provider that answers each request by **what it says**,
+    /// not by when it arrived (REQ-623 ADR-6).
+    ///
+    /// Concurrent children make arrival order a scheduler accident, so the
+    /// ordered script of [`Self::start`] cannot address one. Here every request
+    /// is answered by the first **unconsumed** `table` entry, in list order,
+    /// whose [`Matcher`] its body satisfies; that entry is then spent. A request
+    /// no live entry matches gets `default`. Consuming entries is what lets a
+    /// test script one child's successive requests — two entries with the same
+    /// needle answer that child's first and second request in turn — and keeps
+    /// a later request that merely *quotes* a child's task (the parent's
+    /// follow-up, carrying the tool call) from re-taking that child's reply:
+    /// put the most specific needles first.
+    ///
+    /// Each connection gets its own thread, so a reply held on a [`Rendezvous`]
+    /// parks only its own request. Every request body is captured — into
+    /// [`Self::requests`] and the suite-wide [`global_capture`] — on arrival,
+    /// before it is matched or parked, so [`assert_no_boundary_bytes`] sees a
+    /// request that is still parked when the test asserts.
+    pub fn start_matching(table: Vec<(Matcher, MockResponse)>, default: MockResponse) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+
+        let table: Arc<MatchTable> = Arc::new(Mutex::new(table.into_iter().map(Some).collect()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let running = Arc::new(AtomicBool::new(true));
+
+        let handle = {
+            let requests = Arc::clone(&requests);
+            let running = Arc::clone(&running);
+            let default = default.clone();
+            thread::spawn(move || {
+                let mut connections = Vec::new();
+                while running.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let stream = accepted(stream);
+                            let table = Arc::clone(&table);
+                            let requests = Arc::clone(&requests);
+                            let running = Arc::clone(&running);
+                            let default = default.clone();
+                            connections.push(thread::spawn(move || {
+                                serve_matched(stream, &table, &default, &requests, &running);
+                            }));
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                // `running` is down, so a parked connection gives up within
+                // `PARKED_POLL`; joining here makes `Drop` wait for them all.
+                for connection in connections {
+                    let _ = connection.join();
+                }
+            })
+        };
+
+        Self {
+            port,
+            scripted: Arc::new(Mutex::new(VecDeque::new())),
             default,
             requests,
             running,
@@ -404,7 +660,50 @@ fn handle_http(
     let body = read_http_body(&mut stream);
     record_egress(body.clone());
     requests.lock().unwrap().push(body);
+    write_http_response(&mut stream, response);
+}
 
+/// A [`MockProvider::start_matching`] table: `None` marks a spent entry.
+type MatchTable = Mutex<Vec<Option<(Matcher, MockResponse)>>>;
+
+/// One connection on the matching path: capture the body, take the reply its
+/// body selects, park on that reply's rendezvous if it has one, then answer.
+fn serve_matched(
+    mut stream: TcpStream,
+    table: &MatchTable,
+    default: &MockResponse,
+    requests: &Arc<Mutex<Vec<Vec<u8>>>>,
+    running: &AtomicBool,
+) {
+    let body = read_http_body(&mut stream);
+    // Captured before matching or parking: a parked request is still egress.
+    record_egress(body.clone());
+    requests.lock().unwrap().push(body.clone());
+
+    let response = take_first_match(table, &body).unwrap_or_else(|| default.clone());
+    if let Some(hold) = &response.hold {
+        if !hold.park(running) {
+            return; // the provider is shutting down; drop the request unanswered
+        }
+    }
+    write_http_response(&mut stream, &response);
+}
+
+/// Spend and return the first live entry whose matcher `body` satisfies.
+///
+/// The table lock is released before the caller parks, so a held request never
+/// blocks another request's matching.
+fn take_first_match(table: &MatchTable, body: &[u8]) -> Option<MockResponse> {
+    let mut table = table.lock().unwrap();
+    table
+        .iter_mut()
+        .find(|entry| matches!(entry, Some((matcher, _)) if matcher.matches(body)))
+        .and_then(Option::take)
+        .map(|(_, response)| response)
+}
+
+/// Write `response` as a `Connection: close` HTTP/1.1 reply.
+fn write_http_response(stream: &mut TcpStream, response: &MockResponse) {
     let code = response.status;
     let head = format!(
         "HTTP/1.1 {code} {}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",

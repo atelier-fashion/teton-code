@@ -1,7 +1,7 @@
 ---
 id: TASK-423
 title: "e2e fixture: MockProvider request matching and a rendezvous hold"
-status: draft
+status: complete
 parent: REQ-623
 created: 2026-10-05
 updated: 2026-10-05
@@ -25,10 +25,10 @@ with.
 
 ## Acceptance Criteria
 
-- [ ] Two concurrent requests with different task text each receive their matched reply regardless of arrival order
-- [ ] `rendezvous(3)` holds two requests and releases all three when the third arrives
-- [ ] Existing e2e suites using `start`/`start_delayed` are unchanged and green
-- [ ] `global_capture` and `assert_no_boundary_bytes` still see every request body on the matching path
+- [x] Two concurrent requests with different task text each receive their matched reply regardless of arrival order
+- [x] `rendezvous(3)` holds two requests and releases all three when the third arrives
+- [x] Existing e2e suites using `start`/`start_delayed` are unchanged and green
+- [x] `global_capture` and `assert_no_boundary_bytes` still see every request body on the matching path
 
 ## Verification
 
