@@ -8835,6 +8835,31 @@ fn cost_report_view(report: &CostReport) -> CostReportView {
                 bytes_in: w.bytes_in,
             })
             .collect(),
+        // REQ-623 BR-8 / AC-12: a parent turn's children nested under it. The
+        // nesting happened in `cost::report::aggregate`; this only re-types it.
+        per_turn: report
+            .per_turn
+            .iter()
+            .map(|turn| teton_protocol::methods::CostTurnView {
+                session_id: SessionId::from(turn.session_id.clone()),
+                turn_id: turn.turn_id.clone(),
+                own: group(&turn.own),
+                children: turn
+                    .children
+                    .iter()
+                    .map(|child| teton_protocol::methods::CostChildView {
+                        child_id: child.child_id.clone(),
+                        name: child.name.clone(),
+                        route: child.route.clone(),
+                        calls: child.calls,
+                        input_tokens: child.input_tokens,
+                        output_tokens: child.output_tokens,
+                        usd_micros: child.usd_micros,
+                    })
+                    .collect(),
+                total: group(&turn.total),
+            })
+            .collect(),
     }
 }
 

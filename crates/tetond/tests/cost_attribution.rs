@@ -18,6 +18,9 @@
 //!    recorded individually).
 //! 5. No ledger row carries prompt or credential content (BR-7): the row holds
 //!    only token counts and routing metadata.
+//! 6. A child's call is recorded with both its `child_id` and its
+//!    `parent_turn_id`, and `/cost` nests it under that parent turn, whose total
+//!    is its own calls plus its children's (REQ-623 BR-8 / AC-12).
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -27,8 +30,9 @@ use futures::StreamExt;
 
 use teton_core::entities::{BoundaryMode, PrivacyBoundary};
 use teton_core::ProvenanceId;
+use teton_protocol::agent::ChildId;
 use teton_protocol::events::CostRecord;
-use teton_protocol::Phase;
+use teton_protocol::{Phase, SessionId, TurnId};
 use teton_providers::transport::{
     ByteStream, HttpMethod, Transport, TransportError, TransportRequest, TransportResponse,
 };
@@ -332,6 +336,253 @@ async fn no_ledger_row_carries_prompt_or_credential_content() {
     // The emitted event is equally content-free.
     let events = cost_sink.records.lock().unwrap();
     assert!(!events[0].model.contains("sk-live"));
+}
+
+// ---------------------------------------------------------------------------
+// REQ-623 BR-8 / AC-12 — a child's spend nests under its parent turn
+// ---------------------------------------------------------------------------
+//
+// Each call goes out through the real egress choke point with the attribution
+// a child's egress (or the parent turn's own) carries, so the ids are proved to
+// survive the metered stream path — `MeteredBody` → the store → the report —
+// rather than only a hand-built `LedgerRow`.
+
+/// Send one call through `egress` under `attribution` and drain it, so the
+/// metered body records it.
+async fn send_attributed(
+    egress: &Egress<ScriptedTransport>,
+    session: &str,
+    provider: &str,
+    attribution: CostAttribution,
+) {
+    let ctx = EgressContext::new(provider)
+        .with_session(session)
+        .with_cost(attribution);
+    let resp = egress
+        .send(request("prompt"), &Provenance::empty(), &ctx)
+        .await
+        .expect("clean call is allowed");
+    drain(resp.body).await;
+}
+
+/// BR-8: a child's call is recorded with **both** ids — on the stored row and
+/// on the live `cost_recorded` event — and `/cost` puts it on its own line
+/// under the parent turn it ran in, with the turn's own call kept apart.
+///
+/// Mutation (recorded): grouping `per_turn` by session alone (dropping the
+/// `parent_turn_id` from the key) reddens 2 tests — this one, where turn-2's
+/// child lands under turn-1, and `report::tests::a_turn_is_keyed_by_session
+/// _and_needs_a_child_to_appear`. Not carrying `child_id` through
+/// `MeteredBody::finalize` reddens 2 — this one and
+/// `parent_total_is_own_plus_children`; every ledger unit test stays green,
+/// because none of them goes through the metered stream.
+#[tokio::test]
+async fn child_records_nest_under_parent_turn() {
+    let transport = ScriptedTransport::with_script(&[(100, 10), (200, 20), (300, 30), (400, 40)]);
+    let (ledger, cost_sink) = ledger();
+    let egress =
+        Egress::new(transport, Vec::new(), Arc::new(NoopSink)).with_cost_meter(ledger.clone());
+
+    let audit = ChildId::new("toolu_01", "audit");
+    let later = ChildId::new("toolu_02", "audit");
+
+    // turn-1: the parent's own call, then its child's.
+    send_attributed(
+        &egress,
+        "sess-nest",
+        "anthropic",
+        CostAttribution::new("claude-opus-5").with_turn(TurnId::from("turn-1")),
+    )
+    .await;
+    send_attributed(
+        &egress,
+        "sess-nest",
+        "deepseek",
+        CostAttribution::new("deepseek-v4-pro").for_child(audit.clone(), TurnId::from("turn-1")),
+    )
+    .await;
+    // turn-2 dispatches a child of the same name under a fresh call id.
+    send_attributed(
+        &egress,
+        "sess-nest",
+        "deepseek",
+        CostAttribution::new("deepseek-v4-pro").for_child(later.clone(), TurnId::from("turn-2")),
+    )
+    .await;
+    // A call attributed to nothing, exactly as every call before REQ-623.
+    send_attributed(
+        &egress,
+        "sess-nest",
+        "anthropic",
+        CostAttribution::new("claude-opus-5"),
+    )
+    .await;
+
+    // Both ids on the stored row ...
+    let rows = ledger.all_records().expect("read rows");
+    assert_eq!(rows.len(), 4, "one row per call, children included");
+    assert_eq!(rows[1].child_id, Some(audit.clone()));
+    assert_eq!(rows[1].parent_turn_id, Some(TurnId::from("turn-1")));
+    assert_eq!(
+        (rows[3].child_id.clone(), rows[3].parent_turn_id.clone()),
+        (None, None)
+    );
+    // ... and on the live event a client sees.
+    {
+        let events = cost_sink.records.lock().unwrap();
+        assert_eq!(events[1].child_id, Some(audit.clone()));
+        assert_eq!(events[1].parent_turn_id, Some(TurnId::from("turn-1")));
+        assert_eq!(
+            events[0].child_id, None,
+            "the turn's own call names no child"
+        );
+    }
+
+    let report = ledger.report().expect("report");
+    let turns: Vec<(&str, &str)> = report
+        .per_turn
+        .iter()
+        .map(|t| (t.session_id.as_str(), t.turn_id.0.as_str()))
+        .collect();
+    assert_eq!(
+        turns,
+        vec![("sess-nest", "turn-1"), ("sess-nest", "turn-2")],
+        "each turn that dispatched a child appears once, in ledger order"
+    );
+
+    let first = &report.per_turn[0];
+    assert_eq!(first.children.len(), 1, "turn-1 has exactly its own child");
+    let line = &first.children[0];
+    assert_eq!(line.child_id, audit);
+    assert_eq!(line.name, "audit");
+    assert_eq!(line.route, "deepseek/deepseek-v4-pro");
+    assert_eq!(
+        (line.calls, line.input_tokens, line.output_tokens),
+        (1, 200, 20)
+    );
+    assert_eq!(
+        (first.own.calls, first.own.input_tokens),
+        (1, 100),
+        "the parent's own call is kept apart from its child's line"
+    );
+
+    let second = &report.per_turn[1];
+    assert_eq!(second.children.len(), 1);
+    assert_eq!(second.children[0].child_id, later);
+    assert_eq!(second.children[0].input_tokens, 300);
+    assert_eq!(
+        second.own.calls, 0,
+        "turn-2 made no stamped call of its own"
+    );
+
+    // The unattributed call is in the session's roll-up and nowhere else.
+    assert_eq!(report.total.calls, 4);
+    assert_eq!(report.per_session[0].calls, 4);
+}
+
+/// AC-12: a parent turn with two children reports `total = own + child_a +
+/// child_b` and one line per child.
+///
+/// Each figure is priced independently from the price table here — the
+/// subject under test is the nesting and the summing, not the pricing — and
+/// the four amounts differ, so a child dropped from the total, counted twice,
+/// or folded into the parent's own line changes a number this test pins.
+///
+/// Mutation (recorded): the turn's `total` accumulating only its own rows
+/// reddens 3 tests — this one and two in `report::tests`
+/// (`a_turn_nests_each_child_and_totals_own_plus_children`,
+/// `a_turn_is_keyed_by_session_and_needs_a_child_to_appear`). Folding every
+/// child onto one line reddens this test and the first of those two.
+#[tokio::test]
+async fn parent_total_is_own_plus_children() {
+    let script = [(1000u64, 500u64), (4000, 2000), (3000, 100), (2000, 900)];
+    let transport = ScriptedTransport::with_script(&script);
+    let (ledger, _sink) = ledger();
+    let egress =
+        Egress::new(transport, Vec::new(), Arc::new(NoopSink)).with_cost_meter(ledger.clone());
+    let prices = PriceTable::bundled();
+
+    let turn = TurnId::from("turn-7");
+    let child_a = ChildId::new("toolu_09", "audit-a");
+    let child_b = ChildId::new("toolu_09", "audit-b");
+
+    // The parent's own call before the `agent` call ...
+    send_attributed(
+        &egress,
+        "sess-total",
+        "anthropic",
+        CostAttribution::new("claude-opus-5").with_turn(turn.clone()),
+    )
+    .await;
+    // ... its two children ...
+    send_attributed(
+        &egress,
+        "sess-total",
+        "deepseek",
+        CostAttribution::new("deepseek-v4-pro").for_child(child_a.clone(), turn.clone()),
+    )
+    .await;
+    send_attributed(
+        &egress,
+        "sess-total",
+        "anthropic",
+        CostAttribution::new("claude-opus-5").for_child(child_b.clone(), turn.clone()),
+    )
+    .await;
+    // ... and its own call after they report back.
+    send_attributed(
+        &egress,
+        "sess-total",
+        "anthropic",
+        CostAttribution::new("claude-opus-5").with_turn(turn.clone()),
+    )
+    .await;
+
+    let price = |model: &str, (input, output): (u64, u64)| {
+        prices
+            .price(model, input, output)
+            .expect("the bundled table prices this model")
+    };
+    let own = price("claude-opus-5", script[0]) + price("claude-opus-5", script[3]);
+    let a = price("deepseek-v4-pro", script[1]);
+    let b = price("claude-opus-5", script[2]);
+    assert!(
+        own > 0 && a > 0 && b > 0 && a != b,
+        "non-vacuity: three distinct, non-zero amounts ({own}, {a}, {b})"
+    );
+
+    let report = ledger.report().expect("report");
+    assert_eq!(report.per_turn.len(), 1);
+    let parent = &report.per_turn[0];
+    assert_eq!(parent.turn_id, turn);
+    assert_eq!((parent.own.calls, parent.own.usd_micros), (2, own));
+
+    let lines: Vec<(&str, i64)> = parent
+        .children
+        .iter()
+        .map(|c| (c.name.as_str(), c.usd_micros))
+        .collect();
+    assert_eq!(
+        lines,
+        vec![("audit-a", a), ("audit-b", b)],
+        "one line per child"
+    );
+
+    assert_eq!(parent.total.usd_micros, own + a + b, "total = own + a + b");
+    assert_eq!(parent.total.calls, 4);
+    // The parent pays: the session's spend is the same figure, counted once.
+    assert_eq!(report.total.usd_micros, own + a + b);
+
+    // And the ledger's per-child figure agrees with the report's line.
+    let session = SessionId::from("sess-total");
+    assert_eq!(
+        ledger.spent_by_child(&session, &child_a).expect("query"),
+        a.unsigned_abs()
+    );
+    assert_eq!(
+        ledger.spent_by_child(&session, &child_b).expect("query"),
+        b.unsigned_abs()
+    );
 }
 
 // ---------------------------------------------------------------------------
