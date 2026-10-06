@@ -1,7 +1,7 @@
 ---
 id: TASK-422
 title: "The [agent] config table: AgentConfig, defaults, validation, is_unset"
-status: draft
+status: complete
 parent: REQ-623
 created: 2026-10-05
 updated: 2026-10-05
@@ -23,10 +23,10 @@ table is not written back to disk (ASSUME-007 round-trip).
 
 ## Acceptance Criteria
 
-- [ ] A config with no `[agent]` table loads with the six defaults and serializes without an `[agent]` section
-- [ ] `max_children_per_call = 0` and `report_max_bytes = 10` are structural errors naming the key
-- [ ] `enabled = false` loads and is distinguishable from unset
-- [ ] `cargo test -p teton-core` green
+- [x] A config with no `[agent]` table loads with the six defaults and serializes without an `[agent]` section
+- [x] `max_children_per_call = 0` and `report_max_bytes = 10` are structural errors naming the key
+- [x] `enabled = false` loads and is distinguishable from unset
+- [x] `cargo test -p teton-core` green
 
 ## Verification
 
