@@ -290,11 +290,16 @@ jobs:
             gcs)
               [ -n "${GCP_SITE_BUCKET:-}" ] || note 'vars.GCP_SITE_BUCKET'
               ;;
+            firebase)
+              # Needs nothing beyond secrets.GCP_PROJECT: the project's DEFAULT
+              # hosting site is deployed, and firebase.json at the repo root
+              # carries the rest (REQ-626).
+              ;;
             '')
-              note 'vars.GCP_DEPLOY_SURFACE (set it to cloud-run or gcs)'
+              note 'vars.GCP_DEPLOY_SURFACE (set it to cloud-run, gcs or firebase)'
               ;;
             *)
-              note "vars.GCP_DEPLOY_SURFACE is '$surface', which is neither cloud-run nor gcs"
+              note "vars.GCP_DEPLOY_SURFACE is '$surface', which is none of cloud-run, gcs or firebase"
               surface=''
               ;;
           esac
@@ -345,7 +350,7 @@ jobs:
         if: steps.config.outputs.ready == 'true'
         uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
 
-      # Surface A of two (ADR-548-3): the site is a Cloud Run service. Selected
+      # Surface A of three (ADR-548-3): the site is a Cloud Run service. Selected
       # by vars.GCP_DEPLOY_SURFACE=cloud-run.
       #
       # `--source` builds with Google Cloud buildpacks. If the Atelier site
@@ -384,7 +389,7 @@ jobs:
           printf 'Cloud Run service %s (%s) now serves teton %s at %s\n' \
             "$SERVICE" "$REGION" "$TAG" "$url" >"$RECEIPT"
 
-      # Surface B of two (ADR-548-3): the site is static objects behind the
+      # Surface B of three (ADR-548-3; decommissioned for tetoncode.ai by REQ-626 — kept for a shared-bucket future): the site is static objects behind the
       # existing external load balancer. Selected by vars.GCP_DEPLOY_SURFACE=gcs.
       #
       # rsync, never a delete-the-rest sync: the destination may be a prefix in a
@@ -456,6 +461,56 @@ jobs:
           fi
 
           printf 'gs://%s was synced with teton %s%s\n' "$BUCKET" "$TAG" "$cdn_note" >"$RECEIPT"
+
+      # Surface C of three (REQ-626): Firebase Hosting. Selected by
+      # vars.GCP_DEPLOY_SURFACE=firebase, and the surface tetoncode.ai serves
+      # from since 2026-10-06. Google-managed TLS, a global CDN and the
+      # www→apex redirect come with the product, so there is no load balancer,
+      # URL map, certificate or CDN invalidation to own here — the flat ~$18/mo
+      # forwarding rule the `gcs` surface paid to put one static page behind a
+      # global load balancer is what this replaces.
+      #
+      # Same WIF credential as the other surfaces: firebase-tools honours the
+      # GOOGLE_APPLICATION_CREDENTIALS that google-github-actions/auth exports.
+      # The CLI version is pinned, the run is --non-interactive, and the receipt
+      # is written only after the live default URL is observed to carry $TAG —
+      # "Deploy complete" from the CLI is not the evidence AC-7 asks for; the
+      # page at the URL is.
+      - name: Deploy to Firebase Hosting
+        if: steps.config.outputs.ready == 'true' && steps.config.outputs.surface == 'firebase'
+        env:
+          RECEIPT: ${{ runner.temp }}/site-deploy-receipt
+          PROJECT: ${{ secrets.GCP_PROJECT }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # firebase.json (repo root) points hosting at site/dist and carries the
+          # five-minute Cache-Control the gcs surface used to set by hand.
+          npx --yes firebase-tools@15.11.0 deploy \
+            --only hosting \
+            --project "$PROJECT" \
+            --non-interactive --force \
+            --message "teton $TAG (deploy-site run $GITHUB_RUN_ID)"
+
+          # The project's default site is named after the project, so its
+          # canonical URL is derivable without another variable. Masked in the
+          # log like everything else that carries the project id.
+          url="https://${PROJECT}.web.app/"
+          live=''
+          for _ in 1 2 3 4 5 6; do
+            if curl -fsS --max-time 15 "$url" | grep -qF "$TAG"; then
+              live=yes
+              break
+            fi
+            sleep 10
+          done
+          if [ -z "$live" ]; then
+            echo "::error title=Firebase deploy not observed::the CLI reported success but $url did not serve a page carrying $TAG after 6 attempts (60s). Nothing is recorded as published — check the Hosting release history in the Firebase console."
+            exit 1
+          fi
+
+          printf 'Firebase Hosting (default site of the project) was published with teton %s and serves it at %s\n' "$TAG" "$url" >"$RECEIPT"
 
       # THE GUARD (ADR-548-3, LESSON-447). The last word on this job's colour.
       #
