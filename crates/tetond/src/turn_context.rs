@@ -74,7 +74,7 @@ use std::sync::{Arc, Mutex};
 use teton_core::config::Config;
 use teton_core::cost_ceiling::PromptSpend;
 use teton_inference::{ChatFormat, Engine};
-use teton_protocol::SessionId;
+use teton_protocol::{SessionId, TurnId};
 
 use crate::broadcast::EventBus;
 use crate::grants::ConnectionId;
@@ -181,6 +181,17 @@ pub struct TurnContext<'a> {
     /// facts after the parent's claim, so it cannot go stale between a claim
     /// and this construction point.
     pub child: Option<&'a ChildTurn>,
+    /// The prompt turn every model call this context makes is billed under
+    /// (REQ-623 BR-8, AC-12), or `None` for a context that makes calls on no
+    /// turn's behalf.
+    ///
+    /// Set by [`TurnContext::for_turn`] at the top of the attempt loop — the
+    /// turn id is minted with the claim, long before the loop, and is never
+    /// rebound — so every egress and every local source an attempt builds,
+    /// and every duty route it resolves, stamps the turn's own rows with it.
+    /// A child's rows carry its own pair through its spend share instead, so
+    /// on a child this names the parent turn and changes nothing.
+    pub turn_id: Option<&'a TurnId>,
 }
 
 /// The duty-routing context: [`TurnCore`] plus the two facts that travel with
@@ -212,6 +223,11 @@ pub struct DutyContext<'a> {
     /// share (the parent pays, ADR-4) and announces no `route_decided`, which
     /// carries no child id and would read as the parent's.
     pub child: Option<&'a ChildTurn>,
+    /// The prompt turn this duty's calls are billed under — carried from
+    /// [`TurnContext::turn_id`]. `None` for the detached title duty, which
+    /// outlives the prompt that triggered it (REQ-588's reason for its `None`
+    /// spend accumulator, applied to attribution).
+    pub turn_id: Option<&'a TurnId>,
 }
 
 impl<'a> TurnCore<'a> {
@@ -234,6 +250,7 @@ impl<'a> TurnCore<'a> {
             local_engine,
             prompt_spend,
             child: None,
+            turn_id: None,
         }
     }
 }
@@ -259,6 +276,17 @@ impl<'a> TurnContext<'a> {
             gate,
             invoker,
             child: None,
+            turn_id: None,
+        }
+    }
+
+    /// This context, billing its calls under the prompt turn `turn_id`
+    /// (REQ-623 BR-8) — see [`TurnContext::turn_id`].
+    #[must_use]
+    pub fn for_turn(self, turn_id: &'a TurnId) -> Self {
+        Self {
+            turn_id: Some(turn_id),
+            ..self
         }
     }
 
@@ -291,6 +319,7 @@ impl<'a> TurnContext<'a> {
     ) -> DutyContext<'a> {
         DutyContext {
             child: self.child,
+            turn_id: self.turn_id,
             ..self.core.duties(local_engine, prompt_spend)
         }
     }
@@ -318,6 +347,7 @@ impl<'a> DutyContext<'a> {
             local_engine,
             prompt_spend,
             child: None,
+            turn_id: None,
         }
     }
 }
@@ -443,6 +473,8 @@ mod tests {
             // after the parent's claim — nothing in it is read off the session
             // root, so it cannot go stale between a claim and this point.
             child: _,
+            // REQ-623 BR-8: minted with the claim and never rebound.
+            turn_id: _,
         } = tctx;
     }
 }

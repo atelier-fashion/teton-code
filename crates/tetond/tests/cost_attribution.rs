@@ -20,7 +20,8 @@
 //!    only token counts and routing metadata.
 //! 6. A child's call is recorded with both its `child_id` and its
 //!    `parent_turn_id`, and `/cost` nests it under that parent turn, whose total
-//!    is its own calls plus its children's (REQ-623 BR-8 / AC-12).
+//!    is its own calls plus its children's (REQ-623 BR-8 / AC-12) — the parent's
+//!    own calls stamped at its choke point, not by its caller.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -37,7 +38,7 @@ use teton_providers::transport::{
     ByteStream, HttpMethod, Transport, TransportError, TransportRequest, TransportResponse,
 };
 
-use tetond::cost::{CostAttribution, CostEventSink, CostLedger, PriceTable};
+use tetond::cost::{ChildSpend, CostAttribution, CostEventSink, CostLedger, PriceTable, SharePool};
 use tetond::egress::{Egress, EgressContext, EgressError, NoopSink, Provenance};
 
 /// Mint the identity of a fixture file (REQ-571 ADR-A).
@@ -583,6 +584,135 @@ async fn parent_total_is_own_plus_children() {
         ledger.spent_by_child(&session, &child_b).expect("query"),
         b.unsigned_abs()
     );
+}
+
+/// **AC-12, the parent's own half: a prompt turn's choke point stamps its own
+/// calls with the turn, so `/cost` gives the parent a non-zero `own` beside
+/// its children** (TASK-424's open item, closed by TASK-428).
+///
+/// The two tests above hand the attribution its turn (`with_turn`) — they
+/// prove the ledger and the report, not that production ever stamps it. Here
+/// nothing is handed in by the caller: the parent's choke point is built the
+/// way `run_one_attempt` and the duty routes build theirs
+/// (`Egress::with_turn`), its calls carry a bare `CostAttribution::new`, and a
+/// child's choke point is built the way the child runner builds one
+/// (`with_child_spend` over `ChildSpend::under_turn`). The parent's own line
+/// is non-zero and the child's call is not folded into it.
+///
+/// Benign path: a choke point built with no turn stamps none — the row is
+/// unattributed, exactly as every call before REQ-623 — and an attribution
+/// that already names a turn keeps it.
+///
+/// Mutation (run 2026-10-06, reverted): `Egress::send` ignoring `self.turn`
+/// (the attribution passed through unstamped) reddens this test at "the
+/// parent's own call nests under its turn": `per_turn` holds the turn with
+/// zero own calls.
+#[tokio::test]
+async fn a_parent_turns_own_calls_are_stamped_at_its_choke_point() {
+    let script = [(1000u64, 500u64), (4000, 2000), (3000, 100), (2000, 900)];
+    let (ledger, _sink) = ledger();
+    let turn = TurnId::from("turn-12");
+    let child = ChildId::new("turn-12:call-2", "audit");
+
+    let parent_egress = Egress::new(
+        ScriptedTransport::with_script(&script[..2]),
+        Vec::new(),
+        Arc::new(NoopSink),
+    )
+    .with_cost_meter(ledger.clone())
+    .with_turn(Some(turn.clone()));
+    let child_egress = Egress::new(
+        ScriptedTransport::with_script(&script[2..3]),
+        Vec::new(),
+        Arc::new(NoopSink),
+    )
+    .with_cost_meter(ledger.clone())
+    .with_child_spend(Some(
+        ChildSpend::new(
+            child.clone(),
+            SharePool::new(None, std::slice::from_ref(&child)),
+            None,
+        )
+        .under_turn(turn.clone()),
+    ))
+    .with_turn(Some(turn.clone()));
+    let unturned = Egress::new(
+        ScriptedTransport::with_script(&script[3..]),
+        Vec::new(),
+        Arc::new(NoopSink),
+    )
+    .with_cost_meter(ledger.clone());
+
+    // The parent's own call, the child's, the parent's again — none handed a
+    // turn by its caller.
+    send_attributed(
+        &parent_egress,
+        "sess-own",
+        "anthropic",
+        CostAttribution::new("claude-opus-5"),
+    )
+    .await;
+    send_attributed(
+        &child_egress,
+        "sess-own",
+        "deepseek",
+        CostAttribution::new("deepseek-v4-pro"),
+    )
+    .await;
+    // An attribution that already names a turn keeps it.
+    send_attributed(
+        &parent_egress,
+        "sess-own",
+        "anthropic",
+        CostAttribution::new("claude-opus-5").with_turn(TurnId::from("turn-other")),
+    )
+    .await;
+    // Benign: a choke point with no turn stamps none.
+    send_attributed(
+        &unturned,
+        "sess-own",
+        "anthropic",
+        CostAttribution::new("claude-opus-5"),
+    )
+    .await;
+
+    let rows = ledger.all_records().expect("read rows");
+    assert_eq!(rows.len(), 4);
+    assert_eq!(
+        (rows[0].parent_turn_id.clone(), rows[0].child_id.clone()),
+        (Some(turn.clone()), None),
+        "the parent's own call names its turn and no child"
+    );
+    assert_eq!(
+        (rows[1].parent_turn_id.clone(), rows[1].child_id.clone()),
+        (Some(turn.clone()), Some(child.clone())),
+        "the child's call names both — its own pair wins over the choke point's turn"
+    );
+    assert_eq!(rows[2].parent_turn_id, Some(TurnId::from("turn-other")));
+    assert_eq!(
+        (rows[3].parent_turn_id.clone(), rows[3].child_id.clone()),
+        (None, None),
+        "benign: no turn at the choke point, none on the row"
+    );
+
+    let report = ledger.report().expect("report");
+    let parent = report
+        .per_turn
+        .iter()
+        .find(|t| t.turn_id == turn)
+        .expect("the turn with a child is reported");
+    let own_price = PriceTable::bundled()
+        .price("claude-opus-5", script[0].0, script[0].1)
+        .expect("priced");
+    assert!(own_price > 0, "non-vacuity: the own call costs something");
+    assert_eq!(
+        (parent.own.calls, parent.own.usd_micros),
+        (1, own_price),
+        "the parent's own call nests under its turn, non-zero"
+    );
+    assert_eq!(parent.children.len(), 1);
+    assert_eq!(parent.children[0].child_id, child);
+    assert_eq!(parent.total.calls, 2, "own + the child's, nothing else");
 }
 
 // ---------------------------------------------------------------------------

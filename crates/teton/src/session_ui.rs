@@ -1609,6 +1609,9 @@ fn format_agent_call_refused(refused: &events::AgentCallRefused) -> String {
         ),
         AgentRefusal::DuplicateName { name } => format!("two tasks are named {name}"),
         AgentRefusal::EmptyTask { index } => format!("the task at index {index} has no text"),
+        AgentRefusal::NameTooLong { name, max } => {
+            format!("the task name `{name}` is longer than {max} characters")
+        }
     };
     format!("agent call refused ({code}): {why}; no child was started")
 }

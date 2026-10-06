@@ -98,6 +98,10 @@ pub const REPORT_TRUNCATED: &str = "report_truncated";
 /// The token a `turns_exhausted` report's marker opens with (BR-10).
 pub const TURNS_EXHAUSTED: &str = "turns_exhausted";
 
+/// The refusal code of a child the permission gate stopped (BR-10's "refused
+/// by a gate"): `gate_denied:<tool>` — see [`ChildToolCalls::gate_refusal`].
+pub const GATE_DENIED: &str = "gate_denied";
+
 // ---------------------------------------------------------------------------
 // The seam
 // ---------------------------------------------------------------------------
@@ -527,10 +531,74 @@ pub struct ChildTaskScope {
     pub child_id: ChildId,
     /// Its name — what a consent prompt is labelled with (BR-5).
     pub name: String,
+    /// The prompt turn the child runs under.
+    ///
+    /// Here beside [`Self::child_id`] because the permission gate stamps both
+    /// on a `permission_request` this child raises (ADR-5), and the gate holds
+    /// no emitter — it is the session's, shared by the parent and every
+    /// sibling — so the asking *task* is the one place that knows whose ask it
+    /// is. Minted by the runner from the same facts the child's
+    /// `SessionEvents::for_child` emitter was, so the two cannot disagree.
+    pub parent_turn_id: TurnId,
     /// Its work clock, for anything that makes it wait on a human.
     pub deadline: PausableDeadline,
-    /// The call's consent mutex (ADR-5).
+    /// The call's consent mutex (ADR-5): the gate takes it around a child's
+    /// ask, so concurrent asks from one call's children reach the user one at
+    /// a time, and the child's clock is paused while it queues for it.
     pub consent: Arc<tokio::sync::Mutex<()>>,
+    /// What the child's tool calls came to at the gate — read when the child
+    /// ends, to tell BR-10's "refused by a gate" from a child that ended on its
+    /// own.
+    pub tool_calls: ChildToolCalls,
+}
+
+/// What one child's tool calls came to at the permission gate (BR-10).
+///
+/// The loop notes a call the gate **denied** (its `Denied` arm) and a call
+/// that **ran** (dispatched); nothing else is counted. Read once, when the
+/// child ends, by [`Self::gate_refusal`].
+///
+/// Shared through the task-local [`ChildTaskScope`] rather than returned by the
+/// loop, because the loop is the prompt turn's, unchanged, and the scope is
+/// already how code inside a child's task learns which child it is serving.
+#[derive(Debug, Clone, Default)]
+pub struct ChildToolCalls(Arc<Mutex<ToolCallTally>>);
+
+#[derive(Debug, Default)]
+struct ToolCallTally {
+    /// Every tool the gate denied, in the order it denied them.
+    denied: Vec<String>,
+    /// Calls that were dispatched.
+    ran: u32,
+}
+
+impl ChildToolCalls {
+    /// The gate denied a call to `tool`; it did not run.
+    pub fn note_denied(&self, tool: &str) {
+        lock(&self.0).denied.push(tool.to_owned());
+    }
+
+    /// A call was dispatched.
+    pub fn note_ran(&self) {
+        lock(&self.0).ran += 1;
+    }
+
+    /// The refusal a child that ended with **nothing to report** carries when
+    /// the gate is why: every call it attempted was denied and none ran —
+    /// `gate_denied:<the first tool denied>`.
+    ///
+    /// `None` when any call ran, or when none was denied. A denial is otherwise
+    /// a typed tool failure inside the child (BR-5): the child read it, and
+    /// whatever it did next — a report saying why, another tool — is its own
+    /// ending.
+    #[must_use]
+    pub fn gate_refusal(&self) -> Option<String> {
+        let tally = lock(&self.0);
+        match (tally.ran, tally.denied.first()) {
+            (0, Some(tool)) => Some(format!("{GATE_DENIED}:{tool}")),
+            _ => None,
+        }
+    }
 }
 
 impl ChildTaskScope {
@@ -723,8 +791,10 @@ mod tests {
         ChildTaskScope {
             child_id: ChildId::new("call-1", "audit"),
             name: "audit".to_owned(),
+            parent_turn_id: TurnId::from("turn-1"),
             deadline: deadline.clone(),
             consent: Arc::new(tokio::sync::Mutex::new(())),
+            tool_calls: ChildToolCalls::default(),
         }
     }
 
@@ -793,14 +863,19 @@ mod tests {
             }
         }));
 
-        let request_id = match tokio::time::timeout(Duration::from_secs(5), prompts.recv())
-            .await
-            .expect("the child's ask is published")
-            .expect("a prompt arrives")
-            .event
-        {
-            Event::PermissionRequest(request) => request.request_id,
-            other => panic!("expected permission_request, got {other:?}"),
+        // TASK-428: the gate labels a child's ask with
+        // `agent_child_consent_requested` just before the question itself.
+        let request_id = loop {
+            match tokio::time::timeout(Duration::from_secs(5), prompts.recv())
+                .await
+                .expect("the child's ask is published")
+                .expect("a prompt arrives")
+                .event
+            {
+                Event::PermissionRequest(request) => break request.request_id,
+                Event::AgentChildConsentRequested(_) => {}
+                other => panic!("expected permission_request, got {other:?}"),
+            }
         };
         assert!(
             deadline.is_paused(),

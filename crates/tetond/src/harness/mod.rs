@@ -117,7 +117,7 @@ pub mod turn_loop;
 pub use budget::{BudgetInputs, RouteBudget};
 pub use child::{
     bound_report, current_child, ChildAskClock, ChildDispatcher, ChildOutcome, ChildOutcomeSlot,
-    ChildSpec, ChildTaskScope, ChildTurn, PausableDeadline,
+    ChildSpec, ChildTaskScope, ChildToolCalls, ChildTurn, PausableDeadline,
 };
 pub use compact::COMPACT_DUTY;
 pub use completion::{

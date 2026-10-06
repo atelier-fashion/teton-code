@@ -47,8 +47,8 @@ use teton_protocol::TurnId;
 use crate::cost::{share::unspent, ChildSpend};
 use crate::harness::child::{
     bound_report, child_system_section, over_budget_refusal, turns_exhausted_report,
-    ChildDispatcher, ChildOutcome, ChildOutcomeSlot, ChildSpec, ChildTaskScope, ChildTurn,
-    PausableDeadline, ShareRelease,
+    ChildDispatcher, ChildOutcome, ChildOutcomeSlot, ChildSpec, ChildTaskScope, ChildToolCalls,
+    ChildTurn, PausableDeadline, ShareRelease,
 };
 use crate::harness::context::BlockRole;
 use crate::harness::reply::prose_before_tool_call;
@@ -87,17 +87,8 @@ pub(super) struct ChildTurns {
 
 impl DaemonRuntime {
     /// The dispatcher an `agent` call in this prompt turn runs its children
-    /// through (REQ-623 ADR-2) — what TASK-428's `register_agent_tool` is
-    /// handed in `build_tools`' [`super::turn::ToolSet::Prompt`] arm.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "TASK-428 registers the agent tool with this dispatcher; until then only \
-                      this module's tests construct one, and the expectation fails the build \
-                      the moment a caller lands"
-        )
-    )]
+    /// through (REQ-623 ADR-2) — what `register_agent_tool` is handed in
+    /// `build_tools`' [`super::turn::ToolSet::Prompt`] arm.
     pub(super) fn child_turns(
         self: &Arc<Self>,
         tctx: TurnContext<'_>,
@@ -139,11 +130,14 @@ impl ChildDispatcher for ChildTurns {
             model_calls: Arc::clone(&model_calls),
             seed_provenance: spec.provenance.clone(),
         };
+        let tool_calls = ChildToolCalls::default();
         let scope = ChildTaskScope {
             child_id: spec.child_id.clone(),
             name: spec.name.clone(),
+            parent_turn_id: self.parent_turn_id.clone(),
             deadline: deadline.clone(),
             consent: Arc::clone(&spec.consent),
+            tool_calls: tool_calls.clone(),
         };
         let work = Work {
             turns: self.clone(),
@@ -151,6 +145,7 @@ impl ChildDispatcher for ChildTurns {
             spend: spend.clone(),
             progress: Arc::clone(&progress),
             model_calls: Arc::clone(&model_calls),
+            tool_calls,
         };
         let mut handle = AbortOnDrop(tokio::spawn(scope.scope(work.run())));
 
@@ -236,6 +231,9 @@ struct Work {
     spend: ChildSpend,
     progress: Arc<Mutex<Progress>>,
     model_calls: Arc<AtomicU32>,
+    /// What the child's calls came to at the gate — the same log its scope
+    /// carries, read when it ends (BR-10's "refused by a gate").
+    tool_calls: ChildToolCalls,
 }
 
 impl Work {
@@ -246,6 +244,7 @@ impl Work {
             spend,
             progress,
             model_calls,
+            tool_calls,
         } = self;
         let runtime = &turns.runtime;
         let session_id = &turns.session_id;
@@ -422,10 +421,7 @@ impl Work {
                         ..Ended::of(ChildStatus::TurnsExhausted)
                     },
                     StopReason::Cancelled => Ended::of(ChildStatus::Cancelled),
-                    _ => Ended {
-                        text: outcome.final_text,
-                        ..Ended::of(ChildStatus::Completed)
-                    },
+                    _ => finished_on_its_own(outcome.final_text, &tool_calls),
                 },
                 // The success arm always leaves its outcome; an `Ok` without one
                 // is a broken invariant, reported rather than unwrapped.
@@ -440,6 +436,29 @@ impl Work {
             provenance: Some(provenance),
             ..ended
         }
+    }
+}
+
+/// A child whose loop ended with its final text: `completed` — or `refused`,
+/// when the text is empty and the gate is why (BR-10's "refused by a gate").
+///
+/// The rule (TASK-428): a child that has **nothing to report** and whose every
+/// attempted tool call the gate denied, none having run, ends `refused` with
+/// `gate_denied:<tool>` — an unattended deny of a tool the task needed (BR-5),
+/// or a level that refuses it, named so the parent can tell "the child found
+/// nothing" from "the child was not allowed to look". Any other denial is a
+/// typed tool failure the child read and answered on its own (BR-5): a report
+/// saying why, or another tool that ran, makes the ending its own.
+fn finished_on_its_own(text: String, tool_calls: &ChildToolCalls) -> Ended {
+    match tool_calls.gate_refusal() {
+        Some(refusal) if text.trim().is_empty() => Ended {
+            refusal: Some(refusal),
+            ..Ended::of(ChildStatus::Refused)
+        },
+        _ => Ended {
+            text,
+            ..Ended::of(ChildStatus::Completed)
+        },
     }
 }
 
@@ -820,8 +839,30 @@ mod tests {
                     mode: SessionMode::Structured,
                     phase: Some(ProtoPhase::Implement),
                     typed: true,
+                    prompt_spend: None,
                 },
             )
+        }
+
+        /// Replace the session's gate with one that allows every tool but
+        /// `tool`, which the level denies — what an unattended session with
+        /// no decision for that gate answers (BR-5).
+        fn deny(&self, tool: &str) {
+            let mut config = PermissionConfig::permissive();
+            config.set(tool, crate::harness::PermissionPolicy::Deny);
+            self.runtime
+                .session_gates
+                .lock()
+                .expect("session gate mutex")
+                .insert(
+                    self.session_id.clone(),
+                    Arc::new(PermissionGate::new(
+                        self.session_id.clone(),
+                        config,
+                        Arc::clone(&self.events),
+                        Arc::clone(&self.runtime.pending),
+                    )),
+                );
         }
 
         /// A child spec with the `[agent]` defaults and no spend ceiling.
@@ -883,11 +924,13 @@ mod tests {
     /// The parent turn runs first and is committed, so the session really
     /// holds a conversation the child could have been seeded from — asserted
     /// before the absence is (non-vacuity). The oracle for "the session's
-    /// system prompt" is the parent's own captured system segment: the child's
-    /// is that, byte for byte, followed by the child's section. **TASK-428
-    /// note:** once `agent` is in the prompt registry, the parent's segment
-    /// carries its roster entry and the child's does not; this comparison must
-    /// then strip that entry and nothing else.
+    /// system prompt" is the parent's own captured system segment **less
+    /// exactly `agent`'s roster entry** — its line and its `arguments:` line,
+    /// found by text, asserted present exactly once, never rebuilt from the
+    /// tool (TASK-428): the child's is that, byte for byte, followed by the
+    /// child's section. So the comparison also says the one roster difference
+    /// is `agent` (BR-2), and a child prompt missing any other entry still
+    /// reddens it.
     ///
     /// Benign path: the parent's own first request carries its ask as its only
     /// user message, so the parser reads a real request.
@@ -900,6 +943,9 @@ mod tests {
     ///   sequence — the child's request opens on the parent's exchange.
     /// - **Drop the context** (`child_system_section(None, ..)`): reddens at the
     ///   system-prompt equality.
+    /// - **Register `agent` for children too** (TASK-428, the registration moved
+    ///   out of the `ToolSet::Prompt` arm): reddens at the system-prompt
+    ///   equality — the child's roster gains the entry the oracle stripped.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn child_context_is_system_context_task_only() {
         const ASK: &str = "PARENT-ASK-MARKER please look around";
@@ -954,10 +1000,10 @@ mod tests {
             child[0].1,
             format!(
                 "{}{}",
-                parent[0].1,
+                without_agent_entry(&parent[0].1),
                 child_system_section(Some(CONTEXT), 32_768)
             ),
-            "the session's system prompt, then the child's section with the context"
+            "the session's system prompt less `agent`, then the child's section with the context"
         );
         for marker in ["PARENT-ASK-MARKER", "PARENT-ANSWER-MARKER"] {
             assert!(
@@ -965,6 +1011,41 @@ mod tests {
                 "the parent's conversation reached the child: {marker}"
             );
         }
+    }
+
+    /// `system` with exactly `agent`'s roster entry — the `- agent: ` line and
+    /// the `  arguments: ` line under it — taken out, and nothing else.
+    ///
+    /// Found by text rather than rebuilt from the tool's own description, so
+    /// the oracle is not computed by the subject; asserted present exactly
+    /// once, so a roster that stopped listing `agent` cannot make the strip a
+    /// silent no-op.
+    fn without_agent_entry(system: &str) -> String {
+        let lines: Vec<&str> = system.split_inclusive('\n').collect();
+        let entries: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.starts_with("- agent: "))
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "non-vacuity: the parent's roster lists `agent` exactly once"
+        );
+        let at = entries[0];
+        assert!(
+            lines
+                .get(at + 1)
+                .is_some_and(|line| line.starts_with("  arguments: ")),
+            "the entry's second line is its schema"
+        );
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != at && *index != at + 1)
+            .map(|(_, line)| *line)
+            .collect()
     }
 
     // ---- BR-7 / AC-11 -----------------------------------------------------
@@ -1324,6 +1405,67 @@ mod tests {
             Some(0)
         );
         assert!(broke.result.report.is_empty());
+    }
+
+    /// **BR-10's "refused by a gate" (TASK-428's rule): a child with nothing to
+    /// report whose every attempted call the gate denied ends `refused` with
+    /// `gate_denied:<tool>` — and only that child.**
+    ///
+    /// The session gate denies `shell` (an unattended session with no decision
+    /// for it answers the same). Three children, each meeting that denial:
+    ///
+    /// | child | after the denial | ends |
+    /// |---|---|---|
+    /// | `stopped` | an empty final answer | `refused`, `gate_denied:shell` |
+    /// | `explains` | a report saying why | `completed`, that report |
+    /// | `reads` | a `read` that ran, then an empty answer | `completed`, empty |
+    ///
+    /// The second and third are the benign half: a denial is a typed tool
+    /// failure the child read (BR-5), and what it did next is its own ending.
+    ///
+    /// # Mutations (run 2026-10-06, each reverted)
+    ///
+    /// - **Never refuse** (`finished_on_its_own` always `completed`): reddens
+    ///   at the `stopped` leg.
+    /// - **Refuse on any denial** (drop the `text.trim().is_empty()` guard):
+    ///   reddens at the `explains` leg.
+    /// - **Don't count a call that ran** (`note_ran` removed from the loop):
+    ///   reddens at the `reads` leg.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gate_denial_refuses_only_a_child_that_had_nothing_else() {
+        let rig = Rig::new("child-gate-denied", true);
+        std::fs::write(rig.root.join("notes.txt"), "notes\n").unwrap();
+        rig.deny("shell");
+        let dispatcher = rig.dispatcher();
+        let shell = call("shell", serde_json::json!({ "command": "ls" }));
+
+        rig.engine.say(&shell);
+        rig.engine.say("");
+        let stopped = dispatcher
+            .run_child(rig.spec("stopped", "list the tree"))
+            .await;
+        assert_eq!(stopped.status(), ChildStatus::Refused, "{stopped:?}");
+        assert_eq!(stopped.result.refusal.as_deref(), Some("gate_denied:shell"));
+        assert!(stopped.result.report.is_empty());
+
+        rig.engine.say(&shell);
+        rig.engine.say("I was not allowed to run `ls`.");
+        let explains = dispatcher
+            .run_child(rig.spec("explains", "list the tree"))
+            .await;
+        assert_eq!(explains.status(), ChildStatus::Completed, "{explains:?}");
+        assert_eq!(explains.result.report, "I was not allowed to run `ls`.");
+        assert_eq!(explains.result.refusal, None);
+
+        rig.engine.say(&shell);
+        rig.engine
+            .say(&call("read", serde_json::json!({ "path": "notes.txt" })));
+        rig.engine.say("");
+        let reads = dispatcher
+            .run_child(rig.spec("reads", "list the tree"))
+            .await;
+        assert_eq!(reads.status(), ChildStatus::Completed, "{reads:?}");
+        assert_eq!(reads.result.refusal, None);
     }
 
     // ---- AC-19 ------------------------------------------------------------

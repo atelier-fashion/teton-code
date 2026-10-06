@@ -43,6 +43,7 @@
 use super::*;
 
 use crate::harness::child::CountedSource;
+use crate::harness::tools::agent::{register_agent_tool, AgentParent};
 
 /// Where this daemon writes session transcripts, for the config it is handed —
 /// REQ-611 ADR-4, the one place that pairing is spelled.
@@ -417,6 +418,11 @@ pub(super) struct ParentTurn<'a> {
     /// Whether the user typed this prompt rather than invoking a skill
     /// (REQ-613 BR-1's condition — see [`ToolSet::may_offer_generation`]).
     pub(super) typed: bool,
+    /// The prompt's spend accumulator — the `Arc` every egress of this prompt
+    /// shares (REQ-588 ADR-1) — which an `agent` call reads its children's
+    /// headroom from and which their spend is paid into (REQ-623 ADR-4).
+    /// `None` exactly when no ceiling is configured.
+    pub(super) prompt_spend: Option<&'a Arc<teton_core::cost_ceiling::PromptSpend>>,
 }
 
 impl DaemonRuntime {
@@ -589,6 +595,20 @@ impl DaemonRuntime {
         // trusts. A skill turn's `prompt` is empty, so an invocation contributes
         // nothing, which is the correct answer: nobody pasted anything.
         self.record_user_prompt_urls(&session_id, &prompt);
+        // REQ-588 ADR-1: the prompt's spend accumulator — "per prompt" is its
+        // lifetime, not a key looked up somewhere. Every attempt, reroute and
+        // duty of this prompt is handed this same `Arc`, and so is the `agent`
+        // tool built with the registry below (REQ-623 ADR-4): its children pay
+        // into it, which is why it exists before the tools. The next prompt gets
+        // a new one and starts at zero, without anything having to reset it.
+        //
+        // `None` when no ceiling is configured, which makes the whole feature
+        // cost nothing when it is off (ADR-6): the choke point's check needs
+        // both, so neither accumulator nor pricing lookup exists un-opted-in.
+        let prompt_spend = config
+            .cost
+            .ceiling_micro_cents()
+            .map(|_| Arc::new(teton_core::cost_ceiling::PromptSpend::default()));
         // The gate is the one fetched above the expansion (REQ-589 ADR-10). It
         // is still fetched before the tools, which is what the web tool needs:
         // that tool raises its own per-tier prompt inside its run rather than
@@ -626,6 +646,7 @@ impl DaemonRuntime {
                     mode,
                     phase,
                     typed: skill_turn.is_none(),
+                    prompt_spend: prompt_spend.as_ref(),
                 }),
             )
             .await;
@@ -673,22 +694,6 @@ impl DaemonRuntime {
         // commit/abandon below instead of each exit remembering to disarm —
         // BR-6's atomicity is a property of the shape, not of ten call sites
         // agreeing.
-        // REQ-588 ADR-1: the prompt's spend accumulator, created **here** —
-        // before the attempt loop — because "per prompt" is its lifetime, not a
-        // key looked up somewhere. Every attempt, every fallback reroute and
-        // every duty of this prompt is handed this same `Arc`, so they add into
-        // one total; the next prompt gets a new one and therefore starts at
-        // zero, without anything having to remember to reset it.
-        //
-        // `None` when no ceiling is configured, which is what makes the whole
-        // feature cost nothing when it is off (ADR-6): the check at the choke
-        // point needs both this and a ceiling, so neither the accumulator nor
-        // the pricing lookup exists on an un-opted-in machine.
-        let prompt_spend = config
-            .cost
-            .ceiling_micro_cents()
-            .map(|_| Arc::new(teton_core::cost_ceiling::PromptSpend::default()));
-
         let outcome = self
             .run_attempts(
                 tctx,
@@ -1724,6 +1729,11 @@ impl DaemonRuntime {
         inputs: AttemptInputs<'_>,
         st: &mut AttemptState,
     ) -> Result<PromptTurnResult, RpcError> {
+        // REQ-623 BR-8 / AC-12: every call this loop makes — each attempt's,
+        // each duty's — is billed under the turn, so `/cost` totals a parent
+        // turn as its own calls plus its children's. A child's `inputs.turn_id`
+        // is its parent's, and its rows carry the child's own pair instead.
+        let tctx = tctx.for_turn(inputs.turn_id);
         'turn: loop {
             // REQ-623: a child announces no `route_decided` — the payload names
             // no child, so on the shared bus it would read as the parent's turn
@@ -3229,6 +3239,8 @@ impl DaemonRuntime {
             // A child never reaches the offer: its task is admitted whole or
             // refused `over_budget`, with nobody to ask (REQ-623 BR-1).
             child: _,
+            // The offer bills nothing.
+            turn_id: _,
         } = tctx;
         let budget = &route.harness.budget;
         let measured = ContextManager::would_seed_fit(
@@ -3812,9 +3824,9 @@ impl DaemonRuntime {
     ///
     /// Everything above is built for both, in the same order. What differs is
     /// one tool: the `agent` tool, registered under [`ToolSet::Prompt`] only —
-    /// TASK-428 adds that registration in the arm at the end, beside
-    /// `register_skill_tool`, with the [`ParentTurn`] the arm carries. A child
-    /// keeps `skill` (BR-12) and everything else.
+    /// last, after `register_skill_tool`, behind `agent.enabled`, with the
+    /// [`ParentTurn`] the arm carries. A child keeps `skill` (BR-12) and
+    /// everything else.
     pub(super) async fn build_tools(
         self: &Arc<Self>,
         tctx: TurnContext<'_>,
@@ -3839,6 +3851,9 @@ impl DaemonRuntime {
             // Read through `toolset` instead: a child's registry differs from a
             // prompt turn's by what it lacks, and the toolset says which.
             child: _,
+            // The registry bills nothing; the `agent` tool's turn is the
+            // `ParentTurn`'s.
+            turn_id: _,
         } = tctx;
         // REQ-615 BR-4: the two write-capable built-ins report a refused write
         // to the session that made it. Same emitter shape the projects tool
@@ -3938,11 +3953,29 @@ impl DaemonRuntime {
             self.skill_command_timeout_ms,
         );
         match toolset {
-            // REQ-623 ADR-7: where TASK-428 registers the `agent` tool, behind
-            // `agent.enabled`, with `self.child_turns(tctx, parent)` as its
-            // dispatcher. Nothing is registered here yet, so a prompt turn's
-            // registry is byte-identical to what it was before this REQ.
-            ToolSet::Prompt(_parent) => {}
+            // REQ-623 ADR-7: `register_agent_tool` is the one place the
+            // `agent.enabled` condition is expressed, so a session that turned
+            // it off has no `agent` tool — in no roster, in no dispatch — and a
+            // model that names it anyway is told the key (BR-14). Last, and
+            // cap-exempt. The dispatcher is built only when the tool is: it
+            // carries the turn's config snapshot into every child.
+            ToolSet::Prompt(parent) => {
+                register_agent_tool(
+                    &mut tools,
+                    &config.agent,
+                    AgentParent {
+                        turn_id: parent.turn_id.clone(),
+                        // The parent's emitter: the call's `agent_*` events
+                        // are the parent's news (ADR-3).
+                        events: SessionEvents::new(Arc::clone(events), session_id.clone())
+                            .with_sink(self.transcript()),
+                        spend_ceiling: config.cost.ceiling_micro_cents(),
+                        prompt_spend: parent.prompt_spend.cloned(),
+                    },
+                    || self.child_turns(tctx, parent),
+                    tokio::runtime::Handle::current(),
+                );
+            }
             // BR-2: depth is one. Nothing further for a child — in particular
             // no `agent`, so a child that names it gets the registry's ordinary
             // unknown-tool refusal.
@@ -4113,6 +4146,8 @@ impl DaemonRuntime {
             // parent — the egress below takes its spend share, and the local
             // source writes its rows under the child's ids.
             child,
+            // REQ-623 BR-8: and a prompt turn's own attempt under the turn.
+            turn_id,
         } = tctx;
         let mut hook = NoopProvenanceHook;
 
@@ -4169,6 +4204,8 @@ impl DaemonRuntime {
                     .metered(Arc::new(self.ledger.clone()));
                 if let Some(child) = child {
                     source = source.for_child(child.child_id.clone(), child.parent_turn_id.clone());
+                } else if let Some(turn_id) = turn_id {
+                    source = source.under_turn(turn_id.clone());
                 }
                 return run_session_turn_with_pressure_policy(
                     // REQ-623: a child's model calls are counted where they are
@@ -4247,7 +4284,9 @@ impl DaemonRuntime {
             // against its share and pays into the prompt's accumulator too;
             // its rows carry the child's ids. `None` — every prompt turn —
             // leaves the choke point as it was.
-            .with_child_spend(child.map(|c| c.spend.clone()));
+            .with_child_spend(child.map(|c| c.spend.clone()))
+            // REQ-623 BR-8 / AC-12: a prompt turn's own rows name the turn.
+            .with_turn(turn_id.cloned());
         // REQ-562 ADR-1/ADR-2: the turn's own outbound payload is scanned here,
         // and only when the user opted in.
         if let Some(gate) = self.redaction_gate(router, config, events, session_id) {
@@ -4323,63 +4362,14 @@ impl DaemonRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::super::testsupport::scratch_root;
+    use super::super::testsupport::turn_registry;
     use super::*;
 
-    use crate::skills::{discover, RealFs};
-
-    /// The names a registry built with `toolset` holds, over a session whose
-    /// root carries one model-invocable skill — so `skill` is registered and a
-    /// child keeping it (BR-12) is a real claim.
+    /// The names a registry built with `toolset` holds, `agent` on — over a
+    /// session whose root carries one model-invocable skill, so `skill` is
+    /// registered and a child keeping it (BR-12) is a real claim.
     async fn registry_names(toolset_is_child: bool) -> Vec<String> {
-        let runtime = Arc::new(DaemonRuntime::minimal());
-        let root = scratch_root("toolset", true);
-        std::fs::create_dir_all(root.join(".claude/skills/survey")).unwrap();
-        std::fs::write(
-            root.join(".claude/skills/survey/SKILL.md"),
-            "---\ndescription: survey the tree\n---\n\nSurvey it.\n",
-        )
-        .unwrap();
-        let probed = runtime.session_root_for(Some(&root));
-        let skills = Arc::new(discover(None, &probed.path, probed.view.kind, &RealFs));
-        let config = runtime.config.lock().expect("config mutex").clone();
-        let events = Arc::new(EventBus::new());
-        let sessions = SessionRegistry::new();
-        let session_id = sessions
-            .create(SessionMode::Freeform, None, Some(root))
-            .expect("a session")
-            .session_id;
-        let router = runtime.turn_router(&config, &session_id);
-        let gate = runtime.permission_gate_for(&session_id, &events, &config);
-        let turn_id = teton_protocol::TurnId::from("turn-1");
-        let child = crate::harness::ChildTurn {
-            child_id: teton_protocol::agent::ChildId::new("call-1", "c"),
-            parent_turn_id: turn_id.clone(),
-            max_turns: 12,
-            spend: crate::cost::ChildSpend::new(
-                teton_protocol::agent::ChildId::new("call-1", "c"),
-                crate::cost::SharePool::new(None, &[]),
-                None,
-            ),
-            model_calls: Arc::default(),
-        };
-        let tctx = TurnContext::new(&events, &session_id, &config, &router, &gate, None);
-        let (tctx, toolset) = if toolset_is_child {
-            (tctx.for_child(&child), ToolSet::Child)
-        } else {
-            (
-                tctx,
-                ToolSet::Prompt(ParentTurn {
-                    turn_id: &turn_id,
-                    sessions: &sessions,
-                    mode: SessionMode::Freeform,
-                    phase: None,
-                    typed: true,
-                }),
-            )
-        };
-        runtime
-            .build_tools(tctx, skills, toolset)
+        turn_registry(toolset_is_child, true)
             .await
             .names()
             .into_iter()
@@ -4390,28 +4380,30 @@ mod tests {
     /// **BR-2 / AC-3: a child's registry has no `agent` tool — and is
     /// otherwise the prompt turn's.**
     ///
-    /// Stated as the only difference the two may have, so the assertion holds
-    /// before TASK-428 registers `agent` under [`ToolSet::Prompt`] and after:
-    /// the child has every tool the prompt turn has except `agent`, `skill`
-    /// included (BR-12), and never `agent`.
+    /// Stated as the only difference the two may have: the child has every
+    /// tool the prompt turn has except `agent`, `skill` included (BR-12), and
+    /// never `agent`. The prompt turn's registry holds `agent` (non-vacuity:
+    /// TASK-428 registers it, on by default).
     ///
-    /// Benign path: [`ToolSet::Prompt`] keeps today's registry — nothing this
-    /// task adds reaches it, so it is the child's registry exactly, until
-    /// TASK-428 adds `agent` and nothing else.
+    /// # Mutations (each reverted)
     ///
-    /// # Mutation (run 2026-10-05 over the 60 tests matching `child`, reverted)
-    ///
-    /// - **Register `skill` for prompt turns only** (`register_skill_tool`
-    ///   moved into the `ToolSet::Prompt` arm): 1 red, this test — the prompt
-    ///   turn's registry holds a tool beyond `agent` that the child's lacks.
-    ///
-    /// Until TASK-428 lands the two arms register the same tools, so there is
-    /// no `agent` registration to invert yet; TASK-428 re-runs this with its
-    /// registration moved into the `Child` arm.
+    /// - **Register `skill` for prompt turns only** (run 2026-10-05 over the 60
+    ///   tests matching `child`; `register_skill_tool` moved into the
+    ///   `ToolSet::Prompt` arm): 1 red, this test — the prompt turn's registry
+    ///   holds a tool beyond `agent` that the child's lacks.
+    /// - **Register `agent` for children too** (run 2026-10-06 by TASK-428; the
+    ///   `register_agent_tool` call duplicated into the `ToolSet::Child` arm):
+    ///   reddens this test at "depth is one", and
+    ///   `child_context_is_system_context_task_only` and
+    ///   `agent::tests::child_registry_has_skill_not_agent` beside it.
     #[tokio::test]
     async fn child_toolset_omits_agent() {
         let prompt = registry_names(false).await;
         let child = registry_names(true).await;
+        assert!(
+            prompt.iter().any(|name| name == "agent"),
+            "non-vacuity: the prompt turn's registry holds `agent`: {prompt:?}"
+        );
         assert!(
             child.iter().any(|name| name == "skill"),
             "non-vacuity, and BR-12: the child keeps `skill`: {child:?}"
@@ -4426,6 +4418,131 @@ mod tests {
             prompt_without_agent,
             child.iter().collect::<Vec<_>>(),
             "the child's registry is the prompt turn's, less `agent` and nothing else"
+        );
+    }
+
+    /// **BR-14: `agent.enabled = false` is absence, not refusal** — through the
+    /// registry the daemon builds for a prompt turn.
+    ///
+    /// Off: `agent` is not a registered name, not looked up, not exposed at any
+    /// cap — the degraded profile's included, where it would otherwise be
+    /// cap-exempt. Benign path: the default (`enabled = true`) registers it, and
+    /// cap-exempt, so it survives a cap of zero.
+    ///
+    /// # Mutation (run 2026-10-06, reverted)
+    ///
+    /// - **Ignore the flag** (`register_agent_tool`'s `!config.enabled` early
+    ///   return removed): reddens this test at "off is absence", and
+    ///   `agent_roster_schema_and_disabled`.
+    #[tokio::test]
+    async fn agent_disabled_is_absent_from_registry() {
+        let on = turn_registry(false, true).await;
+        assert!(on.get("agent").is_some(), "benign: on by default");
+        assert!(
+            on.exposed_names(Some(0)).contains(&"agent"),
+            "cap-exempt: a cap of zero still exposes it (ADR-7)"
+        );
+
+        let off = turn_registry(false, false).await;
+        assert!(
+            !off.names().contains(&"agent"),
+            "off is absence: {:?}",
+            off.names()
+        );
+        assert!(off.get("agent").is_none());
+        for cap in [None, Some(5), Some(0)] {
+            assert!(
+                !off.exposed_names(cap).contains(&"agent"),
+                "off is exposed at no cap ({cap:?})"
+            );
+        }
+        assert!(
+            off.get("skill").is_some(),
+            "non-vacuity: the rest of the prompt turn's registry is there"
+        );
+    }
+
+    /// **AC-1: the prompt's roster lists `agent` with a schema that admits
+    /// `tasks: [{task, name?, tier?, context?}]`; with `agent.enabled = false`
+    /// the roster omits it and a call to it gets the unknown-tool answer naming
+    /// `agent.enabled`.**
+    ///
+    /// The roster is the registry's own `docs` — what the system prompt
+    /// renders. The schema is read as JSON and its shape asserted against the
+    /// spec's literals, never against a second call to the tool.
+    ///
+    /// Benign path: with the tool on, the same roster lists it and its schema;
+    /// and an unknown tool **other** than `agent` gets the bare answer, with no
+    /// key named — the note is the absent tool's, not every unknown one's.
+    ///
+    /// # Mutation (run 2026-10-06, reverted)
+    ///
+    /// - **Drop the absent note** (`note_absent` call removed from
+    ///   `register_agent_tool`): reddens this test at "names the key". Nothing
+    ///   else notices.
+    #[tokio::test]
+    async fn agent_roster_schema_and_disabled() {
+        let on = turn_registry(false, true).await;
+        let roster = on.docs(None);
+        let entry = roster
+            .lines()
+            .position(|line| line.starts_with("- agent: "))
+            .expect("the roster lists `agent`");
+        let schema_line = roster.lines().nth(entry + 1).expect("its arguments line");
+        let schema: serde_json::Value = serde_json::from_str(
+            schema_line
+                .strip_prefix("  arguments: ")
+                .expect("the entry's second line is its schema"),
+        )
+        .expect("the schema is JSON");
+        assert_eq!(schema["required"], serde_json::json!(["tasks"]));
+        let tasks = &schema["properties"]["tasks"];
+        assert_eq!(tasks["type"], "array");
+        assert_eq!(tasks["minItems"], 1);
+        let item = &tasks["items"];
+        assert_eq!(
+            item["required"],
+            serde_json::json!(["task"]),
+            "only `task` is required"
+        );
+        let mut keys: Vec<&str> = item["properties"]
+            .as_object()
+            .expect("an object schema")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["context", "name", "task", "tier"]);
+        assert_eq!(
+            item["properties"]["tier"]["enum"],
+            serde_json::json!(["reflex", "scan", "build", "think"])
+        );
+
+        let off = turn_registry(false, false).await;
+        assert!(
+            !off.docs(None).contains("- agent: "),
+            "the roster omits it: {}",
+            off.docs(None)
+        );
+        let ctx = ToolContext::new(std::env::temp_dir());
+        let answer = off.dispatch("agent", &ctx, &serde_json::json!({ "tasks": [] }));
+        assert!(answer.is_error);
+        assert!(
+            answer.content.starts_with("unknown tool `agent`"),
+            "the ordinary unknown-tool answer: {}",
+            answer.content
+        );
+        assert!(
+            answer.content.contains("agent.enabled = false"),
+            "names the key: {}",
+            answer.content
+        );
+        let other = off.dispatch("dispatcher", &ctx, &serde_json::json!({}));
+        assert!(
+            other.content.starts_with("unknown tool `dispatcher`")
+                && !other.content.contains("agent.enabled"),
+            "benign: another unknown tool gets the bare answer: {}",
+            other.content
         );
     }
 }

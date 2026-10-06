@@ -1951,15 +1951,18 @@ fn route_for(bound: BudgetBound, verdict: WindowVerdict) -> (Fixture, Option<Moc
 /// then moved it the other way, to **183,334**, which widens this fixture's
 /// clearance rather than closing it; the figure is left where it is.
 ///
-/// It is squeezed from both sides, which is why the figure is 130,000 rather
+/// It is squeezed from both sides, which is why the figure is 128,000 rather
 /// than something comfortably large. The expansion must be **over the clamp**
 /// (183,334 B) and still **fit the declared window**, because
 /// `each_reachable_window_verdict_is_offered_and_pins_its_own_sentence` uses
 /// this route as its `RedactScan` + `FitsWindow` cell — and the usable window
 /// is 197,952 B, above which the verdict becomes `ExceedsWindow` (or, in the
-/// last 2,048 B, `FitsWindowIntoTheReservation`). 60,001 + 130,000 = 190,001
-/// sits between the two, 6,667 B clear of the clamp (5,736 until REQ-620's
-/// raise narrowed the clamp) and 7,951 B clear of the window. The word half (44,000 against a 65,984-word budget) stays
+/// last 2,048 B, `FitsWindowIntoTheReservation`). 60,001 + 128,000 = 188,001
+/// sits between the two, 4,667 B clear of the clamp. It was 130,000 until
+/// REQ-623 registered `agent` for every prompt turn: its roster entry — about
+/// 1.6 KB, most of it a JSON schema — rides in the system prompt the window
+/// verdict measures with the expansion, and 130,000 then read
+/// `ExceedsWindow`. The word half (44,000 against a 65,984-word budget) stays
 /// deliberately under: the clamp is byte-denominated, so this cell must be over
 /// on bytes alone.
 fn redact_scan_route() -> (Fixture, Option<MockProvider>) {
@@ -1976,7 +1979,7 @@ fn redact_scan_route() -> (Fixture, Option<MockProvider>) {
             ),
             format!("{} $ARGUMENTS", sized_body(20_000, 60_000)),
         )
-        .with_arguments(sized_body(24_000, 130_000)),
+        .with_arguments(sized_body(24_000, 128_000)),
     );
     (fx, Some(provider))
 }

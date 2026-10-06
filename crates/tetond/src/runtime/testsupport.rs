@@ -135,3 +135,79 @@ pub(super) fn scratch_root(tag: &str, project: bool) -> PathBuf {
     }
     dir
 }
+
+/// The registry the daemon builds for one turn — `build_tools` itself — over
+/// a session whose root holds one model-invocable skill, so `skill` is
+/// registered and a child keeping it is a real claim (REQ-623 BR-2, BR-12,
+/// BR-14).
+///
+/// `child` picks the toolset: a child's registry (`ToolSet::Child`, built
+/// through a child's context) or a prompt turn's. `agent_enabled` is the
+/// session's `[agent] enabled`. Shared by `turn.rs`'s registry tests and the
+/// `agent` tool's own, which may not reach `runtime::*` in production but
+/// must be able to assert what the runtime's registry holds.
+pub(crate) async fn turn_registry(
+    child: bool,
+    agent_enabled: bool,
+) -> crate::harness::tools::ToolRegistry {
+    use std::sync::Arc;
+
+    use teton_protocol::SessionMode;
+
+    use crate::broadcast::EventBus;
+    use crate::runtime::turn::{ParentTurn, ToolSet};
+    use crate::runtime::DaemonRuntime;
+    use crate::sessions::SessionRegistry;
+    use crate::skills::{discover, RealFs};
+    use crate::turn_context::TurnContext;
+
+    let runtime = Arc::new(DaemonRuntime::minimal());
+    runtime.config.lock().expect("config mutex").agent.enabled = agent_enabled;
+    let root = scratch_root("toolset", true);
+    std::fs::create_dir_all(root.join(".claude/skills/survey")).unwrap();
+    std::fs::write(
+        root.join(".claude/skills/survey/SKILL.md"),
+        "---\ndescription: survey the tree\n---\n\nSurvey it.\n",
+    )
+    .unwrap();
+    let probed = runtime.session_root_for(Some(&root));
+    let skills = Arc::new(discover(None, &probed.path, probed.view.kind, &RealFs));
+    let config = runtime.config.lock().expect("config mutex").clone();
+    let events = Arc::new(EventBus::new());
+    let sessions = SessionRegistry::new();
+    let session_id = sessions
+        .create(SessionMode::Freeform, None, Some(root))
+        .expect("a session")
+        .session_id;
+    let router = runtime.turn_router(&config, &session_id);
+    let gate = runtime.permission_gate_for(&session_id, &events, &config);
+    let turn_id = teton_protocol::TurnId::from("turn-1");
+    let child_turn = crate::harness::ChildTurn {
+        child_id: teton_protocol::agent::ChildId::new("call-1", "c"),
+        parent_turn_id: turn_id.clone(),
+        max_turns: 12,
+        spend: crate::cost::ChildSpend::new(
+            teton_protocol::agent::ChildId::new("call-1", "c"),
+            crate::cost::SharePool::new(None, &[]),
+            None,
+        ),
+        model_calls: Arc::default(),
+    };
+    let tctx = TurnContext::new(&events, &session_id, &config, &router, &gate, None);
+    let (tctx, toolset) = if child {
+        (tctx.for_child(&child_turn), ToolSet::Child)
+    } else {
+        (
+            tctx,
+            ToolSet::Prompt(ParentTurn {
+                turn_id: &turn_id,
+                sessions: &sessions,
+                mode: SessionMode::Freeform,
+                phase: None,
+                typed: true,
+                prompt_spend: None,
+            }),
+        )
+    };
+    runtime.build_tools(tctx, skills, toolset).await
+}

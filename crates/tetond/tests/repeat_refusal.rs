@@ -34,6 +34,8 @@
 //! | AC-6: a new prompt turn dispatches what the last one refused | [`identical_means_identical_and_a_new_turn_starts_empty`] |
 //! | BR-5: the refusal rides outside the untrusted frame | [`a_repeat_refusal_rides_outside_the_untrusted_frame`] |
 //! | AC-10: the recorded 26-call turn replays in at most 9 | [`the_recorded_twenty_six_call_turn_replays_in_nine`] |
+//! | REQ-623 BR-3: `agent` is write-capable — refused on the third identical call, not the second | [`agent_is_write_capable_third_identical_refused`] |
+//! | REQ-623 BR-8 (the same turn, read off `/cost`): the parent's own remote calls nest under its turn beside its two children | [`agent_is_write_capable_third_identical_refused`] |
 //!
 //! ## Mutation table
 //!
@@ -766,6 +768,125 @@ async fn a_repeat_refusal_rides_outside_the_untrusted_frame() {
          BUG-147's dropped-calls notice uses, so a model can tell a refusal from \
          a lost call.\n{refusal}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-623 BR-3 — `agent` in the ledger
+// ---------------------------------------------------------------------------
+
+/// **REQ-623 BR-3: `agent` is a write-capable call — the second identical
+/// call dispatches, the third is refused before it reaches the tool.**
+///
+/// Through the daemon's own turn path, with real children: each accepted call
+/// runs one child against the same scripted vendor, and the requests are
+/// strictly sequential (one child per call, one call per reply), so the script
+/// below is the exact order the vendor is asked in — parent, child, parent,
+/// child, parent (refused, no child), parent.
+///
+/// Counted off `agent_call_started`, which the tool publishes only for a call
+/// it accepted, and off the vendor's request count, which includes every
+/// child's request: a third dispatch would be a seventh request.
+///
+/// Benign path: the second identical call **is** dispatched — `agent` is not
+/// read-only, because its children can write, and a retry after a child
+/// changed the repository is a legitimate second attempt (the `edit` rule).
+///
+/// The same turn, read back off `/cost`, is also the daemon-path proof of
+/// BR-8's parent half (TASK-424's open item): the parent's four remote calls
+/// are stamped with its turn at its own choke point, so the turn's `own` line
+/// counts them beside its two children's lines.
+///
+/// # Mutations (run 2026-10-06, each reverted)
+///
+/// - **File `agent` under `READ_ONLY_TOOLS`**: reddens here at the benign
+///   leg — one call started, the second refused.
+/// - **Remove the `as_agent` arm** (the call reaches `Tool::run`): reddens
+///   here — no call is started, every "dispatch" is the typed
+///   `agent_requires_async_dispatch` refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_is_write_capable_third_identical_refused() {
+    let repo = Tree::new("agent");
+    let h = Harness::new();
+    let session = h.session_at(repo.path());
+    let mut sub = h.events.subscribe(4096);
+
+    let call = json!({ "tasks": [{ "task": "summarise the README", "name": "reader" }] });
+    h.vendor.will_call("agent", &call);
+    h.vendor.will_finish(); // the first call's child
+    h.vendor.will_call("agent", &call);
+    h.vendor.will_finish(); // the second call's child
+    h.vendor.will_call("agent", &call);
+    h.vendor.will_finish(); // the parent, after the refusal
+    h.turn(&session, "summarise the readme, twice over").await;
+
+    let published = drain(&mut sub).await;
+    let started: Vec<&teton_protocol::events::AgentCallStarted> = published
+        .iter()
+        .filter_map(|event| match event {
+            Event::AgentCallStarted(started) => Some(started),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        started.len(),
+        2,
+        "two identical `agent` calls dispatch — write-capable — and the third is \
+         refused before the tool sees it; events: {:?}",
+        published
+            .iter()
+            .map(|e| format!("{e:?}")
+                .split('(')
+                .next()
+                .unwrap_or_default()
+                .to_owned())
+            .collect::<Vec<_>>()
+    );
+    let completed = published
+        .iter()
+        .filter(|event| {
+            matches!(event, Event::AgentChildFinished(finished)
+                if finished.status == teton_protocol::agent::ChildStatus::Completed)
+        })
+        .count();
+    assert_eq!(completed, 2, "both dispatched children ran to completion");
+    assert_eq!(
+        h.vendor.bodies.lock().unwrap().len(),
+        6,
+        "four parent requests and two children's — no third child ran"
+    );
+
+    let results = tool_results(&h.vendor);
+    let refusals: Vec<&String> = results
+        .iter()
+        .filter(|r| r.contains("repeated: this exact call"))
+        .collect();
+    assert_eq!(refusals.len(), 1, "results: {results:#?}");
+    assert!(
+        refusals[0].contains("already ran 2 times"),
+        "the third call is refused after two dispatches: {}",
+        refusals[0]
+    );
+    assert_eq!(
+        repeats(&published)
+            .iter()
+            .map(|r| (r.tool.as_str(), r.count))
+            .collect::<Vec<_>>(),
+        [("agent", 2)]
+    );
+
+    let report = h.runtime.cost_report().expect("the ledger reads").report;
+    assert_eq!(
+        report.per_turn.len(),
+        1,
+        "one parent turn dispatched children"
+    );
+    let turn = &report.per_turn[0];
+    assert_eq!(
+        (turn.own.calls, turn.children.len()),
+        (4, 2),
+        "the parent's four requests are its own line, its two children theirs"
+    );
+    assert_eq!(turn.total.calls, 6);
 }
 
 // ---------------------------------------------------------------------------

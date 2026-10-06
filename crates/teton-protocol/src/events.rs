@@ -995,8 +995,15 @@ pub struct CostRecord {
     /// [`SessionUpdate::child_id`]: omitted when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_id: Option<ChildId>,
-    /// The prompt turn the child ran under, beside [`Self::child_id`]; `None`
-    /// exactly when it is.
+    /// The prompt turn this call rolls up under (REQ-623 BR-8): for a child's
+    /// call, the turn the child ran under — always present beside
+    /// [`Self::child_id`]; for a prompt turn's **own** call, that turn, so
+    /// `/cost` can total a parent as its own calls plus its children's.
+    ///
+    /// So it is *not* `None` exactly when `child_id` is: a parent turn's own
+    /// call carries a turn and no child. `None` is a call attributed to no
+    /// turn — a connection probe, the detached session-title duty — and every
+    /// row written before REQ-623.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_turn_id: Option<TurnId>,
 }

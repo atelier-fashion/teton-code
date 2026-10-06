@@ -12682,6 +12682,7 @@ provider_id = "on-device"
                             mode: SessionMode::Freeform,
                             phase: None,
                             typed: true,
+                            prompt_spend: None,
                         }),
                     )
                     .await;
@@ -12692,9 +12693,25 @@ provider_id = "on-device"
                     "tier {tier:?} registered the wrong tool set"
                 );
                 if tier != WebTier::Off {
-                    // Added last, so it reads after the built-ins and MCP in the
-                    // exposed tool docs.
-                    assert_eq!(tools.names().last().copied(), Some(WEB_TOOL_NAME));
+                    // Added after the built-ins and MCP, so it reads after them
+                    // in the exposed tool docs. Only the prompt turn's two
+                    // registry-conditional tools follow it — `skill` (REQ-587)
+                    // and `agent` (REQ-623 ADR-7), `agent` on by default.
+                    let before_the_conditional_pair: Vec<&str> = tools
+                        .names()
+                        .into_iter()
+                        .filter(|name| {
+                            ![
+                                crate::harness::tools::SKILL_TOOL_NAME,
+                                crate::harness::tools::AGENT_TOOL_NAME,
+                            ]
+                            .contains(name)
+                        })
+                        .collect();
+                    assert_eq!(
+                        before_the_conditional_pair.last().copied(),
+                        Some(WEB_TOOL_NAME)
+                    );
                     // ...but it is cap-exempt (REQ-563 decision 2026-08-09), so
                     // even the weak-model default cap of 5 — which equals the
                     // built-in count — still exposes it. An explicitly opted-in
@@ -12772,6 +12789,7 @@ provider_id = "on-device"
                             mode: SessionMode::Freeform,
                             phase: None,
                             typed: true,
+                            prompt_spend: None,
                         }),
                     )
                     .await
@@ -12799,6 +12817,7 @@ provider_id = "on-device"
                             mode: SessionMode::Freeform,
                             phase: None,
                             typed: true,
+                            prompt_spend: None,
                         }),
                     )
                     .await
@@ -13196,6 +13215,7 @@ max_page_bytes_from_the_future = 4096
                             mode: SessionMode::Freeform,
                             phase: None,
                             typed: true,
+                            prompt_spend: None,
                         }),
                     )
                     .await

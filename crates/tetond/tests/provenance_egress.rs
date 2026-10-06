@@ -266,6 +266,23 @@ async fn drive_bodies(
     Vec<Vec<u8>>,
     Vec<teton_protocol::events::PrivacyBlock>,
 ) {
+    drive_bodies_with(repo, session_id, bodies, ctx, None).await
+}
+
+/// [`drive_bodies`] with one more tool registered beside the built-ins — the
+/// `agent` tool, for REQ-623's boundary case, which the daemon registers per
+/// prompt turn rather than in `with_builtins`.
+async fn drive_bodies_with(
+    repo: &std::path::Path,
+    session_id: &SessionId,
+    bodies: Vec<String>,
+    ctx: &mut ContextManager,
+    extra: Option<Arc<dyn tetond::harness::Tool>>,
+) -> (
+    Result<tetond::harness::TurnOutcome, HarnessError>,
+    Vec<Vec<u8>>,
+    Vec<teton_protocol::events::PrivacyBlock>,
+) {
     let transport = CaptureSse::with_bodies(bodies);
     let capture = transport.clone();
 
@@ -298,6 +315,9 @@ async fn drive_bodies(
         None,
         None,
     );
+    if let Some(tool) = extra {
+        tools.register_cap_exempt(tool);
+    }
     // REQ-614: the classifier needs a **project** root and the effective
     // boundary set to reach any verdict but `Unknown`. Without both, every
     // shell result here would be `Unknown` — the pre-REQ-614 answer — so the
@@ -765,6 +785,111 @@ async fn projects_touches_no_repo_file_and_leaves_the_next_remote_turn_free() {
             "boundary content reached egress through a tool that reads no files"
         );
     }
+}
+
+/// A child dispatcher whose one child read `secrets/prod.env` and quoted it in
+/// its report — what a real child that `read` the boundary file would hand
+/// back: the bytes in its report, the file's identity in its provenance.
+struct ChildThatReadTheSecret {
+    read: teton_core::ProvenanceId,
+}
+
+#[async_trait]
+impl tetond::harness::child::ChildDispatcher for ChildThatReadTheSecret {
+    async fn run_child(
+        &self,
+        spec: tetond::harness::child::ChildSpec,
+    ) -> tetond::harness::child::ChildOutcome {
+        let report = format!("The production config says: {SECRET}");
+        tetond::harness::child::ChildOutcome {
+            result: teton_protocol::agent::ChildResult {
+                name: spec.name,
+                status: teton_protocol::agent::ChildStatus::Completed,
+                report: report.clone(),
+                refusal: None,
+                error: None,
+                turns_used: 2,
+                route: None,
+                bounds: None,
+                cost_micro_cents: 0,
+                spend_ceiling_final_micro_cents: None,
+            },
+            provenance: tetond::egress::Provenance::tainted_by(self.read.clone()),
+            report_bytes: report.len() as u64,
+            truncated: false,
+            share_released: None,
+        }
+    }
+}
+
+/// **REQ-623 ADR-8 / BR-9: a child that read boundary content pins its
+/// parent.** The `agent` result block carries the union of its children's
+/// provenance, so the parent's next remote turn is refused exactly as if the
+/// parent had read the file itself — and none of the bytes the child quoted
+/// reach the wire.
+///
+/// The child is a stand-in that returns what a real child's `read` of
+/// `secrets/prod.env` would: the content in its report and the file's identity
+/// in its provenance. The end-to-end leg — a real child turn reading the file
+/// under a configured boundary — is TASK-430's AC-10.
+///
+/// Mutation (run 2026-10-06, reverted): the tool leaving its result block's
+/// provenance empty (`result_of` without the union) reddens this test — the
+/// second request goes out carrying the secret.
+#[tokio::test]
+async fn an_agent_childs_boundary_read_blocks_the_parents_next_remote_turn() {
+    use tetond::harness::tools::agent::{AgentParent, AgentTool};
+
+    let repo = temp_repo();
+    let read = teton_core::ProvenanceId::from_resolved(&repo, &repo.join("secrets/prod.env"))
+        .expect("a canonical identity");
+    let bus = Arc::new(EventBus::new());
+    let agent: Arc<dyn tetond::harness::Tool> = Arc::new(AgentTool::new(
+        Arc::new(ChildThatReadTheSecret { read }),
+        teton_core::config::AgentConfig::default(),
+        AgentParent {
+            turn_id: teton_protocol::TurnId::from("turn-1"),
+            events: SessionEvents::new(bus, SessionId::from("provctl")),
+            spend_ceiling: None,
+            prompt_spend: None,
+        },
+        tokio::runtime::Handle::current(),
+    ));
+    let mut ctx = ContextManager::new(scripted_system(), scripted_config().context_budget_tokens);
+    ctx.push_user(PROMPT);
+    let (result, captured, blocks) = drive_bodies_with(
+        &repo,
+        &SessionId::from("provctl"),
+        vec![
+            sse_turn(
+                "Dispatching a reader.",
+                Some((
+                    "c1",
+                    "agent",
+                    r#"{"tasks":[{"task":"read the production config","name":"reader"}]}"#,
+                )),
+            ),
+            sse_turn("should never send", None),
+        ],
+        &mut ctx,
+        Some(agent),
+    )
+    .await;
+
+    // Non-vacuity: the child's report — the secret — is in the parent's
+    // context, so a send of it would leak.
+    assert!(
+        ctx.blocks().iter().any(|b| b.text.contains(SECRET)),
+        "the child's report was folded into the parent's context"
+    );
+    assert!(
+        context_provenance(&ctx).contains("secrets/prod.env"),
+        "the result block carries the child's provenance"
+    );
+    assert_blocked_and_clean(&result, &captured, &blocks);
+    assert_eq!(blocks[0].path, "secrets/prod.env");
+    assert_last_tool_result_is_framed(&ctx);
+    std::fs::remove_dir_all(&repo).ok();
 }
 
 /// **REQ-577 BR-6: the bundled-docs tool surfaces nothing from the repository,

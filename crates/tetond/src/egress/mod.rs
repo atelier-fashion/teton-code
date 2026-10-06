@@ -116,7 +116,7 @@ use teton_protocol::events::{
     BlockCause, ByteSpan, Event, FindingKind as WireFindingKind, PrivacyAction, PrivacyBlock,
     ProvenanceRejected,
 };
-use teton_protocol::{ProviderId, SessionId};
+use teton_protocol::{ProviderId, SessionId, TurnId};
 use teton_providers::transport::{
     BlockDetail, ByteStream, HttpMethod, Transport, TransportError, TransportRequest,
     TransportResponse,
@@ -555,6 +555,12 @@ pub struct Egress<T: Transport> {
     /// the child's accumulator and the prompt's. `None` — every choke point
     /// but a child's — leaves the prompt-turn path exactly as it was.
     child_spend: Option<ChildSpend>,
+    /// The prompt turn this choke point's calls are billed under (REQ-623
+    /// BR-8, AC-12) — the parent turn's half of what [`Self::child_spend`] is
+    /// for a child: every metered call that names no turn of its own is
+    /// stamped with it, so `/cost` totals a parent turn as its own calls plus
+    /// its children's. A child's choke point stamps the child's pair instead.
+    turn: Option<TurnId>,
     /// The REQ-562 redaction scanner, present **iff** `[privacy] redact` is on
     /// (ADR-2). `None` is the off state in full: no branch inside the hot path,
     /// no scanner call, nothing that could claim a scan ran.
@@ -628,6 +634,7 @@ impl<T: Transport> Egress<T> {
             spend_ceiling: None,
             prompt_spend: None,
             child_spend: None,
+            turn: None,
             cost: None,
             redaction: None,
             search_redaction: None,
@@ -715,6 +722,20 @@ impl<T: Transport> Egress<T> {
     #[must_use]
     pub fn with_child_spend(mut self, spend: Option<ChildSpend>) -> Self {
         self.child_spend = spend;
+        self
+    }
+
+    /// Bill this choke point's calls under the prompt turn `turn` (REQ-623
+    /// BR-8, AC-12) — see the field. At the choke point rather than at each
+    /// source that builds an attribution, because this is the one place every
+    /// remote call of the turn and of its duties passes (LESSON-501): a stamp
+    /// left to each builder is a stamp one of them forgets.
+    ///
+    /// `None` (the default) changes nothing, and an attribution that already
+    /// names a turn keeps it.
+    #[must_use]
+    pub fn with_turn(mut self, turn: Option<TurnId>) -> Self {
+        self.turn = turn;
         self
     }
 
@@ -1088,7 +1109,10 @@ impl<T: Transport> Egress<T> {
                 response,
                 ctx.session_id.clone(),
                 ctx.provider_id.clone(),
-                attribution.clone(),
+                match (&self.turn, &attribution.parent_turn_id) {
+                    (Some(turn), None) => attribution.clone().with_turn(turn.clone()),
+                    _ => attribution.clone(),
+                },
                 self.prompt_spend.clone(),
             )),
             _ => Ok(response),

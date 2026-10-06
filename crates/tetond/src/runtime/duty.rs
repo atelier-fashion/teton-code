@@ -463,6 +463,7 @@ impl DaemonRuntime {
             local_engine,
             prompt_spend,
             child,
+            turn_id,
         } = dctx;
         // The category's own name, read off the duty rather than spelled again:
         // two surfaces describing one routing state must not be able to drift.
@@ -561,7 +562,10 @@ impl DaemonRuntime {
             // wiring, and its rows carry the child's ids — so a child's
             // `compact` or `digest` cannot spend past its share on the prompt's
             // headroom.
-            .with_child_spend(child.map(|c| c.spend.clone()));
+            .with_child_spend(child.map(|c| c.spend.clone()))
+            // REQ-623 BR-8 / AC-12: a prompt turn's duty is the turn's own
+            // spend, and its rows say so. `None` for the detached title duty.
+            .with_turn(turn_id.cloned());
         // REQ-562 ADR-1: a remotely-bound duty's prompt is an outbound payload
         // like any other, so it crosses the same gate the turn path's does. It
         // is the same construction for the same reason the boundaries and the

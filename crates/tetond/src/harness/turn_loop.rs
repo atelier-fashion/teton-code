@@ -1066,6 +1066,34 @@ impl SessionEvents {
         );
     }
 
+    /// Publish one of the `agent_*` events an `agent` call reports its progress
+    /// with (REQ-623 spec Events, ADR-3).
+    ///
+    /// They are the **parent's** news — a call accepted or refused, a child
+    /// finished, a share moved, the call done — so they go out through the
+    /// parent's emitter, which stamps nothing; the ids they need are fields of
+    /// their own payloads. `agent_child_started` is the runner's and
+    /// `agent_child_consent_requested` the gate's, so neither comes through
+    /// here.
+    pub fn agent_event(&self, event: Event) {
+        debug_assert!(
+            self.child.is_none(),
+            "an agent_* event is the parent's news; a child has no `agent` tool (BR-2)"
+        );
+        debug_assert!(
+            matches!(
+                event,
+                Event::AgentCallStarted(_)
+                    | Event::AgentCallRefused(_)
+                    | Event::AgentChildFinished(_)
+                    | Event::AgentChildShareReleased(_)
+                    | Event::AgentCallFinished(_)
+            ),
+            "`agent_event` publishes the `agent` tool's own events and nothing else"
+        );
+        self.bus.publish(Some(self.session_id.clone()), event);
+    }
+
     /// Announce what the context gate did to fit this turn's budget (REQ-586
     /// BR-7, ADR-3).
     ///
@@ -1795,6 +1823,11 @@ async fn serve_tool_call(
     };
     match decision {
         PermissionDecision::Denied => {
+            // REQ-623 BR-10: inside a child, what the gate refused is what
+            // tells "refused by a gate" from a child that ended on its own.
+            if let Some(child) = super::child::current_child() {
+                child.tool_calls.note_denied(&name);
+            }
             events.tool_finished(&call.id, false);
             // Who refused this matters to what the model does next.
             // A level refusal was never a question — nobody was
@@ -2057,22 +2090,52 @@ async fn run_the_allowed_tool(
             return Ok(());
         }
     }
-    // **Off the async worker** (BUG-226). `Tool::run` is synchronous and a
-    // `shell` call holds this thread for as long as its child runs — up to the
-    // tool's ceiling. That is not only this turn's time: `tool_started` above
-    // woke this connection's event forwarder, and a task woken from a worker
-    // goes into that worker's LIFO slot, which no other worker can steal
-    // (tokio-rs/tokio#4941). Dispatched inline, the forwarder sat in the slot
-    // until the tool returned, and the client received `tool_call` and
-    // `tool_call_update` together — a `[running]` line printed at the moment
-    // the tool finished, which is the silent stretch REQ-621 exists to remove.
-    // Observed on tokio 1.53 with a standalone probe (8 of 8 trials; 0 of 8
-    // through the helper), and intermittently as
-    // `a_running_tool_shows_its_title_elapsed_and_cost_so_far_beneath_its_running_line`
-    // finding one row where it expects a counter. The helper hands the core —
-    // run queue and slot — to a fresh thread before this one blocks.
-    let outcome =
-        crate::runtime::block_in_place_if_multithread(|| tools.dispatch(name, tool_ctx, arguments));
+    // ── REQ-623 ADR-1: the `agent` tool is awaited, never run ─
+    //
+    // **Before** the synchronous dispatch below, and the order is the design.
+    // An `agent` call is minutes of awaiting child turns; run through
+    // `Tool::run` it would park a worker thread on its children for all of
+    // them — BUG-226's shape at N times the duration — so it is reached by
+    // downcast and `.await`ed here, on the loop's own async path,
+    // where the parent's event forwarder keeps draining while the children
+    // run (BR-4). Every other tool falls through to BUG-226's fix unchanged.
+    // Everything around it — the repeat gate above, the fold, the framing and
+    // the ledger record below — is the same for `agent` as for any tool.
+    let agent = tools.get(name).and_then(|tool| tool.as_agent());
+    let outcome = if let Some(agent) = agent {
+        agent
+            .dispatch(super::tools::AgentCall {
+                tool_call_id: &call.id,
+                arguments,
+                // BR-7: no child's cap exceeds the parent's own.
+                parent_max_turns: config.max_turns,
+                // The tasks were written from this context: they carry its
+                // taint into every child (LESSON-501).
+                provenance: super::completion::context_provenance(ctx),
+            })
+            .await
+    } else {
+        // **Off the async worker** (BUG-226). `Tool::run` is synchronous and a
+        // `shell` call holds this thread for as long as its child runs — up to
+        // the tool's ceiling. That is not only this turn's time: `tool_started`
+        // above woke this connection's event forwarder, and a task woken from a
+        // worker goes into that worker's LIFO slot, which no other worker can
+        // steal (tokio-rs/tokio#4941). Dispatched inline, the forwarder sat in
+        // the slot until the tool returned, and the client received `tool_call`
+        // and `tool_call_update` together — a `[running]` line printed at the
+        // moment the tool finished, which is the silent stretch REQ-621 exists
+        // to remove. Observed on tokio 1.53 with a standalone probe (8 of 8
+        // trials; 0 of 8 through the helper), and intermittently as
+        // `a_running_tool_shows_its_title_elapsed_and_cost_so_far_beneath_its_running_line`
+        // finding one row where it expects a counter. The helper hands the core
+        // — run queue and slot — to a fresh thread before this one blocks.
+        crate::runtime::block_in_place_if_multithread(|| tools.dispatch(name, tool_ctx, arguments))
+    };
+    // REQ-623 BR-10: inside a child, a call that ran is a call the gate did
+    // not stop — see `ChildToolCalls::gate_refusal`.
+    if let Some(child) = super::child::current_child() {
+        child.tool_calls.note_ran();
+    }
     // REQ-567 OQ-1: the tool has RUN. Everything from here
     // to the fold below awaits — the tool's own duty, then
     // `digest` — and a cancellation landing in one of those

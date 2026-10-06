@@ -325,6 +325,20 @@ pub enum AgentRefusal {
         /// Its 0-based position in the call's `tasks`.
         index: u32,
     },
+    /// A task's `name` was longer than the spec's bound (the entity table's
+    /// `name ≤ 40 chars`).
+    ///
+    /// Its own code rather than a silent cut or a borrowed one: a cut name
+    /// could collide with a sibling's and turn into a [`Self::DuplicateName`]
+    /// the model never wrote, and `duplicate_name` / `empty_task` would each
+    /// name the wrong fault. Added by TASK-428, additively — a pre-REQ client
+    /// that does not know the tag fails to decode only this one event.
+    NameTooLong {
+        /// The name as the call gave it.
+        name: String,
+        /// The bound, in characters.
+        max: u32,
+    },
 }
 
 impl AgentRefusal {
@@ -336,6 +350,7 @@ impl AgentRefusal {
             AgentRefusal::ChildCapReached { .. } => "child_cap_reached",
             AgentRefusal::DuplicateName { .. } => "duplicate_name",
             AgentRefusal::EmptyTask { .. } => "empty_task",
+            AgentRefusal::NameTooLong { .. } => "name_too_long",
         }
     }
 }
@@ -617,11 +632,16 @@ mod tests {
         );
     }
 
-    /// The four refusal codes the spec names, each carrying its numbers under
-    /// a `kind` tag that agrees with [`AgentRefusal::code`]; a fifth code does
-    /// not parse.
+    /// The five refusal codes — the four the spec names and `name_too_long`,
+    /// which TASK-428 added for the entity table's 40-character name bound —
+    /// each carrying its numbers under a `kind` tag that agrees with
+    /// [`AgentRefusal::code`]; a sixth code does not parse.
+    ///
+    /// Renamed from `agent_refusal_codes_are_the_four_the_spec_names` when the
+    /// fifth landed: a name stating "four" over a five-row table is a test
+    /// whose title lies.
     #[test]
-    fn agent_refusal_codes_are_the_four_the_spec_names() {
+    fn agent_refusal_codes_are_the_five_the_tool_raises() {
         for (refusal, code) in [
             (
                 AgentRefusal::TooManyChildren {
@@ -645,6 +665,13 @@ mod tests {
                 "duplicate_name",
             ),
             (AgentRefusal::EmptyTask { index: 2 }, "empty_task"),
+            (
+                AgentRefusal::NameTooLong {
+                    name: "n".repeat(41),
+                    max: 40,
+                },
+                "name_too_long",
+            ),
         ] {
             assert_eq!(refusal.code(), code);
             let wire = serde_json::to_value(&refusal).unwrap();
@@ -662,6 +689,14 @@ mod tests {
         assert_eq!(
             wire,
             json!({"kind": "too_many_children", "requested": 6, "cap": 5})
+        );
+        assert_eq!(
+            serde_json::to_value(AgentRefusal::NameTooLong {
+                name: "auditor".to_owned(),
+                max: 40,
+            })
+            .unwrap(),
+            json!({"kind": "name_too_long", "name": "auditor", "max": 40})
         );
         assert!(serde_json::from_value::<AgentRefusal>(json!({"kind": "nested_agent"})).is_err());
     }
