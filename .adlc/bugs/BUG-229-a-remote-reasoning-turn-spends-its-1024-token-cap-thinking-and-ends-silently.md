@@ -1,10 +1,10 @@
 ---
 id: BUG-229
 title: "A remote reasoning turn spends its 1,024-token output cap thinking and ends silently as EndTurn"
-status: open
+status: resolved
 severity: high
 created: 2026-09-26
-updated: 2026-09-28
+updated: 2026-10-07
 component: "daemon/harness"
 domain: "harness"
 stack: ["rust", "daemon"]
@@ -147,3 +147,17 @@ fix that case is visible as `MaxTokens` rather than silent.
   128k quarter is now 59,904 B); the digest table row and reservation updated.
 - `crates/tetond/tests/redact_egress.rs`, `crates/tetond/tests/routing.rs`:
   derive under the remote reservation the router really uses.
+
+## Deployment
+
+Merged 2026-10-07 as atelier-fashion/teton-code#333 (squash `7118be42`). There's
+no deploy target: this repo ships by release (plain OSS flow), so the fix
+reaches users with the next tagged release.
+
+The merge with `main` picked up REQ-623 (subagent dispatch): the redact-scan
+golden row combines both changes (79,872 words / 182,403 bytes), and
+`tools/agent.rs`'s test source gained `stopped_at_cap`. Follow-up: a child
+agent cut off at its cap is still reported `completed` by
+`runtime/child_turn.rs` (separate bug in flight).
+
+Lesson: LESSON-666.
