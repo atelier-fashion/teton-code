@@ -653,7 +653,7 @@ impl Router {
                 BudgetInputs {
                     window: capabilities.max_context,
                     cap: capabilities.context_budget_cap,
-                    reservation: budget::generation_reservation(),
+                    reservation: budget::remote_generation_reservation(),
                     is_local: false,
                     redact_scan: self.redact_scan,
                     provider_id: Some(id),
@@ -1225,10 +1225,22 @@ impl Router {
     /// [`HarnessConfig::with_route_budget`] rather than being set field by
     /// field, so a config's budget-bearing fields cannot disagree with the
     /// [`RouteBudget`] the route reports.
+    ///
+    /// A third, since BUG-229: the output cap. The reservation the budget
+    /// subtracted is the `max_tokens` the request sends, read off the same
+    /// [`BudgetInputs`](budget::BudgetInputs) so the two cannot disagree. The
+    /// local tier keeps the default config's cap, which is the one its arm of
+    /// [`budget::derive`] reserves.
     #[must_use]
     pub fn harness_config_for(&self, provider_id: &str) -> HarnessConfig {
-        HarnessConfig::from_harness_profile(self.capability_of(provider_id).harness_profile())
-            .with_route_budget(self.budget_for(Some(provider_id)))
+        let mut config =
+            HarnessConfig::from_harness_profile(self.capability_of(provider_id).harness_profile())
+                .with_route_budget(self.budget_for(Some(provider_id)));
+        let inputs = self.budget_inputs_for(Some(provider_id));
+        if !inputs.is_local {
+            config.gen_params.max_tokens = inputs.reservation;
+        }
+        config
     }
 
     // ---- internal helpers ----
@@ -1928,11 +1940,11 @@ mod tests {
         );
         // REQ-586 AC-1/AC-4, through the real router rather than a fixture
         // literal: `three_rungs` declares the 200,000-token window `native()`
-        // carries, so the event announces the pair derived from it — 199k
-        // usable words after the 1,024-token generation reservation — under
-        // `bound: window`.
-        assert_eq!(decided.budget_tokens, Some(132_650));
-        assert_eq!(decided.budget_bytes, Some(397_952));
+        // carries, so the event announces the pair derived from it — 191,808
+        // usable tokens after the 8,192-token remote generation reservation
+        // (BUG-229), × 2/3 words and × 2 bytes — under `bound: window`.
+        assert_eq!(decided.budget_tokens, Some(127_872));
+        assert_eq!(decided.budget_bytes, Some(383_616));
         assert_eq!(decided.bound, Some(BudgetBound::Window));
     }
 
@@ -2617,6 +2629,45 @@ mod tests {
         assert_eq!(cfg.context_budget_bytes, cfg.budget.budget_bytes);
     }
 
+    /// **BUG-229.** A remote route sends the remote output cap, and it is the
+    /// same number its budget reserved; the local tier keeps its own.
+    ///
+    /// Before the fix every route sent `LOCAL_GENERATION_RESERVATION` (1,024),
+    /// sized for a local reply scanner that ends turns early. A remote
+    /// reasoning model counts its thinking against `max_tokens`, spent all of
+    /// it, and answered nothing.
+    ///
+    /// Mutation: deleting the `max_tokens` stamp in `harness_config_for`
+    /// reddens the first assertion; reverting `budget_inputs_for`'s remote
+    /// reservation to `generation_reservation()` reddens the second.
+    #[test]
+    fn a_remote_route_sends_the_remote_output_cap_its_budget_reserved() {
+        let router = five_bound_router();
+        for id in ["wide", "capped", "silent"] {
+            let cfg = router.harness_config_for(id);
+            assert_eq!(
+                cfg.gen_params.max_tokens,
+                budget::REMOTE_GENERATION_RESERVATION,
+                "{id}: a remote route must not send the local tier's cap"
+            );
+            assert_eq!(
+                router.budget_inputs_for(Some(id)).reservation,
+                cfg.gen_params.max_tokens,
+                "{id}: the room the budget reserved is the room the request asks for"
+            );
+        }
+        assert_eq!(
+            router.harness_config_for("local").gen_params.max_tokens,
+            budget::LOCAL_GENERATION_RESERVATION,
+            "the local tier's cap is unchanged"
+        );
+        assert_ne!(
+            router.harness_config_for("wide").gen_params.max_tokens,
+            router.harness_config_for("local").gen_params.max_tokens,
+            "non-vacuity: the two caps must differ for the first assertion to mean anything"
+        );
+    }
+
     // ---- REQ-586: the budget is a property of the route attempt ----------
 
     /// A router that reaches **all five** [`BudgetBound`]s: `wide` declares a
@@ -2677,11 +2728,11 @@ mod tests {
     fn the_route_budget_is_derived_from_the_routes_own_window() {
         let router = five_bound_router();
 
-        // A declared window, less the 1,024-token generation reservation the
-        // adapters actually send: (128,000 − 1,024) words ÷ the 3/2 safety
-        // ratio, and the same figure × the 2 B/token floor.
+        // A declared window, less the 8,192-token generation reservation a
+        // remote request actually sends (BUG-229): (128,000 − 8,192) words ÷
+        // the 3/2 safety ratio, and the same figure × the 2 B/token floor.
         let wide = router.budget_for(Some("wide"));
-        assert_eq!((wide.budget_tokens, wide.budget_bytes), (84_650, 253_952));
+        assert_eq!((wide.budget_tokens, wide.budget_bytes), (79_872, 239_616));
         assert_eq!(wide.bound, BudgetBound::Window);
 
         // No declared window: today's pair, and the event says *why* — a
@@ -2722,7 +2773,7 @@ mod tests {
         let capped = router.budget_for(Some("capped"));
         assert_eq!(
             (capped.budget_tokens, capped.budget_bytes),
-            (25_984, 77_952)
+            (21_205, 63_616)
         );
         assert_eq!(capped.bound, BudgetBound::UserCap);
         assert!(
@@ -2892,12 +2943,23 @@ mod tests {
     /// so the cap *is* the window this route ran under. And `default_unknown`
     /// reports `0`, which is how "no window is known" gets said rather than
     /// guessed (REQ-586: an unknown window is stated).
+    ///
+    /// **BUG-229 moved the three declared-window rows, deliberately.** A remote
+    /// route reserves [`budget::REMOTE_GENERATION_RESERVATION`] (8,192) where
+    /// it reserved the local tier's 1,024, because that is now the
+    /// `max_tokens` its requests send. `window` and `redact_scan`'s word half
+    /// fall from 84,650 to 79,872 and `user_cap`'s pair from 25,984 / 77,952 to
+    /// 21,205 / 63,616, with their digest thresholds scaled alongside. The
+    /// `redact_scan` byte half does not move — the scan bound clamps it either
+    /// way (182,403 since REQ-623). `local_engine` and `default_unknown` are byte-identical: neither
+    /// subtracts a remote reservation. Captured from the running code, not
+    /// hand-computed.
     const BUDGET_FOR_GOLDEN: [&str; 5] = [
         "local_engine: RouteBudget { window_tokens: 32768, budget_tokens: 21162, budget_bytes: 63488, bound: LocalEngine, window_label: \"the local context window\", digest_threshold_tokens: 7749, digest_threshold_bytes: 23250, floored: false, provider_id: None, repo_context_cap: 8192 }",
         "default_unknown: RouteBudget { window_tokens: 0, budget_tokens: 4096, budget_bytes: 32768, bound: DefaultUnknown, window_label: \"silent's context window\", digest_threshold_tokens: 1500, digest_threshold_bytes: 12000, floored: false, provider_id: Some(\"silent\"), repo_context_cap: 8192 }",
-        "window: RouteBudget { window_tokens: 128000, budget_tokens: 84650, budget_bytes: 253952, bound: Window, window_label: \"wide's context window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 93000, floored: false, provider_id: Some(\"wide\"), repo_context_cap: 8192 }",
-        "user_cap: RouteBudget { window_tokens: 40000, budget_tokens: 25984, budget_bytes: 77952, bound: UserCap, window_label: \"capped's context window\", digest_threshold_tokens: 9515, digest_threshold_bytes: 28546, floored: false, provider_id: Some(\"capped\"), repo_context_cap: 8192 }",
-        "redact_scan: RouteBudget { window_tokens: 128000, budget_tokens: 84650, budget_bytes: 182403, bound: RedactScan, window_label: \"the redact-scannable window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 66797, floored: false, provider_id: Some(\"wide\"), repo_context_cap: 8192 }",
+        "window: RouteBudget { window_tokens: 128000, budget_tokens: 79872, budget_bytes: 239616, bound: Window, window_label: \"wide's context window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 87750, floored: false, provider_id: Some(\"wide\"), repo_context_cap: 8192 }",
+        "user_cap: RouteBudget { window_tokens: 40000, budget_tokens: 21205, budget_bytes: 63616, bound: UserCap, window_label: \"capped's context window\", digest_threshold_tokens: 7765, digest_threshold_bytes: 23296, floored: false, provider_id: Some(\"capped\"), repo_context_cap: 8192 }",
+        "redact_scan: RouteBudget { window_tokens: 128000, budget_tokens: 79872, budget_bytes: 182403, bound: RedactScan, window_label: \"the redact-scannable window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 66797, floored: false, provider_id: Some(\"wide\"), repo_context_cap: 8192 }",
     ];
 
     /// **REQ-589 TASK-259.** What the accessor is *for*: the provider's declared
@@ -2948,7 +3010,7 @@ mod tests {
         assert!(scanning.budget_inputs_for(Some("wide")).redact_scan);
         assert_eq!(
             router.budget_inputs_for(Some("wide")).reservation,
-            budget::generation_reservation()
+            budget::remote_generation_reservation()
         );
     }
 
@@ -3246,7 +3308,7 @@ mod tests {
 
         let route = router.resolve(CoreCategory::Design);
         assert_eq!(route.budget.bound, BudgetBound::Window);
-        assert_eq!(route.budget.budget_tokens, 84_650);
+        assert_eq!(route.budget.budget_tokens, 79_872);
 
         let outcome = router.on_provider_failure(&route, "wide", FailureClass::MalformedToolCall);
         let next = outcome.route.expect("continues on the same provider");
@@ -3272,7 +3334,7 @@ mod tests {
             (before.budget_tokens, before.budget_bytes, before.bound),
             "the event after the degrade announces the budget it announced before"
         );
-        assert_eq!(after.budget_tokens, Some(84_650));
+        assert_eq!(after.budget_tokens, Some(79_872));
 
         // The user's cap is part of "the failed provider's budget" too, and it
         // is the half a re-derivation from an empty profile would lose *without*

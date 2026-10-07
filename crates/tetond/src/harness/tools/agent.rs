@@ -2060,6 +2060,7 @@ mod tests {
                     dropped_calls: 0,
                     cache: None,
                     call_in_text: false,
+                    stopped_at_cap: false,
                 })
             }
         }

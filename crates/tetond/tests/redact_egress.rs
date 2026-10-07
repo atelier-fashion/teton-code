@@ -1090,10 +1090,10 @@ async fn a_context_budget_full_payload_is_scanned_across_windows_and_forwards() 
 /// reader can see this fixture is not accidentally testing the word guard.
 #[tokio::test]
 async fn a_redact_scanned_128k_route_assembles_a_body_the_scan_reads_whole_and_forwards() {
-    /// The provider window AC-6 names, and the reservation every route
-    /// subtracts (`HarnessConfig::default().gen_params.max_tokens`).
+    /// The provider window AC-6 names, and the reservation a remote route
+    /// subtracts — the `max_tokens` its requests send (BUG-229).
     const WINDOW: u32 = 128_000;
-    const RESERVATION: u32 = 1_024;
+    const RESERVATION: u32 = tetond::harness::budget::REMOTE_GENERATION_RESERVATION;
 
     let inputs = |redact_scan: bool| BudgetInputs {
         window: WINDOW,
@@ -1780,9 +1780,9 @@ fn system_prompt_with_notes(notes: RepoContextBlock) -> String {
 /// while 1 stayed green, which is why all three are here.
 #[tokio::test]
 async fn the_resident_notes_block_is_inside_the_scanned_body_at_the_raised_bound() {
-    /// The provider window, and the reservation every route subtracts.
+    /// The provider window, and the reservation a remote route subtracts.
     const WINDOW: u32 = 128_000;
-    const RESERVATION: u32 = 1_024;
+    const RESERVATION: u32 = tetond::harness::budget::REMOTE_GENERATION_RESERVATION;
 
     let scanned = derive(BudgetInputs {
         window: WINDOW,

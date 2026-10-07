@@ -37,7 +37,8 @@ use teton_inference::{ChatFormat, Completion, Engine, EngineError, MissReason};
 use teton_protocol::events::{PrefixCache, PrefixCacheMiss, PrefixCacheOutcome};
 use teton_protocol::{Category, Phase, ProviderId, SessionId};
 use teton_providers::{
-    Message, Provider, ProviderError, Role, TokenUsage, ToolSpec, Transport, TurnEvent, TurnRequest,
+    Message, Provider, ProviderError, Role, StopReason as ProviderStopReason, TokenUsage, ToolSpec,
+    Transport, TurnEvent, TurnRequest,
 };
 
 use crate::cost::{CostAttribution, LocalUsageMeter};
@@ -133,6 +134,16 @@ pub struct SourceTurn {
     /// Always `false` when the decision is not a tool call — there is no call to
     /// be embedded.
     pub call_in_text: bool,
+    /// Whether generation stopped because it reached `max_tokens`, rather than
+    /// because the model finished (BUG-229).
+    ///
+    /// A remote source reads it off the provider's own stop reason (`length`,
+    /// `max_tokens`); the local source compares the tokens it generated with
+    /// the cap it asked for. The loop ends such a turn as
+    /// [`StopReason::MaxTokens`](teton_protocol::methods::StopReason::MaxTokens):
+    /// a reasoning model that spent the whole cap thinking answers with
+    /// nothing, and reported as `EndTurn` that empty answer looked finished.
+    pub stopped_at_cap: bool,
 }
 
 /// A source of model turns for the turn loop: local engine or remote provider.
@@ -497,6 +508,9 @@ impl CompletionSource for LocalEngineSource {
         // there and `clean_len` keeps it — so the block the loop pushes carries
         // it and the cancellation trim has something to cut.
         let call_in_text = matches!(decision, TurnDecision::ToolCall { .. });
+        // The engine stops at `max_tokens` without saying so; a completion that
+        // used all of it is the only witness this tier has (BUG-229).
+        let stopped_at_cap = completion.completion_tokens >= config.gen_params.max_tokens;
         Ok(SourceTurn {
             text,
             decision,
@@ -510,6 +524,7 @@ impl CompletionSource for LocalEngineSource {
             dropped_calls: parsed.dropped_calls,
             cache: Some(cache),
             call_in_text,
+            stopped_at_cap,
         })
     }
 }
@@ -808,6 +823,7 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
         let mut tool_call: Option<TurnDecision> = None;
         let mut dropped_calls = 0u32;
         let mut usage = TokenUsage::default();
+        let mut stopped_at_cap = false;
         while let Some(event) = stream.next().await {
             let event = match event {
                 Ok(event) => event,
@@ -834,6 +850,10 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
                 TurnEvent::ToolCall(_) => dropped_calls += 1,
                 TurnEvent::Completed(completion) => {
                     usage = completion.usage;
+                    // BUG-229: read before it is dropped. Discarding the stop
+                    // reason is what made a cap spent on reasoning end the
+                    // turn as an ordinary, empty `EndTurn`.
+                    stopped_at_cap = completion.stop_reason == ProviderStopReason::MaxTokens;
                 }
             }
         }
@@ -892,6 +912,7 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
             // block carries its call belongs at the one seam every source
             // passes through, and this flag only says who put it there.
             call_in_text,
+            stopped_at_cap,
         })
     }
 }
@@ -1271,6 +1292,95 @@ mod tests {
                 output_tokens: 4,
                 reasoning_tokens: None,
             }
+        );
+    }
+
+    // ---- BUG-229: a call that ran out of output tokens --------------------
+
+    /// A provider that answers with no text and no call, then ends on
+    /// `stop` — BUG-229's record 87 when `stop` is `MaxTokens`: 1,024 output
+    /// tokens, 1,021 of them reasoning, and nothing to show for it.
+    struct SpentOnReasoning {
+        stop: StopReason,
+    }
+
+    #[async_trait]
+    impl Provider for SpentOnReasoning {
+        fn id(&self) -> &str {
+            "spent"
+        }
+        fn capabilities(&self) -> CapabilityProfile {
+            CapabilityProfile::default()
+        }
+
+        async fn stream_turn(
+            &self,
+            _request: TurnRequest,
+            _transport: &dyn Transport,
+        ) -> Result<TurnStream, ProviderError> {
+            let events: Vec<Result<TurnEvent, ProviderError>> =
+                vec![Ok(TurnEvent::Completed(TurnCompletion {
+                    usage: TokenUsage {
+                        input_tokens: 40_000,
+                        output_tokens: 1_024,
+                        reasoning_tokens: Some(1_021),
+                    },
+                    stop_reason: self.stop.clone(),
+                }))];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    async fn spent_turn(stop: StopReason) -> SourceTurn {
+        let provider = SpentOnReasoning { stop };
+        let egress = Egress::new(NullTransport, Vec::new(), Arc::new(NoopSink));
+        let mut source = RemoteProviderSource::new(
+            &provider,
+            &egress,
+            "spent",
+            "kimi-k3",
+            "sess-under-test",
+            ResolvedEffort::effort(teton_core::EffortLevel::High),
+        );
+        let tools = ToolRegistry::with_builtins();
+        let exposed = tools.exposed_names(None);
+        source
+            .produce_turn(
+                &flat_prompt("prompt"),
+                &Provenance::empty(),
+                &HarnessConfig::default(),
+                &tools,
+                &exposed,
+                &mut |_| {},
+            )
+            .await
+            .expect("remote turn")
+    }
+
+    /// BUG-229: the provider's `max_tokens` stop survives the source. It was
+    /// read as usage only and the stop reason dropped, so the loop could not
+    /// tell a cap spent on reasoning from a model that chose to say nothing.
+    ///
+    /// Mutation: dropping the `stopped_at_cap` assignment in the `Completed`
+    /// arm reddens the first assertion.
+    #[tokio::test]
+    async fn a_remote_turn_that_ran_out_of_output_says_so() {
+        let turn = spent_turn(StopReason::MaxTokens).await;
+        assert!(turn.stopped_at_cap, "a `length` stop must reach the loop");
+        assert!(
+            matches!(&turn.decision, TurnDecision::EndTurn { final_text } if final_text.is_empty()),
+            "the shape BUG-229 saw: no text, no call — {:?}",
+            turn.decision
+        );
+
+        // And only then: the same empty answer on an ordinary stop is not a
+        // truncation, so the flag is a reading of the stop reason and not of
+        // the empty text.
+        assert!(!spent_turn(StopReason::EndTurn).await.stopped_at_cap);
+        assert!(
+            !spent_turn(StopReason::Other("content_filter".to_owned()))
+                .await
+                .stopped_at_cap
         );
     }
 
@@ -2110,6 +2220,44 @@ mod tests {
         let prov = context_provenance(&ctx);
         assert!(prov.is_empty());
         assert!(!prov.is_unknown());
+    }
+
+    /// BUG-229, the local half: the engine stops at `max_tokens` without a
+    /// stop reason, so a completion that used every token it was allowed is
+    /// the witness. An answer that ended on its own inside the cap is not.
+    ///
+    /// Mutation: `let stopped_at_cap = false;` in `LocalEngineSource`
+    /// reddens the first assertion.
+    #[tokio::test]
+    async fn a_local_turn_cut_at_its_cap_says_so() {
+        async fn local_turn(reply: &str, max_tokens: u32) -> SourceTurn {
+            let engine: Arc<Mutex<dyn Engine>> =
+                Arc::new(Mutex::new(MockEngine::with_response("mock", reply)));
+            let mut source =
+                LocalEngineSource::new(engine, ChatFormat::Flat, SessionId::from("test-session"));
+            let mut config = HarnessConfig::default();
+            config.gen_params.max_tokens = max_tokens;
+            let tools = ToolRegistry::with_builtins();
+            let exposed = tools.exposed_names(None);
+            source
+                .produce_turn(
+                    &flat_prompt("prompt"),
+                    &Provenance::empty(),
+                    &config,
+                    &tools,
+                    &exposed,
+                    &mut |_| {},
+                )
+                .await
+                .expect("local turn")
+        }
+
+        let long = "word ".repeat(50);
+        assert!(
+            local_turn(&long, 10).await.stopped_at_cap,
+            "cut at 10 of 50 words"
+        );
+        assert!(!local_turn("A short answer.", 1_024).await.stopped_at_cap);
     }
 
     #[tokio::test]

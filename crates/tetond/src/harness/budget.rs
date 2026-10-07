@@ -311,8 +311,8 @@ pub const LOCAL_DIGEST_THRESHOLD_TOKENS: usize = 1_500;
 pub const LOCAL_DIGEST_THRESHOLD_BYTES: usize =
     LOCAL_DIGEST_THRESHOLD_TOKENS * APPROX_BYTES_PER_TOKEN;
 
-/// Provider tokens every route reserves for the generation — **the one home**
-/// of the 1,024 literal (ADR-1, LESSON-456).
+/// Provider tokens the **local** route reserves for the generation — **the one
+/// home** of the 1,024 literal (ADR-1, LESSON-456).
 ///
 /// This is the `max_tokens` the adapters actually send: `HarnessConfig`'s
 /// default `gen_params` reads this constant rather than restating it, and
@@ -341,6 +341,29 @@ pub const LOCAL_DIGEST_THRESHOLD_BYTES: usize =
 /// `gen_params` its literal back. The arrow runs one way — config reads the
 /// constant, the constant never reads the config.
 pub const LOCAL_GENERATION_RESERVATION: u32 = 1_024;
+
+/// Provider tokens a **remote** route reserves for the generation, and the
+/// `max_tokens` its requests send (BUG-229).
+///
+/// [`LOCAL_GENERATION_RESERVATION`] is sized for the local tier: prose plus
+/// one complete tool call, cut short by the reply scanner long before the cap
+/// (BUG-147). A remote reasoning model counts its *thinking* against the same
+/// field, so 1,024 tokens sent to `kimi-k3` at effort `high` was spent on
+/// reasoning (`output_tokens: 1024, reasoning_tokens: 1021`) and the call
+/// answered nothing.
+///
+/// 8,192 because it is the largest value every provider the README documents
+/// accepts: a `max_tokens` above a model's output ceiling is a 400 on every
+/// request (DeepSeek's `deepseek-chat` stops at 8,192), which is a worse
+/// failure than the one this fixes. A turn that still exhausts it ends as
+/// `MaxTokens`, not `EndTurn`, so a larger need is visible rather than silent.
+///
+/// [`Router::budget_for`](crate::router::Router::budget_for) subtracts this
+/// from a remote window and
+/// [`Router::harness_config_for`](crate::router::Router::harness_config_for)
+/// sends it, through the one accessor [`remote_generation_reservation`], so
+/// the reserved room and the requested room are one number.
+pub const REMOTE_GENERATION_RESERVATION: u32 = 8_192;
 
 /// Safety ratio between whitespace words and real BPE tokens, numerator: a
 /// word budget of N claims at most `N × 3/2` provider tokens.
@@ -507,9 +530,9 @@ pub struct BudgetInputs<'a> {
     /// none. A **window ceiling**: it bounds `window`, and the pair is
     /// recomputed from the smaller value (BR-5).
     pub cap: u32,
-    /// Provider tokens reserved for generation — the `max_tokens` the
-    /// adapters send ([`LOCAL_GENERATION_RESERVATION`], handed over by
-    /// [`generation_reservation`]; ADR-1).
+    /// Provider tokens reserved for generation — the `max_tokens` a remote
+    /// route's requests send ([`REMOTE_GENERATION_RESERVATION`], handed over by
+    /// [`remote_generation_reservation`]; BUG-229). The local arm ignores it.
     pub reservation: u32,
     /// Whether the route is the local tier (routing-table classification).
     pub is_local: bool,
@@ -609,7 +632,7 @@ pub struct RouteBudget {
     /// Reported beside the pair rather than left to be inferred from it,
     /// because the two are in different currencies and inferring one from the
     /// other is the mistake LESSON-446 records: a declared 1,000,000-token
-    /// window derives a 665,984-**word** budget, and a surface printing only
+    /// window derives a 661,205-**word** budget, and a surface printing only
     /// the second reads as though the window shrank.
     pub window_tokens: u32,
     /// Context budget in whitespace-approximated tokens (words).
@@ -1098,10 +1121,10 @@ fn digest_thresholds(budget_tokens: usize, budget_bytes: usize) -> (usize, usize
 /// The reservation [`derive`] subtracts — [`LOCAL_GENERATION_RESERVATION`],
 /// returned directly (ADR-1).
 ///
-/// `Router::budget_for` and [`big_window_notice`] both derive under this one
-/// number, and the harness's default `gen_params` sends the same constant as
-/// `max_tokens`, so the budget a user is *told about* at registration is the
-/// budget their turns get.
+/// [`derive`]'s local arm reserves this number and the harness's default
+/// `gen_params` sends it as `max_tokens`. A remote route reserves and sends
+/// [`remote_generation_reservation`] instead (BUG-229); either way the budget a
+/// user is *told about* is the budget their turns get.
 ///
 /// **This function reads no config, and must not start.** Reading the number
 /// back off a default-constructed harness config closes a cycle the moment
@@ -1111,6 +1134,14 @@ fn digest_thresholds(budget_tokens: usize, budget_bytes: usize) -> (usize, usize
 #[must_use]
 pub const fn generation_reservation() -> u32 {
     LOCAL_GENERATION_RESERVATION
+}
+
+/// The reservation a **remote** route's budget subtracts and its requests send
+/// as `max_tokens` — [`REMOTE_GENERATION_RESERVATION`], returned directly for
+/// the same reason [`generation_reservation`] is (BUG-229).
+#[must_use]
+pub const fn remote_generation_reservation() -> u32 {
+    REMOTE_GENERATION_RESERVATION
 }
 
 /// The one sentence a registration that records a big context window earns, or
@@ -1136,7 +1167,7 @@ pub const fn generation_reservation() -> u32 {
 /// not use).
 ///
 /// The figures are the route's own: the per-call pair comes from [`derive`]
-/// under the real [`generation_reservation`], the cap and the redact scan are
+/// under the real [`remote_generation_reservation`], the cap and the redact scan are
 /// applied exactly as a turn would apply them, and the worst case is that pair
 /// times [`NATIVE_MAX_ITERATIONS`] — a `Native` route's loop ceiling, which is
 /// how many calls one *prompt* may run.
@@ -1148,7 +1179,7 @@ pub fn big_window_notice(window: u32, cap: u32, redact_scan: bool) -> Option<Str
     let budget = derive(BudgetInputs {
         window,
         cap,
-        reservation: generation_reservation(),
+        reservation: remote_generation_reservation(),
         is_local: false,
         redact_scan,
         // The label is the only thing an id would change, and this sentence
@@ -2044,8 +2075,8 @@ fn sentence_tail(caller: SkillCaller, bound: BudgetBound, sentence: &SkillSenten
 ///
 /// The two figures are in different currencies and the second is smaller, so a
 /// surface printing only the budget reads as though the window shrank. On
-/// `kimi-k3` a declared 1,000,000-token window derives a 665,984-**word**
-/// budget, and a user who declared 1,000,000 and is shown 665,984 has no way to
+/// `kimi-k3` a declared 1,000,000-token window derives a 661,205-**word**
+/// budget, and a user who declared 1,000,000 and is shown 661,205 has no way to
 /// tell whether the daemon capped them, lost a third of their window, or is
 /// simply counting something else. It is counting something else, and this
 /// sentence says which: `≈1,000,000 tokens at 3/2`.
@@ -5529,8 +5560,8 @@ mod tests {
         assert_eq!(
             big_window_notice(1_000_000, 0, false).expect("a 1m window is above the threshold"),
             "a 1,000,000-token context window is recorded, so every call to this provider may \
-             carry up to 665,984 words / 2 MB of context, and one prompt may run up to 25 calls \
-             — 16,649,600 words / 49.9 MB of input at worst. Nothing is capped by default: the \
+             carry up to 661,205 words / 2 MB of context, and one prompt may run up to 25 calls \
+             — 16,530,125 words / 49.6 MB of input at worst. Nothing is capped by default: the \
              window you declare is the budget. Set `capabilities.context_budget_cap` below \
              `capabilities.max_context` to spend less."
         );
@@ -5545,7 +5576,7 @@ mod tests {
         let budget = derive(BudgetInputs {
             window: 1_000_000,
             cap: 0,
-            reservation: generation_reservation(),
+            reservation: remote_generation_reservation(),
             is_local: false,
             redact_scan: false,
             provider_id: None,
@@ -5565,7 +5596,11 @@ mod tests {
         let capped = big_window_notice(1_000_000, 300_000, false).expect("above the threshold");
         assert!(
             capped.contains(&thousands(
-                derive(remote(1_000_000, 300_000, false)).budget_tokens as u64
+                derive(BudgetInputs {
+                    reservation: remote_generation_reservation(),
+                    ..remote(1_000_000, 300_000, false)
+                })
+                .budget_tokens as u64
             )),
             "{capped}"
         );
