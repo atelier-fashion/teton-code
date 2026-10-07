@@ -4250,8 +4250,14 @@ pub fn resolve_permission(
     // and a user answering for three concurrent children has to know which one
     // wants `shell`; the parent's own request carries none, and every string
     // below is then exactly what it was before children existed.
+    //
+    // The heading says the grant's scope beside the name (security review): an
+    // answer to a child's ask is the session's — its siblings and the parent
+    // hold it too — and "by child audit-1" alone reads as narrower than that.
     let asker = req.child_id.as_ref().map(ChildId::name);
-    let by_child = asker.map_or_else(String::new, |name| format!(" by child {name}"));
+    let by_child = asker.map_or_else(String::new, |name| {
+        format!(" by child {name} (for this session)")
+    });
     let for_child = asker.map_or_else(String::new, |name| format!(" for child {name}"));
 
     // Session-scoped auto-decisions first — these consume no prompt.

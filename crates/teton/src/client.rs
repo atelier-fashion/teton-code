@@ -4230,6 +4230,11 @@ mod tests {
     /// | `for_child` always empty in `resolve_permission` | the child's question |
     /// | `child_label` splits at the **last** `/` | the `scan/src` heading |
     ///
+    /// Since verify (2026-10-07) the child's heading also states the grant's
+    /// scope — `(for this session)` — because an answer to a child's ask is
+    /// the session's; the parent's heading is unchanged. Dropping the suffix
+    /// reddens this test at both child headings.
+    ///
     /// Since verify (2026-10-07) the split is `ChildId::name`'s, the id's one
     /// sanctioned accessor in `teton-protocol`; the third row's mutation,
     /// re-run there (`rsplit_once`), reddens this test at the same heading and
@@ -4294,7 +4299,7 @@ mod tests {
         let (lines, questions, replies) = ask(Some(ChildId::new("toolu_01", "audit-1")));
         assert_eq!(
             lines,
-            ["permission requested by child audit-1: shell — run `cargo test`"]
+            ["permission requested by child audit-1 (for this session): shell — run `cargo test`"]
         );
         assert_eq!(
             questions,
@@ -4312,7 +4317,7 @@ mod tests {
         let (lines, _, _) = ask(Some(ChildId::new("toolu_01", "scan/src")));
         assert_eq!(
             lines,
-            ["permission requested by child scan/src: shell — run `cargo test`"]
+            ["permission requested by child scan/src (for this session): shell — run `cargo test`"]
         );
     }
 

@@ -116,7 +116,8 @@ how long its report may be, and your `task`.
 
 - **Depth is one.** A child has no `agent` tool and cannot start children.
 - **The session's permissions, asked through the session's prompt.** A child's
-  question is labelled with its name, and concurrent questions come one at a
+  question is labelled with its name and `(for this session)`, and concurrent
+  questions come one at a
   time while the other children keep working. A grant it is given is the
   session's: you and its siblings have it too. Unattended, a gate with no
   standing answer denies, and the child's tool call fails. At `plan` a child is
