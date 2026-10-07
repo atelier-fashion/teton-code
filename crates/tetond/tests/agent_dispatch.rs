@@ -453,7 +453,17 @@ fn surviving_shell(started: &str, release: &str, survived: &str) -> Value {
 /// that applied to a scratch copy of the source at `6eb7dc2`, the cancel and
 /// deadline tests were green in 6 of 6 runs of this binary; without it, both
 /// tool-in-flight tests are red here on every run.
+///
+/// One child-scoped event is *allowed* late, and is filtered here by name:
+/// `agent_child_share_released`. BR-8 as amended at the verify pass keeps a
+/// timed-out child's share until its work has actually ended, then releases
+/// it — so under a spend ceiling, with siblings running, that event follows
+/// the result by design. Everything else a dead child publishes is the leak.
 fn assert_no_late_child_events(late: &[Value]) {
+    let late: Vec<&Value> = late
+        .iter()
+        .filter(|e| e["event"] != "agent_child_share_released")
+        .collect();
     assert!(
         late.is_empty(),
         "no child event after the release — the child's task must be gone, not merely \
