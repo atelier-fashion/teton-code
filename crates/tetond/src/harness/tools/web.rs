@@ -2434,7 +2434,8 @@ mod tests {
             REDACT_BODY_OVERHEAD_BYTES, REDACT_ESCAPING_DIVISOR,
         };
         use crate::harness::turn_loop::{
-            build_system_prompt, worst_case_session_root, HarnessConfig, SkillToolDocs,
+            build_system_prompt, worst_case_session_root, AgentToolDocs, HarnessConfig,
+            SkillToolDocs,
         };
         use crate::repo_context::RepoContextBlock;
 
@@ -2467,6 +2468,14 @@ mod tests {
         // `skill::tests::the_doc_only_tool_and_the_real_one_render_one_set_of_prompt_bytes`.
         let skill_docs = Arc::new(SkillToolDocs::worst_case());
         tools.register_cap_exempt(Arc::clone(&skill_docs) as Arc<dyn Tool>);
+        // And the `agent` tool (REQ-623), in both sweeps or in neither, for the
+        // same reason: it is cap-exempt and resident on every prompt turn with
+        // `agent.enabled` — the default. `AgentToolDocs` renders the shipped
+        // tool's own description and schema, pinned byte-identical by
+        // `agent::tests::the_doc_only_agent_tool_and_the_real_one_render_one_set_of_prompt_bytes`,
+        // at both caps' `u32::MAX` — the ceiling the opted-out twin measures too.
+        let agent_docs = Arc::new(AgentToolDocs::worst_case());
+        tools.register_cap_exempt(Arc::clone(&agent_docs) as Arc<dyn Tool>);
 
         let base = HarnessConfig::for_strong_model();
         // Non-vacuity: the tool's docs really are in what is being measured.
@@ -2554,6 +2563,16 @@ mod tests {
              its root is resident an 8,192-byte block on every turn (REQ-612 ADR-1, \
              AC-4). Build the config rows with \
              `repo_context: Some(RepoContextBlock::worst_case())` — do not delete this \
+             check:\n{widest}"
+        );
+        // REQ-623, the twin of `egress::redact`'s `agent` self-check: dropping the
+        // registration above *shrinks* the prompt by the whole docs line, and
+        // every arithmetic assertion below passes on the smaller number.
+        assert!(
+            widest.contains("- agent: ") && widest.contains(agent_docs.description()),
+            "the widest prompt measured carries no worst-case `agent` tool docs, so the \
+             sweep is measuring a resident prompt smaller than every default prompt turn \
+             sends (REQ-623). Register `AgentToolDocs::worst_case()` — do not delete this \
              check:\n{widest}"
         );
         let worst = widest.len();

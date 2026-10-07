@@ -2854,6 +2854,14 @@ mod tests {
     /// the sign reversed: a narrowing that reached the scanned route and
     /// nothing else.
     ///
+    /// **And a third time for REQ-623, the same way.** The `agent` tool's docs
+    /// line rides every default prompt turn and neither prompt-margin sweep had
+    /// measured it; once they did, `REDACT_BODY_OVERHEAD_BYTES` went 24 → 25
+    /// KiB, the chunk count again held at four, and the whole KiB came off the
+    /// bound once more: `183334 → 182403`, byte digest threshold
+    /// `67138 → 66797`. Word half 84,650 and the other four rows byte-identical,
+    /// a third time.
+    ///
     /// The other three rows are byte-identical to the capture, which is what
     /// says the window touched the two window-derived arms and nothing else.
     ///
@@ -2889,7 +2897,7 @@ mod tests {
         "default_unknown: RouteBudget { window_tokens: 0, budget_tokens: 4096, budget_bytes: 32768, bound: DefaultUnknown, window_label: \"silent's context window\", digest_threshold_tokens: 1500, digest_threshold_bytes: 12000, floored: false, provider_id: Some(\"silent\"), repo_context_cap: 8192 }",
         "window: RouteBudget { window_tokens: 128000, budget_tokens: 84650, budget_bytes: 253952, bound: Window, window_label: \"wide's context window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 93000, floored: false, provider_id: Some(\"wide\"), repo_context_cap: 8192 }",
         "user_cap: RouteBudget { window_tokens: 40000, budget_tokens: 25984, budget_bytes: 77952, bound: UserCap, window_label: \"capped's context window\", digest_threshold_tokens: 9515, digest_threshold_bytes: 28546, floored: false, provider_id: Some(\"capped\"), repo_context_cap: 8192 }",
-        "redact_scan: RouteBudget { window_tokens: 128000, budget_tokens: 84650, budget_bytes: 183334, bound: RedactScan, window_label: \"the redact-scannable window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 67138, floored: false, provider_id: Some(\"wide\"), repo_context_cap: 8192 }",
+        "redact_scan: RouteBudget { window_tokens: 128000, budget_tokens: 84650, budget_bytes: 182403, bound: RedactScan, window_label: \"the redact-scannable window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 66797, floored: false, provider_id: Some(\"wide\"), repo_context_cap: 8192 }",
     ];
 
     /// **REQ-589 TASK-259.** What the accessor is *for*: the provider's declared

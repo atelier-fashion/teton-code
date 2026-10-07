@@ -3673,6 +3673,102 @@ impl super::tools::Tool for SkillToolDocs {
     }
 }
 
+/// An `agent` tool carrying REQ-623's **prompt bytes and nothing else**: the
+/// rendered description and the input schema, with no dispatcher, no parent,
+/// no runtime handle and no per-turn counter — [`SkillToolDocs`]'s shape, for
+/// the same reason (REQ-587 ADR-9).
+///
+/// **Why it exists.** `register_agent_tool` puts the `agent` tool in every
+/// prompt turn's registry whenever `agent.enabled` — the default — and
+/// cap-exempt, so its docs line is resident exactly as the `skill` tool's is.
+/// `ToolRegistry::with_builtins()` cannot hold it, and the real
+/// [`AgentTool`](super::tools::agent::AgentTool) holds a
+/// `tokio::runtime::Handle` and a `ChildDispatcher`, so the sync sweep in
+/// `egress::redact` cannot build one. Until TASK-428's Phase-4 fix neither
+/// sweep registered it, and both measured a prompt about 1.3 KB smaller than
+/// the one every default prompt turn sends — LESSON-481's shape, which ADR-9
+/// had already closed once for `skill`.
+///
+/// **It is not a stub with a hand-typed description.** Both prompt surfaces
+/// come from the functions the shipped tool reaches for
+/// (`agent::describe` and `agent::schema`), and
+/// `tools::agent::tests::the_doc_only_agent_tool_and_the_real_one_render_one_set_of_prompt_bytes`
+/// pins the two byte-identical.
+///
+/// **Why it lives here rather than in `harness::tools::agent`.**
+/// `tests/boundary_coverage.rs` counts every `impl Tool for …` in the tools
+/// module's production half as a tool the product ships; a measurement fixture
+/// is not one, and [`SkillToolDocs`] sits here for exactly that reason.
+#[cfg(test)]
+pub(crate) struct AgentToolDocs {
+    /// The rendered description, owned because `Tool::description` borrows from
+    /// `&self` — the real tool's own arrangement.
+    description: String,
+    /// The per-call cap the schema's `maxItems` renders.
+    per_call: u32,
+}
+
+#[cfg(test)]
+impl AgentToolDocs {
+    /// The docs an `[agent]` table of `config` puts in the prompt, rendered
+    /// exactly as `AgentTool::new` and `AgentTool::input_schema` render them.
+    pub(crate) fn new(config: &teton_core::config::AgentConfig) -> Self {
+        Self {
+            description: super::tools::agent::describe(config),
+            per_call: config.max_children_per_call,
+        }
+    }
+
+    /// The **worst case** the resident prompt can carry: both caps at
+    /// `u32::MAX`.
+    ///
+    /// The description states `max_children_per_call` and
+    /// `max_children_per_turn` and the schema's `maxItems` states the first, all
+    /// as decimal numbers, so the docs line grows with the caps' digit counts.
+    /// `AgentConfig::validate_agent` bounds the caps from below only (each at
+    /// least 1), so the largest value the config admits is the type's own:
+    /// ten digits each, **27 bytes** over the defaults' `5` and `8` (nine in
+    /// each of the three places). The ceiling by derivation, as
+    /// [`SkillToolDocs::worst_case`] synthesizes a roster at `ROSTER_MAX_BYTES`
+    /// rather than reading the developer's own tree.
+    pub(crate) fn worst_case() -> Self {
+        Self::new(&teton_core::config::AgentConfig {
+            max_children_per_call: u32::MAX,
+            max_children_per_turn: u32::MAX,
+            ..teton_core::config::AgentConfig::default()
+        })
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl super::tools::Tool for AgentToolDocs {
+    fn name(&self) -> &str {
+        super::tools::AGENT_TOOL_NAME
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        super::tools::agent::schema(self.per_call)
+    }
+
+    /// Never reached: the sweeps that register this build a system prompt, they
+    /// do not run a turn. It refuses rather than panicking, as
+    /// [`SkillToolDocs`] does.
+    fn run(
+        &self,
+        _ctx: &super::tools::ToolContext,
+        _args: &serde_json::Value,
+    ) -> super::tools::ToolOutcome {
+        super::tools::ToolOutcome::error(
+            "the doc-only `agent` tool renders documentation and runs nothing (REQ-623)",
+        )
+    }
+}
+
 /// Build the system prompt: the agent's instructions, Teton's bundled
 /// self-configuration guide, the exposed tool docs, the tool-call format the
 /// local model must follow, and — last — the repository's own notes.

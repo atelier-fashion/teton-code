@@ -618,7 +618,7 @@ pub(crate) const REDACT_ESCAPING_DIVISOR: usize = 10;
 /// (`harness::tools::web::tests::the_web_tool_docs_clear_the_outbound_body_overhead`);
 /// this is the number both of them measure against, so the two shapes cannot
 /// come to disagree about the budget.
-pub(crate) const REDACT_BODY_OVERHEAD_BYTES: usize = 24 * 1024;
+pub(crate) const REDACT_BODY_OVERHEAD_BYTES: usize = 25 * 1024;
 
 /// The smallest headroom [`REDACT_BODY_OVERHEAD_BYTES`] may be left with after
 /// the largest system prompt this build produces (REQ-572 verify).
@@ -701,7 +701,7 @@ pub(crate) const MIN_PROMPT_HEADROOM_BYTES: usize = 48;
 /// last time. Add a ledger line to [`REDACT_BODY_OVERHEAD_BYTES`] saying which
 /// REQ spent the bytes, then move this number in the same diff.
 #[cfg(test)]
-pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 512;
+pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 208;
 
 /// The same pin for the **web-enabled** prompt shape measured by
 /// `harness::tools::web::tests::the_web_tool_docs_clear_the_outbound_body_overhead`.
@@ -713,7 +713,7 @@ pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 512;
 /// holds the budget vocabulary, so the two shapes cannot come to disagree about
 /// which constant they are measuring against.
 #[cfg(test)]
-pub(crate) const RECORDED_WEB_PROMPT_MARGIN_BYTES: usize = 559;
+pub(crate) const RECORDED_WEB_PROMPT_MARGIN_BYTES: usize = 255;
 
 /// The gap between the two recorded margins, pinned (REQ-617).
 ///
@@ -2800,7 +2800,8 @@ mod tests {
 
         use crate::harness::tools::{Tool, ToolRegistry};
         use crate::harness::turn_loop::{
-            build_system_prompt, worst_case_session_root, HarnessConfig, SkillToolDocs,
+            build_system_prompt, worst_case_session_root, AgentToolDocs, HarnessConfig,
+            SkillToolDocs,
         };
         use crate::repo_context::RepoContextBlock;
 
@@ -2833,6 +2834,18 @@ mod tests {
         let skill_docs = Arc::new(SkillToolDocs::worst_case());
         let mut tools = ToolRegistry::with_builtins();
         tools.register_cap_exempt(Arc::clone(&skill_docs) as Arc<dyn Tool>);
+        // **And the `agent` tool, for the same reason** (REQ-623, TASK-428's
+        // Phase-4 fix). `register_agent_tool` puts it in every prompt turn's
+        // registry whenever `agent.enabled` — the default — cap-exempt, so its
+        // docs line is resident exactly as `skill`'s is, and
+        // `with_builtins()` cannot hold it either. `AgentToolDocs` because the
+        // real `AgentTool` holds a runtime handle and a dispatcher; its bytes
+        // come from `agent::describe` and `agent::schema`, pinned byte-identical
+        // by `harness::tools::agent::tests::the_doc_only_agent_tool_and_the_real_one_render_one_set_of_prompt_bytes`.
+        // At both caps' `u32::MAX`, the largest the config admits: the caps are
+        // rendered as decimal numbers, so that is the docs line's ceiling.
+        let agent_docs = Arc::new(AgentToolDocs::worst_case());
+        tools.register_cap_exempt(Arc::clone(&agent_docs) as Arc<dyn Tool>);
 
         // REQ-612 ADR-1 / AC-4: the repository-notes block, synthesized **at**
         // `REPO_CONTEXT_MAX_BYTES` rather than read from a fixture, so the cap
@@ -2917,6 +2930,19 @@ mod tests {
             "the `skill` tool's docs are in the prompt but not its worst-case roster, so \
              the sweep is measuring the description without the bytes that grow with the \
              user's installed skills (REQ-587 BR-2):\n{widest}"
+        );
+        // The `agent` tool's twin of the `skill` self-check above (REQ-623): the
+        // registration is a guard only while dropping it reddens something, and
+        // every arithmetic assertion below *passes* on the smaller prompt a
+        // dropped registration leaves. Matched on the rendered entry and on the
+        // worst-case description, so a stand-in rendered at the default caps
+        // cannot pass for the ceiling either.
+        assert!(
+            widest.contains("- agent: ") && widest.contains(agent_docs.description()),
+            "the widest prompt measured carries no worst-case `agent` tool docs, so the \
+             sweep is measuring a resident prompt smaller than every default prompt turn \
+             sends (REQ-623; the LESSON-481 shape REQ-587 ADR-9 closed for `skill`). \
+             Register `AgentToolDocs::worst_case()` — do not delete this check:\n{widest}"
         );
         // REQ-612 AC-4, the third self-check and the same shape as the two
         // above: the repository-notes block is the last region of the prompt
@@ -3177,14 +3203,14 @@ mod tests {
 
         assert_eq!(
             REDACT_SCANNABLE_CONTEXT_BYTES,
-            183_334,
+            182_403,
             "the scannable bound moved to {REDACT_SCANNABLE_CONTEXT_BYTES}. It is derived, \
              so this is not a bug — it is the *cost*: every `[privacy] redact = true` \
              route's byte budget just changed by {} bytes, and that budget is what BR-7's \
              `bound: redact scan` refusal measures against. Update this figure in the same \
              diff that moved `REDACT_BODY_OVERHEAD_BYTES`, and say in that diff which way \
              the budget went.",
-            183_334i64 - REDACT_SCANNABLE_CONTEXT_BYTES as i64
+            182_403i64 - REDACT_SCANNABLE_CONTEXT_BYTES as i64
         );
     }
 

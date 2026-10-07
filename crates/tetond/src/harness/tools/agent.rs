@@ -159,17 +159,7 @@ impl AgentTool {
         parent: AgentParent,
         runtime: Handle,
     ) -> Self {
-        let description = format!(
-            "Hand tasks to child turns that run concurrently and return their reports. Each \
-             child starts with a fresh context — this session's system prompt and tools (minus \
-             `agent`) and nothing of this conversation — so write everything it needs into \
-             `task` (and optional `context`). The result is a JSON array, one entry per task, \
-             with its `name`, `status` (completed, refused, cancelled, turns_exhausted, \
-             budget_exhausted, spend_exhausted, timed_out, failed) and final `report`. At most \
-             {} tasks per call and {} per turn; `tier` (reflex, scan, build, think) is a request \
-             the router may not honour.",
-            config.max_children_per_call, config.max_children_per_turn
-        );
+        let description = describe(&config);
         Self {
             dispatcher,
             config,
@@ -686,9 +676,38 @@ fn publish_finished(events: &SessionEvents, child_id: &ChildId, outcome: &ChildO
     }
 }
 
+/// The model-facing description, stating `config`'s two caps.
+///
+/// A function rather than a `format!` inside [`AgentTool::new`] because two
+/// things render it: the shipped tool, and the doc-only stand-in the two
+/// prompt-margin sweeps register (`turn_loop::AgentToolDocs`), which cannot
+/// build a real `AgentTool` — it holds a runtime [`Handle`] and a dispatcher,
+/// and one of the sweeps is a sync `#[test]`. One renderer is what keeps the
+/// bytes the sweeps measure the bytes the model reads; a second spelling beside
+/// it would drift while the budget's tests stayed green (LESSON-481). The two
+/// caps are rendered as decimal numbers, so the description grows with their
+/// digit count — the reason the sweeps measure it at the largest caps the
+/// config admits.
+pub(crate) fn describe(config: &AgentConfig) -> String {
+    format!(
+        "Hand tasks to child turns that run concurrently and return their reports. Each \
+         child starts with a fresh context — this session's system prompt and tools (minus \
+         `agent`) and nothing of this conversation — so write everything it needs into \
+         `task` (and optional `context`). The result is a JSON array, one entry per task, \
+         with its `name`, `status` (completed, refused, cancelled, turns_exhausted, \
+         budget_exhausted, spend_exhausted, timed_out, failed) and final `report`. At most \
+         {} tasks per call and {} per turn; `tier` (reflex, scan, build, think) is a request \
+         the router may not honour.",
+        config.max_children_per_call, config.max_children_per_turn
+    )
+}
+
 /// The schema the roster advertises (AC-1): `tasks: [{task, name?, tier?,
 /// context?}]`, at most `per_call` of them.
-fn schema(per_call: u32) -> Value {
+///
+/// `pub(crate)` for the same reason as [`describe`]: the sweeps' stand-in
+/// renders its schema from here, and `maxItems` carries `per_call`'s digits.
+pub(crate) fn schema(per_call: u32) -> Value {
     let tiers: Vec<&str> = [Tier::Reflex, Tier::Scan, Tier::Build, Tier::Think]
         .iter()
         .map(|tier| tier.as_str())
@@ -1857,5 +1876,100 @@ mod tests {
         assert_eq!(ceilings, [Some(200), Some(200), Some(200)]);
         let seen = f.seen.lock().unwrap();
         assert!(seen.iter().all(|spec| spec.spend.ceiling() == Some(200)));
+    }
+
+    /// **The byte-identity pin for the sweeps' stand-in** — REQ-587 ADR-9's
+    /// `the_doc_only_tool_and_the_real_one_render_one_set_of_prompt_bytes`,
+    /// for `agent`.
+    ///
+    /// The two prompt-margin sweeps (`egress::redact`'s
+    /// `the_total_cap_clears_the_harness_context_budget_with_margin` and
+    /// `web`'s `the_web_tool_docs_clear_the_outbound_body_overhead`) cannot
+    /// build a real [`AgentTool`] — one is a sync `#[test]` and the tool holds a
+    /// [`Handle`] and a dispatcher — so they register
+    /// `turn_loop::AgentToolDocs`. A hand-typed stand-in would drift from the
+    /// renderer while the margin tests stayed green; this compares the two
+    /// tools' prompt surfaces directly, at three `[agent]` tables:
+    ///
+    /// - the **defaults** (5 per call, 8 per turn), what every session that
+    ///   never wrote `[agent]` renders;
+    /// - a **departed** table (2 and 3), so a stand-in that ignored its config
+    ///   and rendered the defaults could not pass on the first row alone;
+    /// - **both caps at `u32::MAX`**, the largest the config admits
+    ///   (`validate_agent` bounds them from below only) — the row the sweeps
+    ///   register as `AgentToolDocs::worst_case()`.
+    ///
+    /// And the worst case is a ceiling: its docs are exactly **27 bytes**
+    /// longer than the defaults' — nine more digits in each of the
+    /// description's two caps and the schema's `maxItems`. The 27 is written
+    /// out here rather than computed from either tool, so the expected value
+    /// does not come from the subject.
+    ///
+    /// # Mutations (run 2026-10-07, each reverted)
+    ///
+    /// - **`AgentToolDocs::input_schema` rendering `schema(5)`** (a stand-in
+    ///   frozen at the default cap): red at the `u32::MAX` row's schema
+    ///   assertion, and at the departed row's.
+    /// - **`AgentToolDocs::worst_case` at the defaults** (`AgentConfig::default()`):
+    ///   red at the 27-byte growth assertion, naming a growth of 0.
+    #[tokio::test]
+    async fn the_doc_only_agent_tool_and_the_real_one_render_one_set_of_prompt_bytes() {
+        use crate::harness::turn_loop::AgentToolDocs;
+
+        let widest = AgentConfig {
+            max_children_per_call: u32::MAX,
+            max_children_per_turn: u32::MAX,
+            ..AgentConfig::default()
+        };
+        let departed = AgentConfig {
+            max_children_per_call: 2,
+            max_children_per_turn: 3,
+            ..AgentConfig::default()
+        };
+        for (label, config, docs) in [
+            (
+                "defaults",
+                AgentConfig::default(),
+                AgentToolDocs::new(&AgentConfig::default()),
+            ),
+            ("departed", departed, AgentToolDocs::new(&departed)),
+            ("u32::MAX", widest, AgentToolDocs::worst_case()),
+        ] {
+            let real = fixture_with(config, parent, echo()).tool;
+            assert_eq!(real.name(), docs.name(), "{label}");
+            assert_eq!(
+                real.description(),
+                docs.description(),
+                "{label}: the doc-only `agent` tool and the shipped one render different \
+                 descriptions, so the two prompt-margin sweeps are measuring bytes the model \
+                 never reads. Both must come from `agent::describe`."
+            );
+            assert_eq!(
+                real.input_schema(),
+                docs.input_schema(),
+                "{label}: the doc-only `agent` tool and the shipped one render different input \
+                 schemas. `ToolRegistry::docs` puts the schema in the resident prompt beside \
+                 the description, so this is prompt bytes the sweeps would miss."
+            );
+        }
+
+        // Non-vacuity: the description under comparison states the caps it was
+        // built with, so two paths agreeing on it agree on the numbers too.
+        assert!(
+            describe(&departed).contains("At most 2 tasks per call and 3 per turn"),
+            "{}",
+            describe(&departed)
+        );
+
+        let rendered =
+            |docs: &AgentToolDocs| docs.description().len() + docs.input_schema().to_string().len();
+        let default_bytes = rendered(&AgentToolDocs::new(&AgentConfig::default()));
+        let worst_bytes = rendered(&AgentToolDocs::worst_case());
+        assert_eq!(
+            worst_bytes.checked_sub(default_bytes),
+            Some(27),
+            "the worst case the sweeps register is not the defaults plus nine digits in each \
+             of the three places a cap is rendered ({default_bytes} → {worst_bytes})"
+        );
     }
 }
