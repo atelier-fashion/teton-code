@@ -893,6 +893,93 @@ mod tests {
     /// this test,
     /// `egress::tests::a_child_over_its_share_is_refused_while_a_raised_sibling_is_not`
     /// and `egress::tests::a_childs_choke_point_ignores_the_prompt_pair_and_counts_once`.
+    /// **BUG-231 regression.** A priced call whose cost is two-thirds of the
+    /// ceiling must leave the ceiling unreached, and the refusal sentence must
+    /// render the real dollars. REQ-588 added the ledger's `usd_micros` (1e-6
+    /// USD) to the micro-cent (1e-5 USD) accumulator unconverted, so this call
+    /// read as ten times its price: a $0.44 call "spent $4.40" against a $0.66
+    /// ceiling and was refused. Rate-independent: the ceiling is derived from
+    /// the bundled price through the real config edge
+    /// (`CostConfig::ceiling_micro_cents`), so a price-table change moves both
+    /// sides together.
+    ///
+    /// Mutation (run and reverted): restoring the identity in
+    /// `ledger::spend_units` reddens six — this test (spent == price, the
+    /// ceiling reached), `ledger::tests::spend_units_counts_a_price_and_refuses_to_count_nonsense`,
+    /// `a_childs_spend_reaches_its_own_and_the_parents_accumulator_in_ledger_units`,
+    /// `agent_dispatch::spend::two_child_split_and_three_child_release`,
+    /// `agent_dispatch::statuses::spend_exhausted` and
+    /// `cost_attribution::parent_total_is_own_plus_children`.
+    #[tokio::test]
+    async fn a_priced_call_just_under_the_ceiling_does_not_reach_it() {
+        let ledger = CostLedger::open_in_memory(PriceTable::bundled(), Arc::new(NoopCostSink))
+            .expect("open in-memory ledger");
+        let prices = PriceTable::bundled();
+        let price = prices
+            .price("claude-fable-5", 1200, 340)
+            .expect("bundled price")
+            .unsigned_abs();
+        assert!(price > 0, "non-vacuity: the call costs something");
+        // A ceiling of 1.5× the price, in dollars, through the real conversion.
+        let ceiling = teton_core::config::CostConfig {
+            prompt_ceiling_usd: Some(price as f64 * 1.5 / 1_000_000.0),
+        }
+        .ceiling_micro_cents()
+        .expect("finite ceiling converts");
+        assert!(ceiling > 0);
+
+        let child = id("audit");
+        let pool = SharePool::new(Some(ceiling), std::slice::from_ref(&child));
+        let spend = ChildSpend::new(child.clone(), pool, None);
+        let session = SessionId::from("s1");
+        let response = TransportResponse {
+            status: 200,
+            location: None,
+            body: Box::pin(futures::stream::iter(
+                [
+                    "event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":1200,\"output_tokens\":1}}}\n\n",
+                    "event: message_delta\ndata: {\"usage\":{\"output_tokens\":340}}\n\n",
+                ]
+                .into_iter()
+                .map(|c| Ok::<_, TransportError>(c.as_bytes().to_vec()))
+                .collect::<Vec<_>>(),
+            )),
+        };
+        let mut body = spend
+            .meter_response(
+                &ledger,
+                response,
+                Some(session.clone()),
+                ProviderId::from("anthropic"),
+                CostAttribution::new("claude-fable-5")
+                    .for_child(child.clone(), TurnId::from("turn-1")),
+            )
+            .body;
+        while body.next().await.is_some() {}
+
+        // The accumulator holds micro-cents: a tenth of the usd_micros price.
+        assert_eq!(spend.spent(), price / 10);
+        // Two-thirds of the way to the line is not the line.
+        assert!(
+            spend.spent() < spend.ceiling().expect("a bounded child"),
+            "spent {} must be under the ceiling {}",
+            spend.spent(),
+            ceiling
+        );
+        // And the sentence a refusal would carry renders the price, not 10× it.
+        let dollars = price / 1_000_000;
+        let cents = (price / 10_000) % 100;
+        assert_eq!(
+            teton_core::cost_ceiling::usd(spend.spent()),
+            format!("${dollars}.{cents:02}")
+        );
+        // The ledger's own sum agrees with the live figure (REQ-623 BR-8).
+        assert_eq!(
+            ledger.spent_by_child(&session, &child).expect("query"),
+            spend.spent()
+        );
+    }
+
     #[tokio::test]
     async fn a_childs_spend_reaches_its_own_and_the_parents_accumulator_in_ledger_units() {
         let ledger = CostLedger::open_in_memory(PriceTable::bundled(), Arc::new(NoopCostSink))
@@ -933,10 +1020,13 @@ mod tests {
         ]))
         .body;
         while body.next().await.is_some() {}
+        // Micro-cents, not the price's usd_micros (BUG-231): the accumulator's
+        // unit is the ceiling's.
         let first = prices
             .price("claude-fable-5", 1200, 340)
             .expect("bundled price")
-            .unsigned_abs();
+            .unsigned_abs()
+            / 10;
         assert!(first > 0, "non-vacuity: the call cost something");
         assert_eq!(spend.spent(), first, "counted on the terminal None");
         drop(body);
@@ -953,7 +1043,8 @@ mod tests {
         let second = prices
             .price("claude-fable-5", 3000, 1)
             .expect("bundled price")
-            .unsigned_abs();
+            .unsigned_abs()
+            / 10;
         assert!(second > 0);
 
         assert_eq!(spend.spent(), first + second);

@@ -576,13 +576,16 @@ async fn parent_total_is_own_plus_children() {
 
     // And the ledger's per-child figure agrees with the report's line.
     let session = SessionId::from("sess-total");
+    // The ledger's per-child figure is in the accumulator's micro-cents
+    // (BUG-231), the report's line in the row's usd_micros: one priced row per
+    // child here, so the conversion is a single `/ 10`.
     assert_eq!(
         ledger.spent_by_child(&session, &child_a).expect("query"),
-        a.unsigned_abs()
+        a.unsigned_abs() / 10
     );
     assert_eq!(
         ledger.spent_by_child(&session, &child_b).expect("query"),
-        b.unsigned_abs()
+        b.unsigned_abs() / 10
     );
 }
 

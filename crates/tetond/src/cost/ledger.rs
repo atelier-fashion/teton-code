@@ -1280,13 +1280,21 @@ fn has_column(conn: &Connection, column: &str) -> Result<bool, rusqlite::Error> 
 /// rows through it (REQ-623), so a child's ledger-derived spend and the figure
 /// its ceiling is checked against cannot drift apart.
 ///
-/// Today the recorded `usd_micros`, as-is. A negative price is nonsense rather
-/// than a credit, so it is treated as uncountable rather than reducing a total;
-/// `None` is an unpriced call.
+/// The recorded `usd_micros` (1e-6 USD) converted to the accumulator's
+/// micro-cents (1e-5 USD) through
+/// [`USD_MICROS_PER_MICRO_CENT`](super::USD_MICROS_PER_MICRO_CENT) — re-exported by
+/// `cost`, because this file must not be able to name `teton_core` at all
+/// (`duty::tests::the_only_text_to_category_map_is_the_ledgers_own_round_trip`)
+/// — the unit `[cost] prompt_ceiling_usd` is converted to and the refusal
+/// renders. BUG-231: this is where REQ-588 added the price unconverted, so a
+/// $1.00 ceiling bound at ~$0.10. A sub-micro-cent remainder (under 1e-5 USD)
+/// truncates; the ledger row keeps the exact price. A negative price is
+/// nonsense rather than a credit, so it is treated as uncountable rather than
+/// reducing a total; `None` is an unpriced call.
 fn spend_units(usd_micros: Option<i64>) -> Option<u64> {
     usd_micros
         .filter(|micros| *micros >= 0)
-        .map(i64::unsigned_abs)
+        .map(|micros| i64::unsigned_abs(micros / super::USD_MICROS_PER_MICRO_CENT))
 }
 
 /// Milliseconds since the Unix epoch (0 if the clock is before it).
@@ -2542,20 +2550,16 @@ CREATE TRIGGER cost_records_no_delete
             )
             .expect("record");
 
-        let expected = prices.price("claude-fable-5", 1000, 500).unwrap()
-            + prices.price("deepseek-v4-pro", 4000, 2000).unwrap();
+        // Summed per row in the accumulator's unit (BUG-231): each row's
+        // `usd_micros` converts to micro-cents on its own before the sum.
+        let expected = spend_units(prices.price("claude-fable-5", 1000, 500)).unwrap()
+            + spend_units(prices.price("deepseek-v4-pro", 4000, 2000)).unwrap();
         assert!(expected > 0, "non-vacuity: the child really spent");
         let s1 = SessionId::from("s1");
-        assert_eq!(
-            ledger.spent_by_child(&s1, &audit).expect("query"),
-            expected.unsigned_abs(),
-        );
+        assert_eq!(ledger.spent_by_child(&s1, &audit).expect("query"), expected,);
         assert_eq!(
             ledger.spent_by_child(&s1, &lint).expect("query"),
-            prices
-                .price("claude-fable-5", 9000, 9000)
-                .unwrap()
-                .unsigned_abs(),
+            spend_units(prices.price("claude-fable-5", 9000, 9000)).unwrap(),
             "the sibling's spend is its own"
         );
         assert_eq!(
@@ -2570,9 +2574,24 @@ CREATE TRIGGER cost_records_no_delete
     /// The unit `spent_by_child` sums in is the one the live accumulator is fed
     /// in, by construction: both go through `spend_units`. Pinned here so a
     /// change to one side's conversion is a change to both.
+    ///
+    /// **BUG-231.** The price is `usd_micros` (1e-6 USD); the accumulator and
+    /// the ceiling are micro-cents (1e-5 USD). REQ-588 fed the price through
+    /// unconverted — `35_000 → 35_000` — so a $1.00 ceiling bound at ~$0.10.
+    /// Mutation: restoring the identity (`.map(i64::unsigned_abs)`) reddens
+    /// this test and `a_priced_call_just_under_the_ceiling_does_not_reach_it`.
     #[test]
     fn spend_units_counts_a_price_and_refuses_to_count_nonsense() {
-        assert_eq!(spend_units(Some(35_000)), Some(35_000));
+        assert_eq!(
+            spend_units(Some(35_000)),
+            Some(3_500),
+            "usd_micros → micro-cents"
+        );
+        assert_eq!(
+            spend_units(Some(9)),
+            Some(0),
+            "under one micro-cent truncates"
+        );
         assert_eq!(spend_units(Some(0)), Some(0), "free is countable");
         assert_eq!(spend_units(None), None, "unpriced is not");
         assert_eq!(spend_units(Some(-1)), None, "a negative price is no credit");

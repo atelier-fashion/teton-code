@@ -57,7 +57,7 @@ pub mod share;
 // a blunt check on purpose, so `teton_core::Category` can never arrive there
 // under an alias. Importing through this module keeps that guard intact
 // instead of narrowing it to buy one import.
-pub(crate) use teton_core::cost_ceiling::PromptSpend;
+pub(crate) use teton_core::cost_ceiling::{PromptSpend, USD_MICROS_PER_MICRO_CENT};
 
 use std::sync::Arc;
 use teton_protocol::agent::ChildId;

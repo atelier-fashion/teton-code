@@ -1272,7 +1272,11 @@ mod spend {
     use super::*;
 
     /// The ceiling every leg runs under, in dollars as a person types it.
-    pub(super) const CEILING_USD: f64 = 1.0;
+    /// Sized so two scripted child calls reach it and a third does not —
+    /// re-tuned ×0.1 by BUG-231, when the daemon stopped counting every call
+    /// ten times over; the arithmetic asserts below (`spent >= share`, the odd
+    /// remainders) are what keep this number honest rather than decorative.
+    pub(super) const CEILING_USD: f64 = 0.1;
 
     /// [`CEILING_USD`] in the unit every spend comparison runs in — through
     /// REQ-588's own one conversion at the config edge, not a re-spelling of
@@ -1297,11 +1301,30 @@ mod spend {
             .collect()
     }
 
-    /// A row's spend, in the ledger's unit.
+    /// A child's rows summed in the price's own unit, `usd_micros` — what the
+    /// `/cost` view reports (the CLI divides by 1,000,000). Exact, so it is the
+    /// right-hand side for a view comparison; `units` is for the ceiling side.
+    pub(super) fn raw_usd_micros(client: &Client, session: &str, child_id: &str) -> u64 {
+        cost_rows(client, session)
+            .iter()
+            .filter(|(_, r)| r["child_id"] == child_id)
+            .map(|(_, r)| {
+                r["usd_micros"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("a priced row: {r}"))
+            })
+            .sum()
+    }
+
+    /// A row's spend in the accumulator's unit: micro-cents (1e-5 USD), the
+    /// unit `ceiling_units()` is in. The row records `usd_micros` (1e-6 USD);
+    /// the daemon converts per row through `spend_units` (BUG-231), so the
+    /// expectation converts per row too — never a sum of raw `usd_micros`.
     pub(super) fn units(record: &Value) -> u64 {
         record["usd_micros"]
             .as_u64()
             .unwrap_or_else(|| panic!("a priced row: {record}"))
+            / 10
     }
 
     /// What the parent prompt had recorded before its call started: the
@@ -1531,13 +1554,15 @@ mod spend {
             1,
             "the parent's next call was refused before it was sent"
         );
+        // The view reports the exact price in usd_micros (BUG-231): compare it
+        // with the rows' own sum, not with the micro-cent figure the ceiling saw.
         assert_eq!(
             cost_view_child(&mut rig.client, &split_session, &hungry),
-            hungry_spent
+            spend::raw_usd_micros(&rig.client, &split_session, &hungry)
         );
         assert_eq!(
             cost_view_child(&mut rig.client, &split_session, &frugal),
-            frugal_spent
+            spend::raw_usd_micros(&rig.client, &split_session, &frugal)
         );
 
         // ================= Three children: the release. ===================
@@ -1675,9 +1700,10 @@ mod spend {
                 "{name}: its stamped share plus its part"
             );
         }
+        // The view is exact usd_micros; the rows above are micro-cents (BUG-231).
         assert_eq!(
             cost_view_child(&mut rig.client, &release_session, &first),
-            first_rows.iter().sum::<u64>()
+            spend::raw_usd_micros(&rig.client, &release_session, &first)
         );
         assert_no_boundary_bytes();
     }
