@@ -64,7 +64,8 @@ The three questions below are **closed**. Their answers are recorded, redacted,
 against OQ-5 in
 [REQ-548's requirement file](../.adlc/specs/REQ-548-homebrew-install-and-landing-page/requirement.md):
 surface `gcs` (Cloud Storage behind an external HTTPS load balancer with Cloud
-CDN, §4's resource names), a dedicated GCP project whose id lives only in the
+CDN, §4's resource names) — **superseded 2026-10-06 by surface `firebase`
+(REQ-626; the LB was pure fixed cost for one static page)** — a dedicated GCP project whose id lives only in the
 `GCP_PROJECT` secret, and workload identity federation as the CI deploy
 identity — with the provider's attribute condition already restricted to this
 repository and to `refs/heads/main` / `refs/tags/v*`, which closes §9's
@@ -115,7 +116,7 @@ Exactly what the workflow reads — no more, no less. Every name below appears i
 | `secrets.GCP_WIF_PROVIDER` | secret | always, unless using a key | `projects/123456789/locations/global/workloadIdentityPools/github/providers/github` |
 | `secrets.GCP_SERVICE_ACCOUNT` | secret | always, unless using a key | `teton-site-deploy@PROJECT_ID.iam.gserviceaccount.com` |
 | `secrets.GCP_CREDENTIALS_JSON` | secret | only as the not-recommended fallback to the two above | the full contents of a service-account key JSON |
-| `vars.GCP_DEPLOY_SURFACE` | variable | always | `cloud-run` or `gcs` |
+| `vars.GCP_DEPLOY_SURFACE` | variable | always | `firebase` (current), `gcs` or `cloud-run` |
 | `vars.GCP_RUN_SERVICE` | variable | surface is `cloud-run` | `teton-site` |
 | `vars.GCP_RUN_REGION` | variable | surface is `cloud-run` | `us-central1` |
 | `vars.GCP_SITE_BUCKET` | variable | surface is `gcs` | `tetoncode-ai` or `atelier-sites/teton` |
@@ -153,7 +154,7 @@ gh secret set GCP_PROJECT           # paste the project id
 gh secret set GCP_WIF_PROVIDER      # paste the full provider resource name
 gh secret set GCP_SERVICE_ACCOUNT   # paste the service-account email
 
-gh variable set GCP_DEPLOY_SURFACE --body 'gcs'          # or 'cloud-run'
+gh variable set GCP_DEPLOY_SURFACE --body 'firebase'     # or 'gcs' / 'cloud-run'
 gh variable set GCP_SITE_BUCKET    --body 'tetoncode-ai' # gcs
 # gh variable set GCP_RUN_SERVICE  --body 'teton-site'   # cloud-run
 # gh variable set GCP_RUN_REGION   --body 'us-central1'  # cloud-run
@@ -214,6 +215,7 @@ Roles the service account needs, by surface — grant the narrowest that works:
 | Surface | Roles |
 |---------|-------|
 | `gcs` | `roles/storage.objectAdmin` **and** `roles/storage.legacyBucketReader`, both **on the bucket only** (not project-wide); plus `roles/compute.loadBalancerAdmin` if `vars.GCP_CDN_URL_MAP` is set, for cache invalidation. `legacyBucketReader` is not optional: `gcloud storage rsync` calls `storage.buckets.get`, which `objectAdmin` does not carry — the first configured deploy run failed on exactly this |
+| `firebase` | `roles/firebasehosting.admin` and `roles/serviceusage.serviceUsageConsumer`, project-level (Hosting has no narrower scope; the second lets firebase-tools bill its API calls to the project). Nothing on the bucket, no `compute.*` |
 | `cloud-run` | `roles/run.admin`; `roles/iam.serviceAccountUser` on the Cloud Run runtime service account; `roles/cloudbuild.builds.editor` and `roles/artifactregistry.writer` for `--source` builds |
 
 ### Service-account key (fallback, not recommended)
@@ -245,7 +247,49 @@ pointing at Google **before** a Google-managed certificate will provision;
 issuance typically takes 15–60 minutes after the record resolves, and the
 certificate sits in `PROVISIONING` until then. That wait is normal, not a fault.
 
-### Surface `gcs` — bucket behind an external HTTPS load balancer
+### Surface `firebase` — Firebase Hosting (current since 2026-10-06, REQ-626)
+
+One-time setup, done:
+
+```sh
+gcloud services enable firebase.googleapis.com firebasehosting.googleapis.com --project="$PROJECT_ID"
+# Add Firebase to the project (REST; the CLI equivalent is `firebase projects:addfirebase`):
+curl -sS -X POST -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+  -H "x-goog-user-project: $PROJECT_ID" -H "Content-Type: application/json" \
+  "https://firebase.googleapis.com/v1beta1/projects/${PROJECT_ID}:addFirebase" -d '{}'
+# Register the domains on the project's default site (same REST base; the CLI has no command for this):
+#   POST .../sites/${PROJECT_ID}/customDomains?customDomainId=tetoncode.ai      body {}
+#   POST .../sites/${PROJECT_ID}/customDomains?customDomainId=www.tetoncode.ai  body {"redirectTarget":"tetoncode.ai"}
+```
+
+DNS at the registrar (GoDaddy — REQ-548 OQ-1 answered), exactly what the
+`customDomains` resource lists under `requiredDnsUpdates`:
+
+| Host | Type | Value | Replaces |
+|------|------|-------|----------|
+| `tetoncode.ai` | `A` | `199.36.158.100` | the `A` to the old load-balancer IP |
+| `tetoncode.ai` | `TXT` | `hosting-site=<project id>` | — (ownership proof) |
+| `www.tetoncode.ai` | `CNAME` | `<project id>.web.app` | the `CNAME` to the apex |
+
+TLS is provisioned by Firebase after the `A` record resolves (minutes; up to
+24 h worst case). The cut-over window is the gap between the `A` flip and
+`certState: CERT_ACTIVE` — accepted for a landing page. Check with:
+
+```sh
+curl -sS -H "Authorization: Bearer $(gcloud auth print-access-token)" -H "x-goog-user-project: $PROJECT_ID" \
+  "https://firebasehosting.googleapis.com/v1beta1/projects/${PROJECT_ID}/sites/${PROJECT_ID}/customDomains/tetoncode.ai" \
+  | grep -E '"(hostState|ownershipState|certState)"'
+# hostState HOST_ACTIVE / ownershipState OWNERSHIP_ACTIVE / certState CERT_ACTIVE → done.
+```
+
+Then `gh variable set GCP_DEPLOY_SURFACE --body 'firebase'`, and once the
+domain is active, tear down the `gcs` surface's LB (§4 below, reversed: the
+two forwarding rules, both proxies, both URL maps, the certificate, the
+backend bucket, the reserved address). The bucket itself may stay — it costs
+nothing empty and the rsync step is harmless if the surface is ever flipped
+back.
+
+### Surface `gcs` — bucket behind an external HTTPS load balancer (decommissioned 2026-10-06)
 
 ```sh
 # 1. Bucket, public-read, index.html as both entry point and 404 page.
