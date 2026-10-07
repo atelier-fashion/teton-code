@@ -588,10 +588,14 @@ mod tests {
     /// report's own `total` — chosen unequal to any line beneath it, so a
     /// renderer that printed `own` (or the first child) in its place reds.
     ///
-    /// **Mutations, applied and observed red (2026-10-05)** — each **1 red of 880** in the `teton`
-    /// unit suite, this test, and each reverted with the same edit. The e2e
-    /// suites carry no agent events until TASK-430, so they were not run
-    /// under mutation; that task re-runs these and owns the counts (LESSON-652):
+    /// **Mutations, applied and observed red (2026-10-05; re-run 2026-10-07 by
+    /// TASK-430, which owns the counts — LESSON-652)** — each **1 red of
+    /// 1,079**, this test, over the `teton` unit suite (880), its `cli_e2e`
+    /// (98) and `pty_e2e` (54) suites, and `tetond`'s `agent_dispatch`,
+    /// `provenance_egress` and `event_response_ordering` (47). No end-to-end
+    /// test reddened: the CLI suites drive no agent events, and TASK-430's
+    /// drive the daemon over its socket, never the CLI. Each reverted with the
+    /// same edit:
     ///
     /// | Mutation | Fails on |
     /// |---|---|
