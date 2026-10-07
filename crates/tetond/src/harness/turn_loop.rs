@@ -812,11 +812,26 @@ impl SessionEvents {
     /// (see [`Self::context_compacted`]).
     ///
     /// `permission_request` and `cost_recorded` carry the same two fields but
-    /// are built by the permission gate and the cost ledger, not here; they
-    /// read the pair off the emitter the child was handed, through
-    /// [`Self::child_scope`], rather than minting it again. The `agent_*`
-    /// events are the parent's news and go out through the **parent's**
-    /// emitter (ADR-3), which stamps nothing.
+    /// are built outside this type, and **neither reads this emitter**. The
+    /// pair has four carriers, each a copy of one mint — the id the `agent`
+    /// tool mints per child (`ChildSpec::child_id`, and inside
+    /// `ChildSpec::spend`) and the dispatcher's parent turn id, both handed to
+    /// `ChildTurns::run_child`, which builds or stamps every carrier from them:
+    ///
+    /// 1. this emitter's field — `session_update`, `context_pressure` and the
+    ///    transcript bodies — set from the `ChildTurn` the assemble stage reads;
+    /// 2. the [`current_child`](crate::harness::child::current_child)
+    ///    task-local (`ChildTaskScope`), which the permission gate reads on the
+    ///    asking task to stamp `permission_request`;
+    /// 3. the child's `ChildSpend`, stamped `under_turn` by the runner, whose
+    ///    `CostAttribution::for_child` names a remote call's ledger row and its
+    ///    `cost_recorded` (a local call's source is stamped from carrier 4);
+    /// 4. the `ChildTurn` on the child's `TurnContext` — the attempt loop, the
+    ///    duty routes, the completion sources.
+    ///
+    /// None derives the pair again, so none can disagree with another. The
+    /// `agent_*` events are the parent's news and go out through the
+    /// **parent's** emitter (ADR-3), which stamps nothing.
     ///
     /// Called on an emitter that already speaks for a child, the new pair
     /// replaces the old: a child has no `agent` tool, so there is no grandchild
@@ -839,10 +854,11 @@ impl SessionEvents {
     /// The child turn this emitter speaks for, or `None` for the parent's own
     /// (REQ-623 ADR-3).
     ///
-    /// For the emitters that build a child-tagged payload outside this type —
-    /// the permission gate's `permission_request`, the ledger's
-    /// `cost_recorded` — so the ids they stamp are the ones this emitter was
-    /// made with, not a second derivation that could disagree.
+    /// One production reader: `refit_for_reroute`, which must not publish a
+    /// child's re-rendered repository notes as the session's
+    /// `repo_context_state` (that payload names no child). It is not how the
+    /// permission gate or the ledger learn a child's ids — see
+    /// [`Self::for_child`] for the four carriers and their one source.
     #[must_use]
     pub fn child_scope(&self) -> Option<&crate::transcript::record::ChildScope> {
         self.child.as_ref()

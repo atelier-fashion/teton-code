@@ -82,13 +82,21 @@
   `block_on` inside `run` is BUG-226's shape at N times the duration. Children
   are tokio tasks in one `JoinSet` per call, behind the `ChildDispatcher` trait
   (`harness/child.rs`) that `runtime/child_turn.rs` implements, so
-  `harness/tools/agent.rs` never imports the runtime. **A child id is stamped
-  by `SessionEvents::for_child` and nowhere else:** it returns the parent's
-  emitter — same bus, same session, same transcript sink — carrying
-  `child_id` and `parent_turn_id`, and every payload with the fields
-  (`session_update`, `context_pressure`, the transcript bodies) takes them from
-  it, while `permission_request` and `cost_recorded` read the pair back off the
-  emitter (`child_scope()`) rather than deriving it again (LESSON-501). Four
+  `harness/tools/agent.rs` never imports the runtime. **A child's id pair is
+  minted once and copied, never re-derived (LESSON-501):** the `agent` tool
+  mints the `ChildId` (`ChildSpec::child_id`, and inside `ChildSpec::spend`),
+  the dispatcher holds the parent turn id, and `ChildTurns::run_child` builds
+  or stamps all four carriers from that one source — (1) the emitter
+  `SessionEvents::for_child` returns (same bus, session and transcript sink),
+  which stamps `session_update`, `context_pressure` and the transcript bodies;
+  (2) the `current_child()` task-local (`ChildTaskScope`), which the permission
+  gate reads on the asking task to stamp `permission_request`; (3) the
+  `ChildSpend`, stamped `under_turn`, whose `CostAttribution::for_child` names
+  a remote call's ledger row and `cost_recorded`; and (4) the `ChildTurn` on
+  the child's `TurnContext`, which the attempt loop, duty routes and local
+  source read. *(Corrected 2026-10-07, verify: this said the pair was stamped
+  by `for_child` "and nowhere else", read back off the emitter by the gate and
+  the ledger — neither reads the emitter.)* Four
   session-scoped payloads REQ-623 deliberately did not widen are **suppressed**
   in a child rather than published unstamped, because a client would read them
   as the parent's: `route_decided`, `context_compacted`, `turn_queued` and
