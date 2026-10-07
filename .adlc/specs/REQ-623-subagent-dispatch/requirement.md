@@ -4,7 +4,7 @@ title: "Subagent dispatch — an `agent` tool runs bounded child turn-loops and 
 status: approved
 deployable: true
 created: 2026-10-05
-updated: 2026-10-05
+updated: 2026-10-07
 component: "daemon/session"
 domain: "harness"
 stack: ["rust", "daemon", "llm-providers"]
@@ -93,8 +93,10 @@ REQ-587 AC-15 recorded, and it is the gate the `pipeline-runner`,
 | ChildResult | `status` | enum | `completed` / `refused` / `cancelled` / `turns_exhausted` / `budget_exhausted` / `spend_exhausted` / `timed_out` / `failed` |
 | ChildResult | `report` | string | the child's final assistant text; ≤ `agent.report_max_bytes` (BR-11); empty unless `completed` or `turns_exhausted` |
 | ChildResult | `refusal` | string | typed refusal code when `status = refused`; absent otherwise |
+| ChildResult | `error` | string | *added 2026-10-07 (verify)* — `<code>: <message>` when `status = failed`; absent otherwise (BR-10) |
 | ChildResult | `turns_used` | u32 | model calls the child made |
-| ChildResult | `route` | string | tier + provider + model the child ran on |
+| ChildResult | `route` | ~~string~~ object `{tier?, provider_id, model}` *(amended 2026-10-07)* | ~~tier + provider + model the child ran on~~ the route the child **ended** on, after any privacy pin or fallback (BR-6) — a structure rather than a sentence, so a client selects on its parts; absent only for a child that ended before its route was resolved |
+| ChildResult | `bounds` | ChildBounds | *added 2026-10-07 (verify)* — the bounds stamped before the first call, echoed (BR-7, AC-11); absent exactly where `route` is |
 | ChildResult | `cost_micro_cents` | u64 | sum of the child's `CostRecord`s |
 | ChildResult | `spend_ceiling_final_micro_cents` | Option<u64> | the child's ceiling when it ended — ≥ the stamped share, raised only by sibling releases (BR-8) |
 | ChildResult | `provenance` | ProvenanceId set | every provenance the child's context touched — carried onto the result block (BR-9) |
@@ -225,6 +227,17 @@ REQ-587 AC-15 recorded, and it is the gate the `pipeline-runner`,
   call still checks the session ceiling after the call returns — children
   can leave the parent with no headroom, and that is the existing
   spend-exhausted path, not a new one.
+  *Amended 2026-10-07 (verify):* "a child whose next call **would exceed**
+  its current ceiling" is checked the way REQ-588's prompt ceiling is —
+  before the call, against what is already spent, because a call's cost is
+  not known until its response is metered. A child's call is refused once
+  its spend has **reached** its current ceiling (`spent >= share`); the call
+  that carries it past the ceiling is allowed, so a child can overshoot its
+  share by **at most one call**, and an overshoot is never charged to its
+  siblings. And a `timed_out` child still inside a blocking tool keeps its
+  share until that work has actually ended — the tool could still draw a
+  metered call — then releases it; `agent_child_share_released` follows the
+  result.
 - [ ] BR-9: **Provenance flows up, never sideways.** The result block the
   parent receives carries the union of every `ProvenanceId` the child's
   context touched. If that union
@@ -249,6 +262,18 @@ REQ-587 AC-15 recorded, and it is the gate the `pipeline-runner`,
   never fails the parent turn: the parent receives the result and decides.
   Cancelling the parent turn cancels every running child, and the cancel
   reaches a child's blocking tool call the way it reaches the parent's today.
+  *Amended 2026-10-07 (verify):* (1) **The gate's `refused`**: a child ends
+  `refused` with `gate_denied:<tool>` exactly when its final text is empty
+  **and** every tool call it attempted was denied — by the session gate, an
+  unattended deny, or a tool's own consent gate (`skill`'s project-skill
+  acknowledgment, `web`'s consent, a skill command's consent) — and none ran.
+  Any other denial is a typed tool failure the child read (BR-5): a report
+  saying why, or another tool that ran, makes its ending `completed`.
+  (2) **"Reaches" means abandons, not kills**: when a child is cancelled or
+  times out, the in-flight call is abandoned — its result never reaches a
+  model; the tool process itself is not killed (follow-up — see Deferred), so
+  a blocking `shell` runs to its own timeout and may outlive the parent's
+  turn, exactly as the parent's own cancelled `shell` does today.
 - [ ] BR-11: **A report is bounded, and over-bound is loud.** A child's final
   text longer than `report_max_bytes` is cut at the bound with a typed
   marker naming the kept and dropped byte counts, `truncated: true` on
@@ -264,6 +289,11 @@ REQ-587 AC-15 recorded, and it is the gate the `pipeline-runner`,
   the session's existing grants and asked through BR-5 when missing. A
   user-skill expansion in a child carries `unknown` provenance exactly as it
   does in a prompt turn, so it pins the child — and through BR-9, the parent.
+  *Amended 2026-10-07 (verify):* since REQ-619 a `~/.claude` user skill
+  carries a `~`-scoped identity, **not** `unknown`. What pins the child — and
+  through BR-9 the parent — is a configured boundary covering it (for
+  example `**/.claude/skills/**`), exactly as for a prompt turn; AC-16's
+  "with a boundary configured" is that boundary.
 - [ ] BR-13: **Children are visible wherever the parent is.** The REQ-621
   activity line shows the call's running children by name; the REQ-611
   transcript records every child turn in the session's file with `child_id`
@@ -275,6 +305,8 @@ REQ-587 AC-15 recorded, and it is the gate the `pipeline-runner`,
   the model cannot name it; a skill that asks for it gets the ordinary
   unknown-tool refusal naming the config key. The session's `/help` and the
   REQ-617 command roster say whether `agent` is available.
+  *Amended 2026-10-07 (verify):* the `/help` clause is **not implemented** by
+  this REQ and moves to Deferred (follow-up); the rest of BR-14 stands.
 
 ## Acceptance Criteria
 
@@ -356,6 +388,10 @@ REQ-587 AC-15 recorded, and it is the gate the `pipeline-runner`,
   cancelled, status `timed_out`), and a child whose provider returns a
   terminal error after its reroute path (`failed` with the code). In every
   case the parent turn continues and receives the result. (BR-10)
+  *Amended 2026-10-07 (verify):* "the tool is cancelled" reads: the
+  in-flight call is **abandoned** — its result never reaches a model, and
+  `timed_out` comes back while it is still in flight; the tool process itself
+  is not killed (follow-up — see Deferred).
 - [ ] AC-15: A child whose final text is `report_max_bytes + 1` long returns
   a report of exactly `report_max_bytes` plus the typed marker naming kept
   and dropped counts, `agent_child_finished` has `truncated: true`, and the
@@ -457,6 +493,18 @@ _All five resolved with the author on 2026-10-05; kept for the record._
   allowlists, model overrides, custom system prompts). A child's system
   prompt is the session's; the task text is where a skill puts the role.
 - Hooks, `allowed-tools`, `context: fork` for skills.
+
+## Deferred
+
+_Added 2026-10-07 (verify) — found in scope, settled as follow-ups._
+
+- **Shell cancellation reaching a child's in-flight tool.** A cancelled or
+  timed-out child's blocking tool is abandoned, not killed (BR-10, AC-14 as
+  amended): a `shell` command runs to its own timeout and may outlive the
+  parent's turn. The parent's own cancelled `shell` behaves the same today.
+  BUG to be filed at wrapup.
+- **`/help` saying whether `agent` is available** (BR-14's `/help` clause) —
+  not implemented by this REQ; follow-up.
 
 ## Retrieved Context
 

@@ -169,9 +169,13 @@ statuses:
 - `refused` — `refusal` says why: `over_budget` (shorten the task or context),
   or `gate_denied:<tool>` (it was not allowed to run what the task needed).
 - `budget_exhausted` — its context could no longer be fitted mid-run.
-- `spend_exhausted` — its next call would have passed its spend share.
-- `timed_out` — its deadline passed; a tool still running was cancelled.
-- `cancelled` — your turn was cancelled.
+- `spend_exhausted` — its spend reached its share, so its next call was not
+  sent (the call that crossed the share was allowed: at most one over).
+- `timed_out` — its deadline passed. A tool still running is abandoned — its
+  result never reaches a model — but not killed: a `shell` command runs on to
+  its own timeout.
+- `cancelled` — your turn was cancelled; a tool it had running is abandoned
+  the same way.
 - `failed` — a provider or engine error after its own retries and reroutes;
   `error` carries the code.
 
