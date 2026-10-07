@@ -555,8 +555,13 @@ pub struct ChildTaskScope {
 /// What one child's tool calls came to at the permission gate (BR-10).
 ///
 /// The loop notes a call the gate **denied** (its `Denied` arm) and a call
-/// that **ran** (dispatched); nothing else is counted. Read once, when the
-/// child ends, by [`Self::gate_refusal`].
+/// that **ran** (dispatched). One tool holds a gate of its own that the loop
+/// cannot see: `skill`'s project-skill acknowledgment, asked inside `run`, so a
+/// refusal there reaches the loop as a dispatch. The tool notes that refusal
+/// itself ([`Self::note_refused_inside`]) and it is taken back out of the
+/// dispatches — BR-10 names "a project-skill gate" as a `refused` ending, and a
+/// call whose own gate stopped it did not run. Read once, when the child ends,
+/// by [`Self::gate_refusal`].
 ///
 /// Shared through the task-local [`ChildTaskScope`] rather than returned by the
 /// loop, because the loop is the prompt turn's, unchanged, and the scope is
@@ -570,6 +575,9 @@ struct ToolCallTally {
     denied: Vec<String>,
     /// Calls that were dispatched.
     ran: u32,
+    /// Dispatched calls whose own consent gate refused them, so nothing ran —
+    /// counted by the loop among `ran`, and subtracted from it here.
+    refused_inside: u32,
 }
 
 impl ChildToolCalls {
@@ -583,6 +591,17 @@ impl ChildToolCalls {
         lock(&self.0).ran += 1;
     }
 
+    /// A dispatched call to `tool` was refused by the consent gate the tool
+    /// holds itself, so it did not run — `skill`'s project-skill
+    /// acknowledgment, declined or unanswerable (BR-10's "a project-skill
+    /// gate"). A denial like the loop's; the dispatch the loop counts for it
+    /// is not a call that ran.
+    pub fn note_refused_inside(&self, tool: &str) {
+        let mut tally = lock(&self.0);
+        tally.denied.push(tool.to_owned());
+        tally.refused_inside += 1;
+    }
+
     /// The refusal a child that ended with **nothing to report** carries when
     /// the gate is why: every call it attempted was denied and none ran —
     /// `gate_denied:<the first tool denied>`.
@@ -594,7 +613,10 @@ impl ChildToolCalls {
     #[must_use]
     pub fn gate_refusal(&self) -> Option<String> {
         let tally = lock(&self.0);
-        match (tally.ran, tally.denied.first()) {
+        match (
+            tally.ran.saturating_sub(tally.refused_inside),
+            tally.denied.first(),
+        ) {
             (0, Some(tool)) => Some(format!("{GATE_DENIED}:{tool}")),
             _ => None,
         }
@@ -1042,5 +1064,26 @@ mod tests {
         assert!(with.ends_with("## Context from the dispatching turn\n\nCONTEXT-BYTES"));
         let without = child_system_section(None, 4_096);
         assert!(!without.contains("Context from the dispatching turn"));
+    }
+
+    /// **BR-10's "a project-skill gate": a call refused inside its own gate
+    /// counts as denied, and its dispatch does not count as a call that ran.**
+    ///
+    /// The loop notes every dispatch, including `skill`'s, whose project-skill
+    /// acknowledgment is asked inside `run`; the tool notes the refusal. A
+    /// child whose only call was refused that way has nothing that ran — and a
+    /// second call that genuinely ran makes the ending its own again.
+    ///
+    /// Mutation (run 2026-10-07, reverted): `gate_refusal` reading `ran`
+    /// without subtracting `refused_inside` reddens this test at its first
+    /// assertion and `agent_dispatch::statuses::refused` at its status.
+    #[test]
+    fn a_call_refused_inside_its_own_gate_is_denied_not_ran() {
+        let calls = ChildToolCalls::default();
+        calls.note_refused_inside("skill");
+        calls.note_ran(); // the loop's count of the same dispatch
+        assert_eq!(calls.gate_refusal().as_deref(), Some("gate_denied:skill"));
+        calls.note_ran(); // a later call that did run
+        assert_eq!(calls.gate_refusal(), None);
     }
 }

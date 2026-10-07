@@ -1899,6 +1899,14 @@ impl SkillTool {
         // expander is asked, so a refused acknowledgment runs no command.
         if skill.source == SkillSource::Project {
             if let Err(refusal) = self.acknowledge_project(ctx, &name).await {
+                // REQ-623 BR-10: inside a child, the project-skill gate
+                // refusing — declined, or nobody to ask — is a gate denial and
+                // the call did not run, so a child left with nothing to report
+                // ends `refused`, not `completed` (see
+                // `ChildToolCalls::note_refused_inside`).
+                if let Some(child) = crate::harness::child::current_child() {
+                    child.tool_calls.note_refused_inside(SKILL_TOOL_NAME);
+                }
                 return self.refuse(ctx, args, refusal);
             }
         }
