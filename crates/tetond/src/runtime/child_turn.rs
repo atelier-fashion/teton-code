@@ -2036,6 +2036,65 @@ mod tests {
         assert_eq!(reads.result.refusal, None);
     }
 
+    // ---- AC-3 -------------------------------------------------------------
+
+    /// **AC-3 / BR-2: a live child whose model calls `agent` starts nothing** —
+    /// it reads the ordinary not-an-available-tool answer, finishes, and the
+    /// bus carries no grandchild: no `agent_call_started`, no
+    /// `agent_call_refused`, no `agent_child_started` but its own, and no model
+    /// call but its own two.
+    ///
+    /// Driven through the daemon's real child path (route, assemble with
+    /// `ToolSet::Child`, attempt), so the registry the model's call meets is
+    /// the one a child actually has.
+    ///
+    /// Mutation (run 2026-10-07, reverted): an `agent` tool registered in
+    /// `build_tools`' `ToolSet::Child` arm (the doc-only stand-in) — 4 reds of
+    /// the 2,331 lib tests: this one at the not-an-available-tool answer, and
+    /// the three registry/roster checks (`child_registry_has_skill_not_agent`,
+    /// `child_toolset_omits_agent`, `child_context_is_system_context_task_only`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_live_child_calling_agent_starts_no_grandchild() {
+        let rig = Rig::new("child-no-grandchild", true);
+        rig.engine.say(&call(
+            "agent",
+            serde_json::json!({ "tasks": [{ "task": "GRANDCHILD-TASK", "name": "deeper" }] }),
+        ));
+        rig.engine.say("I cannot dispatch from here.");
+        let mut sub = rig.events.subscribe(4096);
+        let spec = rig.spec("nested", "try to fan out");
+        let child_id = spec.child_id.clone();
+        let outcome = rig.dispatcher().run_child(spec).await;
+        assert_eq!(outcome.status(), ChildStatus::Completed, "{outcome:?}");
+
+        let prompts = rig.engine.prompts();
+        assert_eq!(prompts.len(), 2, "the child's call, then its answer");
+        let answer = chatml(&prompts[1])
+            .pop()
+            .map(|(_, body)| body)
+            .expect("the tool result is the request's last message");
+        assert!(
+            answer.contains("`agent` is not an available tool"),
+            "a child's `agent` call meets the unknown-tool answer: {answer}"
+        );
+
+        let events = drained(&mut sub);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::AgentCallStarted(_) | Event::AgentCallRefused(_))),
+            "a child's `agent` call reached the tool"
+        );
+        let started: Vec<&ChildId> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::AgentChildStarted(started) => Some(&started.child_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started, [&child_id], "only the child itself started");
+    }
+
     // ---- AC-19 ------------------------------------------------------------
 
     /// **AC-19: a child's `shell` starts in the session root, with the same

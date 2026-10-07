@@ -528,7 +528,11 @@ impl PausableDeadline {
         self.inner.changed.notify_waiters();
     }
 
-    /// Resolves once the work time reaches the budget — never while paused.
+    /// Resolves once the work time reaches the budget. A pause stops the
+    /// clock — no time accrues while it is held — but hands none back: a
+    /// deadline whose budget was spent before the pause began is expired, and
+    /// stays so (verify, 2026-10-07: a paused clock used to wait for a resume
+    /// before reporting a budget it had already spent).
     ///
     /// Cancel-safe: it holds no state of its own, so a `select!` that drops it
     /// and builds it again loses nothing.
@@ -542,6 +546,7 @@ impl PausableDeadline {
             let wake_at = {
                 let clock = lock(&self.inner.clock);
                 match clock.running_since {
+                    None if clock.worked >= self.inner.budget => return,
                     None => None,
                     Some(since) => {
                         if clock.worked + since.elapsed() >= self.inner.budget {
@@ -1120,6 +1125,71 @@ mod tests {
             assert_eq!(kept.text, text, "byte-identical, no marker");
             assert_eq!(kept.whole_bytes, kept.kept_bytes);
         }
+    }
+
+    /// **BR-11: a 4-byte character at the bound is kept whole or not at all,
+    /// wherever the bound lands in it.** `😀` is four bytes; after `ab` it
+    /// occupies bytes 2..6. A bound of 3, 4 or 5 lands one, two or three bytes
+    /// inside it and keeps `ab` (2 bytes); a bound of 6 is exactly its end —
+    /// the next character's start — and keeps it. The text is never cut inside
+    /// the character, and the marker's counts are bytes.
+    ///
+    /// Mutation (run 2026-10-07, reverted): the `is_char_boundary` walk
+    /// stepping back only once (`if` for `while`) — 1 red of the 2,333 lib
+    /// tests, this one, panicking at the bound of 5 (byte 4 is still inside
+    /// the character).
+    #[test]
+    fn a_four_byte_character_at_the_bound_is_never_split() {
+        let text = "ab😀cd";
+        assert_eq!(text.len(), 8, "non-vacuity: `😀` is four bytes");
+        for bound in [3, 4, 5] {
+            let cut = bound_report(text, bound);
+            assert!(cut.truncated, "bound {bound}");
+            assert_eq!(cut.kept_bytes, 2, "bound {bound} lands inside `😀`");
+            assert!(
+                cut.text
+                    .starts_with("ab\n\n[report_truncated: kept 2 bytes, dropped 6 bytes"),
+                "bound {bound}: {}",
+                cut.text
+            );
+        }
+        let cut = bound_report(text, 6);
+        assert_eq!(cut.kept_bytes, 6, "a bound on a character start keeps `😀`");
+        assert!(
+            cut.text
+                .starts_with("ab😀\n\n[report_truncated: kept 6 bytes, dropped 2 bytes"),
+            "{}",
+            cut.text
+        );
+    }
+
+    /// **BR-5: a pause taken after the budget is spent does not un-expire the
+    /// deadline, and a resume after expiry does not reset it.** The clock
+    /// counts work time; neither a late pause nor a resume hands any back.
+    ///
+    /// Found by this test: the paused arm of `expired` waited for a resume
+    /// before reporting a budget it had already spent.
+    ///
+    /// Mutation (run 2026-10-07, reverted): that arm restored (`None => None`
+    /// alone) — 1 red of the 2,333 lib tests, this one, at the late pause.
+    #[tokio::test(start_paused = true)]
+    async fn a_spent_deadline_stays_expired_across_pause_and_resume() {
+        let deadline = PausableDeadline::start(Duration::from_secs(5));
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(deadline.worked() >= deadline.budget(), "non-vacuity: spent");
+
+        let late = deadline.pause();
+        assert!(deadline.is_paused());
+        tokio::time::timeout(Duration::from_millis(1), deadline.expired())
+            .await
+            .expect("a pause taken after the budget was spent does not un-expire it");
+
+        late.resume();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::timeout(Duration::from_millis(1), deadline.expired())
+            .await
+            .expect("a resume after expiry does not reset the clock");
+        assert!(deadline.worked() >= Duration::from_secs(7));
     }
 
     /// The task-local answers inside a child's scope and nowhere else — the

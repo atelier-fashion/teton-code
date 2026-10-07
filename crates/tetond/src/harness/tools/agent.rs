@@ -1293,7 +1293,9 @@ mod tests {
     /// Three children park on one barrier sized three, so the call can only
     /// complete if all three are running at once — a sequential dispatch
     /// deadlocks on the barrier and the bound below fails it. Past the
-    /// barrier they finish in the reverse of task order. The result is
+    /// barrier each waits on a gate of its own, which the test opens in the
+    /// reverse of task order — each only once the one before has landed, so
+    /// the finish order is the test's, not a race of sleeps. The result is
     /// returned only once all three are terminal: nothing is still running
     /// when it arrives, every `agent_child_finished` precedes
     /// `agent_call_finished`, and both the result and the call's tally list
@@ -1320,17 +1322,31 @@ mod tests {
         let barrier = Arc::new(tokio::sync::Barrier::new(3));
         let running = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
+        let gates: Arc<HashMap<String, tokio::sync::Notify>> = Arc::new(
+            ["child-1", "child-2", "child-3"]
+                .into_iter()
+                .map(|name| (name.to_owned(), tokio::sync::Notify::new()))
+                .collect(),
+        );
         let child_run = {
-            let (barrier, running, peak) = (barrier.clone(), running.clone(), peak.clone());
+            let (barrier, running, peak, gates) = (
+                barrier.clone(),
+                running.clone(),
+                peak.clone(),
+                gates.clone(),
+            );
             run(move |spec: ChildSpec| {
-                let (barrier, running, peak) = (barrier.clone(), running.clone(), peak.clone());
+                let (barrier, running, peak, gates) = (
+                    barrier.clone(),
+                    running.clone(),
+                    peak.clone(),
+                    gates.clone(),
+                );
                 async move {
                     let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(now, Ordering::SeqCst);
                     barrier.wait().await;
-                    // `child-1` finishes last, `child-3` first.
-                    let order: u64 = spec.name.trim_start_matches("child-").parse().unwrap();
-                    tokio::time::sleep(Duration::from_millis(60 - 20 * order)).await;
+                    gates[&spec.name].notified().await;
                     running.fetch_sub(1, Ordering::SeqCst);
                     completed(&spec, "done")
                 }
@@ -1338,10 +1354,30 @@ mod tests {
         };
         let f = fixture(child_run);
         let mut sub = f.bus.subscribe(1024);
+        let mut landings = f.bus.subscribe(1024);
 
-        let outcome = tokio::time::timeout(Duration::from_secs(10), call(&f.tool, "call-1", tasks(3)))
-            .await
-            .expect("all three children were running at once: a sequential dispatch never passes the barrier");
+        // `child-3` lands first and `child-1` last: each gate opens only once
+        // the child before it has published its finish.
+        let drive = async {
+            for name in ["child-3", "child-2", "child-1"] {
+                gates[name].notify_one();
+                loop {
+                    let envelope = tokio::time::timeout(Duration::from_secs(5), landings.recv())
+                        .await
+                        .expect("the released child lands")
+                        .expect("the bus is open");
+                    if matches!(&envelope.event, Event::AgentChildFinished(f) if f.child_id.name() == name)
+                    {
+                        break;
+                    }
+                }
+            }
+        };
+        let (outcome, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(call(&f.tool, "call-1", tasks(3)), drive)
+        })
+        .await
+        .expect("all three children were running at once: a sequential dispatch never passes the barrier");
         assert_eq!(peak.load(Ordering::SeqCst), 3, "three children overlapped");
         assert_eq!(
             running.load(Ordering::SeqCst),
@@ -1638,6 +1674,193 @@ mod tests {
         }
     }
 
+    /// **BR-5 / BR-10: a parent cancelled while one child waits on the user and
+    /// its sibling queues behind it leaves nothing held** — both children
+    /// report `cancelled`, the call's consent queue is free, and neither
+    /// child's work clock is left paused.
+    ///
+    /// The gate asks for `shell` and carries the daemon's `ChildAskClock`; the
+    /// first child's question is open when the parent's task is aborted, and
+    /// the second is queued on the call's consent mutex.
+    ///
+    /// Mutation (run 2026-10-07, reverted): `AwaitingHuman`'s drop no longer
+    /// settling the ask (`ask_settled` removed) — 3 reds of the 2,330 lib
+    /// tests: this one, at the asking child's clock, which stays paused for
+    /// ever in the observer's map, and the two ask-bracket tests
+    /// (`deadline_pauses_during_consent`,
+    /// `ask_await_hook_brackets_the_pending_interval`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancel_during_a_consent_wait_leaves_no_queue_or_clock_held() {
+        let bus = Arc::new(EventBus::new());
+        let pending = Arc::new(PendingPermissions::new());
+        let mut table = PermissionConfig::with_default(PermissionPolicy::Allow);
+        table.set("shell", PermissionPolicy::Ask);
+        let gate = Arc::new(
+            PermissionGate::new(
+                SessionId::from(SESSION),
+                table,
+                Arc::clone(&bus),
+                Arc::clone(&pending),
+            )
+            .with_ask_observer(Arc::new(ChildAskClock::default())),
+        );
+        let clocks: Arc<StdMutex<HashMap<String, PausableDeadline>>> = Arc::default();
+        let queue: Arc<StdMutex<Option<Arc<tokio::sync::Mutex<()>>>>> = Arc::default();
+        let child_run = {
+            let (gate, clocks, queue) = (gate.clone(), clocks.clone(), queue.clone());
+            run(move |spec: ChildSpec| {
+                let (gate, clocks, queue) = (gate.clone(), clocks.clone(), queue.clone());
+                async move {
+                    let deadline = PausableDeadline::start(Duration::from_secs(600));
+                    clocks
+                        .lock()
+                        .unwrap()
+                        .insert(spec.name.clone(), deadline.clone());
+                    *queue.lock().unwrap() = Some(Arc::clone(&spec.consent));
+                    let scope = ChildTaskScope {
+                        child_id: spec.child_id.clone(),
+                        name: spec.name.clone(),
+                        parent_turn_id: TurnId::from(TURN),
+                        deadline,
+                        consent: Arc::clone(&spec.consent),
+                        tool_calls: ChildToolCalls::default(),
+                    };
+                    let _ = scope.scope(gate.authorize("shell", None)).await;
+                    completed(&spec, "never reached")
+                }
+            })
+        };
+        let tool = AgentTool::new(
+            Arc::new(Stub {
+                run: child_run,
+                seen: Arc::default(),
+            }),
+            AgentConfig::default(),
+            parent(&bus),
+            Handle::current(),
+        );
+        let mut sub = bus.subscribe(1024);
+        let parent_turn = tokio::spawn(async move {
+            call(
+                &tool,
+                "call-1",
+                json!({ "tasks": [{ "task": "build it", "name": "first" }, { "task": "test it", "name": "second" }] }),
+            )
+            .await
+        });
+        loop {
+            let envelope = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+                .await
+                .expect("a child asks")
+                .expect("the bus is open");
+            if matches!(envelope.event, Event::PermissionRequest(_)) {
+                break;
+            }
+        }
+        // Non-vacuity: both children running, one waiting on the user and one
+        // on the queue — waited for, since the second may still be starting.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                {
+                    let clocks = clocks.lock().unwrap();
+                    if clocks.len() == 2 && clocks.values().all(PausableDeadline::is_paused) {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both children are running, both clocks paused");
+
+        parent_turn.abort();
+        assert!(parent_turn.await.unwrap_err().is_cancelled());
+        let tally = loop {
+            let envelope = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+                .await
+                .expect("the call's end is still published")
+                .expect("the bus is open");
+            if let Event::AgentCallFinished(tally) = envelope.event {
+                break tally;
+            }
+        };
+        assert!(
+            tally
+                .children
+                .iter()
+                .all(|c| c.status == ChildStatus::Cancelled),
+            "{tally:?}"
+        );
+        for (name, clock) in clocks.lock().unwrap().iter() {
+            assert!(
+                !clock.is_paused(),
+                "`{name}`'s clock is still paused after its run was dropped"
+            );
+        }
+        let queue = queue.lock().unwrap().clone().expect("the call's queue");
+        assert!(
+            queue.try_lock().is_ok(),
+            "the call's consent queue is still held after the cancel"
+        );
+    }
+
+    /// **BR-8: a prompt with no headroom left gives its children a share of
+    /// nothing — never an underflow, never "no ceiling".** A prompt that has
+    /// spent past its ceiling (1,000 of 900) splits zero; each child is
+    /// stamped `Some(0)`, ends with that final ceiling, and nothing is
+    /// released when they end.
+    ///
+    /// Benign: the same call under a prompt with no ceiling gives its children
+    /// no ceiling at all.
+    ///
+    /// Mutation (run 2026-10-07, reverted): `headroom` answering `None` ("no
+    /// ceiling") once the prompt is spent out — 2 reds of the 2,330 lib tests,
+    /// this one at the ceilings and `headroom_is_the_ceiling_less_the_spend_and_never_negative`.
+    #[tokio::test]
+    async fn a_prompt_with_no_headroom_shares_nothing() {
+        let prompt_spend = Arc::new(PromptSpend::new());
+        prompt_spend.add(1_000);
+        let f = fixture_with(
+            AgentConfig::default(),
+            {
+                let prompt_spend = Arc::clone(&prompt_spend);
+                move |bus| AgentParent {
+                    spend_ceiling: Some(900),
+                    prompt_spend: Some(Arc::clone(&prompt_spend)),
+                    ..parent(bus)
+                }
+            },
+            run(|spec: ChildSpec| async move {
+                let mut done = completed(&spec, "spent nothing");
+                done.share_released = spec.spend.release();
+                done
+            }),
+        );
+        let mut sub = f.bus.subscribe(1024);
+        let outcome = call(&f.tool, "call-1", tasks(2)).await;
+        let ceilings: Vec<Option<u64>> = results(&outcome)
+            .into_iter()
+            .map(|r| r.spend_ceiling_final_micro_cents)
+            .collect();
+        assert_eq!(ceilings, [Some(0), Some(0)]);
+        assert!(f
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|spec| spec.spend.stamped_share() == Some(0)));
+        assert!(
+            !drained(&mut sub)
+                .iter()
+                .any(|e| matches!(e, Event::AgentChildShareReleased(_))),
+            "a share of nothing releases nothing"
+        );
+
+        let unlimited = fixture(echo());
+        let outcome = call(&unlimited.tool, "call-1", tasks(1)).await;
+        assert_eq!(results(&outcome)[0].spend_ceiling_final_micro_cents, None);
+    }
+
     /// **BR-10: cancelling the parent turn cancels every running child, and
     /// each one still reports `cancelled`.**
     ///
@@ -1684,7 +1907,12 @@ mod tests {
         let mut sub = f.bus.subscribe(1024);
         let tool = f.tool;
         let parent_turn = tokio::spawn(async move { call(&tool, "call-1", tasks(2)).await });
-        let _ = entered.acquire_many(2).await.expect("both children run");
+        let _ = tokio::time::timeout(Duration::from_secs(10), entered.acquire_many(2))
+            .await
+            .expect(
+                "both children start within the bound — a sequential dispatch parks on the first",
+            )
+            .expect("both children run");
 
         parent_turn.abort();
         assert!(parent_turn.await.unwrap_err().is_cancelled());
