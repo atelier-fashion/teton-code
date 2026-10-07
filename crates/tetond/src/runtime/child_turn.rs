@@ -2126,6 +2126,11 @@ mod tests {
     ///   `SessionEvents::context_compacted`): reddens at the emitter leg.
     /// - **Announce a child's duty** (`resolve_duty` ignoring `dctx.child`):
     ///   reddens at the duty leg.
+    /// - **One predicate, read by every site** (verify, 2026-10-07):
+    ///   `is_parent_only` answering `false` — 1 red of the 2,326 lib tests,
+    ///   this one, at the run leg (the attempt loop, the emitter and the duty
+    ///   route all ask it). The kinds are asserted here as literals, so a
+    ///   kind taken off `PARENT_ONLY_EVENTS` reddens at the list itself.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn child_publishes_none_of_the_unstamped_kinds() {
         // The run leg.
@@ -2141,7 +2146,17 @@ mod tests {
         assert_eq!(outcome.status(), ChildStatus::Completed, "{outcome:?}");
         let events = drained(&mut sub);
         let names: Vec<&str> = events.iter().map(Event::name).collect();
-        for parent_only in PARENT_ONLY_EVENTS {
+        const SUPPRESSED: [&str; 4] = [
+            "route_decided",
+            "context_compacted",
+            "turn_queued",
+            "prefill_progress",
+        ];
+        assert_eq!(
+            PARENT_ONLY_EVENTS, SUPPRESSED,
+            "the list the suppression sites read is the four the module names"
+        );
+        for parent_only in SUPPRESSED {
             assert!(
                 !names.contains(&parent_only),
                 "a child published `{parent_only}`: {names:?}"

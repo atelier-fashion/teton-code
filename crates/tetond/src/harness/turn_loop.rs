@@ -1186,43 +1186,42 @@ impl SessionEvents {
     /// stamped; see `harness::child`'s module docs for the other three
     /// payloads a child suppresses rather than widens.
     pub fn context_compacted(&self, record: &CompactionRecord, provider_id: Option<&str>) {
-        if self.child.is_some() {
+        let event = Event::ContextCompacted(ContextCompacted {
+            kept_bytes: record.kept_bytes as u64,
+            dropped_bytes: record.dropped_bytes as u64,
+            summarized_bytes: record.summarized_bytes as u64,
+            anchor_bytes: record.anchor_bytes as u64,
+            dropped_blocks_omitted: record
+                .dropped_blocks
+                .len()
+                .saturating_sub(COMPACTED_BLOCKS_LISTED) as u64,
+            dropped_blocks: record
+                .dropped_blocks
+                .iter()
+                .take(COMPACTED_BLOCKS_LISTED)
+                .map(|&(role, class, bytes)| CompactedBlock {
+                    kind: match role {
+                        BlockRole::User => CompactedBlockKind::User,
+                        BlockRole::Assistant => CompactedBlockKind::Assistant,
+                        BlockRole::Tool => CompactedBlockKind::Tool,
+                    },
+                    provenance_class: match class {
+                        ProvenanceClass::None => WireProvenanceClass::None,
+                        ProvenanceClass::Rooted => WireProvenanceClass::Rooted,
+                        ProvenanceClass::Unknown => WireProvenanceClass::Unknown,
+                    },
+                    bytes: bytes as u64,
+                })
+                .collect(),
+            provider_id: provider_id.map(ToOwned::to_owned),
+            fallback: record.fallback,
+        });
+        // REQ-623: a child's compaction stays off the bus — the payload names
+        // no child (`harness::child::is_parent_only`).
+        if self.child.is_some() && super::child::is_parent_only(&event) {
             return;
         }
-        self.bus.publish(
-            Some(self.session_id.clone()),
-            Event::ContextCompacted(ContextCompacted {
-                kept_bytes: record.kept_bytes as u64,
-                dropped_bytes: record.dropped_bytes as u64,
-                summarized_bytes: record.summarized_bytes as u64,
-                anchor_bytes: record.anchor_bytes as u64,
-                dropped_blocks_omitted: record
-                    .dropped_blocks
-                    .len()
-                    .saturating_sub(COMPACTED_BLOCKS_LISTED)
-                    as u64,
-                dropped_blocks: record
-                    .dropped_blocks
-                    .iter()
-                    .take(COMPACTED_BLOCKS_LISTED)
-                    .map(|&(role, class, bytes)| CompactedBlock {
-                        kind: match role {
-                            BlockRole::User => CompactedBlockKind::User,
-                            BlockRole::Assistant => CompactedBlockKind::Assistant,
-                            BlockRole::Tool => CompactedBlockKind::Tool,
-                        },
-                        provenance_class: match class {
-                            ProvenanceClass::None => WireProvenanceClass::None,
-                            ProvenanceClass::Rooted => WireProvenanceClass::Rooted,
-                            ProvenanceClass::Unknown => WireProvenanceClass::Unknown,
-                        },
-                        bytes: bytes as u64,
-                    })
-                    .collect(),
-                provider_id: provider_id.map(ToOwned::to_owned),
-                fallback: record.fallback,
-            }),
-        );
+        self.bus.publish(Some(self.session_id.clone()), event);
     }
 
     /// Announce that this turn's anchor set alone will not fit, so nothing was

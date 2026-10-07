@@ -55,7 +55,21 @@
 //! - `prefill_progress` — the daemon publishes none today; listed so a future
 //!   publisher on the turn path inherits the rule.
 //!
-//! [`PARENT_ONLY_EVENTS`] names them for the test that pins the rule.
+//! [`PARENT_ONLY_EVENTS`] names them, and [`is_parent_only`] is the one test
+//! the suppression sites ask — `run_attempts` and `resolve_duty` of a child's
+//! `route_decided`, `SessionEvents::context_compacted` of its compaction — so
+//! the list and the behaviour are one fact, not two that happen to agree.
+//!
+//! ## Kinds that still reach the bus unstamped from a child (follow-up)
+//!
+//! Five more session-scoped payloads carry no child id and are **not**
+//! suppressed: `provider_degraded` (a child's provider failing over),
+//! `capability_dead_end`, `prefix_cache`, `tool_call_repeated` and
+//! `shell_duty_skipped`. Each is published from inside a child's run exactly
+//! as from a prompt turn's, so a client attributes it to the parent. None
+//! flips the activity row the way the four above did, which is why they were
+//! left; stamping them (or suppressing them) is a follow-up, recorded in the
+//! requirement's Deferred list.
 //!
 //! ASSUME-010: the test module stays last.
 
@@ -67,7 +81,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use teton_protocol::agent::{ChildId, ChildResult, ChildRoute, ChildStatus};
-use teton_protocol::events::{bytes_figure, thousands};
+use teton_protocol::events::{bytes_figure, thousands, Event};
 use teton_protocol::{RequestId, Tier, TurnId};
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -90,6 +104,14 @@ pub const PARENT_ONLY_EVENTS: [&str; 4] = [
     "turn_queued",
     "prefill_progress",
 ];
+
+/// Whether `event` is one a child turn never publishes — its kind is in
+/// [`PARENT_ONLY_EVENTS`]. The one question every suppression site asks (see
+/// the module docs), so taking a kind off the list publishes it from a child.
+#[must_use]
+pub fn is_parent_only(event: &Event) -> bool {
+    PARENT_ONLY_EVENTS.contains(&event.name())
+}
 
 /// The token a truncated report's marker opens with (BR-11) — what a reader
 /// greps for, and what [`bound_report`] writes.

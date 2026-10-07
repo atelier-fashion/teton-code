@@ -509,6 +509,11 @@ _Added 2026-10-07 (verify) — found in scope, settled as follow-ups._
   BUG to be filed at wrapup.
 - **`/help` saying whether `agent` is available** (BR-14's `/help` clause) —
   not implemented by this REQ; follow-up.
+- **Five session-scoped kinds still published unstamped from a child** —
+  `provider_degraded`, `capability_dead_end`, `prefix_cache`,
+  `tool_call_repeated`, `shell_duty_skipped`. A client attributes them to the
+  parent; none flips the activity row the way the four suppressed kinds did.
+  Stamp or suppress them (`harness::child` module docs).
 - **A default report bound beside a lowered transcript record cap.**
   `report_max_bytes` is held to `[transcript] max_record_bytes` only when the
   user moved it off its 32 KiB default: a record cap lowered below 32 KiB was a

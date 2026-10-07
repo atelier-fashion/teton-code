@@ -418,10 +418,10 @@ impl DaemonRuntime {
         route: &crate::router::Route,
         dctx: DutyContext<'_>,
     ) -> DutyRoute {
-        let decided = match dctx.child {
-            Some(_) => None,
-            None => route.route_decided(),
-        };
+        let decided = route.route_decided().filter(|decided| {
+            dctx.child.is_none()
+                || !crate::harness::child::is_parent_only(&Event::RouteDecided(decided.clone()))
+        });
         self.build_duty_route(duty, route, dctx).announcing(
             dctx.core.events,
             Some(dctx.core.session_id.clone()),

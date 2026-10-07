@@ -1769,19 +1769,23 @@ impl DaemonRuntime {
             // child ended up, not where it started. (Its stamped bounds were
             // applied to that route by `AttemptState::reroute`, before the
             // refit measured against it — BR-7.)
-            match tctx.child {
-                Some(child) => {
-                    if let Some(route) =
-                        super::child_turn::child_route_of(&st.route, self.engine.model())
-                    {
-                        child.route.set(route);
-                    }
+            if let Some(child) = tctx.child {
+                if let Some(route) =
+                    super::child_turn::child_route_of(&st.route, self.engine.model())
+                {
+                    child.route.set(route);
                 }
-                None => tctx.core.router.emit_route_decided(
+            }
+            let announces = st.route.route_decided().is_some_and(|decided| {
+                tctx.child.is_none()
+                    || !crate::harness::child::is_parent_only(&Event::RouteDecided(decided))
+            });
+            if announces {
+                tctx.core.router.emit_route_decided(
                     tctx.core.events,
                     Some(tctx.core.session_id.clone()),
                     &st.route,
-                ),
+                );
             }
             let provider_id = st.route.provider_id.clone();
 
