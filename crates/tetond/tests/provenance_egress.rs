@@ -831,7 +831,8 @@ impl tetond::harness::child::ChildDispatcher for ChildThatReadTheSecret {
 /// The child is a stand-in that returns what a real child's `read` of
 /// `secrets/prod.env` would: the content in its report and the file's identity
 /// in its provenance. The end-to-end leg — a real child turn reading the file
-/// under a configured boundary — is TASK-430's AC-10.
+/// under a configured boundary, through the daemon — is
+/// [`child_local_only_read_pins_child_and_parent`] below (TASK-430's AC-10).
 ///
 /// Mutation (run 2026-10-07, reverted): the tool leaving its result block's
 /// provenance empty (`result_of` without the union) reddens this test at its
@@ -3359,4 +3360,348 @@ async fn a_boundary_covered_notes_file_never_leaves_and_an_uncovered_one_is_in_t
     );
 
     std::fs::remove_dir_all(&repo).ok();
+}
+
+// ---------------------------------------------------------------------------
+// REQ-623 AC-10 / BR-9 — a real child, through the daemon
+// ---------------------------------------------------------------------------
+//
+// [`an_agent_childs_boundary_read_blocks_the_parents_next_remote_turn`] above
+// proves the result block's union pins the parent, with a stand-in child. The
+// two below spawn the shipped binary, so the child is a **real** child turn —
+// its own remote route, its own `read`, its own egress check — and the claim is
+// settled on the bytes a mock provider captured (conventions: a BR-1 claim
+// needs egress capture). The scripted local tier is what a pinned call is
+// rerouted onto.
+
+#[path = "e2e/harness.rs"]
+mod harness;
+
+/// A child's own request: its only user message opens with its `task`
+/// (REQ-623 BR-1). The parent's follow-up quotes the task too, but only inside
+/// its tool call's escaped arguments, never as the start of a message.
+fn child_request(task: &str) -> harness::Matcher {
+    harness::Matcher::body_contains(format!("\"content\":\"{task}"))
+}
+
+/// Every captured request body of `provider` containing `needle`.
+fn requests_containing(provider: &harness::MockProvider, needle: &str) -> Vec<String> {
+    provider
+        .requests()
+        .iter()
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .filter(|b| b.contains(needle))
+        .collect()
+}
+
+/// One daemon for the AC-10 pair: the remote provider on `build`, the
+/// `secrets/**` boundary, a scripted local tier, and transcripts on (so the
+/// parent's own context can be read back without anything leaving the
+/// machine). Returns the workspace, the daemon, a client, the session, and the
+/// transcript directory.
+fn agent_boundary_daemon(
+    tag: &str,
+    provider: &harness::MockProvider,
+) -> (
+    harness::Workspace,
+    harness::Daemon,
+    harness::Client,
+    String,
+    PathBuf,
+) {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let ws = harness::Workspace::new(tag);
+    let transcripts = ws.root.join("transcripts");
+    let mut config = harness::remote_provider_block_with_window(
+        "remote",
+        &provider.openai_endpoint(),
+        "deepseek-v4-flash",
+        128_000,
+    );
+    config.push_str(&harness::tier_block("build", "remote"));
+    config.push_str("[[boundaries]]\npath_glob = \"secrets/**\"\nmode = \"local-only\"\n\n");
+    config.push_str(&format!(
+        "[transcript]\nenabled = true\ndir = \"{}\"\nretain_days = 0\n\n",
+        transcripts.display()
+    ));
+    ws.write_config(&config);
+    // What a local model that read the file hands back: the file's own bytes,
+    // passed through. Every reply is the same, so it does not matter which
+    // local consumer — the child, the parent, a duty — takes which.
+    let local = format!("The production config says {}.", harness::SECRET_SENTINEL);
+    let script = ws.write_script(&vec![local.as_str(); 8].join("\n---\n"));
+    let daemon = harness::Daemon::spawn(
+        &ws,
+        harness::DaemonOptions::default()
+            .env("TETON_PROBE_RAM_BYTES", (16 * GIB).to_string())
+            .env("TETON_PROBE_DISK_BYTES", "500000000000")
+            .env("TETON_PROBE_GPU", "apple-silicon")
+            .script(script),
+    );
+    let mut client = daemon.connect();
+    let session = client.create_session("structured", Some("implement"));
+    (ws, daemon, client, session, transcripts)
+}
+
+/// The `output` of the parent's `agent` tool-result record in `session`'s
+/// transcript — the result block the parent's context holds — once written.
+fn parent_agent_result(dir: &std::path::Path, session: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let found = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().contains(session))
+            .find_map(|path| {
+                std::fs::read_to_string(path)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .find(|r| {
+                        r["kind"] == "tool_result"
+                            && r.get("child_id").is_none()
+                            && r["output"]
+                                .as_str()
+                                .is_some_and(|o| o.contains("\"status\""))
+                    })
+                    .and_then(|r| r["output"].as_str().map(str::to_owned))
+            });
+        if let Some(output) = found {
+            return output;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the parent's agent result never reached {session}'s transcript"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// **REQ-623 AC-10 (BR-6, BR-9): a child that reads a `local-only` path (a)
+/// routes local for its remaining calls, (b) returns a result carrying that
+/// path's identity, and (c) pins the parent's next model call local — proven
+/// by egress capture: no remote request from the child after the read, none
+/// from the parent after the result, and no byte of the file on the wire.**
+///
+/// The child's first call is remote (its context is clean) and asks to `read`
+/// `secrets/prod.env`. Its next call would carry the file: it is blocked
+/// (the child's own `privacy_block`, inside the call) and rerouted to the
+/// local tier, where it answers — quoting the file, as a model that read it
+/// would. The parent then holds that report, and its next call is blocked
+/// too, naming `secrets/prod.env`: the parent never read the file, so the only
+/// way its block can name it is the provenance the child's result block
+/// carried (b). Non-vacuity: the transcript shows the parent's context really
+/// held the secret, so a remote send of it would have leaked.
+///
+/// # Mutations (run 2026-10-07, each reverted)
+///
+/// - **The result block sheds the children's provenance** (`result_of`
+///   without the union): RED_UNION_AC10.
+#[test]
+fn child_local_only_read_pins_child_and_parent() {
+    let provider = harness::MockProvider::start_matching(
+        vec![
+            (
+                child_request("AC10-READER"),
+                harness::MockResponse::ok(harness::openai_turn(
+                    "",
+                    Some(("mock-call", "read", r#"{"path":"secrets/prod.env"}"#)),
+                    100,
+                    10,
+                )),
+            ),
+            (
+                child_request("AC10-READER"),
+                harness::MockResponse::ok(harness::openai_turn(
+                    "the child answered remotely",
+                    None,
+                    100,
+                    10,
+                )),
+            ),
+            (
+                harness::Matcher::body_contains("AC10-PARENT"),
+                harness::MockResponse::ok(harness::openai_turn(
+                    "",
+                    Some((
+                        "mock-call",
+                        "agent",
+                        r#"{"tasks":[{"task":"AC10-READER read secrets/prod.env and report","name":"reader"}]}"#,
+                    )),
+                    100,
+                    10,
+                )),
+            ),
+            (
+                harness::Matcher::body_contains("AC10-PARENT"),
+                harness::MockResponse::ok(harness::openai_turn(
+                    "the parent answered remotely",
+                    None,
+                    100,
+                    10,
+                )),
+            ),
+        ],
+        harness::MockResponse::ok(harness::openai_turn("UNMATCHED-REQUEST", None, 1, 1)),
+    );
+    let (_ws, _daemon, mut client, session, transcripts) =
+        agent_boundary_daemon("ac10-pin", &provider);
+
+    let response = client.prompt(
+        &session,
+        "AC10-PARENT have a child read the production config",
+    );
+    assert_eq!(
+        response["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "the pinned turn completes on the local tier: {response}"
+    );
+    client.drain_events(std::time::Duration::from_millis(300));
+
+    // (a) The child: one remote request — the one that asked to read — and
+    // none after the read.
+    let child = requests_containing(&provider, "\"content\":\"AC10-READER");
+    assert_eq!(
+        child.len(),
+        1,
+        "after the read, the child made no remote request: {:?}",
+        client.event_names()
+    );
+    let started = client
+        .event_index_from(0, |e| e["event"] == "agent_child_started")
+        .expect("the child started");
+    let call_end = client
+        .event_index_from(0, |e| e["event"] == "agent_call_finished")
+        .expect("the call finished");
+    let blocks: Vec<(usize, String)> = client
+        .events()
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e["event"] == "privacy_block")
+        .map(|(i, e)| (i, e["path"].as_str().unwrap_or_default().to_owned()))
+        .collect();
+    assert!(
+        blocks
+            .iter()
+            .any(|(i, p)| *i > started && *i < call_end && p == "secrets/prod.env"),
+        "the child's own next call was blocked on the file: {blocks:?}"
+    );
+    let finished = client.events_named("agent_child_finished");
+    assert_eq!(finished.len(), 1);
+    assert_eq!(
+        finished[0]["status"], "completed",
+        "the child answered on the local tier: {}",
+        finished[0]
+    );
+
+    // (b) + (c) The parent: one remote request — the dispatch — and none after
+    // the result; its block names the file it never read.
+    assert_eq!(
+        requests_containing(&provider, "AC10-PARENT").len(),
+        1,
+        "after the result, the parent made no remote request"
+    );
+    assert!(
+        blocks
+            .iter()
+            .any(|(i, p)| *i > call_end && p == "secrets/prod.env"),
+        "the parent's next call was blocked naming the child's read — the result's \
+         provenance: {blocks:?}"
+    );
+
+    // Non-vacuity: the parent's context held the secret the child quoted.
+    let result = parent_agent_result(&transcripts, &session);
+    assert!(
+        result.contains(harness::SECRET_SENTINEL),
+        "fixture: the child's report carried the file's bytes into the parent: {result}"
+    );
+    harness::assert_no_boundary_bytes();
+}
+
+/// **REQ-623 BR-9, the benign twin: a child that touches no boundary leaves
+/// its parent's next call remote.**
+///
+/// The same daemon, the same `secrets/**` boundary — the child reads
+/// `README.md` instead. Its follow-up leaves the machine, the parent's next
+/// request leaves too, carrying the child's report, and nothing is blocked or
+/// pinned. Without this leg, (c) above could be a daemon that pinned every
+/// parent of every child.
+#[test]
+fn child_without_boundary_touch_does_not_pin_parent() {
+    let provider = harness::MockProvider::start_matching(
+        vec![
+            (
+                child_request("BR9-READER"),
+                harness::MockResponse::ok(harness::openai_turn(
+                    "",
+                    Some(("mock-call", "read", r#"{"path":"README.md"}"#)),
+                    100,
+                    10,
+                )),
+            ),
+            (
+                child_request("BR9-READER"),
+                harness::MockResponse::ok(harness::openai_turn(
+                    "BR9-REPORT the README describes a demo",
+                    None,
+                    100,
+                    10,
+                )),
+            ),
+            (
+                harness::Matcher::body_contains("BR9-PARENT"),
+                harness::MockResponse::ok(harness::openai_turn(
+                    "",
+                    Some((
+                        "mock-call",
+                        "agent",
+                        r#"{"tasks":[{"task":"BR9-READER read the README and report","name":"reader"}]}"#,
+                    )),
+                    100,
+                    10,
+                )),
+            ),
+            (
+                harness::Matcher::body_contains("BR9-PARENT"),
+                harness::MockResponse::ok(harness::openai_turn(
+                    "the parent answered remotely",
+                    None,
+                    100,
+                    10,
+                )),
+            ),
+        ],
+        harness::MockResponse::ok(harness::openai_turn("UNMATCHED-REQUEST", None, 1, 1)),
+    );
+    let (_ws, _daemon, mut client, session, _transcripts) =
+        agent_boundary_daemon("br9-free", &provider);
+
+    let response = client.prompt(&session, "BR9-PARENT have a child read the README");
+    assert_eq!(
+        response["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "{response}"
+    );
+    client.drain_events(std::time::Duration::from_millis(300));
+
+    assert_eq!(
+        requests_containing(&provider, "\"content\":\"BR9-READER").len(),
+        2,
+        "the child's follow-up left the machine"
+    );
+    let parent = requests_containing(&provider, "BR9-PARENT");
+    assert_eq!(parent.len(), 2, "the parent's next call left the machine");
+    assert!(
+        parent[1].contains("BR9-REPORT"),
+        "carrying the child's report"
+    );
+    assert!(
+        client.events_named("privacy_block").is_empty(),
+        "nothing was blocked: {:?}",
+        client.event_names()
+    );
+    assert!(client.events_named("session_pinned").is_empty());
+    harness::assert_no_boundary_bytes();
 }

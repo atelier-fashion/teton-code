@@ -454,3 +454,280 @@ async fn a_creations_phase_transition_precedes_the_creations_response() {
     server_task.abort();
     let _ = std::fs::remove_file(&path);
 }
+
+// ---------------------------------------------------------------------------
+// REQ-623 BR-13 / ADR-3 — a child's events never enter the parent's sequence
+// ---------------------------------------------------------------------------
+
+#[path = "e2e/harness.rs"]
+mod harness;
+
+/// Iterations of the child-ordering run. Children interleave by scheduler
+/// accident (LESSON-591); a parent sequence that let one child event through
+/// would differ between runs, and across these it would be caught.
+const CHILD_TURNS: usize = 25;
+
+/// Whether `event` is child-scoped: it names a child at its top level
+/// (`session_update`, `permission_request`, `context_pressure`, every
+/// `agent_child_*`) or in its ledger record (`cost_recorded`).
+fn child_of(event: &Value) -> Option<&str> {
+    event
+        .get("child_id")
+        .and_then(Value::as_str)
+        .or_else(|| event["record"].get("child_id").and_then(Value::as_str))
+}
+
+/// An event's name, with a `session_update`'s kind — the granularity the
+/// golden sequences below are written at.
+fn shape(event: &Value) -> String {
+    let name = event["event"].as_str().unwrap_or_default();
+    match event["update"]["kind"].as_str() {
+        Some(kind) if name == "session_update" => format!("{name}:{kind}"),
+        _ => name.to_owned(),
+    }
+}
+
+/// Consecutive repeats collapsed to one entry — the REQ-598 fixture's rule, so
+/// a chunk count is never pinned.
+fn collapsed(shapes: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in shapes {
+        if out.last() != Some(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// The parent turn's golden sequence for one prompt whose single `agent` call
+/// dispatches two children, **child-scoped events excluded** (ADR-3).
+///
+/// Written out by hand, entry by entry, and checked against what the turn
+/// does — not regenerated from a run (LESSON-569): the parent decides its
+/// route, streams its dispatch call (`tool_call` for `agent`), the tool
+/// announces the call, every child runs entirely inside the gap that follows,
+/// the call's end is announced, the `agent` tool call completes, and the
+/// parent streams its closing reply. (This in-process daemon installs no cost
+/// ledger, so no `cost_recorded` is published by parent or child; the
+/// spawned-daemon suites see those, and `agent_dispatch.rs` reads them.)
+const PARENT_GOLDEN: [&str; 6] = [
+    "route_decided",
+    "session_update:tool_call",
+    "agent_call_started",
+    "agent_call_finished",
+    "session_update:tool_call_update",
+    "session_update:agent_message_chunk",
+];
+
+/// `left`'s own sequence: started, its `read` started and finished, its answer
+/// streamed, finished.
+const LEFT_GOLDEN: [&str; 5] = [
+    "agent_child_started",
+    "session_update:tool_call",
+    "session_update:tool_call_update",
+    "session_update:agent_message_chunk",
+    "agent_child_finished",
+];
+
+/// `right`'s own sequence: started, its answer streamed, finished.
+const RIGHT_GOLDEN: [&str; 3] = [
+    "agent_child_started",
+    "session_update:agent_message_chunk",
+    "agent_child_finished",
+];
+
+/// **REQ-623 BR-13 / ADR-3 (LESSON-591): the parent's golden sequence excludes
+/// every child-scoped event; each child's own order is asserted separately; and
+/// no order across children is pinned.**
+///
+/// Over the real socket, `CHILD_TURNS` fresh sessions each run one prompt whose
+/// `agent` call dispatches `left` (a `read`, then an answer) and `right` (an
+/// answer), every event read off the wire before the prompt's response. For
+/// every run:
+///
+/// - with child-scoped events filtered out, the parent's sequence is
+///   [`PARENT_GOLDEN`] exactly — the same every run, however the children
+///   interleaved;
+/// - filtered by `child_id`, each child's sequence is its own golden;
+/// - every child event lies strictly between `agent_call_started` and
+///   `agent_call_finished` — a parent-anchored fact, not a cross-child one.
+///
+/// Benign path: the parent sequence keeps `agent_call_started` and
+/// `agent_call_finished`, which are the parent's news and name no child.
+///
+/// # Mutation (run 2026-10-07, reverted)
+///
+/// - **`SessionEvents::for_child` stamps nothing** (returns the parent's
+///   emitter unchanged): RED_STAMP.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn child_events_excluded_from_parent_golden() {
+    use harness::{openai_turn, Matcher, MockProvider, MockResponse};
+
+    let reply = |text: &str| MockResponse::ok(openai_turn(text, None, 100, 10));
+    let mut table = Vec::new();
+    for _ in 0..CHILD_TURNS {
+        table.push((
+            Matcher::body_contains("\"content\":\"GOLDEN-LEFT"),
+            MockResponse::ok(openai_turn(
+                "",
+                Some(("mock-call", "read", r#"{"path":"left.txt"}"#)),
+                100,
+                10,
+            )),
+        ));
+        table.push((
+            Matcher::body_contains("\"content\":\"GOLDEN-LEFT"),
+            reply("left read its file"),
+        ));
+        table.push((
+            Matcher::body_contains("\"content\":\"GOLDEN-RIGHT"),
+            reply("right answered"),
+        ));
+        table.push((
+            Matcher::body_contains("GOLDEN-PARENT"),
+            MockResponse::ok(openai_turn(
+                "",
+                Some((
+                    "mock-call",
+                    "agent",
+                    r#"{"tasks":[{"task":"GOLDEN-LEFT read left.txt","name":"left"},{"task":"GOLDEN-RIGHT answer","name":"right"}]}"#,
+                )),
+                100,
+                10,
+            )),
+        ));
+        table.push((
+            Matcher::body_contains("GOLDEN-PARENT"),
+            reply("Both are back."),
+        ));
+    }
+    let provider = MockProvider::start_matching(table, reply("UNMATCHED-REQUEST"));
+
+    let root = std::env::temp_dir().join(format!(
+        "teton-golden-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("left.txt"), "left contents\n").unwrap();
+
+    let path = temp_socket("ord-child");
+    let listener = server::bind_listener(&path).unwrap();
+    let daemon = Arc::new(Daemon::new());
+    let server_task = tokio::spawn(server::serve(listener, daemon));
+    let mut client = TestClient::connect(&path).await;
+    client.handshake().await;
+    for (id, update) in [
+        (
+            1000,
+            json!({ "op": "register_provider", "id": "golden", "kind": "openai-compatible",
+                    "endpoint": provider.openai_endpoint(), "model": "deepseek-v4-flash" }),
+        ),
+        (
+            1001,
+            json!({ "op": "set_tier_binding", "tier": "build", "provider_id": "golden" }),
+        ),
+    ] {
+        let (_, applied) = client
+            .call_collecting_events(id, "config/set", json!({ "update": update }))
+            .await;
+        assert_eq!(
+            applied["result"]["applied"].as_bool(),
+            Some(true),
+            "{applied}"
+        );
+    }
+
+    for turn in 0..CHILD_TURNS {
+        let id = 2 + 2 * turn as i64;
+        let (_, created) = client
+            .call_collecting_events(
+                id,
+                "session/create",
+                json!({ "mode": "structured", "phase": "implement", "cwd": root }),
+            )
+            .await;
+        let sid = created["result"]["session_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("session/create failed: {created}"))
+            .to_owned();
+        let (events, response) = client
+            .call_collecting_events(
+                id + 1,
+                "session/prompt",
+                json!({
+                    "session_id": sid,
+                    "prompt": [{ "type": "text", "text": "GOLDEN-PARENT dispatch two" }],
+                }),
+            )
+            .await;
+        assert_eq!(
+            response["result"]["stop_reason"], "end_turn",
+            "turn {turn}: {response}"
+        );
+        let mine: Vec<&Value> = events
+            .iter()
+            .filter(|e| e.get("session_id").and_then(Value::as_str) == Some(sid.as_str()))
+            .collect();
+
+        let parent = collapsed(
+            mine.iter()
+                .filter(|e| child_of(e).is_none())
+                .map(|e| shape(e)),
+        );
+        assert_eq!(
+            parent, PARENT_GOLDEN,
+            "turn {turn}: the parent's sequence, child events excluded"
+        );
+
+        let started = mine
+            .iter()
+            .position(|e| e["event"] == "agent_call_started")
+            .expect("the call started");
+        let finished = mine
+            .iter()
+            .position(|e| e["event"] == "agent_call_finished")
+            .expect("the call finished");
+        let ids: Vec<(String, String)> = mine
+            .iter()
+            .filter(|e| e["event"] == "agent_child_started")
+            .map(|e| {
+                (
+                    e["name"].as_str().unwrap_or_default().to_owned(),
+                    e["child_id"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(ids.len(), 2, "turn {turn}: two children started");
+        for (name, child_id) in &ids {
+            let own: Vec<(usize, String)> = mine
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| child_of(e) == Some(child_id.as_str()))
+                .map(|(i, e)| (i, shape(e)))
+                .collect();
+            assert!(
+                own.iter().all(|(i, _)| *i > started && *i < finished),
+                "turn {turn}: every event of {name} lies inside its call"
+            );
+            let golden: &[&str] = match name.as_str() {
+                "left" => &LEFT_GOLDEN,
+                "right" => &RIGHT_GOLDEN,
+                other => panic!("an unexpected child {other}"),
+            };
+            assert_eq!(
+                collapsed(own.into_iter().map(|(_, s)| s)),
+                golden,
+                "turn {turn}: {name}'s own order"
+            );
+        }
+    }
+
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&root);
+    harness::assert_no_boundary_bytes();
+}
