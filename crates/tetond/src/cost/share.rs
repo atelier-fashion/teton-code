@@ -392,7 +392,7 @@ impl ChildSpend {
     ///
     /// Call it once the child has reached its terminal status and its work has
     /// actually ended — every response body it drew dropped, so its last call
-    /// is counted, and no tool still running that could draw another.
+    /// is counted, and its task over, so nothing of it is still running.
     #[must_use = "what moved is what agent_child_share_released announces"]
     pub fn release(&self) -> Option<ShareRelease> {
         self.pool.release(&self.child, self.spent())

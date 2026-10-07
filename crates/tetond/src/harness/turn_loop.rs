@@ -2147,6 +2147,20 @@ async fn run_the_allowed_tool(
         // — run queue and slot — to a fresh thread before this one blocks.
         crate::runtime::block_in_place_if_multithread(|| tools.dispatch(name, tool_ctx, arguments))
     };
+    // REQ-623 BR-10 / AC-14: a cancellation point, inside a child. The dispatch
+    // above blocks this task's thread, so an abort issued while the tool ran —
+    // the child's deadline passing, its parent turn cancelled — has not landed
+    // yet: an abort lands only at the task's next await. Without one here the
+    // loop carried on synchronously after the tool returned, publishing the
+    // call's `tool_call_update` after the child's `agent_child_finished`,
+    // marking the result's provenance on the session, and at worst sending the
+    // next model call with the abandoned output in it. Yielding hands the
+    // runtime the chance to drop the task before any of the result is used —
+    // which is what "its result never reaches a model" rests on. A prompt turn
+    // takes no extra await here: its cancellation is the commit seam's.
+    if super::child::current_child().is_some() {
+        tokio::task::yield_now().await;
+    }
     // REQ-623 BR-10: inside a child, a call that ran is a call the gate did
     // not stop — see `ChildToolCalls::gate_refusal`.
     if let Some(child) = super::child::current_child() {
@@ -8806,6 +8820,208 @@ mod tests {
         }
         fn run(&self, _ctx: &ToolContext, _args: &Value) -> ToolOutcome {
             ToolOutcome::ok(self.result.clone()).with_disposition(self.disposition)
+        }
+    }
+
+    /// A tool that blocks its thread until the test lets it go — a `shell`
+    /// command still running, as far as the loop can tell.
+    struct BlockingStubTool {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl super::super::tools::Tool for BlockingStubTool {
+        fn name(&self) -> &str {
+            "stub_blocker"
+        }
+        fn description(&self) -> &str {
+            "A stand-in that blocks until released."
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn gates_itself(&self) -> bool {
+            true
+        }
+        fn run(&self, _ctx: &ToolContext, _args: &Value) -> ToolOutcome {
+            let _ = self.entered.send(());
+            let _ = self
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(30));
+            ToolOutcome::ok("ABANDONED-RESULT-MARKER")
+        }
+    }
+
+    /// **REQ-623 BR-10 / AC-14: a child aborted while a tool blocks its thread
+    /// takes no further loop step once the tool returns** — no
+    /// `tool_call_update` for the call, and no second model call carrying the
+    /// abandoned result.
+    ///
+    /// The turn runs inside a child's scope on its own task; its tool blocks
+    /// until released. The task is aborted mid-tool (it cannot land: the
+    /// thread is blocked), then the tool is released. The abort must land at
+    /// the cancellation point right after the dispatch.
+    ///
+    /// Benign: the same turn outside a child — the parent's — runs on after
+    /// its tool and publishes the update, so the observation channel works.
+    ///
+    /// Mutation (run 2026-10-07, reverted): the child's `yield_now` after the
+    /// dispatch removed — 1 red of the 2,325 lib tests, this one, at the
+    /// update the aborted child still published; red on 4 of 4 runs, and the
+    /// fix green on 5 of 5.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_aborted_child_takes_no_step_after_its_blocking_tool_returns() {
+        use crate::harness::child::{ChildTaskScope, ChildToolCalls, PausableDeadline};
+
+        async fn turn(in_a_child: bool) -> (Vec<Event>, usize) {
+            let session_id = SessionId::from("abort-after-tool");
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(1024);
+            let gate = Arc::new(PermissionGate::new(
+                session_id.clone(),
+                PermissionConfig::with_default(super::super::permissions::PermissionPolicy::Deny),
+                Arc::clone(&bus),
+                Arc::new(PendingPermissions::new()),
+            ));
+            let events = SessionEvents::new(Arc::clone(&bus), session_id);
+            let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let mut tools = ToolRegistry::with_builtins();
+            tools.register_cap_exempt(Arc::new(BlockingStubTool {
+                entered: entered_tx,
+                release: std::sync::Mutex::new(release_rx),
+            }));
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = Arc::clone(&calls);
+            let run = async move {
+                let config = HarnessConfig {
+                    max_turns: 4,
+                    ..HarnessConfig::default()
+                };
+                let tool_ctx = ToolContext::new(std::env::temp_dir());
+                let mut hook = NoopProvenanceHook;
+                let mut ctx = ContextManager::new(FOLD_SYSTEM, 1_000_000);
+                ctx.push_user(FOLD_REQUEST);
+                let mut source = CountingCallOnce {
+                    inner: CallOnceThenEndSource {
+                        name: "stub_blocker",
+                        calls: 0,
+                        dropped_calls: 0,
+                    },
+                    calls: counted,
+                };
+                let _ = run_session_turn_with_source(
+                    &mut source,
+                    &tools,
+                    &tool_ctx,
+                    &gate,
+                    &events,
+                    &mut ctx,
+                    &config,
+                    &mut hook,
+                    &DutyRoute::unresolved("no digest route in this test"),
+                    &DutyRoute::unresolved("no compact route in this test"),
+                    &ToolDuties {
+                        triage: &DutyRoute::unresolved("no triage route in this test"),
+                        shell: &DutyRoute::unresolved("no shell route in this test"),
+                    },
+                )
+                .await;
+            };
+            let task = if in_a_child {
+                tokio::spawn(
+                    ChildTaskScope {
+                        child_id: teton_protocol::agent::ChildId::new("turn-1:call-1", "blocked"),
+                        name: "blocked".to_owned(),
+                        parent_turn_id: teton_protocol::TurnId::from("turn-1"),
+                        deadline: PausableDeadline::start(std::time::Duration::from_secs(60)),
+                        consent: Arc::new(tokio::sync::Mutex::new(())),
+                        tool_calls: ChildToolCalls::default(),
+                    }
+                    .scope(run),
+                )
+            } else {
+                tokio::spawn(run)
+            };
+            tokio::task::spawn_blocking(move || {
+                entered
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("the tool started")
+            })
+            .await
+            .unwrap();
+            if in_a_child {
+                task.abort();
+            }
+            let _ = release.send(());
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), task).await;
+            let events = std::iter::from_fn(|| sub.try_recv())
+                .map(|envelope| envelope.event)
+                .collect();
+            (events, calls.load(std::sync::atomic::Ordering::SeqCst))
+        }
+
+        fn updates(events: &[Event]) -> usize {
+            events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        Event::SessionUpdate(SessionUpdate {
+                            update: SessionUpdatePayload::ToolCallUpdate { .. },
+                            ..
+                        })
+                    )
+                })
+                .count()
+        }
+
+        let (parent, parent_calls) = turn(false).await;
+        assert!(
+            updates(&parent) >= 1 && parent_calls == 2,
+            "benign: the parent's turn ran on after its tool ({parent_calls} calls): {parent:?}"
+        );
+
+        let (child, child_calls) = turn(true).await;
+        assert_eq!(
+            updates(&child),
+            0,
+            "the aborted child published its abandoned call's update: {child:?}"
+        );
+        assert_eq!(
+            child_calls, 1,
+            "the aborted child asked for another turn after its tool returned"
+        );
+    }
+
+    /// [`CallOnceThenEndSource`], counting the calls it serves into a shared
+    /// counter the test can read after the task is gone.
+    struct CountingCallOnce {
+        inner: CallOnceThenEndSource,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl CompletionSource for CountingCallOnce {
+        fn chat_format(&self) -> ChatFormat {
+            self.inner.chat_format()
+        }
+
+        async fn produce_turn(
+            &mut self,
+            prompt: &PreparedPrompt,
+            provenance: &EgressProvenance,
+            config: &HarnessConfig,
+            tools: &ToolRegistry,
+            exposed: &[&str],
+            on_token: &mut (dyn for<'s> FnMut(&'s str) + Send),
+        ) -> Result<SourceTurn, HarnessError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner
+                .produce_turn(prompt, provenance, config, tools, exposed, on_token)
+                .await
         }
     }
 

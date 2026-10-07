@@ -235,9 +235,13 @@ REQ-587 AC-15 recorded, and it is the gate the `pipeline-runner`,
   that carries it past the ceiling is allowed, so a child can overshoot its
   share by **at most one call**, and an overshoot is never charged to its
   siblings. And a `timed_out` child still inside a blocking tool keeps its
-  share until that work has actually ended — the tool could still draw a
-  metered call — then releases it; `agent_child_share_released` follows the
-  result.
+  share until its work task has actually ended, then releases it;
+  `agent_child_share_released` follows the result. The task takes no step
+  after the tool returns — the loop yields at a cancellation point after
+  every dispatch in a child, so the abort lands before the result is used —
+  and so no metered call can follow the abandoned one; releasing only when
+  the task has ended keeps that independent of what a tool does while it
+  blocks.
 - [ ] BR-9: **Provenance flows up, never sideways.** The result block the
   parent receives carries the union of every `ProvenanceId` the child's
   context touched. If that union

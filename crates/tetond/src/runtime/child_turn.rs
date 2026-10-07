@@ -65,16 +65,20 @@ use crate::harness::reply::prose_before_tool_call;
 /// **What the grace does not do** (AC-14, BR-10 as amended 2026-10-07):
 ///
 /// - **It does not kill the tool.** The in-flight call is *abandoned* — its
-///   result never reaches a model, because the abort lands the moment the
-///   tool returns — but the tool's process is not killed: a `shell` command
+///   result never reaches a model, because the abort lands at the
+///   cancellation point the loop takes the moment the tool returns
+///   (`run_the_allowed_tool` yields after every dispatch in a child) — but
+///   the tool's process is not killed: a `shell` command
 ///   runs to its own timeout (30 s by default) and may outlive the parent's
 ///   turn. That is the parent's own cancelled-`shell` behaviour today; making
 ///   cancellation reach the process is a follow-up (the requirement's
 ///   Deferred list).
 /// - **It does not release the share.** A child still inside a blocking tool
 ///   after the grace keeps its share until the work task has actually ended
-///   (BR-8): the tool may yet draw a metered call against it, and a share
-///   already handed to siblings would let that call overspend the prompt.
+///   (BR-8). The cancellation point means the task takes no step once the
+///   tool returns, so no metered call follows the abandoned one; releasing
+///   only when the task is over keeps that true by construction rather than
+///   by an argument about what every tool does while it blocks.
 ///   [`ChildTurns::release_when_ended`] waits for the task and then releases
 ///   and announces it; the parent's result says `timed_out` without a
 ///   release, and the `agent_child_share_released` follows when it happens.
@@ -1878,8 +1882,8 @@ mod tests {
     /// **BR-8: a timed-out child still inside a blocking tool keeps its share
     /// until its work has actually ended** — the parent hears `timed_out` after
     /// the grace, but a running sibling is handed the share only once the tool
-    /// has returned and the abort has landed, because until then the tool could
-    /// still draw a metered call against it. The release is then announced as
+    /// has returned and the abort has landed — when the child's work is over,
+    /// not when its parent was told. The release is then announced as
     /// `agent_child_share_released`.
     ///
     /// Two children share a 1,000 pool (500 each); `stuck` spends nothing and
