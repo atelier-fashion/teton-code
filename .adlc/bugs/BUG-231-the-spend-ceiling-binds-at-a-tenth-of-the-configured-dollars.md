@@ -1,10 +1,11 @@
 ---
 id: BUG-231
 title: "The per-prompt spend ceiling binds at a tenth of the configured dollars — config micro-cents vs recorded usd_micros"
-status: open
+status: resolved
 severity: high
 created: 2026-10-07
 updated: 2026-10-08
+resolved: 2026-10-08
 component: "daemon/cost-ledger"
 domain: "cost"
 stack: ["rust", "daemon"]
@@ -92,6 +93,12 @@ regression test, `spend_units_counts_a_price_and_refuses_to_count_nonsense`,
 had pinned the 1:1 unit (`spent_by_child_is_exactly_that_childs_spend`, the
 share accumulator test, the e2e `units()` helper and `cost_attribution`'s
 per-child equality) now convert per row, the way the daemon does.
+
+## Deployment
+
+- Merged to `main` as `53a82af` (#338) on 2026-10-08; squash of `fix/bug-231-spend-ceiling-units`.
+- No deploy-on-merge for the daemon — ships with the next release (the release runbook); until then `main` carries the fix.
+- Lesson: LESSON-665.
 
 ## Files Changed
 
