@@ -442,6 +442,15 @@ impl WebTool {
             // value, and the `permission_request` this answered is itself the
             // record. Minting a neighbouring outcome to fill the gap would put
             // a wrong word in the one place BR-7 is read from.
+            //
+            // REQ-623 BR-10: this gate is the tool's own, invisible to the
+            // loop, which counted the call as dispatched. Inside a child, a
+            // denial here is a gate denial and nothing was looked up, so a
+            // child left with nothing else ends `refused`, not `completed`
+            // (`ChildToolCalls::note_refused_inside`).
+            if let Some(child) = crate::harness::child::current_child() {
+                child.tool_calls.note_refused_inside(WEB_TOOL_NAME);
+            }
             return ToolOutcome::error(format!(
                 "Permission denied: the user declined this web {}. Do not retry it; take a \
                  different approach or finish.",
@@ -1765,6 +1774,63 @@ mod tests {
         assert!(
             fx.seam.recorded().is_empty(),
             "a declined lookup has no outcome vocabulary and must not borrow a neighbouring one"
+        );
+    }
+
+    /// **REQ-623 BR-10: a web lookup denied at the tool's own consent, inside a
+    /// child, is a gate denial** — so a child whose only call this was, and
+    /// which then had nothing to report, ends `refused gate_denied:web` rather
+    /// than `completed` with an empty report.
+    ///
+    /// The loop cannot see this gate: it counts the call as dispatched
+    /// (`note_ran`, done here by hand in its place), and the tool takes the
+    /// dispatch back out. Benign: an allowed lookup inside a child notes
+    /// nothing, and the same dispatch then counts as a call that ran.
+    ///
+    /// Mutation (run 2026-10-07, reverted): the `note_refused_inside` call
+    /// removed from the denial branch — 1 red of the 2,323 lib tests, this one,
+    /// at the refusal.
+    #[tokio::test]
+    async fn a_denied_lookup_inside_a_child_is_a_gate_refusal() {
+        use crate::harness::child::{ChildTaskScope, ChildToolCalls, PausableDeadline};
+        let in_a_child = |tool_calls: &ChildToolCalls| ChildTaskScope {
+            child_id: teton_protocol::agent::ChildId::new("turn-1:call-1", "looker"),
+            name: "looker".to_owned(),
+            parent_turn_id: teton_protocol::TurnId::from("turn-1"),
+            deadline: PausableDeadline::start(std::time::Duration::from_secs(60)),
+            consent: Arc::new(tokio::sync::Mutex::new(())),
+            tool_calls: tool_calls.clone(),
+        };
+
+        let denied = fixture(
+            "child-denied",
+            web_config(WebTier::FetchAnyUrl),
+            PermissionPolicy::Deny,
+            &[],
+        );
+        let calls = ChildToolCalls::default();
+        let out = in_a_child(&calls)
+            .scope(denied.tool.lookup(&json!({ "url": "https://docs.rs/x" })))
+            .await;
+        assert!(out.content.contains("declined"), "{}", out.content);
+        calls.note_ran(); // the loop's count of the same dispatch
+        assert_eq!(calls.gate_refusal().as_deref(), Some("gate_denied:web"));
+
+        let allowed = fixture(
+            "child-allowed",
+            web_config(WebTier::FetchAnyUrl),
+            PermissionPolicy::Allow,
+            &[],
+        );
+        let calls = ChildToolCalls::default();
+        let _ = in_a_child(&calls)
+            .scope(allowed.tool.lookup(&json!({ "url": "https://docs.rs/x" })))
+            .await;
+        calls.note_ran();
+        assert_eq!(
+            calls.gate_refusal(),
+            None,
+            "benign: an allowed lookup is a call that ran"
         );
     }
 
