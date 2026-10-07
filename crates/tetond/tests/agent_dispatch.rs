@@ -33,6 +33,9 @@
 //! | AC-9 | `tier: build` under a Think parent; no binding → category default | [`routing::build_child_under_think_parent`] |
 //! | AC-13, BR-8 | shares and release derived from the ledger | [`spend::two_child_split_and_three_child_release`] |
 //! | AC-14, BR-10 | one test per terminal status, the parent continuing in each | `statuses::*` |
+//! | AC-14, BR-10 | a cancel or deadline with a tool in flight: reported while parked, nothing after | [`statuses::timed_out`], [`statuses::cancelled_with_tool_in_flight`] |
+//! | AC-15, BR-11 | an over-bound report is cut loudly; the transcript holds it whole | [`statuses::report_truncated`] |
+//! | ADR-3, BR-5, BR-8 | the emitter, the gate and the ledger name a child identically | [`ids::emitter_gate_and_ledger_agree_for_one_child`] |
 //! | AC-16, BR-12 | a user skill in a child pins the child and the parent | [`skills::user_skill_in_child_pins_parent`] |
 //! | AC-17 | one transcript file holds the parent's and every child's records | [`transcript::one_file_parent_and_children`] |
 //!
@@ -62,6 +65,15 @@
 //! the daemon source, the binaries rebuilt, this binary plus
 //! `provenance_egress` and `event_response_ordering` run (47 tests), and the
 //! mutation reverted by a targeted edit. A count is over those 47.
+//!
+//! The REQ-623 verify pass re-ran its mutations **outside the shared tree** —
+//! each in a scratch copy of the source (named per record, `b6148d1` for the
+//! sweep), with this directory synced in — while another agent edited the
+//! daemon source. Its counts are over 51 tests (this binary's 21,
+//! `provenance_egress`'s 26, `event_response_ordering`'s 4), and each sweep
+//! run carried the `yield_now` fix described at
+//! [`assert_no_late_child_events`], without which two tests here are red on
+//! every run.
 //!
 //! Every test here went red under at least one mutation of the behaviour it
 //! guards. Two findings the batch produced:
@@ -413,53 +425,39 @@ fn surviving_shell(started: &str, release: &str, survived: &str) -> Value {
     })
 }
 
-/// **KNOWN LEAK — current behaviour, pinned so it cannot widen unnoticed**
-/// (REQ-623 verify; a BUG is to be filed at wrapup).
+/// **No child-scoped event after a child's end** — the leaked-task guard the
+/// cancel and deadline tests share (REQ-623 verify).
 ///
-/// A child whose deadline fires, or whose parent turn is cancelled, while its
-/// `shell` is in flight is parked *inside* the blocking dispatch
+/// The hazard it guards, found by this guard at the verify pass: a child
+/// whose deadline fires, or whose parent turn is cancelled, while its `shell`
+/// is in flight is parked *inside* the blocking dispatch
 /// (`block_in_place_if_multithread(|| tools.dispatch(..))` in
 /// `turn_loop::run_the_allowed_tool`). Its abort cannot land until the shell
 /// returns, and a tokio abort is only observed when the task next returns
-/// `Pending` — so once the test releases the shell, the dead child's loop runs
-/// on: it publishes the call's `tool_call_update` (`completed`, child-stamped)
-/// **after** `agent_child_finished` said the child was over, and keeps going
-/// until something pends. Under REQ-597's shipped boundary globs that is far
-/// enough to classify the shell result, block the child's next call and **pin
-/// the whole session local** (`session_pinned`, `privacy_block`, both
-/// unstamped) — observed in this file's in-process leg during the verify pass,
-/// before its boundaries were turned off to keep the classifier out of it.
+/// `Pending` — so once the shell is released, the dead child's loop runs on
+/// until something pends: it publishes the call's `tool_call_update`
+/// (`completed`, child-stamped) after `agent_child_finished` said the child
+/// was over; under REQ-597's shipped boundary globs it classifies the shell
+/// result, blocks its own next call and **pins the whole session local**
+/// (`session_pinned`, `privacy_block`, both unstamped); and when the
+/// connection to the provider does not pend — observed in 1 of 14 runs of
+/// this binary on the shared tree, and in 2 of 3 in a scratch copy under
+/// concurrent load — it **sends its next model call, carrying the discarded
+/// tool output**. The last is what the request-count and [`SURVIVOR_OUTPUT`]
+/// assertions beside this catch, intermittently; this one catches the
+/// deterministic part, every run.
 ///
-/// What still holds, and is asserted strictly beside this: no provider request
-/// follows, and the tool's output reaches no model. The leak is the event
-/// stream and the session's state.
-///
-/// When the dispatch honours the child's end, `late` is empty and each caller's
-/// `assert_only_known_leak(..)` becomes `assert!(late.is_empty())`.
-fn assert_only_known_leak(late: &[Value], tool_call_id: &str) {
-    let shapes: Vec<(String, String, String)> = late
-        .iter()
-        .map(|e| {
-            (
-                e["event"].as_str().unwrap_or_default().to_owned(),
-                e["update"]["kind"].as_str().unwrap_or_default().to_owned(),
-                e["update"]["tool_call_id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned(),
-            )
-        })
-        .collect();
-    assert_eq!(
-        shapes,
-        vec![(
-            "session_update".to_owned(),
-            "tool_call_update".to_owned(),
-            tool_call_id.to_owned()
-        )],
-        "after the release, the dead child published exactly its in-flight call's \
-         tool_call_update and nothing else (the known leak — see this function's doc): \
-         {late:#?}"
+/// The fix is the daemon's (src), not this file's: let a requested abort land
+/// before anything after the dispatch runs — a `tokio::task::yield_now().await`
+/// right after the blocking dispatch returns, inside a child. With exactly
+/// that applied to a scratch copy of the source at `6eb7dc2`, the cancel and
+/// deadline tests were green in 6 of 6 runs of this binary; without it, both
+/// tool-in-flight tests are red here on every run.
+fn assert_no_late_child_events(late: &[Value]) {
+    assert!(
+        late.is_empty(),
+        "no child event after the release — the child's task must be gone, not merely \
+         unreported (see this function's doc for the mechanism): {late:#?}"
     );
 }
 
@@ -1390,6 +1388,21 @@ mod spend {
     ///   share already held its part. That is how the stamping bug was found;
     ///   after the fix this test is green under that mutation, and
     ///   `cost::share`'s own test pins the fix.
+    ///
+    /// REQ-623 verify (each in a scratch copy at `b6148d1` with the
+    /// `yield_now` fix applied, counted over 51 tests across this binary,
+    /// `provenance_egress` and `event_response_ordering`):
+    ///
+    /// - **Ceiling for floor in the split** (`share::split` as
+    ///   `headroom.div_ceil(n)`): 1 red, this test, at `floor(headroom / 2)`.
+    /// - **Ceiling for floor in the release** (`release_parts` as
+    ///   `unspent.div_ceil(n)`): 1 red, this test, at the two-thirds split.
+    ///   **Green on this test as it stood before the verify pass**: `early`
+    ///   was billed 25,237 tokens, its unspent share came to 22,210 — even —
+    ///   and `ceil(22,210 / 2) == floor(22,210 / 2)`. Billing 25,239 makes it
+    ///   odd, and the `% 2 == 1` assertion keeps it so (LESSON-640).
+    /// - **The ledger's projection drops the child**: red here, among 4 (see
+    ///   [`ids::emitter_gate_and_ledger_agree_for_one_child`]).
     #[test]
     fn two_child_split_and_three_child_release() {
         let readme = json!({ "path": "README.md" });
@@ -1416,7 +1429,9 @@ mod spend {
                 ),
                 (parent("SPLIT-PARENT"), says("the ceiling stops this call")),
                 // Three-child release.
-                (child("REL-EARLY"), says_billing("early report", 25_237, 0)),
+                // 25,239 input tokens: about a third of early's share, and an
+                // odd unspent remainder (asserted below — LESSON-640).
+                (child("REL-EARLY"), says_billing("early report", 25_239, 0)),
                 (
                     child("REL-FIRST"),
                     first_gate.hold(calls_billing("read", &readme, 90_000, 10)),
@@ -1454,7 +1469,16 @@ mod spend {
             spent_before > 0,
             "fixture: the parent's own first call was billed"
         );
-        let share = (ceiling - spent_before) / 2;
+        let headroom = ceiling - spent_before;
+        // LESSON-640: the floor is only observable on a headroom it truncates.
+        // An even headroom would let a ceil-for-floor (or round) mutation
+        // stamp the same share and survive.
+        assert!(
+            !headroom.is_multiple_of(2),
+            "fixture arithmetic: the split leg's headroom ({headroom}) must be odd, or \
+             floor(headroom / 2) is indistinguishable from its ceiling"
+        );
+        let share = headroom / 2;
         assert_eq!(stamped(client, &hungry), share, "floor(headroom / 2)");
         assert_eq!(stamped(client, &frugal), share, "floor(headroom / 2)");
 
@@ -1551,7 +1575,13 @@ mod spend {
         let first = child_id_of(client, "first");
         let second = child_id_of(client, "second");
         let spent_before = parent_spend_before_call(client, &release_session);
-        let share = (ceiling - spent_before) / 3;
+        let headroom = ceiling - spent_before;
+        assert!(
+            !headroom.is_multiple_of(3),
+            "fixture arithmetic: the release leg's headroom ({headroom}) must not divide by \
+             three, or floor(headroom / 3) is indistinguishable from its ceiling"
+        );
+        let share = headroom / 3;
         for id in [&early, &first, &second] {
             assert_eq!(stamped(client, id), share, "floor(headroom / 3) for {id}");
         }
@@ -1561,6 +1591,11 @@ mod spend {
             "fixture arithmetic: early finished under its share ({early_spent} of {share})"
         );
         let unspent = share - early_spent;
+        assert!(
+            unspent % 2 == 1,
+            "fixture arithmetic: early's unspent share ({unspent}) must be odd, or the \
+             release's floor(unspent / 2) is indistinguishable from its ceiling"
+        );
         let part = unspent / 2;
         assert_eq!(released["child_id"], json!(early), "{released}");
         assert_eq!(
@@ -2037,7 +2072,7 @@ mod statuses {
     /// - **Children run one at a time**: red here too — the second child never
     ///   parks.
     /// - **The work outlives its cancel** (REQ-623 verify, run in a scratch
-    ///   copy of the source at `b1f7c21`: `AbortOnDrop::drop` and the deadline
+    ///   copy of the source at `f2c5591`: `AbortOnDrop::drop` and the deadline
     ///   arm's `handle.0.abort()` both removed): 3 red of this binary's 19 —
     ///   this test at the leaked-task guard (a child read its released reply and
     ///   streamed `one is never answered`), [`cancelled_with_tool_in_flight`]
@@ -2140,14 +2175,13 @@ mod statuses {
     /// 1. `agent_child_finished` reports the child `cancelled`, and
     ///    `agent_call_finished` arrives, **while the shell is still parked**;
     /// 2. after the release, the shell's output ([`SURVIVOR_OUTPUT`]) reaches
-    ///    no provider request, and no request is made at all.
+    ///    no provider request, no request is made at all, and no child-scoped
+    ///    event is published over a settle window
+    ///    ([`assert_no_late_child_events`] has the mechanism this found).
     ///
-    /// **Not guaranteed, and pinned as found: "no further child event".** The
-    /// dead child publishes its in-flight call's `tool_call_update` once the
-    /// shell returns, and — under the shipped boundary globs — runs on far
-    /// enough to pin the session local ([`assert_only_known_leak`] has the
-    /// mechanism). This leg turns the builtin globs off, so what it pins is
-    /// the one stamped event and not the classifier's verdict on a `printf`.
+    /// The builtin boundary globs are off here, so what is asserted is the
+    /// child's task and not the classifier's verdict on a `printf`; with them
+    /// on, the same leak also pins the session local.
     ///
     /// **The process itself survives** — the orchestrator's settled decision
     /// at the REQ-623 verify pass: a cancelled child's tool process is not
@@ -2159,8 +2193,11 @@ mod statuses {
     ///
     /// # Mutations (run 2026-10-07, each reverted)
     ///
+    /// - **The source as it stands at `6eb7dc2`** (no mutation): red, every
+    ///   run, at the late-event guard (see [`assert_no_late_child_events`]);
+    ///   green in 6 of 6 with the `yield_now` fix applied to a scratch copy.
     /// - **The work outlives its cancel** (REQ-623 verify, run in a scratch
-    ///   copy of the source at `b1f7c21`: `AbortOnDrop::drop` and the deadline
+    ///   copy of the source at `f2c5591`: `AbortOnDrop::drop` and the deadline
     ///   arm's `handle.0.abort()` both removed): 3 red of this binary's 19 —
     ///   this test at "nothing was sent after the tool's output existed" (3
     ///   requests, not 2: the dead child sent its next call), and the other
@@ -2264,7 +2301,7 @@ mod statuses {
                 .any(|b| b.contains(SURVIVOR_OUTPUT)),
             "the cancelled tool's output never reached a model"
         );
-        assert_only_known_leak(&late, "call-1");
+        assert_no_late_child_events(&late);
         assert_no_boundary_bytes();
     }
 
@@ -2422,14 +2459,10 @@ mod statuses {
     ///    parked, holding `timed_out`, an empty report and the deadline it ran
     ///    under;
     /// 3. once the test releases the park, the shell's output
-    ///    ([`SURVIVOR_OUTPUT`]) reaches **no** provider request and the child is
-    ///    never answered again.
-    ///
-    /// **Not guaranteed, and pinned as found: "no further child event".** The
-    /// verify pass asked for it and the daemon does not deliver it — the dead
-    /// child publishes its in-flight call's `tool_call_update` once the shell
-    /// returns. [`assert_only_known_leak`] pins exactly that one event, so the
-    /// leak cannot widen unnoticed and the fix flips one line.
+    ///    ([`SURVIVOR_OUTPUT`]) reaches **no** provider request, the child is
+    ///    never answered again, and no further child-scoped event is published
+    ///    — the child's task is gone, not merely unreported
+    ///    ([`assert_no_late_child_events`] has the mechanism this found).
     ///
     /// **The process itself survives, and this test says so.** Settled at the
     /// REQ-623 verify pass: a timed-out child's tool process is *not* killed —
@@ -2444,8 +2477,17 @@ mod statuses {
     /// - **The deadline never fires** (the runner's `deadline.expired()` arm
     ///   made pending): 1 red, this test — no finish arrives while the tool is
     ///   parked. Recorded before the verify pass, against the 1 s deadline.
+    /// - **The source as it stands at `6eb7dc2`/`b6148d1`** (no mutation):
+    ///   red, every run, at the late-event guard — the dead child's
+    ///   `tool_call_update` — and intermittently earlier, at "nothing was
+    ///   sent": see [`assert_no_late_child_events`]. Green in 6 of 6 runs with
+    ///   the `yield_now` fix described there applied to a scratch copy, and in
+    ///   the 13-mutation sweep below it.
+    /// - Re-run over `b6148d1` + the fix, across 51 tests in three binaries:
+    ///   the work-outlives-its-end mutation, 3 red (this test and both
+    ///   `cancelled` tests); the deadline-waits mutation, 1 red (this test).
     /// - **The deadline waits for the work** (REQ-623 verify, run in a scratch
-    ///   copy of the source at `b1f7c21`: the deadline arm's
+    ///   copy of the source at `f2c5591`: the deadline arm's
     ///   `timeout(ABORT_GRACE, &mut handle.0)` made an unbounded
     ///   `(&mut handle.0).await`): 1 red of this binary's 19, this test, at "no
     ///   finish while parked".
@@ -2554,19 +2596,174 @@ mod statuses {
             .filter(|e| child_scoped(e))
             .cloned()
             .collect();
-        let tool_call_id = rig
+        assert_no_late_child_events(&late);
+        assert_no_boundary_bytes();
+    }
+
+    /// The `report_max_bytes` [`report_truncated`] runs under: the validator's
+    /// floor, so the report it overruns stays small.
+    const REPORT_MAX: usize = 1_024;
+
+    /// An OpenAI-compatible end of turn whose `text` is streamed as `parts`
+    /// content deltas — so "the transcript holds the full text" is a claim
+    /// about records that have to be *joined*, not one record read back.
+    fn says_in_parts(text: &str, parts: usize) -> MockResponse {
+        let step = text.len().div_ceil(parts);
+        let mut body = String::new();
+        for piece in text.as_bytes().chunks(step) {
+            let piece = std::str::from_utf8(piece).expect("an ASCII report splits anywhere");
+            let chunk = json!({ "choices": [{ "delta": { "content": piece } }] });
+            body.push_str(&format!("data: {chunk}\n\n"));
+        }
+        let finish = json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }] });
+        body.push_str(&format!("data: {finish}\n\n"));
+        let usage = json!({ "usage": { "prompt_tokens": 100, "completion_tokens": 10 } });
+        body.push_str(&format!("data: {usage}\n\n"));
+        body.push_str("data: [DONE]\n\n");
+        MockResponse::ok(body)
+    }
+
+    /// **AC-15 (BR-11): a child whose final text is `report_max_bytes + 1`
+    /// long returns exactly `report_max_bytes` of it plus the typed marker
+    /// naming kept and dropped; `agent_child_finished` says `truncated: true`
+    /// and the whole size; and the session transcript holds the full text.**
+    ///
+    /// `[agent] report_max_bytes = 1024` (the validator's floor) and a child
+    /// whose answer is 1,025 ASCII bytes, streamed in three deltas. The
+    /// expected cut and counts are literals and slices of the fixture's own
+    /// text, never read back from the subject; the one figure read off the
+    /// daemon — the bound — is read off the marker and asserted equal to the
+    /// literal the config wrote. The full text is reconstructed from the
+    /// transcript by joining the child-stamped `agent_message_chunk` records,
+    /// which is the place BR-11's marker tells the reader to look.
+    ///
+    /// # Mutations (REQ-623 verify, each in a scratch copy of the source at
+    /// `b6148d1` with the `yield_now` fix applied — see
+    /// [`assert_no_late_child_events`] — counted over this binary,
+    /// `provenance_egress` and `event_response_ordering`: 51 tests)
+    ///
+    /// - **The finish says whole** (`publish_finished` writing `truncated:
+    ///   false`): 1 red, this test, at `truncated == true`.
+    /// - **Never cut** (`bound_report`'s `whole <= bound` made always true): 1
+    ///   red, this test, at the marker.
+    #[test]
+    fn report_truncated() {
+        let text = format!(
+            "AC15-REPORT {}",
+            "r".repeat(REPORT_MAX + 1 - "AC15-REPORT ".len())
+        );
+        assert_eq!(
+            text.len(),
+            REPORT_MAX + 1,
+            "fixture arithmetic: one byte over the bound"
+        );
+        let provider = MockProvider::start_matching(
+            vec![
+                (child("ST-LONG"), says_in_parts(&text, 3)),
+                (
+                    parent("ST-TRUNCATED"),
+                    dispatch(json!([{ "task": "ST-LONG write a long report", "name": "long" }])),
+                ),
+                (parent("ST-TRUNCATED"), says("The parent carried on.")),
+            ],
+            unmatched(),
+        );
+        let transcripts = std::cell::RefCell::new(std::path::PathBuf::new());
+        let mut rig = Rig::with_config("st-truncated", "", |ws| {
+            let dir = ws.root.join("transcripts");
+            let mut config = base_config(&provider);
+            config.push_str(&agent_table(&[(
+                "report_max_bytes",
+                &REPORT_MAX.to_string(),
+            )]));
+            config.push_str(&format!(
+                "[transcript]\nenabled = true\ndir = \"{}\"\nretain_days = 0\n\n",
+                dir.display()
+            ));
+            ws.write_config(&config);
+            *transcripts.borrow_mut() = dir;
+            DaemonOptions::default()
+        });
+        let response = rig.prompt("ST-TRUNCATED dispatch one call");
+        assert_eq!(response["result"]["stop_reason"], "end_turn", "{response}");
+
+        // The report the parent was handed: the first 1,024 bytes, then the
+        // marker naming what was kept and dropped.
+        let result = result_named(&handed(&provider, "ST-TRUNCATED"), "long").clone();
+        assert_eq!(result["status"], "completed", "{result}");
+        let report = result["report"].as_str().unwrap_or_default();
+        assert!(
+            report.len() > REPORT_MAX && report.is_char_boundary(REPORT_MAX),
+            "the report holds the kept bytes and a marker: {report}"
+        );
+        let (kept, marker) = report.split_at(REPORT_MAX);
+        assert_eq!(
+            kept,
+            &text[..REPORT_MAX],
+            "exactly report_max_bytes of the child's text"
+        );
+        assert!(
+            marker.starts_with("\n\n[report_truncated: kept 1024 bytes, dropped 1 bytes at ")
+                && marker.ends_with(']'),
+            "the typed marker names kept and dropped: {marker}"
+        );
+        assert!(
+            marker.contains("agent.report_max_bytes = 1024"),
+            "and the bound the config set: {marker}"
+        );
+
+        // `agent_child_finished`: truncated, and the whole size.
+        let id = child_id_of(&rig.client, "long");
+        let finished = rig
             .client
-            .events()
-            .iter()
-            .find(|e| {
-                child_scoped(e)
-                    && e["update"]["kind"] == "tool_call"
-                    && e["event"] == "session_update"
-            })
-            .and_then(|e| e["update"]["tool_call_id"].as_str())
-            .unwrap_or_default()
-            .to_owned();
-        assert_only_known_leak(&late, &tool_call_id);
+            .events_named("agent_child_finished")
+            .into_iter()
+            .find(|e| e["child_id"] == id.as_str())
+            .cloned()
+            .expect("the child finished");
+        assert_eq!(finished["truncated"], true, "{finished}");
+        assert_eq!(
+            finished["report_bytes"],
+            json!(REPORT_MAX + 1),
+            "report_bytes is the whole text's size: {finished}"
+        );
+
+        // The transcript holds the full text: the child's streamed chunks,
+        // stamped with its id, join to the 1,025 bytes the child wrote.
+        let dir = transcripts.borrow().clone();
+        let deadline = Instant::now() + WINDOW;
+        let joined = loop {
+            let joined: String = std::fs::read_dir(&dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.to_string_lossy().contains(rig.session.as_str()))
+                .flat_map(|p| {
+                    std::fs::read_to_string(p)
+                        .unwrap_or_default()
+                        .lines()
+                        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                        .collect::<Vec<_>>()
+                })
+                .filter(|r| {
+                    r["kind"] == "session_update"
+                        && r["child_id"] == id.as_str()
+                        && r["update"]["kind"] == "agent_message_chunk"
+                })
+                .filter_map(|r| r["update"]["text"].as_str().map(str::to_owned))
+                .collect();
+            if joined.len() >= text.len() || Instant::now() >= deadline {
+                break joined;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        assert_eq!(
+            joined.len(),
+            REPORT_MAX + 1,
+            "the transcript holds every byte the child wrote"
+        );
+        assert_eq!(joined, text, "and they are the child's text, in order");
         assert_no_boundary_bytes();
     }
 
@@ -2594,6 +2791,165 @@ mod statuses {
         assert!(
             code.parse::<i64>().is_ok_and(|c| c < 0),
             "the error leads with its code: {error}"
+        );
+        assert_no_boundary_bytes();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BR-5 / BR-8 / BR-13 — one child, one pair of ids, on every carrier
+// ---------------------------------------------------------------------------
+
+mod ids {
+    use super::*;
+
+    /// **REQ-623 ADR-3 / BR-5 / BR-8 / BR-13: the emitter, the gate and the
+    /// ledger name a child identically.** Three subsystems stamp a child's
+    /// ids — the child's `SessionEvents` (its tool events), the session's
+    /// permission gate (its `permission_request`) and the cost ledger (its
+    /// `cost_recorded` rows) — each from its own carrier. A client that groups
+    /// by `child_id`, and `/cost` that nests by `parent_turn_id`, are only
+    /// correct if the three agree.
+    ///
+    /// One child, at `guarded`, that `read`s a file (no ask), runs a `shell`
+    /// (an ask, answered by the client's auto-approval) and answers: three
+    /// remote calls, four tool events, one ask. Every carrier must name the
+    /// pair `agent_child_started` announced, and that turn must be the one
+    /// the parent's own ledger rows roll up under. Non-vacuity: each carrier
+    /// is present in the count the fixture implies, so an empty set cannot
+    /// agree by default.
+    ///
+    /// # Mutations (REQ-623 verify, each in a scratch copy of the source at
+    /// `b6148d1` with the `yield_now` fix applied, counted over 51 tests across
+    /// this binary, `provenance_egress` and `event_response_ordering`)
+    ///
+    /// - **The ledger bills another turn** (`ChildSpend`'s metering passing
+    ///   `for_child` a turn of its own): 1 red, this test, at `cost_recorded`.
+    /// - **The gate stamps another turn** (`permission_request.parent_turn_id`
+    ///   minted apart from the child's scope): 2 red — this test at
+    ///   `permission_request`, and AC-7's consent test.
+    /// - **The ledger's projection drops the child** (`cost_recorded` written
+    ///   with `child_id: None`): 4 red — this test at "one ledger row per remote
+    ///   call" (0 of 3), the AC-13 and `spend_exhausted` spend tests, and the
+    ///   BR-13 golden (the children's rows enter the parent's sequence).
+    #[test]
+    fn emitter_gate_and_ledger_agree_for_one_child() {
+        let provider = MockProvider::start_matching(
+            vec![
+                (
+                    child("IDS-CHILD"),
+                    calls("read", &json!({ "path": "ids-child.txt" })),
+                ),
+                (
+                    child("IDS-CHILD"),
+                    calls("shell", &json!({ "command": "echo ids-child-ran" })),
+                ),
+                (child("IDS-CHILD"), says("ids child done")),
+                (
+                    parent("IDS-PARENT"),
+                    dispatch(json!([{ "task": "IDS-CHILD read, run, answer", "name": "carrier" }])),
+                ),
+                (parent("IDS-PARENT"), says("The child is back.")),
+            ],
+            unmatched(),
+        );
+        let mut rig = Rig::with_config(
+            "ids",
+            &{
+                let mut config = base_config(&provider);
+                config.push_str(NO_DEFAULT_BOUNDARIES);
+                config
+            },
+            |ws| {
+                std::fs::write(ws.repo.join("ids-child.txt"), "ids child contents\n").unwrap();
+                DaemonOptions::default()
+            },
+        );
+        rig.level("guarded");
+        let response = rig.prompt("IDS-PARENT dispatch one child that reads and runs");
+        assert_eq!(response["result"]["stop_reason"], "end_turn", "{response}");
+        let client = &rig.client;
+
+        let started = client.events_named("agent_child_started")[0].clone();
+        let pair = (
+            started["child_id"].clone(),
+            started["parent_turn_id"].clone(),
+        );
+        assert!(
+            pair.0.is_string() && pair.1.is_string(),
+            "agent_child_started names both: {started}"
+        );
+        let child_id = pair.0.as_str().unwrap_or_default().to_owned();
+        assert_eq!(finished_status(client, &child_id), "completed");
+
+        // Every carrier's pair, by carrier.
+        let tool_events: Vec<(Value, Value)> = client
+            .events_named("session_update")
+            .into_iter()
+            .filter(|e| {
+                e.get("child_id").is_some()
+                    && matches!(
+                        e["update"]["kind"].as_str(),
+                        Some("tool_call" | "tool_call_update")
+                    )
+            })
+            .map(|e| (e["child_id"].clone(), e["parent_turn_id"].clone()))
+            .collect();
+        let asks: Vec<(Value, Value)> = client
+            .events_named("permission_request")
+            .into_iter()
+            .map(|e| (e["child_id"].clone(), e["parent_turn_id"].clone()))
+            .collect();
+        let rows: Vec<(Value, Value)> = spend::cost_rows(client, &rig.session)
+            .into_iter()
+            .filter(|(_, r)| r.get("child_id").is_some())
+            .map(|(_, r)| (r["child_id"].clone(), r["parent_turn_id"].clone()))
+            .collect();
+
+        // Non-vacuity: the counts the fixture implies.
+        assert_eq!(
+            tool_events.len(),
+            4,
+            "read and shell, each started and finished: {:?}",
+            client.event_names()
+        );
+        assert_eq!(
+            asks.len(),
+            1,
+            "the shell asked, once: {:?}",
+            client.event_names()
+        );
+        assert_eq!(
+            rows.len(),
+            child_requests(&provider, "IDS-CHILD").len(),
+            "one ledger row per remote call the child made"
+        );
+        assert_eq!(rows.len(), 3, "fixture: three child calls");
+
+        for (carrier, pairs) in [
+            ("session_update", &tool_events),
+            ("permission_request", &asks),
+            ("cost_recorded", &rows),
+        ] {
+            for got in pairs {
+                assert_eq!(
+                    got, &pair,
+                    "{carrier} names the child exactly as agent_child_started did"
+                );
+            }
+        }
+
+        // And the turn is the parent's own: its ledger rows roll up under the
+        // same `parent_turn_id`, with no child.
+        let parent_turns: Vec<Value> = spend::cost_rows(client, &rig.session)
+            .into_iter()
+            .filter(|(_, r)| r.get("child_id").is_none())
+            .map(|(_, r)| r["parent_turn_id"].clone())
+            .collect();
+        assert!(
+            !parent_turns.is_empty() && parent_turns.iter().all(|t| *t == pair.1),
+            "the parent's own rows name the turn the child ran under: {parent_turns:?} vs {}",
+            pair.1
         );
         assert_no_boundary_bytes();
     }

@@ -3507,6 +3507,24 @@ fn parent_agent_result(dir: &std::path::Path, session: &str) -> String {
 ///   twice.
 /// - **Every report emptied**: red here at the non-vacuity check — the
 ///   parent's context no longer holds the secret.
+///
+/// REQ-623 verify — AC-11's reroute clause and BR-6's "the result's route
+/// says so" added; each mutation in a scratch copy of the source at `b6148d1`
+/// with the `yield_now` fix applied (see `agent_dispatch`'s
+/// `assert_no_late_child_events`), counted over 51 tests across this binary,
+/// `agent_dispatch` and `event_response_ordering`:
+///
+/// - **The route stamped once** (the attempt loop's `child.route.set(..)`
+///   dropped — `f2c5591`'s fix reverted in effect): 1 red, this test, at "the
+///   result names the route the child ended on" (it said `remote`).
+/// - **A silent refit** (`refit_for_reroute` publishing no
+///   `context_pressure`): 1 red, this test, at the child-stamped pressure.
+/// - **The echoed bounds drift** (`finish` echoing a context budget one byte
+///   off the stamped one): 2 red — this test at the byte-for-byte echo, and
+///   `agent_dispatch`'s `statuses::completed`.
+/// - **The task carries no provenance**: red here only at the process-global
+///   capture — this test's own per-provider check passed; the leak was
+///   [`parent_taint_carried_into_a_childs_task`]'s.
 #[test]
 fn child_local_only_read_pins_child_and_parent() {
     let provider = harness::MockProvider::start_matching(
@@ -3625,7 +3643,67 @@ fn child_local_only_read_pins_child_and_parent() {
         result.contains(harness::SECRET_SENTINEL),
         "fixture: the child's report carried the file's bytes into the parent: {result}"
     );
+
+    // AC-11 (BR-7), the reroute clause: the child's pin moved it onto the
+    // local route mid-run. The refit is loud — a `context_pressure` stamped
+    // with the child's id, inside the call — and the bounds the result echoes
+    // are the ones `agent_child_started` stamped, byte for byte.
+    let started_event = client.events()[started].clone();
+    let child_id = started_event["child_id"]
+        .as_str()
+        .expect("agent_child_started names its child")
+        .to_owned();
+    let pressure: Vec<(usize, &serde_json::Value)> = client
+        .events()
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e["event"] == "context_pressure" && e["child_id"] == child_id.as_str())
+        .collect();
+    assert!(
+        pressure
+            .iter()
+            .any(|(i, e)| *i > started && *i < call_end && e["parent_turn_id"].is_string()),
+        "the child's reroute refit was announced with its child_id, inside the call: {:?}",
+        client.event_names()
+    );
+    let child_result = agent_result_entry(&result, "reader");
+    assert_eq!(
+        serde_json::to_string(&child_result["bounds"]).unwrap(),
+        serde_json::to_string(&started_event["bounds"]).unwrap(),
+        "the result echoes the stamped bounds byte for byte, across the reroute"
+    );
+    // BR-6: "a child whose context touches local-only provenance routes local
+    // regardless of the request, and the result's route says so".
+    assert_eq!(
+        started_event["route"]["provider_id"], "remote",
+        "fixture: the child started on the remote route: {started_event}"
+    );
+    assert_ne!(
+        child_result["route"]["provider_id"], started_event["route"]["provider_id"],
+        "the result names the route the child ended on, not the one it started on: \
+         {child_result}"
+    );
+    assert_eq!(
+        child_result["route"]["provider_id"], "local",
+        "and that route is local: {child_result}"
+    );
+    harness::assert_no_secret_in("the remote provider", &provider.requests());
     harness::assert_no_boundary_bytes();
+}
+
+/// The entry named `name` in an `agent` result's JSON array, as the parent's
+/// transcript recorded it (the tool's raw output: one `ChildResult` per task).
+fn agent_result_entry(output: &str, name: &str) -> serde_json::Value {
+    let start = output.find('[').expect("an agent result is a JSON array");
+    let end = output.rfind(']').expect("an agent result is a JSON array");
+    let entries: Vec<serde_json::Value> = serde_json::from_str(&output[start..=end])
+        .unwrap_or_else(|e| {
+            panic!("the agent result parses as JSON ({e}): {output}");
+        });
+    entries
+        .into_iter()
+        .find(|entry| entry["name"] == name)
+        .unwrap_or_else(|| panic!("no result named {name}: {output}"))
 }
 
 /// **REQ-623 BR-9, the benign twin: a child that touches no boundary leaves
@@ -3640,6 +3718,13 @@ fn child_local_only_read_pins_child_and_parent() {
 /// Mutation (run 2026-10-07, reverted): **every result block pins** (its
 /// boundary bit forced on): red here directly — the parent's next call is
 /// blocked — among 16 across the three binaries.
+///
+/// REQ-623 verify: the per-provider `assert_no_secret_in` beside the global
+/// capture is what tells a leak of this test's own from a cascade. Under the
+/// task-carries-no-provenance mutation (see
+/// [`parent_taint_carried_into_a_childs_task`]) this test went red — but at
+/// the process-global capture, with its own provider's check passing: the
+/// leak was that test's, and this red is the cascade, not a finding.
 #[test]
 fn child_without_boundary_touch_does_not_pin_parent() {
     let provider = harness::MockProvider::start_matching(
@@ -3715,5 +3800,213 @@ fn child_without_boundary_touch_does_not_pin_parent() {
         client.event_names()
     );
     assert!(client.events_named("session_pinned").is_empty());
+    // This test's own provider first, so a leak *here* reddens here — the
+    // global capture below also sees every earlier test's requests, and a
+    // leak there would otherwise be counted as this test's red too.
+    harness::assert_no_secret_in("the remote provider", &provider.requests());
+    harness::assert_no_boundary_bytes();
+}
+
+/// **REQ-623 BR-1 / BR-9, the downward direction: a parent's taint travels
+/// into the task it writes.** A parent on an *unpinned local* route reads
+/// `secrets/prod.env` — legitimately, nothing leaves the machine — and then
+/// dispatches a child whose `task` and `context` both quote the file, asking
+/// for `tier: think`, which is bound to a remote provider. The child's first
+/// call must be judged by the provenance the task was written from: blocked
+/// inside the call, naming the file, and rerouted local — so no request to the
+/// remote provider carries a byte of the file.
+///
+/// The parent's route is `build` → `local`, so the parent itself never meets
+/// an egress check; the only thing that can stop the child is the task block
+/// carrying the parent's context provenance (`CarriedTurn::detached`). A child
+/// route of `think`/`remote` in `agent_child_started` is the non-vacuity that
+/// the child really was headed off the machine; the parent's recorded
+/// `agent` call input carrying the secret is the non-vacuity that the task
+/// really held the file's bytes.
+///
+/// The leak marker is in the file's bytes and — necessarily — in the scripted
+/// **local** model's reply that quotes it into the task: that reply is what a
+/// local model which read the file writes, and it reaches no wire under a
+/// correct daemon (LESSON-624's rule is about text that reaches the provider
+/// legitimately; this text never may).
+///
+/// # Mutations (REQ-623 verify, each reverted)
+///
+/// - **The task carries no provenance** (`CarriedTurn::detached` pushing the
+///   task with an empty source set and both bits clear; run in a scratch copy
+///   of the source at `b6148d1` with the `yield_now` fix applied, counted
+///   over 51 tests across this binary, `agent_dispatch` and
+///   `event_response_ordering`): **3 red, 1 of them its own** — this test, at
+///   the per-provider check (request 0 of 1 carried the file). The AC-10 pair
+///   passed their own per-provider checks and went red only at the
+///   process-global capture this test's leak landed in: one leak, counted
+///   three times.
+/// - **Test-side: no boundary at all** (`[[boundaries]]` dropped and
+///   `disable_default_boundaries = true`, on the shared tree): red at the
+///   per-provider check — the remote provider's request 0 carried the file.
+#[test]
+fn parent_taint_carried_into_a_childs_task() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let remote = harness::MockProvider::start_matching(
+        Vec::new(),
+        harness::MockResponse::ok(harness::openai_turn("UNMATCHED-REQUEST", None, 1, 1)),
+    );
+    let ws = harness::Workspace::new("taint-down");
+    let transcripts = ws.root.join("transcripts");
+    let mut config = String::from("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n");
+    config.push_str(&harness::remote_provider_block_with_window(
+        "remote",
+        &remote.openai_endpoint(),
+        "deepseek-v4-flash",
+        128_000,
+    ));
+    config.push_str(&harness::tier_block("build", "local"));
+    config.push_str(&harness::tier_block("think", "remote"));
+    config.push_str("[[boundaries]]\npath_glob = \"secrets/**\"\nmode = \"local-only\"\n\n");
+    config.push_str(&format!(
+        "[transcript]\nenabled = true\ndir = \"{}\"\nretain_days = 0\n\n",
+        transcripts.display()
+    ));
+    ws.write_config(&config);
+    // The file's two lines, as the parent's local model quotes them.
+    let quoted = format!(
+        "API_KEY={} DATABASE_URL=postgres://prod-db.internal/main",
+        harness::SECRET_SENTINEL
+    );
+    let dispatch = serde_json::json!({
+        "tool": "agent",
+        "arguments": { "tasks": [{
+            "task": format!("TAINT-CHILD summarise this production config: {quoted}"),
+            "context": format!("The parent read secrets/prod.env; it says {quoted}"),
+            "tier": "think",
+            "name": "summariser",
+        }]},
+    });
+    let script = [
+        "Reading the production config first.\n{\"tool\": \"read\", \"arguments\": {\"path\": \"secrets/prod.env\"}}".to_owned(),
+        format!("Handing it to a child.\n{dispatch}"),
+        "The config holds one API key and one database URL.".to_owned(),
+        "The child summarised the config.".to_owned(),
+        "Nothing more to add.".to_owned(),
+    ]
+    .join("\n---\n");
+    let script = ws.write_script(&script);
+    let daemon = harness::Daemon::spawn(
+        &ws,
+        harness::DaemonOptions::default()
+            .env("TETON_PROBE_RAM_BYTES", (16 * GIB).to_string())
+            .env("TETON_PROBE_DISK_BYTES", "500000000000")
+            .env("TETON_PROBE_GPU", "apple-silicon")
+            .script(script),
+    );
+    let mut client = daemon.connect();
+    let session = client.create_session("structured", Some("implement"));
+    client.call(
+        "session/permissions",
+        serde_json::json!({ "session_id": session, "level": "full" }),
+    );
+
+    let response = client.prompt(
+        &session,
+        "TAINT-PARENT read the config and delegate a summary",
+    );
+    assert_eq!(
+        response["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "{response}\n{}",
+        daemon.log()
+    );
+    client.drain_events(std::time::Duration::from_millis(300));
+
+    // Non-vacuity, the route: the child asked for think and was routed remote.
+    let started = client
+        .event_index_from(0, |e| e["event"] == "agent_child_started")
+        .unwrap_or_else(|| panic!("the child started: {:?}", client.event_names()));
+    let started_event = client.events()[started].clone();
+    assert_eq!(
+        started_event["route"]["provider_id"], "remote",
+        "fixture: the child was headed off the machine: {started_event}"
+    );
+    assert!(
+        client.events_named("session_pinned").is_empty()
+            || client
+                .event_index_from(0, |e| e["event"] == "session_pinned")
+                .is_some_and(|i| i > started),
+        "fixture: the parent was unpinned when it dispatched: {:?}",
+        client.event_names()
+    );
+
+    // Egress: nothing of the file, and nothing of the child, left the machine.
+    harness::assert_no_secret_in("the remote provider", &remote.requests());
+    assert!(
+        requests_containing(&remote, "TAINT-CHILD").is_empty(),
+        "the child's request never reached the remote provider"
+    );
+
+    // The block: inside the call, naming the file the parent read.
+    let call_end = client
+        .event_index_from(0, |e| e["event"] == "agent_call_finished")
+        .expect("the call finished");
+    let blocks: Vec<(usize, String)> = client
+        .events()
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e["event"] == "privacy_block")
+        .map(|(i, e)| (i, e["path"].as_str().unwrap_or_default().to_owned()))
+        .collect();
+    assert!(
+        blocks
+            .iter()
+            .any(|(i, p)| *i > started && *i < call_end && p == "secrets/prod.env"),
+        "the child's first call was blocked on the parent's read: {blocks:?} {:?}",
+        client.event_names()
+    );
+
+    // Non-vacuity, the task: the parent's recorded `agent` call really carried
+    // the file's bytes in both `task` and `context`.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let input = loop {
+        let found = std::fs::read_dir(&transcripts)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().contains(session.as_str()))
+            .find_map(|path| {
+                std::fs::read_to_string(path)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .find(|r| {
+                        r["kind"] == "tool_call_input"
+                            && r["tool"] == "agent"
+                            && r.get("child_id").is_none()
+                    })
+            });
+        if let Some(record) = found {
+            break record;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the parent's agent call never reached the transcript"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    let task = &input["input"]["tasks"][0];
+    for field in ["task", "context"] {
+        assert!(
+            task[field]
+                .as_str()
+                .is_some_and(|t| t.contains(harness::SECRET_SENTINEL)),
+            "fixture: the dispatched {field} quoted the file: {task}"
+        );
+    }
+    let finished = client.events_named("agent_child_finished");
+    assert_eq!(finished.len(), 1);
+    assert_eq!(
+        finished[0]["status"], "completed",
+        "the child answered on the local tier: {}",
+        finished[0]
+    );
     harness::assert_no_boundary_bytes();
 }

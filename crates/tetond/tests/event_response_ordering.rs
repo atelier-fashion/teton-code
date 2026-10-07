@@ -504,35 +504,51 @@ fn collapsed(shapes: impl IntoIterator<Item = String>) -> Vec<String> {
 ///
 /// Written out by hand, entry by entry, and checked against what the turn
 /// does — not regenerated from a run (LESSON-569): the parent decides its
-/// route, streams its dispatch call (`tool_call` for `agent`), the tool
-/// announces the call, every child runs entirely inside the gap that follows,
-/// the call's end is announced, the `agent` tool call completes, and the
-/// parent streams its closing reply. (This in-process daemon installs no cost
-/// ledger, so no `cost_recorded` is published by parent or child; the
-/// spawned-daemon suites see those, and `agent_dispatch.rs` reads them.)
-const PARENT_GOLDEN: [&str; 6] = [
+/// route; its dispatch call streams no text (the reply is a bare tool call)
+/// and, once its stream ends, the ledger records it (`cost_recorded`); the
+/// loop starts the `agent` tool (`tool_call`), the tool announces the call,
+/// every child runs entirely inside the gap that follows, the call's end is
+/// announced, the `agent` tool call completes, the parent streams its closing
+/// reply, and the ledger records that call too.
+///
+/// **A ledger is installed** (REQ-623 verify): the daemon is built on
+/// `DaemonRuntime::from_env`, whose ledger publishes `cost_recorded` onto the
+/// session's bus. Before that this test ran on `Daemon::new()`'s minimal
+/// runtime, whose ledger sink drops every row — so a child's
+/// `cost_recorded`, the one child-scoped event that names its child inside
+/// `record` rather than at the top level, was never published here, and its
+/// exclusion from the parent's sequence was untested in the one test whose
+/// subject is that exclusion.
+const PARENT_GOLDEN: [&str; 8] = [
     "route_decided",
+    "cost_recorded",
     "session_update:tool_call",
     "agent_call_started",
     "agent_call_finished",
     "session_update:tool_call_update",
     "session_update:agent_message_chunk",
+    "cost_recorded",
 ];
 
-/// `left`'s own sequence: started, its `read` started and finished, its answer
-/// streamed, finished.
-const LEFT_GOLDEN: [&str; 5] = [
+/// `left`'s own sequence: started; its first call (a bare `read` call, no
+/// text) recorded; its `read` started and finished; its answer streamed and
+/// recorded; finished.
+const LEFT_GOLDEN: [&str; 7] = [
     "agent_child_started",
+    "cost_recorded",
     "session_update:tool_call",
     "session_update:tool_call_update",
     "session_update:agent_message_chunk",
+    "cost_recorded",
     "agent_child_finished",
 ];
 
-/// `right`'s own sequence: started, its answer streamed, finished.
-const RIGHT_GOLDEN: [&str; 3] = [
+/// `right`'s own sequence: started, its answer streamed and recorded,
+/// finished.
+const RIGHT_GOLDEN: [&str; 4] = [
     "agent_child_started",
     "session_update:agent_message_chunk",
+    "cost_recorded",
     "agent_child_finished",
 ];
 
@@ -564,6 +580,13 @@ const RIGHT_GOLDEN: [&str; 3] = [
 /// - **Every result block pins**: red here as well — the parent's closing
 ///   call is blocked, and this in-process daemon has no local tier to answer
 ///   it.
+/// - **The ledger's projection drops the child** (REQ-623 verify, after the
+///   ledger was installed here: `cost_recorded` written with `child_id:
+///   None`, in a scratch copy of the source at `b6148d1` with the
+///   `yield_now` fix applied): red here — the children's rows enter the
+///   parent's sequence — among 4 across this binary, `agent_dispatch` and
+///   `provenance_egress`. Before the ledger was installed this mutation could
+///   not have reddened this test: no row was ever published.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn child_events_excluded_from_parent_golden() {
     use harness::{openai_turn, Matcher, MockProvider, MockResponse};
@@ -621,7 +644,15 @@ async fn child_events_excluded_from_parent_golden() {
 
     let path = temp_socket("ord-child");
     let listener = server::bind_listener(&path).unwrap();
-    let daemon = Arc::new(Daemon::new());
+    let state = root.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let bus = Arc::new(tetond::broadcast::EventBus::new());
+    let runtime = Arc::new(
+        tetond::runtime::DaemonRuntime::from_env(&state, &bus).expect("the daemon starts"),
+    );
+    let daemon = Arc::new(
+        Daemon::with_runtime(bus, runtime).with_daemon_process(server::DaemonProcess::Embedded),
+    );
     let server_task = tokio::spawn(server::serve(listener, daemon));
     let mut client = TestClient::connect(&path).await;
     client.handshake().await;
