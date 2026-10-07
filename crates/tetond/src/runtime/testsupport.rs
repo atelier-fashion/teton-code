@@ -186,6 +186,7 @@ pub(crate) async fn turn_registry(
         child_id: teton_protocol::agent::ChildId::new("call-1", "c"),
         parent_turn_id: turn_id.clone(),
         max_turns: 12,
+        budget: crate::harness::HarnessConfig::default().budget,
         spend: crate::cost::ChildSpend::new(
             teton_protocol::agent::ChildId::new("call-1", "c"),
             crate::cost::SharePool::new(None, &[]),

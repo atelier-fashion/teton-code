@@ -1019,6 +1019,39 @@ fn budget_of(
     }
 }
 
+impl RouteBudget {
+    /// This budget held to `stamp` — or `None` when it already sits inside the
+    /// stamp in both currencies (REQ-623 BR-7).
+    ///
+    /// A child's context budget is stamped once, before its first model call,
+    /// and a reroute to a wider window must not raise it: the bound the parent
+    /// was told is the bound the child runs under. The pair takes the smaller
+    /// figure in each currency, and the `digest` thresholds and the notes cap
+    /// are re-derived from the held pair by the two functions every
+    /// constructor here uses, so the held budget cannot disagree with itself.
+    /// The window, its label, the bound and the provider stay this route's:
+    /// they say whose window the child is now in, and the stamp is a cap
+    /// within it.
+    #[must_use]
+    pub fn held_to(&self, stamp: &RouteBudget) -> Option<RouteBudget> {
+        if self.budget_tokens <= stamp.budget_tokens && self.budget_bytes <= stamp.budget_bytes {
+            return None;
+        }
+        let budget_tokens = self.budget_tokens.min(stamp.budget_tokens);
+        let budget_bytes = self.budget_bytes.min(stamp.budget_bytes);
+        let (digest_threshold_tokens, digest_threshold_bytes) =
+            digest_thresholds(budget_tokens, budget_bytes);
+        Some(RouteBudget {
+            budget_tokens,
+            budget_bytes,
+            digest_threshold_tokens,
+            digest_threshold_bytes,
+            repo_context_cap: repo_context_cap(budget_bytes),
+            ..self.clone()
+        })
+    }
+}
+
 /// The default pair with the given bound and label — [`derive`]'s
 /// `DefaultUnknown` arm, and since REQ-590 that arm alone.
 /// The label and its id arrive as one value from [`labelled_provider`], so this

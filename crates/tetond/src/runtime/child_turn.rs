@@ -298,6 +298,9 @@ impl Work {
             child_id: spec.child_id.clone(),
             parent_turn_id: turns.parent_turn_id.clone(),
             max_turns,
+            // BR-7: the budget the bounds below stamp, before the assemble
+            // stage or any reroute can touch the route.
+            budget: route.budget.clone(),
             spend: spend.clone(),
             model_calls,
             route: route_cell.clone(),
@@ -1265,6 +1268,292 @@ mod tests {
         );
     }
 
+    // ---- BR-7 across a reroute ---------------------------------------------
+
+    /// A loopback OpenAI-compatible vendor answering each request with the
+    /// next scripted response, whole — a streamed turn or a bare status — and
+    /// `503` once the script runs out. It keeps every request body it read.
+    struct Vendor {
+        url: String,
+        bodies: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Vendor {
+        fn serve(responses: Vec<String>) -> Self {
+            use std::io::Write as _;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a mock vendor");
+            let url = format!(
+                "http://{}/v1/chat/completions",
+                listener.local_addr().expect("the vendor's address")
+            );
+            let bodies = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&bodies);
+            let mut script = VecDeque::from(responses);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { break };
+                    let body = read_whole_request(&mut stream);
+                    seen.lock().unwrap().push(body);
+                    let response = script.pop_front().unwrap_or_else(|| vendor_status(503));
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+            });
+            Self { url, bodies }
+        }
+
+        /// How many of the child's own turn requests the vendor read: those
+        /// carrying its task beside a system prompt. A duty the child's tools
+        /// raise (one fired here after the reroute) may quote the task too,
+        /// but it is sent as a single user message.
+        fn turn_requests_carrying(&self, task: &str) -> usize {
+            self.bodies
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|body| body.contains(task) && body.contains(r#""role":"system""#))
+                .count()
+        }
+    }
+
+    /// Read one request — head, then exactly `Content-Length` body bytes — so
+    /// the vendor never answers (and closes) before the client has finished
+    /// sending, which a client reports as a transport failure. Returns the
+    /// body as text.
+    fn read_whole_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read as _;
+        let mut seen = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let Ok(n) = stream.read(&mut chunk) else {
+                return String::new();
+            };
+            if n == 0 {
+                return String::new();
+            }
+            seen.extend_from_slice(&chunk[..n]);
+            let Some(end) = seen.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&seen[..end]).to_ascii_lowercase();
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while seen.len() - (end + 4) < length {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => seen.extend_from_slice(&chunk[..n]),
+                }
+            }
+            return String::from_utf8_lossy(&seen[end + 4..]).into_owned();
+        }
+    }
+
+    /// A whole HTTP response carrying one streamed turn that calls `read`.
+    fn vendor_read_call(id: &str, path: &str) -> String {
+        let call = serde_json::json!({
+            "choices": [{ "delta": { "tool_calls": [{
+                "index": 0,
+                "id": id,
+                "function": {
+                    "name": "read",
+                    "arguments": serde_json::json!({ "path": path }).to_string()
+                }
+            }]}}]
+        });
+        let finish =
+            serde_json::json!({ "choices": [{ "delta": {}, "finish_reason": "tool_calls" }] });
+        let usage = serde_json::json!({ "usage": { "prompt_tokens": 10, "completion_tokens": 5 } });
+        let body = format!("data: {call}\n\ndata: {finish}\n\ndata: {usage}\n\ndata: [DONE]\n\n");
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// A whole HTTP response with `status` and a small JSON error body.
+    fn vendor_status(status: u16) -> String {
+        let body = r#"{"error":{"message":"scripted"}}"#;
+        format!(
+            "HTTP/1.1 {status} Scripted\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// A remote provider declaring a small window at `vendor`, bound to every
+    /// tier with the local tier as its fallback.
+    fn falling_back_config(vendor: &Vendor) -> Config {
+        Config {
+            providers: vec![
+                ModelProvider {
+                    id: "small".to_owned(),
+                    kind: ProviderKind::OpenaiCompatible,
+                    endpoint: Some(vendor.url.clone()),
+                    model: Some("small-1".to_owned()),
+                    auth_ref: None,
+                    allow_cleartext: false,
+                    capabilities: ProviderCapabilities {
+                        max_context: 8_000,
+                        ..ProviderCapabilities::default()
+                    },
+                },
+                ModelProvider {
+                    id: "local".to_owned(),
+                    kind: ProviderKind::Local,
+                    endpoint: None,
+                    model: None,
+                    auth_ref: None,
+                    allow_cleartext: false,
+                    capabilities: ProviderCapabilities::default(),
+                },
+            ],
+            tiers: Tier::ALL
+                .iter()
+                .map(|tier| TierBinding {
+                    tier: *tier,
+                    provider_id: "small".to_owned(),
+                    fallback_id: Some("local".to_owned()),
+                })
+                .collect(),
+            ..Config::default()
+        }
+    }
+
+    /// The vendor's script: two `read` calls, then `422` — a client error the
+    /// router falls back on.
+    fn two_calls_then_a_fallback() -> Vendor {
+        Vendor::serve(vec![
+            vendor_read_call("call-a", "notes.txt"),
+            vendor_read_call("call-b", "notes.txt"),
+            vendor_status(422),
+        ])
+    }
+
+    /// **BR-7 across a reroute: a child moved to a new route mid-run keeps
+    /// the bounds it was stamped with** — no more model calls than the
+    /// stamped `max_turns` in total, and a context budget never wider than the
+    /// stamped one.
+    ///
+    /// The child is routed to a remote provider declaring a small window
+    /// (floored to 50,000 bytes — the stamp), which serves two `read` calls
+    /// and then answers `422`. The fallback is the local tier, whose own
+    /// budget is wider (asserted). The local engine opens with ~52 KB of prose
+    /// — over the stamp, inside the local budget — and keeps calling tools.
+    ///
+    /// - **Turns**: the stamp is 4 and the remote served 2, so the local
+    ///   attempt has 2 left. `turns_used` is 4 and the child ends
+    ///   `turns_exhausted`.
+    /// - **Budget**: every `context_pressure` the child publishes is fitted to
+    ///   at most the stamp, and one is — the local attempt's gate cutting the
+    ///   52 KB reply to it, which a local-wide budget would have let stand.
+    ///
+    /// "None left" — a reroute after the stamp is spent — is not reachable
+    /// here: a reroute follows a failed call, a failed call is not counted, and
+    /// the loop stops at the stamp before making one. `hold_to_bounds`'s own
+    /// test pins that arithmetic.
+    ///
+    /// # Mutations (run 2026-10-07, each reverted)
+    ///
+    /// - **Restart the turn count per attempt** (`hold_to_bounds` taking
+    ///   `made` as 0): 2 reds of the 69 tests matching `child` — this one at
+    ///   `turns_used` (6 against a stamp of 4), and `hold_to_bounds`' own
+    ///   test.
+    /// - **Let the budget follow the route** (the `held_to` clamp skipped):
+    ///   2 reds of 69 — this one at the budget assertion (the reroute's refit
+    ///   announces the local tier's 63,488 bytes, past the 50,000 stamped),
+    ///   and `hold_to_bounds`' own test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rerouted_child_keeps_its_stamped_bounds() {
+        const TASK: &str = "REROUTE-TASK-MARKER: read the notes, repeatedly";
+        let vendor = two_calls_then_a_fallback();
+        let rig = Rig::with_config("child-reroute-bounds", true, falling_back_config(&vendor));
+        std::fs::write(rig.root.join("notes.txt"), "notes\n").unwrap();
+        let read = call("read", serde_json::json!({ "path": "notes.txt" }));
+        rig.engine
+            .say(&format!("{} {read}", "lorem ".repeat(52_000 / 6)));
+        for _ in 0..6 {
+            rig.engine.say(&read);
+        }
+        let mut sub = rig.events.subscribe(8192);
+        let spec = ChildSpec {
+            max_turns: 4,
+            ..rig.spec("rerouted", TASK)
+        };
+        let child_id = spec.child_id.clone();
+
+        let outcome = rig.dispatcher().run_child(spec).await;
+
+        let bounds = outcome
+            .result
+            .bounds
+            .expect("a routed child echoes its bounds");
+        let router = rig.runtime.turn_router(&rig.config, &rig.session_id);
+        let local = router.budget_for(Some("local"));
+        assert_eq!(bounds.max_turns, 4, "{outcome:?}");
+        assert!(
+            local.budget_bytes as u64 > bounds.context_budget_bytes,
+            "non-vacuity: the fallback's own budget ({}) is wider than the stamp ({})",
+            local.budget_bytes,
+            bounds.context_budget_bytes
+        );
+        assert_eq!(
+            vendor.turn_requests_carrying("REROUTE-TASK-MARKER"),
+            3,
+            "non-vacuity: the remote served two of the child's calls and failed the third"
+        );
+        assert_eq!(
+            outcome
+                .result
+                .route
+                .as_ref()
+                .map(|r| r.provider_id.0.as_str()),
+            Some("local"),
+            "non-vacuity: the child was moved to the fallback"
+        );
+
+        assert_eq!(
+            outcome.status(),
+            ChildStatus::TurnsExhausted,
+            "{:?}",
+            outcome.result
+        );
+        assert!(
+            outcome.result.turns_used <= bounds.max_turns,
+            "a reroute let the child make {} calls against a stamp of {}",
+            outcome.result.turns_used,
+            bounds.max_turns
+        );
+        assert_eq!(outcome.result.turns_used, 4);
+        assert_eq!(
+            rig.engine.prompts().len(),
+            2,
+            "the local attempt had the two turns the remote left it"
+        );
+
+        let pressured: Vec<teton_protocol::events::ContextPressure> = drained(&mut sub)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::ContextPressure(cp) if cp.child_id.as_ref() == Some(&child_id) => Some(cp),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            pressured
+                .iter()
+                .all(|cp| cp.budget_bytes <= bounds.context_budget_bytes),
+            "the child's context was fitted past its stamped budget: {pressured:#?}"
+        );
+        assert!(
+            pressured.iter().any(|cp| cp.budget_bytes == bounds.context_budget_bytes
+                && cp.dropped_blocks + cp.elided_bytes > 0),
+            "non-vacuity: the local attempt's gate cut the 52 KB reply to the stamp: {pressured:#?}"
+        );
+    }
+
     // ---- BR-9 / ADR-8 -----------------------------------------------------
 
     /// **BR-9 / ADR-8: the outcome carries the union of everything the child's
@@ -1790,6 +2079,7 @@ mod tests {
             child_id,
             parent_turn_id: TurnId::from("turn-parent"),
             max_turns: 12,
+            budget: crate::harness::HarnessConfig::default().budget,
             spend: rig.spec("x", "x").spend,
             model_calls: Arc::new(AtomicU32::new(0)),
             route: ChildRouteCell::default(),

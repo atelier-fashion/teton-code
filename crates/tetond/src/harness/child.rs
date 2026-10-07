@@ -289,10 +289,12 @@ pub struct ChildTurn {
     pub child_id: ChildId,
     /// The prompt turn it runs under.
     pub parent_turn_id: TurnId,
-    /// The stamped `max_turns` bound — re-applied to every attempt's route,
-    /// because a reroute swaps in the new provider's profile and must never
-    /// raise the bound (BR-7).
+    /// The stamped `max_turns` bound — the child's whole run, across every
+    /// attempt (BR-7). See [`Self::hold_to_bounds`].
     pub max_turns: u32,
+    /// The stamped context budget — `ChildBounds.context_budget_bytes` is its
+    /// byte half. A reroute is held to it (BR-7, [`Self::hold_to_bounds`]).
+    pub budget: RouteBudget,
     /// The child's spend wiring (ADR-4) — every choke point the child's calls
     /// go through is built with it.
     pub spend: ChildSpend,
@@ -309,6 +311,27 @@ pub struct ChildTurn {
     /// the reason [`Self::model_calls`] is: a child that times out or is
     /// cancelled mid-reroute never returns its route.
     pub route: ChildRouteCell,
+}
+
+impl ChildTurn {
+    /// Hold a route the child is being moved to after stamping — a privacy
+    /// pin, a fallback, a retry — to the bounds it was stamped with (BR-7).
+    ///
+    /// A reroute starts the loop's own turn count at zero and brings the new
+    /// provider's profile and budget, so without this a rerouted child could
+    /// run past its stamped `max_turns` and in a wider context than the parent
+    /// was told. So the new attempt gets only the turns the child has **left**
+    /// — the stamp less the model calls already made, which may be zero, and
+    /// then the loop ends `turns_exhausted` at its first check without making
+    /// a call — and a budget no wider than the stamped one in either currency.
+    pub fn hold_to_bounds(&self, harness: &mut HarnessConfig, budget: &mut RouteBudget) {
+        let made = self.model_calls.load(Ordering::Relaxed);
+        harness.max_turns = harness.max_turns.min(self.max_turns.saturating_sub(made));
+        if let Some(held) = budget.held_to(&self.budget) {
+            *harness = harness.clone().with_route_budget(held.clone());
+            *budget = held;
+        }
+    }
 }
 
 /// Where a child's current route is kept — see [`ChildTurn::route`].
@@ -1111,5 +1134,95 @@ mod tests {
         assert_eq!(calls.gate_refusal().as_deref(), Some("gate_denied:skill"));
         calls.note_ran(); // a later call that did run
         assert_eq!(calls.gate_refusal(), None);
+    }
+
+    /// **BR-7: a route a child is moved to gets only the turns it has left,
+    /// and a budget no wider than the stamp** — `hold_to_bounds`' arithmetic,
+    /// including the "none left" end the attempt loop cannot be driven to
+    /// (a reroute follows a failed call, which is not counted, so the stamp is
+    /// never spent when one happens): zero turns, which the loop's first check
+    /// ends `turns_exhausted` before any call.
+    ///
+    /// The stamp is a local derivation and the new route a wider remote one,
+    /// both built by `derive` here; the expected thresholds are not re-derived
+    /// from the subject but read off the stamp, whose pair the held budget
+    /// must equal.
+    ///
+    /// Benign: a route already inside the stamp is left exactly as it was.
+    ///
+    /// Mutations (run 2026-10-07, each reverted — 2 reds of the 69 tests
+    /// matching `child` apiece, this one and
+    /// `a_rerouted_child_keeps_its_stamped_bounds`): `saturating_sub(made)`
+    /// dropped (the stamp re-applied whole, today's pre-fix behaviour) reddens
+    /// this at its first assertion; the `held_to` clamp skipped, at the
+    /// budget pair.
+    #[test]
+    fn a_rerouted_attempt_is_held_to_what_the_child_has_left() {
+        use super::super::budget::{derive, BudgetInputs};
+        let stamp = derive(BudgetInputs::local());
+        let wider = derive(BudgetInputs {
+            window: 200_000,
+            cap: 0,
+            reservation: 4_096,
+            is_local: false,
+            redact_scan: false,
+            provider_id: Some("wide"),
+            local_window: 0,
+        });
+        assert!(
+            wider.budget_bytes > stamp.budget_bytes && wider.budget_tokens > stamp.budget_tokens,
+            "non-vacuity: the new route is wider in both currencies"
+        );
+        let child = ChildTurn {
+            child_id: ChildId::new("call-1", "held"),
+            parent_turn_id: TurnId::from("turn-1"),
+            max_turns: 5,
+            budget: stamp.clone(),
+            spend: ChildSpend::new(
+                ChildId::new("call-1", "held"),
+                crate::cost::SharePool::new(None, &[]),
+                None,
+            ),
+            model_calls: Arc::new(AtomicU32::new(3)),
+            route: ChildRouteCell::default(),
+        };
+
+        let mut harness = HarnessConfig::default().with_route_budget(wider.clone());
+        harness.max_turns = 40;
+        let mut budget = wider.clone();
+        child.hold_to_bounds(&mut harness, &mut budget);
+        assert_eq!(harness.max_turns, 2, "5 stamped, 3 made");
+        assert_eq!(
+            (budget.budget_tokens, budget.budget_bytes),
+            (stamp.budget_tokens, stamp.budget_bytes)
+        );
+        assert_eq!(
+            (
+                budget.digest_threshold_tokens,
+                budget.digest_threshold_bytes
+            ),
+            (stamp.digest_threshold_tokens, stamp.digest_threshold_bytes),
+            "the thresholds follow the held pair"
+        );
+        assert_eq!(
+            harness.budget, budget,
+            "the harness runs under the held budget"
+        );
+        assert_eq!(harness.context_budget_bytes, stamp.budget_bytes);
+        assert_eq!(
+            budget.provider_id.as_deref(),
+            Some("wide"),
+            "still the new route's window"
+        );
+
+        // None left.
+        child.model_calls.store(5, Ordering::Relaxed);
+        let mut harness = HarnessConfig::default();
+        let mut budget = stamp.clone();
+        child.hold_to_bounds(&mut harness, &mut budget);
+        assert_eq!(harness.max_turns, 0);
+
+        // Benign: inside the stamp, untouched.
+        assert_eq!(stamp.held_to(&wider), None);
     }
 }

@@ -233,6 +233,30 @@ pub(super) struct AttemptState {
     pub(super) finished: Option<crate::harness::TurnOutcome>,
 }
 
+impl AttemptState {
+    /// Move the turn to `next`, handing back the budget it is leaving — the
+    /// one move both reroute arms make.
+    ///
+    /// A child's new route is held to its stamped bounds here (REQ-623 BR-7,
+    /// [`crate::harness::ChildTurn::hold_to_bounds`]): the turns it has left and a context
+    /// budget no wider than the stamp. Here rather than at the top of the next
+    /// attempt, so the refit and the skill re-check that follow the move
+    /// already measure against the held budget — a refit announced at a
+    /// budget the child was never going to run under would be a
+    /// `context_pressure` line that lies.
+    fn reroute(
+        &mut self,
+        next: crate::router::Route,
+        child: Option<&crate::harness::ChildTurn>,
+    ) -> crate::harness::RouteBudget {
+        let previous = std::mem::replace(&mut self.route, next).budget;
+        if let Some(child) = child {
+            child.hold_to_bounds(&mut self.route.harness, &mut self.route.budget);
+        }
+        previous
+    }
+}
+
 /// What the routing stage decides, before any `TurnContext` exists.
 ///
 /// A parameter bundle carried across the pivot. It cannot *be* a `TurnContext`
@@ -1740,14 +1764,13 @@ impl DaemonRuntime {
             // moving. The child's route rides `agent_child_started` and its
             // result instead (see `harness::child`).
             //
-            // And its turn cap is re-applied on every attempt: a reroute swaps in
-            // the new provider's profile, and BR-7 says the stamped bound is
-            // never raised. The route it is about to run on is recorded for its
-            // result (BR-6) — a reroute moved it, and the result reports where
-            // the child ended up, not where it started.
+            // The route it is about to run on is recorded for its result
+            // (BR-6) — a reroute moved it, and the result reports where the
+            // child ended up, not where it started. (Its stamped bounds were
+            // applied to that route by `AttemptState::reroute`, before the
+            // refit measured against it — BR-7.)
             match tctx.child {
                 Some(child) => {
-                    st.route.harness.max_turns = st.route.harness.max_turns.min(child.max_turns);
                     if let Some(route) =
                         super::child_turn::child_route_of(&st.route, self.engine.model())
                     {
@@ -1885,11 +1908,12 @@ impl DaemonRuntime {
                     // was assembled against, so the context is re-fitted here —
                     // after the route is chosen, before the retry — rather than
                     // arriving over-window at a tier that has no fallback left.
-                    let previous = st.route.budget.clone();
-                    st.route = tctx
-                        .core
-                        .router
-                        .resolve_local_pin(reroute_after_block_reason(detail));
+                    let previous = st.reroute(
+                        tctx.core
+                            .router
+                            .resolve_local_pin(reroute_after_block_reason(detail)),
+                        tctx.child,
+                    );
                     if let Some(refusal) = skill_would_not_survive_refit(
                         &st.skill_refit,
                         inputs.typed_refit,
@@ -2136,8 +2160,7 @@ impl DaemonRuntime {
                             // degrade arrives through this arm too and is
                             // silent by construction — it keeps the failed
                             // provider's pair (see `refit_for_reroute`).
-                            let previous = st.route.budget.clone();
-                            st.route = next;
+                            let previous = st.reroute(next, tctx.child);
                             if let Some(refusal) = skill_would_not_survive_refit(
                                 &st.skill_refit,
                                 inputs.typed_refit,
@@ -2534,8 +2557,8 @@ impl DaemonRuntime {
     /// The prompt turn's attempt loop, unchanged: every reroute arm, every
     /// typed outcome, the privacy reroute that pins the remainder of a child
     /// local after a `local-only` read. What a child changes is read off
-    /// `tctx.child` inside it — no `route_decided`, the turn cap re-clamped on
-    /// every attempt, every egress on the child's spend — and the outcome the
+    /// `tctx.child` inside it — no `route_decided`, the stamped bounds held on
+    /// every reroute, every egress on the child's spend — and the outcome the
     /// success arm leaves in [`AttemptState::finished`]. A child never reaches
     /// `commit_or_abandon`: its context is dropped, not committed.
     pub(super) async fn run_child_attempts(
