@@ -100,8 +100,19 @@
   session-scoped payloads REQ-623 deliberately did not widen are **suppressed**
   in a child rather than published unstamped, because a client would read them
   as the parent's: `route_decided`, `context_compacted`, `turn_queued` and
-  `prefill_progress` (`PARENT_ONLY_EVENTS`). The `agent_*` events are the
+  `prefill_progress` (`PARENT_ONLY_EVENTS`, asked through the one predicate
+  `is_parent_only` by every suppression site). The `agent_*` events are the
   parent's news and go out on the parent's own emitter, which stamps nothing.
+  *Verify additions (2026-10-07):* a child's **route** is a `ChildRouteCell`
+  on its `ChildTurn`, rewritten at the top of every attempt, so its result
+  names the route it ended on (BR-6); a reroute holds the new route to the
+  child's **stamped bounds** before the refit measures against it —
+  `AttemptState::reroute` → `ChildTurn::hold_to_bounds`: the turns it has left
+  and a budget no wider than the stamp (BR-7); the `agent` result folds whole
+  under `ResultDisposition::UntrustedWhole` — enveloped, never digested
+  (BR-11); and `run_the_allowed_tool` **yields after every dispatch inside a
+  child**, so an abort issued while a tool blocked lands before the result is
+  used (BR-10, AC-14) — the tool is abandoned, not killed.
 - **Workflow-aware routing** — phase (spec/architect/implement/review/io)
   determines model tier via a user-visible policy table; never per-prompt
   heuristics in structured mode (BR-5).
@@ -168,6 +179,11 @@
   state of its own rather than a share of `u64::MAX`. The user-facing
   consequence, stated on the `cost` docs page: with children running, the
   prompt's overshoot bound is one in-flight call per child, not one in total.
+  *Verify (2026-10-07):* `SharePool::release` returns the `ShareRelease` it
+  divided, computed under its lock; a child timed out inside a blocking tool is
+  reported after `ABORT_GRACE` but releases only when its work task has ended
+  (`ChildTurns::release_when_ended`); and a child's choke point carries its
+  `ChildSpend` **instead of** the prompt pair — `with_child_spend` clears it.
 - **A withheld capability explains itself at the point it bites** — when a
   security decision removes something a user's command needs, the resulting
   failure names the daemon and the key that reverses it, on the failing call and
