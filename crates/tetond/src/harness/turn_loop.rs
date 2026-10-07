@@ -2309,7 +2309,15 @@ async fn run_the_allowed_tool(
     // a summary of itself, and the failure arm truncates it
     // mechanically. The decision is read off the result
     // (ADR-1), never off `name`.
-    let folded = if disposition == ResultDisposition::Expansion {
+    //
+    // **REQ-623 BR-11: so is an `agent` result.** Its reports are
+    // bounded already, loudly, and the array is typed fields the
+    // parent keys on; a digest would replace the result with a
+    // summary of it. `UntrustedWhole` is that tool's value.
+    let folded = if matches!(
+        disposition,
+        ResultDisposition::Expansion | ResultDisposition::UntrustedWhole
+    ) {
         folded
     } else {
         let outcome = summarize_if_large(
@@ -2348,7 +2356,9 @@ async fn run_the_allowed_tool(
     // by the expander that measured it.
     let folded = match disposition {
         ResultDisposition::Expansion => folded,
-        ResultDisposition::UntrustedData => frame_untrusted_builtin(name, &folded),
+        ResultDisposition::UntrustedData | ResultDisposition::UntrustedWhole => {
+            frame_untrusted_builtin(name, &folded)
+        }
         ResultDisposition::Data => {
             if UNTRUSTED_OUTPUT_TOOLS.contains(&name) {
                 frame_untrusted_builtin(name, &folded)
@@ -9230,6 +9240,75 @@ mod tests {
             expansion, big,
             "the expansion went through the `digest` duty — the model was handed \
              a summary of the procedure instead of the procedure (BR-7)"
+        );
+    }
+
+    /// **REQ-623 BR-11: an `agent` result is folded whole — framed as data,
+    /// never through the `digest` duty.**
+    ///
+    /// The body is the shape the tool returns — a JSON array of child results
+    /// — sized past the default config's **byte** threshold (asserted), with
+    /// the word threshold out of reach so the bytes alone decide. The control
+    /// leg is the same bytes as `UntrustedData`, which the duty does take; the
+    /// agent leg is `UntrustedWhole`, the value `agent`'s `result_of` sets
+    /// (its own test pins that), registered under the tool's real name.
+    ///
+    /// # Mutations (run 2026-10-07, each reverted — 1 red of the 2,319 lib
+    /// tests apiece)
+    ///
+    /// - **Digest it** (the `UntrustedWhole` arm dropped from the fold's digest
+    ///   guard): this test, at the verbatim assertion — the fold's mechanical
+    ///   fallback cuts the array mid-object.
+    /// - **The tool asks for the old value** (`result_of` setting
+    ///   `UntrustedData`): `agent`'s own `result_of` test, at its disposition.
+    #[tokio::test]
+    async fn an_agent_result_past_the_digest_threshold_is_folded_whole() {
+        let threshold = HarnessConfig::default().summarize_threshold_bytes;
+        let report = "finding ".repeat(threshold / 8 + 64);
+        let body = format!(
+            "[\n  {{\n    \"name\": \"survey\",\n    \"status\": \"completed\",\n    \
+             \"report\": \"{report}\"\n  }}\n]"
+        );
+        assert!(
+            body.len() > threshold,
+            "non-vacuity: the body ({} bytes) is past the byte threshold ({threshold})",
+            body.len()
+        );
+
+        let control = folded_result(
+            StubDispositionTool {
+                name: super::super::tools::AGENT_TOOL_NAME,
+                result: body.clone(),
+                disposition: ResultDisposition::UntrustedData,
+            },
+            usize::MAX,
+        )
+        .await;
+        assert!(
+            !control.contains(&body),
+            "the control was folded whole, so the byte threshold never fired and the \
+             agent leg below proves nothing:\n{control}"
+        );
+
+        let agent = folded_result(
+            StubDispositionTool {
+                name: super::super::tools::AGENT_TOOL_NAME,
+                result: body.clone(),
+                disposition: ResultDisposition::UntrustedWhole,
+            },
+            usize::MAX,
+        )
+        .await;
+        assert!(
+            agent.contains(&body),
+            "the agent result went through the `digest` duty — the parent was handed a \
+             summary of its children's typed results instead of the results (BR-11)"
+        );
+        assert!(
+            agent.contains("trust=\"untrusted\""),
+            "a child's report is model output about the repository and keeps the \
+             envelope:\n{}",
+            &agent[..agent.len().min(400)]
         );
     }
 

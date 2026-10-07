@@ -453,7 +453,10 @@ fn result_of(outcomes: &[ChildOutcome]) -> ToolOutcome {
     }
     ToolOutcome::ok(content)
         .with_provenance(block_provenance(&union))
-        .with_disposition(ResultDisposition::UntrustedData)
+        // BR-11: framed as data, and folded whole — never through the
+        // `digest` duty, which would hand the parent a summary of the array
+        // instead of the typed results it keys on.
+        .with_disposition(ResultDisposition::UntrustedWhole)
 }
 
 /// The children's provenance union as the result block's [`ToolProvenance`] —
@@ -1659,7 +1662,7 @@ mod tests {
             json!({ "tasks": [{ "task": "x", "name": "a" }, { "task": "y", "name": "b" }] }),
         )
         .await;
-        assert_eq!(outcome.disposition, ResultDisposition::UntrustedData);
+        assert_eq!(outcome.disposition, ResultDisposition::UntrustedWhole);
         assert_eq!(
             outcome.provenance,
             ToolProvenance::UnknownWith(std::iter::once(read).collect(), None)

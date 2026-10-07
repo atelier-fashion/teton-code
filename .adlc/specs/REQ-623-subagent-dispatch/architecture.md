@@ -83,9 +83,14 @@ No new RPC methods. The model-facing surface is one tool:
                                  "context": "string?" } ] } }
 ```
 
-The tool result is a JSON `ChildResult[]` under `ResultDisposition::UntrustedData`
+The tool result is a JSON `ChildResult[]` under `ResultDisposition::UntrustedWhole`
 — a child's report is model output about repository content and is framed
-exactly as a `read` result would be, never as instructions.
+exactly as a `read` result would be, never as instructions. *(Amended
+2026-10-07, verify: originally `UntrustedData`, which also sends an oversized
+result through the `digest` duty. The array is typed fields the parent keys
+on and each report is already bounded by BR-11's loud cut, so a fourth
+disposition — enveloped like `UntrustedData`, never condensed like
+`Expansion` — carries it whole.)*
 
 `/cost` (existing RPC) gains per-child rows nested under their parent turn;
 the CLI renders them indented. `PermissionRequest` carries the child id so

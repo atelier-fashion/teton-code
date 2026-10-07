@@ -713,6 +713,8 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 /// asks for the envelope *by value* rather than by name, which is how a tool
 /// deliberately kept out of `UNTRUSTED_OUTPUT_TOOLS` still frames those of its
 /// own results that are data. `Expansion` is never enveloped and never digested.
+/// REQ-623 added a fourth, [`UntrustedWhole`](Self::UntrustedWhole): enveloped
+/// like `UntrustedData`, never digested like `Expansion`.
 ///
 /// The default is what keeps this additive: every existing
 /// [`ToolOutcome::ok`]/[`ToolOutcome::error`] is byte-identical to what it was,
@@ -734,6 +736,19 @@ pub enum ResultDisposition {
     /// by the expander that composed the body, so the loop's job here is to fold
     /// it verbatim and keep its hands off.
     Expansion,
+    /// Data framed as untrusted whatever the tool is called — as
+    /// [`UntrustedData`](Self::UntrustedData) — and **never condensed**, as
+    /// [`Expansion`](Self::Expansion) is not: the `agent` tool's typed JSON
+    /// (REQ-623 BR-11).
+    ///
+    /// Each child's report is already cut at `agent.report_max_bytes` with a
+    /// loud, typed marker, and the array around it is fields the parent model
+    /// keys on (`status`, `refusal`, `bounds`). The `digest` duty would hand
+    /// the model a prose summary of that array, and its fallback would cut it
+    /// mid-object — either way the parent reads something that is not the
+    /// result BR-10 promised it. It is still repository-derived model output,
+    /// so the envelope stays.
+    UntrustedWhole,
 }
 
 /// The result of running a tool: text folded back into the model's context, a
