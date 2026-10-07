@@ -94,7 +94,10 @@ one pinned the session.
 
 ## Fidelity
 
-Nothing is translated: `Agent`, `Task`, `Workflow`, subagents and Claude Code
-tool names pass through with nothing behind them. A skill that invokes other
-skills now runs them, but one that dispatches subagents degrades to this one
-loop. Say so rather than pretend a step ran.
+Nothing is translated: a body reaches you as written, Claude Code's tool names
+included. A skill that invokes other skills now runs them, through `skill`. One
+that dispatches subagents (`Agent`, `Task`, `subagent_type`) does it through the
+`agent` tool when that tool is listed — `teton_docs commands` describes it —
+with the role written into the task, because agent definitions are not loaded.
+`Workflow`, background agents and per-agent worktrees still have nothing behind
+them. Say so rather than pretend a step ran.

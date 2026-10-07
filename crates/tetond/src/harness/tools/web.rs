@@ -2400,6 +2400,16 @@ mod tests {
     /// history expansion all pin and none of them was named — for a net 7
     /// bytes on both shapes. Re-measured, not reasoned.)*
     ///
+    /// **Recorded headroom at REQ-623:** `worst` **17,669**, `spent`
+    /// **24,017**, margin **559**, down 202 from REQ-620's 761, with
+    /// `REDACT_BODY_OVERHEAD_BYTES` unmoved at 24 KiB and the floor unmoved at
+    /// 48. Both shapes pay the same 202: the guide's capability line gains the
+    /// sentence naming the `agent` tool beside `skill` (TASK-431). This shape
+    /// stays the looser of the two by the same 47 B. **This sweep does not
+    /// register the `agent` tool's own docs**, which every prompt turn with
+    /// `agent.enabled` carries; `egress::redact`'s twin of this paragraph says
+    /// what that leaves unmeasured.
+    ///
     /// **Mutation run for REQ-612:** dropping `repo_context` from the config
     /// rows below turns this red at the block self-check, naming the reason,
     /// rather than quietly re-pinning the margin of a prompt no session with a

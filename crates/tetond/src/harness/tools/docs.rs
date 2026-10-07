@@ -620,6 +620,15 @@ mod tests {
     /// limit and is this REQ's entire subject: `/proceed` reaching its first
     /// gate is the reason the tool exists. What still degrades is a skill that
     /// dispatches subagents, and the topic keeps saying so.
+    ///
+    /// **REQ-623 moved the second needle (TASK-431, LESSON-570).** "One that
+    /// dispatches subagents degrades to this one loop" was true when REQ-587
+    /// shipped and false once the `agent` tool landed: a skill's `Agent` /
+    /// `Task` dispatch now reaches child turns. The stale phrase is asserted
+    /// absent and the replacement present — conditional on the tool being
+    /// listed, because `[agent] enabled = false` removes it. Mutation
+    /// (2026-10-07): restoring the REQ-587 sentence in `skills.md` → red on the
+    /// stale-claim check; deleting the replacement → red on the needle.
     #[test]
     fn the_skills_topic_does_not_say_a_skill_invoking_skill_stalls() {
         let topic = skills_topic();
@@ -638,11 +647,22 @@ mod tests {
             "invokes other skills now runs them",
             "a skill whose phases are skill invocations reaches them (BR-1)",
         );
-        assert_states(
+        assert_no_stale_claim(
             &topic,
             "dispatches subagents degrades",
+            "REQ-623's `agent` tool runs a skill's subagent dispatch as child turns",
+        );
+        assert_states(
+            &topic,
+            "does it through the `agent` tool when that tool is listed",
+            "a skill's subagent dispatch maps onto the `agent` tool, and only where the \
+             session lists it (REQ-623 BR-14)",
+        );
+        assert_states(
+            &topic,
+            "still have nothing behind them",
             "what genuinely still degrades is named, so the model does not pretend a \
-             subagent step ran",
+             step ran",
         );
     }
 

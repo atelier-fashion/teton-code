@@ -26,14 +26,17 @@ the default and it is not a mistake to be corrected.
 
 The scope is **one prompt**, not a session, a day or a month. Each new prompt
 starts from zero; the total is everything that prompt causes, across its
-retries, its fallbacks to another provider, and the duties it runs.
+retries, its fallbacks to another provider, the duties it runs, and the child
+turns its `agent` calls start.
 
 The check happens **between calls**, and this is the part worth reading
 carefully. What a call will cost cannot be known before the model has written
 its reply, so Teton cannot decline a call for being too expensive. It can only
 refuse to start the *next* one once the ceiling has been reached. A prompt can
 therefore finish slightly over the number set — by at most the cost of
-one call: the one that was already in flight. A ceiling of `$5.00` is a promise to
+one call: the one that was already in flight. While an `agent` call runs, each
+child spends from its own share of what is left under the same rule, so the
+bound is one call per child running at once. A ceiling of `$5.00` is a promise to
 stop at $5.00, not a promise never to exceed it.
 
 Two things the ceiling deliberately does not do:

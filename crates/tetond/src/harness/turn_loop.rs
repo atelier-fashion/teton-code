@@ -6695,6 +6695,174 @@ mod tests {
         );
     }
 
+    /// **REQ-623 BR-14 / TASK-431: the resident prompt names the `agent` tool
+    /// beside `skill`, conditionally, and outside the built-in commands clause.**
+    ///
+    /// The vendored ADLC skills phrase dispatch in another harness's vocabulary
+    /// — "the Agent tool", `subagent_type` — and the spec's Assumption is that
+    /// the model maps that phrasing onto `agent { tasks }` from this sentence
+    /// and the tool's schema alone. So the sentence is the one resident place
+    /// the mapping is written down, and it says the four things a model needs
+    /// before it hands work away: the work runs in **concurrent child turns**,
+    /// each starts from a **fresh context**, each runs at **this session's
+    /// permissions**, and their **reports** come back.
+    ///
+    /// # Why the sentence opens on a condition
+    ///
+    /// The guide is one static file resident in every turn, and the `agent`
+    /// tool is not: `agent.enabled = false` leaves it out of the registry
+    /// (BR-14), and a child's registry never holds it (BR-2) while the child's
+    /// system prompt is the session's, guide included. A sentence that said
+    /// "you can dispatch children" would be false in both of those prompts —
+    /// LESSON-570's defect, a capability claim true of one build shape and not
+    /// the other. "When the `agent` tool is listed" is true in all three, and
+    /// the tool list directly below the guide is what answers it.
+    ///
+    /// # Where it sits, and the benign half
+    ///
+    /// On the capability line, after the `skill` clause and **before** `The
+    /// built-in commands are `: `agent` is a tool, not a `/command`, so it must
+    /// not join the list
+    /// `the_resident_prompt_names_every_command_family_the_roster_carries`
+    /// reads — that guard would refuse a non-`/` token, and a model reading the
+    /// list would tell the user to type `/agent`. The benign half asserts the
+    /// list carries no `agent` token at all, so the REQ-617 guard and this one
+    /// agree about where the sentence may not go.
+    ///
+    /// The sentence carries no `task` either, though the schema's key is
+    /// `tasks`: the guide's one-line-about-asking rule
+    /// (`the_system_prompt_forbids_asking_for_a_credential_in_the_conversation`)
+    /// is a substring match on `ask`, and `task` contains it. The schema in the
+    /// tool docs names the key; the guide names the tool.
+    ///
+    /// # Mutations run (2026-10-07)
+    ///
+    /// Dropping the sentence from `self_config.md` → red here, on the mapping
+    /// needle, and on the two prompt-margin pins (`egress::redact` and
+    /// `tools::web`, each 202 bytes off) — three reds, and no other guide test.
+    /// Moving it after the command list's closing `;` → red here alone, on the
+    /// order assertion; the REQ-617 guard stays green, which is why this one
+    /// pins the position. Opening it unconditionally (`Your `agent` tool is
+    /// listed, …`, mapping kept) → red here alone, on the condition assertion.
+    /// Each was run and reverted.
+    #[test]
+    fn the_resident_prompt_names_the_agent_tool_beside_skill() {
+        const SKILL: &str = "only through the `skill` tool";
+        // The mapping is the needle; the condition is asserted on its own below,
+        // so an unconditional re-wording that keeps the mapping fails *there*,
+        // naming the rule it broke, rather than on a missing substring.
+        const MAPPING: &str = "`agent` tool is listed, it is what the skills call the Agent tool";
+        const OPEN: &str = "The built-in commands are ";
+
+        let line = SELF_CONFIG_GUIDE
+            .lines()
+            .find(|line| line.contains(SKILL))
+            .expect("the capability line names the `skill` tool (REQ-587 BR-8)");
+        let skill_at = line.find(SKILL).expect("found above");
+        let mapping_at = line.find(MAPPING).unwrap_or_else(|| {
+            panic!(
+                "the capability line no longer names the `agent` tool beside `skill` \
+                 (REQ-623 BR-14). Without it the model reads the skills' \"Agent tool\" \
+                 and `subagent_type` with nothing resident that maps them onto `agent`, \
+                 which is the stall REQ-587 AC-15 recorded. Restore the sentence in \
+                 crates/tetond/src/harness/self_config.md, or re-word this needle with \
+                 it.\nline: {line}"
+            )
+        });
+        // The sentence starts after the full stop that ends the one before it.
+        let agent_at = line[..mapping_at].rfind(". ").map_or(0, |stop| stop + 2);
+        let open_at = line
+            .find(OPEN)
+            .expect("the capability line carries the built-in command list (REQ-617)");
+        assert!(
+            skill_at < agent_at && agent_at < open_at,
+            "the `agent` sentence has to sit beside the `skill` clause and before \
+             `{OPEN}`: it is a tool, not a command, and inside or after the list it reads \
+             as one.\nskill at {skill_at}, agent at {agent_at}, list at {open_at}\n\
+             line: {line}"
+        );
+
+        let sentence = &line[agent_at..open_at];
+        assert!(
+            sentence.starts_with("When the `agent` tool is listed"),
+            "the `agent` sentence must open on its condition: the guide is resident \
+             where the tool is absent (`agent.enabled = false`, BR-14; every child, \
+             BR-2), and an unconditional claim is false there (LESSON-570).\n\
+             sentence: {sentence}"
+        );
+        for fact in [
+            "concurrent child turns",
+            "fresh context",
+            "this session's permissions",
+            "reports",
+        ] {
+            assert!(
+                sentence.contains(fact),
+                "the `agent` sentence no longer says `{fact}`. Each of the four is a fact \
+                 a model needs before it hands work away (REQ-623 BR-1, BR-4, BR-5, \
+                 BR-10); re-word the needle with the sentence rather than deleting \
+                 it.\nsentence: {sentence}"
+            );
+        }
+
+        // The benign half: the built-in command list is untouched by the
+        // sentence, and the sentence is resident exactly once.
+        let list = line[open_at + OPEN.len()..]
+            .split(';')
+            .next()
+            .expect("split yields at least one piece");
+        assert!(
+            !list.to_ascii_lowercase().contains("agent"),
+            "the built-in command list names `agent`, which is a tool, not a command \
+             (REQ-617's guard reads this list as `/family` tokens).\nlist: {list}"
+        );
+        let naming: Vec<&str> = SELF_CONFIG_GUIDE
+            .lines()
+            .filter(|line| line.contains("`agent`"))
+            .collect();
+        assert_eq!(
+            naming.len(),
+            1,
+            "the guide names the `agent` tool on {} lines; it is one fact, said once, \
+             on the capability line.\nlines: {naming:?}",
+            naming.len()
+        );
+
+        // LESSON-570, swept over the whole guide rather than the clause: no line
+        // may still say the model cannot hand work away.
+        let guide = SELF_CONFIG_GUIDE.to_ascii_lowercase();
+        for stale in [
+            "cannot dispatch",
+            "cannot delegate",
+            "subagents degrade",
+            "nothing behind them",
+        ] {
+            assert!(
+                !guide.contains(stale),
+                "the guide says `{stale}`, which REQ-623 made false — the `agent` tool \
+                 hands work to child turns (LESSON-570)."
+            );
+        }
+
+        // Resident in both harness shapes, and true where the tool is absent:
+        // `with_builtins` registers no `agent` tool — BR-14's off shape — and the
+        // sentence is still there, still conditional, and the roster below it
+        // does not list the tool it is conditioned on.
+        for config in [HarnessConfig::default(), HarnessConfig::for_strong_model()] {
+            let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
+            assert!(
+                system.contains(sentence),
+                "the `agent` sentence is in self_config.md but not in the built system \
+                 prompt for {config:?}"
+            );
+            assert!(
+                !system.contains("\n- agent: "),
+                "`ToolRegistry::with_builtins()` lists an `agent` tool, so this check no \
+                 longer measures the shape where the tool is absent"
+            );
+        }
+    }
+
     /// **REQ-592 AC-1 / BR-1: the prompt says where its words land, and says it
     /// once.**
     ///

@@ -585,6 +585,31 @@ pub(crate) const REDACT_ESCAPING_DIVISOR: usize = 10;
 /// *(721 / 768 / 673 until this REQ's own Phase-5 verify spent 7 more bytes on
 /// "other shell syntax".)*
 ///
+/// **REQ-623 spends 202 bytes of margin and does NOT move this constant.** One
+/// sentence on the guide's capability line, beside the `skill` clause (TASK-431):
+/// *"When the `agent` tool is listed, it is what the skills call the Agent tool:
+/// it hands work to concurrent child turns, each with a fresh context and this
+/// session's permissions, and returns their reports."* It opens on a condition
+/// because the guide is resident where the tool is not — `agent.enabled = false`
+/// (BR-14), and every child turn (BR-2). Measured, not added up: the widest
+/// prompt 17,514 → **17,716**, `spent` 23,862 → **24,064**, margin 714 →
+/// **512** on this shape and 761 → **559** on the web-enabled twin, the gap
+/// still 47. 464 bytes of usable room above the floor.
+///
+/// **What neither sweep measures yet, stated so the 512 is not trusted past what
+/// it covers:** the `agent` tool's own docs line. `register_agent_tool` puts the
+/// tool in every prompt turn's registry when `agent.enabled` — the default —
+/// cap-exempt, so its description and schema are resident exactly as the
+/// `skill` tool's are, and neither sweep registers it: the LESSON-481 shape
+/// ADR-9 closed for `skill`. Computed from its description and schema at the
+/// default caps (not measured here) it is about **1,301** bytes, more than the
+/// margin above, so a sweep that registered it would fail
+/// `spent < REDACT_BODY_OVERHEAD_BYTES` and this constant would need REQ-620's
+/// treatment — a raise and a re-derivation of the four figures below it.
+/// Recorded at TASK-431; the remedy belongs with the tool's registration
+/// (a doc-only stand-in in both sweeps, as `SkillToolDocs` is), not with a
+/// sentence of the guide.
+///
 /// `pub(crate)` because the *other* prompt shape has to clear it too and cannot
 /// be built from here: with `[web] tier` above `off` the system prompt carries
 /// the web tool's docs instead of REQ-563's BR-6 opt-in clause, and building
@@ -665,13 +690,18 @@ pub(crate) const MIN_PROMPT_HEADROOM_BYTES: usize = 48;
 /// The ledger line, and the 931 it cost every scanned route, are on
 /// [`REDACT_BODY_OVERHEAD_BYTES`].
 ///
+/// REQ-623 leaves **512**, 464 usable: 202 bytes for the guide's sentence naming
+/// the `agent` tool beside `skill` (TASK-431). The `agent` tool's own docs line
+/// is not in either sweep, so this figure overstates the room a real prompt
+/// turn has; the ledger on [`REDACT_BODY_OVERHEAD_BYTES`] says by how much.
+///
 /// # Updating it
 ///
 /// Re-measure, do not reason — that correction is what reasoning about it cost
 /// last time. Add a ledger line to [`REDACT_BODY_OVERHEAD_BYTES`] saying which
 /// REQ spent the bytes, then move this number in the same diff.
 #[cfg(test)]
-pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 714;
+pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 512;
 
 /// The same pin for the **web-enabled** prompt shape measured by
 /// `harness::tools::web::tests::the_web_tool_docs_clear_the_outbound_body_overhead`.
@@ -683,7 +713,7 @@ pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 714;
 /// holds the budget vocabulary, so the two shapes cannot come to disagree about
 /// which constant they are measuring against.
 #[cfg(test)]
-pub(crate) const RECORDED_WEB_PROMPT_MARGIN_BYTES: usize = 761;
+pub(crate) const RECORDED_WEB_PROMPT_MARGIN_BYTES: usize = 559;
 
 /// The gap between the two recorded margins, pinned (REQ-617).
 ///
