@@ -1253,6 +1253,15 @@ impl ContextConfig {
 /// `[transcript] max_record_bytes` follows).
 const MIN_AGENT_REPORT_MAX_BYTES: u64 = 1024;
 
+/// The longest `[agent] child_deadline_secs` the daemon accepts — one week
+/// (REQ-623 BR-5).
+///
+/// A child's deadline is work time, so it is a bound a user picks in minutes;
+/// a value past this is a typo, not a policy. Refused at load rather than
+/// clamped, for [`MIN_AGENT_REPORT_MAX_BYTES`]'s reason, and well inside what
+/// the runtime's clock can add to an instant.
+const MAX_AGENT_CHILD_DEADLINE_SECS: u64 = 604_800;
+
 /// Subagent dispatch (`[agent]`, REQ-623): whether the `agent` tool exists in a
 /// session at all, and the bounds every child it starts runs under.
 ///
@@ -1313,15 +1322,20 @@ pub struct AgentConfig {
 
     /// A child's whole-run wall-clock deadline, in seconds.
     ///
-    /// Defaults to `600`.
+    /// Defaults to `600`; at most [`MAX_AGENT_CHILD_DEADLINE_SECS`] (a week).
     pub child_deadline_secs: u64,
 
     /// The longest report a child hands back to its parent, in bytes
     /// (REQ-623 BR-11).
     ///
-    /// Defaults to 32 KiB, and must be at least [`MIN_AGENT_REPORT_MAX_BYTES`].
-    /// A longer report is cut at the bound with a typed marker; the full text
-    /// is in the transcript.
+    /// Defaults to 32 KiB, and must be at least [`MIN_AGENT_REPORT_MAX_BYTES`];
+    /// set to anything else, it must also be at most `[transcript]
+    /// max_record_bytes`. A longer report is cut at the bound with a typed
+    /// marker that sends the reader to the transcript for the full text — which
+    /// the transcript cuts at its own record cap, so a report bound above that
+    /// cap would point at a record cut shorter than the report itself was. The
+    /// default is not compared, so a record cap lowered before `[agent]`
+    /// existed still loads (see `validate_agent`).
     pub report_max_bytes: u64,
 }
 
@@ -2224,6 +2238,49 @@ pub enum ConfigError {
         /// The budget as written, so the user can find the line.
         bytes: u64,
     },
+
+    /// `[agent] child_deadline_secs` is longer than a week (REQ-623 BR-5).
+    #[error(
+        "[agent] child_deadline_secs = {secs} is too long; a child's deadline is the work time \
+         one child may take, and the longest accepted is 604800 (one week). The default is 600."
+    )]
+    AgentDeadlineTooLong {
+        /// The deadline as written, so the user can find the line.
+        secs: u64,
+    },
+
+    /// `[agent] max_children_per_call` is above `max_children_per_turn`
+    /// (REQ-623 BR-3): every call that used the difference would be refused
+    /// `child_cap_reached`, so the per-call figure is a cap that can never be
+    /// reached as written.
+    #[error(
+        "[agent] max_children_per_call = {per_call} is above max_children_per_turn = {per_turn}; \
+         one call can never start more children than its whole turn may, so a per-call cap \
+         above the per-turn cap is unreachable. Lower max_children_per_call or raise \
+         max_children_per_turn."
+    )]
+    AgentPerCallAbovePerTurn {
+        /// `max_children_per_call` as written.
+        per_call: u32,
+        /// `max_children_per_turn` as written.
+        per_turn: u32,
+    },
+
+    /// `[agent] report_max_bytes` is above `[transcript] max_record_bytes`
+    /// (REQ-623 BR-11): a cut report's marker says the full text is in the
+    /// transcript, and the transcript would cut it shorter than the report.
+    #[error(
+        "[agent] report_max_bytes = {bytes} is above [transcript] max_record_bytes = \
+         {record_cap}; a child's cut report points the reader at the transcript for the full \
+         text, and the transcript cuts every record at max_record_bytes. Lower \
+         report_max_bytes or raise max_record_bytes."
+    )]
+    AgentReportAboveRecordCap {
+        /// `[agent] report_max_bytes` as written.
+        bytes: u64,
+        /// `[transcript] max_record_bytes` as configured.
+        record_cap: u64,
+    },
 }
 
 impl Config {
@@ -2391,15 +2448,23 @@ impl Config {
         Ok(())
     }
 
-    /// `[agent]`'s structural check (REQ-623 BR-3, BR-11).
+    /// `[agent]`'s structural check (REQ-623 BR-3, BR-5, BR-11).
     ///
-    /// **Structure only**: every cap and the deadline at least 1, and the
-    /// report budget at least [`MIN_AGENT_REPORT_MAX_BYTES`]. It does not
-    /// compare the caps with each other — a per-turn cap below the per-call cap
-    /// is coherent (the per-turn cap binds first) — and it does not compare
+    /// **Structure only**: every cap and the deadline at least 1, the deadline
+    /// at most [`MAX_AGENT_CHILD_DEADLINE_SECS`], the report budget at least
+    /// [`MIN_AGENT_REPORT_MAX_BYTES`] and — when moved off its default — at
+    /// most the **configured** `[transcript] max_record_bytes` (not a constant:
+    /// the transcript's cap is the user's too), and the per-call cap at most
+    /// the per-turn cap (a
+    /// per-call cap above it can never be reached). It does not compare
     /// `child_max_turns` with any parent's `max_turns`, which is a runtime
     /// clamp, not a load-time rule. Keys are checked in the struct's
-    /// declaration order, and one refusal names one key.
+    /// declaration order, and one refusal names one key or one pair.
+    ///
+    /// *Amended 2026-10-07 (verify):* this used to say a per-turn cap below
+    /// the per-call cap is coherent because the per-turn cap binds first. It
+    /// binds first by refusing every call that uses the difference, which
+    /// makes the per-call figure dead — the reflector's finding.
     fn validate_agent(&self) -> Result<(), ConfigError> {
         let agent = &self.agent;
         for (key, value) in [
@@ -2418,9 +2483,35 @@ impl Config {
                 return Err(ConfigError::AgentCapZero { key });
             }
         }
+        if agent.max_children_per_call > agent.max_children_per_turn {
+            return Err(ConfigError::AgentPerCallAbovePerTurn {
+                per_call: agent.max_children_per_call,
+                per_turn: agent.max_children_per_turn,
+            });
+        }
+        if agent.child_deadline_secs > MAX_AGENT_CHILD_DEADLINE_SECS {
+            return Err(ConfigError::AgentDeadlineTooLong {
+                secs: agent.child_deadline_secs,
+            });
+        }
         if agent.report_max_bytes < MIN_AGENT_REPORT_MAX_BYTES {
             return Err(ConfigError::AgentReportBudgetTooSmall {
                 bytes: agent.report_max_bytes,
+            });
+        }
+        // Compared only when the user moved the report bound: a `[transcript]
+        // max_record_bytes` lowered below the default 32 KiB report was a valid
+        // config before `[agent]` existed, and refusing it now would make a
+        // config that loaded yesterday fatal today (conventions: validity vs
+        // usability). On such a machine a cut report's full text can be cut in
+        // the transcript too — a known gap, recorded in REQ-623's Deferred.
+        let record_cap = u64::try_from(self.transcript.max_record_bytes).unwrap_or(u64::MAX);
+        if agent.report_max_bytes != AgentConfig::default().report_max_bytes
+            && agent.report_max_bytes > record_cap
+        {
+            return Err(ConfigError::AgentReportAboveRecordCap {
+                bytes: agent.report_max_bytes,
+                record_cap,
             });
         }
         Ok(())
@@ -8281,6 +8372,98 @@ cache_ttl_secs = 60
     }
 
     // ---- REQ-623: the [agent] table (subagent dispatch) ----
+
+    /// **REQ-623 BR-3 / BR-5 / BR-11 (verify): `[agent]`'s three bounds from
+    /// above** — each refused at load naming its key (or both keys of a pair),
+    /// each valid exactly at its edge.
+    ///
+    /// - `child_deadline_secs` at most a week (604,800): past it the runtime's
+    ///   clock is asked for an instant it may not be able to name, and the
+    ///   value is a typo rather than a policy.
+    /// - `max_children_per_call` at most `max_children_per_turn`: a per-call
+    ///   cap above it can never be reached.
+    /// - `report_max_bytes`, once moved off its default, at most the
+    ///   **configured** `[transcript] max_record_bytes` — the leg that raises
+    ///   the record cap shows the bound moves with it, so it is not a constant
+    ///   65,536; and the default report beside a lowered record cap still
+    ///   loads, because that config was valid before `[agent]` existed.
+    ///
+    /// The expected figures are literals and the configs are built here; the
+    /// boundary rows (equal is valid) are the benign half.
+    ///
+    /// Mutations (run 2026-10-07, each reverted, over the 366 `teton-core` lib
+    /// tests): each of the three checks removed from `validate_agent`, and the
+    /// record-cap check compared with a constant 65,536 — 1 red apiece, this
+    /// test (the last at the raised-cap row); the default-report exemption
+    /// dropped — 3 reds, this test at the lowered-cap row and the two REQ-611
+    /// transcript tests whose fixtures lower the cap.
+    #[test]
+    fn agent_bounds_from_above_are_refused_naming_the_keys() {
+        let mut cfg = Config::default();
+        cfg.agent.child_deadline_secs = 604_800;
+        cfg.validate()
+            .expect("a week is the longest deadline, and valid");
+        cfg.agent.child_deadline_secs = 604_801;
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ConfigError::AgentDeadlineTooLong { secs: 604_801 }
+        );
+        let err = Config::load("[agent]\nchild_deadline_secs = 9223372036854775807\n")
+            .expect_err("a deadline the clock cannot add must be refused at load");
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("child_deadline_secs = 9223372036854775807"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("604800"), "{rendered}");
+
+        let mut cfg = Config::default();
+        cfg.agent.max_children_per_call = 8;
+        cfg.agent.max_children_per_turn = 8;
+        cfg.validate()
+            .expect("a per-call cap equal to the per-turn cap is valid");
+        cfg.agent.max_children_per_call = 9;
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ConfigError::AgentPerCallAbovePerTurn {
+                per_call: 9,
+                per_turn: 8
+            }
+        );
+        let err = Config::load("[agent]\nmax_children_per_call = 9\n")
+            .expect_err("a per-call cap above the default per-turn 8 must be refused");
+        let rendered = format!("{err}");
+        assert!(rendered.contains("max_children_per_call = 9"), "{rendered}");
+        assert!(rendered.contains("max_children_per_turn = 8"), "{rendered}");
+
+        let mut cfg = Config::default();
+        cfg.agent.report_max_bytes = 65_536;
+        cfg.validate()
+            .expect("a report bound equal to the default record cap is valid");
+        cfg.agent.report_max_bytes = 65_537;
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ConfigError::AgentReportAboveRecordCap {
+                bytes: 65_537,
+                record_cap: 65_536
+            }
+        );
+        cfg.transcript.max_record_bytes = 131_072;
+        cfg.validate()
+            .expect("the bound is the configured record cap, not a constant");
+        let mut lowered = Config::default();
+        lowered.transcript.max_record_bytes = 4_096;
+        lowered
+            .validate()
+            .expect("the default report beside a lowered record cap still loads");
+        let err = Config::load(
+            "[transcript]\nmax_record_bytes = 4096\n\n[agent]\nreport_max_bytes = 8192\n",
+        )
+        .expect_err("a report bound above a lowered record cap must be refused");
+        let rendered = format!("{err}");
+        assert!(rendered.contains("report_max_bytes = 8192"), "{rendered}");
+        assert!(rendered.contains("max_record_bytes = 4096"), "{rendered}");
+    }
 
     /// **REQ-623 BR-3 / TASK-422.** `[agent]` loads with the six shipped
     /// defaults when absent, stays out of a config that never named it, and

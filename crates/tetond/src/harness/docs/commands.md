@@ -138,10 +138,10 @@ how long its report may be, and your `task`.
 | key | default | bounds |
 |---|---|---|
 | `enabled` | `true` | whether the tool exists at all |
-| `max_children_per_call` | `5` | tasks in one call |
+| `max_children_per_call` | `5` | tasks in one call; at most `max_children_per_turn` |
 | `max_children_per_turn` | `8` | children one prompt turn starts, across all its calls |
 | `child_max_turns` | `12` | model calls per child, never more than your own cap |
-| `child_deadline_secs` | `600` | a child's wall clock; time waiting on the user's answer does not count |
+| `child_deadline_secs` | `600` | a child's wall clock, at most a week; time waiting on the user's answer does not count |
 | `report_max_bytes` | `32768` | the report handed back; a longer one is cut |
 
 A child's context budget is derived from the route it runs on, exactly as a

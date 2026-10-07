@@ -3751,8 +3751,9 @@ impl AgentToolDocs {
     /// The description states `max_children_per_call` and
     /// `max_children_per_turn` and the schema's `maxItems` states the first, all
     /// as decimal numbers, so the docs line grows with the caps' digit counts.
-    /// `AgentConfig::validate_agent` bounds the caps from below only (each at
-    /// least 1), so the largest value the config admits is the type's own:
+    /// `AgentConfig::validate_agent` bounds each cap from below at one, and
+    /// the per-call cap by the per-turn cap — equal is admitted — so the
+    /// largest value the config admits for either is the type's own:
     /// ten digits each, **27 bytes** over the defaults' `5` and `8` (nine in
     /// each of the three places). The ceiling by derivation, as
     /// [`SkillToolDocs::worst_case`] synthesizes a roster at `ROSTER_MAX_BYTES`

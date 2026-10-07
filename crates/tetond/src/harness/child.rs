@@ -525,13 +525,18 @@ impl PausableDeadline {
                         if clock.worked + since.elapsed() >= self.inner.budget {
                             return;
                         }
-                        Some(since + (self.inner.budget - clock.worked))
+                        // A budget too far out for the clock to name an
+                        // instant for never expires — the wait is then only
+                        // for a pause or a resume. `validate_agent` caps the
+                        // configured deadline at a week, far inside this, so
+                        // it is a guard against a panic, not a policy.
+                        Some(since.checked_add(self.inner.budget - clock.worked))
                     }
                 }
             };
             match wake_at {
-                None => notified.await,
-                Some(at) => {
+                None | Some(None) => notified.await,
+                Some(Some(at)) => {
                     tokio::select! {
                         () = tokio::time::sleep_until(at) => {}
                         () = &mut notified => {}
@@ -1138,6 +1143,35 @@ mod tests {
         assert_eq!(calls.gate_refusal().as_deref(), Some("gate_denied:skill"));
         calls.note_ran(); // a later call that did run
         assert_eq!(calls.gate_refusal(), None);
+    }
+
+    /// **A deadline too long for the clock to name an instant never expires —
+    /// it does not panic.** `since + budget` overflowed `Instant` for a budget
+    /// near `Duration::MAX`; `checked_add` makes that "never" (the configured
+    /// deadline is capped at a week by `validate_agent`, so this is the guard
+    /// behind the guard).
+    ///
+    /// Benign: a pause and a resume of the same deadline still work, and it is
+    /// still not expired.
+    ///
+    /// Mutation (run 2026-10-07, reverted): `since + (budget - worked)` back in
+    /// place of `checked_add` — this test panics ("overflow when adding
+    /// duration to instant"), 1 red of the 2,324 lib tests.
+    #[tokio::test]
+    async fn an_unrepresentable_deadline_never_expires_and_never_panics() {
+        let deadline = PausableDeadline::start(Duration::MAX);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), deadline.expired())
+                .await
+                .is_err(),
+            "a deadline past the clock's reach expired"
+        );
+        deadline.pause().resume();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), deadline.expired())
+                .await
+                .is_err()
+        );
     }
 
     /// **BR-7: a route a child is moved to gets only the turns it has left,

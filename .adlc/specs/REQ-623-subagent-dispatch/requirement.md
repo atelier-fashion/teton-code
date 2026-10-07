@@ -100,11 +100,11 @@ REQ-587 AC-15 recorded, and it is the gate the `pipeline-runner`,
 | ChildResult | `cost_micro_cents` | u64 | sum of the child's `CostRecord`s |
 | ChildResult | `spend_ceiling_final_micro_cents` | Option<u64> | the child's ceiling when it ended — ≥ the stamped share, raised only by sibling releases (BR-8) |
 | ChildResult | `provenance` | ProvenanceId set | every provenance the child's context touched — carried onto the result block (BR-9) |
-| AgentConfig | `max_children_per_call` | u32 | default 5; `[agent]` config table |
+| AgentConfig | `max_children_per_call` | u32 | default 5; `[agent]` config table; *amended 2026-10-07:* at most `max_children_per_turn` (above it the cap is unreachable), refused at load |
 | AgentConfig | `max_children_per_turn` | u32 | default 8; counts every child started by one parent prompt turn across all `agent` calls |
 | AgentConfig | `child_max_turns` | u32 | default 12 (the local profile's own cap); clamped to the parent's `max_turns` |
-| AgentConfig | `child_deadline_secs` | u64 | default 600 |
-| AgentConfig | `report_max_bytes` | u64 | default 32 KiB |
+| AgentConfig | `child_deadline_secs` | u64 | default 600; *amended 2026-10-07:* at most 604,800 (one week), refused at load |
+| AgentConfig | `report_max_bytes` | u64 | default 32 KiB; *amended 2026-10-07:* when moved off the default, at most the configured `[transcript] max_record_bytes` (the marker sends the reader to a record the transcript cuts there), refused at load |
 | AgentConfig | `enabled` | bool | default true; `false` leaves `agent` out of the registry entirely |
 
 ### Events
@@ -505,6 +505,12 @@ _Added 2026-10-07 (verify) — found in scope, settled as follow-ups._
   BUG to be filed at wrapup.
 - **`/help` saying whether `agent` is available** (BR-14's `/help` clause) —
   not implemented by this REQ; follow-up.
+- **A default report bound beside a lowered transcript record cap.**
+  `report_max_bytes` is held to `[transcript] max_record_bytes` only when the
+  user moved it off its 32 KiB default: a record cap lowered below 32 KiB was a
+  valid config before `[agent]` existed and must still load. On such a machine
+  a cut report's "full text is in the transcript" can be cut there too.
+  Follow-up: clamp the effective bound at runtime when the key is unset.
 
 ## Retrieved Context
 
