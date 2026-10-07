@@ -55,8 +55,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use teton_core::category::{
-    resolve as resolve_category, Category as CoreCategory, CategoryResolution, CategoryTable,
-    JudgmentCategory, Tier as CoreTier, TierBinding,
+    resolve as resolve_category, resolve_with_tier_request as resolve_category_with_tier_request,
+    Category as CoreCategory, CategoryResolution, CategoryTable, JudgmentCategory,
+    Tier as CoreTier, TierBinding,
 };
 use teton_core::effort::{resolve_effort, EffortLevel, EffortOmission, ResolvedEffort};
 use teton_core::entities::{ProviderCapabilities, ProviderKind};
@@ -830,6 +831,55 @@ impl Router {
         self.route_from(self.resolution_for(category))
     }
 
+    /// [`Router::resolve`] for a call that **requests** a tier — a child turn's
+    /// `tier` hint (REQ-623 BR-6).
+    ///
+    /// The decision is [`teton_core::category::resolve_with_tier_request`]'s:
+    /// the requested tier's *configured* binding, screened exactly as a
+    /// category's own row is, else precisely the route [`Router::resolve`]
+    /// gives `category`. `request == None` **is** [`Router::resolve`] — the
+    /// same resolution, so the same `Route` byte for byte, which
+    /// `tier_request_binding_default_then_pin` sweeps across every category.
+    ///
+    /// A request the table cannot honour is not a refusal and not an error: the
+    /// route is the category's default, its reason says the request was not
+    /// honoured, and its [`Route::resolution`] reports the tier that actually
+    /// served — so `route_decided` and a child's `ChildResult.route` name what
+    /// ran, not what was asked for.
+    ///
+    /// **The privacy pin is not here, and does not need to be.** The caller
+    /// checks the session's pin *before* resolving any category and takes
+    /// [`Router::resolve_local_pin`] when it holds (REQ-558 BR-7, LESSON-432);
+    /// that path takes no tier and reads no binding, so no request can reach
+    /// it. Requested → routed → pinned is therefore an order of precedence
+    /// enforced by the shape of the two calls, not by a check in this one.
+    ///
+    /// No state is written: the request lives in this call's arguments and
+    /// nowhere else, so a child's request cannot move the parent's next
+    /// [`Router::resolve`] (AC-9).
+    #[must_use]
+    pub fn resolve_with_tier_request(
+        &self,
+        category: CoreCategory,
+        request: Option<CoreTier>,
+    ) -> Route {
+        let effective = self.effective_table();
+        self.route_from(resolve_category_with_tier_request(
+            category,
+            request,
+            // "Configured" is the user's own rows — an unbound tier's inherited
+            // fill is not a binding anyone asked for (see the core function's
+            // "Why two tables").
+            &self.table,
+            &effective,
+            // The same two screens as `resolution_for`, for the same reason
+            // (ADR-E / BUG-155): a requested row is a dispatch axis, and an
+            // unscreened one would be the fourth path that bypasses them.
+            |id| self.health_of(id),
+            |id| self.is_usable(id),
+        ))
+    }
+
     /// The pure [`CategoryResolution`] behind [`Router::resolve`], for a caller
     /// that needs the decision itself rather than a turn-ready [`Route`].
     ///
@@ -917,6 +967,32 @@ impl Router {
     #[must_use]
     pub fn resolve_judgment(&self, classification: &Classification) -> Route {
         let resolved = self.resolve(CoreCategory::from(classification.category));
+        Route {
+            reason: format!("{} {}", classification.sentence(), resolved.reason),
+            ..resolved
+        }
+    }
+
+    /// [`Router::resolve_judgment`] for a freeform call that **requests** a
+    /// tier — a child turn's `tier` hint in a freeform session (REQ-623 BR-6).
+    ///
+    /// The category is the classifier's, exactly as for a prompt turn; the
+    /// request then changes only which row serves it, through
+    /// [`Router::resolve_with_tier_request`] — the one place that decision is
+    /// made. `request == None` resolves the same category through the same
+    /// table as [`Router::resolve_judgment`], and the reason is composed the
+    /// same way, so the classification and the resolver both still speak.
+    ///
+    /// Like its structured sibling it holds no privacy pin: the caller checks
+    /// the session's pin first and never reaches here when it holds.
+    #[must_use]
+    pub fn resolve_judgment_with_tier_request(
+        &self,
+        classification: &Classification,
+        request: Option<CoreTier>,
+    ) -> Route {
+        let resolved =
+            self.resolve_with_tier_request(CoreCategory::from(classification.category), request);
         Route {
             reason: format!("{} {}", classification.sentence(), resolved.reason),
             ..resolved
@@ -2087,6 +2163,8 @@ mod tests {
     #[test]
     fn no_routing_signature_takes_a_phase() {
         let _dispatch: fn(&Router, CoreCategory) -> Route = Router::resolve;
+        let _requested: fn(&Router, CoreCategory, Option<CoreTier>) -> Route =
+            Router::resolve_with_tier_request;
         let _pin: fn(&Router, String) -> Route = Router::resolve_local_pin;
         let _failure: fn(&Router, &Route, &str, FailureClass) -> FailureOutcome =
             Router::on_provider_failure;
@@ -2134,6 +2212,9 @@ mod tests {
     fn no_routing_function_can_see_prompt_text() {
         let _freeform: fn(&Router) -> CoreCategory = Router::freeform_category;
         let _dispatch: fn(&Router, CoreCategory) -> Route = Router::resolve;
+        // REQ-623 BR-6: a tier request is a `Tier`, never text.
+        let _requested: fn(&Router, CoreCategory, Option<CoreTier>) -> Route =
+            Router::resolve_with_tier_request;
         let _resolution: fn(&Router, CoreCategory) -> CategoryResolution = Router::resolution_for;
         let _judgment: fn(&Router, &Classification) -> Route = Router::resolve_judgment;
         let _default: fn(&Router) -> JudgmentCategory = Router::judgment_default;
@@ -2773,6 +2854,14 @@ mod tests {
     /// the sign reversed: a narrowing that reached the scanned route and
     /// nothing else.
     ///
+    /// **And a third time for REQ-623, the same way.** The `agent` tool's docs
+    /// line rides every default prompt turn and neither prompt-margin sweep had
+    /// measured it; once they did, `REDACT_BODY_OVERHEAD_BYTES` went 24 → 25
+    /// KiB, the chunk count again held at four, and the whole KiB came off the
+    /// bound once more: `183334 → 182403`, byte digest threshold
+    /// `67138 → 66797`. Word half 84,650 and the other four rows byte-identical,
+    /// a third time.
+    ///
     /// The other three rows are byte-identical to the capture, which is what
     /// says the window touched the two window-derived arms and nothing else.
     ///
@@ -2808,7 +2897,7 @@ mod tests {
         "default_unknown: RouteBudget { window_tokens: 0, budget_tokens: 4096, budget_bytes: 32768, bound: DefaultUnknown, window_label: \"silent's context window\", digest_threshold_tokens: 1500, digest_threshold_bytes: 12000, floored: false, provider_id: Some(\"silent\"), repo_context_cap: 8192 }",
         "window: RouteBudget { window_tokens: 128000, budget_tokens: 84650, budget_bytes: 253952, bound: Window, window_label: \"wide's context window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 93000, floored: false, provider_id: Some(\"wide\"), repo_context_cap: 8192 }",
         "user_cap: RouteBudget { window_tokens: 40000, budget_tokens: 25984, budget_bytes: 77952, bound: UserCap, window_label: \"capped's context window\", digest_threshold_tokens: 9515, digest_threshold_bytes: 28546, floored: false, provider_id: Some(\"capped\"), repo_context_cap: 8192 }",
-        "redact_scan: RouteBudget { window_tokens: 128000, budget_tokens: 84650, budget_bytes: 183334, bound: RedactScan, window_label: \"the redact-scannable window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 67138, floored: false, provider_id: Some(\"wide\"), repo_context_cap: 8192 }",
+        "redact_scan: RouteBudget { window_tokens: 128000, budget_tokens: 84650, budget_bytes: 182403, bound: RedactScan, window_label: \"the redact-scannable window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 66797, floored: false, provider_id: Some(\"wide\"), repo_context_cap: 8192 }",
     ];
 
     /// **REQ-589 TASK-259.** What the accessor is *for*: the provider's declared
@@ -3401,6 +3490,285 @@ mod tests {
 
         // And the one exception, named rather than assumed.
         assert!(router.resolve_local_pin("tainted").resolution.is_none());
+    }
+
+    // ---- REQ-623 BR-6: a requested tier ---------------------------------
+
+    /// The tier-request fixture: `think` on a frontier provider, `build` on
+    /// `kimi` when `build_bound`, and a declared default (`deepseek`) that is
+    /// **neither** — so an unbound `build`'s inherited fill (`deepseek`) and a
+    /// `think` category's own route (`anthropic`) are different answers, and a
+    /// resolver that honoured the fill would be caught.
+    fn tier_request_router(build_bound: bool) -> Router {
+        let mut table = CategoryTable::new()
+            .with_local_provider("local")
+            .with_tier(tier(CoreTier::Think, "anthropic", None));
+        if build_bound {
+            table = table.with_tier(tier(CoreTier::Build, "kimi", Some("deepseek")));
+        }
+        Router::new(table, Some("deepseek".to_owned()))
+            .with_provider(
+                "anthropic",
+                ProviderKind::Anthropic,
+                "claude-opus-4",
+                native(),
+                ProviderHealth::Healthy,
+            )
+            .with_provider(
+                "kimi",
+                ProviderKind::OpenaiCompatible,
+                "kimi-k2",
+                native(),
+                ProviderHealth::Healthy,
+            )
+            .with_provider(
+                "deepseek",
+                ProviderKind::OpenaiCompatible,
+                "deepseek-chat",
+                native(),
+                ProviderHealth::Healthy,
+            )
+    }
+
+    /// **REQ-623 BR-6, at the router: requested, routed, pinned — in that
+    /// order, and never a refusal.**
+    ///
+    /// Table-driven over the rows BR-6 names. Every expected provider is a
+    /// literal written here, never a value read back off the router: the
+    /// `binding absent` row in particular must say `anthropic` (the `think`
+    /// category's own route) and not `deepseek` (the unbound `build` tier's
+    /// inherited fill), and computing it from `resolve` would let a resolver
+    /// that honoured the fill agree with itself.
+    ///
+    /// The pin rows have two halves. A category pinned **by construction**
+    /// (`redact`) is this function's to hold, and it does. The session's
+    /// **boundary** pin is the caller's — checked before any category is
+    /// resolved, `runtime/turn.rs` `dispatch_route` — so what is assertable here
+    /// is the precedent `the_taint_pin_overrides_every_category_binding` sets:
+    /// on a router where the request *is* honoured remotely, the pin lands
+    /// local, carries no resolution (it consulted none, so it cannot claim the
+    /// requested tier), and takes no request it could be talked out of.
+    ///
+    /// The benign row is the byte-identity claim: `request == None` is
+    /// `resolve`, compared as the whole `Route`'s `Debug` rendering, for every
+    /// category on every fixture.
+    ///
+    /// # Mutations
+    ///
+    /// Run against `teton_core::category::resolve_with_tier_request`, each
+    /// reverted after:
+    ///
+    /// - **Drop the binding lookup** (`configured.tier_binding(requested)` →
+    ///   `None`): four of the six rows redden — `binding present` (`design`
+    ///   lands on `anthropic`, not `kimi`), `binding present, primary down`
+    ///   and `requested row outranks an override` on all four checks, and
+    ///   `binding present, nothing it names can serve` on its reason alone
+    ///   (the provider is the default either way; only the sentence knows).
+    /// - **Look the request up in the effective table** (`table` for
+    ///   `configured`): `binding absent` reddens on all four checks — the
+    ///   inherited fill sends `design` to `deepseek`.
+    /// - **Drop the pinned-category guard**: `pinned by construction` reddens
+    ///   on all four — `redact` requesting `think` lands on `anthropic`.
+    /// - **Treat no request as a request for the category's own tier**
+    ///   (`request.unwrap_or(category.tier())`): the benign sweep reddens on
+    ///   its first category, `route`, whose reason gains a "not honoured"
+    ///   sentence.
+    #[test]
+    fn tier_request_binding_default_then_pin() {
+        struct Row {
+            name: &'static str,
+            router: Router,
+            category: CoreCategory,
+            request: CoreTier,
+            provider: &'static str,
+            /// The tier the resolution reports: the requested one only when
+            /// the requested row served.
+            tier: CoreTier,
+            /// A substring of the reason that says which of BR-6's legs fired.
+            says: &'static str,
+        }
+        let mut primary_down = tier_request_router(true);
+        primary_down.set_health("kimi", ProviderHealth::Unavailable);
+        let mut whole_row_down = tier_request_router(true);
+        whole_row_down.set_health("kimi", ProviderHealth::Unavailable);
+        whole_row_down.set_health("deepseek", ProviderHealth::Unavailable);
+        let overridden = Router::new(
+            CategoryTable::new()
+                .with_local_provider("local")
+                .with_tier(tier(CoreTier::Think, "anthropic", None))
+                .with_tier(tier(CoreTier::Build, "kimi", None))
+                .with_override(teton_core::category::CategoryOverride {
+                    name: teton_core::category::ConfigurableCategory::Design,
+                    provider_id: "deepseek".to_owned(),
+                    fallback_id: None,
+                }),
+            None,
+        )
+        .with_provider(
+            "kimi",
+            ProviderKind::OpenaiCompatible,
+            "kimi-k2",
+            native(),
+            ProviderHealth::Healthy,
+        )
+        .with_provider(
+            "deepseek",
+            ProviderKind::OpenaiCompatible,
+            "deepseek-chat",
+            native(),
+            ProviderHealth::Healthy,
+        );
+
+        let rows = [
+            Row {
+                name: "binding present",
+                router: tier_request_router(true),
+                category: CoreCategory::Design,
+                request: CoreTier::Build,
+                provider: "kimi",
+                tier: CoreTier::Build,
+                says: "through the requested 'build' tier binding",
+            },
+            Row {
+                name: "binding present, primary down",
+                router: primary_down,
+                category: CoreCategory::Design,
+                request: CoreTier::Build,
+                provider: "deepseek",
+                tier: CoreTier::Build,
+                says: "Through the requested 'build' tier binding: 'kimi' is unavailable",
+            },
+            Row {
+                name: "requested row outranks an override",
+                router: overridden,
+                category: CoreCategory::Design,
+                request: CoreTier::Build,
+                provider: "kimi",
+                tier: CoreTier::Build,
+                says: "through the requested 'build' tier binding",
+            },
+            Row {
+                name: "binding absent",
+                router: tier_request_router(false),
+                category: CoreCategory::Design,
+                request: CoreTier::Build,
+                provider: "anthropic",
+                tier: CoreTier::Think,
+                says: "The 'build' tier was requested, but no provider is configured for it",
+            },
+            Row {
+                name: "binding present, nothing it names can serve",
+                router: whole_row_down,
+                category: CoreCategory::Design,
+                request: CoreTier::Build,
+                provider: "anthropic",
+                tier: CoreTier::Think,
+                says: "no provider its binding names can serve",
+            },
+            Row {
+                name: "pinned by construction",
+                router: tier_request_router(true),
+                category: CoreCategory::Redact,
+                request: CoreTier::Think,
+                provider: "local",
+                tier: CoreTier::Reflex,
+                says: "pinned to the local tier by construction, so the request is not honoured",
+            },
+        ];
+
+        // Every row is checked before anything fails, so a mutation reports the
+        // whole set of rows it reddens rather than the first.
+        let mut red: Vec<String> = Vec::new();
+        for row in rows {
+            let route = row
+                .router
+                .resolve_with_tier_request(row.category, Some(row.request));
+            let name = row.name;
+            let served = route.provider_id.as_ref().map(|p| p.0.as_str());
+            let resolved_tier = route.resolution.as_ref().map(|r| r.tier);
+            // Never a refusal: every row routes somewhere, and to the literal.
+            if served != Some(row.provider) {
+                red.push(format!(
+                    "{name}: served {served:?}, expected {}",
+                    row.provider
+                ));
+            }
+            if resolved_tier != Some(row.tier) {
+                red.push(format!(
+                    "{name}: reported tier {resolved_tier:?}, expected {:?}",
+                    row.tier
+                ));
+            }
+            if route.resolution.as_ref().map(|r| r.category) != Some(row.category) {
+                red.push(format!("{name}: resolved the wrong category"));
+            }
+            if !route.reason.contains(row.says) {
+                red.push(format!(
+                    "{name}: reason does not say {:?}: {}",
+                    row.says, route.reason
+                ));
+            }
+            // The wire reports the tier that served, projected off the same
+            // resolution (ADR-D) — what a child's `ChildResult.route` names.
+            if route.route_decided().and_then(|e| e.tier) != Some(to_protocol_tier(row.tier)) {
+                red.push(format!("{name}: route_decided reports another tier"));
+            }
+        }
+        assert!(red.is_empty(), "BR-6 rows reddened:\n{}", red.join("\n"));
+
+        // The boundary pin, over both fixtures and every request. Non-vacuity
+        // first: on the bound fixture the request IS honoured remotely, so a
+        // local answer below is the pin holding, not the request failing.
+        let bound = tier_request_router(true);
+        assert_eq!(
+            bound
+                .resolve_with_tier_request(CoreCategory::Design, Some(CoreTier::Build))
+                .provider_id
+                .map(|p| p.0),
+            Some("kimi".to_owned())
+        );
+        // What `dispatch_route` does on a pinned session: the pin, with no
+        // category and no request in hand — `no_routing_signature_takes_a_phase`
+        // pins that it takes neither, so there is nothing a request could say
+        // to it.
+        for router in [tier_request_router(true), tier_request_router(false)] {
+            let pinned = router.resolve_local_pin("this child read local-only content");
+            assert_eq!(
+                pinned.provider_id.as_ref().map(|p| p.0.as_str()),
+                Some("local"),
+                "the boundary pin is local whatever the table would honour"
+            );
+            assert!(
+                pinned.resolution.is_none(),
+                "the pin resolved no category, so it reports no requested tier"
+            );
+        }
+
+        // Benign: no request is exactly today's route, for every category on
+        // every fixture. `Debug` is the whole value — provider, model, reason,
+        // outcome, harness, budget, effort and the resolution — so "byte
+        // identical" is meant literally.
+        for router in [
+            tier_request_router(true),
+            tier_request_router(false),
+            router(),
+        ] {
+            for category in CoreCategory::ALL {
+                assert_eq!(
+                    format!("{:?}", router.resolve_with_tier_request(category, None)),
+                    format!("{:?}", router.resolve(category)),
+                    "no request must route `{category}` exactly as `resolve` does"
+                );
+            }
+        }
+
+        // And nothing is remembered: the parent's own route is unmoved by a
+        // request resolved just before it (AC-9).
+        let _child = bound.resolve_with_tier_request(CoreCategory::Design, Some(CoreTier::Build));
+        assert_eq!(
+            bound.resolve(CoreCategory::Design).provider_id.map(|p| p.0),
+            Some("anthropic".to_owned())
+        );
     }
 
     #[test]

@@ -25,7 +25,11 @@
 //!   path is never sent over the wire, but both sides derive the same one).
 //! - [`commands`] — the session's built-in command roster, so the daemon can
 //!   state in the prompt what only the CLI's dispatch table knows (REQ-617).
+//! - [`agent`] — the `agent` tool's shapes: a child task, its bounds, its
+//!   eight terminal statuses, its result, and why a call was refused whole
+//!   (REQ-623).
 
+pub mod agent;
 pub mod commands;
 pub mod effort;
 pub mod events;

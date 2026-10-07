@@ -40,7 +40,7 @@
 
 use std::collections::BTreeSet;
 
-use tetond::harness::tools::{ToolRegistry, SKILL_TOOL_NAME, WEB_TOOL_NAME};
+use tetond::harness::tools::{ToolRegistry, AGENT_TOOL_NAME, SKILL_TOOL_NAME, WEB_TOOL_NAME};
 use tetond::mcp::namespaced_tool_name;
 
 // ---------------------------------------------------------------------------
@@ -55,6 +55,7 @@ use tetond::mcp::namespaced_tool_name;
 /// and that test compares the declarations against this list.
 const TOOL_SOURCES: &[(&str, &str)] = &[
     ("mod.rs", include_str!("../src/harness/tools/mod.rs")),
+    ("agent.rs", include_str!("../src/harness/tools/agent.rs")),
     ("docs.rs", include_str!("../src/harness/tools/docs.rs")),
     ("edit.rs", include_str!("../src/harness/tools/edit.rs")),
     ("glob.rs", include_str!("../src/harness/tools/glob.rs")),
@@ -276,6 +277,21 @@ const COVERAGE: &[Covered] = &[
                 "a_user_skill_leaves_under_a_boundary_it_never_touched_and_is_refused_by_one_that_names_it",
             ),
         ],
+    },
+    Covered {
+        tool_type: "AgentTool",
+        registered: Some(AGENT_TOOL_NAME),
+        // Registered by `build_tools` for prompt turns only, behind
+        // `agent.enabled` (REQ-623 ADR-7) — the `skill` posture.
+        builtin: false,
+        mention: "agent",
+        surfaces: "every child turn's final report — model output about whatever that \
+                   child read, from anywhere its own tools could reach — with the union \
+                   of the children's provenance on the block (ADR-8)",
+        tests: &[(
+            "provenance_egress.rs",
+            "an_agent_childs_boundary_read_blocks_the_parents_next_remote_turn",
+        )],
     },
     Covered {
         tool_type: "McpToolHandle",
@@ -514,14 +530,15 @@ fn every_content_surfacing_tool_has_a_boundary_test() {
     // an empty claim (BUG-159).
     // REQ-614 raised this from 12 to 13 (`shell_provenance.rs`); REQ-620 raised
     // it to 14 (`shell_syntax.rs`, the null-redirect recogniser both the write
-    // gate and the classifier read). The equality — rather than a `>=` floor —
-    // is deliberate: it makes *adding* a tool source file a change someone has
-    // to look at, which is how a new file that should have carried a boundary
-    // test gets noticed. Neither file declares an `impl Tool for`, so the
-    // derived set below is unchanged by them.
+    // gate and the classifier read). Neither of those declares an `impl Tool
+    // for`, so the derived set below was unchanged by them. REQ-623 raised it
+    // to 15 with `agent.rs`, which does, and whose tool is in `COVERAGE`. The
+    // equality — rather than a `>=` floor — is deliberate: it makes *adding* a
+    // tool source file a change someone has to look at, which is how a new
+    // file that should have carried a boundary test gets noticed.
     assert_eq!(
         TOOL_SOURCES.len(),
-        14,
+        15,
         "the embedded source list changed; the scan below is no longer the module's shape"
     );
     for (file, text) in TOOL_SOURCES {

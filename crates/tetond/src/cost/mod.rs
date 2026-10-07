@@ -38,12 +38,18 @@
 //!   and the streamed-usage extractor.
 //! - [`prices`] — the versioned TOML price table; unknown models are *unpriced*,
 //!   never guessed (BR-2).
-//! - [`report`] — per-session / per-phase / per-provider aggregation and the
-//!   AC-4 savings-vs-frontier estimate (OQ-6), each labeled as an estimate.
+//! - [`report`] — per-session / per-phase / per-provider aggregation, the
+//!   per-turn nesting of a turn's children (REQ-623 BR-8), and the AC-4
+//!   savings-vs-frontier estimate (OQ-6), each labeled as an estimate.
+//! - [`share`] — an `agent` call's per-child spend shares (REQ-623 ADR-4): the
+//!   equal split of the prompt's headroom, the release of an ended child's
+//!   unspent share to its running siblings, and the [`ChildSpend`] a child's
+//!   egress checks and pays through.
 
 pub mod ledger;
 pub mod prices;
 pub mod report;
+pub mod share;
 
 // REQ-588: re-exported here so `ledger.rs` can name the accumulator without
 // naming `teton_core`. The duty-path guard in `harness::duty` asserts that the
@@ -54,15 +60,19 @@ pub mod report;
 pub(crate) use teton_core::cost_ceiling::PromptSpend;
 
 use std::sync::Arc;
+use teton_protocol::agent::ChildId;
 use teton_protocol::events::{CostRecord, CostRecorded, Event};
-use teton_protocol::{Category, Phase, ProviderId, SessionId};
+use teton_protocol::{Category, Phase, ProviderId, SessionId, TurnId};
 use teton_providers::transport::TransportResponse;
 
 use crate::broadcast::EventBus;
 
 pub use ledger::{CostLedger, LedgerError, LedgerRow, WebLookupRow, WebOverrideRow};
 pub use prices::{ModelPrice, PriceTable};
-pub use report::{CostReport, GroupTotals, SavingsEstimate, UnpricedTotals, WebTotals};
+pub use report::{
+    ChildTotals, CostReport, GroupTotals, SavingsEstimate, TurnTotals, UnpricedTotals, WebTotals,
+};
+pub use share::{ChildSpend, SharePool, ShareRelease};
 
 /// The billing attribution a caller pins to a remote call *at call time*.
 ///
@@ -98,6 +108,20 @@ pub struct CostAttribution {
     /// gives: only the connection test opts in, via
     /// [`CostAttribution::probe`].
     pub probe: bool,
+    /// The prompt turn this call's spend rolls up under (REQ-623 BR-8), or
+    /// `None` for a call nobody attributed to a turn.
+    ///
+    /// On a child's call it is the parent turn the child ran under, set with
+    /// the `child_id` by [`CostAttribution::for_child`]. On a parent turn's own
+    /// call it is that turn, set by [`CostAttribution::with_turn`] — which is
+    /// what lets `/cost` total a parent turn as its own calls plus its
+    /// children's. The ledger keeps it as the `parent_turn_id` column either
+    /// way: the turn a row nests under.
+    pub parent_turn_id: Option<TurnId>,
+    /// The child turn that made this call (REQ-623 BR-8), or `None` for a call
+    /// a parent turn made itself. Never set without
+    /// [`Self::parent_turn_id`]: the only builder that sets it sets both.
+    pub child_id: Option<ChildId>,
 }
 
 impl CostAttribution {
@@ -110,6 +134,8 @@ impl CostAttribution {
             category: None,
             model: model.into(),
             probe: false,
+            parent_turn_id: None,
+            child_id: None,
         }
     }
 
@@ -138,6 +164,30 @@ impl CostAttribution {
     #[must_use]
     pub fn probe(mut self) -> Self {
         self.probe = true;
+        self
+    }
+
+    /// Attribute a parent turn's **own** call to `turn_id` (REQ-623 AC-12).
+    ///
+    /// Changes nothing about how the call is sent or priced. It is what puts
+    /// the call under its turn in the per-turn `/cost` view, beside that turn's
+    /// children; a call without it is still counted everywhere else.
+    #[must_use]
+    pub fn with_turn(mut self, turn_id: TurnId) -> Self {
+        self.parent_turn_id = Some(turn_id);
+        self
+    }
+
+    /// Attribute a **child's** call to `child_id`, running under the parent
+    /// turn `parent_turn_id` (REQ-623 BR-8).
+    ///
+    /// Both ids in one builder so a child's row can never carry one without the
+    /// other: a child id with no parent turn would be spend `/cost` could not
+    /// nest anywhere.
+    #[must_use]
+    pub fn for_child(mut self, child_id: ChildId, parent_turn_id: TurnId) -> Self {
+        self.child_id = Some(child_id);
+        self.parent_turn_id = Some(parent_turn_id);
         self
     }
 }
@@ -286,5 +336,29 @@ mod tests {
         // The flag says what the call was for; it does not change what it
         // bills, so the model still drives the price lookup.
         assert_eq!(probe.model, "kimi-k2");
+    }
+
+    /// REQ-623 BR-8: a turn's own call carries the turn and no child; a
+    /// child's call carries both; and every call that opts into neither — all
+    /// of them before this REQ — carries neither.
+    #[test]
+    fn turn_and_child_attribution_travel_together() {
+        let plain = CostAttribution::new("claude-fable-5");
+        assert_eq!((plain.parent_turn_id, plain.child_id), (None, None));
+
+        let own = CostAttribution::new("claude-fable-5").with_turn(TurnId::from("turn-3"));
+        assert_eq!(own.parent_turn_id, Some(TurnId::from("turn-3")));
+        assert_eq!(own.child_id, None, "a turn's own call names no child");
+
+        let child = CostAttribution::new("deepseek-chat")
+            .with_category(Category::Review)
+            .for_child(ChildId::new("call-1", "audit"), TurnId::from("turn-3"));
+        assert_eq!(child.child_id, Some(ChildId::new("call-1", "audit")));
+        assert_eq!(child.parent_turn_id, Some(TurnId::from("turn-3")));
+        assert_eq!(
+            child.category,
+            Some(Category::Review),
+            "and the ids ride beside the existing attribution, not over it"
+        );
     }
 }

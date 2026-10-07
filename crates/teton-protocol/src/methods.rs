@@ -9,6 +9,7 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::agent::ChildId;
 use crate::effort::{EffortLevel, ResolvedEffort};
 use crate::events::{
     CatalogEntryView, ModelSelectionProposed, ProbeReportView, SelectionSource, WebCapabilityState,
@@ -2527,6 +2528,55 @@ pub struct CostReportView {
     /// empty roll-up rather than a deserialization failure.
     #[serde(default)]
     pub web_per_session: Vec<WebTotalsView>,
+    /// Every parent turn that dispatched children, each with one line per child
+    /// beneath its own calls (REQ-623 BR-8 / AC-12), in the order the turns
+    /// first spent.
+    ///
+    /// A view over calls the totals and roll-ups above already count — never
+    /// added to them. Defaulted and omitted when empty: a daemon built before
+    /// REQ-623 sends no such key and reads as "no children", and a report with
+    /// no children is byte-identical to one from before the field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub per_turn: Vec<CostTurnView>,
+}
+
+/// One parent turn inside a [`CostReportView`] (REQ-623 AC-12): its own calls,
+/// one line per child, and the two summed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CostTurnView {
+    /// The session the turn ran in.
+    pub session_id: SessionId,
+    /// The parent turn.
+    pub turn_id: TurnId,
+    /// The turn's own calls (keyed by the turn id).
+    pub own: CostGroupView,
+    /// One line per child, in the order the children first spent.
+    pub children: Vec<CostChildView>,
+    /// `own` plus every child's — the parent turn's total (keyed by the turn
+    /// id).
+    pub total: CostGroupView,
+}
+
+/// One child's line beneath its parent turn in a [`CostTurnView`] (REQ-623
+/// AC-12).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CostChildView {
+    /// The child's full id — the key a client matches against
+    /// `agent_child_started` / `agent_child_finished`.
+    pub child_id: ChildId,
+    /// The label to show the line under (the child's name).
+    pub name: String,
+    /// Where the child's calls went, as `provider/model`; a rerouted child
+    /// lists each distinct route in call order, joined by `" → "`.
+    pub route: String,
+    /// Calls the child made.
+    pub calls: u64,
+    /// Input tokens over the child's calls.
+    pub input_tokens: u64,
+    /// Output tokens over the child's calls.
+    pub output_tokens: u64,
+    /// The child's recorded spend in integer micro-USD (priced calls only).
+    pub usd_micros: i64,
 }
 
 /// One session's web-lookup totals inside a [`CostReportView`] (REQ-563 AC-6).
@@ -5660,8 +5710,63 @@ mod tests {
                 }],
                 reasoning_tokens: None,
                 calls_reporting_reasoning: 0,
+                per_turn: vec![CostTurnView {
+                    session_id: SessionId::from("sess-under-test"),
+                    turn_id: TurnId::from("turn-2"),
+                    own: CostGroupView {
+                        key: "turn-2".to_owned(),
+                        calls: 1,
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        usd_micros: 100,
+                    },
+                    children: vec![CostChildView {
+                        child_id: ChildId::new("call-1", "audit"),
+                        name: "audit".to_owned(),
+                        route: "deepseek/deepseek-v4-pro".to_owned(),
+                        calls: 1,
+                        input_tokens: 4_000,
+                        output_tokens: 2_000,
+                        usd_micros: 3_000,
+                    }],
+                    total: CostGroupView {
+                        key: "turn-2".to_owned(),
+                        calls: 2,
+                        input_tokens: 4_010,
+                        output_tokens: 2_005,
+                        usd_micros: 3_100,
+                    },
+                }],
             },
         });
+    }
+
+    /// REQ-623: a report from a daemon that predates child dispatch carries no
+    /// `per_turn` key and reads as no children; a report from this build with
+    /// no children omits the key, so it is byte-identical to the older one.
+    #[test]
+    fn a_cost_report_without_children_neither_needs_nor_sends_per_turn() {
+        let pre_623 = serde_json::json!({
+            "total_usd_micros": 0,
+            "total_calls": 0,
+            "priced_calls": 0,
+            "unpriced_calls": 0,
+            "savings_usd_micros": 0,
+            "baseline_usd_micros": 0,
+            "baseline_model": "anthropic/claude-opus-4",
+            "methodology": "Estimate, not a measurement.",
+            "per_phase": [],
+            "per_provider": [],
+        });
+        let decoded: CostReportView =
+            serde_json::from_value(pre_623).expect("an older report still decodes");
+        assert!(decoded.per_turn.is_empty());
+
+        let wire = serde_json::to_value(&decoded).expect("serializes");
+        assert!(
+            wire.get("per_turn").is_none(),
+            "an empty nested view is omitted: {wire}"
+        );
     }
 
     /// A `cost/query` answer from a daemon built before REQ-563 carries no

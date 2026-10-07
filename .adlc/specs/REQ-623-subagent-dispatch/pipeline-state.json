@@ -1,0 +1,132 @@
+{
+  "req": "REQ-623",
+  "branch": "feat/REQ-623-subagent-dispatch",
+  "startedAt": "2026-10-06T00:04:05Z",
+  "completed": false,
+  "currentPhase": 7,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "integrationBranch": "main",
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree",
+      "completedAt": "2026-10-06T00:04:05Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-10-06T00:05:31Z",
+      "note": "ran in-session on commit f59226c before /proceed; artifacts byte-identical"
+    },
+    {
+      "phase": 2,
+      "name": "Architect",
+      "completedAt": "2026-10-06T00:05:31Z",
+      "note": "ran in-session on commit f59226c before /proceed; artifacts byte-identical"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-10-06T00:05:31Z",
+      "note": "ran in-session on commit f59226c before /proceed; artifacts byte-identical"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-10-07T12:52:15Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify",
+      "completedAt": "2026-10-07T14:39:17Z"
+    },
+    {
+      "phase": 6,
+      "name": "Create Pull Request",
+      "completedAt": "2026-10-07T14:39:17Z"
+    }
+  ],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/GitHub/teton-code/.worktrees/REQ-623",
+      "branch": "feat/REQ-623-subagent-dispatch",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/334",
+      "prNumber": 334,
+      "prCreatedAt": "2026-10-06T00:04:04Z",
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-422",
+      "TASK-423",
+      "TASK-421",
+      "TASK-432",
+      "TASK-425",
+      "TASK-424",
+      "TASK-426",
+      "TASK-429",
+      "TASK-427",
+      "TASK-428",
+      "TASK-431",
+      "TASK-430"
+    ],
+    "failedTasks": [],
+    "inFlight": [],
+    "tier": 5
+  },
+  "conflictsResolved": [],
+  "notes": [
+    "TASK-424 found a pre-existing spend-ceiling unit mismatch (config micro-cents 1e5/USD vs recorded usd_micros 1e6/USD added to PromptSpend unconverted) \u2014 file a BUG at wrapup; shares reuse the shared spend_units helper so they stay consistent with the ceiling check.",
+    "TASK-424: a parent turn's own calls need CostAttribution::with_turn(turn_id) stamped where the prompt's egress is built \u2014 assigned to TASK-428.",
+    "TASK-427 follow-ups: provider_degraded/capability_dead_end may publish unstamped from a child; MCP/web lookups by a child are not charged to its share; run_prompt_turn is 233 lines total (227 before) / 125 code lines.",
+    "TASK-428 follow-ups: text-form (local-tier) call to a disabled agent gets the parser's generic message, not the agent.enabled hint; large agent results still pass the digest condenser; agent_child_consent_requested only for bus-published asks (addressed skill consent gets no label); agent roster entry (~1.6KB) rides in every prompt turn incl. local/degraded.",
+    "TASK-431 gaps: BR-14 says /help reports whether agent is available \u2014 CLI does not today; AC-18 runbook OUTSTANDING; REQ-623 Validation section to be written at wrapup.",
+    "TASK-430 follow-ups: spend ceiling binds at a tenth of configured dollars (REQ-588 unit bug, confirmed in a probe: $0.44 call reported as $4.40 vs $0.05 ceiling) \u2014 BUG at wrapup; a child that reroutes to local mid-run still names its starting remote route in the result; a timed-out child's blocking shell keeps running (output never reaches a model); BR-12 wording: since REQ-619 a user skill carries a ~-scoped identity, not `unknown` \u2014 spec amendment at wrapup; statuses::cancelled is in-process (daemon has no cancel RPC; disconnect aborts after 300 s)."
+  ],
+  "phase5": {
+    "prepass": "api-error (adlc-read hit max-tokens on the 1 MB diff) \u2014 reviewers ran without candidates",
+    "workspaceGate": "4,859 passed / 0 failed / 83 targets",
+    "findings": {
+      "critical": 0,
+      "major": 9,
+      "minor": 14,
+      "majorList": [
+        "BR-7 child max_turns/budget reset per attempt (reroute exceeds stamp)",
+        "BR-11 agent result digested/middle-cut",
+        "BR-6 route not updated after mid-child pin",
+        "no egress-capture test for parent\u2192child taint via task/context",
+        "AC-15 no e2e leg",
+        "AC-14 'tool is cancelled' is not the behaviour \u2014 spec amendment + follow-up",
+        "ChildId split in 3 crates vs opaque doc",
+        "ADR-3 single-carrier doc claim false (4 carriers)",
+        "BR-8 'would exceed' vs 'has reached'; share released before timed-out tool ends"
+      ]
+    },
+    "reflectorQuestion": {
+      "q": "Should the parent turn stay open until a timed-out/cancelled child's orphaned blocking tool returns?",
+      "settled": "document + amend AC-14/BR-10 + file follow-up BUG at wrapup; matches the parent's own cancelled-shell behaviour today",
+      "settledBy": "orchestrator, 2026-10-07"
+    },
+    "fixPass": "two agents: src+spec+docs / tests+fixtures",
+    "stepD": "4 re-verifiers clean (correctness 9/9, security 6/6, architecture 8/8, test-audit all confirmed); residual doc nits in 6bf1988",
+    "fixPassResult": "src: 20 commits (f2c5591..91770d3), tests: 3 commits; tetond --tests 3,052 passed / 0 failed; new bug fixed: PausableDeadline::expired never fired when budget spent before a pause (e299bb4); cancellation point after child tool dispatch (166b054)"
+  }
+}

@@ -79,6 +79,15 @@ pub const READ_ONLY_SHELL_PAIRS: &[&str] = &["git status", "git log", "git diff"
 /// REQ-587's own counter, which implements a more permissive rule (BR-6b admits
 /// a repeat when another tool completed in between). Filing it here would refuse
 /// calls REQ-587 deliberately allows.
+///
+/// `agent` is **not** here either, and that is a classification rather than an
+/// omission (REQ-623 BR-3): the tool itself writes nothing, but its children
+/// can, so an identical `agent` call after one that changed the repository is
+/// a legitimate second attempt. It falls to the write-capable default — the
+/// second identical call dispatches, the third is refused — exactly as an
+/// `edit` does. The permission table allows it at every level for the
+/// opposite reason (each child's tools are gated); the two are not in tension,
+/// because one is about consent and the other about waste.
 pub const READ_ONLY_TOOLS: &[&str] = &["read", "glob", "grep", "projects", "teton_docs"];
 
 /// How many identical calls are dispatched before the next one is refused.
@@ -432,6 +441,29 @@ mod tests {
     /// `skill` is governed by REQ-587's counter, not by this module. Filing it
     /// under `READ_ONLY_TOOLS` would refuse the repeats BR-6b deliberately
     /// admits, so the absence is asserted rather than left to inspection.
+    /// REQ-623 BR-3: `agent` is write-capable — its children can write — so
+    /// an identical call is dispatched twice and refused on the third.
+    #[test]
+    fn agent_is_write_capable() {
+        let call = json!({ "tasks": [{ "task": "audit src/cost" }] });
+        assert_eq!(
+            allowance_for(crate::harness::tools::AGENT_TOOL_NAME, &call),
+            Allowance::Twice
+        );
+        let mut ledger = RepeatLedger::new();
+        for _ in 0..2 {
+            assert_eq!(ledger.verdict("agent", &call), Verdict::First);
+            ledger.record("agent", &call, 512);
+        }
+        assert_eq!(
+            ledger.verdict("agent", &call),
+            Verdict::Refused {
+                count: 2,
+                first_result_len: 512
+            }
+        );
+    }
+
     #[test]
     fn skill_is_not_in_the_read_only_table() {
         assert!(!READ_ONLY_TOOLS.contains(&"skill"));

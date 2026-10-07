@@ -68,12 +68,25 @@
 //! root's **display** and no other path, for `repo_context_state`'s reason —
 //! which file was written is [`crate::methods::SessionContextResult`]'s routed
 //! answer.
+//! REQ-623 adds the subagent dispatch family — `agent_call_started`,
+//! `agent_child_started`, `agent_child_consent_requested`,
+//! `agent_child_share_released`, `agent_child_finished`, `agent_call_finished`
+//! and `agent_call_refused` — and stamps two optional facts, the child's
+//! [`ChildId`] and its parent's [`TurnId`], on the payloads a child turn
+//! emits through the ordinary vocabulary: [`SessionUpdate`] (the tool start and
+//! finish a child's loop streams), [`ContextPressure`], [`CostRecord`] and
+//! [`PermissionRequest`]. On payloads and never on [`EventEnvelope`]
+//! (architecture ADR-3): the envelope is the bus's own frame and the transcript
+//! line reserves its keys. Earlier REQs' `tool_call_repeated` and
+//! `shell_duty_skipped` (REQ-617) are the variants this index had stopped
+//! naming; they are named here.
 //!
 //! This list is an index, not decoration: a new variant of [`Event`] that is not
 //! named here makes the paragraph above wrong.
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent::{AgentRefusal, ChildBounds, ChildId, ChildRoute, ChildStatus};
 use crate::effort::ResolvedEffort;
 use crate::methods::{
     ProviderHealth, ProviderTestOutcome, RepoContextOrigin, RepoContextSource,
@@ -287,6 +300,25 @@ pub enum Event {
     ToolCallRepeated(ToolCallRepeated),
     /// The `shell` duty declined to interpret a result (REQ-617 BR-7).
     ShellDutySkipped(ShellDutySkipped),
+    /// An `agent` call passed validation and its children are about to start
+    /// (REQ-623).
+    AgentCallStarted(AgentCallStarted),
+    /// A child turn is about to make its first model call, under bounds that
+    /// are now fixed (REQ-623 BR-7).
+    AgentChildStarted(AgentChildStarted),
+    /// A child reached an ask-gate at an attended session (REQ-623 BR-5).
+    AgentChildConsentRequested(AgentChildConsentRequested),
+    /// A child ended with unspent share and it was split among its running
+    /// siblings (REQ-623 BR-8).
+    AgentChildShareReleased(AgentChildShareReleased),
+    /// A child reached its terminal status (REQ-623 BR-10).
+    AgentChildFinished(AgentChildFinished),
+    /// Every child of a call is terminal and the tool result is being returned
+    /// (REQ-623 BR-4).
+    AgentCallFinished(AgentCallFinished),
+    /// An `agent` call was refused whole before any child started (REQ-623
+    /// BR-3).
+    AgentCallRefused(AgentCallRefused),
 }
 
 impl Event {
@@ -349,6 +381,13 @@ impl Event {
             Event::WriteRefusedNonProject(_) => "write_refused_non_project",
             Event::SkillRefusedNeedsProject(_) => "skill_refused_needs_project",
             Event::SkillPreambleFallback(_) => "skill_preamble_fallback",
+            Event::AgentCallStarted(_) => "agent_call_started",
+            Event::AgentChildStarted(_) => "agent_child_started",
+            Event::AgentChildConsentRequested(_) => "agent_child_consent_requested",
+            Event::AgentChildShareReleased(_) => "agent_child_share_released",
+            Event::AgentChildFinished(_) => "agent_child_finished",
+            Event::AgentCallFinished(_) => "agent_call_finished",
+            Event::AgentCallRefused(_) => "agent_call_refused",
         }
     }
 }
@@ -358,10 +397,36 @@ impl Event {
 // ---------------------------------------------------------------------------
 
 /// A streaming update within a prompt turn. ACP: `session/update`.
+///
+/// # The child stamp (REQ-623 ADR-3)
+///
+/// A child turn runs the ordinary loop, so it streams ordinary updates — the
+/// `tool_call` its loop sends when a tool starts and the `tool_call_update`
+/// when it finishes are the spec's "child-scoped tool events". [`Self::child_id`]
+/// and [`Self::parent_turn_id`] say which child, stamped by the emitter the
+/// child's loop was handed and nowhere later (LESSON-501).
+///
+/// They sit on this struct rather than on the [`SessionUpdatePayload`]
+/// variants so that **every** update a child streams is attributable, not only
+/// its tool starts: a child's `agent_message_chunk` is text the parent turn did
+/// not write, and a client or a golden sequence that cannot tell it apart from
+/// the parent's own reply would interleave five children's prose into one
+/// answer (LESSON-591).
+///
+/// Both are absent on everything the parent turn streams, and on every frame a
+/// pre-REQ-623 daemon wrote — so this is additive and moves no protocol
+/// version: an old client ignores the keys, a new client reads `None`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionUpdate {
     /// The specific update.
     pub update: SessionUpdatePayload,
+    /// The child turn that streamed this update, or `None` for the parent's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_id: Option<ChildId>,
+    /// The prompt turn the child ran under, beside [`Self::child_id`]; `None`
+    /// exactly when it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_turn_id: Option<TurnId>,
 }
 
 /// The kinds of streaming update a turn can emit. ACP: `SessionUpdate` variants.
@@ -920,6 +985,27 @@ pub struct CostRecord {
     /// moves.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub probe: bool,
+    /// The child turn whose model call this was (REQ-623 BR-8), or `None` for a
+    /// call the parent turn made — and for every row written before REQ-623,
+    /// where the ledger column is `NULL`.
+    ///
+    /// On the record rather than on [`CostRecorded`]: `cost_recorded` is a
+    /// projection of a ledger row, and the ledger is what `/cost` nests a
+    /// parent turn's children under. Same additivity as
+    /// [`SessionUpdate::child_id`]: omitted when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_id: Option<ChildId>,
+    /// The prompt turn this call rolls up under (REQ-623 BR-8): for a child's
+    /// call, the turn the child ran under — always present beside
+    /// [`Self::child_id`]; for a prompt turn's **own** call, that turn, so
+    /// `/cost` can total a parent as its own calls plus its children's.
+    ///
+    /// So it is *not* `None` exactly when `child_id` is: a parent turn's own
+    /// call carries a turn and no child. `None` is a call attributed to no
+    /// turn — a connection probe, the detached session-title duty — and every
+    /// row written before REQ-623.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_turn_id: Option<TurnId>,
 }
 
 /// Event payload wrapping a [`CostRecord`] (spec Events: `cost_recorded`).
@@ -1351,6 +1437,15 @@ pub struct PermissionRequest {
     /// list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<PermissionSubject>,
+    /// The child turn whose tool call is asking (REQ-623 BR-5), so the consent
+    /// prompt can name the child; `None` for the parent's own asks. Same
+    /// additivity as [`SessionUpdate::child_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_id: Option<ChildId>,
+    /// The prompt turn the child ran under, beside [`Self::child_id`]; `None`
+    /// exactly when it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_turn_id: Option<TurnId>,
 }
 
 /// What a [`PermissionRequest`] is about, in a form a client selects on by
@@ -3121,7 +3216,10 @@ pub enum ContextPressureKind {
 /// [`Event`] is internally tagged and flattened, so a `session_id` on this
 /// struct would emit the key twice and fail to deserialize — the same shape
 /// [`ContextCleared`], [`SessionTitled`] and [`PrefixCache`] document.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not `Copy` since REQ-623: a child's pressure names the child, and an id is a
+/// string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextPressure {
     /// What the gate did.
     pub kind: ContextPressureKind,
@@ -3167,6 +3265,15 @@ pub struct ContextPressure {
     /// makes no claim either way, exactly as `bound_floored` reads.
     #[serde(default)]
     pub anchors_intact: bool,
+    /// The child turn whose context was pressured (REQ-623 BR-7 — a mid-child
+    /// reroute refits loudly), or `None` for the parent's. Same additivity as
+    /// [`SessionUpdate::child_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_id: Option<ChildId>,
+    /// The prompt turn the child ran under, beside [`Self::child_id`]; `None`
+    /// exactly when it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_turn_id: Option<TurnId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -4679,6 +4786,170 @@ pub struct RepoContextGeneration {
     pub reason: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// agent_* (REQ-623 — subagent dispatch)
+// ---------------------------------------------------------------------------
+//
+// Seven events, one per fact in a call's life: accepted, each child started,
+// a child asking for consent, a child's unspent share moving to its siblings,
+// each child finished, the call finished — or the call refused before any of
+// that. The shapes they carry ([`ChildId`], [`ChildBounds`], [`ChildStatus`],
+// [`ChildRoute`], [`AgentRefusal`]) live in [`crate::agent`].
+//
+// None of these carries a `session_id`: the envelope names the session, and a
+// second key would emit twice and fail to deserialize (the shape
+// [`ContextPressure`] documents). None carries a task's text or a child's
+// report either — those are repository-derived and reach the model as the tool
+// result, framed; the bus fans out to every subscriber (REQ-611 BR-4).
+
+/// One child an `agent` call is about to start, as [`AgentCallStarted`] lists
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedChild {
+    /// The child's name — the task's own, or the `child-<n>` default.
+    pub name: String,
+    /// The tier the task *requested*, if it requested one. Where the child
+    /// actually runs is [`AgentChildStarted::route`] — a request is not a
+    /// binding (BR-6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_tier: Option<Tier>,
+}
+
+/// An `agent` call passed validation and its children are about to start
+/// (spec Events: `agent_call_started`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCallStarted {
+    /// The daemon-minted call id, unique within the session; every child's
+    /// [`ChildId`] begins with it.
+    pub call_id: String,
+    /// The prompt turn that made the call.
+    pub parent_turn_id: TurnId,
+    /// The call's children, in the order the tasks were given.
+    pub children: Vec<PlannedChild>,
+}
+
+/// A child is about to make its first model call (spec Events:
+/// `agent_child_started`).
+///
+/// Published once the route is resolved and the bounds are stamped, which is
+/// what lets it carry both: [`Self::bounds`] is the value the child's
+/// [`crate::agent::ChildResult::bounds`] echoes (BR-7, AC-11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentChildStarted {
+    /// The child.
+    pub child_id: ChildId,
+    /// The prompt turn the child runs under.
+    pub parent_turn_id: TurnId,
+    /// The child's name, so a client can label it without a lookup.
+    pub name: String,
+    /// The route the router chose, after the privacy pin.
+    pub route: ChildRoute,
+    /// The four numbers the child runs under, fixed from here on (the spend
+    /// share may only rise, by [`AgentChildShareReleased`]).
+    pub bounds: ChildBounds,
+}
+
+/// A child reached an ask-gate at an attended session (spec Events:
+/// `agent_child_consent_requested`, BR-5).
+///
+/// The label, not a second copy of the question. The ordinary
+/// [`PermissionRequest`] the gate raises beside it is the consent payload and
+/// carries the same [`PermissionRequest::child_id`]; repeating its options and
+/// description here would be two surfaces describing one question, free to
+/// disagree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentChildConsentRequested {
+    /// The child that is asking.
+    pub child_id: ChildId,
+    /// Its name — what the consent prompt is labelled with.
+    pub name: String,
+    /// The tool the child wants to run.
+    pub tool: String,
+}
+
+/// One sibling's raised ceiling, as [`AgentChildShareReleased`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareRecipient {
+    /// The running sibling that received a part.
+    pub child_id: ChildId,
+    /// Its spend ceiling after the release, in micro-cents — its stamped share
+    /// plus every part it has received so far.
+    pub new_ceiling_micro_cents: u64,
+}
+
+/// A child ended with unspent share while siblings still ran, and the unspent
+/// amount was split equally among them (spec Events:
+/// `agent_child_share_released`, BR-8).
+///
+/// Floored; the remainder stays in the prompt's pool and is not named. A
+/// ceiling only ever rises, so every [`ShareRecipient::new_ceiling_micro_cents`]
+/// is at least that sibling's stamped share.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentChildShareReleased {
+    /// The child that ended and released its share.
+    pub child_id: ChildId,
+    /// How much it left unspent, in micro-cents.
+    pub released_micro_cents: u64,
+    /// Every running sibling and its new ceiling.
+    pub recipients: Vec<ShareRecipient>,
+}
+
+/// A child reached its terminal status (spec Events: `agent_child_finished`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentChildFinished {
+    /// The child.
+    pub child_id: ChildId,
+    /// Which of the eight ways it ended.
+    pub status: ChildStatus,
+    /// Model calls it made.
+    pub turns_used: u32,
+    /// The sum of its own cost records, in micro-cents.
+    pub cost_micro_cents: u64,
+    /// The size of the child's **whole** final text, in bytes, before any cut —
+    /// beside [`Self::truncated`], how much the bound dropped is legible here
+    /// rather than only in the transcript.
+    pub report_bytes: u64,
+    /// Whether the report the parent receives was cut at `agent.report_max_bytes`
+    /// (BR-11). The full text is in the session transcript.
+    pub truncated: bool,
+}
+
+/// One child's terminal status, as [`AgentCallFinished`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinishedChild {
+    /// The child's name — the same key [`AgentCallStarted::children`] used.
+    pub name: String,
+    /// How it ended.
+    pub status: ChildStatus,
+}
+
+/// Every child of a call is terminal and the tool result is being returned
+/// (spec Events: `agent_call_finished`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCallFinished {
+    /// The call.
+    pub call_id: String,
+    /// Every child's terminal status, in the order the tasks were given.
+    pub children: Vec<FinishedChild>,
+    /// The sum of every child's cost, in micro-cents.
+    pub total_cost_micro_cents: u64,
+    /// Wall-clock time from acceptance to the result, in milliseconds.
+    pub elapsed_ms: u64,
+}
+
+/// An `agent` call was refused whole before any child started (spec Events:
+/// `agent_call_refused`, BR-3).
+///
+/// No `agent_child_started` precedes or follows one for the same call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCallRefused {
+    /// The refused call.
+    pub call_id: String,
+    /// Why, with the numbers that refused it. Nested rather than flattened, so
+    /// its `kind` tag cannot collide with a key the transcript line owns.
+    pub refusal: AgentRefusal,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4913,6 +5184,8 @@ mod tests {
                         cached_tokens: None,
                         reasoning_tokens: None,
                         probe: false,
+                        child_id: None,
+                        parent_turn_id: None,
                     },
                 }),
                 "cost_recorded",
@@ -4937,6 +5210,8 @@ mod tests {
                     update: SessionUpdatePayload::AgentMessageChunk {
                         text: "hi".to_owned(),
                     },
+                    child_id: None,
+                    parent_turn_id: None,
                 }),
                 "session_update",
             ),
@@ -4953,6 +5228,8 @@ mod tests {
                     description: None,
                     options: vec![],
                     subject: None,
+                    child_id: None,
+                    parent_turn_id: None,
                 }),
                 "permission_request",
             ),
@@ -5067,6 +5344,8 @@ mod tests {
                     bound: BudgetBound::LocalEngine,
                     bound_floored: false,
                     anchors_intact: true,
+                    child_id: None,
+                    parent_turn_id: None,
                 }),
                 "context_pressure",
             ),
@@ -6019,10 +6298,12 @@ mod tests {
             bound: BudgetBound::LocalEngine,
             bound_floored: false,
             anchors_intact: true,
+            child_id: None,
+            parent_turn_id: None,
         };
         round_trip(&pressure);
 
-        let wire = envelope_wire(Event::ContextPressure(pressure));
+        let wire = envelope_wire(Event::ContextPressure(pressure.clone()));
         assert_eq!(wire["event"], "context_pressure");
         assert_eq!(wire["session_id"], "s1");
         assert_eq!(wire["kind"], "blocks_dropped");
@@ -6032,7 +6313,7 @@ mod tests {
         assert_eq!(wire["budget_tokens"], 4_096);
         assert_eq!(wire["budget_bytes"], 32_768);
         assert_eq!(wire["bound"], "local_engine");
-        let payload = serde_json::to_value(pressure).unwrap();
+        let payload = serde_json::to_value(&pressure).unwrap();
         assert!(
             payload.get("session_id").is_none(),
             "the envelope names the session, the payload must not: {payload}"
@@ -6119,6 +6400,8 @@ mod tests {
                 bound: BudgetBound::RedactScan,
                 bound_floored: false,
                 anchors_intact: true,
+                child_id: None,
+                parent_turn_id: None,
             };
             round_trip(&pressure);
             let wire = envelope_wire(Event::ContextPressure(pressure));
@@ -6198,6 +6481,8 @@ mod tests {
             bound: BudgetBound::UserCap,
             bound_floored: true,
             anchors_intact: true,
+            child_id: None,
+            parent_turn_id: None,
         };
         round_trip(&pressure);
         let wire = envelope_wire(Event::ContextPressure(pressure));
@@ -6287,6 +6572,8 @@ mod tests {
             update: SessionUpdatePayload::AgentMessageChunk {
                 text: "chunk".to_owned(),
             },
+            child_id: None,
+            parent_turn_id: None,
         });
         round_trip(&SessionUpdate {
             update: SessionUpdatePayload::ToolCall {
@@ -6294,12 +6581,16 @@ mod tests {
                 title: "read file".to_owned(),
                 status: ToolCallStatus::Pending,
             },
+            child_id: None,
+            parent_turn_id: None,
         });
         round_trip(&SessionUpdate {
             update: SessionUpdatePayload::ToolCallUpdate {
                 tool_call_id: "c1".to_owned(),
                 status: ToolCallStatus::Completed,
             },
+            child_id: None,
+            parent_turn_id: None,
         });
         round_trip(&SessionUpdate {
             update: SessionUpdatePayload::Diff {
@@ -6307,6 +6598,8 @@ mod tests {
                 old_text: None,
                 new_text: "fn a() {}".to_owned(),
             },
+            child_id: None,
+            parent_turn_id: None,
         });
         round_trip(&SessionUpdate {
             update: SessionUpdatePayload::Plan {
@@ -6315,6 +6608,8 @@ mod tests {
                     status: PlanEntryStatus::InProgress,
                 }],
             },
+            child_id: None,
+            parent_turn_id: None,
         });
     }
 
@@ -6562,6 +6857,8 @@ mod tests {
                 ],
                 invoked_by: InvokedBy::User,
             }),
+            child_id: None,
+            parent_turn_id: None,
         })
         .unwrap();
         assert!(
@@ -7288,6 +7585,8 @@ mod tests {
             description: None,
             options: vec![],
             subject: Some(subject),
+            child_id: None,
+            parent_turn_id: None,
         })
         .unwrap();
         assert!(
@@ -8131,6 +8430,8 @@ mod tests {
                 cached_tokens: None,
                 reasoning_tokens: None,
                 probe: false,
+                child_id: None,
+                parent_turn_id: None,
             },
         });
     }
@@ -8157,6 +8458,8 @@ mod tests {
             cached_tokens: None,
             reasoning_tokens: None,
             probe: false,
+            child_id: None,
+            parent_turn_id: None,
         };
         round_trip(&turn);
         let wire = serde_json::to_value(&turn).unwrap();
@@ -8444,6 +8747,8 @@ mod tests {
                 },
             ],
             subject: None,
+            child_id: None,
+            parent_turn_id: None,
         });
     }
 
@@ -9688,6 +9993,8 @@ mod tests {
                 kind: PermissionOptionKind::AllowOnce,
             }],
             subject: Some(subject),
+            child_id: None,
+            parent_turn_id: None,
         })
         .unwrap();
         assert!(
@@ -9988,6 +10295,354 @@ mod tests {
                 "envelope name mismatch"
             );
         }
+    }
+
+    /// **REQ-623: the seven `agent_*` events carry the wire names the spec's
+    /// Events table spells, and round-trip through the envelope.**
+    ///
+    /// The expected names are literals copied from the table, never read off
+    /// [`Event::name`] — the subject — so a derive and an arm that drifted
+    /// together still go red here. Every payload is built with every optional
+    /// populated, so a field that failed to round-trip cannot hide behind its
+    /// default (`envelope_wire` asserts the round trip). No payload names the
+    /// session: the envelope does, and a second `session_id` would emit twice.
+    ///
+    /// **Mutation (run 2026-10-05):** changing the `name()` arm for
+    /// `AgentCallRefused` to `"agent_refused"` reds this test on that row's
+    /// `name()` assertion, and nothing else in the crate (1 of 247) —
+    /// `Event::name` has no other witness for the seven.
+    #[test]
+    fn agent_events_round_trip_their_wire_names() {
+        let call = "toolu_01".to_owned();
+        let first = ChildId::new(&call, "audit-1");
+        let second = ChildId::new(&call, "audit-2");
+        let cases = vec![
+            (
+                Event::AgentCallStarted(AgentCallStarted {
+                    call_id: call.clone(),
+                    parent_turn_id: TurnId::from("turn-3"),
+                    children: vec![
+                        PlannedChild {
+                            name: "audit-1".to_owned(),
+                            requested_tier: Some(Tier::Build),
+                        },
+                        PlannedChild {
+                            name: "audit-2".to_owned(),
+                            requested_tier: None,
+                        },
+                    ],
+                }),
+                "agent_call_started",
+            ),
+            (
+                Event::AgentChildStarted(AgentChildStarted {
+                    child_id: first.clone(),
+                    parent_turn_id: TurnId::from("turn-3"),
+                    name: "audit-1".to_owned(),
+                    route: ChildRoute {
+                        tier: Some(Tier::Build),
+                        provider_id: ProviderId::from("anthropic"),
+                        model: "claude-sonnet".to_owned(),
+                    },
+                    bounds: ChildBounds {
+                        max_turns: 12,
+                        context_budget_bytes: 397_952,
+                        spend_ceiling_micro_cents: Some(125_000),
+                        deadline_secs: 600,
+                    },
+                }),
+                "agent_child_started",
+            ),
+            (
+                Event::AgentChildConsentRequested(AgentChildConsentRequested {
+                    child_id: first.clone(),
+                    name: "audit-1".to_owned(),
+                    tool: "shell".to_owned(),
+                }),
+                "agent_child_consent_requested",
+            ),
+            (
+                Event::AgentChildShareReleased(AgentChildShareReleased {
+                    child_id: first.clone(),
+                    released_micro_cents: 83_334,
+                    recipients: vec![ShareRecipient {
+                        child_id: second.clone(),
+                        new_ceiling_micro_cents: 208_334,
+                    }],
+                }),
+                "agent_child_share_released",
+            ),
+            (
+                Event::AgentChildFinished(AgentChildFinished {
+                    child_id: first.clone(),
+                    status: ChildStatus::Completed,
+                    turns_used: 4,
+                    cost_micro_cents: 41_666,
+                    report_bytes: 32_769,
+                    truncated: true,
+                }),
+                "agent_child_finished",
+            ),
+            (
+                Event::AgentCallFinished(AgentCallFinished {
+                    call_id: call.clone(),
+                    children: vec![
+                        FinishedChild {
+                            name: "audit-1".to_owned(),
+                            status: ChildStatus::Completed,
+                        },
+                        FinishedChild {
+                            name: "audit-2".to_owned(),
+                            status: ChildStatus::SpendExhausted,
+                        },
+                    ],
+                    total_cost_micro_cents: 291_666,
+                    elapsed_ms: 48_210,
+                }),
+                "agent_call_finished",
+            ),
+            (
+                Event::AgentCallRefused(AgentCallRefused {
+                    call_id: call.clone(),
+                    refusal: AgentRefusal::TooManyChildren {
+                        requested: 6,
+                        cap: 5,
+                    },
+                }),
+                "agent_call_refused",
+            ),
+        ];
+
+        let mut seen = std::collections::BTreeSet::new();
+        for (event, expected) in cases {
+            assert_eq!(event.name(), expected, "name() mismatch");
+            assert!(seen.insert(expected), "{expected} listed twice");
+            let payload = serde_json::to_value(&event).unwrap();
+            assert!(
+                payload.get("session_id").is_none(),
+                "the envelope names the session, the payload must not: {payload}"
+            );
+            let wire = envelope_wire(event);
+            assert_eq!(wire["event"], expected, "wire tag mismatch: {wire}");
+        }
+        assert_eq!(seen.len(), 7, "the spec names seven agent events");
+
+        // Two shapes a client keys on: the id is a bare string, and the
+        // refusal's code is nested under `refusal` rather than flattened into
+        // the frame beside the transcript's own `kind`.
+        let wire = envelope_wire(Event::AgentChildConsentRequested(
+            AgentChildConsentRequested {
+                child_id: first,
+                name: "audit-1".to_owned(),
+                tool: "shell".to_owned(),
+            },
+        ));
+        assert_eq!(wire["child_id"], "toolu_01/audit-1");
+        let wire = envelope_wire(Event::AgentCallRefused(AgentCallRefused {
+            call_id: call,
+            refusal: AgentRefusal::ChildCapReached {
+                started: 5,
+                requested: 4,
+                cap: 8,
+            },
+        }));
+        assert_eq!(wire["refusal"]["kind"], "child_cap_reached");
+        assert_eq!(wire["refusal"]["cap"], 8);
+        assert!(wire.get("kind").is_none(), "{wire}");
+    }
+
+    /// **REQ-623 BR-13 / ADR-3: the child stamp is additive on every payload a
+    /// child turn streams through the ordinary vocabulary.**
+    ///
+    /// Five rows — a `tool_started` (`session_update`/`tool_call`), a
+    /// `tool_finished` (`tool_call_update`), a `context_pressure`, a
+    /// `cost_recorded` and a `permission_request` — and four claims on each:
+    ///
+    /// 1. **Unstamped emits no key.** The parent's own events, and every frame
+    ///    a pre-REQ-623 daemon wrote, carry neither `child_id` nor
+    ///    `parent_turn_id` — not `null`, *no key*, anywhere in the frame — so
+    ///    a parent turn serializes byte-identically to before and neither
+    ///    protocol version moves.
+    /// 2. **Stamped carries both**, as bare strings, at the payload's own level
+    ///    (`record` for `cost_recorded`), and round-trips.
+    /// 3. **A frame without the keys decodes to `None`** — the stamped frame
+    ///    with its two keys removed is exactly the unstamped event.
+    /// 4. **A reader built before the fields still reads a stamped frame**,
+    ///    shown with the pre-REQ shapes of `session_update` and
+    ///    `permission_request`.
+    ///
+    /// **Mutations (run 2026-10-05):** dropping `skip_serializing_if` from
+    /// [`SessionUpdate::child_id`] reds this test on the `tool_started` row's
+    /// "no key" assertion (`"child_id":null` appears) — and nothing else in
+    /// the crate (1 of 247). The same inversion on [`ContextPressure`],
+    /// [`CostRecord`] and [`PermissionRequest`] reds this test on that row,
+    /// one at a time, so no row is decoration. Dropping `#[serde(default)]`
+    /// from the same field reds
+    /// **nothing**: serde already reads a missing `Option` as `None`, so the
+    /// attribute states the property rather than providing it — claim 3 is
+    /// asserted on the property, not on the attribute (LESSON-550).
+    #[test]
+    fn child_ids_are_optional_and_omitted_when_none() {
+        let child = ChildId::new("toolu_01", "audit-1");
+        let parent = TurnId::from("turn-3");
+
+        let session_update = |update: SessionUpdatePayload, stamp: bool| {
+            Event::SessionUpdate(SessionUpdate {
+                update,
+                child_id: stamp.then(|| child.clone()),
+                parent_turn_id: stamp.then(|| parent.clone()),
+            })
+        };
+        let tool_started = |stamp| {
+            session_update(
+                SessionUpdatePayload::ToolCall {
+                    tool_call_id: "c1".to_owned(),
+                    title: "grep TODO".to_owned(),
+                    status: ToolCallStatus::InProgress,
+                },
+                stamp,
+            )
+        };
+        let tool_finished = |stamp| {
+            session_update(
+                SessionUpdatePayload::ToolCallUpdate {
+                    tool_call_id: "c1".to_owned(),
+                    status: ToolCallStatus::Completed,
+                },
+                stamp,
+            )
+        };
+        let pressure = |stamp: bool| {
+            Event::ContextPressure(ContextPressure {
+                kind: ContextPressureKind::RefitOnReroute,
+                dropped_blocks: 2,
+                elided_bytes: 0,
+                newest_user_elided: false,
+                budget_tokens: 4_096,
+                budget_bytes: 32_768,
+                bound: BudgetBound::LocalEngine,
+                bound_floored: false,
+                anchors_intact: true,
+                child_id: stamp.then(|| child.clone()),
+                parent_turn_id: stamp.then(|| parent.clone()),
+            })
+        };
+        let cost = |stamp: bool| {
+            Event::CostRecorded(CostRecorded {
+                record: CostRecord {
+                    session_id: SessionId::from("s1"),
+                    phase: None,
+                    category: Some(Category::Edit),
+                    provider_id: ProviderId::from("anthropic"),
+                    model: "claude-sonnet".to_owned(),
+                    input_tokens: 1_200,
+                    output_tokens: 300,
+                    usd_micros: 4_100,
+                    cached_tokens: None,
+                    reasoning_tokens: None,
+                    probe: false,
+                    child_id: stamp.then(|| child.clone()),
+                    parent_turn_id: stamp.then(|| parent.clone()),
+                },
+            })
+        };
+        let permission = |stamp: bool| {
+            Event::PermissionRequest(PermissionRequest {
+                request_id: RequestId::from("r1"),
+                tool_name: "shell".to_owned(),
+                description: Some("cargo test".to_owned()),
+                options: vec![PermissionOption {
+                    option_id: "allow_once".to_owned(),
+                    label: "Allow once".to_owned(),
+                    kind: PermissionOptionKind::AllowOnce,
+                }],
+                subject: None,
+                child_id: stamp.then(|| child.clone()),
+                parent_turn_id: stamp.then(|| parent.clone()),
+            })
+        };
+
+        let rows: Vec<(&str, Event, Event, Option<&str>)> = vec![
+            (
+                "tool_started",
+                tool_started(false),
+                tool_started(true),
+                None,
+            ),
+            (
+                "tool_finished",
+                tool_finished(false),
+                tool_finished(true),
+                None,
+            ),
+            ("context_pressure", pressure(false), pressure(true), None),
+            ("cost_recorded", cost(false), cost(true), Some("record")),
+            (
+                "permission_request",
+                permission(false),
+                permission(true),
+                None,
+            ),
+        ];
+
+        for (label, unstamped, stamped, nested) in rows {
+            // 1. Unstamped: no key at any depth of the frame.
+            let wire = envelope_wire(unstamped.clone());
+            let text = wire.to_string();
+            assert!(
+                !text.contains("child_id") && !text.contains("parent_turn_id"),
+                "{label}: an unstamped frame must carry neither key: {text}"
+            );
+
+            // 2. Stamped: both, as bare strings, where the payload's own
+            //    fields are.
+            let wire = envelope_wire(stamped.clone());
+            let at = nested.map_or(&wire, |key| &wire[key]);
+            assert_eq!(at["child_id"], "toolu_01/audit-1", "{label}: {wire}");
+            assert_eq!(at["parent_turn_id"], "turn-3", "{label}: {wire}");
+
+            // 3. The same frame as a pre-REQ daemon wrote it decodes to `None`.
+            let mut legacy = wire.clone();
+            let obj = match nested {
+                Some(key) => legacy[key].as_object_mut().unwrap(),
+                None => legacy.as_object_mut().unwrap(),
+            };
+            assert!(obj.remove("child_id").is_some(), "{label}");
+            assert!(obj.remove("parent_turn_id").is_some(), "{label}");
+            let back: EventEnvelope = serde_json::from_value(legacy).expect(label);
+            assert_eq!(
+                back,
+                EventEnvelope::new(1, Some(SessionId::from("s1")), unstamped),
+                "{label}: a frame without the keys must read `None`"
+            );
+        }
+
+        // 4. Readers built before the fields: the shapes `session_update` and
+        //    `permission_request` had, decoding stamped payloads.
+        #[derive(Deserialize)]
+        struct PreChildSessionUpdate {
+            update: SessionUpdatePayload,
+        }
+        #[derive(Deserialize)]
+        struct PreChildPermissionRequest {
+            request_id: RequestId,
+            tool_name: String,
+        }
+        let Event::SessionUpdate(stamped) = tool_started(true) else {
+            unreachable!()
+        };
+        let old: PreChildSessionUpdate =
+            serde_json::from_value(serde_json::to_value(&stamped).unwrap())
+                .expect("a pre-REQ client still reads a child's tool start");
+        assert_eq!(old.update, stamped.update);
+        let Event::PermissionRequest(stamped) = permission(true) else {
+            unreachable!()
+        };
+        let old: PreChildPermissionRequest =
+            serde_json::from_value(serde_json::to_value(&stamped).unwrap())
+                .expect("a pre-REQ client still reads a child's ask");
+        assert_eq!(old.request_id, RequestId::from("r1"));
+        assert_eq!(old.tool_name, "shell");
     }
 }
 

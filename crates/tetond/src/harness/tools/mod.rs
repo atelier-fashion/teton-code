@@ -47,6 +47,7 @@ use super::context::ToolProvenance;
 use super::duty::DutyRoute;
 use crate::session_root::ProbedRoot;
 
+pub mod agent;
 pub mod docs;
 pub mod edit;
 pub mod glob;
@@ -61,6 +62,10 @@ pub mod skill;
 pub mod walk;
 pub mod web;
 
+pub use agent::{
+    register_agent_tool, AgentCall, AgentParent, AgentTool, AGENT_CAP_EXEMPT_REASON,
+    AGENT_TOOL_NAME,
+};
 pub use docs::{DocsTool, DOCS_TOOL_NAME};
 pub use edit::EditTool;
 pub use glob::GlobTool;
@@ -123,6 +128,7 @@ pub const CAP_EXEMPT_TOOLS: &[(&str, &str)] = &[
          capability that exists because the user installed skills must not be silently \
          withheld by a cap whose limit equals the built-in count (REQ-587 BR-2)",
     ),
+    (AGENT_TOOL_NAME, AGENT_CAP_EXEMPT_REASON),
 ];
 
 /// Every tool that raises its **own** permission prompt inside [`Tool::run`],
@@ -707,6 +713,8 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 /// asks for the envelope *by value* rather than by name, which is how a tool
 /// deliberately kept out of `UNTRUSTED_OUTPUT_TOOLS` still frames those of its
 /// own results that are data. `Expansion` is never enveloped and never digested.
+/// REQ-623 added a fourth, [`UntrustedWhole`](Self::UntrustedWhole): enveloped
+/// like `UntrustedData`, never digested like `Expansion`.
 ///
 /// The default is what keeps this additive: every existing
 /// [`ToolOutcome::ok`]/[`ToolOutcome::error`] is byte-identical to what it was,
@@ -728,6 +736,19 @@ pub enum ResultDisposition {
     /// by the expander that composed the body, so the loop's job here is to fold
     /// it verbatim and keep its hands off.
     Expansion,
+    /// Data framed as untrusted whatever the tool is called — as
+    /// [`UntrustedData`](Self::UntrustedData) — and **never condensed**, as
+    /// [`Expansion`](Self::Expansion) is not: the `agent` tool's typed JSON
+    /// (REQ-623 BR-11).
+    ///
+    /// Each child's report is already cut at `agent.report_max_bytes` with a
+    /// loud, typed marker, and the array around it is fields the parent model
+    /// keys on (`status`, `refusal`, `bounds`). The `digest` duty would hand
+    /// the model a prose summary of that array, and its fallback would cut it
+    /// mid-object — either way the parent reads something that is not the
+    /// result BR-10 promised it. It is still repository-derived model output,
+    /// so the envelope stays.
+    UntrustedWhole,
 }
 
 /// The result of running a tool: text folded back into the model's context, a
@@ -1109,6 +1130,19 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// This tool **as** the `agent` tool, when it is one (REQ-623 ADR-1).
+    ///
+    /// `as_skill`'s pattern, for the second tool the loop must treat specially:
+    /// an `agent` call is minutes of awaiting child turns, so the loop
+    /// `.await`s [`agent::AgentTool::dispatch`] on its async path instead of
+    /// running [`Tool::run`] off the worker — `block_in_place` around a
+    /// `block_on` would be BUG-226's shape at N times the duration. A
+    /// default-`None` accessor names the one tool and leaves every other
+    /// implementation untouched.
+    fn as_agent(&self) -> Option<&agent::AgentTool> {
+        None
+    }
+
     /// Refine this tool's own `outcome` through the harness duty this tool owns,
     /// given the `request` the turn is serving and the `args` it was called with.
     ///
@@ -1156,13 +1190,31 @@ struct Registration {
 /// so put the most load-bearing tools first.
 pub struct ToolRegistry {
     tools: Vec<Registration>,
+    /// Why a tool the model may still name is **absent** from this registry,
+    /// keyed by its name — appended to the unknown-tool answer (REQ-623 BR-14).
+    ///
+    /// Absence stays absence: the tool is in no roster, no schema and no
+    /// dispatch. What a note changes is only the sentence a model gets for
+    /// calling it anyway — `agent` turned off by config names the key, where
+    /// the bare answer would leave the model (and the skill that asked) to
+    /// guess why a tool the skill names does not exist.
+    absent: Vec<(&'static str, &'static str)>,
 }
 
 impl ToolRegistry {
     /// An empty registry.
     #[must_use]
     pub fn new() -> Self {
-        Self { tools: Vec::new() }
+        Self {
+            tools: Vec::new(),
+            absent: Vec::new(),
+        }
+    }
+
+    /// Record why `name` is absent from this registry — said when the model
+    /// calls it anyway (see the field's docs). Registers nothing.
+    pub fn note_absent(&mut self, name: &'static str, why: &'static str) {
+        self.absent.push((name, why));
     }
 
     /// A registry with the full built-in tool set, in weak-model priority order:
@@ -1307,10 +1359,17 @@ impl ToolRegistry {
     pub fn dispatch(&self, name: &str, ctx: &ToolContext, args: &Value) -> ToolOutcome {
         match self.get(name) {
             Some(tool) => tool.run(ctx, args),
-            None => ToolOutcome::error(format!(
-                "unknown tool `{name}`; available tools: {}",
-                self.names().join(", ")
-            )),
+            None => {
+                let mut answer = format!(
+                    "unknown tool `{name}`; available tools: {}",
+                    self.names().join(", ")
+                );
+                // REQ-623 BR-14: a tool absent by configuration says which key.
+                if let Some((_, why)) = self.absent.iter().find(|(absent, _)| *absent == name) {
+                    answer.push_str(&format!(" ({why})"));
+                }
+                ToolOutcome::error(answer)
+            }
         }
     }
 
@@ -2366,9 +2425,22 @@ mod tests {
         ))
     }
 
-    /// The daemon's registration order, with the **real** `skill` tool and a
-    /// stand-in for `web`: built-ins, then MCP, then the two optional
-    /// cap-exempt tools, last.
+    /// A dispatcher for a registry that is only ever listed, never called.
+    struct NoChildren;
+
+    #[async_trait]
+    impl crate::harness::child::ChildDispatcher for NoChildren {
+        async fn run_child(
+            &self,
+            spec: crate::harness::child::ChildSpec,
+        ) -> crate::harness::child::ChildOutcome {
+            crate::harness::child::ChildOutcome::cancelled_before_start(spec.name)
+        }
+    }
+
+    /// The daemon's registration order for a **prompt** turn, with the real
+    /// `skill` and `agent` tools and a stand-in for `web`: built-ins, then MCP,
+    /// then the optional cap-exempt tools, `agent` last (REQ-623 ADR-7).
     fn daemon_shaped_registry(tag: &str) -> ToolRegistry {
         let mut reg = ToolRegistry::with_builtins();
         reg.register(Arc::new(StubTool("mcp")));
@@ -2394,6 +2466,24 @@ mod tests {
             ),
             "the fixture registry holds a model-invocable skill, so registration is \
              the condition's `true` arm"
+        );
+        assert!(
+            agent::register_agent_tool(
+                &mut reg,
+                &teton_core::config::AgentConfig::default(),
+                agent::AgentParent {
+                    turn_id: teton_protocol::TurnId::from("turn-tools"),
+                    events: crate::harness::turn_loop::SessionEvents::new(
+                        Arc::new(crate::broadcast::EventBus::new()),
+                        teton_protocol::SessionId::from("tools-mod-test"),
+                    ),
+                    spend_ceiling: None,
+                    prompt_spend: None,
+                },
+                || Arc::new(NoChildren),
+                tokio::runtime::Handle::current(),
+            ),
+            "`agent.enabled` defaults to true, so registration is the `true` arm"
         );
         reg
     }
@@ -2473,10 +2563,11 @@ mod tests {
                 // it — registered before `web` because web must stay last.
                 PROJECTS_TOOL_NAME,
                 WEB_TOOL_NAME,
-                SKILL_TOOL_NAME
+                SKILL_TOOL_NAME,
+                AGENT_TOOL_NAME
             ],
             "under the degraded cap the five built-ins, `teton_docs`, the opted-in web \
-             tool and `skill` are all exposed — and the non-exempt MCP tool is not"
+             tool, `skill` and `agent` are all exposed — and the non-exempt MCP tool is not"
         );
 
         let strong = reg.exposed_names(None);
@@ -2492,7 +2583,8 @@ mod tests {
                 DOCS_TOOL_NAME,
                 PROJECTS_TOOL_NAME,
                 WEB_TOOL_NAME,
-                SKILL_TOOL_NAME
+                SKILL_TOOL_NAME,
+                AGENT_TOOL_NAME
             ],
             "a cap of zero bounds the non-exempt registrations only; the exempt tools \
              are present exactly as `teton_docs` is today"

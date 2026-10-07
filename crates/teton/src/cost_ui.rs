@@ -21,7 +21,7 @@
 //! `prices.toml` — was a second source of truth and has been removed.)
 
 use teton_protocol::events::CostRecord;
-use teton_protocol::methods::CostReportView;
+use teton_protocol::methods::{CostReportView, CostTurnView};
 
 use crate::render::{LineKind, Surface};
 
@@ -118,6 +118,7 @@ pub fn render_report_view(report: &CostReportView, surface: &mut dyn Surface) {
 
     render_group(surface, "per phase", &report.per_phase);
     render_group(surface, "per provider", &report.per_provider);
+    render_turns_with_children(surface, &report.per_turn);
     render_web_lookups(surface, &report.web_per_session);
 
     surface.line(
@@ -223,6 +224,81 @@ pub(crate) fn render_reasoning_split(
     );
 }
 
+/// Render every parent turn that dispatched children, with one indented line
+/// per child beneath it (REQ-623 BR-8 / BR-13, AC-12).
+///
+/// ```text
+/// turns with children:
+///   turn-2 (sess-a): $0.003100 over 2 call(s)
+///     own                 1 call(s)       10 in /       5 out  $0.000100
+///     child audit         1 call(s)     4000 in /    2000 out  $0.003000  deepseek/deepseek-v4-pro
+/// ```
+///
+/// The label column is wider than the roll-ups' twelve because every child's
+/// label carries `child ` ahead of a model-chosen name; a name longer than the
+/// column pushes its own row's figures right and nobody else's.
+///
+/// **The parent's total is the daemon's `total`, never a sum taken here**: the
+/// report already carries `own + children` (REQ-544 M-7's one-source rule for
+/// every figure on this surface), and a client that added the lines up would be
+/// a second ledger free to disagree with the first the day a child goes
+/// unpriced. The rows beneath it are the parts, so a reader can check the sum
+/// by eye; the client does not.
+///
+/// A **view** over calls the totals above already count, drawn after the
+/// roll-ups it is a breakdown of and labelled as turns, so it is never read as
+/// an addition to them. Silent when empty, like [`render_web_lookups`] and for
+/// the same reason — a report from a daemon that predates REQ-623, or from a
+/// session that never dispatched a child, is byte-identical to before the
+/// field existed.
+///
+/// No per-child status: the report is a ledger, and a ledger row knows what a
+/// call cost, not how the child ended. The status is on the session's own
+/// `agent_child_finished` line.
+fn render_turns_with_children(surface: &mut dyn Surface, turns: &[CostTurnView]) {
+    if turns.is_empty() {
+        return;
+    }
+    surface.line(LineKind::Cost, "turns with children:");
+    for turn in turns {
+        surface.line(
+            LineKind::Cost,
+            &format!(
+                "  {} ({}): {} over {} call(s)",
+                turn.turn_id,
+                turn.session_id,
+                format_usd(turn.total.usd_micros),
+                turn.total.calls,
+            ),
+        );
+        surface.line(
+            LineKind::Cost,
+            &format!(
+                "    {:<16} {:>4} call(s)  {:>7} in / {:>7} out  {}",
+                "own",
+                turn.own.calls,
+                turn.own.input_tokens,
+                turn.own.output_tokens,
+                format_usd(turn.own.usd_micros),
+            ),
+        );
+        for child in &turn.children {
+            surface.line(
+                LineKind::Cost,
+                &format!(
+                    "    {:<16} {:>4} call(s)  {:>7} in / {:>7} out  {}  {}",
+                    format!("child {}", child.name),
+                    child.calls,
+                    child.input_tokens,
+                    child.output_tokens,
+                    format_usd(child.usd_micros),
+                    child.route,
+                ),
+            );
+        }
+    }
+}
+
 /// Render the per-session web-lookup roll-up (REQ-563 BR-7 / AC-6).
 ///
 /// Its own section rather than a column on the call tables, mirroring the
@@ -274,6 +350,8 @@ mod tests {
             cached_tokens: None,
             reasoning_tokens: None,
             probe: false,
+            child_id: None,
+            parent_turn_id: None,
         }
     }
 
@@ -324,6 +402,7 @@ mod tests {
                 usd_micros: 3_000,
             }],
             web_per_session: Vec::new(),
+            per_turn: Vec::new(),
             reasoning_tokens: None,
             calls_reporting_reasoning: 0,
             probe_calls: 0,
@@ -362,6 +441,7 @@ mod tests {
             per_phase: Vec::new(),
             per_provider: Vec::new(),
             web_per_session: Vec::new(),
+            per_turn: Vec::new(),
             reasoning_tokens: None,
             calls_reporting_reasoning: 0,
             probe_calls: 0,
@@ -402,6 +482,7 @@ mod tests {
             per_phase: Vec::new(),
             per_provider: Vec::new(),
             web_per_session: Vec::new(),
+            per_turn: Vec::new(),
             reasoning_tokens: None,
             calls_reporting_reasoning: 0,
             probe_calls: 0,
@@ -486,10 +567,129 @@ mod tests {
             }],
             per_provider: Vec::new(),
             web_per_session: Vec::new(),
+            per_turn: Vec::new(),
             reasoning_tokens: None,
             calls_reporting_reasoning: 0,
             probe_calls: 0,
         }
+    }
+
+    // ---- REQ-623: per-child rows under the parent turn (AC-12) -----------
+
+    /// **AC-12: the parent turn's total, then its own calls and one indented
+    /// line per child — and a report with no children renders exactly as it
+    /// did before the field existed.**
+    ///
+    /// Golden on both sides. The nested section is asserted line for line, in
+    /// place, between the per-provider roll-up it breaks down and the savings
+    /// line; the no-children report is asserted as its **whole** cost surface,
+    /// written out, so a stray heading or a reordered roll-up is a diff rather
+    /// than a `contains` that still holds. The parent's `$0.003100` is the
+    /// report's own `total` — chosen unequal to any line beneath it, so a
+    /// renderer that printed `own` (or the first child) in its place reds.
+    ///
+    /// **Mutations, applied and observed red (2026-10-05; re-run 2026-10-07 by
+    /// TASK-430, which owns the counts — LESSON-652)** — each **1 red of
+    /// 1,079**, this test, over the `teton` unit suite (880), its `cli_e2e`
+    /// (98) and `pty_e2e` (54) suites, and `tetond`'s `agent_dispatch`,
+    /// `provenance_egress` and `event_response_ordering` (47). No end-to-end
+    /// test reddened: the CLI suites drive no agent events, and TASK-430's
+    /// drive the daemon over its socket, never the CLI. Each reverted with the
+    /// same edit:
+    ///
+    /// | Mutation | Fails on |
+    /// |---|---|
+    /// | drop the `for child in &turn.children` loop | the child lines are missing |
+    /// | print `turn.own` as the parent's total | `$0.000100 over 1 call(s)` on the turn line |
+    /// | drop the `is_empty` early return (heading always drawn) | the no-children golden gains `turns with children:` |
+    #[test]
+    fn child_rows_nest_under_parent() {
+        use teton_protocol::agent::ChildId;
+        use teton_protocol::methods::{CostChildView, CostTurnView};
+        use teton_protocol::TurnId;
+
+        let group = |key: &str, calls, input_tokens, output_tokens, usd_micros| CostGroupView {
+            key: key.to_owned(),
+            calls,
+            input_tokens,
+            output_tokens,
+            usd_micros,
+        };
+        let child =
+            |name: &str, route: &str, input_tokens, output_tokens, usd_micros| CostChildView {
+                child_id: ChildId::new("toolu_01", name),
+                name: name.to_owned(),
+                route: route.to_owned(),
+                calls: 1,
+                input_tokens,
+                output_tokens,
+                usd_micros,
+            };
+        let report = CostReportView {
+            total_usd_micros: 5_100,
+            total_calls: 3,
+            per_turn: vec![CostTurnView {
+                session_id: SessionId::from("sess-a"),
+                turn_id: TurnId::from("turn-2"),
+                own: group("turn-2", 1, 10, 5, 100),
+                children: vec![
+                    child("audit-1", "deepseek/deepseek-v4-pro", 4_000, 2_000, 3_000),
+                    child(
+                        "audit-2",
+                        "deepseek/deepseek-v4-pro → anthropic/claude-opus-5",
+                        900,
+                        300,
+                        2_000,
+                    ),
+                ],
+                total: group("turn-2", 3, 4_910, 2_305, 5_100),
+            }],
+            ..fully_priced()
+        };
+
+        let mut surface = RecordingSurface::new();
+        render_report_view(&report, &mut surface);
+        let lines = surface.lines_of(LineKind::Cost);
+        let start = lines
+            .iter()
+            .position(|line| *line == "per provider: (no attributed calls)")
+            .expect("the per-provider roll-up precedes the nested section");
+        assert_eq!(
+            lines[start + 1..start + 6],
+            [
+                "turns with children:",
+                "  turn-2 (sess-a): $0.005100 over 3 call(s)",
+                "    own                 1 call(s)       10 in /       5 out  $0.000100",
+                "    child audit-1       1 call(s)     4000 in /    2000 out  $0.003000  \
+                 deepseek/deepseek-v4-pro",
+                "    child audit-2       1 call(s)      900 in /     300 out  $0.002000  \
+                 deepseek/deepseek-v4-pro → anthropic/claude-opus-5",
+            ],
+            "{lines:#?}"
+        );
+        assert!(
+            lines[start + 6].starts_with("estimated savings vs "),
+            "the savings line follows the nested section: {lines:#?}"
+        );
+
+        // Benign: no `per_turn` — a pre-REQ-623 daemon, or no child dispatched
+        // — renders the cost surface it always did, byte for byte.
+        let mut before = RecordingSurface::new();
+        render_report_view(&fully_priced(), &mut before);
+        assert_eq!(
+            before.lines_of(LineKind::Cost),
+            [
+                "── cost summary ──",
+                "total: $0.003000 over 1 call(s)",
+                "  thinking:    unreported (no provider reported a reasoning split)",
+                "per phase:",
+                "  implement       1 call(s)       10 in /      10 out  $0.003000",
+                "per provider: (no attributed calls)",
+                "estimated savings vs anthropic/claude-opus-4: $0.000000 (baseline $0.003000 − \
+                 actual $0.003000)",
+                "  (estimate) Estimate, not a measurement.",
+            ]
+        );
     }
 
     // ---- REQ-581: the probe count (BR-5) ----------------------------------

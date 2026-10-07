@@ -442,6 +442,15 @@ impl WebTool {
             // value, and the `permission_request` this answered is itself the
             // record. Minting a neighbouring outcome to fill the gap would put
             // a wrong word in the one place BR-7 is read from.
+            //
+            // REQ-623 BR-10: this gate is the tool's own, invisible to the
+            // loop, which counted the call as dispatched. Inside a child, a
+            // denial here is a gate denial and nothing was looked up, so a
+            // child left with nothing else ends `refused`, not `completed`
+            // (`ChildToolCalls::note_refused_inside`).
+            if let Some(child) = crate::harness::child::current_child() {
+                child.tool_calls.note_refused_inside(WEB_TOOL_NAME);
+            }
             return ToolOutcome::error(format!(
                 "Permission denied: the user declined this web {}. Do not retry it; take a \
                  different approach or finish.",
@@ -1768,6 +1777,63 @@ mod tests {
         );
     }
 
+    /// **REQ-623 BR-10: a web lookup denied at the tool's own consent, inside a
+    /// child, is a gate denial** — so a child whose only call this was, and
+    /// which then had nothing to report, ends `refused gate_denied:web` rather
+    /// than `completed` with an empty report.
+    ///
+    /// The loop cannot see this gate: it counts the call as dispatched
+    /// (`note_ran`, done here by hand in its place), and the tool takes the
+    /// dispatch back out. Benign: an allowed lookup inside a child notes
+    /// nothing, and the same dispatch then counts as a call that ran.
+    ///
+    /// Mutation (run 2026-10-07, reverted): the `note_refused_inside` call
+    /// removed from the denial branch — 1 red of the 2,323 lib tests, this one,
+    /// at the refusal.
+    #[tokio::test]
+    async fn a_denied_lookup_inside_a_child_is_a_gate_refusal() {
+        use crate::harness::child::{ChildTaskScope, ChildToolCalls, PausableDeadline};
+        let in_a_child = |tool_calls: &ChildToolCalls| ChildTaskScope {
+            child_id: teton_protocol::agent::ChildId::new("turn-1:call-1", "looker"),
+            name: "looker".to_owned(),
+            parent_turn_id: teton_protocol::TurnId::from("turn-1"),
+            deadline: PausableDeadline::start(std::time::Duration::from_secs(60)),
+            consent: Arc::new(tokio::sync::Mutex::new(())),
+            tool_calls: tool_calls.clone(),
+        };
+
+        let denied = fixture(
+            "child-denied",
+            web_config(WebTier::FetchAnyUrl),
+            PermissionPolicy::Deny,
+            &[],
+        );
+        let calls = ChildToolCalls::default();
+        let out = in_a_child(&calls)
+            .scope(denied.tool.lookup(&json!({ "url": "https://docs.rs/x" })))
+            .await;
+        assert!(out.content.contains("declined"), "{}", out.content);
+        calls.note_ran(); // the loop's count of the same dispatch
+        assert_eq!(calls.gate_refusal().as_deref(), Some("gate_denied:web"));
+
+        let allowed = fixture(
+            "child-allowed",
+            web_config(WebTier::FetchAnyUrl),
+            PermissionPolicy::Allow,
+            &[],
+        );
+        let calls = ChildToolCalls::default();
+        let _ = in_a_child(&calls)
+            .scope(allowed.tool.lookup(&json!({ "url": "https://docs.rs/x" })))
+            .await;
+        calls.note_ran();
+        assert_eq!(
+            calls.gate_refusal(),
+            None,
+            "benign: an allowed lookup is a call that ran"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Shape
     // -----------------------------------------------------------------------
@@ -2400,6 +2466,31 @@ mod tests {
     /// history expansion all pin and none of them was named — for a net 7
     /// bytes on both shapes. Re-measured, not reasoned.)*
     ///
+    /// **Recorded headroom at REQ-623:** `worst` **17,669**, `spent`
+    /// **24,017**, margin **559**, down 202 from REQ-620's 761, with
+    /// `REDACT_BODY_OVERHEAD_BYTES` unmoved at 24 KiB and the floor unmoved at
+    /// 48. Both shapes pay the same 202: the guide's capability line gains the
+    /// sentence naming the `agent` tool beside `skill` (TASK-431). This shape
+    /// stays the looser of the two by the same 47 B. **This sweep did not
+    /// register the `agent` tool's own docs**, which every prompt turn with
+    /// `agent.enabled` carries — the gap the next paragraph closes.
+    ///
+    /// **Recorded headroom at REQ-623 (TASK-428's Phase-4 fix):** `worst`
+    /// **18,997**, `spent` **25,345**, margin **255** — against an overhead
+    /// raised 24 → 25 KiB by the fix, with the floor unmoved at 48 and this
+    /// shape still the looser of the two by 47 B. Both sweeps now register
+    /// `turn_loop::AgentToolDocs::worst_case()`, the `agent` tool's docs line at
+    /// both caps' `u32::MAX`: **1,328** bytes on both shapes (1,301 at the
+    /// default caps), which put this one 769 over the 24 KiB ceiling. The
+    /// account — and the second 931-byte cut to every scanned route — is
+    /// `egress::redact`'s twin of this paragraph.
+    ///
+    /// **Mutations run for REQ-623** (2026-10-07, each reverted by edit):
+    /// dropping the `agent` registration → red at this sweep's `- agent: `
+    /// self-check; the overhead back at `24 * 1024` → red at the first
+    /// arithmetic assertion, an 18,997-byte prompt plus 6,348 of escaping
+    /// against 24,576, **769** over.
+    ///
     /// **Mutation run for REQ-612:** dropping `repo_context` from the config
     /// rows below turns this red at the block self-check, naming the reason,
     /// rather than quietly re-pinning the margin of a prompt no session with a
@@ -2424,7 +2515,8 @@ mod tests {
             REDACT_BODY_OVERHEAD_BYTES, REDACT_ESCAPING_DIVISOR,
         };
         use crate::harness::turn_loop::{
-            build_system_prompt, worst_case_session_root, HarnessConfig, SkillToolDocs,
+            build_system_prompt, worst_case_session_root, AgentToolDocs, HarnessConfig,
+            SkillToolDocs,
         };
         use crate::repo_context::RepoContextBlock;
 
@@ -2457,6 +2549,14 @@ mod tests {
         // `skill::tests::the_doc_only_tool_and_the_real_one_render_one_set_of_prompt_bytes`.
         let skill_docs = Arc::new(SkillToolDocs::worst_case());
         tools.register_cap_exempt(Arc::clone(&skill_docs) as Arc<dyn Tool>);
+        // And the `agent` tool (REQ-623), in both sweeps or in neither, for the
+        // same reason: it is cap-exempt and resident on every prompt turn with
+        // `agent.enabled` — the default. `AgentToolDocs` renders the shipped
+        // tool's own description and schema, pinned byte-identical by
+        // `agent::tests::the_doc_only_agent_tool_and_the_real_one_render_one_set_of_prompt_bytes`,
+        // at both caps' `u32::MAX` — the ceiling the opted-out twin measures too.
+        let agent_docs = Arc::new(AgentToolDocs::worst_case());
+        tools.register_cap_exempt(Arc::clone(&agent_docs) as Arc<dyn Tool>);
 
         let base = HarnessConfig::for_strong_model();
         // Non-vacuity: the tool's docs really are in what is being measured.
@@ -2544,6 +2644,16 @@ mod tests {
              its root is resident an 8,192-byte block on every turn (REQ-612 ADR-1, \
              AC-4). Build the config rows with \
              `repo_context: Some(RepoContextBlock::worst_case())` — do not delete this \
+             check:\n{widest}"
+        );
+        // REQ-623, the twin of `egress::redact`'s `agent` self-check: dropping the
+        // registration above *shrinks* the prompt by the whole docs line, and
+        // every arithmetic assertion below passes on the smaller number.
+        assert!(
+            widest.contains("- agent: ") && widest.contains(agent_docs.description()),
+            "the widest prompt measured carries no worst-case `agent` tool docs, so the \
+             sweep is measuring a resident prompt smaller than every default prompt turn \
+             sends (REQ-623). Register `AgentToolDocs::worst_case()` — do not delete this \
              check:\n{widest}"
         );
         let worst = widest.len();

@@ -18,6 +18,64 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [Unreleased]
+
+### Added
+
+- **The model can hand work to child turns (REQ-623).** A prompt turn's model
+  now has an `agent` tool — what Claude Code-style skills call "the Agent tool"
+  — that runs **child turns** concurrently (five per call by default) and
+  returns each one's final report as a single result. A child is a real turn
+  with a fresh context: the session's system prompt and the task it was handed,
+  never the parent's conversation. It has the session's tools except `agent`
+  (children do not start children), the session's permission level, root and
+  privacy boundaries, and `skill`. Its permission questions come through the
+  session's ordinary prompt, labelled with its name and `(for this session)`
+  and asked one at a time; a grant is the session's. A child's name is up to 40
+  letters, digits, `.`, `_` and `-`. A child may request a tier, but the router decides and
+  a boundary still pins — and a child that reads protected content pins its
+  parent's next call. Each child runs under a turn cap, a context budget, a
+  deadline that does not count time spent waiting on the user, and, with `[cost]
+  prompt_ceiling_usd` set, an equal share of the prompt's remaining ceiling that
+  rises when a sibling finishes under its own. Every child ends in one of eight
+  typed statuses, and a failed child never fails its parent. Children show on
+  the activity row (`children: audit-1 12s`), prefix their tool lines `child
+  <name>:`, get one row each under their parent turn in `/cost`, and are
+  recorded in the session's transcript file. The skills that fan work out —
+  `/analyze`'s auditors, `/review`'s reviewers, `/proceed`'s implementers — now
+  have something to hand it to, where before they ran every dimension in one
+  context.
+
+  **Upgrade note:** on by default. A new `[agent]` table in `config.toml` sets
+  the bounds — `max_children_per_call` (5), `max_children_per_turn` (8),
+  `child_max_turns` (12), `child_deadline_secs` (600), `report_max_bytes`
+  (32768) — and `enabled = false` takes the tool out of every session. A zero
+  cap or deadline, a deadline over a week (604800), a `max_children_per_call`
+  above `max_children_per_turn`, a `report_max_bytes` under 1024, or one set
+  above `[transcript] max_record_bytes`, is refused at load. A child that times
+  out or is cancelled abandons a tool still running — its output never reaches
+  a model — but does not kill it: a `shell` command runs to its own timeout. A
+  child's remote calls are billed like any other and count against the same
+  per-prompt ceiling, so one prompt can now spend on several calls at once: with
+  a ceiling set it can finish over by one in-flight call per child rather than
+  one in total. The cost ledger gains two nullable columns (`child_id`,
+  `parent_turn_id`), added in place on first start.
+
+### Changed
+
+- **The system-prompt overhead ceiling rises 24 → 25 KiB
+  (`REDACT_BODY_OVERHEAD_BYTES`, REQ-623).** The `agent` tool's description and
+  schema ride every prompt turn while it is enabled — 1,328 bytes at the
+  largest caps the `[agent]` table admits — and the resident prompt had 512
+  left. The four figures derived from the ceiling were re-derived and
+  re-asserted: the chunk count stays 4, the total cap and the per-scan maximum
+  are unmoved.
+
+  **Upgrade note:** every route with `[privacy] redact = true` now scans 931
+  fewer bytes of context per turn — the scannable bound falls 183,334 →
+  182,403. Nothing else moves: no configuration key, on-disk file, or wire
+  shape changes with it, and routes without redaction are unaffected.
+
 ## [0.1.36] - 2026-09-22
 
 ### Fixed
