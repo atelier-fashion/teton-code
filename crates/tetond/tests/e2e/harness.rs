@@ -309,6 +309,26 @@ impl Rendezvous {
         true
     }
 
+    /// A hold that **only [`Self::open`] releases** — no count of arrivals
+    /// does (REQ-623 TASK-430).
+    ///
+    /// For a request that must stay parked until something the test observes
+    /// *on the daemon's side* has happened — a sibling child's finish, a share
+    /// released, a consent answered — none of which is a request to this
+    /// server, so no arrival count could stand for it. The test watches its
+    /// client for the event, then opens the gate.
+    pub fn gate() -> Self {
+        Self::new(usize::MAX)
+    }
+
+    /// Release every request parked on this hold now, and let every later one
+    /// pass straight through — exactly as the `n`th arrival would have.
+    pub fn open(&self) {
+        let mut state = self.shared.state.lock().unwrap();
+        state.released = true;
+        self.shared.changed.notify_all();
+    }
+
     /// Park the calling connection thread until the rendezvous releases.
     ///
     /// Returns `false` — the request goes unanswered — when the provider
@@ -1385,6 +1405,24 @@ impl Client {
         )
     }
 
+    /// Answer the permission prompt `request_id` with `outcome` **without**
+    /// waiting for the daemon's acknowledgement (REQ-623 TASK-430).
+    ///
+    /// A consent test answers while its own `session/prompt` is still running,
+    /// and [`Self::call`] would pump — and drop — that prompt's response if it
+    /// landed first. The acknowledgement this returns the id of is consumed and
+    /// discarded by whichever await reads past it.
+    ///
+    /// `outcome` is the wire form: `{"outcome": "selected", "option_id":
+    /// "allow_always"}`, or `{"outcome": "refused", "reason": "no_terminal"}` —
+    /// what a client with nobody at its terminal answers.
+    pub fn respond_permission(&mut self, request_id: &str, outcome: Value) -> i64 {
+        self.send(
+            "permission/respond",
+            json!({ "request_id": request_id, "outcome": outcome }),
+        )
+    }
+
     /// Close this connection the way a departing client does.
     ///
     /// Explicit because dropping the struct is not enough on its own: the reader
@@ -2428,4 +2466,36 @@ pub fn tier_block_with_fallback(tier: &str, provider: &str, fallback: &str) -> S
 /// TOML, and a test that passes `"redact"` should and does fail at config load.
 pub fn category_block(category: &str, provider: &str) -> String {
     format!("[[categories]]\nname = \"{category}\"\nprovider_id = \"{provider}\"\n\n")
+}
+
+// ---------------------------------------------------------------------------
+// REQ-623 fixture builders: the `[agent]` and `[cost]` tables
+// ---------------------------------------------------------------------------
+
+/// The `[agent]` table (REQ-623), carrying only the keys a fixture overrides —
+/// each `(key, value)` written verbatim as TOML, so a number is `"1"` and a
+/// bool `"false"`. Every key left out keeps the shipped default
+/// (`max_children_per_call` 5, `max_children_per_turn` 8, `child_max_turns` 12,
+/// `child_deadline_secs` 600, `report_max_bytes` 32768, `enabled` true).
+///
+/// `Config` refuses no unknown key, so a misspelled one would be ignored and
+/// the fixture would run under the default it meant to override. A test that
+/// leans on an override therefore reads the bound back off the daemon —
+/// `agent_child_started` publishes all four — before it relies on it.
+pub fn agent_table(entries: &[(&str, &str)]) -> String {
+    let mut out = String::from("[agent]\n");
+    for (key, value) in entries {
+        out.push_str(&format!("{key} = {value}\n"));
+    }
+    out.push('\n');
+    out
+}
+
+/// The `[cost]` table with a per-prompt spend ceiling (REQ-588), in dollars as
+/// a person types it. The daemon converts it once, at load, to the integral
+/// unit every spend comparison runs in — so a test that wants the ceiling in
+/// that unit reads it back off the daemon (`agent_child_started`'s stamped
+/// share, `cost_recorded`'s `usd_micros`), never off this float.
+pub fn cost_table(prompt_ceiling_usd: f64) -> String {
+    format!("[cost]\nprompt_ceiling_usd = {prompt_ceiling_usd}\n\n")
 }
