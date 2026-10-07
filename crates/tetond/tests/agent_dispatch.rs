@@ -58,9 +58,25 @@
 //!
 //! Recorded on each test's own doc comment (conventions: run the inversion on
 //! every test in the batch and count the reds). Each mutation was applied to
-//! the daemon source, the binary rebuilt, this binary plus
-//! `provenance_egress` and `event_response_ordering` run, and the mutation
-//! reverted by a targeted edit.
+//! the daemon source, the binaries rebuilt, this binary plus
+//! `provenance_egress` and `event_response_ordering` run (47 tests), and the
+//! mutation reverted by a targeted edit. A count is over those 47.
+//!
+//! Every test here went red under at least one mutation of the behaviour it
+//! guards. Two findings the batch produced:
+//!
+//! - **Two daemon bugs, fixed in their own commits.** A child refused by a
+//!   project-skill gate ended `completed` (found by [`statuses::refused`]);
+//!   and a child stamped its spend ceiling *at stamping time* rather than its
+//!   initial share, so a sibling's earlier release leaked into
+//!   `agent_child_started` (found by [`spend::two_child_split_and_three_child_release`]
+//!   under the sequential-children mutation).
+//! - **BUG-226's own mutation does not redden the parked verifier.**
+//!   Dispatching a child's tool inline (no `block_in_place_if_multithread`)
+//!   left [`liveness::child_tool_started_arrives_while_parked`] green in 8 of 8
+//!   runs: the LIFO-slot starvation that bug recorded does not reproduce inside
+//!   a child's own task in this build. Blocking the *parent's* worker on the
+//!   call does redden it — see that test.
 
 #[path = "e2e/harness.rs"]
 mod harness;
@@ -393,8 +409,10 @@ mod concurrency {
     /// # Mutation (run 2026-10-07, reverted)
     ///
     /// - **Children run one at a time** (`flight.land().await` moved inside
-    ///   `run_children`'s launch loop): RED_SEQUENTIAL — see the counts
-    ///   recorded in the module docs of each group below.
+    ///   `run_children`'s launch loop): 3 red — this test (the first child
+    ///   parks on the rendezvous and the prompt never answers), the AC-7
+    ///   consent test (the sibling never reaches the gate while the first ask
+    ///   is open) and [`statuses::cancelled`] (the second child never parks).
     #[test]
     fn three_children_rendezvous() {
         let rv = Rendezvous::new(3);
@@ -518,9 +536,20 @@ mod liveness {
     ///
     /// # Mutation (run 2026-10-07, reverted)
     ///
-    /// - **Dispatch the child's tool inline** (`run_the_allowed_tool` calling
-    ///   `tools.dispatch` without `block_in_place_if_multithread`, BUG-226's
-    ///   shape): RED_INLINE.
+    /// - **The parent's worker blocked on the call** (the loop's `as_agent` arm
+    ///   `futures::executor::block_on` instead of `.await` — BUG-226's shape at
+    ///   N× the duration): red here, among 14 of this binary's 18; the two
+    ///   daemon-spawning AC-10 tests went red too, and the in-process
+    ///   `provenance_egress` agent test deadlocked on its current-thread
+    ///   runtime and was killed.
+    /// - **Stamp nothing** (`SessionEvents::for_child` returns the parent's
+    ///   emitter): 5 red, this test among them — the event arrives, unstamped.
+    /// - **The child's tool dispatched inline** (`run_the_allowed_tool`
+    ///   calling `tools.dispatch` without `block_in_place_if_multithread`,
+    ///   BUG-226's own fix removed): **0 red, in 8 of 8 runs of this test.** A
+    ///   finding, not a pass: the LIFO-slot starvation BUG-226 recorded does
+    ///   not reproduce inside a child's own task in this build, so this
+    ///   verifier guards the parent-blocking shape and not that one.
     #[test]
     fn child_tool_started_arrives_while_parked() {
         let (_provider, mut rig) = parked_rig("ac6", "AC6-PARENT", "AC6-WATCHED", "watched");
@@ -585,7 +614,9 @@ mod liveness {
     ///
     /// # Mutation (run 2026-10-07, reverted)
     ///
-    /// - **Release the claim before the attempt stage**: RED_CLAIM.
+    /// - **The claim released at once** (`run_prompt_turn` destructuring the
+    ///   claim as `_`, so it drops before the attempt): 1 red, this test — the
+    ///   second prompt runs.
     #[test]
     fn second_prompt_refused_busy_during_call() {
         let (provider, mut rig) = parked_rig("br4", "BR4-PARENT", "BR4-HOLDER", "holder");
@@ -704,9 +735,10 @@ mod consent {
     /// # Mutations (run 2026-10-07, each reverted)
     ///
     /// - **No re-read of the grant once a queued child's turn comes**
-    ///   (`replay_grant` after `queue_for_consent` removed): RED_REPLAY.
-    /// - **Grants keyed per child** (the sibling cannot see the first child's
-    ///   `allow_always`): covered by the same assertion.
+    ///   (`replay_grant` after `queue_for_consent` removed): 1 red, this test —
+    ///   the queued sibling asks a second time.
+    /// - **Children skip the loop's gate** (see AC-8's test): 3 red, this test
+    ///   among them — nobody is asked at all.
     #[test]
     fn guarded_child_asks_and_sibling_reuses_grant() {
         let provider = MockProvider::start_matching(
@@ -825,7 +857,8 @@ mod consent {
     /// # Mutation (run 2026-10-07, reverted)
     ///
     /// - **Children skip the loop's gate** (`self_gated` true inside a child):
-    ///   RED_PLAN.
+    ///   3 red — this test (the edit lands), AC-7's (no consent asked) and
+    ///   BR-5's (the command runs).
     #[test]
     fn plan_child_edit_denies() {
         let edit = json!({
@@ -899,8 +932,9 @@ mod consent {
     ///
     /// # Mutation (run 2026-10-07, reverted)
     ///
-    /// - **A refused ask treated as allowed** (`Settled::Refused` deciding
-    ///   `Allowed`): RED_UNATTENDED.
+    /// - **A refused ask treated as allowed** (`PermissionOutcome::Refused`
+    ///   settling `Allowed`): 2 red — this test (the marker file appears) and
+    ///   [`statuses::refused`] (the project skill expands).
     #[test]
     fn unattended_unlisted_gate_denies_typed() {
         let provider = MockProvider::start_matching(
@@ -1053,7 +1087,9 @@ mod routing {
     /// # Mutation (run 2026-10-07, reverted)
     ///
     /// - **The child's tier request dropped** (`dispatch_route` handed `None`
-    ///   for a child): RED_TIER.
+    ///   for a child): 2 red — this test at the bound leg, and
+    ///   [`statuses::refused`] (the oversized child's `scan` request is lost,
+    ///   it lands on the 128k route and completes).
     #[test]
     fn build_child_under_think_parent() {
         // --- Binding present. ---------------------------------------------
@@ -1241,12 +1277,20 @@ mod spend {
     ///
     /// # Mutations (run 2026-10-07, each reverted)
     ///
-    /// - **No release** (`SharePool::release` returning no recipients):
-    ///   RED_NORELEASE.
-    /// - **Shares not split** (each child stamped the whole headroom):
-    ///   RED_NOSPLIT.
+    /// - **No release** (`SharePool::release` returning no recipients): 1
+    ///   red, this test at the release leg.
+    /// - **Shares not split** (each child stamped the whole headroom): 2 red,
+    ///   this test and [`statuses::spend_exhausted`].
     /// - **A child's spend not added to the prompt's** (`ChildSpend::add`
-    ///   without the parent add): RED_NOPARENT.
+    ///   without the parent add): 1 red, this test — the parent's next call is
+    ///   not refused.
+    /// - **The spend arm collapsed** (`SPEND_CEILING_REACHED` ending a child
+    ///   `failed`): 2 red, this test and [`statuses::spend_exhausted`].
+    /// - **Children run one at a time**, before the stamped-share fix: red
+    ///   here — `first` was stamped after `early` released, and its "initial"
+    ///   share already held its part. That is how the stamping bug was found;
+    ///   after the fix this test is green under that mutation, and
+    ///   `cost::share`'s own test pins the fix.
     #[test]
     fn two_child_split_and_three_child_release() {
         let readme = json!({ "path": "README.md" });
@@ -1529,7 +1573,8 @@ mod statuses {
     /// untouched and unmarked, and the result carries the route and bounds it
     /// ran under. Benign path for the whole matrix.
     ///
-    /// Mutation (run 2026-10-07, reverted): RED_COMPLETED.
+    /// Mutation (run 2026-10-07, reverted): **every report emptied** (`finish`
+    /// discarding the bounded text): 8 red, this test among them.
     #[test]
     fn completed() {
         let (_provider, rig, results) = one_call(
@@ -1570,9 +1615,14 @@ mod statuses {
     /// # Mutations (run 2026-10-07, each reverted)
     ///
     /// - **The project-skill gate's refusal counted as a call that ran**
-    ///   (`gate_refusal` reading `ran` unadjusted): RED_SKILLGATE.
-    /// - **Whole-or-refused dropped** (the `!fit.fits` return made dead):
-    ///   RED_FITS.
+    ///   (`gate_refusal` reading `ran` unadjusted): 1 red here, plus
+    ///   `child::tests::a_call_refused_inside_its_own_gate_is_denied_not_ran`
+    ///   in the lib. Before this task's fix that was the shipped behaviour:
+    ///   `gated` ended `completed` with an empty report.
+    /// - **Whole-or-refused dropped** (the `!fit.fits` return made dead): 1
+    ///   red, this test — the oversized task is sent.
+    /// - The refused-as-allowed and dropped-tier mutations redden it too (see
+    ///   BR-5's and AC-9's tests).
     #[test]
     fn refused() {
         let oversized_task = format!("ST-OVERSIZED {}", "word ".repeat(10_000));
@@ -1684,9 +1734,12 @@ mod statuses {
     /// both children parked on their first model call. What it observes is the
     /// session's bus, which is what every client attached to it reads.
     ///
-    /// Mutation (run 2026-10-07, reverted): **the dropped call publishes
-    /// nothing** (`Flight::drop` aborting without spawning the reaper):
-    /// RED_REAPER.
+    /// # Mutations (run 2026-10-07, each reverted)
+    ///
+    /// - **The dropped call publishes nothing** (`Flight::drop` aborting
+    ///   without spawning the reaper): 1 red, this test.
+    /// - **Children run one at a time**: red here too — the second child never
+    ///   parks.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cancelled() {
         use teton_protocol::agent::ChildStatus;
@@ -1854,7 +1907,8 @@ mod statuses {
     /// calls a tool on its only turn: the report is the last text it wrote,
     /// marked as unfinished, and `bounds.max_turns` says what stopped it.
     ///
-    /// Mutation (run 2026-10-07, reverted): RED_TURNS.
+    /// Mutation (run 2026-10-07, reverted): **the cap's arm ends `completed`
+    /// with the raw text**: 1 red, this test.
     #[test]
     fn turns_exhausted() {
         let (_provider, _rig, results) = one_call(
@@ -1891,7 +1945,9 @@ mod statuses {
     /// as too large for its window (REQ-586's typed outcome): the child ends
     /// `budget_exhausted` with an empty report, and nothing else is tried.
     ///
-    /// Mutation (run 2026-10-07, reverted): RED_BUDGET.
+    /// Mutation (run 2026-10-07, reverted): **the window arm ends `failed`**
+    /// (`ended_by` mapping `CONTEXT_LENGTH_EXCEEDED` to `failed`): 1 red, this
+    /// test.
     #[test]
     fn budget_exhausted() {
         let (provider, _rig, results) = one_call(
@@ -1921,7 +1977,11 @@ mod statuses {
     /// no release reaches `spender` first; and the call's total is left under
     /// the prompt's ceiling, so the parent continues and receives both results.
     ///
-    /// Mutation (run 2026-10-07, reverted): RED_SPEND.
+    /// # Mutations (run 2026-10-07, each reverted)
+    ///
+    /// - **The spend arm ends `failed`**: 2 red, this test and AC-13's.
+    /// - **Shares not split**: 2 red, the same two — `spender`'s first call is
+    ///   inside a share of the whole headroom, so it is answered again.
     #[test]
     fn spend_exhausted() {
         let gate = Rendezvous::gate();
@@ -1992,7 +2052,9 @@ mod statuses {
     /// under. The tool's output never reaches a model — the child is not
     /// answered again.
     ///
-    /// Mutation (run 2026-10-07, reverted): RED_DEADLINE.
+    /// Mutation (run 2026-10-07, reverted): **the deadline never fires** (the
+    /// runner's `deadline.expired()` arm made pending): 1 red, this test — no
+    /// finish arrives while the tool is parked.
     #[test]
     fn timed_out() {
         let provider = MockProvider::start_matching(
@@ -2048,7 +2110,8 @@ mod statuses {
     /// `401` — settled, never retried — and this daemon has no fallback and no
     /// local tier to reroute onto.
     ///
-    /// Mutation (run 2026-10-07, reverted): RED_FAILED.
+    /// Mutation (run 2026-10-07, reverted): **a terminal error ends
+    /// `completed`** (`ended_by`'s fall-through arm): 1 red, this test.
     #[test]
     fn failed() {
         let (_provider, _rig, results) = one_call(
@@ -2151,7 +2214,11 @@ mod skills {
     /// # Mutation (run 2026-10-07, reverted)
     ///
     /// - **The result block sheds the children's provenance** (`result_of`
-    ///   without the union): RED_UNION.
+    ///   without the union): red here at the pinned leg (the parent's next
+    ///   call leaves), among 4 — the others are `provenance_egress`'s two
+    ///   AC-10 tests and its in-process agent test.
+    /// - **Every result block pins** (its boundary bit forced on): red here at
+    ///   the benign leg, among 16.
     #[test]
     fn user_skill_in_child_pins_parent() {
         // --- Benign: the expansion stays in the child. ----------------------
@@ -2302,8 +2369,9 @@ mod transcript {
     /// announce, under the turn its `prompt_submitted` opened. Benign half: the
     /// parent's own tool records carry neither id.
     ///
-    /// Mutation (run 2026-10-07, reverted): **the runner hands each child the
-    /// parent's emitter** (no `for_child`): RED_EMITTER.
+    /// Mutation (run 2026-10-07, reverted): **`for_child` stamps nothing**
+    /// (each child records through an emitter indistinguishable from the
+    /// parent's): 5 red, this test among them.
     #[test]
     fn one_file_parent_and_children() {
         let provider = MockProvider::start_matching(

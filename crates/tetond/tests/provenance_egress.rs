@@ -3429,7 +3429,7 @@ fn agent_boundary_daemon(
     // passed through. Every reply is the same, so it does not matter which
     // local consumer — the child, the parent, a duty — takes which.
     let local = format!("The production config says {}.", harness::SECRET_SENTINEL);
-    let script = ws.write_script(&vec![local.as_str(); 8].join("\n---\n"));
+    let script = ws.write_script(&[local.as_str(); 8].join("\n---\n"));
     let daemon = harness::Daemon::spawn(
         &ws,
         harness::DaemonOptions::default()
@@ -3498,7 +3498,15 @@ fn parent_agent_result(dir: &std::path::Path, session: &str) -> String {
 /// # Mutations (run 2026-10-07, each reverted)
 ///
 /// - **The result block sheds the children's provenance** (`result_of`
-///   without the union): RED_UNION_AC10.
+///   without the union): 4 red over this binary, `agent_dispatch` and
+///   `event_response_ordering` — this test (the parent's next call leaves,
+///   carrying the secret), the in-process agent test above, `agent_dispatch`'s
+///   AC-16 test, and [`child_without_boundary_touch_does_not_pin_parent`]
+///   **only through the process-global capture**: it runs after this one and
+///   its `assert_no_boundary_bytes` sees this test's leak. One leak, counted
+///   twice.
+/// - **Every report emptied**: red here at the non-vacuity check — the
+///   parent's context no longer holds the secret.
 #[test]
 fn child_local_only_read_pins_child_and_parent() {
     let provider = harness::MockProvider::start_matching(
@@ -3628,6 +3636,10 @@ fn child_local_only_read_pins_child_and_parent() {
 /// request leaves too, carrying the child's report, and nothing is blocked or
 /// pinned. Without this leg, (c) above could be a daemon that pinned every
 /// parent of every child.
+///
+/// Mutation (run 2026-10-07, reverted): **every result block pins** (its
+/// boundary bit forced on): red here directly — the parent's next call is
+/// blocked — among 16 across the three binaries.
 #[test]
 fn child_without_boundary_touch_does_not_pin_parent() {
     let provider = harness::MockProvider::start_matching(

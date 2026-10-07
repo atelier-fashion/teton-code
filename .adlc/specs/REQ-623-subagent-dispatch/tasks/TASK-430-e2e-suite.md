@@ -1,10 +1,10 @@
 ---
 id: TASK-430
 title: "e2e: agent_dispatch.rs — concurrency, claim, consent, tiers, boundary, spend shares, the status matrix, skills, transcript"
-status: draft
+status: complete
 parent: REQ-623
 created: 2026-10-05
-updated: 2026-10-05
+updated: 2026-10-07
 dependencies: ["TASK-428", "TASK-423", "TASK-429"]
 repo: teton-code
 ---
@@ -29,14 +29,14 @@ and records the red count (conventions "run the inversion on every test in the b
 
 ## Acceptance Criteria
 
-- [ ] AC-5: `rendezvous(3)` releases; three `agent_child_started` precede every `agent_child_finished`
-- [ ] AC-6: subscriber receives a child's `tool_started` while the child's tool is parked; a second `prompt` is refused busy during the call
-- [ ] AC-7/AC-8 consent matrix as written in the spec
-- [ ] AC-10: `assert_no_boundary_bytes` over every request after the child's local-only read, from both child and parent; and the benign twin — a child that touches no boundary leaves the parent's next call remote
-- [ ] AC-13: shares and release derived from the ledger's recorded spend, never a literal
-- [ ] AC-14: one test per status, parent continues in each
-- [ ] AC-16, AC-17 as written
-- [ ] Inversion counts recorded in each test's doc comment; a batch with zero reds is a finding, not a pass
+- [x] AC-5: `rendezvous(3)` releases; three `agent_child_started` precede every `agent_child_finished`
+- [x] AC-6: subscriber receives a child's `tool_started` while the child's tool is parked; a second `prompt` is refused busy during the call
+- [x] AC-7/AC-8 consent matrix as written in the spec
+- [x] AC-10: `assert_no_boundary_bytes` over every request after the child's local-only read, from both child and parent; and the benign twin — a child that touches no boundary leaves the parent's next call remote
+- [x] AC-13: shares and release derived from the ledger's recorded spend, never a literal
+- [x] AC-14: one test per status, parent continues in each
+- [x] AC-16, AC-17 as written
+- [x] Inversion counts recorded in each test's doc comment; a batch with zero reds is a finding, not a pass
 
 ## Verification
 

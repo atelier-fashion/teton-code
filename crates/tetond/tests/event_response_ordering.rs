@@ -558,7 +558,12 @@ const RIGHT_GOLDEN: [&str; 3] = [
 /// # Mutation (run 2026-10-07, reverted)
 ///
 /// - **`SessionEvents::for_child` stamps nothing** (returns the parent's
-///   emitter unchanged): RED_STAMP.
+///   emitter unchanged): red here — the children's updates enter the parent's
+///   sequence — among 5 across this binary, `agent_dispatch` and
+///   `provenance_egress`.
+/// - **Every result block pins**: red here as well — the parent's closing
+///   call is blocked, and this in-process daemon has no local tier to answer
+///   it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn child_events_excluded_from_parent_golden() {
     use harness::{openai_turn, Matcher, MockProvider, MockResponse};
