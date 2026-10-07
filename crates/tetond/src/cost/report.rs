@@ -106,13 +106,11 @@ pub struct WebTotals {
 pub struct ChildTotals {
     /// The child's full id, `"<call_id>/<name>"` — the key a client matches on.
     pub child_id: ChildId,
-    /// The label the line is shown under: the id after its first `/`.
+    /// The label the line is shown under: [`ChildId::name`], the id's one
+    /// sanctioned accessor (the part after its first `/`).
     ///
-    /// The ledger has no name column, so this is the one place the label can
-    /// come from. Split at the **first** `/` because the call id half is
-    /// provider-minted and carries none, while the model-authored name may —
-    /// splitting at the last would cut such a name short. A display label
-    /// only: [`Self::child_id`] stays the identity.
+    /// The ledger has no name column, so the id is the one place the label can
+    /// come from. A display label only: [`Self::child_id`] stays the identity.
     pub name: String,
     /// Where the child's calls went, as `provider/model`. A child rerouted
     /// mid-run lists each distinct route once, in call order, joined by `" → "`
@@ -346,7 +344,7 @@ impl TurnAccum {
                 .children
                 .into_iter()
                 .map(|child| ChildTotals {
-                    name: child_label(&child.child_id),
+                    name: child.child_id.name().to_owned(),
                     route: child.routes.join(" → "),
                     calls: child.accum.calls,
                     input_tokens: child.accum.input_tokens,
@@ -358,13 +356,6 @@ impl TurnAccum {
                 .collect(),
         }
     }
-}
-
-/// The label a child's line is shown under: its id after the first `/` (see
-/// [`ChildTotals::name`] for why the first), or the whole id if it has none.
-fn child_label(child_id: &ChildId) -> String {
-    let id = child_id.as_str();
-    id.split_once('/').map_or(id, |(_, name)| name).to_owned()
 }
 
 /// Group the turn-stamped rows by `(session, turn)` in ledger order, keeping
@@ -1212,23 +1203,6 @@ mod tests {
             })
             .collect();
         assert_eq!(turns, vec![("s1", "turn-1", 7), ("s2", "turn-1", 11)]);
-    }
-
-    /// The label is the id after its **first** `/`: the call id half is
-    /// provider-minted and carries none, while a model-authored name may.
-    #[test]
-    fn a_child_label_keeps_a_name_that_contains_a_slash_whole() {
-        assert_eq!(child_label(&ChildId::new("toolu_01", "audit")), "audit");
-        assert_eq!(
-            child_label(&ChildId::new("toolu_01", "docs/api")),
-            "docs/api",
-            "splitting at the last `/` would have shown `api`"
-        );
-        assert_eq!(
-            child_label(&ChildId::from("no-separator".to_owned())),
-            "no-separator",
-            "an id with no `/` is shown whole rather than dropped"
-        );
     }
 
     #[test]

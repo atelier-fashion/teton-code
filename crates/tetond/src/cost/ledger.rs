@@ -26,7 +26,8 @@
 //!
 //! REQ-623's two columns hold identifiers, not content: `parent_turn_id` is a
 //! daemon-minted turn handle, and `child_id` is `"<call_id>/<name>"` — a
-//! provider-minted call id plus the child's short label (≤ 40 characters,
+//! daemon-minted call id (`<turn>:<the loop's call-n>`, never a provider's
+//! tool-call id) plus the child's short label (≤ 40 characters,
 //! defaulting to `child-<n>`). The label is model-authored, but it is a name the
 //! child is shown under, never the task or context it was handed.
 //!
@@ -644,8 +645,9 @@ impl CostLedger {
     /// before it is sent (REQ-588 ADR-3).
     ///
     /// Scoped to `session_id` because a [`ChildId`] is unique only within its
-    /// session: the call id half is provider-minted, and a scripted provider
-    /// mints the same ones in every session sharing this file.
+    /// session: the call id half is daemon-minted from counters that start
+    /// over — `turn-<n>` with every daemon start, the loop's `call-<n>` with
+    /// every turn — so sessions sharing this file mint the same ones.
     ///
     /// # Errors
     /// [`LedgerError`] if the query fails or the mutex is poisoned.

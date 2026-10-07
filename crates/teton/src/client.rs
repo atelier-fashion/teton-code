@@ -1819,9 +1819,10 @@ impl Connection {
                 // interactive client that owns it. A child's request says which
                 // child (REQ-623 AC-7) in the words the answering client's
                 // prompt uses; the parent's is the line it always was.
-                let by_child = req.child_id.as_ref().map_or_else(String::new, |child| {
-                    format!(" by child {}", session_ui::child_label(child))
-                });
+                let by_child = req
+                    .child_id
+                    .as_ref()
+                    .map_or_else(String::new, |child| format!(" by child {}", child.name()));
                 ctx.surface.line(
                     LineKind::Notice,
                     &format!(
@@ -4228,6 +4229,13 @@ mod tests {
     /// | `by_child` always empty in `resolve_permission` | the child's heading |
     /// | `for_child` always empty in `resolve_permission` | the child's question |
     /// | `child_label` splits at the **last** `/` | the `scan/src` heading |
+    ///
+    /// Since verify (2026-10-07) the split is `ChildId::name`'s, the id's one
+    /// sanctioned accessor in `teton-protocol`; the third row's mutation,
+    /// re-run there (`rsplit_once`), reddens this test at the same heading and
+    /// the protocol's own `child_id_name_is_everything_after_the_first_slash`
+    /// — 2 reds over `teton-protocol`, `teton` and `tetond` (lib, bins and
+    /// integration suites).
     #[test]
     fn consent_prompt_names_the_child() {
         use teton_protocol::agent::ChildId;

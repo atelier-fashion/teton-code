@@ -191,6 +191,13 @@ impl AgentTool {
             Err(err) => return err.into(),
         };
         let call_id = format!("{}:{}", self.parent.turn_id, call.tool_call_id);
+        // The no-`/` invariant `ChildId::name` splits on: both halves are
+        // daemon-minted — `turn-<n>`, and the loop's own `call-<n>` (never a
+        // provider's id) — so neither carries the separator.
+        debug_assert!(
+            !call_id.contains('/'),
+            "a call id carries no `/`, or ChildId::name would split it: {call_id}"
+        );
         let planned = match self.admit(tasks) {
             Ok(planned) => planned,
             Err(refusal) => return self.refuse(call_id, refusal),

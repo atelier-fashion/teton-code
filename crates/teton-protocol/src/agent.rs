@@ -36,20 +36,27 @@ use crate::{ProviderId, Tier};
 /// Unique within a session because `call_id` is, and `name` is unique within a
 /// call ([`AgentRefusal::DuplicateName`] refuses the call otherwise).
 ///
-/// # Opaque on purpose
+/// # Opaque on purpose — with one sanctioned accessor
 ///
 /// There is a way to mint one ([`Self::new`]), a way to read it
-/// ([`Self::as_str`], [`fmt::Display`]), and **no way to take one apart**. The
-/// `name` half is model-authored and nothing stops it containing a `/`, so any
-/// split would be a guess; and a consumer that wants the name already has it as
-/// a field of `agent_child_started`. A reader that needs the child's name keys
-/// on the id and looks the name up there — it never parses it back out.
+/// ([`Self::as_str`], [`fmt::Display`]), and exactly **one** way to read a part
+/// of it: [`Self::name`]. No other code splits an id. The `call_id` half is
+/// daemon-minted — `<turn>:<the loop's own call id>`, never containing a `/`,
+/// which the minting site asserts — so the name is everything after the
+/// **first** `/`. A consumer that has the name as a field (as
+/// `agent_child_started` carries it) reads the field; a surface whose event
+/// carries only the id reads [`Self::name`], so a child is called one thing on
+/// every surface and the split cannot be made two ways.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ChildId(String);
 
 impl ChildId {
     /// Mint the id of the child named `name` in the `agent` call `call_id`.
+    ///
+    /// `call_id` carries no `/` — the daemon mints it as
+    /// `<turn>:<the loop's call id>` and asserts so where it does — which is
+    /// what makes [`Self::name`]'s split at the first `/` exact.
     #[must_use]
     pub fn new(call_id: &str, name: &str) -> Self {
         Self(format!("{call_id}/{name}"))
@@ -59,6 +66,21 @@ impl ChildId {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The child's name: everything after the **first** `/`, or the whole id
+    /// when it has none.
+    ///
+    /// **The one sanctioned accessor** of an id's parts — the CLI's consent
+    /// heading, tool lines and end-of-run notices and `/cost`'s child rows all
+    /// read a child's name here, and nothing else splits an id. The first `/`,
+    /// never the last, because the call id half is daemon-minted and carries
+    /// none while a name restored from an older daemon's ledger may (the
+    /// `agent` tool's name charset has excluded `/` since REQ-623's verify);
+    /// an id with no `/` at all is shown whole rather than dropped.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.0.split_once('/').map_or(&self.0, |(_, name)| name)
     }
 }
 
@@ -564,9 +586,34 @@ mod tests {
         let back: ChildId = serde_json::from_value(json!("toolu_01/audit-1")).unwrap();
         assert_eq!(back, id);
         assert_eq!(ChildId::from("toolu_01/audit-1".to_owned()), id);
-        // A name holding the separator is kept whole — which is why there is
-        // no split.
+        // A name holding the separator is kept whole.
         assert_eq!(ChildId::new("c", "a/b").as_str(), "c/a/b");
+    }
+
+    /// **[`ChildId::name`] is the part after the first `/`** — the one
+    /// accessor every surface reads a child's name through.
+    ///
+    /// The ids are literals; the expected names are written out, never read
+    /// off the subject. A name holding a `/` (restored from an older ledger)
+    /// is kept whole, and an id with no `/` at all is shown whole rather than
+    /// dropped.
+    ///
+    /// **Mutation (run 2026-10-07, reverted):** `rsplit_once` for
+    /// `split_once` — 2 reds over `teton-protocol`, `teton` and `tetond` (lib,
+    /// bins and integration suites): this test at `docs/api`, and the CLI's
+    /// `consent_prompt_names_the_child` at its `scan/src` heading.
+    #[test]
+    fn child_id_name_is_everything_after_the_first_slash() {
+        assert_eq!(ChildId::new("turn-1:call-2", "audit").name(), "audit");
+        assert_eq!(
+            ChildId::new("turn-1:call-2", "docs/api").name(),
+            "docs/api",
+            "splitting at the last `/` would have shown `api`"
+        );
+        assert_eq!(
+            ChildId::from("no-separator".to_owned()).name(),
+            "no-separator"
+        );
     }
 
     /// A result round-trips with every optional present and with none; the

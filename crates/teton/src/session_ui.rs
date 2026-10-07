@@ -1454,28 +1454,18 @@ pub fn render_event(
     }
 }
 
-/// The name a child is shown under: its id after the first `/`, or the whole id
-/// if it has none (REQ-623 BR-13, AC-7).
-///
-/// The daemon mints a [`ChildId`] as `<call_id>/<name>`, and the call id is
-/// daemon-minted — it is the **name** half that is model-authored and may
-/// itself contain a `/`, which is why the split is at the first one and never
-/// the last. The daemon's `/cost` labels take the same reading
-/// (`tetond::cost::report::child_label`), so a child is called one thing on the
-/// consent prompt, its tool lines, its end-of-run notice and its cost row.
-///
-/// For the surfaces whose event carries only the id. `agent_child_started`
-/// carries the name as a field, and the activity row reads that instead.
-pub(crate) fn child_label(child_id: &ChildId) -> &str {
-    let id = child_id.as_str();
-    id.split_once('/').map_or(id, |(_, name)| name)
-}
-
 /// The prefix a child's streamed line carries — `child audit-1: ` — or nothing
 /// for the parent's own, which is what keeps every pre-REQ-623 line
 /// byte-identical.
+///
+/// The name is [`ChildId::name`], the id's one sanctioned accessor — the same
+/// reading the daemon's `/cost` rows take, so a child is called one thing on
+/// the consent prompt, its tool lines, its end-of-run notice and its cost row
+/// (REQ-623 BR-13, AC-7). For the surfaces whose event carries only the id;
+/// `agent_child_started` carries the name as a field, and the activity row
+/// reads that instead.
 fn child_prefix(child: Option<&ChildId>) -> String {
-    child.map_or_else(String::new, |id| format!("child {}: ", child_label(id)))
+    child.map_or_else(String::new, |id| format!("child {}: ", id.name()))
 }
 
 /// The verbose line an `agent_call_started` draws: the call and what it is
@@ -1523,7 +1513,7 @@ fn format_child_started(started: &events::AgentChildStarted) -> String {
 fn format_share_released(released: &events::AgentChildShareReleased) -> String {
     format!(
         "child {} released {} of unspent share to {} running sibling(s)",
-        child_label(&released.child_id),
+        released.child_id.name(),
         teton_core::cost_ceiling::usd(released.released_micro_cents),
         released.recipients.len(),
     )
@@ -1541,7 +1531,7 @@ fn format_share_released(released: &events::AgentChildShareReleased) -> String {
 /// the news — and says when its report was cut at the bound (BR-11), since the
 /// parent model read less than the child wrote.
 fn format_child_finished(finished: &events::AgentChildFinished, verbose: bool) -> Option<String> {
-    let name = child_label(&finished.child_id);
+    let name = finished.child_id.name();
     let calls = finished.turns_used;
     let ended = match finished.status {
         ChildStatus::Completed => {
@@ -4257,7 +4247,7 @@ pub fn resolve_permission(
     // and a user answering for three concurrent children has to know which one
     // wants `shell`; the parent's own request carries none, and every string
     // below is then exactly what it was before children existed.
-    let asker = req.child_id.as_ref().map(child_label);
+    let asker = req.child_id.as_ref().map(ChildId::name);
     let by_child = asker.map_or_else(String::new, |name| format!(" by child {name}"));
     let for_child = asker.map_or_else(String::new, |name| format!(" for child {name}"));
 
