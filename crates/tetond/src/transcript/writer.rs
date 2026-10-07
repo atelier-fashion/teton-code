@@ -698,6 +698,7 @@ mod tests {
                 tool_call_id: "call-1".to_owned(),
                 status: ToolCallStatus::Completed,
                 output: "ok".to_owned(),
+                child: None,
             }))
             .expect("append a tool result");
         writer
@@ -764,6 +765,7 @@ mod tests {
                 tool_call_id: "call-1".to_owned(),
                 status: ToolCallStatus::Completed,
                 output: "ok".to_owned(),
+                child: None,
             }))
             .expect("append after a drop");
 
@@ -773,6 +775,60 @@ mod tests {
         assert_eq!(lines[1]["n"], 2);
         assert_eq!(lines[2]["kind"], "tool_result");
         assert_eq!(lines[2]["n"], 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REQ-623 BR-13 — the writer passes a child-scoped record through
+    /// unchanged: the ids reach the file in the body, in the same file and the
+    /// same `n` sequence as the parent's records.
+    ///
+    /// The writer adds nothing for children and must not need to; this pins
+    /// that a record carrying a [`super::super::record::ChildScope`] is just a
+    /// record here. **Shown to fail** (mutation, restored): dropping
+    /// `#[serde(flatten)]` from `ToolResult::child` reddens it at
+    /// `the child's ids reach the file in the body`.
+    #[test]
+    fn a_child_scoped_record_passes_through_into_the_same_file() {
+        use super::super::record::ChildScope;
+        use teton_protocol::agent::ChildId;
+
+        let dir = scratch("child");
+        let mut writer = Writer::open(&dir, &session(), at(1_756_900_272), opened())
+            .expect("a fresh directory opens");
+        for child in [
+            None,
+            Some(ChildScope {
+                child_id: ChildId::new("call-1", "scan"),
+                parent_turn_id: TurnId::from("turn-1"),
+            }),
+        ] {
+            writer
+                .append(&Record::ToolResult(ToolResult {
+                    tool_call_id: "call-1".to_owned(),
+                    status: ToolCallStatus::Completed,
+                    output: "ok".to_owned(),
+                    child,
+                }))
+                .expect("append a tool result");
+        }
+
+        let lines = lines(writer.path());
+        assert_eq!(lines.len(), 3, "opened, the parent's result, the child's");
+        assert_eq!(lines[1].get("child_id"), None, "the parent's carries no id");
+        assert_eq!(
+            (
+                &lines[2]["child_id"],
+                &lines[2]["parent_turn_id"],
+                &lines[2]["n"]
+            ),
+            (
+                &Value::from("call-1/scan"),
+                &Value::from("turn-1"),
+                &Value::from(3)
+            ),
+            "the child's ids reach the file in the body"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

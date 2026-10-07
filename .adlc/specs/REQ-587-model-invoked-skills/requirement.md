@@ -845,6 +845,12 @@ the CLI renders each as one line (BR-9).
   refusal, and the runbook records that this machine ran (f) — so a reader
   cannot mistake the boundary rule for a broken feature. (manual; BR-2,
   BR-4, BR-5, BR-7, BR-8, BR-10)
+  *Note (2026-10-07): the stall leg (a) records — the first "dispatch an
+  agent" step — is what REQ-623 (subagent dispatch, the `agent` tool) removes;
+  it landed as REQ-623. Leg (a)'s stall is now expected later, and REQ-623
+  AC-18's runbook in `docs/manual-verification.md` re-runs `/proceed` through
+  Phase 4 and records the next stall (a companion-file read) as the
+  companion-files spec's evidence. This AC's other legs are unchanged.*
 - [ ] AC-16: **The bundled `skills` docs topic no longer contradicts this
   REQ.** `crates/tetond/src/harness/docs/skills.md` is what the model reads
   when it asks what skills are, and it currently says — compiled into the same
@@ -1137,7 +1143,8 @@ is the reasoning; the bug files are the tracking.
 - **Subagent dispatch** (recommended next spec): a bounded child turn-loop
   the model can hand a task to and get a result back from — what `/proceed`
   Phase 4–5, `/sprint` and `/analyze` assume; AC-15(a) records where
-  `/proceed` stalls once this REQ lands.
+  `/proceed` stalls once this REQ lands. *(2026-10-07: landed as REQ-623 — the
+  `agent` tool; its AC-18 dogfood runbook records where `/proceed` stops next.)*
 - **Companion files**: a skill-scoped read (`skill { name, file }` over the
   skill's own directory, one level, bounded) or an equivalent — `/proceed`
   names three; this REQ records the refusal rather than widening the jail.

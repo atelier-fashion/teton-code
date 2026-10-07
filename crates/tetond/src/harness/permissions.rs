@@ -135,11 +135,11 @@ use tokio::sync::oneshot;
 use teton_core::config::WebTier;
 use teton_core::session_root::{bounded_field, DISPLAY_MAX_CHARS};
 use teton_protocol::events::{
-    BudgetBound, Event, InvokedBy, PermissionOption, PermissionOptionKind, PermissionRequest,
-    PermissionSubject, ProjectSkillTrustEntry, WebConsentDecided, WebConsentScope, WindowVerdict,
-    OPTION_ID_ENABLE_PERMANENT, OPTION_ID_OVER_BUDGET_DECLINE,
-    OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY, OPTION_ID_OVER_BUDGET_PROCEED_ONCE,
-    OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
+    AgentChildConsentRequested, BudgetBound, Event, InvokedBy, PermissionOption,
+    PermissionOptionKind, PermissionRequest, PermissionSubject, ProjectSkillTrustEntry,
+    WebConsentDecided, WebConsentScope, WindowVerdict, OPTION_ID_ENABLE_PERMANENT,
+    OPTION_ID_OVER_BUDGET_DECLINE, OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY,
+    OPTION_ID_OVER_BUDGET_PROCEED_ONCE, OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
 };
 use teton_protocol::methods::{
     expires_on_session_root_change, is_project_acknowledgment_key, is_repo_context_generate_key,
@@ -152,8 +152,9 @@ use teton_protocol::{RequestId, SessionId};
 use crate::broadcast::EventBus;
 use crate::egress::to_protocol_web_tier;
 use crate::grants::ConnectionId;
+use crate::harness::child::{current_child, ChildTaskScope};
 use crate::harness::tools::web::{permission_key_for, tier_name, WEB_PERMISSION_KEYS};
-use crate::harness::tools::{DOCS_TOOL_NAME, SKILL_TOOL_NAME};
+use crate::harness::tools::{AGENT_TOOL_NAME, DOCS_TOOL_NAME, SKILL_TOOL_NAME};
 use crate::skills::{permission_key_for as skill_permission_key_for, SkillSource};
 
 /// Policy for a single tool.
@@ -505,6 +506,23 @@ impl Default for PermissionConfig {
 /// `the_permission_row_and_the_registrys_name_are_one_value` pins it.
 const READ_ONLY_TOOLS: &[&str] = &["read", "glob", "grep", DOCS_TOOL_NAME, SKILL_TOOL_NAME];
 
+/// Tools allowed at **every** level although they are not read-only — today
+/// exactly one, the `agent` tool (REQ-623 ADR-7).
+///
+/// `agent` writes nothing itself: it starts child turns, and every tool a
+/// child then calls is authorized by name through this same gate at the
+/// session's level (BR-5). So the question "may the model dispatch a child?"
+/// has nothing to consent to that the children's own asks do not already
+/// cover, and asking it would put a prompt in front of every fan-out a skill
+/// performs — while denying it at `plan` would refuse a read-only audit its
+/// read-only auditors. Not filed under [`READ_ONLY_TOOLS`], because that set's
+/// claim is about the tool's own effect and a child *can* write (the repeat
+/// ledger counts `agent` write-capable for that reason).
+///
+/// Spelled as the registry's constant, never a literal — the
+/// [`READ_ONLY_TOOLS`] rule, for the `teton_docs` reason (LESSON-524).
+const DISPATCH_TOOLS: &[&str] = &[AGENT_TOOL_NAME];
+
 /// The row a level's table decides the **project-skill acknowledgment** under
 /// (REQ-591 D-3).
 ///
@@ -582,6 +600,7 @@ pub fn table_for(level: PermissionLevel) -> PermissionConfig {
         PermissionLevel::Guarded => {
             let mut cfg = PermissionConfig::with_default(PermissionPolicy::Ask);
             allow_read_only(&mut cfg);
+            allow_dispatch(&mut cfg);
             cfg.set("edit", PermissionPolicy::Ask);
             cfg.set("shell", PermissionPolicy::Ask);
             cfg
@@ -592,6 +611,7 @@ pub fn table_for(level: PermissionLevel) -> PermissionConfig {
         PermissionLevel::Edits => {
             let mut cfg = PermissionConfig::with_default(PermissionPolicy::Ask);
             allow_read_only(&mut cfg);
+            allow_dispatch(&mut cfg);
             cfg.set("edit", PermissionPolicy::Allow);
             cfg.set("shell", PermissionPolicy::Ask);
             cfg
@@ -604,6 +624,10 @@ pub fn table_for(level: PermissionLevel) -> PermissionConfig {
         PermissionLevel::Plan => {
             let mut cfg = PermissionConfig::with_default(PermissionPolicy::Deny);
             allow_read_only(&mut cfg);
+            // REQ-623 ADR-7: a `plan` child is read-only like its parent — its
+            // `edit` and `shell` fall to this table's deny default when *it*
+            // asks — so the dispatch itself has nothing left to refuse.
+            allow_dispatch(&mut cfg);
             // REQ-591 D-3, and the one row that is not a tool.
             //
             // The acknowledgment reached this table unenumerated and took the
@@ -640,6 +664,9 @@ pub fn table_for(level: PermissionLevel) -> PermissionConfig {
             for key in WEB_PERMISSION_KEYS {
                 cfg.set(key, PermissionPolicy::Ask);
             }
+            // Already this level's default; stated so "allowed at every level"
+            // is a row in every table rather than a coincidence of one default.
+            allow_dispatch(&mut cfg);
             cfg
         }
     }
@@ -648,6 +675,13 @@ pub fn table_for(level: PermissionLevel) -> PermissionConfig {
 /// Set every read-only tool to `allow` — the one enumeration any level performs.
 fn allow_read_only(cfg: &mut PermissionConfig) {
     for tool in READ_ONLY_TOOLS {
+        cfg.set(*tool, PermissionPolicy::Allow);
+    }
+}
+
+/// Set every dispatch tool to `allow` — see [`DISPATCH_TOOLS`].
+fn allow_dispatch(cfg: &mut PermissionConfig) {
+    for tool in DISPATCH_TOOLS {
         cfg.set(*tool, PermissionPolicy::Allow);
     }
 }
@@ -1734,6 +1768,93 @@ impl PolicySource {
     }
 }
 
+/// Told when an ask starts awaiting a human and when that wait is over, so a
+/// holder can measure the interval (REQ-623 BR-5, ADR-2).
+///
+/// The consumer is a child turn's `PausableDeadline`: BR-5 says time a child
+/// spends parked on a consent prompt does not count against its
+/// `deadline_secs`, and the gate is the only thing that knows when a call has
+/// stopped working and started waiting. A plain timeout around the child cannot
+/// tell the two apart.
+///
+/// ## What brackets the interval, exactly
+///
+/// [`Self::ask_awaiting`] fires once the prompt has been delivered — published,
+/// or handed to its one addressee — and the gate is about to park on the
+/// answer. [`Self::ask_settled`] fires when that park ends, **however** it ends:
+/// an answer, a client gone, or the awaiting call itself dropped (a cancelled
+/// or aborted turn). Every `ask_awaiting` is followed by exactly one
+/// `ask_settled` for the same request id.
+///
+/// Nothing fires for a decision that waited on nobody: a level `allow` or
+/// `deny`, a remembered session grant, or an addressed request with no route
+/// (which asks nobody). Those are not consent waits, and pausing a clock for
+/// them would be a hole in the bound.
+///
+/// ## Where the calls run
+///
+/// Both run synchronously inside the call that is waiting — `ask_awaiting` on
+/// the task that called the gate, `ask_settled` where that call's future
+/// completes or is dropped — so an observer can attribute the interval to its
+/// caller rather than to the session. Concurrent children share one gate
+/// (ADR-5), so a session-wide "is anyone asking" would pause every child for
+/// one child's prompt. Implementations must not block: they run inside the
+/// gate.
+pub trait AskObserver: Send + Sync {
+    /// `request_id`'s prompt for `tool_name` is out, and the gate is now
+    /// awaiting a human's answer.
+    fn ask_awaiting(&self, request_id: &RequestId, tool_name: &str);
+
+    /// The wait [`Self::ask_awaiting`] announced for `request_id` is over.
+    fn ask_settled(&self, request_id: &RequestId);
+}
+
+/// One pending ask, bracketed for an [`AskObserver`]: announced when built,
+/// closed when dropped — so the interval closes on every exit from the await,
+/// including the future being dropped mid-wait, where code after the `.await`
+/// would never run.
+struct AwaitingHuman {
+    observer: Arc<dyn AskObserver>,
+    request_id: RequestId,
+}
+
+impl AwaitingHuman {
+    /// Open the interval, or do nothing at all when no observer is wired —
+    /// the unset hook costs one `None` check on the path that is about to wait
+    /// for a human anyway.
+    fn begin(
+        observer: Option<&Arc<dyn AskObserver>>,
+        request_id: &RequestId,
+        tool_name: &str,
+    ) -> Option<Self> {
+        let observer = Arc::clone(observer?);
+        observer.ask_awaiting(request_id, tool_name);
+        Some(Self {
+            observer,
+            request_id: request_id.clone(),
+        })
+    }
+}
+
+impl Drop for AwaitingHuman {
+    fn drop(&mut self) {
+        self.observer.ask_settled(&self.request_id);
+    }
+}
+
+/// Wait for `child`'s turn to ask (REQ-623 ADR-5): its call's consent mutex,
+/// held by the caller until the answer is in.
+///
+/// The child's work clock is **paused while it queues** (BR-5): a child
+/// waiting behind a sibling's prompt is waiting on the same human, and the
+/// gate's [`AskObserver`] brackets only the ask itself. The pause ends when the
+/// turn is taken; the observer's own pause covers the prompt that follows, and
+/// pauses nest, so the clock never runs in between.
+async fn queue_for_consent(child: &ChildTaskScope) -> tokio::sync::OwnedMutexGuard<()> {
+    let _queued = child.deadline.pause();
+    Arc::clone(&child.consent).lock_owned().await
+}
+
 /// The session-scoped permission authority.
 ///
 /// Publishes prompts to the event bus, awaits answers via [`PendingPermissions`],
@@ -1802,6 +1923,10 @@ pub struct PermissionGate {
     /// the bus is what ADR-7 exists to keep a skill consent off. Such a gate
     /// answers [`SkillConsent::Unanswerable`] and asks nobody.
     addressed: Option<Arc<dyn AddressedPermissionDelivery>>,
+    /// Who is told when an ask starts and stops awaiting a human (REQ-623
+    /// BR-5). `None` on a gate nobody wired one into, which is every gate but
+    /// the daemon's — and then the await path does nothing extra at all.
+    ask_observer: Option<Arc<dyn AskObserver>>,
 }
 
 impl PermissionGate {
@@ -1860,6 +1985,7 @@ impl PermissionGate {
             project_trust_persistence: None,
             commitment_attestation: None,
             addressed: None,
+            ask_observer: None,
         }
     }
 
@@ -1999,6 +2125,18 @@ impl PermissionGate {
     #[must_use]
     pub fn with_addressed_delivery(mut self, route: Arc<dyn AddressedPermissionDelivery>) -> Self {
         self.addressed = Some(route);
+        self
+    }
+
+    /// Tell `observer` when each ask starts and stops awaiting a human
+    /// (REQ-623 BR-5) — see [`AskObserver`] for exactly what brackets the
+    /// interval.
+    ///
+    /// A seam like the others here: filled in where the session's gate is
+    /// built, and absent everywhere else.
+    #[must_use]
+    pub fn with_ask_observer(mut self, observer: Arc<dyn AskObserver>) -> Self {
+        self.ask_observer = Some(observer);
         self
     }
 
@@ -3104,13 +3242,8 @@ impl PermissionGate {
         // this session" about `/deploy`'s commands send an oversized `/deploy`
         // expansion with no prompt on any screen. See
         // [`Question::consults_grants`].
-        if question.consults_grants() {
-            if let Some(grant) = self.session_grant(tool_name) {
-                return match grant {
-                    RememberedGrant::AllowAlways => Settled::ByGrant(PermissionDecision::Allowed),
-                    RememberedGrant::RejectAlways => Settled::ByGrant(PermissionDecision::Denied),
-                };
-            }
+        if let Some(settled) = self.replay_grant(tool_name, &question) {
+            return settled;
         }
 
         // An addressed request has exactly one recipient, and a gate with no
@@ -3126,8 +3259,41 @@ impl PermissionGate {
             None => None,
         };
 
-        // Register the waiter, deliver the prompt, then await — no lock is held
-        // across the await.
+        // ## A child's ask waits its turn (REQ-623 BR-5, ADR-5)
+        //
+        // One gate serves the parent and every child of an `agent` call, and
+        // concurrent asks from siblings are presented **one at a time**: a
+        // child about to ask takes its call's consent mutex first and holds it
+        // until its answer is in. Here — after the level and a remembered grant
+        // have had their say, so a child whose question is already answered
+        // never queues — and before the waiter exists, so a queued child has
+        // registered nothing a client could see.
+        //
+        // The grant is consulted **again** once the turn is ours: the sibling
+        // ahead in the queue may have been asked the very same question, and
+        // an "allow for this session" answered there is this child's answer
+        // too — visible without a second prompt, which is what "session-scoped
+        // like any other grant" means for siblings. The level is not re-read:
+        // it was read once, at the top, and that is REQ-560 BR-7.
+        //
+        // Outside a child — the parent turn, a fixture — there is no queue and
+        // this is a no-op.
+        let child = current_child();
+        let _our_turn = match &child {
+            Some(child) => {
+                let turn = queue_for_consent(child).await;
+                if let Some(settled) = self.replay_grant(tool_name, &question) {
+                    return settled;
+                }
+                Some(turn)
+            }
+            None => None,
+        };
+
+        // Register the waiter, deliver the prompt, then await. No *gate* lock
+        // is held across the await; a child's consent turn (above) is, by
+        // design — it is what keeps a sibling's prompt off the screen until
+        // this one is answered.
         let request_id = self.pending.next_request_id();
         // The owning session travels with the waiter, so the answer that comes
         // back can be authorized against it (REQ-569 BR-9): this gate is the
@@ -3148,6 +3314,12 @@ impl PermissionGate {
             // for a tool call is a tool call, and has no subject.
             subject: addressed.map(|a| a.subject),
             options: options_for(&question),
+            // REQ-623 BR-5: an ask from a child names the child, so the
+            // consent surface can label it (AC-7). Read off the asking task's
+            // scope — the gate is the session's and holds no emitter — and
+            // `None` for the parent's own asks.
+            child_id: child.as_ref().map(|c| c.child_id.clone()),
+            parent_turn_id: child.as_ref().map(|c| c.parent_turn_id.clone()),
         };
 
         match route {
@@ -3165,13 +3337,41 @@ impl PermissionGate {
                     return Settled::Unanswerable;
                 }
             }
-            None => self.events.publish(
-                Some(self.session_id.clone()),
-                Event::PermissionRequest(request),
-            ),
+            None => {
+                // REQ-623 spec Events: `agent_child_consent_requested` — the
+                // label beside the ordinary consent payload, published first
+                // so a client has the child's name in hand when the question
+                // arrives. Only on the bus path: an addressed request is
+                // delivered to one connection and never published, and its
+                // label would be a public announcement of a private question.
+                if let Some(child) = &child {
+                    self.events.publish(
+                        Some(self.session_id.clone()),
+                        Event::AgentChildConsentRequested(AgentChildConsentRequested {
+                            child_id: child.child_id.clone(),
+                            name: child.name.clone(),
+                            tool: tool_name.to_owned(),
+                        }),
+                    );
+                }
+                self.events.publish(
+                    Some(self.session_id.clone()),
+                    Event::PermissionRequest(request),
+                );
+            }
         }
 
-        match rx.await {
+        // REQ-623 BR-5: the one stretch of this function that waits on a
+        // human, and the only one bracketed for an observer. Everything above
+        // returned without waiting — the level, a grant, an addressee with no
+        // route — so nothing above opens it. Closed by the guard's drop, so a
+        // call abandoned mid-wait closes it too.
+        let answer = {
+            let _awaiting =
+                AwaitingHuman::begin(self.ask_observer.as_ref(), &request_id, tool_name);
+            rx.await
+        };
+        match answer {
             Ok(outcome) => self.interpret(tool_name, outcome, &question, addressee),
             // Client disconnected before answering: deny (never run unapproved).
             // Not a consent decision — nobody decided it — so nothing is
@@ -3181,6 +3381,23 @@ impl PermissionGate {
             // (REQ-585 AC-9), not that someone said no.
             Err(_) => Settled::Unanswerable,
         }
+    }
+
+    /// A remembered session grant's answer to `question`, when it has one —
+    /// [`Self::settle`]'s grant step, asked twice by a child (see there).
+    ///
+    /// No consent event, deliberately: the decision this replays was published
+    /// when it was *made*, and re-announcing it per lookup would turn one
+    /// decision into a stream of them. `None` without a lookup for a question
+    /// that must not consult grants ([`Question::consults_grants`]).
+    fn replay_grant(&self, tool_name: &str, question: &Question) -> Option<Settled> {
+        if !question.consults_grants() {
+            return None;
+        }
+        Some(match self.session_grant(tool_name)? {
+            RememberedGrant::AllowAlways => Settled::ByGrant(PermissionDecision::Allowed),
+            RememberedGrant::RejectAlways => Settled::ByGrant(PermissionDecision::Denied),
+        })
     }
 
     /// Interpret a client's chosen option, recording any `*_always` grant and —
@@ -3955,6 +4172,9 @@ mod tests {
                     // every level, so no level raises an "allow `skill`?"
                     // prompt. The finer questions have their own keys.
                     ("skill", Allow),
+                    // REQ-623 ADR-7: dispatching asks nothing; each child's
+                    // tools ask for themselves.
+                    ("agent", Allow),
                     ("edit", Ask),
                     ("shell", Ask),
                 ],
@@ -3967,6 +4187,7 @@ mod tests {
                     ("grep", Allow),
                     (DOCS_TOOL_NAME, Allow),
                     ("skill", Allow),
+                    ("agent", Allow),
                     ("edit", Allow),
                     ("shell", Ask),
                 ],
@@ -3987,6 +4208,9 @@ mod tests {
                     // that is a different key, and it falls to this level's
                     // `Deny` default without a row.
                     ("skill", Allow),
+                    // REQ-623 ADR-7: a read-only audit may dispatch read-only
+                    // auditors; their `edit` and `shell` deny when *they* ask.
+                    ("agent", Allow),
                     ("edit", Deny),
                     ("shell", Deny),
                 ],
@@ -3998,6 +4222,7 @@ mod tests {
                     ("edit", Allow),
                     ("shell", Allow),
                     ("skill", Allow),
+                    ("agent", Allow),
                     (PERMISSION_KEY_FETCH_USER_URL, Ask),
                     (PERMISSION_KEY_FETCH_ANY_URL, Ask),
                     (PERMISSION_KEY_SEARCH, Ask),
@@ -4498,6 +4723,36 @@ mod tests {
                 "{level}: the `skill` tool must not ask and must not be denied —                  BR-11's constraint is that no level ever raises an \"allow                  `skill`?\" prompt"
             );
         }
+    }
+
+    /// **REQ-623 ADR-7: `agent` is allowed at every level — and is not filed as
+    /// read-only.**
+    ///
+    /// Dispatching writes nothing; each child authorizes its own tools at the
+    /// session's level (BR-5), so a prompt for the dispatch would ask about
+    /// nothing, and a `plan` deny would refuse a read-only audit its read-only
+    /// auditors. The row is the registry's constant, never a literal (the
+    /// `teton_docs` reason, LESSON-524), and it is not in [`READ_ONLY_TOOLS`]:
+    /// a child *can* write, which is also why the repeat ledger counts `agent`
+    /// write-capable.
+    ///
+    /// Mutation (run 2026-10-07, reverted): dropping `allow_dispatch` from the
+    /// `plan` arm reddens this test at `plan` and
+    /// `each_level_expands_to_its_documented_table`.
+    #[test]
+    fn the_agent_tool_is_allowed_at_every_level_and_is_not_read_only() {
+        for level in PermissionLevel::ALL {
+            assert_eq!(
+                table_for(*level).policy_for(AGENT_TOOL_NAME),
+                PermissionPolicy::Allow,
+                "{level}: dispatching a child must neither ask nor be denied"
+            );
+        }
+        assert!(DISPATCH_TOOLS.contains(&AGENT_TOOL_NAME));
+        assert!(
+            !READ_ONLY_TOOLS.contains(&AGENT_TOOL_NAME),
+            "`agent` is allowed because its children are gated, not because it reads"
+        );
     }
 
     /// **The row and the registry's name are one value (REQ-587 TASK-216).**
@@ -5217,6 +5472,189 @@ mod tests {
             PermissionDecision::Denied
         );
         assert_eq!(pending.pending_count(), 0);
+    }
+
+    // ---- REQ-623 BR-5: the ask-await hook ----------------------------------
+
+    /// What an [`AskObserver`] was told, in order, with the clock at each call.
+    #[derive(Default)]
+    struct RecordingObserver {
+        calls: Mutex<Vec<(String, RequestId, tokio::time::Instant)>>,
+    }
+
+    impl RecordingObserver {
+        fn calls(&self) -> Vec<(String, RequestId)> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(what, id, _)| (what.clone(), id.clone()))
+                .collect()
+        }
+
+        /// The clock between `id`'s `awaiting` and its `settled`.
+        fn interval(&self, id: &RequestId) -> Option<std::time::Duration> {
+            let calls = self.calls.lock().unwrap();
+            let at = |what: &str| {
+                calls
+                    .iter()
+                    .find(|(w, i, _)| w.starts_with(what) && i == id)
+                    .map(|(_, _, t)| *t)
+            };
+            Some(at("settled")? - at("awaiting")?)
+        }
+    }
+
+    impl AskObserver for RecordingObserver {
+        fn ask_awaiting(&self, request_id: &RequestId, tool_name: &str) {
+            self.calls.lock().unwrap().push((
+                format!("awaiting {tool_name}"),
+                request_id.clone(),
+                tokio::time::Instant::now(),
+            ));
+        }
+
+        fn ask_settled(&self, request_id: &RequestId) {
+            self.calls.lock().unwrap().push((
+                "settled".to_owned(),
+                request_id.clone(),
+                tokio::time::Instant::now(),
+            ));
+        }
+    }
+
+    /// The id of the next prompt the bus carries — bounded, for
+    /// [`answer_next`]'s reason: a prompt that never comes is a red test, not a
+    /// hung one.
+    async fn next_prompt(sub: &mut crate::broadcast::Subscription) -> RequestId {
+        let env = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
+            .await
+            .expect("a prompt must be published — none arrived within the timeout")
+            .expect("a prompt was published");
+        match env.event {
+            Event::PermissionRequest(pr) => pr.request_id,
+            other => panic!("expected permission_request, got {other:?}"),
+        }
+    }
+
+    /// **REQ-623 BR-5 / ADR-2: the hook brackets the time an ask waits on a
+    /// human, and nothing else.**
+    ///
+    /// A child's `PausableDeadline` stops while this interval is open, so the
+    /// two failure directions are both holes. Fire outside a pending ask (a
+    /// level allow, a deny, a remembered grant) and a child's clock stops while
+    /// it is working — the deadline stops bounding work. Fail to close (an
+    /// abandoned call) and a clock stays stopped forever.
+    ///
+    /// The clock is paused, so the 90 seconds nobody answers for are exact:
+    /// the interval the observer measures is the wait, not the test's
+    /// scheduling.
+    ///
+    /// # Mutations
+    ///
+    /// Each reverted after:
+    ///
+    /// - **Drop the guard's `ask_settled`** (empty `Drop::drop`): reddens at
+    ///   the first post-answer assertion — the interval never closes.
+    /// - **Open the interval before the level is consulted** (a `begin` at the
+    ///   top of `settle`): reddens on the benign path — the auto-allowed
+    ///   `read` reports a wait no human was asked for.
+    /// - **Open it after the await** (`begin` below `rx.await`): reddens at
+    ///   "the interval is open while nobody answers" — nothing is reported
+    ///   during the wait.
+    #[tokio::test(start_paused = true)]
+    async fn ask_await_hook_brackets_the_pending_interval() {
+        let mut cfg = PermissionConfig::with_default(PermissionPolicy::Allow);
+        cfg.set("shell", PermissionPolicy::Ask);
+        cfg.set("edit", PermissionPolicy::Ask);
+        cfg.set("delete_everything", PermissionPolicy::Deny);
+        let (bus, pending, gate) = gate(cfg);
+        let observer = Arc::new(RecordingObserver::default());
+        let gate = Arc::new(gate.with_ask_observer(Arc::clone(&observer) as Arc<dyn AskObserver>));
+        let mut sub = bus.subscribe(16);
+
+        // The benign path: the level answers both ways and nobody waits.
+        assert_eq!(
+            gate.authorize("read", None).await,
+            PermissionDecision::Allowed
+        );
+        assert_eq!(
+            gate.authorize("delete_everything", None).await,
+            PermissionDecision::Denied
+        );
+        assert_eq!(
+            observer.calls(),
+            Vec::new(),
+            "a decision the level made waited on nobody and must report no wait"
+        );
+
+        // An ask. The interval opens once the prompt is out …
+        let asking = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            async move { gate.authorize("shell", None).await }
+        });
+        let rid = next_prompt(&mut sub).await;
+        assert_eq!(
+            observer.calls(),
+            vec![("awaiting shell".to_owned(), rid.clone())],
+            "the interval is open while nobody answers"
+        );
+
+        // … and stays open while the human is away.
+        tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+        assert_eq!(pending.pending_count(), 1);
+        assert_eq!(observer.calls().len(), 1, "still waiting, still open");
+
+        assert!(pending.resolve(
+            &rid,
+            PermissionOutcome::Selected {
+                option_id: "allow_always".to_owned()
+            }
+        ));
+        assert_eq!(asking.await.unwrap(), PermissionDecision::Allowed);
+        assert_eq!(
+            observer.calls(),
+            vec![
+                ("awaiting shell".to_owned(), rid.clone()),
+                ("settled".to_owned(), rid.clone()),
+            ],
+            "the answer closes the interval it opened"
+        );
+        assert_eq!(
+            observer.interval(&rid),
+            Some(std::time::Duration::from_secs(90)),
+            "the measured interval is the wait, exactly"
+        );
+
+        // Benign again: the grant just remembered answers with no prompt, so
+        // no wait is reported.
+        assert_eq!(
+            gate.authorize("shell", None).await,
+            PermissionDecision::Allowed
+        );
+        assert_eq!(
+            observer.calls().len(),
+            2,
+            "a remembered grant waits on nobody"
+        );
+
+        // A call abandoned mid-wait — a cancelled or aborted child — still
+        // closes its interval, or the clock it paused would never restart.
+        let abandoned = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            async move { gate.authorize("edit", None).await }
+        });
+        let abandoned_id = next_prompt(&mut sub).await;
+        abandoned.abort();
+        assert!(abandoned.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            observer.calls()[2..],
+            [
+                ("awaiting edit".to_owned(), abandoned_id.clone()),
+                ("settled".to_owned(), abandoned_id),
+            ],
+            "an abandoned wait closes its interval"
+        );
     }
 
     #[tokio::test]

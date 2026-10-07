@@ -746,8 +746,16 @@ pub struct TurnOutcome {
 ///
 /// `Clone` since REQ-615, because the two write-capable tools each hold one and
 /// the registry builds both from a single emitter. Cloning grants nothing new:
-/// all three fields are handles, and the runtime already constructs several
-/// independent emitters for one session.
+/// three of the fields are handles and the fourth is two ids, and the runtime
+/// already constructs several independent emitters for one session.
+///
+/// # A child turn's emitter (REQ-623 ADR-3)
+///
+/// [`Self::for_child`] returns this same emitter — same bus, same session, same
+/// sink — speaking for one child turn: every payload it makes that has the
+/// `child_id`/`parent_turn_id` fields gets both. The child's loop is handed that
+/// emitter and knows nothing about children; the parent's emitter stamps
+/// nothing.
 #[derive(Clone)]
 pub struct SessionEvents {
     bus: Arc<EventBus>,
@@ -759,6 +767,14 @@ pub struct SessionEvents {
     /// of the turn loop from writing a file: [`Self::new`] never takes one, and
     /// a fixture must go out of its way ([`Self::with_sink`]) to get one.
     sink: Option<Arc<crate::transcript::TranscriptSink>>,
+    /// The child turn this emitter speaks for, or `None` for the parent turn's
+    /// own (REQ-623 ADR-3, BR-13).
+    ///
+    /// Set by [`Self::for_child`] and by nothing else — [`Self::new`] and
+    /// [`Self::with_sink`] leave it `None` — so "this event came from a child" is
+    /// a fact recorded where the event is made rather than re-derived at a later
+    /// seam where the child is gone (LESSON-501).
+    child: Option<crate::transcript::record::ChildScope>,
 }
 
 impl SessionEvents {
@@ -771,6 +787,97 @@ impl SessionEvents {
             bus,
             session_id,
             sink: None,
+            child: None,
+        }
+    }
+
+    /// The same emitter, speaking for one child turn (REQ-623 ADR-3, BR-13).
+    ///
+    /// Same bus, same `session_id`, same transcript sink: a child's events are
+    /// the session's events, and its records land in the session's one file
+    /// (REQ-611 BR-5). What it adds is two facts, stamped into every payload
+    /// this type makes that has the fields —
+    ///
+    /// * every `session_update` the child's loop streams: the `tool_call` a tool
+    ///   start sends, the `tool_call_update` a finish sends, and its
+    ///   `agent_message_chunk`s (all three go through `emit`);
+    /// * its `context_pressure`, so a mid-child refit is attributable (BR-7);
+    /// * the **bodies** of its `tool_call_input` and `tool_result` transcript
+    ///   records, never the line's reserved keys.
+    ///
+    /// The child's loop is handed this emitter and runs unchanged. A payload
+    /// without the fields (`prefix_cache`, `tool_call_repeated`, …) is
+    /// published exactly as the parent's would be — except
+    /// `context_compacted`, which a child's emitter does not publish at all
+    /// (see [`Self::context_compacted`]).
+    ///
+    /// `permission_request` and `cost_recorded` carry the same two fields but
+    /// are built outside this type, and **neither reads this emitter**. The
+    /// pair has four carriers, each a copy of one mint — the id the `agent`
+    /// tool mints per child (`ChildSpec::child_id`, and inside
+    /// `ChildSpec::spend`) and the dispatcher's parent turn id, both handed to
+    /// `ChildTurns::run_child`, which builds or stamps every carrier from them:
+    ///
+    /// 1. this emitter's field — `session_update`, `context_pressure` and the
+    ///    transcript bodies — set from the `ChildTurn` the assemble stage reads;
+    /// 2. the [`current_child`](crate::harness::child::current_child)
+    ///    task-local (`ChildTaskScope`), which the permission gate reads on the
+    ///    asking task to stamp `permission_request`;
+    /// 3. the child's `ChildSpend`, stamped `under_turn` by the runner, whose
+    ///    `CostAttribution::for_child` names a remote call's ledger row and its
+    ///    `cost_recorded` (a local call's source is stamped from carrier 4);
+    /// 4. the `ChildTurn` on the child's `TurnContext` — the attempt loop, the
+    ///    duty routes, the completion sources.
+    ///
+    /// None derives the pair again, so none can disagree with another. The
+    /// `agent_*` events are the parent's news and go out through the
+    /// **parent's** emitter (ADR-3), which stamps nothing.
+    ///
+    /// Called on an emitter that already speaks for a child, the new pair
+    /// replaces the old: a child has no `agent` tool, so there is no grandchild
+    /// a nested scope could describe.
+    #[must_use]
+    pub fn for_child(
+        &self,
+        child_id: teton_protocol::agent::ChildId,
+        parent_turn_id: teton_protocol::TurnId,
+    ) -> Self {
+        Self {
+            child: Some(crate::transcript::record::ChildScope {
+                child_id,
+                parent_turn_id,
+            }),
+            ..self.clone()
+        }
+    }
+
+    /// The child turn this emitter speaks for, or `None` for the parent's own
+    /// (REQ-623 ADR-3).
+    ///
+    /// One production reader: `refit_for_reroute`, which must not publish a
+    /// child's re-rendered repository notes as the session's
+    /// `repo_context_state` (that payload names no child). It is not how the
+    /// permission gate or the ledger learn a child's ids — see
+    /// [`Self::for_child`] for the four carriers and their one source.
+    #[must_use]
+    pub fn child_scope(&self) -> Option<&crate::transcript::record::ChildScope> {
+        self.child.as_ref()
+    }
+
+    /// The pair [`Self::for_child`] recorded, as the two `Option` fields the
+    /// protocol payloads carry — both `Some` or both `None`, never one.
+    fn child_ids(
+        &self,
+    ) -> (
+        Option<teton_protocol::agent::ChildId>,
+        Option<teton_protocol::TurnId>,
+    ) {
+        match self.child.as_ref() {
+            Some(scope) => (
+                Some(scope.child_id.clone()),
+                Some(scope.parent_turn_id.clone()),
+            ),
+            None => (None, None),
         }
     }
 
@@ -798,10 +905,21 @@ impl SessionEvents {
         &self.session_id
     }
 
+    /// Publish one `session_update`, stamped with this emitter's child pair
+    /// when it has one (REQ-623 ADR-3).
+    ///
+    /// The one place a child's tool start, tool finish and text chunk get their
+    /// ids: all three are built by the helpers at the end of this impl and all
+    /// three come through here.
     fn emit(&self, update: SessionUpdatePayload) {
+        let (child_id, parent_turn_id) = self.child_ids();
         self.bus.publish(
             Some(self.session_id.clone()),
-            Event::SessionUpdate(SessionUpdate { update }),
+            Event::SessionUpdate(SessionUpdate {
+                update,
+                child_id,
+                parent_turn_id,
+            }),
         );
     }
 
@@ -855,6 +973,7 @@ impl SessionEvents {
                 tool_call_id: tool_call_id.to_owned(),
                 tool: tool.to_owned(),
                 input: input.clone(),
+                child: self.child.clone(),
             },
         ));
     }
@@ -874,6 +993,7 @@ impl SessionEvents {
                 tool_call_id: tool_call_id.to_owned(),
                 status,
                 output: output.to_owned(),
+                child: self.child.clone(),
             },
         ));
     }
@@ -962,6 +1082,34 @@ impl SessionEvents {
         );
     }
 
+    /// Publish one of the `agent_*` events an `agent` call reports its progress
+    /// with (REQ-623 spec Events, ADR-3).
+    ///
+    /// They are the **parent's** news — a call accepted or refused, a child
+    /// finished, a share moved, the call done — so they go out through the
+    /// parent's emitter, which stamps nothing; the ids they need are fields of
+    /// their own payloads. `agent_child_started` is the runner's and
+    /// `agent_child_consent_requested` the gate's, so neither comes through
+    /// here.
+    pub fn agent_event(&self, event: Event) {
+        debug_assert!(
+            self.child.is_none(),
+            "an agent_* event is the parent's news; a child has no `agent` tool (BR-2)"
+        );
+        debug_assert!(
+            matches!(
+                event,
+                Event::AgentCallStarted(_)
+                    | Event::AgentCallRefused(_)
+                    | Event::AgentChildFinished(_)
+                    | Event::AgentChildShareReleased(_)
+                    | Event::AgentCallFinished(_)
+            ),
+            "`agent_event` publishes the `agent` tool's own events and nothing else"
+        );
+        self.bus.publish(Some(self.session_id.clone()), event);
+    }
+
     /// Announce what the context gate did to fit this turn's budget (REQ-586
     /// BR-7, ADR-3).
     ///
@@ -989,6 +1137,7 @@ impl SessionEvents {
         kind: ContextPressureKind,
         budget: &RouteBudget,
     ) {
+        let (child_id, parent_turn_id) = self.child_ids();
         self.bus.publish(
             Some(self.session_id.clone()),
             Event::ContextPressure(ContextPressure {
@@ -1008,6 +1157,9 @@ impl SessionEvents {
                 // measured. Never composed here: a call site that wrote `true`
                 // would be asserting the invariant rather than reporting it.
                 anchors_intact: report.anchors_intact,
+                // REQ-623 ADR-3: a child's refit names the child.
+                child_id,
+                parent_turn_id,
             }),
         );
     }
@@ -1025,41 +1177,51 @@ impl SessionEvents {
     /// The provider is the *duty's*, not the turn's, because it is the duty
     /// that ran — and `None` on the mechanical path, which ran on nothing. The
     /// model is deliberately not carried; see the field's own doc.
+    ///
+    /// **A child's emitter publishes nothing here** (REQ-623). The payload
+    /// carries no `child_id`, so a child's compaction on the shared bus would
+    /// read as the parent's — a client's activity row would say the parent is
+    /// compacting while it merely waits on its children. A child's refit and
+    /// drops are still loud through [`Self::context_pressure`], which is
+    /// stamped; see `harness::child`'s module docs for the other three
+    /// payloads a child suppresses rather than widens.
     pub fn context_compacted(&self, record: &CompactionRecord, provider_id: Option<&str>) {
-        self.bus.publish(
-            Some(self.session_id.clone()),
-            Event::ContextCompacted(ContextCompacted {
-                kept_bytes: record.kept_bytes as u64,
-                dropped_bytes: record.dropped_bytes as u64,
-                summarized_bytes: record.summarized_bytes as u64,
-                anchor_bytes: record.anchor_bytes as u64,
-                dropped_blocks_omitted: record
-                    .dropped_blocks
-                    .len()
-                    .saturating_sub(COMPACTED_BLOCKS_LISTED)
-                    as u64,
-                dropped_blocks: record
-                    .dropped_blocks
-                    .iter()
-                    .take(COMPACTED_BLOCKS_LISTED)
-                    .map(|&(role, class, bytes)| CompactedBlock {
-                        kind: match role {
-                            BlockRole::User => CompactedBlockKind::User,
-                            BlockRole::Assistant => CompactedBlockKind::Assistant,
-                            BlockRole::Tool => CompactedBlockKind::Tool,
-                        },
-                        provenance_class: match class {
-                            ProvenanceClass::None => WireProvenanceClass::None,
-                            ProvenanceClass::Rooted => WireProvenanceClass::Rooted,
-                            ProvenanceClass::Unknown => WireProvenanceClass::Unknown,
-                        },
-                        bytes: bytes as u64,
-                    })
-                    .collect(),
-                provider_id: provider_id.map(ToOwned::to_owned),
-                fallback: record.fallback,
-            }),
-        );
+        let event = Event::ContextCompacted(ContextCompacted {
+            kept_bytes: record.kept_bytes as u64,
+            dropped_bytes: record.dropped_bytes as u64,
+            summarized_bytes: record.summarized_bytes as u64,
+            anchor_bytes: record.anchor_bytes as u64,
+            dropped_blocks_omitted: record
+                .dropped_blocks
+                .len()
+                .saturating_sub(COMPACTED_BLOCKS_LISTED) as u64,
+            dropped_blocks: record
+                .dropped_blocks
+                .iter()
+                .take(COMPACTED_BLOCKS_LISTED)
+                .map(|&(role, class, bytes)| CompactedBlock {
+                    kind: match role {
+                        BlockRole::User => CompactedBlockKind::User,
+                        BlockRole::Assistant => CompactedBlockKind::Assistant,
+                        BlockRole::Tool => CompactedBlockKind::Tool,
+                    },
+                    provenance_class: match class {
+                        ProvenanceClass::None => WireProvenanceClass::None,
+                        ProvenanceClass::Rooted => WireProvenanceClass::Rooted,
+                        ProvenanceClass::Unknown => WireProvenanceClass::Unknown,
+                    },
+                    bytes: bytes as u64,
+                })
+                .collect(),
+            provider_id: provider_id.map(ToOwned::to_owned),
+            fallback: record.fallback,
+        });
+        // REQ-623: a child's compaction stays off the bus — the payload names
+        // no child (`harness::child::is_parent_only`).
+        if self.child.is_some() && super::child::is_parent_only(&event) {
+            return;
+        }
+        self.bus.publish(Some(self.session_id.clone()), event);
     }
 
     /// Announce that this turn's anchor set alone will not fit, so nothing was
@@ -1676,6 +1838,11 @@ async fn serve_tool_call(
     };
     match decision {
         PermissionDecision::Denied => {
+            // REQ-623 BR-10: inside a child, what the gate refused is what
+            // tells "refused by a gate" from a child that ended on its own.
+            if let Some(child) = super::child::current_child() {
+                child.tool_calls.note_denied(&name);
+            }
             events.tool_finished(&call.id, false);
             // Who refused this matters to what the model does next.
             // A level refusal was never a question — nobody was
@@ -1938,22 +2105,67 @@ async fn run_the_allowed_tool(
             return Ok(());
         }
     }
-    // **Off the async worker** (BUG-226). `Tool::run` is synchronous and a
-    // `shell` call holds this thread for as long as its child runs — up to the
-    // tool's ceiling. That is not only this turn's time: `tool_started` above
-    // woke this connection's event forwarder, and a task woken from a worker
-    // goes into that worker's LIFO slot, which no other worker can steal
-    // (tokio-rs/tokio#4941). Dispatched inline, the forwarder sat in the slot
-    // until the tool returned, and the client received `tool_call` and
-    // `tool_call_update` together — a `[running]` line printed at the moment
-    // the tool finished, which is the silent stretch REQ-621 exists to remove.
-    // Observed on tokio 1.53 with a standalone probe (8 of 8 trials; 0 of 8
-    // through the helper), and intermittently as
-    // `a_running_tool_shows_its_title_elapsed_and_cost_so_far_beneath_its_running_line`
-    // finding one row where it expects a counter. The helper hands the core —
-    // run queue and slot — to a fresh thread before this one blocks.
-    let outcome =
-        crate::runtime::block_in_place_if_multithread(|| tools.dispatch(name, tool_ctx, arguments));
+    // ── REQ-623 ADR-1: the `agent` tool is awaited, never run ─
+    //
+    // **Before** the synchronous dispatch below, and the order is the design.
+    // An `agent` call is minutes of awaiting child turns; run through
+    // `Tool::run` it would park a worker thread on its children for all of
+    // them — BUG-226's shape at N times the duration — so it is reached by
+    // downcast and `.await`ed here, on the loop's own async path,
+    // where the parent's event forwarder keeps draining while the children
+    // run (BR-4). Every other tool falls through to BUG-226's fix unchanged.
+    // Everything around it — the repeat gate above, the fold, the framing and
+    // the ledger record below — is the same for `agent` as for any tool.
+    let agent = tools.get(name).and_then(|tool| tool.as_agent());
+    let outcome = if let Some(agent) = agent {
+        agent
+            .dispatch(super::tools::AgentCall {
+                tool_call_id: &call.id,
+                arguments,
+                // BR-7: no child's cap exceeds the parent's own.
+                parent_max_turns: config.max_turns,
+                // The tasks were written from this context: they carry its
+                // taint into every child (LESSON-501).
+                provenance: super::completion::context_provenance(ctx),
+            })
+            .await
+    } else {
+        // **Off the async worker** (BUG-226). `Tool::run` is synchronous and a
+        // `shell` call holds this thread for as long as its child runs — up to
+        // the tool's ceiling. That is not only this turn's time: `tool_started`
+        // above woke this connection's event forwarder, and a task woken from a
+        // worker goes into that worker's LIFO slot, which no other worker can
+        // steal (tokio-rs/tokio#4941). Dispatched inline, the forwarder sat in
+        // the slot until the tool returned, and the client received `tool_call`
+        // and `tool_call_update` together — a `[running]` line printed at the
+        // moment the tool finished, which is the silent stretch REQ-621 exists
+        // to remove. Observed on tokio 1.53 with a standalone probe (8 of 8
+        // trials; 0 of 8 through the helper), and intermittently as
+        // `a_running_tool_shows_its_title_elapsed_and_cost_so_far_beneath_its_running_line`
+        // finding one row where it expects a counter. The helper hands the core
+        // — run queue and slot — to a fresh thread before this one blocks.
+        crate::runtime::block_in_place_if_multithread(|| tools.dispatch(name, tool_ctx, arguments))
+    };
+    // REQ-623 BR-10 / AC-14: a cancellation point, inside a child. The dispatch
+    // above blocks this task's thread, so an abort issued while the tool ran —
+    // the child's deadline passing, its parent turn cancelled — has not landed
+    // yet: an abort lands only at the task's next await. Without one here the
+    // loop carried on synchronously after the tool returned, publishing the
+    // call's `tool_call_update` after the child's `agent_child_finished`,
+    // marking the result's provenance on the session, and at worst sending the
+    // next model call with the abandoned output in it. Yielding hands the
+    // runtime the chance to drop the task before any of the result is used —
+    // which is what "its result never reaches a model" rests on. A prompt turn
+    // takes no extra await here: its cancellation is the commit seam's.
+    let child = super::child::current_child();
+    if child.is_some() {
+        tokio::task::yield_now().await;
+    }
+    // REQ-623 BR-10: inside a child, a call that ran is a call the gate did
+    // not stop — see `ChildToolCalls::gate_refusal`.
+    if let Some(child) = child {
+        child.tool_calls.note_ran();
+    }
     // REQ-567 OQ-1: the tool has RUN. Everything from here
     // to the fold below awaits — the tool's own duty, then
     // `digest` — and a cancellation landing in one of those
@@ -2127,7 +2339,15 @@ async fn run_the_allowed_tool(
     // a summary of itself, and the failure arm truncates it
     // mechanically. The decision is read off the result
     // (ADR-1), never off `name`.
-    let folded = if disposition == ResultDisposition::Expansion {
+    //
+    // **REQ-623 BR-11: so is an `agent` result.** Its reports are
+    // bounded already, loudly, and the array is typed fields the
+    // parent keys on; a digest would replace the result with a
+    // summary of it. `UntrustedWhole` is that tool's value.
+    let folded = if matches!(
+        disposition,
+        ResultDisposition::Expansion | ResultDisposition::UntrustedWhole
+    ) {
         folded
     } else {
         let outcome = summarize_if_large(
@@ -2154,8 +2374,8 @@ async fn run_the_allowed_tool(
     // the model as an instruction that fires an allowlisted
     // tool. MCP results are already framed at their bridge.
     //
-    // REQ-587 ADR-1: the result says which of the three it
-    // is, and the name list is now only what `Data` — every
+    // REQ-587 ADR-1: the result says which of the four it
+    // is (REQ-623 added `UntrustedWhole`), and the name list is now only what `Data` — every
     // tool that shipped before this REQ — is measured
     // against. `UntrustedData` gets the envelope whatever
     // the tool is called; `Expansion` never gets it, because
@@ -2166,7 +2386,9 @@ async fn run_the_allowed_tool(
     // by the expander that measured it.
     let folded = match disposition {
         ResultDisposition::Expansion => folded,
-        ResultDisposition::UntrustedData => frame_untrusted_builtin(name, &folded),
+        ResultDisposition::UntrustedData | ResultDisposition::UntrustedWhole => {
+            frame_untrusted_builtin(name, &folded)
+        }
         ResultDisposition::Data => {
             if UNTRUSTED_OUTPUT_TOOLS.contains(&name) {
                 frame_untrusted_builtin(name, &folded)
@@ -3501,6 +3723,103 @@ impl super::tools::Tool for SkillToolDocs {
     }
 }
 
+/// An `agent` tool carrying REQ-623's **prompt bytes and nothing else**: the
+/// rendered description and the input schema, with no dispatcher, no parent,
+/// no runtime handle and no per-turn counter — [`SkillToolDocs`]'s shape, for
+/// the same reason (REQ-587 ADR-9).
+///
+/// **Why it exists.** `register_agent_tool` puts the `agent` tool in every
+/// prompt turn's registry whenever `agent.enabled` — the default — and
+/// cap-exempt, so its docs line is resident exactly as the `skill` tool's is.
+/// `ToolRegistry::with_builtins()` cannot hold it, and the real
+/// [`AgentTool`](super::tools::agent::AgentTool) holds a
+/// `tokio::runtime::Handle` and a `ChildDispatcher`, so the sync sweep in
+/// `egress::redact` cannot build one. Until TASK-428's Phase-4 fix neither
+/// sweep registered it, and both measured a prompt about 1.3 KB smaller than
+/// the one every default prompt turn sends — LESSON-481's shape, which ADR-9
+/// had already closed once for `skill`.
+///
+/// **It is not a stub with a hand-typed description.** Both prompt surfaces
+/// come from the functions the shipped tool reaches for
+/// (`agent::describe` and `agent::schema`), and
+/// `tools::agent::tests::the_doc_only_agent_tool_and_the_real_one_render_one_set_of_prompt_bytes`
+/// pins the two byte-identical.
+///
+/// **Why it lives here rather than in `harness::tools::agent`.**
+/// `tests/boundary_coverage.rs` counts every `impl Tool for …` in the tools
+/// module's production half as a tool the product ships; a measurement fixture
+/// is not one, and [`SkillToolDocs`] sits here for exactly that reason.
+#[cfg(test)]
+pub(crate) struct AgentToolDocs {
+    /// The rendered description, owned because `Tool::description` borrows from
+    /// `&self` — the real tool's own arrangement.
+    description: String,
+    /// The per-call cap the schema's `maxItems` renders.
+    per_call: u32,
+}
+
+#[cfg(test)]
+impl AgentToolDocs {
+    /// The docs an `[agent]` table of `config` puts in the prompt, rendered
+    /// exactly as `AgentTool::new` and `AgentTool::input_schema` render them.
+    pub(crate) fn new(config: &teton_core::config::AgentConfig) -> Self {
+        Self {
+            description: super::tools::agent::describe(config),
+            per_call: config.max_children_per_call,
+        }
+    }
+
+    /// The **worst case** the resident prompt can carry: both caps at
+    /// `u32::MAX`.
+    ///
+    /// The description states `max_children_per_call` and
+    /// `max_children_per_turn` and the schema's `maxItems` states the first, all
+    /// as decimal numbers, so the docs line grows with the caps' digit counts.
+    /// `AgentConfig::validate_agent` bounds each cap from below at one, and
+    /// the per-call cap by the per-turn cap — equal is admitted — so the
+    /// largest value the config admits for either is the type's own:
+    /// ten digits each, **27 bytes** over the defaults' `5` and `8` (nine in
+    /// each of the three places). The ceiling by derivation, as
+    /// [`SkillToolDocs::worst_case`] synthesizes a roster at `ROSTER_MAX_BYTES`
+    /// rather than reading the developer's own tree.
+    pub(crate) fn worst_case() -> Self {
+        Self::new(&teton_core::config::AgentConfig {
+            max_children_per_call: u32::MAX,
+            max_children_per_turn: u32::MAX,
+            ..teton_core::config::AgentConfig::default()
+        })
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl super::tools::Tool for AgentToolDocs {
+    fn name(&self) -> &str {
+        super::tools::AGENT_TOOL_NAME
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        super::tools::agent::schema(self.per_call)
+    }
+
+    /// Never reached: the sweeps that register this build a system prompt, they
+    /// do not run a turn. It refuses rather than panicking, as
+    /// [`SkillToolDocs`] does.
+    fn run(
+        &self,
+        _ctx: &super::tools::ToolContext,
+        _args: &serde_json::Value,
+    ) -> super::tools::ToolOutcome {
+        super::tools::ToolOutcome::error(
+            "the doc-only `agent` tool renders documentation and runs nothing (REQ-623)",
+        )
+    }
+}
+
 /// Build the system prompt: the agent's instructions, Teton's bundled
 /// self-configuration guide, the exposed tool docs, the tool-call format the
 /// local model must follow, and — last — the repository's own notes.
@@ -3831,6 +4150,114 @@ mod tests {
     use crate::harness::context::{NoopProvenanceHook, PreparedPrompt};
     use crate::harness::permissions::{PendingPermissions, PermissionConfig};
 
+    /// **REQ-623 ADR-3 / BR-13.** An emitter from [`SessionEvents::for_child`]
+    /// stamps `child_id` and `parent_turn_id` into every payload it makes that
+    /// has the fields; the parent emitter it was made from stamps neither.
+    ///
+    /// Every helper that reaches `emit` is driven — tool start, tool finish,
+    /// text chunk — plus `context_pressure`, from **both** emitters, onto one
+    /// subscription. "Same bus, same session" is half of ADR-3, so each
+    /// envelope's scope is asserted too, and the parent leg is the benign path:
+    /// a stamp that leaked onto every emitter would pass a child-only test.
+    ///
+    /// **Shown to fail** (mutations, run 2026-10-05, restored): writing
+    /// `child_id: None, parent_turn_id: None` back into `emit` reddens this at
+    /// `child tool_call must carry both ids` — and only this: the transcript
+    /// suite drives the sink hand-offs and `context_pressure`, not `emit`, so
+    /// this test is `emit`'s one guard. The same in `context_pressure` reddens
+    /// it at `child context_pressure must carry both ids` (and both REQ-623
+    /// tests in `tests/transcript.rs`). Making `SessionEvents::new` start from
+    /// a fixed child scope reddens it at `the parent speaks for no child`.
+    #[test]
+    fn session_events_for_child_stamps_and_the_parent_emitter_does_not() {
+        let session_id = SessionId::from("sess-0123456789abcdefghjkmnpqrs");
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe(32);
+        let parent = SessionEvents::new(Arc::clone(&bus), session_id.clone());
+        let child_id = teton_protocol::agent::ChildId::new("call-1", "scan");
+        let turn = teton_protocol::TurnId::from("turn-1");
+        let child = parent.for_child(child_id.clone(), turn.clone());
+
+        assert_eq!(child.session_id(), parent.session_id(), "same session");
+        assert!(
+            parent.child_scope().is_none(),
+            "the parent speaks for no child"
+        );
+        assert_eq!(
+            child
+                .child_scope()
+                .map(|scope| (&scope.child_id, &scope.parent_turn_id)),
+            Some((&child_id, &turn)),
+            "the child emitter carries exactly the pair it was made with"
+        );
+
+        let budget = HarnessConfig::default().budget;
+        let report = PressureReport {
+            dropped_blocks: 1,
+            ..PressureReport::default()
+        };
+        for events in [&parent, &child] {
+            events.tool_started("call-a", "read");
+            events.tool_finished("call-a", true);
+            events.agent_message("hello");
+            events.context_pressure(&report, ContextPressureKind::BlocksDropped, &budget);
+        }
+
+        let mut seen = Vec::new();
+        while let Some(envelope) = sub.try_recv() {
+            assert_eq!(
+                envelope.session_id.as_ref(),
+                Some(&session_id),
+                "a child publishes on the parent's bus, scoped to the parent's session"
+            );
+            seen.push(match envelope.event {
+                Event::SessionUpdate(update) => (
+                    match update.update {
+                        SessionUpdatePayload::ToolCall { .. } => "tool_call",
+                        SessionUpdatePayload::ToolCallUpdate { .. } => "tool_call_update",
+                        SessionUpdatePayload::AgentMessageChunk { .. } => "agent_message_chunk",
+                        other => panic!("no helper here sends {other:?}"),
+                    },
+                    update.child_id,
+                    update.parent_turn_id,
+                ),
+                Event::ContextPressure(pressure) => (
+                    "context_pressure",
+                    pressure.child_id,
+                    pressure.parent_turn_id,
+                ),
+                other => panic!("no helper here publishes {other:?}"),
+            });
+        }
+        let kinds: Vec<&str> = seen.iter().map(|(kind, _, _)| *kind).collect();
+        let one_side = [
+            "tool_call",
+            "tool_call_update",
+            "agent_message_chunk",
+            "context_pressure",
+        ];
+        assert_eq!(
+            kinds,
+            [one_side, one_side].concat(),
+            "four payloads from the parent, then the same four from the child"
+        );
+        let (from_parent, from_child) = seen.split_at(one_side.len());
+        for (kind, child_stamp, turn_stamp) in from_parent {
+            assert_eq!(
+                (child_stamp, turn_stamp),
+                (&None, &None),
+                "parent {kind} must carry neither id"
+            );
+        }
+        for (kind, child_stamp, turn_stamp) in from_child {
+            assert_eq!(
+                (child_stamp.as_ref(), turn_stamp.as_ref()),
+                (Some(&child_id), Some(&turn)),
+                "child {kind} must carry both ids"
+            );
+        }
+    }
+
     /// **REQ-589 AC-3.** The remote refusal's wording is byte-identical to what
     /// REQ-586 shipped, and the local one differs from it in exactly one place.
     ///
@@ -3988,6 +4415,7 @@ mod tests {
         while let Some(env) = sub.try_recv() {
             if let Event::SessionUpdate(SessionUpdate {
                 update: SessionUpdatePayload::AgentMessageChunk { text },
+                ..
             }) = &env.event
             {
                 out.push_str(text);
@@ -6517,6 +6945,174 @@ mod tests {
         );
     }
 
+    /// **REQ-623 BR-14 / TASK-431: the resident prompt names the `agent` tool
+    /// beside `skill`, conditionally, and outside the built-in commands clause.**
+    ///
+    /// The vendored ADLC skills phrase dispatch in another harness's vocabulary
+    /// — "the Agent tool", `subagent_type` — and the spec's Assumption is that
+    /// the model maps that phrasing onto `agent { tasks }` from this sentence
+    /// and the tool's schema alone. So the sentence is the one resident place
+    /// the mapping is written down, and it says the four things a model needs
+    /// before it hands work away: the work runs in **concurrent child turns**,
+    /// each starts from a **fresh context**, each runs at **this session's
+    /// permissions**, and their **reports** come back.
+    ///
+    /// # Why the sentence opens on a condition
+    ///
+    /// The guide is one static file resident in every turn, and the `agent`
+    /// tool is not: `agent.enabled = false` leaves it out of the registry
+    /// (BR-14), and a child's registry never holds it (BR-2) while the child's
+    /// system prompt is the session's, guide included. A sentence that said
+    /// "you can dispatch children" would be false in both of those prompts —
+    /// LESSON-570's defect, a capability claim true of one build shape and not
+    /// the other. "When the `agent` tool is listed" is true in all three, and
+    /// the tool list directly below the guide is what answers it.
+    ///
+    /// # Where it sits, and the benign half
+    ///
+    /// On the capability line, after the `skill` clause and **before** `The
+    /// built-in commands are `: `agent` is a tool, not a `/command`, so it must
+    /// not join the list
+    /// `the_resident_prompt_names_every_command_family_the_roster_carries`
+    /// reads — that guard would refuse a non-`/` token, and a model reading the
+    /// list would tell the user to type `/agent`. The benign half asserts the
+    /// list carries no `agent` token at all, so the REQ-617 guard and this one
+    /// agree about where the sentence may not go.
+    ///
+    /// The sentence carries no `task` either, though the schema's key is
+    /// `tasks`: the guide's one-line-about-asking rule
+    /// (`the_system_prompt_forbids_asking_for_a_credential_in_the_conversation`)
+    /// is a substring match on `ask`, and `task` contains it. The schema in the
+    /// tool docs names the key; the guide names the tool.
+    ///
+    /// # Mutations run (2026-10-07)
+    ///
+    /// Dropping the sentence from `self_config.md` → red here, on the mapping
+    /// needle, and on the two prompt-margin pins (`egress::redact` and
+    /// `tools::web`, each 202 bytes off) — three reds, and no other guide test.
+    /// Moving it after the command list's closing `;` → red here alone, on the
+    /// order assertion; the REQ-617 guard stays green, which is why this one
+    /// pins the position. Opening it unconditionally (`Your `agent` tool is
+    /// listed, …`, mapping kept) → red here alone, on the condition assertion.
+    /// Each was run and reverted.
+    #[test]
+    fn the_resident_prompt_names_the_agent_tool_beside_skill() {
+        const SKILL: &str = "only through the `skill` tool";
+        // The mapping is the needle; the condition is asserted on its own below,
+        // so an unconditional re-wording that keeps the mapping fails *there*,
+        // naming the rule it broke, rather than on a missing substring.
+        const MAPPING: &str = "`agent` tool is listed, it is what the skills call the Agent tool";
+        const OPEN: &str = "The built-in commands are ";
+
+        let line = SELF_CONFIG_GUIDE
+            .lines()
+            .find(|line| line.contains(SKILL))
+            .expect("the capability line names the `skill` tool (REQ-587 BR-8)");
+        let skill_at = line.find(SKILL).expect("found above");
+        let mapping_at = line.find(MAPPING).unwrap_or_else(|| {
+            panic!(
+                "the capability line no longer names the `agent` tool beside `skill` \
+                 (REQ-623 BR-14). Without it the model reads the skills' \"Agent tool\" \
+                 and `subagent_type` with nothing resident that maps them onto `agent`, \
+                 which is the stall REQ-587 AC-15 recorded. Restore the sentence in \
+                 crates/tetond/src/harness/self_config.md, or re-word this needle with \
+                 it.\nline: {line}"
+            )
+        });
+        // The sentence starts after the full stop that ends the one before it.
+        let agent_at = line[..mapping_at].rfind(". ").map_or(0, |stop| stop + 2);
+        let open_at = line
+            .find(OPEN)
+            .expect("the capability line carries the built-in command list (REQ-617)");
+        assert!(
+            skill_at < agent_at && agent_at < open_at,
+            "the `agent` sentence has to sit beside the `skill` clause and before \
+             `{OPEN}`: it is a tool, not a command, and inside or after the list it reads \
+             as one.\nskill at {skill_at}, agent at {agent_at}, list at {open_at}\n\
+             line: {line}"
+        );
+
+        let sentence = &line[agent_at..open_at];
+        assert!(
+            sentence.starts_with("When the `agent` tool is listed"),
+            "the `agent` sentence must open on its condition: the guide is resident \
+             where the tool is absent (`agent.enabled = false`, BR-14; every child, \
+             BR-2), and an unconditional claim is false there (LESSON-570).\n\
+             sentence: {sentence}"
+        );
+        for fact in [
+            "concurrent child turns",
+            "fresh context",
+            "this session's permissions",
+            "reports",
+        ] {
+            assert!(
+                sentence.contains(fact),
+                "the `agent` sentence no longer says `{fact}`. Each of the four is a fact \
+                 a model needs before it hands work away (REQ-623 BR-1, BR-4, BR-5, \
+                 BR-10); re-word the needle with the sentence rather than deleting \
+                 it.\nsentence: {sentence}"
+            );
+        }
+
+        // The benign half: the built-in command list is untouched by the
+        // sentence, and the sentence is resident exactly once.
+        let list = line[open_at + OPEN.len()..]
+            .split(';')
+            .next()
+            .expect("split yields at least one piece");
+        assert!(
+            !list.to_ascii_lowercase().contains("agent"),
+            "the built-in command list names `agent`, which is a tool, not a command \
+             (REQ-617's guard reads this list as `/family` tokens).\nlist: {list}"
+        );
+        let naming: Vec<&str> = SELF_CONFIG_GUIDE
+            .lines()
+            .filter(|line| line.contains("`agent`"))
+            .collect();
+        assert_eq!(
+            naming.len(),
+            1,
+            "the guide names the `agent` tool on {} lines; it is one fact, said once, \
+             on the capability line.\nlines: {naming:?}",
+            naming.len()
+        );
+
+        // LESSON-570, swept over the whole guide rather than the clause: no line
+        // may still say the model cannot hand work away.
+        let guide = SELF_CONFIG_GUIDE.to_ascii_lowercase();
+        for stale in [
+            "cannot dispatch",
+            "cannot delegate",
+            "subagents degrade",
+            "nothing behind them",
+        ] {
+            assert!(
+                !guide.contains(stale),
+                "the guide says `{stale}`, which REQ-623 made false — the `agent` tool \
+                 hands work to child turns (LESSON-570)."
+            );
+        }
+
+        // Resident in both harness shapes, and true where the tool is absent:
+        // `with_builtins` registers no `agent` tool — BR-14's off shape — and the
+        // sentence is still there, still conditional, and the roster below it
+        // does not list the tool it is conditioned on.
+        for config in [HarnessConfig::default(), HarnessConfig::for_strong_model()] {
+            let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
+            assert!(
+                system.contains(sentence),
+                "the `agent` sentence is in self_config.md but not in the built system \
+                 prompt for {config:?}"
+            );
+            assert!(
+                !system.contains("\n- agent: "),
+                "`ToolRegistry::with_builtins()` lists an `agent` tool, so this check no \
+                 longer measures the shape where the tool is absent"
+            );
+        }
+    }
+
     /// **REQ-592 AC-1 / BR-1: the prompt says where its words land, and says it
     /// once.**
     ///
@@ -8341,6 +8937,208 @@ mod tests {
         }
     }
 
+    /// A tool that blocks its thread until the test lets it go — a `shell`
+    /// command still running, as far as the loop can tell.
+    struct BlockingStubTool {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl super::super::tools::Tool for BlockingStubTool {
+        fn name(&self) -> &str {
+            "stub_blocker"
+        }
+        fn description(&self) -> &str {
+            "A stand-in that blocks until released."
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn gates_itself(&self) -> bool {
+            true
+        }
+        fn run(&self, _ctx: &ToolContext, _args: &Value) -> ToolOutcome {
+            let _ = self.entered.send(());
+            let _ = self
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(30));
+            ToolOutcome::ok("ABANDONED-RESULT-MARKER")
+        }
+    }
+
+    /// **REQ-623 BR-10 / AC-14: a child aborted while a tool blocks its thread
+    /// takes no further loop step once the tool returns** — no
+    /// `tool_call_update` for the call, and no second model call carrying the
+    /// abandoned result.
+    ///
+    /// The turn runs inside a child's scope on its own task; its tool blocks
+    /// until released. The task is aborted mid-tool (it cannot land: the
+    /// thread is blocked), then the tool is released. The abort must land at
+    /// the cancellation point right after the dispatch.
+    ///
+    /// Benign: the same turn outside a child — the parent's — runs on after
+    /// its tool and publishes the update, so the observation channel works.
+    ///
+    /// Mutation (run 2026-10-07, reverted): the child's `yield_now` after the
+    /// dispatch removed — 1 red of the 2,325 lib tests, this one, at the
+    /// update the aborted child still published; red on 4 of 4 runs, and the
+    /// fix green on 5 of 5.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_aborted_child_takes_no_step_after_its_blocking_tool_returns() {
+        use crate::harness::child::{ChildTaskScope, ChildToolCalls, PausableDeadline};
+
+        async fn turn(in_a_child: bool) -> (Vec<Event>, usize) {
+            let session_id = SessionId::from("abort-after-tool");
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(1024);
+            let gate = Arc::new(PermissionGate::new(
+                session_id.clone(),
+                PermissionConfig::with_default(super::super::permissions::PermissionPolicy::Deny),
+                Arc::clone(&bus),
+                Arc::new(PendingPermissions::new()),
+            ));
+            let events = SessionEvents::new(Arc::clone(&bus), session_id);
+            let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let mut tools = ToolRegistry::with_builtins();
+            tools.register_cap_exempt(Arc::new(BlockingStubTool {
+                entered: entered_tx,
+                release: std::sync::Mutex::new(release_rx),
+            }));
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = Arc::clone(&calls);
+            let run = async move {
+                let config = HarnessConfig {
+                    max_turns: 4,
+                    ..HarnessConfig::default()
+                };
+                let tool_ctx = ToolContext::new(std::env::temp_dir());
+                let mut hook = NoopProvenanceHook;
+                let mut ctx = ContextManager::new(FOLD_SYSTEM, 1_000_000);
+                ctx.push_user(FOLD_REQUEST);
+                let mut source = CountingCallOnce {
+                    inner: CallOnceThenEndSource {
+                        name: "stub_blocker",
+                        calls: 0,
+                        dropped_calls: 0,
+                    },
+                    calls: counted,
+                };
+                let _ = run_session_turn_with_source(
+                    &mut source,
+                    &tools,
+                    &tool_ctx,
+                    &gate,
+                    &events,
+                    &mut ctx,
+                    &config,
+                    &mut hook,
+                    &DutyRoute::unresolved("no digest route in this test"),
+                    &DutyRoute::unresolved("no compact route in this test"),
+                    &ToolDuties {
+                        triage: &DutyRoute::unresolved("no triage route in this test"),
+                        shell: &DutyRoute::unresolved("no shell route in this test"),
+                    },
+                )
+                .await;
+            };
+            let task = if in_a_child {
+                tokio::spawn(
+                    ChildTaskScope {
+                        child_id: teton_protocol::agent::ChildId::new("turn-1:call-1", "blocked"),
+                        name: "blocked".to_owned(),
+                        parent_turn_id: teton_protocol::TurnId::from("turn-1"),
+                        deadline: PausableDeadline::start(std::time::Duration::from_secs(60)),
+                        consent: Arc::new(tokio::sync::Mutex::new(())),
+                        tool_calls: ChildToolCalls::default(),
+                    }
+                    .scope(run),
+                )
+            } else {
+                tokio::spawn(run)
+            };
+            tokio::task::spawn_blocking(move || {
+                entered
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("the tool started")
+            })
+            .await
+            .unwrap();
+            if in_a_child {
+                task.abort();
+            }
+            let _ = release.send(());
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), task).await;
+            let events = std::iter::from_fn(|| sub.try_recv())
+                .map(|envelope| envelope.event)
+                .collect();
+            (events, calls.load(std::sync::atomic::Ordering::SeqCst))
+        }
+
+        fn updates(events: &[Event]) -> usize {
+            events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        Event::SessionUpdate(SessionUpdate {
+                            update: SessionUpdatePayload::ToolCallUpdate { .. },
+                            ..
+                        })
+                    )
+                })
+                .count()
+        }
+
+        let (parent, parent_calls) = turn(false).await;
+        assert!(
+            updates(&parent) >= 1 && parent_calls == 2,
+            "benign: the parent's turn ran on after its tool ({parent_calls} calls): {parent:?}"
+        );
+
+        let (child, child_calls) = turn(true).await;
+        assert_eq!(
+            updates(&child),
+            0,
+            "the aborted child published its abandoned call's update: {child:?}"
+        );
+        assert_eq!(
+            child_calls, 1,
+            "the aborted child asked for another turn after its tool returned"
+        );
+    }
+
+    /// [`CallOnceThenEndSource`], counting the calls it serves into a shared
+    /// counter the test can read after the task is gone.
+    struct CountingCallOnce {
+        inner: CallOnceThenEndSource,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl CompletionSource for CountingCallOnce {
+        fn chat_format(&self) -> ChatFormat {
+            self.inner.chat_format()
+        }
+
+        async fn produce_turn(
+            &mut self,
+            prompt: &PreparedPrompt,
+            provenance: &EgressProvenance,
+            config: &HarnessConfig,
+            tools: &ToolRegistry,
+            exposed: &[&str],
+            on_token: &mut (dyn for<'s> FnMut(&'s str) + Send),
+        ) -> Result<SourceTurn, HarnessError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner
+                .produce_turn(prompt, provenance, config, tools, exposed, on_token)
+                .await
+        }
+    }
+
     /// A tool that runs, succeeds, and does **not** gate itself — so the loop's
     /// permission door decides, and a `Deny` table takes the denied arm.
     struct GatedStubTool {
@@ -8790,6 +9588,75 @@ mod tests {
             expansion, big,
             "the expansion went through the `digest` duty — the model was handed \
              a summary of the procedure instead of the procedure (BR-7)"
+        );
+    }
+
+    /// **REQ-623 BR-11: an `agent` result is folded whole — framed as data,
+    /// never through the `digest` duty.**
+    ///
+    /// The body is the shape the tool returns — a JSON array of child results
+    /// — sized past the default config's **byte** threshold (asserted), with
+    /// the word threshold out of reach so the bytes alone decide. The control
+    /// leg is the same bytes as `UntrustedData`, which the duty does take; the
+    /// agent leg is `UntrustedWhole`, the value `agent`'s `result_of` sets
+    /// (its own test pins that), registered under the tool's real name.
+    ///
+    /// # Mutations (run 2026-10-07, each reverted — 1 red of the 2,319 lib
+    /// tests apiece)
+    ///
+    /// - **Digest it** (the `UntrustedWhole` arm dropped from the fold's digest
+    ///   guard): this test, at the verbatim assertion — the fold's mechanical
+    ///   fallback cuts the array mid-object.
+    /// - **The tool asks for the old value** (`result_of` setting
+    ///   `UntrustedData`): `agent`'s own `result_of` test, at its disposition.
+    #[tokio::test]
+    async fn an_agent_result_past_the_digest_threshold_is_folded_whole() {
+        let threshold = HarnessConfig::default().summarize_threshold_bytes;
+        let report = "finding ".repeat(threshold / 8 + 64);
+        let body = format!(
+            "[\n  {{\n    \"name\": \"survey\",\n    \"status\": \"completed\",\n    \
+             \"report\": \"{report}\"\n  }}\n]"
+        );
+        assert!(
+            body.len() > threshold,
+            "non-vacuity: the body ({} bytes) is past the byte threshold ({threshold})",
+            body.len()
+        );
+
+        let control = folded_result(
+            StubDispositionTool {
+                name: super::super::tools::AGENT_TOOL_NAME,
+                result: body.clone(),
+                disposition: ResultDisposition::UntrustedData,
+            },
+            usize::MAX,
+        )
+        .await;
+        assert!(
+            !control.contains(&body),
+            "the control was folded whole, so the byte threshold never fired and the \
+             agent leg below proves nothing:\n{control}"
+        );
+
+        let agent = folded_result(
+            StubDispositionTool {
+                name: super::super::tools::AGENT_TOOL_NAME,
+                result: body.clone(),
+                disposition: ResultDisposition::UntrustedWhole,
+            },
+            usize::MAX,
+        )
+        .await;
+        assert!(
+            agent.contains(&body),
+            "the agent result went through the `digest` duty — the parent was handed a \
+             summary of its children's typed results instead of the results (BR-11)"
+        );
+        assert!(
+            agent.contains("trust=\"untrusted\""),
+            "a child's report is model output about the repository and keeps the \
+             envelope:\n{}",
+            &agent[..agent.len().min(400)]
         );
     }
 

@@ -8,6 +8,16 @@
 //! ([`WebTotals`], REQ-563 BR-7). The two roll-ups never merge: a lookup is not
 //! a call and must not be counted as one.
 //!
+//! ## A turn and its children (REQ-623 BR-8)
+//!
+//! A child's calls are ordinary calls — the parent pays, so every roll-up above
+//! counts them exactly as it counts any other. [`TurnTotals`] is an additional
+//! *view*, never a second count: rows stamped with a `parent_turn_id` group by
+//! `(session, turn)`, the turn's own calls apart from one line per child, and
+//! the turn's total is the two summed. A row with no ids touches only the
+//! existing roll-ups, which are byte-identical to what they were before the
+//! columns existed.
+//!
 //! ## What the meter is allowed to claim (BR-2)
 //!
 //! Everything here derives **only** from recorded [`LedgerRow`]s. Rows for an
@@ -24,19 +34,21 @@
 //! [`SavingsEstimate::methodology`] string travels with the number so the CLI
 //! can never present it as measured fact.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
-use teton_protocol::Phase;
+use teton_protocol::agent::ChildId;
+use teton_protocol::{Phase, TurnId};
 
 use super::ledger::{LedgerRow, WebLookupRow};
 use super::prices::PriceTable;
 
-/// A rolled-up total for one grouping key (a session id, a phase, or a provider).
+/// A rolled-up total for one grouping key (a session id, a phase, a provider,
+/// or — inside a [`TurnTotals`] — a turn id).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GroupTotals {
-    /// The group key (session id, phase wire-name, or provider id).
+    /// The group key (session id, phase wire-name, provider id, or turn id).
     pub key: String,
     /// Calls in this group (priced and unpriced).
     pub calls: u64,
@@ -87,6 +99,53 @@ pub struct WebTotals {
     /// Bytes those lookups brought back. `0` from every ending that transferred
     /// nothing, so this is content received and not traffic attempted.
     pub bytes_in: u64,
+}
+
+/// One child's line beneath its parent turn (REQ-623 BR-8 / AC-12).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChildTotals {
+    /// The child's full id, `"<call_id>/<name>"` — the key a client matches on.
+    pub child_id: ChildId,
+    /// The label the line is shown under: [`ChildId::name`], the id's one
+    /// sanctioned accessor (the part after its first `/`).
+    ///
+    /// The ledger has no name column, so the id is the one place the label can
+    /// come from. A display label only: [`Self::child_id`] stays the identity.
+    pub name: String,
+    /// Where the child's calls went, as `provider/model`. A child rerouted
+    /// mid-run lists each distinct route once, in call order, joined by `" → "`
+    /// — so a reroute shows rather than being hidden behind the last route.
+    pub route: String,
+    /// Calls the child made (priced and unpriced).
+    pub calls: u64,
+    /// Input tokens over the child's calls.
+    pub input_tokens: u64,
+    /// Output tokens over the child's calls.
+    pub output_tokens: u64,
+    /// The child's cost in micro-USD, over its **priced** calls only.
+    pub usd_micros: i64,
+    /// Of [`Self::calls`], how many were unpriced (cost unknown).
+    pub unpriced_calls: u64,
+}
+
+/// A parent turn that dispatched children, with each child's spend nested
+/// beneath its own (REQ-623 BR-8 / AC-12).
+///
+/// A view over rows every other roll-up already counted — never added to them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TurnTotals {
+    /// The session the turn ran in.
+    pub session_id: String,
+    /// The parent turn.
+    pub turn_id: TurnId,
+    /// The turn's own calls: rows stamped with this turn and no child. Keyed by
+    /// the turn id. All zero where the turn's own calls carried no turn stamp.
+    pub own: GroupTotals,
+    /// One line per child, in the order the children first spent.
+    pub children: Vec<ChildTotals>,
+    /// [`Self::own`] plus every child's — the parent turn's total, keyed by the
+    /// turn id.
+    pub total: GroupTotals,
 }
 
 /// Whole-ledger totals.
@@ -174,6 +233,16 @@ pub struct CostReport {
     /// question is "did any of this spend come from testing", which is asked of
     /// the ledger and not of a session, a phase, or a provider.
     pub probe_calls: u64,
+    /// Every parent turn that dispatched at least one child, with the children
+    /// nested beneath it (REQ-623 BR-8 / AC-12), in the order the turns first
+    /// spent.
+    ///
+    /// Ledger order rather than key order: turn ids come off a counter, and
+    /// sorting `turn-10` before `turn-2` would misreport the sequence. A turn
+    /// with no children does not appear — every other roll-up already says all
+    /// there is to say about it — so a ledger with no children has an empty
+    /// list, not a row per turn.
+    pub per_turn: Vec<TurnTotals>,
 }
 
 /// A running accumulator for one grouping key.
@@ -221,6 +290,108 @@ impl Accum {
     }
 }
 
+/// A running accumulator for one child under one turn.
+struct ChildAccum {
+    child_id: ChildId,
+    accum: Accum,
+    /// Distinct `provider/model` routes, in the order the child first used them.
+    routes: Vec<String>,
+}
+
+/// A running accumulator for one `(session, turn)`.
+struct TurnAccum {
+    session_id: String,
+    turn_id: TurnId,
+    own: Accum,
+    total: Accum,
+    children: Vec<ChildAccum>,
+}
+
+impl TurnAccum {
+    fn add(&mut self, row: &LedgerRow) {
+        self.total.add(row);
+        let Some(child_id) = &row.child_id else {
+            self.own.add(row);
+            return;
+        };
+        let index = match self.children.iter().position(|c| &c.child_id == child_id) {
+            Some(index) => index,
+            None => {
+                self.children.push(ChildAccum {
+                    child_id: child_id.clone(),
+                    accum: Accum::default(),
+                    routes: Vec::new(),
+                });
+                self.children.len() - 1
+            }
+        };
+        let child = &mut self.children[index];
+        child.accum.add(row);
+        let route = format!("{}/{}", row.provider_id, row.model);
+        if !child.routes.contains(&route) {
+            child.routes.push(route);
+        }
+    }
+
+    fn into_totals(self) -> TurnTotals {
+        let key = self.turn_id.0.clone();
+        TurnTotals {
+            session_id: self.session_id,
+            own: self.own.into_group(key.clone()),
+            total: self.total.into_group(key),
+            turn_id: self.turn_id,
+            children: self
+                .children
+                .into_iter()
+                .map(|child| ChildTotals {
+                    name: child.child_id.name().to_owned(),
+                    route: child.routes.join(" → "),
+                    calls: child.accum.calls,
+                    input_tokens: child.accum.input_tokens,
+                    output_tokens: child.accum.output_tokens,
+                    usd_micros: child.accum.usd_micros,
+                    unpriced_calls: child.accum.unpriced_calls,
+                    child_id: child.child_id,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Group the turn-stamped rows by `(session, turn)` in ledger order, keeping
+/// only the turns that dispatched a child (REQ-623 BR-8).
+///
+/// A child row with no `parent_turn_id` cannot be nested anywhere and is left
+/// to the roll-ups that already count it; the only builder that sets a child id
+/// sets the turn too, so such a row comes only from a hand-edited store.
+fn per_turn(rows: &[LedgerRow]) -> Vec<TurnTotals> {
+    let mut index: BTreeMap<(&str, &TurnId), usize> = BTreeMap::new();
+    let mut turns: Vec<TurnAccum> = Vec::new();
+    for row in rows {
+        let Some(turn_id) = &row.parent_turn_id else {
+            continue;
+        };
+        let slot = *index
+            .entry((row.session_id.as_str(), turn_id))
+            .or_insert_with(|| {
+                turns.push(TurnAccum {
+                    session_id: row.session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    own: Accum::default(),
+                    total: Accum::default(),
+                    children: Vec::new(),
+                });
+                turns.len() - 1
+            });
+        turns[slot].add(row);
+    }
+    turns
+        .into_iter()
+        .filter(|turn| !turn.children.is_empty())
+        .map(TurnAccum::into_totals)
+        .collect()
+}
+
 /// The phase wire-name used as a grouping key; freeform (no phase) is `none`.
 fn phase_key(phase: Option<Phase>) -> String {
     match phase {
@@ -253,8 +424,6 @@ struct WebAccum {
 /// as a call (REQ-563 D-7).
 #[must_use]
 pub fn aggregate(rows: &[LedgerRow], web_rows: &[WebLookupRow], prices: &PriceTable) -> CostReport {
-    use std::collections::BTreeMap;
-
     let mut total = Accum::default();
     let mut unpriced = UnpricedTotals {
         calls: 0,
@@ -358,10 +527,11 @@ pub fn aggregate(rows: &[LedgerRow], web_rows: &[WebLookupRow], prices: &PriceTa
             })
             .collect(),
         probe_calls,
+        per_turn: per_turn(rows),
     }
 }
 
-fn into_groups(map: std::collections::BTreeMap<String, Accum>) -> Vec<GroupTotals> {
+fn into_groups(map: BTreeMap<String, Accum>) -> Vec<GroupTotals> {
     map.into_iter()
         .map(|(key, accum)| accum.into_group(key))
         .collect()
@@ -413,6 +583,10 @@ mod tests {
             // `LedgerRow { probe: true, ..row(..) }`, so the default here stays
             // the overwhelmingly common case.
             probe: false,
+            // Attributed to no turn and no child — every row before REQ-623.
+            // The rows a nesting test needs are built with `in_turn`/`by_child`.
+            child_id: None,
+            parent_turn_id: None,
         }
     }
 
@@ -828,6 +1002,207 @@ mod tests {
         let report = aggregate(&rows, &[], &prices);
         assert!(report.web_per_session.is_empty());
         assert_eq!(report.per_session.len(), 1);
+    }
+
+    /// A parent turn's own call, stamped with its turn.
+    fn in_turn(turn: &str, row: LedgerRow) -> LedgerRow {
+        LedgerRow {
+            parent_turn_id: Some(TurnId::from(turn)),
+            ..row
+        }
+    }
+
+    /// A child's call: both ids, as `CostAttribution::for_child` stamps them.
+    fn by_child(call_id: &str, name: &str, turn: &str, row: LedgerRow) -> LedgerRow {
+        LedgerRow {
+            child_id: Some(ChildId::new(call_id, name)),
+            parent_turn_id: Some(TurnId::from(turn)),
+            ..row
+        }
+    }
+
+    /// REQ-623 AC-12: a turn with two children reports `own + a + b` as its
+    /// total and one line per child, each line carrying only that child's
+    /// calls.
+    ///
+    /// The expected figures are literals, never read back from the report: the
+    /// three amounts are distinct and non-zero so a child summed into the wrong
+    /// line, or left out of the total, changes a number this test pins.
+    ///
+    /// Mutation (recorded): `total` accumulating only the turn's own rows
+    /// reddens 3 tests — this one,
+    /// `a_turn_is_keyed_by_session_and_needs_a_child_to_appear`, and
+    /// `cost_attribution::parent_total_is_own_plus_children`. Dropping the
+    /// per-child split (every child row onto the first line) reddens 2 — this
+    /// one and `cost_attribution::parent_total_is_own_plus_children`; the
+    /// one-child-per-turn `child_records_nest_under_parent_turn` cannot see it.
+    #[test]
+    fn a_turn_nests_each_child_and_totals_own_plus_children() {
+        let prices = PriceTable::bundled();
+        let rows = vec![
+            in_turn(
+                "turn-4",
+                row("s1", None, "anthropic", "claude-fable-5", 0, 0, Some(1_000)),
+            ),
+            by_child(
+                "call-9",
+                "audit-a",
+                "turn-4",
+                row("s1", None, "deepseek", "deepseek-v4-pro", 10, 5, Some(20)),
+            ),
+            by_child(
+                "call-9",
+                "audit-b",
+                "turn-4",
+                row("s1", None, "deepseek", "deepseek-v4-pro", 30, 15, Some(300)),
+            ),
+            // audit-a's second call, after its sibling's: it lands on audit-a's
+            // line, not on a third one.
+            by_child(
+                "call-9",
+                "audit-a",
+                "turn-4",
+                row("s1", None, "anthropic", "claude-fable-5", 1, 1, Some(4)),
+            ),
+            in_turn(
+                "turn-4",
+                row(
+                    "s1",
+                    None,
+                    "anthropic",
+                    "claude-fable-5",
+                    0,
+                    0,
+                    Some(50_000),
+                ),
+            ),
+        ];
+        let report = aggregate(&rows, &[], &prices);
+
+        assert_eq!(report.per_turn.len(), 1, "one turn dispatched children");
+        let turn = &report.per_turn[0];
+        assert_eq!(turn.session_id, "s1");
+        assert_eq!(turn.turn_id, TurnId::from("turn-4"));
+        assert_eq!((turn.own.calls, turn.own.usd_micros), (2, 51_000));
+
+        let lines: Vec<(&str, &str, u64, i64)> = turn
+            .children
+            .iter()
+            .map(|c| (c.name.as_str(), c.route.as_str(), c.calls, c.usd_micros))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                (
+                    "audit-a",
+                    "deepseek/deepseek-v4-pro → anthropic/claude-fable-5",
+                    2,
+                    24
+                ),
+                ("audit-b", "deepseek/deepseek-v4-pro", 1, 300),
+            ],
+            "one line per child, in first-spend order, each with its own calls"
+        );
+        assert_eq!(
+            turn.children[0].child_id,
+            ChildId::new("call-9", "audit-a"),
+            "the line keeps the full id a client matches on"
+        );
+
+        assert_eq!(turn.total.usd_micros, 51_000 + 24 + 300, "own + a + b");
+        assert_eq!(turn.total.calls, 5);
+        assert_eq!(turn.total.input_tokens, 41);
+        // The view is not a second count: the session roll-up holds every row
+        // exactly once.
+        assert_eq!(report.total.usd_micros, 51_324);
+        assert_eq!(report.per_session[0].calls, 5);
+    }
+
+    /// REQ-623: the ids add the nested view and move no figure in any roll-up
+    /// that existed before them. The same calls with and without ids must
+    /// report identical totals, savings, and per-session / per-phase /
+    /// per-provider groups — and without ids, no per-turn entry at all.
+    #[test]
+    fn ids_add_a_nested_view_and_move_no_existing_roll_up() {
+        let prices = PriceTable::bundled();
+        let plain = vec![
+            row(
+                "s1",
+                Some(Phase::Implement),
+                "anthropic",
+                "claude-fable-5",
+                1000,
+                500,
+                prices.price("claude-fable-5", 1000, 500),
+            ),
+            row(
+                "s1",
+                Some(Phase::Implement),
+                "deepseek",
+                "deepseek-v4-pro",
+                4000,
+                2000,
+                prices.price("deepseek-v4-pro", 4000, 2000),
+            ),
+        ];
+        let stamped = vec![
+            in_turn("turn-1", plain[0].clone()),
+            by_child("call-1", "child-1", "turn-1", plain[1].clone()),
+        ];
+
+        let before = aggregate(&plain, &[], &prices);
+        let after = aggregate(&stamped, &[], &prices);
+
+        assert!(before.per_turn.is_empty(), "no ids, no nested view");
+        assert_eq!(after.per_turn.len(), 1, "non-vacuity: the ids did nest");
+        assert_eq!(before.total, after.total);
+        assert_eq!(before.savings, after.savings);
+        assert_eq!(before.unpriced, after.unpriced);
+        assert_eq!(before.per_session, after.per_session);
+        assert_eq!(before.per_phase, after.per_phase);
+        assert_eq!(before.per_provider, after.per_provider);
+        assert_eq!(before.probe_calls, after.probe_calls);
+    }
+
+    /// A turn id is minted off a per-process counter, so two sessions — or one
+    /// session either side of a daemon restart sharing this file — can both
+    /// hold a `turn-1`. The grouping keys on `(session, turn)`; and a turn whose
+    /// own calls were stamped but which dispatched no child does not appear.
+    #[test]
+    fn a_turn_is_keyed_by_session_and_needs_a_child_to_appear() {
+        let prices = PriceTable::bundled();
+        let rows = vec![
+            by_child(
+                "call-1",
+                "child-1",
+                "turn-1",
+                row("s1", None, "deepseek", "deepseek-v4-pro", 1, 1, Some(7)),
+            ),
+            by_child(
+                "call-1",
+                "child-1",
+                "turn-1",
+                row("s2", None, "deepseek", "deepseek-v4-pro", 1, 1, Some(11)),
+            ),
+            in_turn(
+                "turn-2",
+                row("s1", None, "anthropic", "claude-fable-5", 1, 1, Some(13)),
+            ),
+        ];
+        let report = aggregate(&rows, &[], &prices);
+
+        let turns: Vec<(&str, &str, i64)> = report
+            .per_turn
+            .iter()
+            .map(|t| {
+                (
+                    t.session_id.as_str(),
+                    t.turn_id.0.as_str(),
+                    t.total.usd_micros,
+                )
+            })
+            .collect();
+        assert_eq!(turns, vec![("s1", "turn-1", 7), ("s2", "turn-1", 11)]);
     }
 
     #[test]

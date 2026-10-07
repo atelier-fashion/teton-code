@@ -1899,6 +1899,14 @@ impl SkillTool {
         // expander is asked, so a refused acknowledgment runs no command.
         if skill.source == SkillSource::Project {
             if let Err(refusal) = self.acknowledge_project(ctx, &name).await {
+                // REQ-623 BR-10: inside a child, the project-skill gate
+                // refusing — declined, or nobody to ask — is a gate denial and
+                // the call did not run, so a child left with nothing to report
+                // ends `refused`, not `completed` (see
+                // `ChildToolCalls::note_refused_inside`).
+                if let Some(child) = crate::harness::child::current_child() {
+                    child.tool_calls.note_refused_inside(SKILL_TOOL_NAME);
+                }
                 return self.refuse(ctx, args, refusal);
             }
         }
@@ -2036,6 +2044,16 @@ impl SkillTool {
             };
             closed_door(consent)
         };
+        // REQ-623 BR-10: the skill-command consent is a gate of the tool's own,
+        // invisible to the loop. Inside a child, a door it closed — declined,
+        // the level, nobody to ask — is a gate denial: the commands did not
+        // run, so a child left with nothing else ends `refused`, not
+        // `completed` (`ChildToolCalls::note_refused_inside`).
+        if door.is_some() {
+            if let Some(child) = crate::harness::child::current_child() {
+                child.tool_calls.note_refused_inside(SKILL_TOOL_NAME);
+            }
+        }
 
         // REQ-619 ADR-619-1: the four values `ShellTool::run` hands the
         // classifier, taken off the **same** `ToolContext` the commands are
@@ -2661,6 +2679,61 @@ mod tests {
         );
         let command = tool.invoke(&home, &call(Some("runs"), "")).await;
         assert!(command.is_error, "{}", command.content);
+    }
+
+    /// **REQ-623 BR-10: a skill whose command consent closed the door, inside
+    /// a child, is a gate denial** — so a child whose only call this was, and
+    /// which then had nothing to report, ends `refused gate_denied:skill`
+    /// rather than `completed` with an empty report.
+    ///
+    /// The door is closed by having nobody to ask (no addressable
+    /// connection), the fail-closed answer an unattended session gets. The
+    /// loop counts the dispatch (`note_ran`, here by hand); the tool takes it
+    /// back out. Benign: the same skill with an addressable connection and an
+    /// allowing level runs its command and notes nothing.
+    ///
+    /// Mutation (run 2026-10-07, reverted): the `note_refused_inside` block
+    /// after `closed_door` removed — 1 red of the 2,323 lib tests, this one,
+    /// at the refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_closed_command_door_inside_a_child_is_a_gate_refusal() {
+        use crate::harness::child::{ChildTaskScope, ChildToolCalls, PausableDeadline};
+        let in_a_child = |tool_calls: &ChildToolCalls| ChildTaskScope {
+            child_id: teton_protocol::agent::ChildId::new("turn-1:call-1", "asker"),
+            name: "asker".to_owned(),
+            parent_turn_id: teton_protocol::TurnId::from("turn-1"),
+            deadline: PausableDeadline::start(std::time::Duration::from_secs(60)),
+            consent: Arc::new(tokio::sync::Mutex::new(())),
+            tool_calls: tool_calls.clone(),
+        };
+        let fx = Fixture::new();
+        fx.user("probe", "", "!`echo probed`\nBody.\n");
+
+        let unasked = tool(fx.registry());
+        let calls = ChildToolCalls::default();
+        let out = in_a_child(&calls)
+            .scope(unasked.invoke(&fx.ctx(), &call(Some("probe"), "")))
+            .await;
+        assert!(
+            !out.content.contains("probed\n"),
+            "non-vacuity: the door was shut, so the command did not run:\n{}",
+            out.content
+        );
+        calls.note_ran(); // the loop's count of the same dispatch
+        assert_eq!(calls.gate_refusal().as_deref(), Some("gate_denied:skill"));
+
+        let allowed = addressed_tool(fx.registry(), PermissionPolicy::Allow);
+        let calls = ChildToolCalls::default();
+        let out = in_a_child(&calls)
+            .scope(allowed.invoke(&fx.ctx(), &call(Some("probe"), "")))
+            .await;
+        assert!(
+            out.content.contains("probed"),
+            "benign: an open door runs the command:\n{}",
+            out.content
+        );
+        calls.note_ran();
+        assert_eq!(calls.gate_refusal(), None);
     }
 
     /// **REQ-615 BR-5 / AC-4: the refusal runs no preamble command.**

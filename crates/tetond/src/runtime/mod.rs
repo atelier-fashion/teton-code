@@ -231,6 +231,7 @@ mod duty;
 mod engine;
 mod provider;
 use provider::*;
+mod child_turn;
 mod session;
 mod taint;
 pub(crate) use taint::*;
@@ -7812,7 +7813,11 @@ pub fn refit_for_reroute(
         return;
     }
     let crate::carry::RebudgetReport { pressure, notes } = conversation.rebudget(next);
-    if let Some((state, block)) = notes {
+    // REQ-623: a child's re-render is the child's prompt, not the session's
+    // notes state — `repo_context_state` names no child, and the parent's last
+    // published triple must stand. The child's refit is still announced below,
+    // through its stamped `context_pressure`.
+    if let (Some((state, block)), None) = (notes, events.child_scope()) {
         let figures = RepoContextFigures::from_render(&state, Some(&block));
         if sessions.claim_repo_context_publish(events.session_id(), figures.triple(), false) {
             events.repo_context_state(figures.into_news(&state));
@@ -8833,6 +8838,31 @@ fn cost_report_view(report: &CostReport) -> CostReportView {
                 key: w.key.clone(),
                 lookups: w.lookups,
                 bytes_in: w.bytes_in,
+            })
+            .collect(),
+        // REQ-623 BR-8 / AC-12: a parent turn's children nested under it. The
+        // nesting happened in `cost::report::aggregate`; this only re-types it.
+        per_turn: report
+            .per_turn
+            .iter()
+            .map(|turn| teton_protocol::methods::CostTurnView {
+                session_id: SessionId::from(turn.session_id.clone()),
+                turn_id: turn.turn_id.clone(),
+                own: group(&turn.own),
+                children: turn
+                    .children
+                    .iter()
+                    .map(|child| teton_protocol::methods::CostChildView {
+                        child_id: child.child_id.clone(),
+                        name: child.name.clone(),
+                        route: child.route.clone(),
+                        calls: child.calls,
+                        input_tokens: child.input_tokens,
+                        output_tokens: child.output_tokens,
+                        usd_micros: child.usd_micros,
+                    })
+                    .collect(),
+                total: group(&turn.total),
             })
             .collect(),
     }
@@ -10727,6 +10757,7 @@ provider_id = "on-device"
             SessionMode::Freeform,
             None,
             "anything",
+            None,
         ));
         assert_eq!(
             turn_route.reason, turn,
@@ -11685,6 +11716,7 @@ provider_id = "on-device"
             transcript: Default::default(),
             context: Default::default(),
             inference: Default::default(),
+            agent: Default::default(),
             pinned_local_model: None,
             effort: teton_core::EffortLevel::default(),
             // The whole point: unset.
@@ -12016,6 +12048,7 @@ provider_id = "on-device"
             transcript: Default::default(),
             context: Default::default(),
             inference: Default::default(),
+            agent: Default::default(),
             pinned_local_model: None,
             effort: teton_core::EffortLevel::default(),
             default_provider: Some("anthropic".to_owned()),
@@ -12504,7 +12537,14 @@ provider_id = "on-device"
             let config = runtime.config.lock().expect("config mutex").clone();
             let router = build_router(&config, true, &BTreeMap::new());
             let route = runtime
-                .dispatch_route(&router, &session, SessionMode::Freeform, None, "anything")
+                .dispatch_route(
+                    &router,
+                    &session,
+                    SessionMode::Freeform,
+                    None,
+                    "anything",
+                    None,
+                )
                 .await;
 
             // REQ-614: the expected sentence now carries the pin's cause. The
@@ -12530,7 +12570,14 @@ provider_id = "on-device"
                 &events,
             );
             let clean_route = runtime
-                .dispatch_route(&router, &clean, SessionMode::Freeform, None, "anything")
+                .dispatch_route(
+                    &router,
+                    &clean,
+                    SessionMode::Freeform,
+                    None,
+                    "anything",
+                    None,
+                )
                 .await;
             assert_ne!(
                 clean_route.reason,
@@ -12628,6 +12675,15 @@ provider_id = "on-device"
                     .build_tools(
                         TurnContext::new(&events, &session, &config, &router, &gate, None),
                         Arc::new(crate::skills::SkillRegistry::default()),
+                        // A prompt turn's registry (REQ-623 BR-2).
+                        crate::runtime::turn::ToolSet::Prompt(crate::runtime::turn::ParentTurn {
+                            turn_id: &teton_protocol::TurnId::from("turn-0"),
+                            sessions: &SessionRegistry::new(),
+                            mode: SessionMode::Freeform,
+                            phase: None,
+                            typed: true,
+                            prompt_spend: None,
+                        }),
                     )
                     .await;
 
@@ -12637,9 +12693,25 @@ provider_id = "on-device"
                     "tier {tier:?} registered the wrong tool set"
                 );
                 if tier != WebTier::Off {
-                    // Added last, so it reads after the built-ins and MCP in the
-                    // exposed tool docs.
-                    assert_eq!(tools.names().last().copied(), Some(WEB_TOOL_NAME));
+                    // Added after the built-ins and MCP, so it reads after them
+                    // in the exposed tool docs. Only the prompt turn's two
+                    // registry-conditional tools follow it — `skill` (REQ-587)
+                    // and `agent` (REQ-623 ADR-7), `agent` on by default.
+                    let before_the_conditional_pair: Vec<&str> = tools
+                        .names()
+                        .into_iter()
+                        .filter(|name| {
+                            ![
+                                crate::harness::tools::SKILL_TOOL_NAME,
+                                crate::harness::tools::AGENT_TOOL_NAME,
+                            ]
+                            .contains(name)
+                        })
+                        .collect();
+                    assert_eq!(
+                        before_the_conditional_pair.last().copied(),
+                        Some(WEB_TOOL_NAME)
+                    );
                     // ...but it is cap-exempt (REQ-563 decision 2026-08-09), so
                     // even the weak-model default cap of 5 — which equals the
                     // built-in count — still exposes it. An explicitly opted-in
@@ -12710,6 +12782,15 @@ provider_id = "on-device"
                     .build_tools(
                         TurnContext::new(&events, &session, &snapshot, &router, &gate, None),
                         Arc::new(crate::skills::SkillRegistry::default()),
+                        // A prompt turn's registry (REQ-623 BR-2).
+                        crate::runtime::turn::ToolSet::Prompt(crate::runtime::turn::ParentTurn {
+                            turn_id: &teton_protocol::TurnId::from("turn-0"),
+                            sessions: &SessionRegistry::new(),
+                            mode: SessionMode::Freeform,
+                            phase: None,
+                            typed: true,
+                            prompt_spend: None,
+                        }),
                     )
                     .await
                     .get(WEB_TOOL_NAME)
@@ -12729,6 +12810,15 @@ provider_id = "on-device"
                     .build_tools(
                         TurnContext::new(&events, &session, &live, &router, &gate, None),
                         Arc::new(crate::skills::SkillRegistry::default()),
+                        // A prompt turn's registry (REQ-623 BR-2).
+                        crate::runtime::turn::ToolSet::Prompt(crate::runtime::turn::ParentTurn {
+                            turn_id: &teton_protocol::TurnId::from("turn-0"),
+                            sessions: &SessionRegistry::new(),
+                            mode: SessionMode::Freeform,
+                            phase: None,
+                            typed: true,
+                            prompt_spend: None,
+                        }),
                     )
                     .await
                     .get(WEB_TOOL_NAME)
@@ -13118,6 +13208,15 @@ max_page_bytes_from_the_future = 4096
                     .build_tools(
                         TurnContext::new(&events, &session, &config, &router, &gate, None),
                         Arc::new(crate::skills::SkillRegistry::default()),
+                        // A prompt turn's registry (REQ-623 BR-2).
+                        crate::runtime::turn::ToolSet::Prompt(crate::runtime::turn::ParentTurn {
+                            turn_id: &teton_protocol::TurnId::from("turn-0"),
+                            sessions: &SessionRegistry::new(),
+                            mode: SessionMode::Freeform,
+                            phase: None,
+                            typed: true,
+                            prompt_spend: None,
+                        }),
                     )
                     .await
                     .get(WEB_TOOL_NAME)
@@ -21097,7 +21196,7 @@ provider_id = \"deepseek\"
             );
             let published = pressure(&mut sub).await;
             assert_eq!(published.len(), 1, "{published:#?}");
-            let event = published[0];
+            let event = published[0].clone();
             assert_eq!(event.kind, ContextPressureKind::RefitOnReroute);
             assert!(event.dropped_blocks > 0, "{event:?}");
             // Both currencies, from the route the turn is moving TO — a client

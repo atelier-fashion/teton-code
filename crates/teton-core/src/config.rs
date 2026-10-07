@@ -1241,6 +1241,134 @@ impl ContextConfig {
     }
 }
 
+/// The smallest `[agent] report_max_bytes` a child's report may be cut to
+/// (REQ-623 BR-11).
+///
+/// An over-bound report is cut at the bound and handed to the parent with a
+/// typed marker naming the kept and dropped byte counts. Below a kilobyte, what
+/// survives the cut is a fragment the parent's model cannot act on — the
+/// marker is most of what it reads — so a smaller budget is refused at load
+/// rather than raised silently: a clamp would leave the user reading a number
+/// in their own file that the daemon does not use (the same rule
+/// `[transcript] max_record_bytes` follows).
+const MIN_AGENT_REPORT_MAX_BYTES: u64 = 1024;
+
+/// The longest `[agent] child_deadline_secs` the daemon accepts — one week
+/// (REQ-623 BR-5).
+///
+/// A child's deadline is work time, so it is a bound a user picks in minutes;
+/// a value past this is a typo, not a policy. Refused at load rather than
+/// clamped, for [`MIN_AGENT_REPORT_MAX_BYTES`]'s reason, and well inside what
+/// the runtime's clock can add to an instant.
+const MAX_AGENT_CHILD_DEADLINE_SECS: u64 = 604_800;
+
+/// Subagent dispatch (`[agent]`, REQ-623): whether the `agent` tool exists in a
+/// session at all, and the bounds every child it starts runs under.
+///
+/// **On by default, and "off" means absent** (BR-14): with `enabled = false`
+/// the tool is not in the registry, not in the prompt's roster, and the model
+/// cannot name it — the session does not carry a tool that runs and refuses.
+///
+/// # Every number here is a bound, so none of them may be zero
+///
+/// [`Config::validate`] refuses a zero cap, a zero deadline and a report budget
+/// under [`MIN_AGENT_REPORT_MAX_BYTES`] at load. That is *structural* in
+/// conventions.md's sense ("config validity vs usability"): a cap of zero is
+/// not an incomplete record the daemon can refuse at the point of use, it is a
+/// bound that refuses every call the tool is ever offered — `enabled = false`
+/// spelled in a way that still puts the tool in the model's roster. The error
+/// names the key and points at `enabled = false` for the user who meant that.
+///
+/// The check runs whether or not the table is enabled, as
+/// `[transcript] max_record_bytes`'s does: a malformed bound is malformed
+/// whether or not the feature is on, and the user should learn so now rather
+/// than on the day they switch it back on.
+///
+/// Every field is serialized unconditionally *within* the table (no per-field
+/// `skip_serializing_if`), like [`TranscriptConfig`]'s: a config that names
+/// `[agent]` at all states every bound rather than leaving a reader to infer
+/// one from an absence. Whether the table is written at all is
+/// [`Self::is_unset`]'s decision, on `Config::agent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentConfig {
+    /// Whether the `agent` tool is registered in a session (REQ-623 BR-14).
+    ///
+    /// **Defaults to `true`.** `false` is not a refusal policy — it is the
+    /// tool's absence, and a skill that asks for it gets the ordinary
+    /// unknown-tool refusal naming this key.
+    pub enabled: bool,
+
+    /// The most tasks one `agent` call may carry (REQ-623 BR-3).
+    ///
+    /// Defaults to `5`. A call over it is refused whole with
+    /// `too_many_children` naming the count and this cap; no child starts.
+    pub max_children_per_call: u32,
+
+    /// The most children one parent prompt turn may start, summed across every
+    /// `agent` call in it (REQ-623 BR-3).
+    ///
+    /// Defaults to `8`. A call that would cross it is refused whole with
+    /// `child_cap_reached` naming both numbers; no child starts.
+    pub max_children_per_turn: u32,
+
+    /// The model calls one child may make before it ends `turns_exhausted`.
+    ///
+    /// Defaults to `12` — the local profile's own cap. This is the configured
+    /// ceiling only; the runtime additionally clamps it to the parent's
+    /// `max_turns`, so a child never outlives the budget of the turn that
+    /// started it.
+    pub child_max_turns: u32,
+
+    /// A child's whole-run wall-clock deadline, in seconds.
+    ///
+    /// Defaults to `600`; at most [`MAX_AGENT_CHILD_DEADLINE_SECS`] (a week).
+    pub child_deadline_secs: u64,
+
+    /// The longest report a child hands back to its parent, in bytes
+    /// (REQ-623 BR-11).
+    ///
+    /// Defaults to 32 KiB, and must be at least [`MIN_AGENT_REPORT_MAX_BYTES`];
+    /// set to anything else, it must also be at most `[transcript]
+    /// max_record_bytes`. A longer report is cut at the bound with a typed
+    /// marker that sends the reader to the transcript for the full text — which
+    /// the transcript cuts at its own record cap, so a report bound above that
+    /// cap would point at a record cut shorter than the report itself was. The
+    /// default is not compared, so a record cap lowered before `[agent]`
+    /// existed still loads (see `validate_agent`).
+    pub report_max_bytes: u64,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_children_per_call: 5,
+            max_children_per_turn: 8,
+            child_max_turns: 12,
+            child_deadline_secs: 600,
+            report_max_bytes: 32_768,
+        }
+    }
+}
+
+impl AgentConfig {
+    /// Whether every field still holds its default, used to keep the `[agent]`
+    /// table out of a config that never named it — the same treatment
+    /// [`TranscriptConfig::is_unset`] gives `[transcript]`.
+    ///
+    /// Note which way round this reads, as for [`ContextConfig::is_unset`]: an
+    /// *unset* `[agent]` is one with the tool **on**, because on is the
+    /// default. `enabled = false` is therefore a departure like any other and
+    /// is written back (BR-14): a user who turned the tool off must find that
+    /// in their file after an unrelated edit, not have it shed as though it
+    /// were the default.
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Top-level configuration document.
 ///
 /// Field order matters for TOML serialization: the scalar `pinned_local_model`
@@ -1352,6 +1480,13 @@ pub struct Config {
     /// array-of-table fields, for the TOML-ordering reason above.
     #[serde(default, skip_serializing_if = "ContextConfig::is_unset")]
     pub context: ContextConfig,
+    /// Subagent dispatch (`[agent]`, REQ-623): whether the `agent` tool is
+    /// registered, and the caps, turn budget, deadline and report budget every
+    /// child runs under. Absent means the tool is on with the shipped bounds —
+    /// see [`AgentConfig`]. Declared here among the tables, before the
+    /// array-of-table fields, for the TOML-ordering reason above.
+    #[serde(default, skip_serializing_if = "AgentConfig::is_unset")]
+    pub agent: AgentConfig,
     /// Registered providers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ModelProvider>,
@@ -2068,6 +2203,84 @@ pub enum ConfigError {
          expanded), or remove the key to use the default transcripts directory."
     )]
     TranscriptDirNotAbsolute,
+
+    /// An `[agent]` cap or deadline is zero (REQ-623 BR-3).
+    ///
+    /// **Structural, so it is fatal at load**, for
+    /// [`ConfigError::UnusableSpendCeiling`]'s reason: a zero bound is not an
+    /// incomplete record the daemon can refuse at the point of use, it is a
+    /// setting under which the tool refuses every call it is offered while
+    /// still sitting in the model's roster. The message points at
+    /// `enabled = false`, which is what a user writing `0` most likely meant.
+    #[error(
+        "[agent] {key} = 0 leaves the `agent` tool unable to start anything; every cap and \
+         deadline in [agent] must be at least 1. Remove the key for its default, or set \
+         `[agent] enabled = false` to take the tool out of the session entirely."
+    )]
+    AgentCapZero {
+        /// The key as the user spells it in `[agent]`, so they can find the line.
+        key: &'static str,
+    },
+
+    /// `[agent] report_max_bytes` is below the floor a truncated report needs
+    /// to say anything (REQ-623 BR-11).
+    ///
+    /// Structural, for [`ConfigError::TranscriptRecordSizeTooSmall`]'s reason:
+    /// the user set a budget, and raising it silently would leave every
+    /// truncation marker reporting a number they did not choose. The value is
+    /// echoed — an integer the user typed, with nothing that could be a secret.
+    #[error(
+        "[agent] report_max_bytes = {bytes} is too small; a child's report is cut at this bound \
+         and handed to the parent with a marker, so the budget must be at least 1024 bytes for \
+         anything useful to survive the cut. The default is 32768."
+    )]
+    AgentReportBudgetTooSmall {
+        /// The budget as written, so the user can find the line.
+        bytes: u64,
+    },
+
+    /// `[agent] child_deadline_secs` is longer than a week (REQ-623 BR-5).
+    #[error(
+        "[agent] child_deadline_secs = {secs} is too long; a child's deadline is the work time \
+         one child may take, and the longest accepted is 604800 (one week). The default is 600."
+    )]
+    AgentDeadlineTooLong {
+        /// The deadline as written, so the user can find the line.
+        secs: u64,
+    },
+
+    /// `[agent] max_children_per_call` is above `max_children_per_turn`
+    /// (REQ-623 BR-3): every call that used the difference would be refused
+    /// `child_cap_reached`, so the per-call figure is a cap that can never be
+    /// reached as written.
+    #[error(
+        "[agent] max_children_per_call = {per_call} is above max_children_per_turn = {per_turn}; \
+         one call can never start more children than its whole turn may, so a per-call cap \
+         above the per-turn cap is unreachable. Lower max_children_per_call or raise \
+         max_children_per_turn."
+    )]
+    AgentPerCallAbovePerTurn {
+        /// `max_children_per_call` as written.
+        per_call: u32,
+        /// `max_children_per_turn` as written.
+        per_turn: u32,
+    },
+
+    /// `[agent] report_max_bytes` is above `[transcript] max_record_bytes`
+    /// (REQ-623 BR-11): a cut report's marker says the full text is in the
+    /// transcript, and the transcript would cut it shorter than the report.
+    #[error(
+        "[agent] report_max_bytes = {bytes} is above [transcript] max_record_bytes = \
+         {record_cap}; a child's cut report points the reader at the transcript for the full \
+         text, and the transcript cuts every record at max_record_bytes. Lower \
+         report_max_bytes or raise max_record_bytes."
+    )]
+    AgentReportAboveRecordCap {
+        /// `[agent] report_max_bytes` as written.
+        bytes: u64,
+        /// `[transcript] max_record_bytes` as configured.
+        record_cap: u64,
+    },
 }
 
 impl Config {
@@ -2235,6 +2448,75 @@ impl Config {
         Ok(())
     }
 
+    /// `[agent]`'s structural check (REQ-623 BR-3, BR-5, BR-11).
+    ///
+    /// **Structure only**: every cap and the deadline at least 1, the deadline
+    /// at most [`MAX_AGENT_CHILD_DEADLINE_SECS`], the report budget at least
+    /// [`MIN_AGENT_REPORT_MAX_BYTES`] and — when moved off its default — at
+    /// most the **configured** `[transcript] max_record_bytes` (not a constant:
+    /// the transcript's cap is the user's too), and the per-call cap at most
+    /// the per-turn cap (a
+    /// per-call cap above it can never be reached). It does not compare
+    /// `child_max_turns` with any parent's `max_turns`, which is a runtime
+    /// clamp, not a load-time rule. Keys are checked in the struct's
+    /// declaration order, and one refusal names one key or one pair.
+    ///
+    /// *Amended 2026-10-07 (verify):* this used to say a per-turn cap below
+    /// the per-call cap is coherent because the per-turn cap binds first. It
+    /// binds first by refusing every call that uses the difference, which
+    /// makes the per-call figure dead — the reflector's finding.
+    fn validate_agent(&self) -> Result<(), ConfigError> {
+        let agent = &self.agent;
+        for (key, value) in [
+            (
+                "max_children_per_call",
+                u64::from(agent.max_children_per_call),
+            ),
+            (
+                "max_children_per_turn",
+                u64::from(agent.max_children_per_turn),
+            ),
+            ("child_max_turns", u64::from(agent.child_max_turns)),
+            ("child_deadline_secs", agent.child_deadline_secs),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::AgentCapZero { key });
+            }
+        }
+        if agent.max_children_per_call > agent.max_children_per_turn {
+            return Err(ConfigError::AgentPerCallAbovePerTurn {
+                per_call: agent.max_children_per_call,
+                per_turn: agent.max_children_per_turn,
+            });
+        }
+        if agent.child_deadline_secs > MAX_AGENT_CHILD_DEADLINE_SECS {
+            return Err(ConfigError::AgentDeadlineTooLong {
+                secs: agent.child_deadline_secs,
+            });
+        }
+        if agent.report_max_bytes < MIN_AGENT_REPORT_MAX_BYTES {
+            return Err(ConfigError::AgentReportBudgetTooSmall {
+                bytes: agent.report_max_bytes,
+            });
+        }
+        // Compared only when the user moved the report bound: a `[transcript]
+        // max_record_bytes` lowered below the default 32 KiB report was a valid
+        // config before `[agent]` existed, and refusing it now would make a
+        // config that loaded yesterday fatal today (conventions: validity vs
+        // usability). On such a machine a cut report's full text can be cut in
+        // the transcript too — a known gap, recorded in REQ-623's Deferred.
+        let record_cap = u64::try_from(self.transcript.max_record_bytes).unwrap_or(u64::MAX);
+        if agent.report_max_bytes != AgentConfig::default().report_max_bytes
+            && agent.report_max_bytes > record_cap
+        {
+            return Err(ConfigError::AgentReportAboveRecordCap {
+                bytes: agent.report_max_bytes,
+                record_cap,
+            });
+        }
+        Ok(())
+    }
+
     /// Validate cross-field invariants and the BR-7 no-raw-keys rule.
     ///
     /// # Errors
@@ -2246,6 +2528,7 @@ impl Config {
         self.validate_cost()?;
         self.validate_skills()?;
         self.validate_transcript()?;
+        self.validate_agent()?;
 
         let mut ids: HashSet<&str> = HashSet::with_capacity(self.providers.len());
         for p in &self.providers {
@@ -3741,6 +4024,10 @@ effort_ladder = []
             // feature *on*, so the round trip proves `[context]` stays out of a
             // config that never turned the notes off.
             context: ContextConfig::default(),
+            // REQ-623: likewise the shipped default (the tool on, the shipped
+            // bounds), so the round trip proves `[agent]` stays out of a config
+            // that never named it.
+            agent: AgentConfig::default(),
             providers: vec![
                 ModelProvider {
                     id: "local".to_owned(),
@@ -8082,5 +8369,371 @@ cache_ttl_secs = 60
         .expect("a pre-REQ config still loads");
         assert_eq!(cfg.boundaries.len(), 1);
         assert_eq!(cfg.boundaries[0].origin, BoundaryOrigin::User);
+    }
+
+    // ---- REQ-623: the [agent] table (subagent dispatch) ----
+
+    /// **REQ-623 BR-3 / BR-5 / BR-11 (verify): `[agent]`'s three bounds from
+    /// above** — each refused at load naming its key (or both keys of a pair),
+    /// each valid exactly at its edge.
+    ///
+    /// - `child_deadline_secs` at most a week (604,800): past it the runtime's
+    ///   clock is asked for an instant it may not be able to name, and the
+    ///   value is a typo rather than a policy.
+    /// - `max_children_per_call` at most `max_children_per_turn`: a per-call
+    ///   cap above it can never be reached.
+    /// - `report_max_bytes`, once moved off its default, at most the
+    ///   **configured** `[transcript] max_record_bytes` — the leg that raises
+    ///   the record cap shows the bound moves with it, so it is not a constant
+    ///   65,536; and the default report beside a lowered record cap still
+    ///   loads, because that config was valid before `[agent]` existed.
+    ///
+    /// The expected figures are literals and the configs are built here; the
+    /// boundary rows (equal is valid) are the benign half.
+    ///
+    /// Mutations (run 2026-10-07, each reverted, over the 366 `teton-core` lib
+    /// tests): each of the three checks removed from `validate_agent`, and the
+    /// record-cap check compared with a constant 65,536 — 1 red apiece, this
+    /// test (the last at the raised-cap row); the default-report exemption
+    /// dropped — 3 reds, this test at the lowered-cap row and the two REQ-611
+    /// transcript tests whose fixtures lower the cap.
+    #[test]
+    fn agent_bounds_from_above_are_refused_naming_the_keys() {
+        let mut cfg = Config::default();
+        cfg.agent.child_deadline_secs = 604_800;
+        cfg.validate()
+            .expect("a week is the longest deadline, and valid");
+        cfg.agent.child_deadline_secs = 604_801;
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ConfigError::AgentDeadlineTooLong { secs: 604_801 }
+        );
+        let err = Config::load("[agent]\nchild_deadline_secs = 9223372036854775807\n")
+            .expect_err("a deadline the clock cannot add must be refused at load");
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("child_deadline_secs = 9223372036854775807"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("604800"), "{rendered}");
+
+        let mut cfg = Config::default();
+        cfg.agent.max_children_per_call = 8;
+        cfg.agent.max_children_per_turn = 8;
+        cfg.validate()
+            .expect("a per-call cap equal to the per-turn cap is valid");
+        cfg.agent.max_children_per_call = 9;
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ConfigError::AgentPerCallAbovePerTurn {
+                per_call: 9,
+                per_turn: 8
+            }
+        );
+        let err = Config::load("[agent]\nmax_children_per_call = 9\n")
+            .expect_err("a per-call cap above the default per-turn 8 must be refused");
+        let rendered = format!("{err}");
+        assert!(rendered.contains("max_children_per_call = 9"), "{rendered}");
+        assert!(rendered.contains("max_children_per_turn = 8"), "{rendered}");
+
+        let mut cfg = Config::default();
+        cfg.agent.report_max_bytes = 65_536;
+        cfg.validate()
+            .expect("a report bound equal to the default record cap is valid");
+        cfg.agent.report_max_bytes = 65_537;
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ConfigError::AgentReportAboveRecordCap {
+                bytes: 65_537,
+                record_cap: 65_536
+            }
+        );
+        cfg.transcript.max_record_bytes = 131_072;
+        cfg.validate()
+            .expect("the bound is the configured record cap, not a constant");
+        let mut lowered = Config::default();
+        lowered.transcript.max_record_bytes = 4_096;
+        lowered
+            .validate()
+            .expect("the default report beside a lowered record cap still loads");
+        let err = Config::load(
+            "[transcript]\nmax_record_bytes = 4096\n\n[agent]\nreport_max_bytes = 8192\n",
+        )
+        .expect_err("a report bound above a lowered record cap must be refused");
+        let rendered = format!("{err}");
+        assert!(rendered.contains("report_max_bytes = 8192"), "{rendered}");
+        assert!(rendered.contains("max_record_bytes = 4096"), "{rendered}");
+    }
+
+    /// **REQ-623 BR-3 / TASK-422.** `[agent]` loads with the six shipped
+    /// defaults when absent, stays out of a config that never named it, and
+    /// refuses a zero cap or a sub-kilobyte report budget at load — naming the
+    /// key — while a valid non-default table passes (the benign path).
+    ///
+    /// The defaults are asserted field by field rather than as
+    /// `== AgentConfig::default()`: a comparison against `default()` stays
+    /// green if `default()` itself drifts, and the numbers are the contract
+    /// the runtime (TASK-428) and the requirement's data model both quote.
+    ///
+    /// **Mutation** (LESSON-441): delete the `report_max_bytes <
+    /// MIN_AGENT_REPORT_MAX_BYTES` check from `Config::validate_agent` — this
+    /// test goes red on the first `report_max_bytes = 10` assertion
+    /// (`cfg.validate().unwrap_err()` panics: the ten-byte budget validates),
+    /// and it is the **only** test in `teton-core` that does. Measured, not
+    /// assumed: `every_config_error_variant_validate_can_raise_is_asserted_by_a_test`
+    /// stays green, because with the check gone the variant is constructed
+    /// nowhere, so it is neither raised nor unasserted. Restored.
+    #[test]
+    fn agent_caps_default_and_validate() {
+        // No table at all — the stock install, and every config authored
+        // before this REQ — and a table named with no keys, which reaches the
+        // defaults through `#[serde(default)]` on the struct rather than on
+        // `Config`'s field: a different mechanism, and the one that silently
+        // yields zeros if the container attribute is dropped.
+        for (label, document) in [
+            ("empty document", ""),
+            ("an unrelated table", "[privacy]\nredact = true\n"),
+            ("table present, keys absent", "[agent]\n"),
+        ] {
+            let cfg = Config::load(document).expect("must load");
+            let agent = cfg.agent;
+            assert!(agent.enabled, "{label}: the tool is on by default");
+            assert_eq!(agent.max_children_per_call, 5, "{label}");
+            assert_eq!(agent.max_children_per_turn, 8, "{label}");
+            assert_eq!(agent.child_max_turns, 12, "{label}");
+            assert_eq!(agent.child_deadline_secs, 600, "{label}");
+            assert_eq!(agent.report_max_bytes, 32_768, "{label}");
+            assert!(agent.is_unset(), "{label}");
+            assert_eq!(agent, AgentConfig::default(), "{label}");
+        }
+
+        // A config that never named `[agent]` does not grow it on a write —
+        // neither through serde ...
+        for (label, cfg) in [
+            ("the in-memory default", Config::default()),
+            (
+                "a loaded config with an unrelated table",
+                Config::load("[privacy]\nredact = true\n").expect("must load"),
+            ),
+        ] {
+            let written = cfg.to_toml().expect("serialize");
+            assert!(
+                !written.contains("[agent]"),
+                "{label}: an unset [agent] table was written: {written}"
+            );
+            assert_eq!(Config::from_toml(&written).expect("reload"), cfg, "{label}");
+        }
+
+        // ... nor through the toml-edit writer every config write goes
+        // through (ASSUME-007): an unrelated edit to a hand-written document
+        // leaves it without the table, and it still reads as the default.
+        const NO_AGENT: &str = "effort = \"high\"\n\n[privacy]\nredact = true\n";
+        let current = Config::load(NO_AGENT).expect("must load");
+        let mut candidate = current.clone();
+        candidate.effort = crate::effort::EffortLevel::Low;
+        let edited = crate::config_doc::apply_config_delta(NO_AGENT, &current, &candidate)
+            .expect("an unrelated write applies");
+        assert!(
+            !edited.contains("agent"),
+            "a config that never named [agent] grew the table:\n{edited}"
+        );
+        assert!(Config::load(&edited)
+            .expect("the edited document loads")
+            .agent
+            .is_unset());
+
+        // Structural refusals: every cap and the deadline at zero, each one
+        // naming its own key — and pointing at `enabled = false`, which is
+        // what a user writing `0` most likely meant.
+        for key in [
+            "max_children_per_call",
+            "max_children_per_turn",
+            "child_max_turns",
+            "child_deadline_secs",
+        ] {
+            let document = format!("[agent]\n{key} = 0\n");
+            let err = Config::load(&document).expect_err("a zero cap must be refused at load");
+            assert!(
+                matches!(&err, LoadError::Validate(ConfigError::AgentCapZero { key: named }) if *named == key),
+                "{key} = 0 was refused for the wrong reason: {err:?}"
+            );
+            let rendered = format!("{err}");
+            assert!(rendered.contains(&format!("{key} = 0")), "{rendered}");
+            assert!(rendered.contains("enabled = false"), "{rendered}");
+        }
+
+        // The sub-kilobyte report budget, named with the value as written.
+        let mut cfg = Config::default();
+        cfg.agent.report_max_bytes = 10;
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ConfigError::AgentReportBudgetTooSmall { bytes: 10 }
+        );
+        let err = Config::load("[agent]\nreport_max_bytes = 10\n")
+            .expect_err("a ten-byte report budget must be refused at load");
+        let rendered = format!("{err}");
+        assert!(rendered.contains("report_max_bytes = 10"), "{rendered}");
+        assert!(rendered.contains("1024"), "{rendered}");
+
+        // The boundaries are valid — the rules are "below 1" and "below 1024",
+        // not "at or below" — and a disabled table is checked all the same.
+        cfg.agent.report_max_bytes = 1023;
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ConfigError::AgentReportBudgetTooSmall { bytes: 1023 }
+        );
+        cfg.agent.report_max_bytes = 1024;
+        cfg.validate().expect("the floor itself is a valid budget");
+        let disabled_but_malformed =
+            Config::load("[agent]\nenabled = false\nmax_children_per_turn = 0\n")
+                .expect_err("a zero cap is malformed whether or not the tool is on");
+        assert!(matches!(
+            disabled_but_malformed,
+            LoadError::Validate(ConfigError::AgentCapZero {
+                key: "max_children_per_turn"
+            })
+        ));
+
+        // The benign path: a valid table with every bound moved off its
+        // default, the smallest legal values included, loads, validates, reads
+        // each key from the file, and round-trips with the table present.
+        let tuned = Config::load(
+            "[agent]\nmax_children_per_call = 1\nmax_children_per_turn = 3\n\
+             child_max_turns = 1\nchild_deadline_secs = 1\nreport_max_bytes = 4096\n",
+        )
+        .expect("a valid non-default [agent] table loads");
+        assert_eq!(
+            tuned.agent,
+            AgentConfig {
+                enabled: true,
+                max_children_per_call: 1,
+                max_children_per_turn: 3,
+                child_max_turns: 1,
+                child_deadline_secs: 1,
+                report_max_bytes: 4096,
+            }
+        );
+        assert!(!tuned.agent.is_unset());
+        let written = tuned.to_toml().expect("serialize");
+        assert!(written.contains("[agent]"), "{written}");
+        assert!(
+            written.contains("enabled = true"),
+            "an emitted [agent] table states every bound, the switch included: {written}"
+        );
+        assert_eq!(Config::load(&written).expect("reload"), tuned);
+    }
+
+    /// **REQ-623 BR-14 / TASK-422.** `enabled = false` loads, and it is a
+    /// departure from the default like any other: `is_unset` is false, so the
+    /// table is written back and survives an unrelated edit rather than being
+    /// shed as though the user had never turned the tool off.
+    ///
+    /// The contrast is the point: `enabled = true` written explicitly *is*
+    /// the absence — writing the default is not a third state — while
+    /// `enabled = false` is not.
+    ///
+    /// **Mutation** (LESSON-441): make `AgentConfig::is_unset` ignore the
+    /// switch (`Self { enabled: true, ..*self } == Self::default()`) — this
+    /// test goes red on its first `!off.agent.is_unset()` assertion, while
+    /// `agent_caps_default_and_validate` stays green (it never departs from
+    /// `enabled = true`). Restored.
+    #[test]
+    fn agent_enabled_false_is_not_unset() {
+        let off = Config::load("[agent]\nenabled = false\n").expect("enabled = false loads");
+        assert!(!off.agent.enabled);
+        assert!(
+            !off.agent.is_unset(),
+            "a tool the user turned off must not read as the shipped default"
+        );
+        assert_ne!(off.agent, AgentConfig::default());
+        assert_eq!(
+            off.agent,
+            AgentConfig {
+                enabled: false,
+                ..AgentConfig::default()
+            },
+            "turning the tool off moves no bound"
+        );
+        off.validate()
+            .expect("a disabled table with valid bounds passes");
+
+        // Writing the default explicitly is the absence; writing `false` is
+        // not.
+        let explicit_on = Config::load("[agent]\nenabled = true\n").expect("must load");
+        assert!(explicit_on.agent.is_unset());
+        assert_eq!(explicit_on, Config::load("").expect("must load"));
+        assert_ne!(off, explicit_on);
+
+        // Every field participates in `is_unset`, not only the switch: one
+        // departure each is enough to make the table worth writing.
+        let base = AgentConfig::default();
+        for (label, departed) in [
+            (
+                "enabled",
+                AgentConfig {
+                    enabled: false,
+                    ..base
+                },
+            ),
+            (
+                "max_children_per_call",
+                AgentConfig {
+                    max_children_per_call: 6,
+                    ..base
+                },
+            ),
+            (
+                "max_children_per_turn",
+                AgentConfig {
+                    max_children_per_turn: 9,
+                    ..base
+                },
+            ),
+            (
+                "child_max_turns",
+                AgentConfig {
+                    child_max_turns: 13,
+                    ..base
+                },
+            ),
+            (
+                "child_deadline_secs",
+                AgentConfig {
+                    child_deadline_secs: 601,
+                    ..base
+                },
+            ),
+            (
+                "report_max_bytes",
+                AgentConfig {
+                    report_max_bytes: 32_769,
+                    ..base
+                },
+            ),
+        ] {
+            assert!(!departed.is_unset(), "{label} departed but read as unset");
+        }
+
+        // Serialized: the table is written with the switch stated, and reads
+        // back off.
+        let written = off.to_toml().expect("serialize");
+        assert!(written.contains("[agent]"), "{written}");
+        assert!(written.contains("enabled = false"), "{written}");
+        assert_eq!(Config::from_toml(&written).expect("reload"), off);
+
+        // And through the toml-edit writer: an unrelated edit keeps the user's
+        // switch and their comment, and the document still reads off.
+        const OFF: &str = "effort = \"high\"\n\n[agent]\n\
+                           # No fan-out on this machine.\nenabled = false\n";
+        let current = Config::load(OFF).expect("must load");
+        let mut candidate = current.clone();
+        candidate.effort = crate::effort::EffortLevel::Low;
+        let edited = crate::config_doc::apply_config_delta(OFF, &current, &candidate)
+            .expect("an unrelated write applies");
+        assert!(edited.contains("enabled = false"), "{edited}");
+        assert!(edited.contains("# No fan-out on this machine."), "{edited}");
+        let reloaded = Config::load(&edited).expect("the edited document loads");
+        assert!(!reloaded.agent.enabled);
+        assert_eq!(reloaded, candidate);
     }
 }

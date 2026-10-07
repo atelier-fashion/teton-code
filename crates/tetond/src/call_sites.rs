@@ -322,14 +322,22 @@ mod tests {
     /// The `Router` methods that answer "where does this category go".
     ///
     /// The source scan below understands calls to exactly these. Asserting the
-    /// set rather than assuming it is what keeps a *fifth* entry point from
+    /// set rather than assuming it is what keeps a *seventh* entry point from
     /// being added and silently going unscanned — at which point the scan would
     /// keep passing while missing the call site it exists to find, which is the
     /// same silent rot the hand-maintained list has.
-    const ROUTER_ENTRY_POINTS: [&str; 4] = [
+    const ROUTER_ENTRY_POINTS: [&str; 6] = [
         "resolve",
         "resolution_for",
         "resolve_judgment",
+        // REQ-623 BR-6: a child turn's tier request. Its first argument is the
+        // category, read like `resolve`'s; the request only changes which row
+        // serves it, never which category was reached.
+        "resolve_with_tier_request",
+        // REQ-623 BR-6, freeform: the classifier's category with a tier request
+        // beside it. Reaches what `resolve_judgment` reaches, by the same
+        // argument — the classifier's return type is exhaustive.
+        "resolve_judgment_with_tier_request",
         // Takes no category: the taint backstop pins the local tier whatever the
         // table says (BR-7), so it reaches no category through the table and
         // contributes nothing to the reached set.
@@ -347,8 +355,14 @@ mod tests {
     /// daemon that is allowed to name no particular category.
     const REPORTING_ONLY: &str = "table_report";
 
-    /// The three the scan reads a category out of.
-    const CATEGORY_BEARING: [&str; 3] = ["resolve", "resolution_for", "resolve_judgment"];
+    /// The five the scan reads a category out of.
+    const CATEGORY_BEARING: [&str; 5] = [
+        "resolve",
+        "resolution_for",
+        "resolve_judgment",
+        "resolve_with_tier_request",
+        "resolve_judgment_with_tier_request",
+    ];
 
     /// The argument text of the call whose `(` is at `open`, paren-balanced.
     fn argument(source: &str, open: usize) -> &str {
@@ -393,8 +407,10 @@ mod tests {
     fn reached_by(method: &str, arg: &str) -> Option<Vec<Category>> {
         // A judgment turn dispatches on whatever the classifier returned, and
         // the classifier's return type is exhaustive — so this call site reaches
-        // all four by construction, no matter what the argument says.
-        if method == "resolve_judgment" {
+        // all four by construction, no matter what the argument says. A
+        // freeform child's tier request (REQ-623) is the same dispatch with a
+        // request beside it, and reaches the same four.
+        if method == "resolve_judgment" || method == "resolve_judgment_with_tier_request" {
             return Some(
                 JudgmentCategory::ALL
                     .into_iter()
@@ -486,8 +502,8 @@ mod tests {
         );
     }
 
-    /// The scan reads three of the router's resolving methods and knows the
-    /// fourth carries no category. A fifth would be unscanned — and unscanned is
+    /// The scan reads five of the router's resolving methods and knows the
+    /// sixth carries no category. A seventh would be unscanned — and unscanned is
     /// how a derived fact quietly becomes a hand-maintained one again.
     #[test]
     fn the_scan_covers_every_router_entry_point() {

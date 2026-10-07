@@ -24,6 +24,13 @@
 //! arguments, a full URL, a search query, or a credential. A ledger row is safe
 //! to read, export, or ship in a report.
 //!
+//! REQ-623's two columns hold identifiers, not content: `parent_turn_id` is a
+//! daemon-minted turn handle, and `child_id` is `"<call_id>/<name>"` — a
+//! daemon-minted call id (`<turn>:<the loop's call-n>`, never a provider's
+//! tool-call id) plus the child's short label (≤ 40 characters,
+//! defaulting to `child-<n>`). The label is model-authored, but it is a name the
+//! child is shown under, never the task or context it was handed.
+//!
 //! ## Streamed-usage recording
 //!
 //! [`CostLedger`] implements [`CostMeter`], the seam the egress choke point calls
@@ -50,8 +57,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures::Stream;
 use rusqlite::Connection;
 
+use teton_protocol::agent::ChildId;
 use teton_protocol::events::{CostRecord, WebLookupKind, WebLookupOutcome};
-use teton_protocol::{Category, Phase, ProviderId, SessionId};
+use teton_protocol::{Category, Phase, ProviderId, SessionId, TurnId};
 use teton_providers::transport::{ByteStream, TransportError, TransportResponse};
 
 use super::prices::PriceTable;
@@ -74,7 +82,9 @@ CREATE TABLE IF NOT EXISTS cost_records (
     usd_micros     INTEGER,
     cached_tokens  INTEGER,
     reasoning_tokens INTEGER,
-    probe          INTEGER
+    probe          INTEGER,
+    child_id       TEXT,
+    parent_turn_id TEXT
 );
 CREATE TRIGGER IF NOT EXISTS cost_records_no_update
     BEFORE UPDATE ON cost_records
@@ -143,7 +153,7 @@ CREATE TRIGGER IF NOT EXISTS shell_overrides_no_delete
 /// does reach an existing file, which is how REQ-563's `web_lookups` arrives on
 /// a `cost.db` written before it existed. Only a new column on a table that is
 /// already there is invisible to the schema batch.
-const ADDITIVE_COLUMNS: [(&str, &str); 4] = [
+const ADDITIVE_COLUMNS: [(&str, &str); 6] = [
     (
         // REQ-558: the routing category the call was made for.
         "category",
@@ -173,6 +183,21 @@ const ADDITIVE_COLUMNS: [(&str, &str); 4] = [
         // the truth about them, and the read maps it to "not a probe".
         "probe",
         "ALTER TABLE cost_records ADD COLUMN probe INTEGER",
+    ),
+    (
+        // REQ-623 BR-8: the child turn that made the call. NULL on a parent
+        // turn's own call and on every row written before this column existed
+        // — no daemon before it could dispatch a child, so NULL is the truth
+        // about those rows, not a gap.
+        "child_id",
+        "ALTER TABLE cost_records ADD COLUMN child_id TEXT",
+    ),
+    (
+        // REQ-623 BR-8: the prompt turn the row nests under in `/cost`. Never
+        // backfilled: a pre-REQ row was attributed to no turn, and inventing one
+        // from timestamps would be a guess the append-only store must not make.
+        "parent_turn_id",
+        "ALTER TABLE cost_records ADD COLUMN parent_turn_id TEXT",
     ),
 ];
 
@@ -278,6 +303,17 @@ pub struct LedgerRow {
     /// A probe is billed like any other call — the flag counts it apart, it
     /// does not exempt it.
     pub probe: bool,
+    /// The child turn that made this call (REQ-623 BR-8), or `None` for a
+    /// parent turn's own call and for every row written before the column
+    /// existed.
+    pub child_id: Option<ChildId>,
+    /// The prompt turn this row nests under in the per-turn `/cost` view
+    /// (REQ-623 BR-8): the parent turn a child ran under, or — on a parent
+    /// turn's own call stamped with
+    /// [`CostAttribution::with_turn`](super::CostAttribution::with_turn) — that
+    /// turn. `None` on every row attributed to no turn, which is every row
+    /// written before the column existed.
+    pub parent_turn_id: Option<TurnId>,
 }
 
 impl LedgerRow {
@@ -301,6 +337,8 @@ impl LedgerRow {
             cached_tokens: self.cached_tokens,
             reasoning_tokens: self.reasoning_tokens,
             probe: self.probe,
+            child_id: self.child_id.clone(),
+            parent_turn_id: self.parent_turn_id.clone(),
         }
     }
 }
@@ -499,6 +537,10 @@ impl CostLedger {
             // the only layer that knows whether it asked a question or tested a
             // connection (REQ-581 BR-5).
             probe: attribution.probe,
+            // REQ-623 BR-8: likewise only the caller knows which turn — and
+            // which child — it is spending for.
+            child_id: attribution.child_id.clone(),
+            parent_turn_id: attribution.parent_turn_id.clone(),
         })
     }
 
@@ -543,6 +585,8 @@ impl CostLedger {
             // The local engine reports no reasoning split (BR-6).
             reasoning_tokens: None,
             probe: attribution.probe,
+            child_id: attribution.child_id.clone(),
+            parent_turn_id: attribution.parent_turn_id.clone(),
         })
     }
 
@@ -555,7 +599,7 @@ impl CostLedger {
         let mut stmt = guard.prepare(
             "SELECT session_id, phase, category, provider_id, model,
                     input_tokens, output_tokens, usd_micros, cached_tokens,
-                    reasoning_tokens, probe
+                    reasoning_tokens, probe, child_id, parent_turn_id
              FROM cost_records ORDER BY id",
         )?;
         let rows = stmt
@@ -579,10 +623,53 @@ impl CostLedger {
                     // `category_from_wire` takes toward a value it does not
                     // recognize: read what was recorded, never guess past it.
                     probe: r.get::<_, Option<i64>>(10)? == Some(1),
+                    // REQ-623: stored whole and restored whole — the id is never
+                    // taken apart here (`ChildId` has no way to), and a NULL is
+                    // a row attributed to no child or no turn.
+                    child_id: r.get::<_, Option<String>>(11)?.map(ChildId::from),
+                    parent_turn_id: r.get::<_, Option<String>>(12)?.map(TurnId::from),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// What one child has spent, in the unit the prompt's
+    /// [`PromptSpend`](super::PromptSpend) accumulates (REQ-623 BR-8).
+    ///
+    /// Summed from the child's recorded rows through [`spend_units`], the same
+    /// conversion [`MeteredBody`] feeds the live accumulator with, so a share
+    /// derived from the ledger and the ceiling a child's egress checks can never
+    /// disagree on units. An unpriced row adds nothing — it fed the accumulator
+    /// nothing either, and with a ceiling in force an unpriced call is refused
+    /// before it is sent (REQ-588 ADR-3).
+    ///
+    /// Scoped to `session_id` because a [`ChildId`] is unique only within its
+    /// session: the call id half is daemon-minted from counters that start
+    /// over — `turn-<n>` with every daemon start, the loop's `call-<n>` with
+    /// every turn — so sessions sharing this file mint the same ones.
+    ///
+    /// # Errors
+    /// [`LedgerError`] if the query fails or the mutex is poisoned.
+    pub fn spent_by_child(
+        &self,
+        session_id: &SessionId,
+        child_id: &ChildId,
+    ) -> Result<u64, LedgerError> {
+        let guard = self.conn.lock().map_err(|_| LedgerError::Poisoned)?;
+        let mut stmt = guard.prepare(
+            "SELECT usd_micros FROM cost_records
+             WHERE session_id = ?1 AND child_id = ?2 ORDER BY id",
+        )?;
+        let costs = stmt
+            .query_map(rusqlite::params![session_id.0, child_id.as_str()], |r| {
+                r.get::<_, Option<i64>>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(costs
+            .into_iter()
+            .filter_map(spend_units)
+            .fold(0_u64, u64::saturating_add))
     }
 
     /// Append one web-lookup row (REQ-563 BR-7).
@@ -913,11 +1000,9 @@ impl MeteredBody {
         // the total, because a total that silently absorbed unknowns would
         // claim a precision it does not have.
         if let Some(spend) = &self.spend {
-            match usd_micros {
-                Some(micros) if micros >= 0 => spend.add(micros.unsigned_abs()),
-                // A negative price is nonsense rather than a credit; treat it
-                // as unpriced rather than reducing the total.
-                Some(_) | None => spend.note_unpriced(),
+            match spend_units(usd_micros) {
+                Some(units) => spend.add(units),
+                None => spend.note_unpriced(),
             }
         }
         let row = LedgerRow {
@@ -939,6 +1024,10 @@ impl MeteredBody {
             // choke point and is billed by this same code — the attribution is
             // the only thing that differs, and it says so here.
             probe: self.attribution.probe,
+            // REQ-623 BR-8: a child's call goes out through this same choke
+            // point too; its attribution is what names the child and the turn.
+            child_id: self.attribution.child_id.clone(),
+            parent_turn_id: self.attribution.parent_turn_id.clone(),
         };
         // Best-effort: never let a ledger hiccup break the response stream.
         let _ = insert_and_emit(&self.conn, self.sink.as_ref(), &row);
@@ -1132,8 +1221,8 @@ fn insert_and_emit(
             "INSERT INTO cost_records
                (recorded_at_ms, session_id, phase, category, provider_id, model,
                 input_tokens, output_tokens, usd_micros, cached_tokens,
-                reasoning_tokens, probe)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                reasoning_tokens, probe, child_id, parent_turn_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 now_ms(),
                 row.session_id,
@@ -1150,6 +1239,8 @@ fn insert_and_emit(
                 // indistinguishable from one written before the column existed
                 // — which is the truth: neither is a probe.
                 row.probe.then_some(1_i64),
+                row.child_id.as_ref().map(ChildId::as_str),
+                row.parent_turn_id.as_ref().map(|t| t.0.as_str()),
             ],
         )?;
     }
@@ -1179,6 +1270,31 @@ fn has_column(conn: &Connection, column: &str) -> Result<bool, rusqlite::Error> 
     let mut stmt =
         conn.prepare("SELECT 1 FROM pragma_table_info('cost_records') WHERE name = ?1")?;
     stmt.exists([column])
+}
+
+/// What one priced call adds to a prompt's [`PromptSpend`](super::PromptSpend),
+/// or `None` when it cannot be counted.
+///
+/// The single definition both sides read: [`MeteredBody::finalize`] feeds the
+/// live accumulator through it and [`CostLedger::spent_by_child`] sums recorded
+/// rows through it (REQ-623), so a child's ledger-derived spend and the figure
+/// its ceiling is checked against cannot drift apart.
+///
+/// The recorded `usd_micros` (1e-6 USD) converted to the accumulator's
+/// micro-cents (1e-5 USD) through
+/// [`USD_MICROS_PER_MICRO_CENT`](super::USD_MICROS_PER_MICRO_CENT) — re-exported by
+/// `cost`, because this file must not be able to name `teton_core` at all
+/// (`duty::tests::the_only_text_to_category_map_is_the_ledgers_own_round_trip`)
+/// — the unit `[cost] prompt_ceiling_usd` is converted to and the refusal
+/// renders. BUG-231: this is where REQ-588 added the price unconverted, so a
+/// $1.00 ceiling bound at ~$0.10. A sub-micro-cent remainder (under 1e-5 USD)
+/// truncates; the ledger row keeps the exact price. A negative price is
+/// nonsense rather than a credit, so it is treated as uncountable rather than
+/// reducing a total; `None` is an unpriced call.
+fn spend_units(usd_micros: Option<i64>) -> Option<u64> {
+    usd_micros
+        .filter(|micros| *micros >= 0)
+        .map(|micros| i64::unsigned_abs(micros / super::USD_MICROS_PER_MICRO_CENT))
 }
 
 /// Milliseconds since the Unix epoch (0 if the clock is before it).
@@ -2166,6 +2282,17 @@ CREATE TRIGGER cost_records_no_delete
                 1,
             )
             .expect("record");
+        // REQ-623: a child's row is as immutable as any other.
+        ledger
+            .record_call(
+                "s",
+                "deepseek",
+                &CostAttribution::new("deepseek-v4-pro")
+                    .for_child(ChildId::new("call-1", "audit"), TurnId::from("turn-1")),
+                1,
+                1,
+            )
+            .expect("record a child's call");
         let guard = ledger.conn.lock().unwrap();
         assert!(
             guard
@@ -2177,6 +2304,297 @@ CREATE TRIGGER cost_records_no_delete
             guard.execute("DELETE FROM cost_records", []).is_err(),
             "DELETE must be rejected by the append-only trigger"
         );
+        // Neither new column can be backfilled or re-attributed after the fact:
+        // a child's spend cannot be moved to another child, or onto a row that
+        // was attributed to none.
+        assert!(
+            guard
+                .execute("UPDATE cost_records SET child_id = 'call-1/other'", [])
+                .is_err(),
+            "a child attribution must not be rewritable"
+        );
+        assert!(
+            guard
+                .execute("UPDATE cost_records SET parent_turn_id = 'turn-9'", [])
+                .is_err(),
+            "a turn attribution must not be rewritable"
+        );
+    }
+
+    /// The `cost_records` table exactly as the build before REQ-623 created it —
+    /// every column through REQ-581's `probe`, and no `child_id` or
+    /// `parent_turn_id`. Reproduced verbatim for the reason [`PRE_REQ_SCHEMA`]
+    /// is: the file under test is the one already on a user's disk.
+    const PRE_REQ_623_SCHEMA: &str = "
+CREATE TABLE cost_records (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    recorded_at_ms INTEGER NOT NULL,
+    session_id     TEXT    NOT NULL,
+    phase          TEXT,
+    category       TEXT,
+    provider_id    TEXT    NOT NULL,
+    model          TEXT    NOT NULL,
+    input_tokens   INTEGER NOT NULL,
+    output_tokens  INTEGER NOT NULL,
+    usd_micros     INTEGER,
+    cached_tokens  INTEGER,
+    reasoning_tokens INTEGER,
+    probe          INTEGER
+);
+CREATE TRIGGER cost_records_no_update
+    BEFORE UPDATE ON cost_records
+    BEGIN SELECT RAISE(ABORT, 'cost ledger is append-only'); END;
+CREATE TRIGGER cost_records_no_delete
+    BEFORE DELETE ON cost_records
+    BEGIN SELECT RAISE(ABORT, 'cost ledger is append-only'); END;
+";
+
+    /// REQ-623: a `cost.db` written before child dispatch opens, gains both
+    /// columns, keeps every historical row, and reads the NULL the migration
+    /// left as `None` — on the row and on the projected wire record alike.
+    ///
+    /// Mutation (recorded): removing the two `ADDITIVE_COLUMNS` entries reddens
+    /// 4 tests — this one, at "the migration must add `child_id`" (the open
+    /// itself succeeds: `CREATE TABLE IF NOT EXISTS` is a no-op on an existing
+    /// file), and the three older migration tests, whose post-open reads and
+    /// appends now name a column the old file lacks. Every test on a fresh file
+    /// stays green, because the schema batch creates the table whole.
+    #[test]
+    fn a_pre_child_ledger_gains_both_columns_and_reads_null_as_none() {
+        let path = scratch_db("pre-req-623");
+        let _ = std::fs::remove_file(&path);
+        {
+            let old = Connection::open(&path).expect("create pre-REQ-623 ledger");
+            old.execute_batch(PRE_REQ_623_SCHEMA)
+                .expect("pre-REQ-623 schema");
+            old.execute(
+                "INSERT INTO cost_records
+                   (recorded_at_ms, session_id, phase, category, provider_id, model,
+                    input_tokens, output_tokens, usd_micros, cached_tokens,
+                    reasoning_tokens, probe)
+                 VALUES (1, 'old-session', 'review', 'review', 'anthropic',
+                         'claude-opus-4', 900, 100, 42, NULL, 7, NULL)",
+                [],
+            )
+            .expect("historical row");
+        }
+
+        let sink = Arc::new(CapturingSink::default());
+        let ledger = CostLedger::open(&path, PriceTable::bundled(), sink.clone())
+            .expect("open a pre-REQ-623 file");
+        {
+            let guard = ledger.conn.lock().unwrap();
+            for column in ["child_id", "parent_turn_id"] {
+                assert!(
+                    has_column(&guard, column).expect("pragma"),
+                    "the migration must add `{column}`"
+                );
+            }
+        }
+
+        let rows = ledger.all_records().expect("read");
+        assert_eq!(rows.len(), 1, "the migration must not drop or rewrite rows");
+        assert_eq!(rows[0].child_id, None, "a historical row names no child");
+        assert_eq!(rows[0].parent_turn_id, None, "nor any turn");
+        // Everything the row did record survives untouched.
+        assert_eq!(rows[0].session_id, "old-session");
+        assert_eq!(rows[0].category, Some(Category::Review));
+        assert_eq!(rows[0].reasoning_tokens, Some(7));
+        assert_eq!(rows[0].usd_micros, Some(42));
+        let wire = rows[0].to_wire();
+        assert_eq!((wire.child_id, wire.parent_turn_id), (None, None));
+        assert!(
+            ledger.report().expect("report").per_turn.is_empty(),
+            "a ledger that predates children nests nothing"
+        );
+
+        // The migrated file takes a child's row with both ids.
+        ledger
+            .record_call(
+                "new-session",
+                "deepseek",
+                &CostAttribution::new("deepseek-v4-pro")
+                    .for_child(ChildId::new("call-1", "audit"), TurnId::from("turn-1")),
+                10,
+                20,
+            )
+            .expect("append after migration");
+        let rows = ledger.all_records().expect("read");
+        assert_eq!(rows[1].child_id, Some(ChildId::new("call-1", "audit")));
+        assert_eq!(rows[1].parent_turn_id, Some(TurnId::from("turn-1")));
+        {
+            let guard = ledger.conn.lock().unwrap();
+            assert!(
+                guard
+                    .execute("UPDATE cost_records SET child_id = 'x'", [])
+                    .is_err(),
+                "the append-only trigger survived the ALTER TABLE"
+            );
+        }
+
+        // Re-opening is idempotent rather than a duplicate ADD COLUMN.
+        let reopened = CostLedger::open(&path, PriceTable::bundled(), sink)
+            .expect("re-open a migrated ledger");
+        assert_eq!(reopened.all_records().expect("read").len(), 2);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// REQ-623 BR-8: both ids are written, read back, and broadcast on the live
+    /// `cost_recorded` event, by the metered path's sibling writers too.
+    #[test]
+    fn a_childs_ids_round_trip_through_the_store_and_the_event() {
+        let (ledger, sink) = ledger();
+        let child = ChildId::new("toolu_7", "audit");
+        ledger
+            .record_call(
+                "s1",
+                "deepseek",
+                &CostAttribution::new("deepseek-v4-pro")
+                    .for_child(child.clone(), TurnId::from("turn-5")),
+                10,
+                5,
+            )
+            .expect("record a child's call");
+        ledger
+            .record_call(
+                "s1",
+                "anthropic",
+                &CostAttribution::new("claude-fable-5").with_turn(TurnId::from("turn-5")),
+                10,
+                5,
+            )
+            .expect("record the turn's own call");
+        ledger
+            .record_local_call(
+                "s1",
+                &CostAttribution::new("qwen2.5-coder-3b")
+                    .for_child(child.clone(), TurnId::from("turn-5")),
+                10,
+                5,
+                0,
+            )
+            .expect("record a child's local call");
+
+        let rows = ledger.all_records().expect("read");
+        let ids: Vec<(Option<&str>, Option<&str>)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.child_id.as_ref().map(ChildId::as_str),
+                    r.parent_turn_id.as_ref().map(|t| t.0.as_str()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                (Some("toolu_7/audit"), Some("turn-5")),
+                (None, Some("turn-5")),
+                (Some("toolu_7/audit"), Some("turn-5")),
+            ]
+        );
+
+        let emitted = sink.records.lock().unwrap();
+        assert_eq!(emitted[0].child_id, Some(child.clone()));
+        assert_eq!(emitted[0].parent_turn_id, Some(TurnId::from("turn-5")));
+        assert_eq!(emitted[1].child_id, None);
+        assert_eq!(emitted[2].child_id, Some(child));
+    }
+
+    /// REQ-623 BR-8: `spent_by_child` is exactly that child's priced spend in
+    /// that session — not its sibling's, not the parent turn's, and not a
+    /// same-named child in another session sharing the file.
+    ///
+    /// The expected figure is the price table's, computed per call here; the
+    /// subject is the ledger's selection and summing, not the pricing.
+    ///
+    /// Mutation (recorded): dropping `session_id = ?1` from the query reddens
+    /// this test alone (the other session's call is summed in); dropping
+    /// `child_id = ?2` reddens this test and
+    /// `cost_attribution::parent_total_is_own_plus_children` (the sibling's and
+    /// the parent's calls are summed in).
+    #[test]
+    fn spent_by_child_is_exactly_that_childs_spend() {
+        let (ledger, _sink) = ledger();
+        let prices = PriceTable::bundled();
+        let turn = TurnId::from("turn-1");
+        let audit = ChildId::new("call-1", "audit");
+        let lint = ChildId::new("call-1", "lint");
+        let child_call = |session: &str, child: &ChildId, model: &str, i: u64, o: u64| {
+            ledger
+                .record_call(
+                    session,
+                    "provider",
+                    &CostAttribution::new(model).for_child(child.clone(), turn.clone()),
+                    i,
+                    o,
+                )
+                .expect("record");
+        };
+        child_call("s1", &audit, "claude-fable-5", 1000, 500);
+        child_call("s1", &lint, "claude-fable-5", 9000, 9000);
+        child_call("s1", &audit, "deepseek-v4-pro", 4000, 2000);
+        // Unpriced: it fed no accumulator, so it adds nothing here either.
+        child_call("s1", &audit, "unpriced-model", 50_000, 50_000);
+        // The same child id in another session.
+        child_call("s2", &audit, "claude-fable-5", 7000, 7000);
+        // The parent turn's own call.
+        ledger
+            .record_call(
+                "s1",
+                "anthropic",
+                &CostAttribution::new("claude-fable-5").with_turn(turn.clone()),
+                3000,
+                3000,
+            )
+            .expect("record");
+
+        // Summed per row in the accumulator's unit (BUG-231): each row's
+        // `usd_micros` converts to micro-cents on its own before the sum.
+        let expected = spend_units(prices.price("claude-fable-5", 1000, 500)).unwrap()
+            + spend_units(prices.price("deepseek-v4-pro", 4000, 2000)).unwrap();
+        assert!(expected > 0, "non-vacuity: the child really spent");
+        let s1 = SessionId::from("s1");
+        assert_eq!(ledger.spent_by_child(&s1, &audit).expect("query"), expected,);
+        assert_eq!(
+            ledger.spent_by_child(&s1, &lint).expect("query"),
+            spend_units(prices.price("claude-fable-5", 9000, 9000)).unwrap(),
+            "the sibling's spend is its own"
+        );
+        assert_eq!(
+            ledger
+                .spent_by_child(&s1, &ChildId::new("call-1", "never-ran"))
+                .expect("query"),
+            0,
+            "a child with no rows has spent nothing"
+        );
+    }
+
+    /// The unit `spent_by_child` sums in is the one the live accumulator is fed
+    /// in, by construction: both go through `spend_units`. Pinned here so a
+    /// change to one side's conversion is a change to both.
+    ///
+    /// **BUG-231.** The price is `usd_micros` (1e-6 USD); the accumulator and
+    /// the ceiling are micro-cents (1e-5 USD). REQ-588 fed the price through
+    /// unconverted — `35_000 → 35_000` — so a $1.00 ceiling bound at ~$0.10.
+    /// Mutation: restoring the identity (`.map(i64::unsigned_abs)`) reddens
+    /// this test and `a_priced_call_just_under_the_ceiling_does_not_reach_it`.
+    #[test]
+    fn spend_units_counts_a_price_and_refuses_to_count_nonsense() {
+        assert_eq!(
+            spend_units(Some(35_000)),
+            Some(3_500),
+            "usd_micros → micro-cents"
+        );
+        assert_eq!(
+            spend_units(Some(9)),
+            Some(0),
+            "under one micro-cent truncates"
+        );
+        assert_eq!(spend_units(Some(0)), Some(0), "free is countable");
+        assert_eq!(spend_units(None), None, "unpriced is not");
+        assert_eq!(spend_units(Some(-1)), None, "a negative price is no credit");
     }
 
     #[tokio::test]

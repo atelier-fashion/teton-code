@@ -20,6 +20,9 @@
 //!    (smaller tool set, shorter loop, mandatory verification) (BR-6).
 //! 6. A routed *remote* call produces a `CostRecord` **and** is subject to
 //!    boundary inspection at the same choke point — the BR-1/BR-2 proof.
+//! 7. A child turn's tier request is requested, routed and pinned in that
+//!    order, never refused, and never moves the parent's route (REQ-623 BR-6,
+//!    AC-9).
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -43,7 +46,7 @@ use teton_core::ToolCallTier;
 use teton_inference::{ChatFormat, Engine, MockEngine};
 
 use teton_protocol::events::{BudgetBound, Event};
-use teton_protocol::{Phase as ProtoPhase, ProviderId, SessionId};
+use teton_protocol::{Phase as ProtoPhase, ProviderId, SessionId, Tier as ProtoTier};
 
 use teton_providers::transport::{
     ByteStream, HttpMethod, Transport, TransportError, TransportRequest, TransportResponse,
@@ -1236,4 +1239,198 @@ async fn each_draft_fixture_is_served_where_the_resolver_sent_it_and_the_row_and
         1,
         "nothing in this test billed a second call"
     );
+}
+
+// --------------------------------------------------------------------------
+// 8. A child's tier request: requested, routed, pinned (REQ-623 BR-6, AC-9)
+// --------------------------------------------------------------------------
+
+/// A **think-tier parent's** table, with or without a `build` binding.
+///
+/// The declared default (`deepseek`) is deliberately neither tier's provider:
+/// with `build` unbound, `build`'s inherited fill is `deepseek` while a `think`
+/// category's own route is `anthropic`, so "the session's default route for
+/// the child's category" and "whatever an unbound `build` would inherit" are
+/// different answers here, and a resolver that confused them is caught.
+fn child_tier_router(build_bound: bool) -> Router {
+    let mut table = CategoryTable::new()
+        .with_local_provider("local")
+        .with_tier(tier(Tier::Think, "anthropic", None));
+    if build_bound {
+        table = table.with_tier(tier(Tier::Build, "kimi", None));
+    }
+    Router::new(table, Some("deepseek".to_owned()))
+        .with_provider(
+            "anthropic",
+            ProviderKind::Anthropic,
+            "claude-opus-4",
+            native(),
+            ProviderHealth::Healthy,
+        )
+        .with_provider(
+            "kimi",
+            ProviderKind::OpenaiCompatible,
+            "kimi-k2",
+            native(),
+            ProviderHealth::Healthy,
+        )
+        .with_provider(
+            "deepseek",
+            ProviderKind::OpenaiCompatible,
+            "deepseek-chat",
+            native(),
+            ProviderHealth::Healthy,
+        )
+        .with_provider(
+            "local",
+            ProviderKind::Local,
+            "qwen2.5-coder-3b",
+            native(),
+            ProviderHealth::Healthy,
+        )
+}
+
+/// **AC-9 (BR-6): a child requesting `tier: build` under a think-tier parent.**
+///
+/// Three rows, driven through the router the way the child runner drives it
+/// (`Router::resolve_with_tier_request` on the child's category, with the
+/// session's pin checked first and taken instead when it holds):
+///
+/// 1. **Build bound** — the child runs on the Build route and its
+///    `route_decided` (what `ChildResult.route` names) says `build`; the
+///    parent's next model call, resolved afterwards on the same router, is
+///    still the Think route, byte for byte what it was before the child asked.
+/// 2. **Build unbound** — the child runs on its category's default route
+///    (`anthropic`), not on the unbound tier's inherited fill (`deepseek`),
+///    and the route names that — a route, not a refusal.
+/// 3. **Boundary pin** — on both tables, the route the request chose is
+///    remote, and content under a `local-only` boundary sent on it is blocked
+///    at the egress choke point before anything reaches the wire (capture: the
+///    scripted transport's one reply is still queued, and nothing is billed).
+///    The pin the runtime then takes lands local and still routes.
+///
+/// # Mutations
+///
+/// - **Drop the binding lookup** in `teton_core::category::
+///   resolve_with_tier_request` (`configured.tier_binding(requested)` →
+///   `None`): row 1 reddens — the child lands on `anthropic`, not `kimi`.
+/// - **Look the request up in the effective table** (`table` for
+///   `configured`): row 2 reddens — the child lands on the fill, `deepseek`.
+#[tokio::test]
+async fn child_tier_request_matrix() {
+    // The parent's turn is a `think` category.
+    let category = Category::Design;
+    assert_eq!(category.tier(), Tier::Think);
+    let session = SessionId::from("sess-child-tier");
+
+    // 1. Build bound: the request is honoured.
+    let router = child_tier_router(true);
+    let parent_before = router.resolve(category);
+    let child = router.resolve_with_tier_request(category, Some(Tier::Build));
+    let named = child.route_decided().expect("the child routed");
+    assert_eq!(
+        named.provider_id,
+        ProviderId::from("kimi"),
+        "{}",
+        named.reason
+    );
+    assert_eq!(named.model.as_deref(), Some("kimi-k2"));
+    assert_eq!(named.tier, Some(ProtoTier::Build));
+    assert!(
+        named.reason.contains("requested 'build'"),
+        "the route says it is the requested tier: {}",
+        named.reason
+    );
+    let parent_after = router.resolve(category);
+    let parent = parent_after.route_decided().expect("the parent routed");
+    assert_eq!(parent.provider_id, ProviderId::from("anthropic"));
+    assert_eq!(parent.tier, Some(ProtoTier::Think));
+    assert_eq!(
+        format!("{parent_before:?}"),
+        format!("{parent_after:?}"),
+        "a child's request must not move the parent's route"
+    );
+
+    // 2. Build unbound: the category's default, named, and not a refusal.
+    let router = child_tier_router(false);
+    assert_eq!(
+        router.tier_report(Tier::Build).provider_id.as_deref(),
+        Some("deepseek"),
+        "non-vacuity: the unbound tier has an inherited fill the child must NOT take"
+    );
+    let child = router.resolve_with_tier_request(category, Some(Tier::Build));
+    let named = child
+        .route_decided()
+        .expect("a request the router cannot honour still routes");
+    assert_eq!(
+        named.provider_id,
+        ProviderId::from("anthropic"),
+        "{}",
+        named.reason
+    );
+    assert_eq!(named.tier, Some(ProtoTier::Think));
+    assert!(
+        named.reason.contains("no provider is configured for it"),
+        "the route says the request was not honoured: {}",
+        named.reason
+    );
+    assert_eq!(
+        router.resolve(category).provider_id,
+        child.provider_id,
+        "and the route it fell to is exactly the parent's"
+    );
+
+    // 3. Boundary pin, on both tables.
+    for build_bound in [true, false] {
+        let router = child_tier_router(build_bound);
+        let child = router.resolve_with_tier_request(category, Some(Tier::Build));
+        let transport = ScriptedTransport::with_script(&[(1500, 600)]);
+        let wire = Arc::clone(&transport.usages);
+        let (ledger, egress) = egress_with_ledger(
+            transport,
+            vec![PrivacyBoundary {
+                path_glob: "secrets/**".to_owned(),
+                mode: BoundaryMode::LocalOnly,
+                origin: Default::default(),
+            }],
+        );
+        let ctx = router
+            .egress_context(&child, session.clone())
+            .expect("the requested route is remote");
+        let err = egress
+            .send(
+                request("API_KEY=sk-live-DO-NOT-LEAK"),
+                &Provenance::tainted_by(source_id("secrets/prod.env")),
+                &ctx,
+            )
+            .await
+            .expect_err("local-only content must not leave on the requested route");
+        assert!(
+            matches!(err, EgressError::PrivacyBlocked { .. }),
+            "build bound = {build_bound}: {err:?}"
+        );
+        assert_eq!(
+            wire.lock().unwrap().len(),
+            1,
+            "build bound = {build_bound}: nothing reached the wire"
+        );
+        assert!(
+            ledger.all_records().expect("read rows").is_empty(),
+            "build bound = {build_bound}: a blocked call is never billed"
+        );
+
+        let pinned = router.resolve_local_pin("this child read local-only content");
+        let named = pinned
+            .route_decided()
+            .expect("the pin routes; it does not refuse");
+        assert_eq!(
+            named.provider_id,
+            ProviderId::from("local"),
+            "build bound = {build_bound}: the pin is local whatever was requested"
+        );
+        assert_eq!(
+            named.tier, None,
+            "the pin resolved no category, so it claims no requested tier"
+        );
+    }
 }

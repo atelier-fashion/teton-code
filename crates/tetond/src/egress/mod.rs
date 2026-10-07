@@ -116,14 +116,14 @@ use teton_protocol::events::{
     BlockCause, ByteSpan, Event, FindingKind as WireFindingKind, PrivacyAction, PrivacyBlock,
     ProvenanceRejected,
 };
-use teton_protocol::{ProviderId, SessionId};
+use teton_protocol::{ProviderId, SessionId, TurnId};
 use teton_providers::transport::{
     BlockDetail, ByteStream, HttpMethod, Transport, TransportError, TransportRequest,
     TransportResponse,
 };
 
 use crate::broadcast::EventBus;
-use crate::cost::{CostAttribution, CostMeter};
+use crate::cost::{ChildSpend, CostAttribution, CostMeter};
 
 pub use inspector::{first_malformed_source, inspect, Inspection, MalformedSource, Violation};
 pub use lookup::{
@@ -547,6 +547,20 @@ pub struct Egress<T: Transport> {
     /// ceiling lives, and a ceiling with no accumulator (or the reverse) is not
     /// a state any caller should be able to construct halfway.
     prompt_spend: Option<Arc<teton_core::cost_ceiling::PromptSpend>>,
+    /// REQ-623 ADR-4: present iff this is a **child's** choke point.
+    ///
+    /// When present it governs spend here in place of the two fields above:
+    /// the check reads the child's own accumulator against its share, read
+    /// from the call's pool at check time, and every metered call adds into
+    /// the child's accumulator and the prompt's. `None` — every choke point
+    /// but a child's — leaves the prompt-turn path exactly as it was.
+    child_spend: Option<ChildSpend>,
+    /// The prompt turn this choke point's calls are billed under (REQ-623
+    /// BR-8, AC-12) — the parent turn's half of what [`Self::child_spend`] is
+    /// for a child: every metered call that names no turn of its own is
+    /// stamped with it, so `/cost` totals a parent turn as its own calls plus
+    /// its children's. A child's choke point stamps the child's pair instead.
+    turn: Option<TurnId>,
     /// The REQ-562 redaction scanner, present **iff** `[privacy] redact` is on
     /// (ADR-2). `None` is the off state in full: no branch inside the hot path,
     /// no scanner call, nothing that could claim a scan ran.
@@ -619,6 +633,8 @@ impl<T: Transport> Egress<T> {
             sink,
             spend_ceiling: None,
             prompt_spend: None,
+            child_spend: None,
+            turn: None,
             cost: None,
             redaction: None,
             search_redaction: None,
@@ -658,6 +674,10 @@ impl<T: Transport> Egress<T> {
     /// lookup, so an un-opted-in machine is byte-identical to before this REQ.
     #[must_use]
     pub fn with_spend_ceiling(mut self, micro_cents: u64) -> Self {
+        debug_assert!(
+            self.child_spend.is_none(),
+            "a child's choke point checks its share, never the prompt's ceiling (REQ-623 ADR-4)"
+        );
         self.spend_ceiling = Some(micro_cents);
         self
     }
@@ -670,6 +690,10 @@ impl<T: Transport> Egress<T> {
     /// could come to disagree.
     #[must_use]
     pub fn with_optional_spend_ceiling(mut self, micro_cents: Option<u64>) -> Self {
+        debug_assert!(
+            self.child_spend.is_none() || micro_cents.is_none(),
+            "a child's choke point checks its share, never the prompt's ceiling (REQ-623 ADR-4)"
+        );
         self.spend_ceiling = micro_cents;
         self
     }
@@ -685,7 +709,56 @@ impl<T: Transport> Egress<T> {
         mut self,
         spend: Option<Arc<teton_core::cost_ceiling::PromptSpend>>,
     ) -> Self {
+        debug_assert!(
+            self.child_spend.is_none() || spend.is_none(),
+            "a child's choke point adds into the prompt through its ChildSpend, never twice \
+             (REQ-623 ADR-4)"
+        );
         self.prompt_spend = spend;
+        self
+    }
+
+    /// Make this a child's choke point (REQ-623 ADR-4, BR-8).
+    ///
+    /// With `Some`, the spend check compares the child's **own** spend with
+    /// its share — [`ChildSpend::ceiling`], read from the call's pool at every
+    /// check, so a sibling's release reaches this child's next call — and
+    /// refuses with the same [`EgressError::SpendCeilingReached`] and the same
+    /// composer a prompt's ceiling uses. Every metered call adds into the
+    /// child's accumulator and the prompt's, so the parent pays. The
+    /// [`Self::with_spend_ceiling`] / [`Self::with_prompt_spend`] pair is not
+    /// consulted on a child's choke point: the `ChildSpend` carries the
+    /// prompt's accumulator itself, and adding through both would count each
+    /// call twice.
+    ///
+    /// **The two are exclusive by construction, not only by the check's match
+    /// order** (verify, 2026-10-07): `Some` clears any prompt pair already set,
+    /// and setting the pair after a child's spend is a debug assertion. The
+    /// runtime's builders set no pair on a child's choke point at all.
+    ///
+    /// `None` (the default) leaves the prompt pair in place; passing `None`
+    /// after a `Some` would drop the child's spend, which no builder does.
+    #[must_use]
+    pub fn with_child_spend(mut self, spend: Option<ChildSpend>) -> Self {
+        if spend.is_some() {
+            self.spend_ceiling = None;
+            self.prompt_spend = None;
+        }
+        self.child_spend = spend;
+        self
+    }
+
+    /// Bill this choke point's calls under the prompt turn `turn` (REQ-623
+    /// BR-8, AC-12) — see the field. At the choke point rather than at each
+    /// source that builds an attribution, because this is the one place every
+    /// remote call of the turn and of its duties passes (LESSON-501): a stamp
+    /// left to each builder is a stamp one of them forgets.
+    ///
+    /// `None` (the default) changes nothing, and an attribution that already
+    /// names a turn keeps it.
+    #[must_use]
+    pub fn with_turn(mut self, turn: Option<TurnId>) -> Self {
+        self.turn = turn;
         self
     }
 
@@ -1017,28 +1090,20 @@ impl<T: Transport> Egress<T> {
         // **Nothing runs when no ceiling is configured** (ADR-6): both `Option`s
         // are `None` on an un-opted-in machine, so there is no pricing lookup
         // and no branch taken.
-        if let (Some(ceiling), Some(spend)) = (self.spend_ceiling, self.prompt_spend.as_ref()) {
-            use teton_core::cost_ceiling::{ceiling_refusal, unpriced_refusal, SpendBound};
-            let bound = SpendBound::PromptCeiling;
-
-            // ADR-2: a floor crossing, not a prediction. What this prompt has
-            // *recorded* decides; what the next call will cost cannot be known
-            // until the model has written it.
-            if spend.reached(ceiling) {
-                return Err(EgressError::SpendCeilingReached {
-                    message: ceiling_refusal(spend.spent(), ceiling, bound),
-                });
+        match &self.child_spend {
+            // REQ-623 ADR-4: a child checks its own spend against its share,
+            // read now rather than stamped at build time so a sibling's release
+            // is seen. An unlimited pool has no share and checks nothing.
+            Some(child) => {
+                if let Some(share) = child.ceiling() {
+                    self.refuse_past_ceiling(ctx, share, child.own(), || child.note_unpriced())?;
+                }
             }
-
-            // ADR-3 / OQ-2: an unpriced call cannot be counted, so with a
-            // ceiling in force it is refused rather than sent uncounted. A
-            // missing price must not become a missing ceiling.
-            if let (Some(meter), Some(attribution)) = (&self.cost, &ctx.cost) {
-                if !meter.can_price(&attribution.model) {
-                    spend.note_unpriced();
-                    return Err(EgressError::SpendCeilingReached {
-                        message: unpriced_refusal(&ctx.provider_id.0, &attribution.model, bound),
-                    });
+            None => {
+                if let (Some(ceiling), Some(spend)) =
+                    (self.spend_ceiling, self.prompt_spend.as_ref())
+                {
+                    self.refuse_past_ceiling(ctx, ceiling, spend, || spend.note_unpriced())?;
                 }
             }
         }
@@ -1053,16 +1118,68 @@ impl<T: Transport> Egress<T> {
         // Bill the call iff the caller attached attribution and a meter is
         // installed; the meter wraps the response so recording happens from the
         // streamed usage when the body drains.
-        match (&self.cost, &ctx.cost) {
-            (Some(meter), Some(attribution)) => Ok(meter.meter_response(
+        match (&self.cost, &ctx.cost, &self.child_spend) {
+            // REQ-623 ADR-4: a child's call is billed exactly as any other, and
+            // its cost lands in the child's accumulator and the prompt's.
+            (Some(meter), Some(attribution), Some(child)) => Ok(child.meter_response(
+                meter.as_ref(),
                 response,
                 ctx.session_id.clone(),
                 ctx.provider_id.clone(),
                 attribution.clone(),
+            )),
+            (Some(meter), Some(attribution), None) => Ok(meter.meter_response(
+                response,
+                ctx.session_id.clone(),
+                ctx.provider_id.clone(),
+                match (&self.turn, &attribution.parent_turn_id) {
+                    (Some(turn), None) => attribution.clone().with_turn(turn.clone()),
+                    _ => attribution.clone(),
+                },
                 self.prompt_spend.clone(),
             )),
             _ => Ok(response),
         }
+    }
+
+    /// REQ-588's two pre-flight refusals, against whichever accumulator
+    /// governs this choke point: the prompt's, or a child's (REQ-623 ADR-4).
+    ///
+    /// One body for both so a child's refusal is the prompt's typed outcome
+    /// and sentence (LESSON-557), not a second composer free to drift.
+    /// `note_unpriced` records an uncountable call on every accumulator it
+    /// concerns — the prompt's, or the child's and the prompt's.
+    fn refuse_past_ceiling(
+        &self,
+        ctx: &EgressContext,
+        ceiling: u64,
+        spend: &teton_core::cost_ceiling::PromptSpend,
+        note_unpriced: impl FnOnce(),
+    ) -> Result<(), EgressError> {
+        use teton_core::cost_ceiling::{ceiling_refusal, unpriced_refusal, SpendBound};
+        let bound = SpendBound::PromptCeiling;
+
+        // ADR-2: a floor crossing, not a prediction. What this prompt has
+        // *recorded* decides; what the next call will cost cannot be known
+        // until the model has written it.
+        if spend.reached(ceiling) {
+            return Err(EgressError::SpendCeilingReached {
+                message: ceiling_refusal(spend.spent(), ceiling, bound),
+            });
+        }
+
+        // ADR-3 / OQ-2: an unpriced call cannot be counted, so with a
+        // ceiling in force it is refused rather than sent uncounted. A
+        // missing price must not become a missing ceiling.
+        if let (Some(meter), Some(attribution)) = (&self.cost, &ctx.cost) {
+            if !meter.can_price(&attribution.model) {
+                note_unpriced();
+                return Err(EgressError::SpendCeilingReached {
+                    message: unpriced_refusal(&ctx.provider_id.0, &attribution.model, bound),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// A per-turn, provenance-scoped [`Transport`] view for the adapter seam.
@@ -1414,6 +1531,7 @@ mod tests {
     }
     use crate::fixture_id;
     use std::sync::Mutex;
+    use teton_protocol::agent::ChildId;
     use teton_protocol::events::ProvenanceRejection;
 
     /// A `Transport` that records what it was asked to send and returns an empty
@@ -2831,6 +2949,337 @@ mod tests {
             .expect("a ceiling with nothing counting against it cannot refuse");
         assert_eq!(sent.lock().unwrap().len(), 1);
         assert_eq!(meter.queries(), 0, "and it must not price, either");
+    }
+
+    // ---- REQ-623: a child's share at the choke point (TASK-426) ----
+
+    /// A meter that bills every call a flat amount into whichever accumulator
+    /// it is handed — the ledger's `finalize`, without the SSE. The ledger's
+    /// own path through a child's accumulator is pinned in `cost::share`.
+    struct FlatMeter(u64);
+
+    impl CostMeter for FlatMeter {
+        fn meter_response(
+            &self,
+            response: TransportResponse,
+            _session_id: Option<SessionId>,
+            _provider_id: ProviderId,
+            _attribution: CostAttribution,
+            spend: Option<Arc<teton_core::cost_ceiling::PromptSpend>>,
+        ) -> TransportResponse {
+            if let Some(spend) = spend {
+                spend.add(self.0);
+            }
+            response
+        }
+    }
+
+    /// A child's choke point billing `per_call` for every call it forwards.
+    fn child_egress(
+        spend: &ChildSpend,
+        per_call: u64,
+    ) -> (Egress<CaptureTransport>, Arc<Mutex<Vec<TransportRequest>>>) {
+        let inner = CaptureTransport::default();
+        let sent = inner.sent.clone();
+        let egress = Egress::new(inner, boundaries(), Arc::new(CapturingSink::default()))
+            .with_cost_meter(Arc::new(FlatMeter(per_call)))
+            .with_child_spend(Some(spend.clone()));
+        (egress, sent)
+    }
+
+    /// One model call, its body drained as an adapter drains it.
+    async fn one_call(egress: &Egress<CaptureTransport>) -> Result<(), EgressError> {
+        let mut body = egress
+            .send(a_request("a call"), &Provenance::empty(), &priced_ctx())
+            .await?
+            .body;
+        while body.next().await.is_some() {}
+        Ok(())
+    }
+
+    /// **BR-8 / AC-13 at the choke point.** Three children split the headroom
+    /// the parent left. `a` spends its whole share and its next call is refused
+    /// with the prompt's own typed outcome and sentence; `c` ends early and its
+    /// unspent share goes to `b`, the one still running; `b` then completes a
+    /// call that its stamped share would have refused. Every call also landed
+    /// in the parent's accumulator, so the parent's next call meets the
+    /// ceiling the children consumed on the existing path.
+    ///
+    /// The amounts are literals from the fixture, never read back from the
+    /// subject.
+    ///
+    /// Mutations (recorded, full `tetond` lib suite): making
+    /// `SharePool::release` raise nobody reddens this test (b's third call is
+    /// refused at its stamped share) and four in `cost::share`; checking the
+    /// parent's accumulator instead of the child's own reddens this test alone
+    /// (c's first call is refused — the parent is already past c's share);
+    /// dropping the parent add in `ChildSpend::add` reddens this test (the
+    /// parent total) and two others.
+    #[tokio::test]
+    async fn a_child_over_its_share_is_refused_while_a_raised_sibling_is_not() {
+        use crate::cost::{share, SharePool};
+        const CEILING: u64 = 1_100_000;
+
+        let parent = Arc::new(teton_core::cost_ceiling::PromptSpend::default());
+        let parent_egress = Egress::new(
+            CaptureTransport::default(),
+            boundaries(),
+            Arc::new(CapturingSink::default()),
+        )
+        .with_cost_meter(Arc::new(FlatMeter(100_000)))
+        .with_spend_ceiling(CEILING)
+        .with_prompt_spend(Some(parent.clone()));
+        one_call(&parent_egress)
+            .await
+            .expect("the parent's own call");
+        assert_eq!(parent.spent(), 100_000);
+
+        let pool = SharePool::new(
+            share::headroom(Some(CEILING), parent.spent()),
+            &[
+                ChildId::new("call-1", "a"),
+                ChildId::new("call-1", "b"),
+                ChildId::new("call-1", "c"),
+            ],
+        );
+        let [a, b, c] = ["a", "b", "c"].map(|name| {
+            ChildSpend::new(
+                ChildId::new("call-1", name),
+                Arc::clone(&pool),
+                Some(parent.clone()),
+            )
+        });
+        assert_eq!(
+            [a.ceiling(), b.ceiling(), c.ceiling()],
+            [Some(333_333); 3],
+            "floor(1_000_000 / 3) each"
+        );
+        let (egress_a, sent_a) = child_egress(&a, 333_333);
+        let (egress_b, sent_b) = child_egress(&b, 200_000);
+        let (egress_c, _) = child_egress(&c, 100_000);
+
+        // `a` spends exactly its share; its next call is refused before the wire.
+        one_call(&egress_a)
+            .await
+            .expect("a's first call is under its share");
+        let err = one_call(&egress_a)
+            .await
+            .expect_err("a has reached its share");
+        let EgressError::SpendCeilingReached { message } = err else {
+            panic!("a child's refusal is the ceiling's typed outcome, got {err:?}");
+        };
+        assert!(
+            message.contains("$3.33"),
+            "the refusal names the child's spend and share: {message}"
+        );
+        assert_eq!(
+            sent_a.lock().unwrap().len(),
+            1,
+            "the refused call never left"
+        );
+        assert!(
+            a.release().is_none(),
+            "a spent its whole share: nothing to give"
+        );
+
+        // `c` ends early having spent 100_000 of 333_333; `b` is the one running.
+        one_call(&egress_c).await.expect("c's call");
+        assert_eq!(
+            c.release().map(|released| released.recipients),
+            Some(vec![(ChildId::new("call-1", "b"), 333_333 + 233_333)])
+        );
+
+        // `b` at 400_000 is past its stamped share and under its raised one.
+        one_call(&egress_b).await.expect("b's first call");
+        one_call(&egress_b).await.expect("b's second call");
+        one_call(&egress_b)
+            .await
+            .expect("400_000 spent: refused under 333_333, allowed under 566_666");
+        let err = one_call(&egress_b)
+            .await
+            .expect_err("600_000 spent has reached even the raised share");
+        assert!(matches!(err, EgressError::SpendCeilingReached { .. }));
+        assert_eq!(sent_b.lock().unwrap().len(), 3);
+
+        // The parent paid for everything: its own call plus every child's.
+        assert_eq!(
+            (a.spent(), b.spent(), c.spent()),
+            (333_333, 600_000, 100_000)
+        );
+        assert_eq!(parent.spent(), 100_000 + 333_333 + 600_000 + 100_000);
+        assert_eq!(
+            parent.spent(),
+            100_000 + a.spent() + b.spent() + c.spent(),
+            "the parent's accumulator is its own spend plus every child's"
+        );
+
+        // And so the parent's next call meets the ceiling on the existing path.
+        let err = one_call(&parent_egress)
+            .await
+            .expect_err("the children consumed the headroom");
+        assert!(matches!(err, EgressError::SpendCeilingReached { .. }));
+    }
+
+    /// No ceiling, no share: a child under an unlimited pool is never checked
+    /// and never priced — ADR-6's "off costs nothing", for children.
+    #[tokio::test]
+    async fn a_child_with_no_ceiling_is_never_checked_or_priced() {
+        use crate::cost::SharePool;
+        let child = ChildId::new("call-1", "free");
+        let spend = ChildSpend::new(
+            child.clone(),
+            SharePool::new(None, std::slice::from_ref(&child)),
+            None,
+        );
+        let inner = CaptureTransport::default();
+        let sent = inner.sent.clone();
+        let meter = Arc::new(PricingMeter::unpriceable());
+        let egress = Egress::new(inner, boundaries(), Arc::new(CapturingSink::default()))
+            .with_cost_meter(meter.clone())
+            .with_child_spend(Some(spend));
+
+        egress
+            .send(a_request("unlimited"), &Provenance::empty(), &priced_ctx())
+            .await
+            .expect("no ceiling refuses nothing");
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert_eq!(meter.queries(), 0, "and prices nothing");
+    }
+
+    /// An uncountable call under a share is refused naming the missing price,
+    /// and the fact lands on the child and on the prompt.
+    #[tokio::test]
+    async fn an_unpriceable_child_call_is_refused_and_noted_on_both_accumulators() {
+        use crate::cost::SharePool;
+        let child = ChildId::new("call-1", "audit");
+        let parent = Arc::new(teton_core::cost_ceiling::PromptSpend::default());
+        let spend = ChildSpend::new(
+            child.clone(),
+            SharePool::new(Some(1_000_000), std::slice::from_ref(&child)),
+            Some(parent.clone()),
+        );
+        let inner = CaptureTransport::default();
+        let sent = inner.sent.clone();
+        let egress = Egress::new(inner, boundaries(), Arc::new(CapturingSink::default()))
+            .with_cost_meter(Arc::new(PricingMeter::unpriceable()))
+            .with_child_spend(Some(spend.clone()));
+
+        let err = egress
+            .send(
+                a_request("unpriceable"),
+                &Provenance::empty(),
+                &priced_ctx(),
+            )
+            .await
+            .expect_err("an uncountable call under a share must not be sent");
+        let EgressError::SpendCeilingReached { message } = err else {
+            panic!("expected the ceiling's typed outcome, got {err:?}");
+        };
+        assert!(message.contains("claude-opus-4"), "{message}");
+        assert!(sent.lock().unwrap().is_empty());
+        assert!(spend.saw_unpriced() && parent.saw_unpriced());
+    }
+
+    /// A child's choke point built the way the prompt turn builds one — with
+    /// the prompt's ceiling and accumulator — is still governed by the child's
+    /// share, and counts each call into the parent once, not twice.
+    ///
+    /// Mutation (recorded, full `tetond` lib suite): letting the prompt pair's
+    /// check run on a child's choke point reddens this test alone (the call is
+    /// refused at the prompt's already-reached ceiling). Since verify
+    /// (2026-10-07) `with_child_spend` also clears the pair, so that mutation
+    /// needs the clear removed too to redden — the clear's own test is
+    /// `attaching_a_childs_spend_clears_the_prompt_pair`.
+    #[tokio::test]
+    async fn a_childs_choke_point_ignores_the_prompt_pair_and_counts_once() {
+        use crate::cost::SharePool;
+        let child = ChildId::new("call-1", "audit");
+        let parent = Arc::new(teton_core::cost_ceiling::PromptSpend::default());
+        parent.add(50_000);
+        let spend = ChildSpend::new(
+            child.clone(),
+            SharePool::new(Some(1_000_000), std::slice::from_ref(&child)),
+            Some(parent.clone()),
+        );
+        let inner = CaptureTransport::default();
+        let egress = Egress::new(inner, boundaries(), Arc::new(CapturingSink::default()))
+            .with_cost_meter(Arc::new(FlatMeter(7_000)))
+            // A prompt ceiling the parent has already reached.
+            .with_spend_ceiling(50_000)
+            .with_prompt_spend(Some(parent.clone()))
+            .with_child_spend(Some(spend.clone()));
+
+        one_call(&egress)
+            .await
+            .expect("the child's share governs, and it has 1_000_000 left");
+        assert_eq!(spend.spent(), 7_000);
+        assert_eq!(
+            parent.spent(),
+            57_000,
+            "one call, counted into the parent once"
+        );
+    }
+
+    /// **REQ-623 ADR-4 (verify): a child's spend and the prompt pair are
+    /// exclusive by construction** — attaching a child's spend clears a prompt
+    /// ceiling and accumulator set before it, and setting either after it is a
+    /// debug assertion.
+    ///
+    /// Benign: a prompt turn's choke point keeps its pair.
+    ///
+    /// Mutation (run 2026-10-07, reverted): the clear removed from
+    /// `with_child_spend` — 1 red of the 2,328 lib tests, this one, at the
+    /// ceiling.
+    #[test]
+    fn attaching_a_childs_spend_clears_the_prompt_pair() {
+        use crate::cost::SharePool;
+        let child = ChildId::new("call-1", "audit");
+        let parent = Arc::new(teton_core::cost_ceiling::PromptSpend::default());
+        let spend = ChildSpend::new(
+            child.clone(),
+            SharePool::new(Some(1_000), std::slice::from_ref(&child)),
+            Some(parent.clone()),
+        );
+        let prompt = Egress::new(
+            CaptureTransport::default(),
+            boundaries(),
+            Arc::new(CapturingSink::default()),
+        )
+        .with_spend_ceiling(50_000)
+        .with_prompt_spend(Some(parent.clone()));
+        assert_eq!(
+            prompt.spend_ceiling,
+            Some(50_000),
+            "benign: a prompt's pair"
+        );
+        assert!(prompt.prompt_spend.is_some());
+
+        let child_egress = prompt.with_child_spend(Some(spend));
+        assert_eq!(child_egress.spend_ceiling, None);
+        assert!(child_egress.prompt_spend.is_none());
+        assert!(child_egress.child_spend.is_some());
+    }
+
+    /// The other order: a prompt pair set on a choke point that already
+    /// carries a child's spend is a builder bug, caught in debug builds.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "never the prompt's ceiling")]
+    fn a_prompt_ceiling_after_a_childs_spend_is_a_debug_assertion() {
+        use crate::cost::SharePool;
+        let child = ChildId::new("call-1", "audit");
+        let spend = ChildSpend::new(
+            child.clone(),
+            SharePool::new(Some(1_000), std::slice::from_ref(&child)),
+            None,
+        );
+        let _ = Egress::new(
+            CaptureTransport::default(),
+            boundaries(),
+            Arc::new(CapturingSink::default()),
+        )
+        .with_child_spend(Some(spend))
+        .with_optional_spend_ceiling(Some(50_000));
     }
 }
 

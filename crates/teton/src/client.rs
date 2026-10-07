@@ -1816,11 +1816,17 @@ impl Connection {
             }
             EventOutcome::Permission(req) => {
                 // Not our session to answer — surface it and leave it to the
-                // interactive client that owns it.
+                // interactive client that owns it. A child's request says which
+                // child (REQ-623 AC-7) in the words the answering client's
+                // prompt uses; the parent's is the line it always was.
+                let by_child = req
+                    .child_id
+                    .as_ref()
+                    .map_or_else(String::new, |child| format!(" by child {}", child.name()));
                 ctx.surface.line(
                     LineKind::Notice,
                     &format!(
-                        "permission requested for tool `{}` in another session",
+                        "permission requested for tool `{}`{by_child} in another session",
                         req.tool_name
                     ),
                 );
@@ -3174,6 +3180,8 @@ mod tests {
                 update: SessionUpdatePayload::AgentMessageChunk {
                     text: text.to_owned(),
                 },
+                child_id: None,
+                parent_turn_id: None,
             }),
         }))
     }
@@ -3227,6 +3235,8 @@ mod tests {
                     label: "Reject once".to_owned(),
                     kind: PermissionOptionKind::RejectOnce,
                 }],
+                child_id: None,
+                parent_turn_id: None,
             }),
         }))
     }
@@ -3698,6 +3708,8 @@ mod tests {
                             label: "Reject once".to_owned(),
                             kind: teton_protocol::events::PermissionOptionKind::RejectOnce,
                         }],
+                        child_id: None,
+                        parent_turn_id: None,
                     },
                 ),
             },
@@ -4185,6 +4197,130 @@ mod tests {
         }
     }
 
+    /// **REQ-623 AC-7: a consent prompt from a child names the child; one from
+    /// the parent is unchanged.**
+    ///
+    /// Driven through the real pump ([`Connection::drain_events`] →
+    /// `dispatch_event` → `render_event` → `resolve_permission`) from the
+    /// envelope a daemon publishes, because the label has to survive every one
+    /// of those seams — a `child_id` dropped anywhere between the decode and
+    /// the prompter would leave a user answering "allow shell?" with three
+    /// children running and no way to know which one asked.
+    ///
+    /// Literal on both sides: the heading the surface draws, the question the
+    /// prompter is asked, and — the benign path — the parent's two strings
+    /// exactly as they were before children existed. A name that itself holds a
+    /// `/` keeps it: the split is at the first `/`, after the daemon-minted call
+    /// id, which is the reading the daemon's own `/cost` labels take. And the
+    /// child's question is **answered**, on the wire, under its own request id —
+    /// a label that cost the reply would be worse than no label.
+    ///
+    /// **Mutations, applied and observed red (2026-10-05; re-run 2026-10-07 by
+    /// TASK-430, which owns the counts — LESSON-652)** — each **1 red of
+    /// 1,079**, this test, over the `teton` unit suite (880), its `cli_e2e`
+    /// (98) and `pty_e2e` (54) suites, and `tetond`'s `agent_dispatch`,
+    /// `provenance_egress` and `event_response_ordering` (47). No end-to-end
+    /// test reddened: the CLI suites drive no agent events, and TASK-430's
+    /// drive the daemon over its socket, never the CLI. Each reverted with the
+    /// same edit:
+    ///
+    /// | Mutation | Fails on |
+    /// |---|---|
+    /// | `by_child` always empty in `resolve_permission` | the child's heading |
+    /// | `for_child` always empty in `resolve_permission` | the child's question |
+    /// | `child_label` splits at the **last** `/` | the `scan/src` heading |
+    ///
+    /// Since verify (2026-10-07) the child's heading also states the grant's
+    /// scope — `(for this session)` — because an answer to a child's ask is
+    /// the session's; the parent's heading is unchanged. Dropping the suffix
+    /// reddens this test at both child headings.
+    ///
+    /// Since verify (2026-10-07) the split is `ChildId::name`'s, the id's one
+    /// sanctioned accessor in `teton-protocol`; the third row's mutation,
+    /// re-run there (`rsplit_once`), reddens this test at the same heading and
+    /// the protocol's own `child_id_name_is_everything_after_the_first_slash`
+    /// — 2 reds over `teton-protocol`, `teton` and `tetond` (lib, bins and
+    /// integration suites).
+    #[test]
+    fn consent_prompt_names_the_child() {
+        use teton_protocol::agent::ChildId;
+        use teton_protocol::events::Event;
+
+        // One permission request through the pump, asked by `child` (or by the
+        // parent, for `None`) and answered `n`. Returns the prompt lines drawn,
+        // the questions asked, and the requests written back to the daemon.
+        let ask = |child: Option<ChildId>| {
+            let (mut conn, tx, peer) = test_connection();
+            let Incoming::Event(mut envelope) = permission_envelope("shell") else {
+                unreachable!("permission_envelope builds an event")
+            };
+            let Event::PermissionRequest(request) = &mut envelope.event else {
+                unreachable!("permission_envelope builds a permission_request")
+            };
+            request.parent_turn_id = child
+                .as_ref()
+                .map(|_| teton_protocol::TurnId::from("turn-3"));
+            request.child_id = child;
+            tx.send(Incoming::Event(envelope)).expect("queue");
+
+            let mut surface = RecordingSurface::new();
+            let mut state = SessionState::new();
+            let mut prompter = crate::prompt::ScriptedPrompter::new(&["n"]);
+            let mut ctx = UiContext {
+                surface: &mut surface,
+                state: &mut state,
+                prompter: &mut prompter,
+                answer_permissions: true,
+                answer_model_proposals: true,
+                auto_accept_model: false,
+                typed_input: true,
+                session_id: None,
+                skills: crate::slash::SkillSnapshot::empty(),
+            };
+            conn.drain_events(&mut ctx, || {}).expect("drain");
+            let lines: Vec<String> = surface
+                .lines_of(LineKind::Prompt)
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            (lines, prompter.questions, requests_written(&peer))
+        };
+
+        // Benign: the parent's ask, byte for byte as before REQ-623.
+        let (lines, questions, replies) = ask(None);
+        assert_eq!(lines, ["permission requested: shell — run `cargo test`"]);
+        assert_eq!(
+            questions,
+            ["  allow shell? [y]es / [n]o / [a]llow-always / [d]eny-always: "]
+        );
+        assert_eq!(replies.len(), 1, "{replies:?}");
+
+        // A child's ask names the child, in the heading and in the question.
+        let (lines, questions, replies) = ask(Some(ChildId::new("toolu_01", "audit-1")));
+        assert_eq!(
+            lines,
+            ["permission requested by child audit-1 (for this session): shell — run `cargo test`"]
+        );
+        assert_eq!(
+            questions,
+            ["  allow shell for child audit-1? [y]es / [n]o / [a]llow-always / [d]eny-always: "]
+        );
+        assert_eq!(
+            replies.len(),
+            1,
+            "the child's question is answered: {replies:?}"
+        );
+        assert_eq!(replies[0]["method"], "permission/respond", "{replies:?}");
+        assert_eq!(replies[0]["params"]["request_id"], "r1", "{replies:?}");
+
+        // A model-chosen name with a `/` in it is the name, whole.
+        let (lines, _, _) = ask(Some(ChildId::new("toolu_01", "scan/src")));
+        assert_eq!(
+            lines,
+            ["permission requested by child scan/src (for this session): shell — run `cargo test`"]
+        );
+    }
+
     #[test]
     fn classify_reads_a_success_response() {
         let raw = r#"{"jsonrpc":"2.0","id":1,"result":{"session_id":"s1"}}"#;
@@ -4244,6 +4380,89 @@ mod tests {
     fn classify_ignores_unknown_notifications_and_junk() {
         assert!(classify(r#"{"jsonrpc":"2.0","method":"mystery","params":{}}"#).is_none());
         assert!(classify("not json at all").is_none());
+    }
+
+    /// **REQ-623 TASK-421: a `tool_started` frame decodes whether or not it
+    /// carries the child stamp.**
+    ///
+    /// Every event reaches this CLI through [`classify`], and an envelope that
+    /// fails to decode there is dropped without a word — so a child id that
+    /// broke decoding would make a child's tool start vanish from the screen,
+    /// which is BUG-226's symptom and what BR-13 forbids. The frames are raw
+    /// JSON-RPC lines, exactly as the socket delivers them, written out by hand
+    /// rather than serialized by the types under test:
+    ///
+    /// - a pre-REQ-623 daemon's `tool_call` (no keys) reads `None`;
+    /// - a child's `tool_call` reads both ids;
+    /// - an `agent_*` event this build knows decodes as itself;
+    /// - an event kind this build does **not** know is skipped, not fatal —
+    ///   the forward-compatible vocabulary rule (REQ-588) still holds with the
+    ///   seven new variants in the enum.
+    ///
+    /// **Mutation (run 2026-10-05):** `#[serde(rename = "child")]` on
+    /// `SessionUpdate::child_id` reds this test on the stamped frame (the key
+    /// is no longer read, and the id decodes `None`) — 1 of 875 in this crate;
+    /// the protocol's own `child_ids_are_optional_and_omitted_when_none` reds
+    /// beside it.
+    #[test]
+    fn classify_decodes_tool_started_with_and_without_child_ids() {
+        use teton_protocol::agent::{ChildId, ChildStatus};
+        use teton_protocol::events::{Event, SessionUpdatePayload};
+        use teton_protocol::TurnId;
+
+        let decode = |raw: &str| match classify(raw) {
+            Some(Incoming::Event(envelope)) => *envelope,
+            _ => panic!("expected an event to decode: {raw}"),
+        };
+
+        let pre = r#"{"jsonrpc":"2.0","method":"event","params":{"session_id":"s1","seq":4,"event":"session_update","update":{"kind":"tool_call","tool_call_id":"c1","title":"read src/lib.rs","status":"in_progress"}}}"#;
+        match decode(pre).event {
+            Event::SessionUpdate(update) => {
+                assert_eq!(update.child_id, None);
+                assert_eq!(update.parent_turn_id, None);
+                assert!(
+                    matches!(
+                        &update.update,
+                        SessionUpdatePayload::ToolCall { tool_call_id, .. } if tool_call_id == "c1"
+                    ),
+                    "{update:?}"
+                );
+            }
+            other => panic!("expected a session_update, got {other:?}"),
+        }
+
+        let post = r#"{"jsonrpc":"2.0","method":"event","params":{"session_id":"s1","seq":5,"event":"session_update","update":{"kind":"tool_call","tool_call_id":"c2","title":"grep TODO","status":"in_progress"},"child_id":"toolu_01/audit-1","parent_turn_id":"turn-3"}}"#;
+        match decode(post).event {
+            Event::SessionUpdate(update) => {
+                assert_eq!(
+                    update.child_id.as_ref().map(ChildId::as_str),
+                    Some("toolu_01/audit-1")
+                );
+                assert_eq!(update.parent_turn_id, Some(TurnId::from("turn-3")));
+                assert!(
+                    matches!(
+                        &update.update,
+                        SessionUpdatePayload::ToolCall { tool_call_id, .. } if tool_call_id == "c2"
+                    ),
+                    "{update:?}"
+                );
+            }
+            other => panic!("expected a session_update, got {other:?}"),
+        }
+
+        let finished = r#"{"jsonrpc":"2.0","method":"event","params":{"session_id":"s1","seq":6,"event":"agent_child_finished","child_id":"toolu_01/audit-1","status":"timed_out","turns_used":3,"cost_micro_cents":900,"report_bytes":0,"truncated":false}}"#;
+        match decode(finished).event {
+            Event::AgentChildFinished(done) => {
+                assert_eq!(done.status, ChildStatus::TimedOut);
+                assert_eq!(done.child_id.as_str(), "toolu_01/audit-1");
+            }
+            other => panic!("expected agent_child_finished, got {other:?}"),
+        }
+
+        assert!(
+            classify(r#"{"jsonrpc":"2.0","method":"event","params":{"session_id":"s1","seq":7,"event":"agent_child_paused","child_id":"toolu_01/audit-1"}}"#).is_none(),
+            "an event kind this build does not know is skipped, not fatal"
+        );
     }
 
     #[test]
@@ -6803,6 +7022,8 @@ mod tests {
                             cached_tokens: None,
                             reasoning_tokens: None,
                             probe: false,
+                            child_id: None,
+                            parent_turn_id: None,
                         },
                     }),
                 ),
@@ -6817,6 +7038,8 @@ mod tests {
                         update: events::SessionUpdatePayload::AgentMessageChunk {
                             text: "the finding is".to_owned(),
                         },
+                        child_id: None,
+                        parent_turn_id: None,
                     }),
                 ),
                 Phase::Streaming,
@@ -6832,6 +7055,8 @@ mod tests {
                             title: "shell: cargo test".to_owned(),
                             status: events::ToolCallStatus::InProgress,
                         },
+                        child_id: None,
+                        parent_turn_id: None,
                     }),
                 ),
                 Phase::ToolRunning,
@@ -6849,6 +7074,8 @@ mod tests {
                             tool_call_id: "c1".to_owned(),
                             status: events::ToolCallStatus::Completed,
                         },
+                        child_id: None,
+                        parent_turn_id: None,
                     }),
                 ),
                 Phase::AwaitingModel,
@@ -6901,6 +7128,8 @@ mod tests {
                             label: "Reject once".to_owned(),
                             kind: events::PermissionOptionKind::RejectOnce,
                         }],
+                        child_id: None,
+                        parent_turn_id: None,
                     }),
                 ),
                 Phase::Held,
@@ -6916,6 +7145,8 @@ mod tests {
                         update: events::SessionUpdatePayload::AgentMessageChunk {
                             text: "not ours".to_owned(),
                         },
+                        child_id: None,
+                        parent_turn_id: None,
                     }),
                 ),
                 Phase::Held,

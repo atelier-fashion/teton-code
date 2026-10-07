@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -92,6 +92,35 @@ pub fn assert_no_boundary_bytes() {
     }
 }
 
+/// Assert the boundary secret is in none of `bodies` — **one** provider's
+/// captured requests, where [`assert_no_boundary_bytes`] reads every
+/// provider's (REQ-623 verify).
+///
+/// The global check runs over a process-wide buffer, so a leak in an earlier
+/// test reddens every later test that calls it: a mutation that leaks once is
+/// then counted as many reds, and a test whose own provider stayed clean cannot
+/// say so. Called beside the global check with the test's own provider, this
+/// one goes red only for a leak *this* test's daemon sent — its red is its own,
+/// not a cascade. It names `label` and every offending request index, so the
+/// failure says which provider and which request carried the bytes
+/// (LESSON-624: print where the marker is before touching the choke point).
+pub fn assert_no_secret_in(label: &str, bodies: &[Vec<u8>]) {
+    let leaked: Vec<usize> = bodies
+        .iter()
+        .enumerate()
+        .filter(|(_, body)| {
+            contains(body, SECRET_SENTINEL.as_bytes())
+                || contains(body, b"postgres://prod-db.internal")
+        })
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "BR-1 VIOLATION: boundary file content reached {label} in request(s) {leaked:?} of {}",
+        bodies.len()
+    );
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
 }
@@ -118,10 +147,20 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// depended on it would be asserting a bug. Bodies are always served as
 /// `text/event-stream` regardless of status — no header support (ADR-2), and
 /// the adapters branch on the status code before they look at the body.
+///
+/// ## Held replies (REQ-623 ADR-6)
+///
+/// A response may carry a [`Rendezvous`] ([`Self::rendezvous`],
+/// [`Rendezvous::hold`]): the request it answers is parked until the
+/// rendezvous's count of requests has arrived, then answered. Only
+/// [`MockProvider::start_matching`] serves held replies — it gives every
+/// connection its own thread, so parked requests do not stop it accepting the
+/// ones that release them. Cloning a held response shares its rendezvous.
 #[derive(Clone)]
 pub struct MockResponse {
     pub status: u16,
     pub body: String,
+    hold: Option<Rendezvous>,
 }
 
 impl MockResponse {
@@ -129,6 +168,7 @@ impl MockResponse {
         Self {
             status: 200,
             body: body.into(),
+            hold: None,
         }
     }
 
@@ -148,12 +188,198 @@ impl MockResponse {
         Self {
             status: code,
             body: body.into(),
+            hold: None,
         }
     }
 
     /// A hard client error (used to simulate a flaky provider for AC-7).
     pub fn bad_request() -> Self {
         Self::status_with_body(400, String::new())
+    }
+
+    /// `inner`, held until `n` requests are parked on it, then released to all
+    /// `n` at once (REQ-623 ADR-6).
+    ///
+    /// Shorthand for `Rendezvous::new(n).hold(inner)`. Every request served
+    /// this response — or a clone of it — parks on the same rendezvous, so in a
+    /// [`MockProvider::start_matching`] table one held reply spans several
+    /// entries by cloning it, and as the `default` it holds every unmatched
+    /// request. Build the [`Rendezvous`] yourself when the parked requests
+    /// should each get a different reply, or when the test needs to watch how
+    /// many have arrived.
+    pub fn rendezvous(n: usize, inner: MockResponse) -> Self {
+        Rendezvous::new(n).hold(inner)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Request matching and the rendezvous hold (REQ-623 ADR-6)
+// ---------------------------------------------------------------------------
+
+/// Which request a [`MockProvider::start_matching`] table entry answers: a
+/// substring of the request **body** (e.g. a child's `task` text).
+///
+/// The match is against the raw bytes the client sent — the JSON-encoded
+/// body — so a needle containing a `"` or a newline must be written as it is
+/// escaped on the wire. Plain words and hyphenated markers match as written.
+#[derive(Clone, Debug)]
+pub struct Matcher {
+    needle: String,
+}
+
+impl Matcher {
+    /// Matches a request whose body contains `needle`.
+    pub fn body_contains(needle: impl Into<String>) -> Self {
+        let needle = needle.into();
+        assert!(
+            !needle.is_empty(),
+            "an empty needle matches every request; use the default reply instead"
+        );
+        Self { needle }
+    }
+
+    /// Whether `body` is a request this matcher answers.
+    pub fn matches(&self, body: &[u8]) -> bool {
+        contains(body, self.needle.as_bytes())
+    }
+}
+
+/// How often a parked request re-checks that its provider is still running, so
+/// dropping a [`MockProvider`] with requests parked on an unmet rendezvous
+/// ends their threads instead of leaking them.
+const PARKED_POLL: Duration = Duration::from_millis(20);
+
+/// A counting hold: requests served a reply built from it park until `n` of
+/// them have arrived, and the `n`th arrival releases **every** parked request
+/// at once (REQ-623 ADR-6).
+///
+/// Release is all-or-nothing and unordered — which parked request writes its
+/// reply first is the scheduler's choice, and nothing here promises one
+/// (LESSON-540): assert on the set of replies, never on their order. Once
+/// released the rendezvous stays open; a later arrival passes straight through.
+///
+/// Clones share one count. That is how replies that differ (one per child) all
+/// wait on the same rendezvous: [`Self::hold`] each of them from one
+/// `Rendezvous`.
+#[derive(Clone)]
+pub struct Rendezvous {
+    shared: Arc<RendezvousShared>,
+}
+
+struct RendezvousShared {
+    n: usize,
+    state: Mutex<RendezvousState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct RendezvousState {
+    arrived: usize,
+    released: bool,
+}
+
+impl Rendezvous {
+    /// A rendezvous that releases when `n` requests have parked on it.
+    pub fn new(n: usize) -> Self {
+        assert!(
+            n > 0,
+            "a rendezvous of zero holds nothing; serve the reply plainly"
+        );
+        Self {
+            shared: Arc::new(RendezvousShared {
+                n,
+                state: Mutex::new(RendezvousState::default()),
+                changed: Condvar::new(),
+            }),
+        }
+    }
+
+    /// `reply`, held on this rendezvous.
+    pub fn hold(&self, reply: MockResponse) -> MockResponse {
+        assert!(
+            reply.hold.is_none(),
+            "a reply waits on one rendezvous; this one is already held"
+        );
+        MockResponse {
+            hold: Some(self.clone()),
+            ..reply
+        }
+    }
+
+    /// How many requests have reached this rendezvous — the parked ones plus,
+    /// once it has released, every one it released or passed through.
+    pub fn arrived(&self) -> usize {
+        self.shared.state.lock().unwrap().arrived
+    }
+
+    /// Whether the `n`th request has arrived and the hold is open.
+    pub fn is_released(&self) -> bool {
+        self.shared.state.lock().unwrap().released
+    }
+
+    /// Block until at least `count` requests have arrived, or `timeout`
+    /// passes. Returns whether they arrived — so a test can wait for a request
+    /// to be *parked* (arrived, not released) instead of sleeping on a guess.
+    pub fn wait_arrived(&self, count: usize, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.shared.state.lock().unwrap();
+        while state.arrived < count {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            state = self
+                .shared
+                .changed
+                .wait_timeout(state, deadline - now)
+                .unwrap()
+                .0;
+        }
+        true
+    }
+
+    /// A hold that **only [`Self::open`] releases** — no count of arrivals
+    /// does (REQ-623 TASK-430).
+    ///
+    /// For a request that must stay parked until something the test observes
+    /// *on the daemon's side* has happened — a sibling child's finish, a share
+    /// released, a consent answered — none of which is a request to this
+    /// server, so no arrival count could stand for it. The test watches its
+    /// client for the event, then opens the gate.
+    pub fn gate() -> Self {
+        Self::new(usize::MAX)
+    }
+
+    /// Release every request parked on this hold now, and let every later one
+    /// pass straight through — exactly as the `n`th arrival would have.
+    pub fn open(&self) {
+        let mut state = self.shared.state.lock().unwrap();
+        state.released = true;
+        self.shared.changed.notify_all();
+    }
+
+    /// Park the calling connection thread until the rendezvous releases.
+    ///
+    /// Returns `false` — the request goes unanswered — when the provider
+    /// stopped `running` first, so a test that ends with a request parked on an
+    /// unmet rendezvous (the failure this fixture exists to produce) does not
+    /// strand the thread.
+    fn park(&self, running: &AtomicBool) -> bool {
+        let shared = &self.shared;
+        let mut state = shared.state.lock().unwrap();
+        state.arrived += 1;
+        if state.arrived >= shared.n {
+            state.released = true;
+        }
+        // Wakes every parked request (on release) and every `wait_arrived`.
+        shared.changed.notify_all();
+        while !state.released {
+            if !running.load(Ordering::SeqCst) {
+                return false;
+            }
+            state = shared.changed.wait_timeout(state, PARKED_POLL).unwrap().0;
+        }
+        true
     }
 }
 
@@ -302,6 +528,15 @@ impl MockProvider {
         default: MockResponse,
         delay: Duration,
     ) -> Self {
+        assert!(
+            scripted
+                .iter()
+                .chain(std::iter::once(&default))
+                .all(|r| r.hold.is_none()),
+            "a held MockResponse needs MockProvider::start_matching: this server answers one \
+             connection at a time, so a request parked on a rendezvous would stop it accepting \
+             the requests that release it"
+        );
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
@@ -341,6 +576,76 @@ impl MockProvider {
         Self {
             port,
             scripted,
+            default,
+            requests,
+            running,
+            handle: Some(handle),
+        }
+    }
+
+    /// Start a mock provider that answers each request by **what it says**,
+    /// not by when it arrived (REQ-623 ADR-6).
+    ///
+    /// Concurrent children make arrival order a scheduler accident, so the
+    /// ordered script of [`Self::start`] cannot address one. Here every request
+    /// is answered by the first **unconsumed** `table` entry, in list order,
+    /// whose [`Matcher`] its body satisfies; that entry is then spent. A request
+    /// no live entry matches gets `default`. Consuming entries is what lets a
+    /// test script one child's successive requests — two entries with the same
+    /// needle answer that child's first and second request in turn — and keeps
+    /// a later request that merely *quotes* a child's task (the parent's
+    /// follow-up, carrying the tool call) from re-taking that child's reply:
+    /// put the most specific needles first.
+    ///
+    /// Each connection gets its own thread, so a reply held on a [`Rendezvous`]
+    /// parks only its own request. Every request body is captured — into
+    /// [`Self::requests`] and the suite-wide [`global_capture`] — on arrival,
+    /// before it is matched or parked, so [`assert_no_boundary_bytes`] sees a
+    /// request that is still parked when the test asserts.
+    pub fn start_matching(table: Vec<(Matcher, MockResponse)>, default: MockResponse) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+
+        let table: Arc<MatchTable> = Arc::new(Mutex::new(table.into_iter().map(Some).collect()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let running = Arc::new(AtomicBool::new(true));
+
+        let handle = {
+            let requests = Arc::clone(&requests);
+            let running = Arc::clone(&running);
+            let default = default.clone();
+            thread::spawn(move || {
+                let mut connections = Vec::new();
+                while running.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let stream = accepted(stream);
+                            let table = Arc::clone(&table);
+                            let requests = Arc::clone(&requests);
+                            let running = Arc::clone(&running);
+                            let default = default.clone();
+                            connections.push(thread::spawn(move || {
+                                serve_matched(stream, &table, &default, &requests, &running);
+                            }));
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                // `running` is down, so a parked connection gives up within
+                // `PARKED_POLL`; joining here makes `Drop` wait for them all.
+                for connection in connections {
+                    let _ = connection.join();
+                }
+            })
+        };
+
+        Self {
+            port,
+            scripted: Arc::new(Mutex::new(VecDeque::new())),
             default,
             requests,
             running,
@@ -404,7 +709,50 @@ fn handle_http(
     let body = read_http_body(&mut stream);
     record_egress(body.clone());
     requests.lock().unwrap().push(body);
+    write_http_response(&mut stream, response);
+}
 
+/// A [`MockProvider::start_matching`] table: `None` marks a spent entry.
+type MatchTable = Mutex<Vec<Option<(Matcher, MockResponse)>>>;
+
+/// One connection on the matching path: capture the body, take the reply its
+/// body selects, park on that reply's rendezvous if it has one, then answer.
+fn serve_matched(
+    mut stream: TcpStream,
+    table: &MatchTable,
+    default: &MockResponse,
+    requests: &Arc<Mutex<Vec<Vec<u8>>>>,
+    running: &AtomicBool,
+) {
+    let body = read_http_body(&mut stream);
+    // Captured before matching or parking: a parked request is still egress.
+    record_egress(body.clone());
+    requests.lock().unwrap().push(body.clone());
+
+    let response = take_first_match(table, &body).unwrap_or_else(|| default.clone());
+    if let Some(hold) = &response.hold {
+        if !hold.park(running) {
+            return; // the provider is shutting down; drop the request unanswered
+        }
+    }
+    write_http_response(&mut stream, &response);
+}
+
+/// Spend and return the first live entry whose matcher `body` satisfies.
+///
+/// The table lock is released before the caller parks, so a held request never
+/// blocks another request's matching.
+fn take_first_match(table: &MatchTable, body: &[u8]) -> Option<MockResponse> {
+    let mut table = table.lock().unwrap();
+    table
+        .iter_mut()
+        .find(|entry| matches!(entry, Some((matcher, _)) if matcher.matches(body)))
+        .and_then(Option::take)
+        .map(|(_, response)| response)
+}
+
+/// Write `response` as a `Connection: close` HTTP/1.1 reply.
+fn write_http_response(stream: &mut TcpStream, response: &MockResponse) {
     let code = response.status;
     let head = format!(
         "HTTP/1.1 {code} {}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -902,6 +1250,21 @@ pub struct Client {
     /// frames the classifier drops (lag notices) and the responses to somebody
     /// else's request. Filled by the reader thread, which is why it is shared.
     raw: Arc<Mutex<Vec<String>>>,
+    /// Responses read off the wire while the caller was waiting for something
+    /// else — an event ([`Self::wait_for_event`], [`Self::drain_events`]) or a
+    /// different request's reply ([`Self::await_response`]). Kept, in arrival
+    /// order, until [`Self::await_response`] asks for their id.
+    ///
+    /// Before REQ-623's verify pass every pump but `await_response` dropped a
+    /// response it read past, and `await_response` dropped every response but
+    /// its own. A test that waited for an event while its prompt was in flight
+    /// was then correct only if the prompt's response happened to follow that
+    /// event on the wire — an ordering assumption nobody wrote down, which
+    /// turned into a twenty-second "timed out awaiting response" the day a
+    /// daemon change moved one event past the response. Stashing makes every
+    /// pump order-independent: a response is consumed exactly once, by the
+    /// await that names it.
+    stashed: Vec<Value>,
 }
 
 impl Client {
@@ -993,6 +1356,7 @@ impl Client {
             auto_approve: true,
             auto_consent,
             raw,
+            stashed: Vec::new(),
         };
         client.handshake();
         client
@@ -1086,6 +1450,24 @@ impl Client {
         )
     }
 
+    /// Answer the permission prompt `request_id` with `outcome` **without**
+    /// waiting for the daemon's acknowledgement (REQ-623 TASK-430).
+    ///
+    /// A consent test answers while its own `session/prompt` is still running,
+    /// and [`Self::call`] would pump — and drop — that prompt's response if it
+    /// landed first. The acknowledgement this returns the id of is consumed and
+    /// discarded by whichever await reads past it.
+    ///
+    /// `outcome` is the wire form: `{"outcome": "selected", "option_id":
+    /// "allow_always"}`, or `{"outcome": "refused", "reason": "no_terminal"}` —
+    /// what a client with nobody at its terminal answers.
+    pub fn respond_permission(&mut self, request_id: &str, outcome: Value) -> i64 {
+        self.send(
+            "permission/respond",
+            json!({ "request_id": request_id, "outcome": outcome }),
+        )
+    }
+
     /// Close this connection the way a departing client does.
     ///
     /// Explicit because dropping the struct is not enough on its own: the reader
@@ -1102,7 +1484,18 @@ impl Client {
     /// Pump (and auto-answer) events until the response to request `id`
     /// arrives, and return it. Every event seen on the way is recorded, so a
     /// caller can read what happened between the send and the reply.
+    ///
+    /// A response some earlier pump read past is taken from the stash first
+    /// (see [`Self::stashed`]); any other request's response read here is
+    /// stashed for its own await rather than dropped.
     pub fn await_response(&mut self, id: i64) -> Value {
+        if let Some(at) = self
+            .stashed
+            .iter()
+            .position(|v| v.get("id").and_then(Value::as_i64) == Some(id))
+        {
+            return self.stashed.remove(at);
+        }
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let remaining = deadline
@@ -1113,6 +1506,7 @@ impl Client {
                     if v.get("id").and_then(Value::as_i64) == Some(id) {
                         return v;
                     }
+                    self.stashed.push(v);
                 }
                 Ok(Incoming::Event(ev)) => self.on_event(ev),
                 Err(RecvTimeoutError::Timeout) => panic!("timed out awaiting response {id}"),
@@ -1139,7 +1533,8 @@ impl Client {
         self.events.push(ev);
     }
 
-    /// Passively collect events for `window`, auto-answering permission prompts.
+    /// Passively collect events for `window`, auto-answering permission prompts
+    /// and stashing any response for [`Self::await_response`].
     pub fn drain_events(&mut self, window: Duration) {
         let deadline = Instant::now() + window;
         loop {
@@ -1151,7 +1546,7 @@ impl Client {
             }
             match self.rx.recv_timeout(remaining) {
                 Ok(Incoming::Event(ev)) => self.on_event(ev),
-                Ok(Incoming::Response(_)) => {}
+                Ok(Incoming::Response(v)) => self.stashed.push(v),
                 Err(_) => return,
             }
         }
@@ -1292,6 +1687,11 @@ impl Client {
 
     /// Pump events until one named `name` arrives (or `window` elapses),
     /// returning the first such event — including one already observed.
+    ///
+    /// A response read on the way is stashed, never dropped (see
+    /// [`Self::stashed`]): a caller may wait here while its own prompt is in
+    /// flight and collect that prompt's response afterwards, whichever side of
+    /// the event it arrived on.
     pub fn wait_for_event(&mut self, name: &str, window: Duration) -> Option<Value> {
         if let Some(seen) = self.events_named(name).first() {
             return Some((*seen).clone());
@@ -1312,7 +1712,7 @@ impl Client {
                         return self.events_named(name).last().map(|e| (*e).clone());
                     }
                 }
-                Ok(Incoming::Response(_)) => {}
+                Ok(Incoming::Response(v)) => self.stashed.push(v),
                 Err(_) => return None,
             }
         }
@@ -1328,6 +1728,9 @@ impl Client {
     /// is what keeps the suite from flaking on a loaded runner where the replayed
     /// lifecycle can land after any guessed window. Events already observed are
     /// considered first, so a stage that arrived before the call is not missed.
+    ///
+    /// Responses read on the way are stashed for [`Self::await_response`], as
+    /// in [`Self::wait_for_event`].
     pub fn wait_for_event_where(
         &mut self,
         name: &str,
@@ -1356,7 +1759,7 @@ impl Client {
                         return self.events.last().cloned();
                     }
                 }
-                Ok(Incoming::Response(_)) => {}
+                Ok(Incoming::Response(v)) => self.stashed.push(v),
                 Err(_) => return None,
             }
         }
@@ -2129,4 +2532,36 @@ pub fn tier_block_with_fallback(tier: &str, provider: &str, fallback: &str) -> S
 /// TOML, and a test that passes `"redact"` should and does fail at config load.
 pub fn category_block(category: &str, provider: &str) -> String {
     format!("[[categories]]\nname = \"{category}\"\nprovider_id = \"{provider}\"\n\n")
+}
+
+// ---------------------------------------------------------------------------
+// REQ-623 fixture builders: the `[agent]` and `[cost]` tables
+// ---------------------------------------------------------------------------
+
+/// The `[agent]` table (REQ-623), carrying only the keys a fixture overrides —
+/// each `(key, value)` written verbatim as TOML, so a number is `"1"` and a
+/// bool `"false"`. Every key left out keeps the shipped default
+/// (`max_children_per_call` 5, `max_children_per_turn` 8, `child_max_turns` 12,
+/// `child_deadline_secs` 600, `report_max_bytes` 32768, `enabled` true).
+///
+/// `Config` refuses no unknown key, so a misspelled one would be ignored and
+/// the fixture would run under the default it meant to override. A test that
+/// leans on an override therefore reads the bound back off the daemon —
+/// `agent_child_started` publishes all four — before it relies on it.
+pub fn agent_table(entries: &[(&str, &str)]) -> String {
+    let mut out = String::from("[agent]\n");
+    for (key, value) in entries {
+        out.push_str(&format!("{key} = {value}\n"));
+    }
+    out.push('\n');
+    out
+}
+
+/// The `[cost]` table with a per-prompt spend ceiling (REQ-588), in dollars as
+/// a person types it. The daemon converts it once, at load, to the integral
+/// unit every spend comparison runs in — so a test that wants the ceiling in
+/// that unit reads it back off the daemon (`agent_child_started`'s stamped
+/// share, `cost_recorded`'s `usd_micros`), never off this float.
+pub fn cost_table(prompt_ceiling_usd: f64) -> String {
+    format!("[cost]\nprompt_ceiling_usd = {prompt_ceiling_usd}\n\n")
 }

@@ -99,6 +99,16 @@ const MUST_BE_PRESENT: &[&str] = &[
 /// | `taint_pin_line` | `carry.rs` |
 /// | `endpoint_query_names_a_credential` | `provider_recipes.rs`, `web_setup_catalog.rs` |
 /// | `PinRecord` | `carry.rs` |
+/// | `turn_registry` | `harness/tools/agent.rs` (its test module only) |
+///
+/// `turn_registry` joined at REQ-623 TASK-428, and it is a **test** fixture:
+/// `testsupport.rs` is compiled only under `cfg(test)`, so the item is absent
+/// from every production build. It is crate-visible because the `agent` tool's
+/// BR-12 test (`child_registry_has_skill_not_agent`) must assert what the
+/// runtime's `build_tools` hands a child, and that tool's module may not reach
+/// `runtime::*` otherwise (REQ-623 architecture, "Layering"). Re-derived by the
+/// method above: demoting it to `pub(super)` yields `E0603` at the test's two
+/// calls in `agent.rs`.
 ///
 /// `PinRecord` joined at REQ-620's Phase-5 verify (M6). `carry.rs` reads what
 /// `runtime::context_taint_cause` derived from a context's provenance — the
@@ -122,6 +132,7 @@ const CRATE_WIDE: &[&str] = &[
     "PinRecord",
     "endpoint_query_names_a_credential",
     "taint_pin_line",
+    "turn_registry",
 ];
 
 /// The submodule items that are **`pub`** — wider than `pub(crate)`, and
@@ -414,8 +425,13 @@ fn declared_pub_crate() -> BTreeSet<String> {
 /// All reverted after observing. Recording mutation 3's compile error rather
 /// than dropping it is the point: a mutation that "passes" because the build
 /// never ran is the false-green this REQ line has already shipped once.
+///
+/// Renamed from `the_crate_wide_surface_is_exactly_the_four_items_that_earn_it`
+/// by REQ-623 TASK-428, when `turn_registry` became the fifth: a count in a
+/// test's name is a claim the next addition falsifies, and `CRATE_WIDE` is
+/// where the count lives.
 #[test]
-fn the_crate_wide_surface_is_exactly_the_four_items_that_earn_it() {
+fn the_crate_wide_surface_is_exactly_the_items_that_earn_it() {
     let found = declared_pub_crate();
     let expected: BTreeSet<String> = CRATE_WIDE.iter().map(|s| (*s).to_owned()).collect();
 

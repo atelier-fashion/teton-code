@@ -22,6 +22,16 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+/// How many recorded `usd_micros` (1e-6 USD — the ledger's and the wire's
+/// price unit) make one micro-cent (1e-5 USD — the unit
+/// `[cost] prompt_ceiling_usd` is converted to and [`usd`] renders).
+///
+/// The one conversion between the two units. BUG-231: REQ-588 added recorded
+/// `usd_micros` to the accumulator unconverted, so a $1.00 ceiling bound at
+/// ~$0.10 and the refusal reported ten times the real spend. Every reader of a
+/// price that feeds a micro-cent total goes through this constant.
+pub const USD_MICROS_PER_MICRO_CENT: i64 = 10;
+
 /// What a prompt has spent so far, in integral micro-cents (ADR-1).
 ///
 /// **Its lifetime is the prompt.** One is created where the prompt is and

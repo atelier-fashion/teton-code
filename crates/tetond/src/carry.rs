@@ -103,6 +103,13 @@ pub struct CarriedTurn {
     /// for byte. See [`RepoContextCarry`] for why the block cannot simply be
     /// kept.
     repo_context: Option<RepoContextCarry>,
+    /// A child turn's context (REQ-623 BR-1): seeded fresh by
+    /// [`Self::detached`] and never written back. Every commit path — the
+    /// explicit ones and the armed `Drop` — returns without touching the
+    /// session, so a child's reads, edits and answer can never become the
+    /// parent's conversation. Its ledger rows, events and transcript records
+    /// are what persist; its context is dropped.
+    detached: bool,
 }
 
 /// The two halves of a system prompt that carries repository notes, kept apart
@@ -277,6 +284,67 @@ impl CarriedTurn {
             armed: true,
             system_sources,
             repo_context,
+            detached: false,
+        }
+    }
+
+    /// Seed a **child** turn's context (REQ-623 BR-1): the session's system
+    /// prompt, then `prompt` as the only user block — and nothing replayed.
+    ///
+    /// [`Self::begin`]'s seeding with two differences, both the point:
+    ///
+    /// - **No replay.** None of the session's conversation is visible to a
+    ///   child; what the parent wants it to know, it wrote into the task or the
+    ///   context (which the caller has already rendered into `system`).
+    /// - **No commit, ever.** The guard is born disarmed and stays detached:
+    ///   [`Self::commit`] and the `Drop` write nothing and pin nothing. The
+    ///   context exists for the child's own attempts — its egress checks, its
+    ///   reroute refit through [`Self::rebudget`] — and then it is dropped.
+    ///
+    /// `provenance` is the task text's own: the parent's context provenance at
+    /// the moment it wrote the task. The user block carries it exactly as a
+    /// skill expansion's block carries the skill file's, so the child's egress
+    /// and its pin judge the task as they would the parent's next call.
+    #[must_use]
+    pub fn detached(
+        sessions: &SessionRegistry,
+        session_id: &SessionId,
+        system: impl Into<String>,
+        harness: &HarnessConfig,
+        prompt: impl Into<String>,
+        provenance: &crate::egress::Provenance,
+        repo_context: Option<RepoContextCarry>,
+    ) -> Self {
+        // As `begin`: the head's identities are the notes block's, read off the
+        // value `system` was built from.
+        let system_sources: BTreeSet<ProvenanceId> = harness
+            .repo_context
+            .as_ref()
+            .map(|block| block.provenance.clone())
+            .into_iter()
+            .collect();
+        let mut ctx = ContextManager::new(system, harness.context_budget_tokens)
+            .with_budget_bytes(harness.context_budget_bytes)
+            .with_window_label(harness.budget.window_label.clone())
+            .with_system_sources(system_sources.clone());
+        ctx.push_user_from(
+            prompt,
+            provenance.ids().cloned().collect(),
+            provenance.is_unknown(),
+            provenance.is_boundary_touch(),
+        );
+        Self {
+            ctx: Some(ctx),
+            sessions: sessions.clone(),
+            session_id: session_id.clone(),
+            // Never consulted: a detached guard pins nothing (see
+            // `commit_now`), so it holds no share of the session's taint set.
+            taint: Arc::new(SessionTaint::new()),
+            boundaries: Vec::new(),
+            armed: false,
+            system_sources,
+            repo_context,
+            detached: true,
         }
     }
 
@@ -512,7 +580,8 @@ impl CarriedTurn {
         let Some(mut ctx) = self.ctx.take() else {
             return PressureReport::default();
         };
-        if panicking {
+        // REQ-623: a child's context is never the session's conversation.
+        if panicking || self.detached {
             return PressureReport::default();
         }
         // Read before the manager is shrunk or consumed, and before any trim:

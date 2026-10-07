@@ -288,6 +288,18 @@ pub struct LocalEngineSource {
     /// go through [`Engine::complete`], which has no way to name a session, so
     /// a duty cannot evict this session's prefix (BR-5).
     session_id: SessionId,
+    /// The child turn these calls belong to, and the prompt turn it runs under
+    /// (REQ-623 BR-8) — `None` for a prompt turn's own source.
+    ///
+    /// The remote tier stamps a child's rows at its choke point (the child's
+    /// `ChildSpend`); this tier has no choke point, so it carries the pair
+    /// itself, for the same reason it carries its meter.
+    child: Option<(teton_protocol::agent::ChildId, teton_protocol::TurnId)>,
+    /// The prompt turn this source's own calls are billed under (REQ-623
+    /// BR-8, AC-12) — the parent's half of [`Self::child`], for the same
+    /// reason: the remote tier stamps it at its choke point
+    /// (`Egress::with_turn`) and this tier has none.
+    turn: Option<teton_protocol::TurnId>,
 }
 
 impl LocalEngineSource {
@@ -309,7 +321,31 @@ impl LocalEngineSource {
             format,
             meter: None,
             session_id,
+            child: None,
+            turn: None,
         }
+    }
+
+    /// Write this source's usage rows under the prompt turn `turn_id`
+    /// (REQ-623 BR-8, AC-12) — a parent turn's own local calls, beside its
+    /// children's in `/cost`. A child's pair ([`Self::for_child`]) wins.
+    #[must_use]
+    pub fn under_turn(mut self, turn_id: teton_protocol::TurnId) -> Self {
+        self.turn = Some(turn_id);
+        self
+    }
+
+    /// Write this source's usage rows under `child_id`, running under the
+    /// prompt turn `parent_turn_id` (REQ-623 BR-8, AC-12) — so `/cost` nests a
+    /// child's local calls under its parent turn beside its remote ones.
+    #[must_use]
+    pub fn for_child(
+        mut self,
+        child_id: teton_protocol::agent::ChildId,
+        parent_turn_id: teton_protocol::TurnId,
+    ) -> Self {
+        self.child = Some((child_id, parent_turn_id));
+        self
     }
 
     /// Record this source's completed turns into `meter` (REQ-564 BR-9).
@@ -439,9 +475,17 @@ impl CompletionSource for LocalEngineSource {
         // One usage row per completed local turn (BR-9). `input_tokens` stays
         // the full prompt; `cached_tokens` says how much of it came for free.
         if let Some(meter) = self.meter.as_ref() {
+            let attribution = match (&self.child, &self.turn) {
+                (Some((child_id, parent_turn_id)), _) => CostAttribution::new(cache.model.clone())
+                    .for_child(child_id.clone(), parent_turn_id.clone()),
+                (None, Some(turn_id)) => {
+                    CostAttribution::new(cache.model.clone()).with_turn(turn_id.clone())
+                }
+                (None, None) => CostAttribution::new(cache.model.clone()),
+            };
             meter.local_call(
                 &self.session_id,
-                &CostAttribution::new(cache.model.clone()),
+                &attribution,
                 u64::from(completion.prompt_tokens),
                 u64::from(completion.completion_tokens),
                 u64::from(completion.cached_tokens),
@@ -1787,9 +1831,11 @@ mod tests {
             match &env.event {
                 Event::SessionUpdate(SessionUpdate {
                     update: SessionUpdatePayload::ToolCall { title, .. },
+                    ..
                 }) => titles.push(title.clone()),
                 Event::SessionUpdate(SessionUpdate {
                     update: SessionUpdatePayload::AgentMessageChunk { text },
+                    ..
                 }) => shown.push_str(text),
                 _ => {}
             }

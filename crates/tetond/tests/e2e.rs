@@ -9,6 +9,9 @@
 //!
 //! - [`harness`] — spawn/drive support, the mock provider (egress-capture) HTTP
 //!   server, the mock HuggingFace host, and the suite-wide BR-1 capture assertion.
+//! - [`harness_tests`] — REQ-623 ADR-6: the mock provider's own fixture
+//!   self-tests (request matching and the rendezvous hold), raw HTTP against
+//!   the mock with no daemon.
 //! - [`ac_matrix`] — one test per REQ-544 acceptance criterion.
 //! - [`consent_matrix`] — one test per REQ-547 acceptance criterion (the
 //!   first-run model-consent gate), against a mock model host and a fixture
@@ -73,6 +76,8 @@ mod daemon_lifetime;
 mod duty_taint;
 #[path = "e2e/harness.rs"]
 mod harness;
+#[path = "e2e/harness_tests.rs"]
+mod harness_tests;
 #[path = "e2e/model_identity.rs"]
 mod model_identity;
 #[path = "e2e/privacy_fixes.rs"]
