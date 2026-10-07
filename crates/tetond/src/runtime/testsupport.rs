@@ -192,6 +192,7 @@ pub(crate) async fn turn_registry(
             None,
         ),
         model_calls: Arc::default(),
+        route: crate::harness::child::ChildRouteCell::default(),
     };
     let tctx = TurnContext::new(&events, &session_id, &config, &router, &gate, None);
     let (tctx, toolset) = if child {

@@ -47,8 +47,8 @@ use teton_protocol::TurnId;
 use crate::cost::{share::unspent, ChildSpend};
 use crate::harness::child::{
     bound_report, child_system_section, over_budget_refusal, turns_exhausted_report,
-    ChildDispatcher, ChildOutcome, ChildOutcomeSlot, ChildSpec, ChildTaskScope, ChildToolCalls,
-    ChildTurn, PausableDeadline, ShareRelease,
+    ChildDispatcher, ChildOutcome, ChildOutcomeSlot, ChildRouteCell, ChildSpec, ChildTaskScope,
+    ChildToolCalls, ChildTurn, PausableDeadline, ShareRelease,
 };
 use crate::harness::context::BlockRole;
 use crate::harness::reply::prose_before_tool_call;
@@ -118,6 +118,7 @@ impl ChildDispatcher for ChildTurns {
         let spend = spec.spend.clone().under_turn(self.parent_turn_id.clone());
         let progress = Arc::new(Mutex::new(Progress::default()));
         let model_calls = Arc::new(AtomicU32::new(0));
+        let route = ChildRouteCell::default();
 
         // Declared before the work handle, so it drops after it: an aborted
         // runner stops the work first, then leaves its outcome.
@@ -128,6 +129,7 @@ impl ChildDispatcher for ChildTurns {
             spend: spend.clone(),
             progress: Arc::clone(&progress),
             model_calls: Arc::clone(&model_calls),
+            route: route.clone(),
             seed_provenance: spec.provenance.clone(),
         };
         let tool_calls = ChildToolCalls::default();
@@ -145,6 +147,7 @@ impl ChildDispatcher for ChildTurns {
             spend: spend.clone(),
             progress: Arc::clone(&progress),
             model_calls: Arc::clone(&model_calls),
+            route: route.clone(),
             tool_calls,
         };
         let mut handle = AbortOnDrop(tokio::spawn(scope.scope(work.run())));
@@ -176,6 +179,7 @@ impl ChildDispatcher for ChildTurns {
             spend: &spend,
             progress: &progress,
             model_calls: &model_calls,
+            route: &route,
             seed_provenance: &spec.provenance,
             ended,
         })
@@ -185,9 +189,12 @@ impl ChildDispatcher for ChildTurns {
 /// What the runner knows once the work has stamped it — read by the runner
 /// after a `timed_out` and by the drop guard after a cancel, when the work
 /// itself can no longer say.
+///
+/// The route is not here: it moves after stamping (a reroute), and the attempt
+/// loop keeps it current in the [`ChildRouteCell`] it shares with the runner
+/// (BR-6). The bounds never move (BR-7).
 #[derive(Default)]
 struct Progress {
-    route: Option<ChildRoute>,
     bounds: Option<ChildBounds>,
 }
 
@@ -231,6 +238,9 @@ struct Work {
     spend: ChildSpend,
     progress: Arc<Mutex<Progress>>,
     model_calls: Arc<AtomicU32>,
+    /// The child's current route — stamped here, kept current by the attempt
+    /// loop (BR-6).
+    route: ChildRouteCell,
     /// What the child's calls came to at the gate — the same log its scope
     /// carries, read when it ends (BR-10's "refused by a gate").
     tool_calls: ChildToolCalls,
@@ -244,6 +254,7 @@ impl Work {
             spend,
             progress,
             model_calls,
+            route: route_cell,
             tool_calls,
         } = self;
         let runtime = &turns.runtime;
@@ -289,6 +300,7 @@ impl Work {
             max_turns,
             spend: spend.clone(),
             model_calls,
+            route: route_cell.clone(),
         };
         let tctx = TurnContext::new(
             &turns.events,
@@ -334,10 +346,12 @@ impl Work {
             spend_ceiling_micro_cents: spend.stamped_share(),
             deadline_secs: spec.deadline.as_secs(),
         });
-        {
-            let mut progress = progress.lock().unwrap_or_else(PoisonError::into_inner);
-            progress.route.clone_from(&child_route);
-            progress.bounds = bounds;
+        progress
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .bounds = bounds;
+        if let Some(route) = &child_route {
+            route_cell.set(route.clone());
         }
 
         // BR-1: the task and its context are admitted whole, or the child is
@@ -489,7 +503,14 @@ fn ended_by(err: &RpcError) -> Ended {
 /// The child's route as the parent reads it (BR-6): what the router chose,
 /// after the pin — `route_decided`'s projection, never a re-derivation. A
 /// local-tier route that names no model takes the loaded engine's.
-fn child_route_of(
+///
+/// `pub(super)` for the attempt loop, which re-projects it at the top of every
+/// attempt so a reroute is reported (see [`ChildTurn::route`]). That is the
+/// whole of "the route it ended on": the cell holds the route of the last
+/// attempt that began. A reroute arm that replaces the route and then ends the
+/// run without another attempt (a refit refusal) leaves the route the child was
+/// last served by, which is where it ran.
+pub(super) fn child_route_of(
     route: &crate::router::Route,
     engine_model: Option<String>,
 ) -> Option<ChildRoute> {
@@ -524,6 +545,7 @@ struct Finish<'a> {
     spend: &'a ChildSpend,
     progress: &'a Mutex<Progress>,
     model_calls: &'a AtomicU32,
+    route: &'a ChildRouteCell,
     seed_provenance: &'a Provenance,
     ended: Ended,
 }
@@ -537,14 +559,15 @@ fn finish(finish: Finish<'_>) -> ChildOutcome {
         spend,
         progress,
         model_calls,
+        route,
         seed_provenance,
         ended,
     } = finish;
     let report = bound_report(&ended.text, report_max_bytes);
-    let (route, bounds) = {
-        let progress = progress.lock().unwrap_or_else(PoisonError::into_inner);
-        (progress.route.clone(), progress.bounds)
-    };
+    let bounds = progress
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .bounds;
     let share_released = release(spend);
     ChildOutcome {
         result: ChildResult {
@@ -554,7 +577,9 @@ fn finish(finish: Finish<'_>) -> ChildOutcome {
             refusal: ended.refusal,
             error: ended.error,
             turns_used: model_calls.load(std::sync::atomic::Ordering::Relaxed),
-            route,
+            // BR-6: where the child ended up — after any pin or fallback — not
+            // where it started.
+            route: route.get(),
             // BR-7: the stamped value, echoed — not re-derived from a route a
             // reroute may since have replaced.
             bounds,
@@ -602,6 +627,7 @@ struct CancelGuard {
     spend: ChildSpend,
     progress: Arc<Mutex<Progress>>,
     model_calls: Arc<AtomicU32>,
+    route: ChildRouteCell,
     seed_provenance: Provenance,
 }
 
@@ -616,6 +642,7 @@ impl Drop for CancelGuard {
             spend: &self.spend,
             progress: &self.progress,
             model_calls: &self.model_calls,
+            route: &self.route,
             seed_provenance: &self.seed_provenance,
             ended: Ended::of(ChildStatus::Cancelled),
         });
@@ -1130,6 +1157,111 @@ mod tests {
         assert!(
             started_at < first_streamed,
             "the bounds were published before the first call answered"
+        );
+    }
+
+    // ---- BR-6 --------------------------------------------------------------
+
+    /// A daemon whose default provider is a remote one at a loopback port
+    /// nothing answers on, with `secret.md` under a `local-only` boundary — so
+    /// a child seeded from that file is routed remote, refused at its first
+    /// call's egress inspection, and pinned to the local tier mid-run.
+    ///
+    /// The endpoint is loopback so that a broken inspection fails fast against
+    /// a closed port rather than reaching a real vendor.
+    fn pinned_mid_run_rig(tag: &str) -> (Rig, Provenance) {
+        let mut config = super::super::testsupport::config_with_remote("deepseek");
+        config.default_provider = Some("deepseek".to_owned());
+        for provider in &mut config.providers {
+            if provider.id == "deepseek" {
+                provider.endpoint = Some("http://127.0.0.1:9/v1/chat/completions".to_owned());
+            }
+        }
+        config.boundaries.push(PrivacyBoundary {
+            path_glob: "secret.md".to_owned(),
+            mode: BoundaryMode::LocalOnly,
+            origin: Default::default(),
+        });
+        let rig = Rig::with_config(tag, true, config);
+        std::fs::write(rig.root.join("secret.md"), "local only\n").unwrap();
+        let secret = ProvenanceId::from_resolved(&rig.root, &rig.root.join("secret.md")).unwrap();
+        (rig, Provenance::tainted_by(secret))
+    }
+
+    /// **BR-6: a child pinned local mid-run reports the local route** — the
+    /// route it ended on, not the one `agent_child_started` announced.
+    ///
+    /// Two legs over the same pin: one that completes on the local tier after
+    /// the reroute, and one whose local call is still in flight when its
+    /// deadline passes, so the run never returns and the result is framed from
+    /// what the attempt loop last recorded.
+    ///
+    /// Non-vacuity: the started event names the remote provider, so the child
+    /// really did begin remote and really was moved.
+    ///
+    /// # Mutation (run 2026-10-07, reverted)
+    ///
+    /// - **Stamp the route once** (the attempt loop's `child.route.set(..)`
+    ///   removed from `run_attempts`): 1 red of the 67 tests matching `child`,
+    ///   this one, at the completed leg's provider — `deepseek`, the route the
+    ///   child started on. With that leg's two route assertions also removed,
+    ///   the timed-out leg reddens on its own, at its provider.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn child_pinned_mid_run_reports_the_local_route() {
+        let (rig, seed) = pinned_mid_run_rig("child-pinned");
+        let mut sub = rig.events.subscribe(4096);
+        rig.engine.say("answered locally");
+        let outcome = rig
+            .dispatcher()
+            .run_child(ChildSpec {
+                provenance: seed.clone(),
+                ..rig.spec("pinned", "summarise the secret")
+            })
+            .await;
+        assert_eq!(outcome.status(), ChildStatus::Completed, "{outcome:?}");
+        assert_eq!(outcome.result.report, "answered locally");
+
+        let started = drained(&mut sub)
+            .into_iter()
+            .find_map(|e| match e {
+                Event::AgentChildStarted(started) => Some(started),
+                _ => None,
+            })
+            .expect("agent_child_started is published");
+        assert_eq!(
+            started.route.provider_id.0, "deepseek",
+            "non-vacuity: the child began on the remote route"
+        );
+        assert!(
+            rig.runtime.session_taint.is_tainted(&rig.session_id),
+            "non-vacuity: the egress inspection pinned the session"
+        );
+        let route = outcome.result.route.as_ref().expect("a routed child");
+        assert_ne!(
+            route.provider_id.0, "deepseek",
+            "the result names the route the child started on, not the one it ended on"
+        );
+        assert_eq!(route.model, "script", "the local engine's model: {route:?}");
+
+        // Timed out on the local tier, after the pin: the run never returns,
+        // and the result still names where it was.
+        let (rig, seed) = pinned_mid_run_rig("child-pinned-timeout");
+        let (release, parked) = mpsc::channel();
+        rig.engine.then(Reply::Park(parked));
+        let timed = rig
+            .dispatcher()
+            .run_child(ChildSpec {
+                provenance: seed,
+                deadline: Duration::from_secs(1),
+                ..rig.spec("pinned-slow", "summarise the secret")
+            })
+            .await;
+        let _ = release.send(());
+        assert_eq!(timed.status(), ChildStatus::TimedOut, "{timed:?}");
+        let route = timed.result.route.as_ref().expect("a routed child");
+        assert_ne!(
+            route.provider_id.0, "deepseek",
+            "a timed-out child reports the route it was pinned to"
         );
     }
 
@@ -1660,6 +1792,7 @@ mod tests {
             max_turns: 12,
             spend: rig.spec("x", "x").spend,
             model_calls: Arc::new(AtomicU32::new(0)),
+            route: ChildRouteCell::default(),
         };
         assert!(
             !announces(

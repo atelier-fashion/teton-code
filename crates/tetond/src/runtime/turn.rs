@@ -1742,10 +1742,17 @@ impl DaemonRuntime {
             //
             // And its turn cap is re-applied on every attempt: a reroute swaps in
             // the new provider's profile, and BR-7 says the stamped bound is
-            // never raised.
+            // never raised. The route it is about to run on is recorded for its
+            // result (BR-6) — a reroute moved it, and the result reports where
+            // the child ended up, not where it started.
             match tctx.child {
                 Some(child) => {
                     st.route.harness.max_turns = st.route.harness.max_turns.min(child.max_turns);
+                    if let Some(route) =
+                        super::child_turn::child_route_of(&st.route, self.engine.model())
+                    {
+                        child.route.set(route);
+                    }
                 }
                 None => tctx.core.router.emit_route_decided(
                     tctx.core.events,

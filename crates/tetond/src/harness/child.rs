@@ -66,7 +66,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use teton_protocol::agent::{ChildId, ChildResult, ChildStatus};
+use teton_protocol::agent::{ChildId, ChildResult, ChildRoute, ChildStatus};
 use teton_protocol::events::{bytes_figure, thousands};
 use teton_protocol::{RequestId, Tier, TurnId};
 use tokio::sync::Notify;
@@ -301,6 +301,32 @@ pub struct ChildTurn {
     /// loop's return, because a child that times out or is cancelled never
     /// returns one, and a reroute starts the loop's own count again.
     pub model_calls: Arc<AtomicU32>,
+    /// The route the child is running on **now** — `ChildResult.route`
+    /// (BR-6). Stamped by the runner before the first call and rewritten by
+    /// the attempt loop at the top of every attempt, so a child a privacy
+    /// block pinned local, or a provider failure moved to a fallback, reports
+    /// the route it ended on rather than the one it started on. Shared with the runner for
+    /// the reason [`Self::model_calls`] is: a child that times out or is
+    /// cancelled mid-reroute never returns its route.
+    pub route: ChildRouteCell,
+}
+
+/// Where a child's current route is kept — see [`ChildTurn::route`].
+#[derive(Debug, Clone, Default)]
+pub struct ChildRouteCell(Arc<Mutex<Option<ChildRoute>>>);
+
+impl ChildRouteCell {
+    /// The child is now running on `route`.
+    pub fn set(&self, route: ChildRoute) {
+        *lock(&self.0) = Some(route);
+    }
+
+    /// The route the child was last running on, or `None` before one was
+    /// stamped.
+    #[must_use]
+    pub fn get(&self) -> Option<ChildRoute> {
+        lock(&self.0).clone()
+    }
 }
 
 /// A [`CompletionSource`] that counts the model calls it serves into a shared
