@@ -14,12 +14,13 @@
 //! `child_id`, and an ordering claim is either within one child or against a
 //! parent-anchored event (`agent_call_started`, `agent_call_finished`).
 //!
-//! The one exception to "through the daemon" is [`statuses::cancelled`]: the
-//! daemon has no RPC that cancels a running prompt — a departing client's turn
-//! *drains* (REQ-565), and the only abort is `TURN_DRAIN_TIMEOUT`'s, 300 s
-//! later — so that test drives the daemon's own `DaemonRuntime` in-process,
-//! with the real child runner and a real HTTP vendor, and drops the parent
-//! turn's future the way that abort does. Its doc comment says so again.
+//! The two exceptions to "through the daemon" are [`statuses::cancelled`] and
+//! [`statuses::cancelled_with_tool_in_flight`]: the daemon has no RPC that
+//! cancels a running prompt — a departing client's turn *drains* (REQ-565),
+//! and the only abort is `TURN_DRAIN_TIMEOUT`'s, 300 s later — so those tests
+//! drive the daemon's own `DaemonRuntime` in-process, with the real child
+//! runner and a real HTTP vendor, and drop the parent turn's future the way
+//! that abort does. Their doc comments say so again.
 //!
 //! | rule | claim | test |
 //! |---|---|---|
@@ -74,9 +75,10 @@
 //! - **BUG-226's own mutation does not redden the parked verifier.**
 //!   Dispatching a child's tool inline (no `block_in_place_if_multithread`)
 //!   left [`liveness::child_tool_started_arrives_while_parked`] green in 8 of 8
-//!   runs: the LIFO-slot starvation that bug recorded does not reproduce inside
-//!   a child's own task in this build. Blocking the *parent's* worker on the
-//!   call does redden it — see that test.
+//!   runs (0 of 5 in the verify pass's re-run): the LIFO-slot starvation that
+//!   bug recorded does not reproduce inside a child's own task in this build.
+//!   That test guards a burst-on-finish forwarder and a parent worker blocked
+//!   on the call — both redden it — and not BUG-226's shape; see its doc.
 
 #[path = "e2e/harness.rs"]
 mod harness;
@@ -388,6 +390,90 @@ fn parked_shell(started: &str, release: &str) -> Value {
     })
 }
 
+/// What [`surviving_shell`] prints once released: assembled by `printf` from
+/// two halves, so the marker is in the tool's **output** and in none of its
+/// arguments (LESSON-624) — a request carrying it carries the output itself.
+const SURVIVOR_OUTPUT: &str = "SHELL-SURVIVOR-OUTPUT";
+
+/// A `shell` command that parks like [`parked_shell`] and, once released,
+/// prints [`SURVIVOR_OUTPUT`] and touches `survived` — so a test can tell
+/// whether the process outlived the child that started it, and whether its
+/// output went anywhere.
+///
+/// The park is bounded (600 polls, ~30 s) and the tail runs only if the
+/// release really came: a test that panics before releasing must not leave a
+/// shell looping forever over a deleted workspace.
+fn surviving_shell(started: &str, release: &str, survived: &str) -> Value {
+    json!({
+        "command": format!(
+            "touch {started} && i=0 && while [ ! -f {release} ] && [ $i -lt 600 ]; \
+             do sleep 0.05; i=$((i+1)); done && [ -f {release} ] \
+             && printf 'SHELL-%s-OUTPUT\\n' SURVIVOR && touch {survived}"
+        )
+    })
+}
+
+/// **KNOWN LEAK — current behaviour, pinned so it cannot widen unnoticed**
+/// (REQ-623 verify; a BUG is to be filed at wrapup).
+///
+/// A child whose deadline fires, or whose parent turn is cancelled, while its
+/// `shell` is in flight is parked *inside* the blocking dispatch
+/// (`block_in_place_if_multithread(|| tools.dispatch(..))` in
+/// `turn_loop::run_the_allowed_tool`). Its abort cannot land until the shell
+/// returns, and a tokio abort is only observed when the task next returns
+/// `Pending` — so once the test releases the shell, the dead child's loop runs
+/// on: it publishes the call's `tool_call_update` (`completed`, child-stamped)
+/// **after** `agent_child_finished` said the child was over, and keeps going
+/// until something pends. Under REQ-597's shipped boundary globs that is far
+/// enough to classify the shell result, block the child's next call and **pin
+/// the whole session local** (`session_pinned`, `privacy_block`, both
+/// unstamped) — observed in this file's in-process leg during the verify pass,
+/// before its boundaries were turned off to keep the classifier out of it.
+///
+/// What still holds, and is asserted strictly beside this: no provider request
+/// follows, and the tool's output reaches no model. The leak is the event
+/// stream and the session's state.
+///
+/// When the dispatch honours the child's end, `late` is empty and each caller's
+/// `assert_only_known_leak(..)` becomes `assert!(late.is_empty())`.
+fn assert_only_known_leak(late: &[Value], tool_call_id: &str) {
+    let shapes: Vec<(String, String, String)> = late
+        .iter()
+        .map(|e| {
+            (
+                e["event"].as_str().unwrap_or_default().to_owned(),
+                e["update"]["kind"].as_str().unwrap_or_default().to_owned(),
+                e["update"]["tool_call_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shapes,
+        vec![(
+            "session_update".to_owned(),
+            "tool_call_update".to_owned(),
+            tool_call_id.to_owned()
+        )],
+        "after the release, the dead child published exactly its in-flight call's \
+         tool_call_update and nothing else (the known leak — see this function's doc): \
+         {late:#?}"
+    );
+}
+
+/// Whether `event` names a child anywhere a child is named: an `agent_child_*`
+/// event, a stamped `session_update`/`permission_request`/`context_pressure`,
+/// or a `cost_recorded` whose record names one.
+fn child_scoped(event: &Value) -> bool {
+    event["child_id"].is_string()
+        || event["record"]["child_id"].is_string()
+        || event["event"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("agent_child_"))
+}
+
 // ---------------------------------------------------------------------------
 // AC-5 — concurrency, proven by a rendezvous
 // ---------------------------------------------------------------------------
@@ -520,19 +606,33 @@ mod liveness {
         (provider, rig)
     }
 
-    /// **AC-6 (BR-4, BR-13; LESSON-518, BUG-226): a child's `tool_call`
-    /// reaches a subscribed client while that child's tool is still parked.**
+    /// **AC-6 (BR-4, BR-13; LESSON-518): a child's `tool_call` reaches a
+    /// subscribed client while that child's tool is still parked.**
     ///
     /// The parked verifier. The child's `shell` touches a `started` file and
     /// then waits on a `release` file only this test creates; the test sees
     /// `started` (so the tool is provably running), and only then — with the
     /// tool still parked and nothing to release it but the test — waits for
-    /// the child-stamped `tool_call` on its own connection. A forwarder that
-    /// delivered child events in a burst when the call finished, or a child
-    /// tool that sat on the worker the forwarder needs (BUG-226's shape at N×
-    /// the duration), cannot deliver it here at all: the call cannot finish
-    /// until the event has arrived. The daemon runs a multi-thread runtime,
-    /// which is the runtime the BUG-226 starvation needs (LESSON-518).
+    /// the child-stamped `tool_call` on its own connection. The call cannot
+    /// finish until the event has arrived, so two shapes cannot deliver it
+    /// here at all:
+    ///
+    /// - **a forwarder that delivers child events in a burst** when the call
+    ///   finishes (a child emitter that buffered, or a call that published its
+    ///   children's news only on landing);
+    /// - **a parent whose worker blocks on the call** — the parent turn's task
+    ///   parked synchronously on its children, so the client's forwarder and
+    ///   the children's own tasks wait on a worker that will not yield.
+    ///
+    /// **What it does not guard: BUG-226's own shape.** That bug was a tool
+    /// dispatched inline on the worker the forwarder's LIFO slot needs; the
+    /// inline-dispatch mutation below left this test green in 8 of 8 runs
+    /// here and 0 of 5 in the verify pass's re-run. The starvation does not
+    /// reproduce inside a child's own task in this build, so a regression of
+    /// `block_in_place_if_multithread` in a child's tool dispatch would pass
+    /// this suite; the guard for it belongs at library level, where the
+    /// runtime's scheduling can be pinned (REQ-623 verify, recorded for the
+    /// follow-up).
     ///
     /// # Mutation (run 2026-10-07, reverted)
     ///
@@ -546,10 +646,9 @@ mod liveness {
     ///   emitter): 5 red, this test among them — the event arrives, unstamped.
     /// - **The child's tool dispatched inline** (`run_the_allowed_tool`
     ///   calling `tools.dispatch` without `block_in_place_if_multithread`,
-    ///   BUG-226's own fix removed): **0 red, in 8 of 8 runs of this test.** A
-    ///   finding, not a pass: the LIFO-slot starvation BUG-226 recorded does
-    ///   not reproduce inside a child's own task in this build, so this
-    ///   verifier guards the parent-blocking shape and not that one.
+    ///   BUG-226's own fix removed): **0 red, in 8 of 8 runs of this test** (and
+    ///   0 of 5 in the verify pass's re-run). A finding, not a pass — see "What
+    ///   it does not guard" above.
     #[test]
     fn child_tool_started_arrives_while_parked() {
         let (_provider, mut rig) = parked_rig("ac6", "AC6-PARENT", "AC6-WATCHED", "watched");
@@ -673,9 +772,9 @@ mod consent {
     /// Returns the prompts it had to answer.
     ///
     /// Pumps with `wait_for_event_where`, which returns *at* the matching
-    /// event: every pump drops the responses it reads past, and the prompt's
-    /// own response follows `agent_call_finished` on the wire, so stopping
-    /// there leaves it for the caller's `await_response`.
+    /// event and stashes any response it reads past — the prompt's own
+    /// included, whichever side of `agent_call_finished` it lands on — for the
+    /// caller's `await_response`.
     fn pump_until_call_finished(client: &mut Client, answered: &[String]) -> Vec<Value> {
         let deadline = Instant::now() + WINDOW;
         let mut extra = Vec::new();
@@ -1721,18 +1820,215 @@ mod statuses {
         "ST-OVERSIZED ".len() + "word ".len() * 10_000
     }
 
+    /// The daemon's own runtime, driven in-process — the rig the two
+    /// `cancelled` tests share, and the only one in this file (see
+    /// [`cancelled`] for why they are the exceptions to "through the daemon").
+    struct InProcess {
+        runtime: std::sync::Arc<tetond::runtime::DaemonRuntime>,
+        bus: std::sync::Arc<tetond::broadcast::EventBus>,
+        sessions: tetond::sessions::SessionRegistry,
+        session: teton_protocol::SessionId,
+        sub: tetond::broadcast::Subscription,
+        ws: Workspace,
+    }
+
+    impl InProcess {
+        /// `provider` registered and bound to `build`, one structured
+        /// `implement` session at `full` rooted in a fresh workspace, and a bus
+        /// subscription opened before anything runs. With `default_boundaries`
+        /// false, REQ-597's builtin globs are off — see
+        /// [`NO_DEFAULT_BOUNDARIES`] for why a test running `shell` wants that.
+        fn start(tag: &str, provider: &MockProvider, default_boundaries: bool) -> Self {
+            use teton_protocol::methods::{
+                ConfigUpdate, ProviderConfig, SessionPermissionsParams, TierBindingConfig,
+            };
+            use teton_protocol::permissions::PermissionLevel;
+            use teton_protocol::{Phase, ProviderId, ProviderKind, SessionMode, Tier};
+            use tetond::broadcast::EventBus;
+            use tetond::runtime::DaemonRuntime;
+            use tetond::sessions::SessionRegistry;
+
+            let ws = Workspace::new(tag);
+            let runtime = if default_boundaries {
+                DaemonRuntime::minimal()
+            } else {
+                DaemonRuntime::minimal().with_default_boundaries_disabled()
+            };
+            let runtime = std::sync::Arc::new(runtime);
+            runtime
+                .apply_config_update(ConfigUpdate::RegisterProvider(ProviderConfig {
+                    id: ProviderId::from(REMOTE),
+                    kind: ProviderKind::OpenaiCompatible,
+                    endpoint: Some(provider.openai_endpoint()),
+                    model: Some(MODEL.to_owned()),
+                    auth_ref: None,
+                    max_context: Some(128_000),
+                    context_budget_cap: None,
+                    allow_cleartext: None,
+                    floored_budget: None,
+                }))
+                .expect("registering the provider");
+            runtime
+                .apply_config_update(ConfigUpdate::SetTierBinding(TierBindingConfig {
+                    tier: Tier::Build,
+                    provider_id: ProviderId::from(REMOTE),
+                    fallback_id: None,
+                }))
+                .expect("binding build");
+            let bus = std::sync::Arc::new(EventBus::new());
+            let sessions = SessionRegistry::new();
+            let session = sessions
+                .create(
+                    SessionMode::Structured,
+                    Some(Phase::Implement),
+                    Some(ws.repo.clone()),
+                )
+                .expect("a structured session")
+                .session_id;
+            let set = runtime.session_permissions(
+                &SessionPermissionsParams {
+                    session_id: session.clone(),
+                    level: Some(PermissionLevel::Full),
+                },
+                &bus,
+            );
+            assert_eq!(set.level, PermissionLevel::Full);
+            let sub = bus.subscribe(4096);
+            Self {
+                runtime,
+                bus,
+                sessions,
+                session,
+                sub,
+                ws,
+            }
+        }
+
+        /// Run `prompt` as the session's prompt turn on a task of its own —
+        /// the task the server's teardown aborts.
+        fn spawn_turn(&self, prompt: &str) -> tokio::task::JoinHandle<impl Send + 'static> {
+            use teton_protocol::{Phase, SessionMode};
+            use tetond::grants::GrantRegistry;
+            use tetond::runtime::ClientPresence;
+
+            let runtime = std::sync::Arc::clone(&self.runtime);
+            let bus = std::sync::Arc::clone(&self.bus);
+            let sessions = self.sessions.clone();
+            let session = self.session.clone();
+            let cwd = self.ws.repo.clone();
+            let prompt = prompt.to_owned();
+            tokio::spawn(async move {
+                runtime
+                    .run_prompt_turn(
+                        &bus,
+                        &sessions,
+                        session,
+                        SessionMode::Structured,
+                        Some(Phase::Implement),
+                        Some(cwd),
+                        prompt,
+                        None,
+                        Some(GrantRegistry::new().next_connection_id()),
+                        ClientPresence::unwatched(),
+                    )
+                    .await
+            })
+        }
+
+        /// Read the bus until `agent_call_finished`, or [`WINDOW`]: every
+        /// child's finish on the way, and the call's own.
+        async fn until_call_finished(
+            &mut self,
+        ) -> (
+            Vec<(String, teton_protocol::agent::ChildStatus)>,
+            Option<teton_protocol::events::AgentCallFinished>,
+        ) {
+            use teton_protocol::events::Event;
+            let mut finished = Vec::new();
+            let mut call_finished = None;
+            let deadline = tokio::time::Instant::now() + WINDOW;
+            while call_finished.is_none() && tokio::time::Instant::now() < deadline {
+                match tokio::time::timeout(Duration::from_millis(200), self.sub.recv()).await {
+                    Ok(Some(envelope)) => match envelope.event {
+                        Event::AgentChildFinished(f) => {
+                            finished.push((
+                                f.child_id
+                                    .to_string()
+                                    .rsplit('/')
+                                    .next()
+                                    .unwrap_or_default()
+                                    .to_owned(),
+                                f.status,
+                            ));
+                        }
+                        Event::AgentCallFinished(f) => call_finished = Some(f),
+                        _ => {}
+                    },
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+            }
+            finished.sort_by(|a, b| a.0.cmp(&b.0));
+            (finished, call_finished)
+        }
+
+        /// Every child-scoped event (see [`child_scoped`]) the bus carries
+        /// within `window`, in its wire form — read after whatever was parked
+        /// has been released, so a child task that outlived its cancel has had
+        /// its chance to speak.
+        async fn child_events_within(&mut self, window: Duration) -> Vec<Value> {
+            let mut late = Vec::new();
+            let deadline = tokio::time::Instant::now() + window;
+            loop {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return late;
+                }
+                match tokio::time::timeout(deadline - now, self.sub.recv()).await {
+                    Ok(Some(envelope)) => {
+                        let wire = serde_json::to_value(&envelope).expect("an envelope serializes");
+                        if child_scoped(&wire) {
+                            late.push(wire);
+                        }
+                    }
+                    Ok(None) | Err(_) => return late,
+                }
+            }
+        }
+    }
+
+    /// Poll for `path` to exist, up to [`WINDOW`], without holding a worker.
+    async fn await_file_async(path: &std::path::Path) -> bool {
+        let deadline = tokio::time::Instant::now() + WINDOW;
+        while tokio::time::Instant::now() < deadline {
+            if path.exists() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
     /// **`cancelled` (AC-14, BR-10): cancelling the parent turn cancels every
-    /// running child, and the cancelled finishes are still published.**
+    /// running child, the cancelled finishes are still published, and nothing
+    /// of a cancelled child runs on afterwards.**
     ///
-    /// **Driven in-process, and this is the one test in the file that is.**
-    /// The daemon has no RPC that cancels a running prompt: a departing
-    /// client's turn *drains* (REQ-565), and the only abort of a started turn
-    /// is the server's `task.abort()` after `TURN_DRAIN_TIMEOUT` — 300 s after
-    /// the disconnect. So this builds the daemon's own [`DaemonRuntime`] — the
-    /// real `agent` tool, the real child runner, a real HTTP vendor — runs the
-    /// prompt turn as a task, and aborts it exactly as that teardown does, with
-    /// both children parked on their first model call. What it observes is the
+    /// **Driven in-process, and this is one of the two tests in the file that
+    /// are** (with [`cancelled_with_tool_in_flight`]). The daemon has no RPC
+    /// that cancels a running prompt: a departing client's turn *drains*
+    /// (REQ-565), and the only abort of a started turn is the server's
+    /// `task.abort()` after `TURN_DRAIN_TIMEOUT` — 300 s after the disconnect.
+    /// So this builds the daemon's own [`DaemonRuntime`] — the real `agent`
+    /// tool, the real child runner, a real HTTP vendor — runs the prompt turn
+    /// as a task, and aborts it exactly as that teardown does, with both
+    /// children parked on their first model call. What it observes is the
     /// session's bus, which is what every client attached to it reads.
+    ///
+    /// Then the leaked-task guard: the provider's held replies are released
+    /// **after** the cancel. A child task that survived its cancel would read
+    /// its reply, stream it and finish a second time; instead, over a settle
+    /// window, no provider request follows and no child-scoped event is
+    /// published.
     ///
     /// # Mutations (run 2026-10-07, each reverted)
     ///
@@ -1740,19 +2036,15 @@ mod statuses {
     ///   without spawning the reaper): 1 red, this test.
     /// - **Children run one at a time**: red here too — the second child never
     ///   parks.
+    /// - **The work outlives its cancel** (REQ-623 verify, run in a scratch
+    ///   copy of the source at `b1f7c21`: `AbortOnDrop::drop` and the deadline
+    ///   arm's `handle.0.abort()` both removed): 3 red of this binary's 19 —
+    ///   this test at the leaked-task guard (a child read its released reply and
+    ///   streamed `one is never answered`), [`cancelled_with_tool_in_flight`]
+    ///   and [`timed_out`].
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cancelled() {
         use teton_protocol::agent::ChildStatus;
-        use teton_protocol::events::Event;
-        use teton_protocol::methods::{
-            ConfigUpdate, ProviderConfig, SessionPermissionsParams, TierBindingConfig,
-        };
-        use teton_protocol::permissions::PermissionLevel;
-        use teton_protocol::{Phase, ProviderId, ProviderKind, SessionMode, Tier};
-        use tetond::broadcast::EventBus;
-        use tetond::grants::GrantRegistry;
-        use tetond::runtime::{ClientPresence, DaemonRuntime};
-        use tetond::sessions::SessionRegistry;
 
         let hold = Rendezvous::gate();
         let provider = MockProvider::start_matching(
@@ -1775,71 +2067,8 @@ mod statuses {
             ],
             unmatched(),
         );
-        let ws = Workspace::new("st-cancelled");
-        let runtime = std::sync::Arc::new(DaemonRuntime::minimal());
-        runtime
-            .apply_config_update(ConfigUpdate::RegisterProvider(ProviderConfig {
-                id: ProviderId::from(REMOTE),
-                kind: ProviderKind::OpenaiCompatible,
-                endpoint: Some(provider.openai_endpoint()),
-                model: Some(MODEL.to_owned()),
-                auth_ref: None,
-                max_context: Some(128_000),
-                context_budget_cap: None,
-                allow_cleartext: None,
-                floored_budget: None,
-            }))
-            .expect("registering the provider");
-        runtime
-            .apply_config_update(ConfigUpdate::SetTierBinding(TierBindingConfig {
-                tier: Tier::Build,
-                provider_id: ProviderId::from(REMOTE),
-                fallback_id: None,
-            }))
-            .expect("binding build");
-        let bus = std::sync::Arc::new(EventBus::new());
-        let sessions = SessionRegistry::new();
-        let session = sessions
-            .create(
-                SessionMode::Structured,
-                Some(Phase::Implement),
-                Some(ws.repo.clone()),
-            )
-            .expect("a structured session")
-            .session_id;
-        let set = runtime.session_permissions(
-            &SessionPermissionsParams {
-                session_id: session.clone(),
-                level: Some(PermissionLevel::Full),
-            },
-            &bus,
-        );
-        assert_eq!(set.level, PermissionLevel::Full);
-        let mut sub = bus.subscribe(4096);
-
-        let turn = {
-            let runtime = std::sync::Arc::clone(&runtime);
-            let bus = std::sync::Arc::clone(&bus);
-            let sessions = sessions.clone();
-            let session = session.clone();
-            let cwd = ws.repo.clone();
-            tokio::spawn(async move {
-                runtime
-                    .run_prompt_turn(
-                        &bus,
-                        &sessions,
-                        session,
-                        SessionMode::Structured,
-                        Some(Phase::Implement),
-                        Some(cwd),
-                        "ST-CANCELLED dispatch two children that wait".to_owned(),
-                        None,
-                        Some(GrantRegistry::new().next_connection_id()),
-                        ClientPresence::unwatched(),
-                    )
-                    .await
-            })
-        };
+        let mut rig = InProcess::start("st-cancelled", &provider, true);
+        let turn = rig.spawn_turn("ST-CANCELLED dispatch two children that wait");
 
         // Both children are parked on their first model call.
         let parked = tokio::time::timeout(WINDOW, async {
@@ -1858,34 +2087,13 @@ mod statuses {
             "the parent turn was cancelled, not finished"
         );
 
-        let mut finished: Vec<(String, ChildStatus)> = Vec::new();
-        let mut call_finished = None;
-        let deadline = tokio::time::Instant::now() + WINDOW;
-        while call_finished.is_none() && tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_millis(200), sub.recv()).await {
-                Ok(Some(envelope)) => match envelope.event {
-                    Event::AgentChildFinished(f) => {
-                        finished.push((f.child_id.to_string(), f.status));
-                    }
-                    Event::AgentCallFinished(f) => call_finished = Some(f),
-                    _ => {}
-                },
-                Ok(None) => break,
-                Err(_) => {}
-            }
-        }
+        let (finished, call_finished) = rig.until_call_finished().await;
+        let requests_at_cancel = provider.request_count();
         hold.open();
         let call_finished =
             call_finished.expect("agent_call_finished was published after the cancel");
-        finished.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
-            finished
-                .iter()
-                .map(|(id, status)| (
-                    id.rsplit('/').next().unwrap_or_default().to_owned(),
-                    *status
-                ))
-                .collect::<Vec<_>>(),
+            finished,
             vec![
                 ("one".to_owned(), ChildStatus::Cancelled),
                 ("two".to_owned(), ChildStatus::Cancelled),
@@ -1900,6 +2108,163 @@ mod statuses {
                 && call_finished.children.len() == 2,
             "{call_finished:?}"
         );
+
+        // The leaked-task guard: the replies the children were parked on are
+        // now written. Nobody may be there to read them.
+        let late = rig.child_events_within(Duration::from_secs(1)).await;
+        assert_eq!(
+            requests_at_cancel, 3,
+            "fixture: the parent's dispatch and both children's parked requests"
+        );
+        assert_eq!(
+            provider.request_count(),
+            requests_at_cancel,
+            "no request after the cancel"
+        );
+        assert!(
+            late.is_empty(),
+            "no child event after the release — the cancelled children are gone: {late:#?}"
+        );
+        assert_no_boundary_bytes();
+    }
+
+    /// **`cancelled` with a tool in flight (AC-14, BR-10): the cancel is
+    /// reported while the child's `shell` is still parked, and once the shell
+    /// is released its output reaches no model and no child event follows.**
+    ///
+    /// In-process for the reason [`cancelled`] gives. One child calls a
+    /// `shell` that parks; the test rendezvous on the shell's start (its
+    /// `started` file), then aborts the parent turn as the server's teardown
+    /// does. Guaranteed, and asserted in this order:
+    ///
+    /// 1. `agent_child_finished` reports the child `cancelled`, and
+    ///    `agent_call_finished` arrives, **while the shell is still parked**;
+    /// 2. after the release, the shell's output ([`SURVIVOR_OUTPUT`]) reaches
+    ///    no provider request, and no request is made at all.
+    ///
+    /// **Not guaranteed, and pinned as found: "no further child event".** The
+    /// dead child publishes its in-flight call's `tool_call_update` once the
+    /// shell returns, and — under the shipped boundary globs — runs on far
+    /// enough to pin the session local ([`assert_only_known_leak`] has the
+    /// mechanism). This leg turns the builtin globs off, so what it pins is
+    /// the one stamped event and not the classifier's verdict on a `printf`.
+    ///
+    /// **The process itself survives** — the orchestrator's settled decision
+    /// at the REQ-623 verify pass: a cancelled child's tool process is not
+    /// killed, its output is discarded. The post-release `touch` of
+    /// `cancel-tool.survived` is asserted to appear; that documents current
+    /// behaviour, not BR-10's "the cancel reaches a child's blocking tool
+    /// call". A follow-up BUG is to be filed at wrapup; when the process is
+    /// killed, that one assertion flips.
+    ///
+    /// # Mutations (run 2026-10-07, each reverted)
+    ///
+    /// - **The work outlives its cancel** (REQ-623 verify, run in a scratch
+    ///   copy of the source at `b1f7c21`: `AbortOnDrop::drop` and the deadline
+    ///   arm's `handle.0.abort()` both removed): 3 red of this binary's 19 —
+    ///   this test at "nothing was sent after the tool's output existed" (3
+    ///   requests, not 2: the dead child sent its next call), and the other
+    ///   two cancel/deadline tests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_with_tool_in_flight() {
+        use teton_protocol::agent::ChildStatus;
+
+        let provider = MockProvider::start_matching(
+            vec![
+                (
+                    child("ST-CANCEL-TOOL"),
+                    calls(
+                        "shell",
+                        &surviving_shell(
+                            "cancel-tool.started",
+                            "cancel-tool.release",
+                            "cancel-tool.survived",
+                        ),
+                    ),
+                ),
+                (
+                    child("ST-CANCEL-TOOL"),
+                    says("tool is never answered twice"),
+                ),
+                (
+                    parent("ST-CANCEL-PARKED"),
+                    dispatch(
+                        json!([{ "task": "ST-CANCEL-TOOL wait in your shell", "name": "tool" }]),
+                    ),
+                ),
+            ],
+            unmatched(),
+        );
+        let mut rig = InProcess::start("st-cancel-tool", &provider, false);
+        let started = rig.ws.repo.join("cancel-tool.started");
+        let release = rig.ws.repo.join("cancel-tool.release");
+        let survived = rig.ws.repo.join("cancel-tool.survived");
+        let turn = rig.spawn_turn("ST-CANCEL-PARKED dispatch one child that waits in a shell");
+
+        assert!(
+            await_file_async(&started).await,
+            "the child's shell never started — the fixture never parked"
+        );
+        turn.abort();
+        let aborted = tokio::time::timeout(WINDOW, turn).await;
+        assert!(
+            aborted
+                .as_ref()
+                .is_ok_and(|joined| joined.as_ref().is_err_and(|e| e.is_cancelled())),
+            "the parent turn was cancelled, not finished, and promptly"
+        );
+
+        // (1) Reported while parked.
+        let (finished, call_finished) = rig.until_call_finished().await;
+        let parked_at_finish = !release.exists() && !survived.exists();
+        let requests_at_cancel = provider.request_count();
+        let Some(call_finished) = call_finished else {
+            std::fs::write(&release, "").ok();
+            panic!("agent_call_finished never arrived while the tool was parked: {finished:?}");
+        };
+        assert!(
+            parked_at_finish,
+            "the cancel was reported while the tool was parked"
+        );
+        assert_eq!(
+            finished,
+            vec![("tool".to_owned(), ChildStatus::Cancelled)],
+            "the child is cancelled, and its finish is published"
+        );
+        assert_eq!(
+            call_finished
+                .children
+                .iter()
+                .map(|c| c.status)
+                .collect::<Vec<_>>(),
+            vec![ChildStatus::Cancelled],
+            "{call_finished:?}"
+        );
+
+        // (2) Release, and watch the output go nowhere.
+        std::fs::write(&release, "").expect("release the parked tool");
+        assert!(
+            await_file_async(&survived).await,
+            "the shell ran to its end after the release — the process is not killed \
+             (current behaviour; see the doc comment)"
+        );
+        let late = rig.child_events_within(Duration::from_secs(1)).await;
+        assert_eq!(
+            requests_at_cancel, 2,
+            "fixture: the parent's dispatch and the child's first request"
+        );
+        assert_eq!(
+            provider.request_count(),
+            requests_at_cancel,
+            "nothing was sent after the tool's output existed"
+        );
+        assert!(
+            !bodies(&provider)
+                .iter()
+                .any(|b| b.contains(SURVIVOR_OUTPUT)),
+            "the cancelled tool's output never reached a model"
+        );
+        assert_only_known_leak(&late, "call-1");
         assert_no_boundary_bytes();
     }
 
@@ -2042,19 +2407,53 @@ mod statuses {
         assert_no_boundary_bytes();
     }
 
-    /// **`timed_out` (AC-14): past its deadline with a tool call in flight.**
+    /// **`timed_out` (AC-14, BR-10): past its deadline with a tool call in
+    /// flight — reported while the tool is still parked, and nothing the tool
+    /// produces afterwards reaches a model or the event stream.**
     ///
-    /// `child_deadline_secs = 1`, and the child's `shell` parks until the test
-    /// releases it — which the test does only after the child has been
-    /// reported `timed_out`, so the deadline provably fired while the tool was
-    /// in flight. The parent is not made to wait for the tool: it continues,
-    /// and receives `timed_out` with an empty report and the deadline it ran
-    /// under. The tool's output never reaches a model — the child is not
-    /// answered again.
+    /// `child_deadline_secs = 2`, and the child's `shell` parks until the test
+    /// releases it. The test rendezvous on the shell's start (its `started`
+    /// file) — the tool is provably in flight — and then lets the deadline
+    /// run. What is guaranteed, and asserted in this order:
     ///
-    /// Mutation (run 2026-10-07, reverted): **the deadline never fires** (the
-    /// runner's `deadline.expired()` arm made pending): 1 red, this test — no
-    /// finish arrives while the tool is parked.
+    /// 1. the child is reported `timed_out` **while the shell is still
+    ///    parked** — the deadline does not wait for the tool;
+    /// 2. the parent continues and its turn **ends** while the shell is still
+    ///    parked, holding `timed_out`, an empty report and the deadline it ran
+    ///    under;
+    /// 3. once the test releases the park, the shell's output
+    ///    ([`SURVIVOR_OUTPUT`]) reaches **no** provider request and the child is
+    ///    never answered again.
+    ///
+    /// **Not guaranteed, and pinned as found: "no further child event".** The
+    /// verify pass asked for it and the daemon does not deliver it — the dead
+    /// child publishes its in-flight call's `tool_call_update` once the shell
+    /// returns. [`assert_only_known_leak`] pins exactly that one event, so the
+    /// leak cannot widen unnoticed and the fix flips one line.
+    ///
+    /// **The process itself survives, and this test says so.** Settled at the
+    /// REQ-623 verify pass: a timed-out child's tool process is *not* killed —
+    /// its output is discarded. The shell's post-release `touch` of
+    /// `timed-slow.survived` is asserted to **appear**; that documents current
+    /// behaviour, it is not the requirement's "the tool is cancelled" (AC-14).
+    /// A follow-up BUG is to be filed at wrapup; when the process is killed,
+    /// that one assertion flips.
+    ///
+    /// # Mutations (run 2026-10-07, each reverted)
+    ///
+    /// - **The deadline never fires** (the runner's `deadline.expired()` arm
+    ///   made pending): 1 red, this test — no finish arrives while the tool is
+    ///   parked. Recorded before the verify pass, against the 1 s deadline.
+    /// - **The deadline waits for the work** (REQ-623 verify, run in a scratch
+    ///   copy of the source at `b1f7c21`: the deadline arm's
+    ///   `timeout(ABORT_GRACE, &mut handle.0)` made an unbounded
+    ///   `(&mut handle.0).await`): 1 red of this binary's 19, this test, at "no
+    ///   finish while parked".
+    /// - **The work outlives its end** (same copy: `AbortOnDrop::drop` and the
+    ///   deadline arm's `handle.0.abort()` both removed): 3 red of 19 — this
+    ///   test at "nothing was sent after the tool's output existed" (4
+    ///   requests, not 3: the dead child sent its next call), and the two
+    ///   `cancelled` tests.
     #[test]
     fn timed_out() {
         let provider = MockProvider::start_matching(
@@ -2063,7 +2462,11 @@ mod statuses {
                     child("ST-SLOW"),
                     calls(
                         "shell",
-                        &parked_shell("timed-slow.started", "timed-slow.release"),
+                        &surviving_shell(
+                            "timed-slow.started",
+                            "timed-slow.release",
+                            "timed-slow.survived",
+                        ),
                     ),
                 ),
                 (child("ST-SLOW"), says("slow is never answered twice")),
@@ -2075,33 +2478,95 @@ mod statuses {
             ],
             unmatched(),
         );
-        let mut extra = agent_table(&[("child_deadline_secs", "1")]);
+        let mut extra = agent_table(&[("child_deadline_secs", "2")]);
         extra.push_str(NO_DEFAULT_BOUNDARIES);
         let mut rig = Rig::start("st-timed", &provider, &extra);
         rig.level("full");
+        let started = rig.ws.repo.join("timed-slow.started");
         let release = rig.ws.repo.join("timed-slow.release");
+        let survived = rig.ws.repo.join("timed-slow.survived");
         let id = rig
             .client
             .prompt_no_wait(&rig.session, "ST-TIMED dispatch one");
-        assert!(await_file(&rig.ws.repo.join("timed-slow.started")));
-        let finished = rig.client.wait_for_event("agent_child_finished", WINDOW);
-        let in_flight = !release.exists();
-        std::fs::write(&release, "").expect("release the parked tool");
-        let finished = finished.unwrap_or_else(|| panic!("{:?}", rig.client.event_names()));
-        assert!(in_flight);
-        assert_eq!(finished["status"], "timed_out", "{finished}");
-        let response = rig.client.await_response(id);
-        assert_eq!(response["result"]["stop_reason"], "end_turn", "{response}");
 
+        // The rendezvous: the tool is running before the clock is let run.
+        assert!(
+            await_file(&started),
+            "the child's shell never started — the deadline fired before the tool parked, \
+             or the fixture never parked: {:?}",
+            rig.client.event_names()
+        );
+        let finished = rig.client.wait_for_event("agent_child_finished", WINDOW);
+        let parked_at_finish = !release.exists() && !survived.exists();
+        let finished = finished.unwrap_or_else(|| {
+            std::fs::write(&release, "").ok();
+            panic!("no finish while parked: {:?}", rig.client.event_names())
+        });
+        assert!(
+            parked_at_finish,
+            "the finish arrived while the tool was parked"
+        );
+        assert_eq!(finished["status"], "timed_out", "{finished}");
+
+        // (2) The parent is not made to wait for the tool: its turn ends with
+        // the shell still parked.
+        let response = rig.client.await_response(id);
+        let parked_at_end = !survived.exists();
+        assert_eq!(response["result"]["stop_reason"], "end_turn", "{response}");
+        assert!(
+            parked_at_end,
+            "the parent's turn ended while the tool was parked"
+        );
         let result = result_named(&handed(&provider, "ST-TIMED"), "slow").clone();
         assert_eq!(result["status"], "timed_out", "{result}");
         assert_eq!(result["report"], "");
-        assert_eq!(result["bounds"]["deadline_secs"], 1);
+        assert_eq!(result["bounds"]["deadline_secs"], 2);
+
+        // (3) Release, and watch the tool's output go nowhere.
+        rig.client.drain_events(Duration::from_millis(200));
+        let requests_before = provider.request_count();
+        let events_before = rig.client.events().len();
+        std::fs::write(&release, "").expect("release the parked tool");
+        assert!(
+            await_file(&survived),
+            "the shell ran to its end after the release — the process is not killed \
+             (current behaviour; see the doc comment)"
+        );
+        rig.client.drain_events(Duration::from_secs(1));
+        assert_eq!(
+            provider.request_count(),
+            requests_before,
+            "nothing was sent after the tool's output existed"
+        );
+        assert!(
+            !bodies(&provider)
+                .iter()
+                .any(|b| b.contains(SURVIVOR_OUTPUT)),
+            "the timed-out tool's output never reached a model"
+        );
         assert_eq!(
             child_requests(&provider, "ST-SLOW").len(),
             1,
-            "the cancelled call's output was never handed to a model"
+            "the child was never answered again"
         );
+        let late: Vec<Value> = rig.client.events()[events_before..]
+            .iter()
+            .filter(|e| child_scoped(e))
+            .cloned()
+            .collect();
+        let tool_call_id = rig
+            .client
+            .events()
+            .iter()
+            .find(|e| {
+                child_scoped(e)
+                    && e["update"]["kind"] == "tool_call"
+                    && e["event"] == "session_update"
+            })
+            .and_then(|e| e["update"]["tool_call_id"].as_str())
+            .unwrap_or_default()
+            .to_owned();
+        assert_only_known_leak(&late, &tool_call_id);
         assert_no_boundary_bytes();
     }
 

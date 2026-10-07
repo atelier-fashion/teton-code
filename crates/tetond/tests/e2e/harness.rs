@@ -92,6 +92,35 @@ pub fn assert_no_boundary_bytes() {
     }
 }
 
+/// Assert the boundary secret is in none of `bodies` — **one** provider's
+/// captured requests, where [`assert_no_boundary_bytes`] reads every
+/// provider's (REQ-623 verify).
+///
+/// The global check runs over a process-wide buffer, so a leak in an earlier
+/// test reddens every later test that calls it: a mutation that leaks once is
+/// then counted as many reds, and a test whose own provider stayed clean cannot
+/// say so. Called beside the global check with the test's own provider, this
+/// one goes red only for a leak *this* test's daemon sent — its red is its own,
+/// not a cascade. It names `label` and every offending request index, so the
+/// failure says which provider and which request carried the bytes
+/// (LESSON-624: print where the marker is before touching the choke point).
+pub fn assert_no_secret_in(label: &str, bodies: &[Vec<u8>]) {
+    let leaked: Vec<usize> = bodies
+        .iter()
+        .enumerate()
+        .filter(|(_, body)| {
+            contains(body, SECRET_SENTINEL.as_bytes())
+                || contains(body, b"postgres://prod-db.internal")
+        })
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "BR-1 VIOLATION: boundary file content reached {label} in request(s) {leaked:?} of {}",
+        bodies.len()
+    );
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
 }
@@ -1221,6 +1250,21 @@ pub struct Client {
     /// frames the classifier drops (lag notices) and the responses to somebody
     /// else's request. Filled by the reader thread, which is why it is shared.
     raw: Arc<Mutex<Vec<String>>>,
+    /// Responses read off the wire while the caller was waiting for something
+    /// else — an event ([`Self::wait_for_event`], [`Self::drain_events`]) or a
+    /// different request's reply ([`Self::await_response`]). Kept, in arrival
+    /// order, until [`Self::await_response`] asks for their id.
+    ///
+    /// Before REQ-623's verify pass every pump but `await_response` dropped a
+    /// response it read past, and `await_response` dropped every response but
+    /// its own. A test that waited for an event while its prompt was in flight
+    /// was then correct only if the prompt's response happened to follow that
+    /// event on the wire — an ordering assumption nobody wrote down, which
+    /// turned into a twenty-second "timed out awaiting response" the day a
+    /// daemon change moved one event past the response. Stashing makes every
+    /// pump order-independent: a response is consumed exactly once, by the
+    /// await that names it.
+    stashed: Vec<Value>,
 }
 
 impl Client {
@@ -1312,6 +1356,7 @@ impl Client {
             auto_approve: true,
             auto_consent,
             raw,
+            stashed: Vec::new(),
         };
         client.handshake();
         client
@@ -1439,7 +1484,18 @@ impl Client {
     /// Pump (and auto-answer) events until the response to request `id`
     /// arrives, and return it. Every event seen on the way is recorded, so a
     /// caller can read what happened between the send and the reply.
+    ///
+    /// A response some earlier pump read past is taken from the stash first
+    /// (see [`Self::stashed`]); any other request's response read here is
+    /// stashed for its own await rather than dropped.
     pub fn await_response(&mut self, id: i64) -> Value {
+        if let Some(at) = self
+            .stashed
+            .iter()
+            .position(|v| v.get("id").and_then(Value::as_i64) == Some(id))
+        {
+            return self.stashed.remove(at);
+        }
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let remaining = deadline
@@ -1450,6 +1506,7 @@ impl Client {
                     if v.get("id").and_then(Value::as_i64) == Some(id) {
                         return v;
                     }
+                    self.stashed.push(v);
                 }
                 Ok(Incoming::Event(ev)) => self.on_event(ev),
                 Err(RecvTimeoutError::Timeout) => panic!("timed out awaiting response {id}"),
@@ -1476,7 +1533,8 @@ impl Client {
         self.events.push(ev);
     }
 
-    /// Passively collect events for `window`, auto-answering permission prompts.
+    /// Passively collect events for `window`, auto-answering permission prompts
+    /// and stashing any response for [`Self::await_response`].
     pub fn drain_events(&mut self, window: Duration) {
         let deadline = Instant::now() + window;
         loop {
@@ -1488,7 +1546,7 @@ impl Client {
             }
             match self.rx.recv_timeout(remaining) {
                 Ok(Incoming::Event(ev)) => self.on_event(ev),
-                Ok(Incoming::Response(_)) => {}
+                Ok(Incoming::Response(v)) => self.stashed.push(v),
                 Err(_) => return,
             }
         }
@@ -1629,6 +1687,11 @@ impl Client {
 
     /// Pump events until one named `name` arrives (or `window` elapses),
     /// returning the first such event — including one already observed.
+    ///
+    /// A response read on the way is stashed, never dropped (see
+    /// [`Self::stashed`]): a caller may wait here while its own prompt is in
+    /// flight and collect that prompt's response afterwards, whichever side of
+    /// the event it arrived on.
     pub fn wait_for_event(&mut self, name: &str, window: Duration) -> Option<Value> {
         if let Some(seen) = self.events_named(name).first() {
             return Some((*seen).clone());
@@ -1649,7 +1712,7 @@ impl Client {
                         return self.events_named(name).last().map(|e| (*e).clone());
                     }
                 }
-                Ok(Incoming::Response(_)) => {}
+                Ok(Incoming::Response(v)) => self.stashed.push(v),
                 Err(_) => return None,
             }
         }
@@ -1665,6 +1728,9 @@ impl Client {
     /// is what keeps the suite from flaking on a loaded runner where the replayed
     /// lifecycle can land after any guessed window. Events already observed are
     /// considered first, so a stage that arrived before the call is not missed.
+    ///
+    /// Responses read on the way are stashed for [`Self::await_response`], as
+    /// in [`Self::wait_for_event`].
     pub fn wait_for_event_where(
         &mut self,
         name: &str,
@@ -1693,7 +1759,7 @@ impl Client {
                         return self.events.last().cloned();
                     }
                 }
-                Ok(Incoming::Response(_)) => {}
+                Ok(Incoming::Response(v)) => self.stashed.push(v),
                 Err(_) => return None,
             }
         }
