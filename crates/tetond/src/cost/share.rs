@@ -122,6 +122,10 @@ pub fn release_parts(unspent: u64, running: usize) -> (u64, u64) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChildShare {
     child: ChildId,
+    /// The child's **initial** share, fixed when the pool is built — what
+    /// `ChildBounds.spend_ceiling_micro_cents` stamps (BR-7, BR-8), however
+    /// late the child gets round to stamping it.
+    stamped: u64,
     /// The child's ceiling now: its stamped share plus every part it has been
     /// released. Only ever raised.
     ceiling: u64,
@@ -157,6 +161,7 @@ impl SharePool {
                     .iter()
                     .map(|child| ChildShare {
                         child: child.clone(),
+                        stamped: each,
                         ceiling: each,
                         ended: false,
                     })
@@ -181,6 +186,27 @@ impl SharePool {
                 .iter()
                 .find(|share| &share.child == child)
                 .map_or(0, |share| share.ceiling),
+        )
+    }
+
+    /// `child`'s **initial** share — the equal split the pool was built with,
+    /// unmoved by any release since (BR-8: "each child's initial share … stamped
+    /// as `ChildBounds.spend_ceiling_micro_cents`").
+    ///
+    /// Distinct from [`Self::share_of`] because a child stamps its bounds once
+    /// its route is resolved, and a sibling may already have finished and
+    /// released by then: stamping the ceiling *now* would publish a share that
+    /// already counts parts it was released, and a final ceiling of "stamped
+    /// share plus parts" would then count them twice. `None` only for the
+    /// unlimited pool; `Some(0)` for a child the pool was not built with.
+    #[must_use]
+    pub fn stamped_share_of(&self, child: &ChildId) -> Option<u64> {
+        let shares = lock(self.shares.as_ref()?);
+        Some(
+            shares
+                .iter()
+                .find(|share| &share.child == child)
+                .map_or(0, |share| share.stamped),
         )
     }
 
@@ -300,6 +326,13 @@ impl ChildSpend {
     #[must_use]
     pub fn ceiling(&self) -> Option<u64> {
         self.pool.share_of(&self.child)
+    }
+
+    /// The child's initial share, for its stamped bounds
+    /// ([`SharePool::stamped_share_of`]).
+    #[must_use]
+    pub fn stamped_share(&self) -> Option<u64> {
+        self.pool.stamped_share_of(&self.child)
     }
 
     /// What the child has spent, in the accumulator's unit.
@@ -484,6 +517,29 @@ mod tests {
                 "headroom({ceiling:?}, {spent})"
             );
         }
+    }
+
+    /// **BR-7 / BR-8: the stamped share is the initial split, whenever it is
+    /// read.** A sibling that ends and releases before a child stamps its
+    /// bounds raises that child's ceiling — and not its stamped share.
+    ///
+    /// Found by TASK-430: under a schedule that stamps a child after an early
+    /// sibling's release, `agent_child_started` published the raised ceiling as
+    /// the "initial" share, and `spend_ceiling_final_micro_cents` was no longer
+    /// "stamped share plus its parts". Mutation (run 2026-10-07, reverted):
+    /// `stamped_share_of` reading `ceiling` reddens this test.
+    #[test]
+    fn a_release_before_stamping_moves_the_ceiling_not_the_stamped_share() {
+        let early = ChildId::new("turn-1:call-1", "early");
+        let late = ChildId::new("turn-1:call-1", "late");
+        let pool = SharePool::new(Some(900), &[early.clone(), late.clone()]);
+        let recipients = pool.release(&early, 150);
+        assert_eq!(recipients, vec![(late.clone(), 750)]);
+        assert_eq!(pool.share_of(&late), Some(750), "the ceiling rose");
+        assert_eq!(pool.stamped_share_of(&late), Some(450), "the stamp did not");
+        assert_eq!(pool.stamped_share_of(&early), Some(450));
+        let unlimited = SharePool::new(None, std::slice::from_ref(&early));
+        assert_eq!(unlimited.stamped_share_of(&early), None);
     }
 
     #[test]

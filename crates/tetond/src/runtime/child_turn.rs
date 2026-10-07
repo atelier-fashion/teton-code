@@ -329,7 +329,9 @@ impl Work {
         let bounds = child_route.as_ref().map(|_| ChildBounds {
             max_turns,
             context_budget_bytes: route.budget.budget_bytes as u64,
-            spend_ceiling_micro_cents: spend.ceiling(),
+            // BR-8: the initial share, not the ceiling now — a sibling may
+            // already have released into it (see `SharePool::stamped_share_of`).
+            spend_ceiling_micro_cents: spend.stamped_share(),
             deadline_secs: spec.deadline.as_secs(),
         });
         {
