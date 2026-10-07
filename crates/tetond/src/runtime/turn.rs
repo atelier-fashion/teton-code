@@ -234,6 +234,23 @@ pub(super) struct AttemptState {
 }
 
 impl AttemptState {
+    /// The state before the first attempt: no attempts made, nothing rerouted,
+    /// no expansion accepted or refitted — only the armed `conversation` and
+    /// the `route` it will be sent on. A prompt turn then sets the expansion
+    /// facts its settle stage produced; a child has none.
+    pub(super) fn new(conversation: CarriedTurn, route: crate::router::Route) -> Self {
+        Self {
+            attempts: 0,
+            rerouted_local: false,
+            withdrew_accepted_expansion: false,
+            accepted: None,
+            skill_refit: Vec::new(),
+            conversation,
+            route,
+            finished: None,
+        }
+    }
+
     /// Move the turn to `next`, handing back the budget it is leaving — the
     /// one move both reroute arms make.
     ///
@@ -1727,14 +1744,9 @@ impl DaemonRuntime {
         // one wide one"). `run_prompt_turn` owns it, so `conversation` and
         // `route` survive the last attempt for the commit protocol to read.
         let st = AttemptState {
-            attempts: 0,
-            rerouted_local: false,
-            withdrew_accepted_expansion: false,
             accepted,
             skill_refit,
-            conversation,
-            route,
-            finished: None,
+            ..AttemptState::new(conversation, route)
         };
 
         (st, typed_refit)
@@ -2565,6 +2577,13 @@ impl DaemonRuntime {
     /// every reroute, every egress on the child's spend — and the outcome the
     /// success arm leaves in [`AttemptState::finished`]. A child never reaches
     /// `commit_or_abandon`: its context is dropped, not committed.
+    ///
+    /// **A door, not a forwarder to remove** (verify, 2026-10-07): it is what
+    /// lets `run_attempts` stay private. The turn's stages are one private span
+    /// in execution order, and `skill_turn.rs`'s ordering suite ends that span
+    /// at the first `pub(super)` item — widening `run_attempts` itself cut the
+    /// span short and reddened three of its tests. `assemble_child_harness` is
+    /// the same door for the same reason.
     pub(super) async fn run_child_attempts(
         self: &Arc<Self>,
         tctx: TurnContext<'_>,

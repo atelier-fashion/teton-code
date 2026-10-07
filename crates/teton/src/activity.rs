@@ -609,8 +609,12 @@ impl TurnActivity {
         // a `+N` count before any later clause is cut. With no children there is
         // no clause at all, which is what keeps every pre-REQ-623 row
         // byte-identical.
+        //
+        // One column is held back so a full row never touches the last cell
+        // (see the fit below) — one figure for the clause and the fit.
+        let budget = width.saturating_sub(1);
         if !self.children.is_empty() {
-            let clause = self.children_clause(now, &row, &tail, width.saturating_sub(1));
+            let clause = self.children_clause(now, &row, &tail, budget);
             row.push_str(&clause);
         }
         row.push_str(&tail);
@@ -632,7 +636,7 @@ impl TurnActivity {
         // A terminal that autowraps on the final column takes the wrap the
         // moment a row is exactly its width, which is the same lost row by the
         // other door.
-        let fitted = fit(&crate::render::defused(&row), width.saturating_sub(1));
+        let fitted = fit(&crate::render::defused(&row), budget);
         // A row with no columns is not a row: painting an empty line would leave
         // exactly the blank residue BR-5 forbids.
         (!fitted.is_empty()).then_some(fitted)

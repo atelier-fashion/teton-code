@@ -285,10 +285,11 @@ pub struct ChildResult {
     /// [`ChildStatus::Refused`] (e.g. `over_budget`); absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
-    /// The error code when [`Self::status`] is [`ChildStatus::Failed`]; absent
-    /// otherwise. BR-10 has `failed` carry "the error code", and the entity
-    /// table has `refusal` absent outside `refused`, so the code needs a field
-    /// of its own.
+    /// `<code>: <message>` when [`Self::status`] is [`ChildStatus::Failed`] —
+    /// the error code first, so a reader can key on it, then what the code
+    /// says happened; absent otherwise. BR-10 has `failed` carry the error
+    /// code, and the entity table has `refusal` absent outside `refused`, so
+    /// it needs a field of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Model calls the child made.

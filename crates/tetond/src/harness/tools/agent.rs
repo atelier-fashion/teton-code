@@ -78,10 +78,10 @@ pub const AGENT_CAP_EXEMPT_REASON: &str =
 
 /// The refusal [`Tool::run`] answers with: the tool is awaited by the loop, not
 /// run (ADR-1).
-pub const ASYNC_DISPATCH_REFUSAL: &str = "agent_requires_async_dispatch";
+pub(crate) const ASYNC_DISPATCH_REFUSAL: &str = "agent_requires_async_dispatch";
 
 /// The bound on a task's `name`, in characters (the spec's entity table).
-pub const NAME_MAX_CHARS: u32 = 40;
+pub(crate) const NAME_MAX_CHARS: u32 = 40;
 
 /// What the parent prompt turn lends its `agent` tool — the per-turn half of
 /// what a call needs; the per-call half arrives as an [`AgentCall`].
@@ -427,7 +427,7 @@ fn echo_bounded(name: &str) -> String {
 /// envelope's closing sentence would contradict (the repeat refusal's
 /// posture, REQ-617 BR-5).
 #[must_use]
-pub fn refusal_message(refusal: &AgentRefusal) -> String {
+fn refusal_message(refusal: &AgentRefusal) -> String {
     let why = match refusal {
         AgentRefusal::TooManyChildren { requested, cap } => format!(
             "{requested} tasks in one call, and at most {cap} are allowed per call \
@@ -564,6 +564,9 @@ impl Flight {
     async fn land(&mut self) {
         while let Some(joined) = self.set.join_next_with_id().await {
             let (index, outcome) = match joined {
+                // Indexing cannot miss: every task in `set` was spawned by
+                // `launch`, which records its id here in the same step, and
+                // nothing removes an entry — so a joined id is always a key.
                 Ok((id, outcome)) => (self.index_of[&id], outcome),
                 Err(err) => {
                     let index = self.index_of[&err.id()];
@@ -831,7 +834,7 @@ pub fn register_agent_tool(
 
 /// What the unknown-tool answer adds when the model names `agent` in a session
 /// that turned it off (BR-14, AC-1).
-pub const AGENT_DISABLED_NOTE: &str =
+pub(crate) const AGENT_DISABLED_NOTE: &str =
     "`agent` is turned off in this session's configuration (agent.enabled = false)";
 
 #[cfg(test)]

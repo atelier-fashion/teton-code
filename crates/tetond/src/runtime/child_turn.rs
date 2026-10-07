@@ -34,7 +34,7 @@
 use super::turn::{AssembledHarness, AttemptInputs, AttemptState, ParentTurn};
 use super::*;
 
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::PoisonError;
 
 use async_trait::async_trait;
@@ -453,16 +453,7 @@ impl Work {
             &spec.provenance,
             repo_context,
         );
-        let mut st = AttemptState {
-            attempts: 0,
-            rerouted_local: false,
-            withdrew_accepted_expansion: false,
-            accepted: None,
-            skill_refit: Vec::new(),
-            conversation,
-            route,
-            finished: None,
-        };
+        let mut st = AttemptState::new(conversation, route);
         let result = runtime
             .run_child_attempts(
                 tctx,
@@ -637,7 +628,7 @@ fn finish(finish: Finish<'_>) -> ChildOutcome {
             report: report.text,
             refusal: ended.refusal,
             error: ended.error,
-            turns_used: model_calls.load(std::sync::atomic::Ordering::Relaxed),
+            turns_used: model_calls.load(Ordering::Relaxed),
             // BR-6: where the child ended up — after any pin or fallback — not
             // where it started.
             route: route.get(),
