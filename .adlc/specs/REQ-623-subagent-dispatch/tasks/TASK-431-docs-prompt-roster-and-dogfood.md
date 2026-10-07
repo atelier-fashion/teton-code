@@ -1,10 +1,10 @@
 ---
 id: TASK-431
 title: "Docs, the REQ-617 roster sentence, architecture-context additions, and the AC-18 dogfood runbook"
-status: draft
+status: complete
 parent: REQ-623
 created: 2026-10-05
-updated: 2026-10-05
+updated: 2026-10-07
 dependencies: ["TASK-428"]
 repo: teton-code
 ---
@@ -31,10 +31,10 @@ as evidence for the companion-files spec). REQ-587's AC-15 note is amended to po
 
 ## Acceptance Criteria
 
-- [ ] `SELF_CONFIG_GUIDE` names `agent` beside `skill`; the REQ-617 guard `the_resident_prompt_names_every_command_family_the_roster_carries` still passes (the sentence is not a `/command`, so it must not join the built-in commands clause)
-- [ ] README/CHANGELOG strings present (grep)
-- [ ] architecture.md sections present
-- [ ] AC-18 runbook present; its result recorded in REQ-623's Validation section when run
+- [x] `SELF_CONFIG_GUIDE` names `agent` beside `skill`; the REQ-617 guard `the_resident_prompt_names_every_command_family_the_roster_carries` still passes (the sentence is not a `/command`, so it must not join the built-in commands clause)
+- [x] README/CHANGELOG strings present (grep)
+- [x] architecture.md sections present
+- [x] AC-18 runbook present; its result recorded in REQ-623's Validation section when run (runbook written and marked OUTSTANDING — the run itself is the wrapup's to record)
 
 ## Verification
 

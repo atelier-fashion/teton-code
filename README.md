@@ -241,6 +241,64 @@ instead. Every daemon-side gate is the same one the shell twin meets.
 To send a prompt that genuinely starts with a slash — a pasted path, say —
 double it: `//usr/local/bin/x — why?` asks the model about `/usr/local/bin/x`.
 
+**The model can hand work to child turns.** A prompt turn's model has an
+`agent` tool — what Claude Code-style skills call "the Agent tool" — that runs
+one or more **child turns** at once and hands each one's final report back as a
+single result. A child is a real turn with a **fresh context**: the session's
+system prompt and the task the model wrote for it, and nothing of your
+conversation, so the twenty files one reviewer reads never land in the window
+of the turn that dispatched it. The children of one call run concurrently, the
+call waits for every one of them, and a child that fails never fails the turn
+that started it — the model gets each child's status and decides.
+
+What a child can do is what the session can do, and no more: the same tools
+except `agent` itself, the same permission level, root and privacy boundaries,
+and `skill`. When a child needs your permission it asks through the same
+prompt, labelled with its name — `allow shell for child audit-1?` — and two
+children asking at once are asked one at a time while the rest keep working; a
+grant you give one child is the session's, so its siblings do not ask again.
+Unattended, a gate with no standing answer denies, and the child carries on
+without that tool or ends saying why. A child may ask for a tier — a `think`
+turn handing implementation to `build` children, say — but the router decides
+and a privacy boundary still pins, and a child that reads protected content
+pins the turn that started it exactly as reading it there would have. What a
+child cannot do: start children of its own, outlive the turn that started it,
+work in a worktree of its own, or load a `.claude/agents` definition — the role
+a skill gives it is written into its task.
+
+Every child runs under bounds fixed before its first model call and echoed in
+its result: a turn cap, a context budget derived from the route it runs on, a
+deadline, and — when a ceiling is set — a spend share. The numbers are an
+`[agent]` table in `config.toml`; these are the defaults:
+
+```toml
+[agent]
+enabled = true              # false takes the tool out of every session
+max_children_per_call = 5   # more tasks in one call is refused whole
+max_children_per_turn = 8   # summed across every `agent` call in a prompt
+child_max_turns = 12        # model calls per child; never above the turn's
+child_deadline_secs = 600   # wall clock; waiting on your answer is not counted
+report_max_bytes = 32768    # longer is cut and marked; the transcript keeps all
+```
+
+With `[cost] prompt_ceiling_usd` set, children spend from the prompt's ceiling
+and you pay for them as part of that one prompt: the headroom left when a call
+starts is split equally among its children, and a child that finishes under
+its share hands what is left to the siblings still running. A child whose next
+call would cross its share ends `spend_exhausted`, and if the children used up
+the ceiling, the turn's own next call is refused the usual way.
+
+Children are visible wherever the turn is. The activity row names the ones
+running — `children: audit-1 12s, audit-2 12s` — a child's tool lines are
+prefixed `child audit-1:`, and a child that ends any way but `completed` prints
+one line saying how. `/cost` lists each turn that dispatched children with its
+total and one row per child beneath it, with the route the child ran on.
+`/verbose` adds the bookkeeping: each call as it starts, where each child runs
+and under which bounds, and any share a finished child released. A recording
+session's transcript holds every child's records in the session's one file,
+each carrying the child's id and its parent turn's
+(`docs/transcript-format.md`).
+
 ### Your own commands
 
 The Claude Code-style skills you already have are session commands here. At
@@ -302,13 +360,16 @@ adding one as the security decision it is. Delete it to go back to being asked.
 What this is **not** is a Claude Code runtime. Frontmatter other than `name`,
 `description` and `argument-hint` is inert — nothing in a file changes your
 permission level, your routing or your boundaries — and the body is passed as
-written, with no translation of tool names and no rewriting of references to
-`Agent`, `Task`, `Skill` or subagents, because there is nothing behind them
-here. Prompt-template skills work. A skill that dispatches subagents or invokes
-other skills gets one model with five tools, and stalls where it would have
-invoked one. And a skill whose expansion does not fit the route's context budget
-is refused with the numbers and the bound — never quietly shortened into
-something you did not type.
+written, with no translation of tool names. The model maps what a body asks for
+onto its own tools: a skill that invokes other skills runs them through `skill`,
+and one that dispatches subagents — `Agent`, `Task`, `subagent_type` — runs
+them as child turns through `agent`, above. What still has nothing behind it:
+`.claude/agents` definitions (a subagent's role travels in its task text),
+background and worktree-isolated agents, and the companion files a skill keeps
+beside its body — `read` refuses them outside the session root, so a skill that
+needs one gets as far as that read. And a skill whose expansion
+does not fit the route's context budget is refused with the numbers and the
+bound — never quietly shortened into something you did not type.
 
 ### Permission levels
 

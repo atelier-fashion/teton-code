@@ -4056,3 +4056,150 @@ Route the slow turn ran on                          :
 Anything that hung, aborted, panicked, or crashed   :
 Notes / findings                                    :
 ```
+
+---
+
+# Manual verification runbook — REQ-623 AC-18 (the skills fan out through `agent`)
+
+**Status: OUTSTANDING — nothing below has been executed.** This is a runbook
+written for a person with the ADLC toolkit on their machine; it is not a record
+of a run, and no box in it may be ticked from CI or by an agent. When it is run,
+the result goes in the sign-off block below **and** in REQ-623's Validation
+section, which is where AC-18 says the stall step is recorded.
+
+## What this proves that CI does not
+
+The e2e suite drives `agent` against a scripted provider: the schema and the
+caps, concurrency by rendezvous, the busy claim, consent, tiers, the boundary,
+spend shares, all eight statuses, skills inside children and the transcript.
+What no mock settles is the thing REQ-623 *assumes* rather than builds: that a
+**real** model, handed the ADLC skills' own words — "dispatch the auditor
+agents", "use the Agent tool with `subagent_type: …`", "launch these in
+parallel" — maps that phrasing onto `agent { tasks }` from the resident roster
+sentence and the tool's schema alone. The skills are written in Claude Code's
+vocabulary and Teton deliberately did not mimic it (the spec's Assumptions). A
+model's behaviour is an observation, never an assertion (LESSON-532).
+
+Two negative results are evidence rather than failures, and the procedure asks
+for both in the model's own words:
+
+- **The model does not map the phrasing** — it runs the dimensions inline, or
+  says it has no way to dispatch. Then the remedy is a roster sentence or a
+  toolkit change, not a schema that copies Claude Code's; record what the model
+  said when the body told it to dispatch.
+- **`/proceed` stalls after Phase 4.** Expected at a companion-file read — a
+  file the skill keeps beside its `SKILL.md`, which `read` refuses outside the
+  session root, REQ-587's other deferral. The exact step is the evidence for
+  the companion-files spec, not a failure of this one.
+
+## Prerequisites
+
+- The shipped binary or a `--release` build, with `TETON_TEST_SEAMS` unset.
+- `agent` enabled — the default. Confirm `config.toml` carries no
+  `[agent] enabled = false`, and record any `[agent]` keys it does carry.
+- A repository with the ADLC toolkit vendored: `.adlc/` present (`/init` has
+  run) and the skills reachable at `~/.claude/skills` (the symlink into the
+  toolkit). For leg (b), a REQ whose architecture is approved and whose tasks
+  are drafted — **in a throwaway clone**, because Phase 4 writes code.
+- A remote provider routed for `build` and `think`, with a declared window
+  large enough for `/proceed`'s expansion; record which provider, model and
+  window. Leg (b)'s point is whether Phase 4 hands work to `build` children,
+  so a session with every tier on one route still runs but measures less.
+- `/boundary list`, recorded verbatim. Since REQ-619 a `~/.claude` skill is
+  judged by the globs that name it and no others, so most boundaries do not
+  touch this run — but a child that reads boundary content pins its parent
+  local, and a run that ends up on the local tier is measuring that tier rather
+  than the mapping.
+- `/verbose` on (it prints `agent call <id>: starting N child(ren) — <names>`
+  and each child's route and bounds) and `/transcript on` (each child's task
+  and records are in the session's file under its `child_id` — the only place
+  to see what the model actually handed each child).
+- Write-heavy fan-out shares the session root (LESSON-610/611): Phase 4's
+  implementers each write. Note whether the skill partitions its outputs by
+  child name; a clobbered file is a toolkit finding, not a Teton one.
+
+## Procedure
+
+### (a) `/analyze` — does the audit fan out through `agent`?
+
+1. [ ] Start `teton` in the vendored repository, `/verbose` and `/transcript on`.
+       Record `/help`'s skills diagnostic line.
+2. [ ] Type `/analyze`. Answer any dynamic-context consent and record which way.
+3. [ ] Watch for the first `agent` call: the verbose line
+       `agent call <call_id>: starting N child(ren) — <names>` and the activity
+       row's `children: …` clause. Record the line verbatim. **If no `agent`
+       call is made** — the parent reads and greps the dimensions itself, one
+       after another — record that, and quote the skill body's dispatch line
+       and the model's words at that point. That is the AC-18 negative.
+4. [ ] From the transcript, record what the model wrote into each child's
+       `task`: did the auditor role the skill names by `subagent_type` reach
+       the task text, and did the model also pass `subagent_type` (ignored,
+       harmless, but evidence of how it mapped the vocabulary)?
+5. [ ] Record each child's status. A child that ends any way but `completed`
+       prints one line in the session; quote it.
+6. [ ] Record whether the consolidated report was produced, and paste `/cost`'s
+       `turns with children:` block.
+7. [ ] If a cap refused the call (`too_many_children`, `child_cap_reached`),
+       record the message and whether the model split the work across calls.
+
+### (b) `/proceed` — does Phase 4 pass the dispatch step, and where does it next stop?
+
+1. [ ] In the throwaway clone, type `/proceed REQ-xxx` for the prepared REQ.
+       Record how many `continue` prompts each phase needed — one prompt's turn
+       cap does not span the pipeline.
+2. [ ] At Phase 4, record whether the implementers are dispatched through
+       `agent`: the verbose call line, the children's names, the tier each
+       requested, and the route each actually ran on (its `started on …` line).
+3. [ ] Record each child's status. `turns_exhausted` or `spend_exhausted` is a
+       finding about a bound, not a stall — record which bound and its value.
+4. [ ] **The AC:** record whether `/proceed` reached the end of Phase 4 without
+       stalling at "dispatch an agent" — the stall REQ-587 AC-15 recorded.
+5. [ ] **Record the exact step at which it next stalls**, quoting the line of
+       the skill body it stopped on and the model's own words. Expected: a
+       companion-file read. Write the quote down, not a paraphrase — it is the
+       companion-files spec's evidence.
+6. [ ] Note whether concurrent implementers overwrote each other's outputs in
+       the shared root.
+
+### (c) The mapping, asked directly
+
+1. [ ] In a fresh session, ask *"can you hand work to a subagent?"*. Expect:
+       yes, through the `agent` tool — child turns with a fresh context and
+       this session's permissions. Record the answer verbatim.
+2. [ ] Set `[agent] enabled = false`, restart the daemon, and ask again.
+       Expect the model not to claim a tool it is not listed; if it calls
+       `agent` anyway, the unknown-tool answer names `agent.enabled`. Record
+       both, then restore the setting.
+
+## Sign-off
+
+```
+REQ-623 AC-18 verified by : ______________________  date: ____________
+Machine          :               (chip / RAM / OS)
+Build            :               (`teton --version`)
+TETON_TEST_SEAMS confirmed unset : yes / no
+[agent] keys in config.toml      :               (none = defaults)
+Provider / model / window for build and think :
+/boundary list, verbatim         :
+/help — skills diagnostic line   :
+(a) first `agent` call line, verbatim         :
+(a) NO agent call — skill line + model's words :
+(a) role from `subagent_type` reached the task text : yes / no
+(a) model also passed `subagent_type`         : yes / no
+(a) child statuses                            :
+(a) consolidated report produced              : yes / no
+(a) /cost `turns with children:` block        :
+(a) cap refusal, if any, and what followed    :
+(b) REQ used, and `continue` prompts per phase :
+(b) Phase 4 dispatched through `agent`         : yes / no
+(b) children: name / requested tier / ran on   :
+(b) child statuses (bound named for any exhausted) :
+(b) reached the end of Phase 4 without the dispatch stall : yes / no   <-- the AC
+(b) NEXT STALL — skill body line, quoted       :
+(b) NEXT STALL — model's words, quoted         :
+(b) outputs clobbered in the shared root       : yes / no
+(c) "can you hand work to a subagent?" — answer :
+(c) with agent.enabled = false — answer, and any unknown-tool text :
+Copied into REQ-623's Validation section       : yes / no
+Notes / findings :
+```

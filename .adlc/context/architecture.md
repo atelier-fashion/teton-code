@@ -65,6 +65,35 @@
   every fallback reroute and that rebinding must stay visible in the signature.
   The stage definitions are laid out in *execution* order, which several
   source-scanning checks depend on.
+- **Child turns: three of those stages, under the parent's claim** (REQ-623
+  ADR-1..3). The `agent` tool's children run **route → assemble → attempt** —
+  the prompt turn's own stage functions (`dispatch_route` with the child's tier
+  request, `assemble_child_harness`, `run_child_attempts` in `runtime/turn.rs`),
+  so a reroute, a privacy block, a spend ceiling and a window refusal are
+  handled by exactly the parent's code — and skip the other five: **claim**
+  (children run under the parent's, so a second prompt is refused busy for the
+  whole call, LESSON-539), **name**, **settle** (a task is not a skill),
+  **prepare** (no seed from the session's conversation: a child's context is
+  fresh) and **commit** (its context is dropped; only ledger rows, events and
+  transcript records persist). The loop reaches the tool through
+  `Tool::as_agent()`, beside `Tool::as_skill()`, and **awaits**
+  `AgentTool::dispatch` on its async path; `AgentTool::run` answers a typed
+  `agent_requires_async_dispatch` refusal, because `block_in_place` +
+  `block_on` inside `run` is BUG-226's shape at N times the duration. Children
+  are tokio tasks in one `JoinSet` per call, behind the `ChildDispatcher` trait
+  (`harness/child.rs`) that `runtime/child_turn.rs` implements, so
+  `harness/tools/agent.rs` never imports the runtime. **A child id is stamped
+  by `SessionEvents::for_child` and nowhere else:** it returns the parent's
+  emitter — same bus, same session, same transcript sink — carrying
+  `child_id` and `parent_turn_id`, and every payload with the fields
+  (`session_update`, `context_pressure`, the transcript bodies) takes them from
+  it, while `permission_request` and `cost_recorded` read the pair back off the
+  emitter (`child_scope()`) rather than deriving it again (LESSON-501). Four
+  session-scoped payloads REQ-623 deliberately did not widen are **suppressed**
+  in a child rather than published unstamped, because a client would read them
+  as the parent's: `route_decided`, `context_compacted`, `turn_queued` and
+  `prefill_progress` (`PARENT_ONLY_EVENTS`). The `agent_*` events are the
+  parent's news and go out on the parent's own emitter, which stamps nothing.
 - **Workflow-aware routing** — phase (spec/architect/implement/review/io)
   determines model tier via a user-visible policy table; never per-prompt
   heuristics in structured mode (BR-5).
@@ -113,6 +142,24 @@
   REQ-596, which closed the cheaper half — the child no longer holds a configured
   credential. A documented guarantee that is false is worse than a narrower one
   that is true.
+- **Cost: the prompt ceiling is split into shares by `SharePool`; shares rise,
+  never fall; the parent accumulator is the sum** (REQ-623 ADR-4, BR-8).
+  REQ-588's ceiling is per prompt, and an `agent` call's children spend from it
+  through a `SharePool` (`cost/share.rs`) built when the call starts:
+  `ceiling − the prompt's accumulator`, read live, split `floor(headroom / n)`
+  among the call's children. A child's egress reads its ceiling from the pool
+  **at check time** (`Egress::with_child_spend`) rather than stamping it at
+  construction, because a share can rise: a child that ends with share unspent
+  releases it to the siblings still running in equal parts (floor; the
+  remainder stays unused), and no share ever falls. Every child call adds into
+  the child's own accumulator **and** the prompt's `PromptSpend`, so the parent
+  accumulator is the parent's own calls plus every child's, and after the call
+  the parent's next model call meets the existing `SpendCeilingReached` arm on
+  the real headroom (LESSON-557: both halves already existed). A prompt with
+  no ceiling builds an *unlimited* pool — no share, no check, no release — a
+  state of its own rather than a share of `u64::MAX`. The user-facing
+  consequence, stated on the `cost` docs page: with children running, the
+  prompt's overshoot bound is one in-flight call per child, not one in total.
 - **A withheld capability explains itself at the point it bites** — when a
   security decision removes something a user's command needs, the resulting
   failure names the daemon and the key that reverses it, on the failing call and
@@ -418,6 +465,23 @@
   fact, one call per paired decision — needs a **test**, because a checklist
   recorded in a task file has no schedule and no owner (LESSON-545,
   LESSON-546).
+- **Testing: concurrent children are addressed by content, never by arrival
+  order** (REQ-623 ADR-3, ADR-6). `tests/e2e/harness.rs`'s `MockProvider`
+  served scripted replies in order, and with concurrent children the arrival
+  order is a scheduler accident, so ordered scripting cannot address a child.
+  `MockProvider::start_matching(table, default)` answers each request from a
+  `(Matcher, MockResponse)` table keyed on a request-body substring
+  (`Matcher::body_contains` — the child's task text), and
+  `MockResponse::rendezvous(n, inner)` holds a reply until `n` requests are
+  parked on it, then releases all of them: concurrency is proven by a
+  rendezvous a sequential implementation would deadlock on, not by a
+  wall-clock bound, and the same primitive is the parked verifier for the
+  live-event check. Egress capture is request-order-agnostic and unchanged.
+  **The LESSON-591 rule, applied to children:** child events interleave
+  nondeterministically, so no golden sequence pins a cross-child order —
+  child events are asserted as a set and in per-child order (filtered by
+  `child_id`), and the parent's sequence drops child-scoped events before it is
+  compared.
 - **A decision with two stores needs one invalidation rule, and it lives above
   both.** REQ-585's skill grants expire when the session root moves — the
   daemon drops `skill:project:*` inside `set_session_cwd`, and the CLI's own
