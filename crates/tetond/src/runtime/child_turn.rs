@@ -1423,7 +1423,8 @@ mod tests {
     /// The second and third are the benign half: a denial is a typed tool
     /// failure the child read (BR-5), and what it did next is its own ending.
     ///
-    /// # Mutations (run 2026-10-06, each reverted)
+    /// # Mutations (run 2026-10-07, each reverted — 1 red apiece, this test,
+    /// over the lib and four integration binaries)
     ///
     /// - **Never refuse** (`finished_on_its_own` always `completed`): reddens
     ///   at the `stopped` leg.

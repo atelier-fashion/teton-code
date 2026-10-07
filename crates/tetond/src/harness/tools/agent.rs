@@ -974,12 +974,14 @@ mod tests {
     /// The name checks run on a fresh turn, and after all three refusals five
     /// and three children still fit — a refusal reserves nothing of the cap.
     ///
-    /// # Mutations (run 2026-10-06, each reverted)
+    /// # Mutations (run 2026-10-06/07, each reverted; over the 2,360 tests of
+    /// the lib and the `repeat_refusal`, `cost_attribution`,
+    /// `provenance_egress` and `boundary_coverage` binaries)
     ///
-    /// - **Drop the per-call cap check**: reddens here at the six-task leg (the
-    ///   per-turn cap admits six of eight, and six children start).
+    /// - **Drop the per-call cap check**: 1 red, this test, at the six-task
+    ///   leg (the per-turn cap admits six of eight, and six children start).
     /// - **Reserve before the name checks** (move the `fetch_update` above
-    ///   them): reddens here at "a refusal reserves nothing".
+    ///   them): 1 red, this test, at "a refusal reserves nothing".
     #[tokio::test]
     async fn caps_refuse_whole_and_typed() {
         let f = fixture(echo());
@@ -1175,12 +1177,22 @@ mod tests {
     /// `agent_call_finished`, and both the result and the call's tally list
     /// the children in task order, not finish order.
     ///
-    /// # Mutations (run 2026-10-06, each reverted)
+    /// # Mutations (run 2026-10-06/07, each reverted; same 2,360-test scope as
+    /// `caps_refuse_whole_and_typed`)
     ///
     /// - **Await each child before starting the next** (`land` inside the
-    ///   `launch` loop): reddens here — the barrier is never reached.
-    /// - **Return on the first child to land** (`land` breaking after one):
-    ///   reddens here at "nothing is still running".
+    ///   `launch` loop): 3 red — this test (the barrier is never reached),
+    ///   `asks_serialise_and_grants_are_shared` and
+    ///   `the_parent_emitter_stays_live_while_children_run` — and
+    ///   `parent_cancel_aborts_every_child_and_each_reports_cancelled` **hangs**
+    ///   (its first child parks for ever, so the second never starts and the
+    ///   test waits on it with no bound); the run was killed to end it.
+    /// - **Return on the first child to land** (`land` breaking after one): 6
+    ///   red — this test, `caps_refuse_whole_and_typed`,
+    ///   `asks_serialise_and_grants_are_shared`,
+    ///   `parent_cancel_aborts_every_child_and_each_reports_cancelled`,
+    ///   `result_is_untrusted_json_with_the_provenance_union` and
+    ///   `shares_split_the_prompts_live_headroom`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn children_overlap_and_parent_waits_for_all() {
         let barrier = Arc::new(tokio::sync::Barrier::new(3));
@@ -1346,14 +1358,18 @@ mod tests {
     /// already answers never queues — answered at once while its call's
     /// consent queue is held by someone else.
     ///
-    /// # Mutations (run 2026-10-06, each reverted)
+    /// # Mutations (run 2026-10-06/07, each reverted; same 2,360-test scope as
+    /// `caps_refuse_whole_and_typed`) — 1 red apiece, this test, and nothing
+    /// else
     ///
-    /// - **Remove the mutex** (`queue_for_consent` taken out of the gate's
-    ///   `settle`): reddens here at "one question at a time".
+    /// - **Remove the mutex** (`queue_for_consent` replaced by a fresh mutex
+    ///   per ask in the gate's `settle`): at "one question at a time".
     /// - **A mutex per child** (the tool handing each spec its own): the same
     ///   red — the queue only serialises what shares it.
-    /// - **No grant re-check after queueing**: reddens here at "the sibling
-    ///   ran on the grant" — a second question is raised.
+    /// - **No grant re-check after queueing**: a second question is raised and
+    ///   the call does not finish on the one answer.
+    /// - **No child id on the request** (`PermissionRequest.child_id: None`):
+    ///   at "the question names the child that asked".
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn asks_serialise_and_grants_are_shared() {
         let bus = Arc::new(EventBus::new());
@@ -1591,10 +1607,13 @@ mod tests {
     /// — so the parent's next call is judged by both. The content is the
     /// `ChildResult` array, nothing else, in task order.
     ///
-    /// # Mutation (run 2026-10-06, reverted)
+    /// # Mutation (run 2026-10-06/07, reverted; same 2,360-test scope as
+    /// `caps_refuse_whole_and_typed`)
     ///
-    /// - **Drop the union** (`result_of` leaving the block `none()`): reddens
-    ///   here at the provenance assertion.
+    /// - **Drop the union** (`result_of` leaving the block `none()`): 2 red —
+    ///   this test at the provenance assertion, and
+    ///   `provenance_egress::an_agent_childs_boundary_read_blocks_the_parents_next_remote_turn`,
+    ///   where the secret then leaves on the parent's next request.
     #[tokio::test]
     async fn result_is_untrusted_json_with_the_provenance_union() {
         let read = ProvenanceId::from_resolved(Path::new("/repo"), Path::new("/repo/notes/a.md"))
@@ -1638,11 +1657,14 @@ mod tests {
     /// in it. `Tool::run`, reached by name through the registry, answers the
     /// typed `agent_requires_async_dispatch` refusal and starts nothing.
     ///
-    /// # Mutation (run 2026-10-06, reverted)
+    /// # Mutation (run 2026-10-06/07, reverted; same 2,360-test scope as
+    /// `caps_refuse_whole_and_typed`)
     ///
     /// - **Remove the `as_agent` arm** (every call through
-    ///   `block_in_place_if_multithread(|| tools.dispatch(..))`): reddens here —
-    ///   the folded result is the refusal and no child ran.
+    ///   `block_in_place_if_multithread(|| tools.dispatch(..))`, so `run`'s
+    ///   refusal is what the model gets): 3 red — this test, and the two that
+    ///   drive a real loop: `repeat_refusal::agent_is_write_capable_third_identical_refused`
+    ///   and `provenance_egress::an_agent_childs_boundary_read_blocks_the_parents_next_remote_turn`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_loop_awaits_agent_and_never_runs_it() {
         use crate::harness::completion::{CompletionSource, SourceTurn, TurnDecision};

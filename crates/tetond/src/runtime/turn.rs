@@ -4391,7 +4391,7 @@ mod tests {
     ///   tests matching `child`; `register_skill_tool` moved into the
     ///   `ToolSet::Prompt` arm): 1 red, this test — the prompt turn's registry
     ///   holds a tool beyond `agent` that the child's lacks.
-    /// - **Register `agent` for children too** (run 2026-10-06 by TASK-428; the
+    /// - **Register `agent` for children too** (run 2026-10-07 by TASK-428; the
     ///   `register_agent_tool` call duplicated into the `ToolSet::Child` arm):
     ///   reddens this test at "depth is one", and
     ///   `child_context_is_system_context_task_only` and
@@ -4429,7 +4429,7 @@ mod tests {
     /// cap-exempt. Benign path: the default (`enabled = true`) registers it, and
     /// cap-exempt, so it survives a cap of zero.
     ///
-    /// # Mutation (run 2026-10-06, reverted)
+    /// # Mutation (run 2026-10-07, reverted)
     ///
     /// - **Ignore the flag** (`register_agent_tool`'s `!config.enabled` early
     ///   return removed): reddens this test at "off is absence", and
@@ -4475,7 +4475,7 @@ mod tests {
     /// and an unknown tool **other** than `agent` gets the bare answer, with no
     /// key named — the note is the absent tool's, not every unknown one's.
     ///
-    /// # Mutation (run 2026-10-06, reverted)
+    /// # Mutation (run 2026-10-07, reverted)
     ///
     /// - **Drop the absent note** (`note_absent` call removed from
     ///   `register_agent_tool`): reddens this test at "names the key". Nothing

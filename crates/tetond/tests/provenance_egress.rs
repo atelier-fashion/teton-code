@@ -833,9 +833,11 @@ impl tetond::harness::child::ChildDispatcher for ChildThatReadTheSecret {
 /// in its provenance. The end-to-end leg — a real child turn reading the file
 /// under a configured boundary — is TASK-430's AC-10.
 ///
-/// Mutation (run 2026-10-06, reverted): the tool leaving its result block's
-/// provenance empty (`result_of` without the union) reddens this test — the
-/// second request goes out carrying the secret.
+/// Mutation (run 2026-10-07, reverted): the tool leaving its result block's
+/// provenance empty (`result_of` without the union) reddens this test at its
+/// provenance assertion — the block no longer names `secrets/prod.env`, so
+/// nothing pins the parent's next request — and `agent::tests::
+/// result_is_untrusted_json_with_the_provenance_union` beside it.
 #[tokio::test]
 async fn an_agent_childs_boundary_read_blocks_the_parents_next_remote_turn() {
     use tetond::harness::tools::agent::{AgentParent, AgentTool};

@@ -796,13 +796,22 @@ async fn a_repeat_refusal_rides_outside_the_untrusted_frame() {
 /// are stamped with its turn at its own choke point, so the turn's `own` line
 /// counts them beside its two children's lines.
 ///
-/// # Mutations (run 2026-10-06, each reverted)
+/// # Mutations (run 2026-10-06/07, each reverted; over the 2,360 tests of the
+/// `tetond` lib and this, `cost_attribution`, `provenance_egress` and
+/// `boundary_coverage`)
 ///
-/// - **File `agent` under `READ_ONLY_TOOLS`**: reddens here at the benign
-///   leg — one call started, the second refused.
-/// - **Remove the `as_agent` arm** (the call reaches `Tool::run`): reddens
-///   here — no call is started, every "dispatch" is the typed
-///   `agent_requires_async_dispatch` refusal.
+/// - **File `agent` under `READ_ONLY_TOOLS`**: 2 red — this test at the benign
+///   leg (one call started, the second refused) and
+///   `harness::repeat::tests::agent_is_write_capable`.
+/// - **Remove the `as_agent` arm** (the call reaches `Tool::run`): 3 red —
+///   this test (no call is started; every "dispatch" is the typed
+///   `agent_requires_async_dispatch` refusal),
+///   `agent::tests::the_loop_awaits_agent_and_never_runs_it` and
+///   `provenance_egress::an_agent_childs_boundary_read_blocks_the_parents_next_remote_turn`.
+/// - **Stop stamping the parent's own calls** (`run_attempts` without
+///   `tctx.for_turn(..)`): 1 red, this test, at its `/cost` leg — the turn's
+///   own line counts nothing. `Egress::send` ignoring its turn reddens this
+///   leg too, beside `cost_attribution`'s choke-point test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn agent_is_write_capable_third_identical_refused() {
     let repo = Tree::new("agent");

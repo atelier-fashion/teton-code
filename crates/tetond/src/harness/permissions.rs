@@ -4736,7 +4736,7 @@ mod tests {
     /// a child *can* write, which is also why the repeat ledger counts `agent`
     /// write-capable.
     ///
-    /// Mutation (run 2026-10-06, reverted): dropping `allow_dispatch` from the
+    /// Mutation (run 2026-10-07, reverted): dropping `allow_dispatch` from the
     /// `plan` arm reddens this test at `plan` and
     /// `each_level_expands_to_its_documented_table`.
     #[test]

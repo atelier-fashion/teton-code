@@ -603,10 +603,11 @@ async fn parent_total_is_own_plus_children() {
 /// unattributed, exactly as every call before REQ-623 — and an attribution
 /// that already names a turn keeps it.
 ///
-/// Mutation (run 2026-10-06, reverted): `Egress::send` ignoring `self.turn`
-/// (the attribution passed through unstamped) reddens this test at "the
-/// parent's own call nests under its turn": `per_turn` holds the turn with
-/// zero own calls.
+/// Mutation (run 2026-10-07, reverted): `Egress::send` ignoring `self.turn`
+/// (the attribution passed through unstamped) reddens 2 — this test, at its
+/// first row ("the parent's own call names its turn and no child"), and
+/// `repeat_refusal::agent_is_write_capable_third_identical_refused` at its
+/// `/cost` leg, the daemon-path half of the same claim.
 #[tokio::test]
 async fn a_parent_turns_own_calls_are_stamped_at_its_choke_point() {
     let script = [(1000u64, 500u64), (4000, 2000), (3000, 100), (2000, 900)];
