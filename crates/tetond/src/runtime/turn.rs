@@ -4312,8 +4312,17 @@ impl DaemonRuntime {
             // REQ-588 BR-1/ADR-6: the user's ceiling, when they set one. Absent
             // leaves the choke point exactly as it was — no check, no pricing
             // lookup, no branch.
-            .with_optional_spend_ceiling(config.cost.ceiling_micro_cents())
-            .with_prompt_spend(prompt_spend.cloned())
+            //
+            // A child's choke point takes neither (REQ-623 ADR-4): its share is
+            // its ceiling, and its `ChildSpend` pays into the prompt's
+            // accumulator itself.
+            .with_optional_spend_ceiling(
+                config
+                    .cost
+                    .ceiling_micro_cents()
+                    .filter(|_| child.is_none()),
+            )
+            .with_prompt_spend(prompt_spend.filter(|_| child.is_none()).cloned())
             // REQ-623 ADR-4: a child's choke point checks the child's own spend
             // against its share and pays into the prompt's accumulator too;
             // its rows carry the child's ids. `None` — every prompt turn —

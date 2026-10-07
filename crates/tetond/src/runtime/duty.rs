@@ -554,8 +554,15 @@ impl DaemonRuntime {
             // REQ-588 BR-1/ADR-6: the user's ceiling, when they set one. Absent
             // leaves the choke point exactly as it was — no check, no pricing
             // lookup, no branch.
-            .with_optional_spend_ceiling(config.cost.ceiling_micro_cents())
-            .with_prompt_spend(prompt_spend.cloned())
+            //
+            // A child's duty takes neither: its share is its ceiling (below).
+            .with_optional_spend_ceiling(
+                config
+                    .cost
+                    .ceiling_micro_cents()
+                    .filter(|_| child.is_none()),
+            )
+            .with_prompt_spend(prompt_spend.filter(|_| child.is_none()).cloned())
             // REQ-623 ADR-4 (TASK-426's open question, answered here): a
             // child's duty is the child's spend. It checks against the child's
             // share and pays into the prompt's accumulator through the child's

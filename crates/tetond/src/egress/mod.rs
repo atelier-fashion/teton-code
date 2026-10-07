@@ -674,6 +674,10 @@ impl<T: Transport> Egress<T> {
     /// lookup, so an un-opted-in machine is byte-identical to before this REQ.
     #[must_use]
     pub fn with_spend_ceiling(mut self, micro_cents: u64) -> Self {
+        debug_assert!(
+            self.child_spend.is_none(),
+            "a child's choke point checks its share, never the prompt's ceiling (REQ-623 ADR-4)"
+        );
         self.spend_ceiling = Some(micro_cents);
         self
     }
@@ -686,6 +690,10 @@ impl<T: Transport> Egress<T> {
     /// could come to disagree.
     #[must_use]
     pub fn with_optional_spend_ceiling(mut self, micro_cents: Option<u64>) -> Self {
+        debug_assert!(
+            self.child_spend.is_none() || micro_cents.is_none(),
+            "a child's choke point checks its share, never the prompt's ceiling (REQ-623 ADR-4)"
+        );
         self.spend_ceiling = micro_cents;
         self
     }
@@ -701,6 +709,11 @@ impl<T: Transport> Egress<T> {
         mut self,
         spend: Option<Arc<teton_core::cost_ceiling::PromptSpend>>,
     ) -> Self {
+        debug_assert!(
+            self.child_spend.is_none() || spend.is_none(),
+            "a child's choke point adds into the prompt through its ChildSpend, never twice \
+             (REQ-623 ADR-4)"
+        );
         self.prompt_spend = spend;
         self
     }
@@ -718,9 +731,18 @@ impl<T: Transport> Egress<T> {
     /// prompt's accumulator itself, and adding through both would count each
     /// call twice.
     ///
+    /// **The two are exclusive by construction, not only by the check's match
+    /// order** (verify, 2026-10-07): `Some` clears any prompt pair already set,
+    /// and setting the pair after a child's spend is a debug assertion. The
+    /// runtime's builders set no pair on a child's choke point at all.
+    ///
     /// `None` (the default) changes nothing.
     #[must_use]
     pub fn with_child_spend(mut self, spend: Option<ChildSpend>) -> Self {
+        if spend.is_some() {
+            self.spend_ceiling = None;
+            self.prompt_spend = None;
+        }
         self.child_spend = spend;
         self
     }
@@ -3163,7 +3185,10 @@ mod tests {
     ///
     /// Mutation (recorded, full `tetond` lib suite): letting the prompt pair's
     /// check run on a child's choke point reddens this test alone (the call is
-    /// refused at the prompt's already-reached ceiling).
+    /// refused at the prompt's already-reached ceiling). Since verify
+    /// (2026-10-07) `with_child_spend` also clears the pair, so that mutation
+    /// needs the clear removed too to redden — the clear's own test is
+    /// `attaching_a_childs_spend_clears_the_prompt_pair`.
     #[tokio::test]
     async fn a_childs_choke_point_ignores_the_prompt_pair_and_counts_once() {
         use crate::cost::SharePool;
@@ -3192,6 +3217,68 @@ mod tests {
             57_000,
             "one call, counted into the parent once"
         );
+    }
+
+    /// **REQ-623 ADR-4 (verify): a child's spend and the prompt pair are
+    /// exclusive by construction** — attaching a child's spend clears a prompt
+    /// ceiling and accumulator set before it, and setting either after it is a
+    /// debug assertion.
+    ///
+    /// Benign: a prompt turn's choke point keeps its pair.
+    ///
+    /// Mutation (run 2026-10-07, reverted): the clear removed from
+    /// `with_child_spend` — 1 red of the 2,328 lib tests, this one, at the
+    /// ceiling.
+    #[test]
+    fn attaching_a_childs_spend_clears_the_prompt_pair() {
+        use crate::cost::SharePool;
+        let child = ChildId::new("call-1", "audit");
+        let parent = Arc::new(teton_core::cost_ceiling::PromptSpend::default());
+        let spend = ChildSpend::new(
+            child.clone(),
+            SharePool::new(Some(1_000), std::slice::from_ref(&child)),
+            Some(parent.clone()),
+        );
+        let prompt = Egress::new(
+            CaptureTransport::default(),
+            boundaries(),
+            Arc::new(CapturingSink::default()),
+        )
+        .with_spend_ceiling(50_000)
+        .with_prompt_spend(Some(parent.clone()));
+        assert_eq!(
+            prompt.spend_ceiling,
+            Some(50_000),
+            "benign: a prompt's pair"
+        );
+        assert!(prompt.prompt_spend.is_some());
+
+        let child_egress = prompt.with_child_spend(Some(spend));
+        assert_eq!(child_egress.spend_ceiling, None);
+        assert!(child_egress.prompt_spend.is_none());
+        assert!(child_egress.child_spend.is_some());
+    }
+
+    /// The other order: a prompt pair set on a choke point that already
+    /// carries a child's spend is a builder bug, caught in debug builds.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "never the prompt's ceiling")]
+    fn a_prompt_ceiling_after_a_childs_spend_is_a_debug_assertion() {
+        use crate::cost::SharePool;
+        let child = ChildId::new("call-1", "audit");
+        let spend = ChildSpend::new(
+            child.clone(),
+            SharePool::new(Some(1_000), std::slice::from_ref(&child)),
+            None,
+        );
+        let _ = Egress::new(
+            CaptureTransport::default(),
+            boundaries(),
+            Arc::new(CapturingSink::default()),
+        )
+        .with_child_spend(Some(spend))
+        .with_optional_spend_ceiling(Some(50_000));
     }
 }
 
