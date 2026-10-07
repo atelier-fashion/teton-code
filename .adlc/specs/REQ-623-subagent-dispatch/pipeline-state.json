@@ -2,8 +2,8 @@
   "req": "REQ-623",
   "branch": "feat/REQ-623-subagent-dispatch",
   "startedAt": "2026-10-06T00:04:05Z",
-  "completed": false,
-  "currentPhase": 7,
+  "completed": true,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
@@ -11,7 +11,9 @@
     3,
     4,
     5,
-    6
+    6,
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -52,6 +54,18 @@
       "phase": 6,
       "name": "Create Pull Request",
       "completedAt": "2026-10-07T14:39:17Z"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-10-07T14:59:00Z",
+      "note": "8/8 checks green on d58f0dd after merging origin/main (REQ-626); squash-merged as 919bccc"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup",
+      "completedAt": "2026-10-07T16:00:00Z",
+      "note": "squash-merged as 919bccc3 (#334); close-out via chore/REQ-623-wrapup; LESSON-664; BUG-231..234; ASSUME-050"
     }
   ],
   "repos": {
@@ -64,9 +78,11 @@
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/334",
       "prNumber": 334,
       "prCreatedAt": "2026-10-06T00:04:04Z",
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
-      "snapshotPR": null
+      "snapshotPR": null,
+      "mergeSha": "919bccc3fb93b709a6acc0d6c3e40f9689aedc85",
+      "mergedAt": "2026-10-07T14:59:48Z"
     }
   },
   "mergeOrder": [
@@ -128,5 +144,6 @@
     "fixPass": "two agents: src+spec+docs / tests+fixtures",
     "stepD": "4 re-verifiers clean (correctness 9/9, security 6/6, architecture 8/8, test-audit all confirmed); residual doc nits in 6bf1988",
     "fixPassResult": "src: 20 commits (f2c5591..91770d3), tests: 3 commits; tetond --tests 3,052 passed / 0 failed; new bug fixed: PausableDeadline::expired never fired when budget spent before a pause (e299bb4); cancellation point after child tool dispatch (166b054)"
-  }
+  },
+  "terminal": "merged"
 }

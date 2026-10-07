@@ -506,20 +506,47 @@ _Added 2026-10-07 (verify) — found in scope, settled as follow-ups._
   timed-out child's blocking tool is abandoned, not killed (BR-10, AC-14 as
   amended): a `shell` command runs to its own timeout and may outlive the
   parent's turn. The parent's own cancelled `shell` behaves the same today.
-  BUG to be filed at wrapup.
+  BUG-232.
 - **`/help` saying whether `agent` is available** (BR-14's `/help` clause) —
-  not implemented by this REQ; follow-up.
+  not implemented by this REQ; follow-up — BUG-234 (with the text-form
+  `agent.enabled` hint).
 - **Five session-scoped kinds still published unstamped from a child** —
   `provider_degraded`, `capability_dead_end`, `prefix_cache`,
   `tool_call_repeated`, `shell_duty_skipped`. A client attributes them to the
   parent; none flips the activity row the way the four suppressed kinds did.
-  Stamp or suppress them (`harness::child` module docs).
+  Stamp or suppress them (`harness::child` module docs). BUG-233.
 - **A default report bound beside a lowered transcript record cap.**
   `report_max_bytes` is held to `[transcript] max_record_bytes` only when the
   user moved it off its 32 KiB default: a record cap lowered below 32 KiB was a
   valid config before `[agent]` existed and must still load. On such a machine
   a cut report's "full text is in the transcript" can be cut there too.
   Follow-up: clamp the effective bound at runtime when the key is unset.
+
+## Validation
+
+`/validate` ran twice before `/proceed` (2026-10-05): spec phase 0 blockers
+(six holes fixed in place — the permissions row contradicting BR-5, the
+consent-wait/deadline gap, the repeat-ledger class, a phantom "model-output
+provenance", a wall-clock AC-5, the skills-vocabulary assumption); task phase 0
+blockers (TASK-432 split out of TASK-427; ADR-4's accumulator type corrected).
+`/proceed` 2026-10-05 → 2026-10-07: twelve tasks, Phase-4 gate 4,859 workspace
+tests green; Phase 5 reflector + five reviewers found 0 Critical / 9 Major /
+~14 Minor, all fixed in a two-agent pass, Step-D re-verify clean on all four
+dimensions. Two bugs the suite caught and fixed before merge: an aborted child
+took one more step after its blocking tool returned (LESSON-664, 166b054) and
+`PausableDeadline::expired` never fired when the budget was spent before a pause
+(e299bb4). Squash-merged as 919bccc3 (#334) on 2026-10-07.
+
+**AC-18 (dogfood) — OUTSTANDING.** The runbook is in
+`docs/manual-verification.md`; run `/analyze` and `/proceed` through Phase 4
+from a Teton session with the ADLC toolkit vendored, record whether `/analyze`
+dispatches through `agent`, whether `/proceed` passes the Phase-4 dispatch
+step, and the exact step where it next stalls (the companion-file read) as
+evidence for the companion-files spec. ASSUME-050 resolves with that run.
+
+Follow-ups filed at wrapup: BUG-231 (REQ-588 spend-ceiling units, pre-existing),
+BUG-232 (abandoned child tool not killed), BUG-233 (five unstamped child
+events), BUG-234 (`/help` + text-form `agent.enabled` hint).
 
 ## Retrieved Context
 
