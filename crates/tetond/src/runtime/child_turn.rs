@@ -39,7 +39,7 @@ use std::sync::PoisonError;
 
 use async_trait::async_trait;
 
-use teton_protocol::agent::{ChildBounds, ChildResult, ChildRoute, ChildStatus};
+use teton_protocol::agent::{ChildBounds, ChildId, ChildResult, ChildRoute, ChildStatus};
 use teton_protocol::events::AgentChildStarted;
 use teton_protocol::methods::StopReason;
 use teton_protocol::TurnId;
@@ -59,7 +59,25 @@ use crate::harness::reply::prose_before_tool_call;
 /// An abort lands at the run's next await: a model stream being read stops at
 /// once, and its response body is dropped — and billed — before the share is
 /// released. A tool blocking its thread does not stop until it returns, and
-/// the parent is not made to wait for it.
+/// the parent is not made to wait for it: after this grace the child is
+/// reported `timed_out` while the tool is still in flight.
+///
+/// **What the grace does not do** (AC-14, BR-10 as amended 2026-10-07):
+///
+/// - **It does not kill the tool.** The in-flight call is *abandoned* — its
+///   result never reaches a model, because the abort lands the moment the
+///   tool returns — but the tool's process is not killed: a `shell` command
+///   runs to its own timeout (30 s by default) and may outlive the parent's
+///   turn. That is the parent's own cancelled-`shell` behaviour today; making
+///   cancellation reach the process is a follow-up (the requirement's
+///   Deferred list).
+/// - **It does not release the share.** A child still inside a blocking tool
+///   after the grace keeps its share until the work task has actually ended
+///   (BR-8): the tool may yet draw a metered call against it, and a share
+///   already handed to siblings would let that call overspend the prompt.
+///   [`ChildTurns::release_when_ended`] waits for the task and then releases
+///   and announces it; the parent's result says `timed_out` without a
+///   release, and the `agent_child_share_released` follows when it happens.
 const ABORT_GRACE: Duration = Duration::from_secs(1);
 
 /// Every child of one prompt turn runs under these facts — the per-turn half
@@ -152,25 +170,27 @@ impl ChildDispatcher for ChildTurns {
         };
         let mut handle = AbortOnDrop(tokio::spawn(scope.scope(work.run())));
 
-        let ended = tokio::select! {
+        // `work_ended`: whether the work task is over, so the share can be
+        // released now (BR-8) — see `ABORT_GRACE` for the one case it is not.
+        let (ended, work_ended) = tokio::select! {
             // A run that finished at the same instant the clock ran out
             // finished: its answer is the truer one.
             biased;
-            joined = &mut handle.0 => match joined {
+            joined = &mut handle.0 => (match joined {
                 Ok(ended) => ended,
                 // BR-10: a child's failure never fails the parent — not even a
                 // panic inside its run.
                 Err(err) if err.is_panic() => Ended::failed(CHILD_PANICKED.to_owned()),
                 Err(_) => Ended::of(ChildStatus::Cancelled),
-            },
+            }, true),
             () = deadline.expired() => {
                 handle.0.abort();
-                let _ = tokio::time::timeout(ABORT_GRACE, &mut handle.0).await;
-                Ended::of(ChildStatus::TimedOut)
+                let stopped = tokio::time::timeout(ABORT_GRACE, &mut handle.0).await.is_ok();
+                (Ended::of(ChildStatus::TimedOut), stopped)
             }
         };
         cancelled.armed = false;
-        finish(Finish {
+        let outcome = finish(Finish {
             name: spec.name.clone(),
             report_max_bytes: spec.report_max_bytes,
             spend: &spend,
@@ -178,8 +198,39 @@ impl ChildDispatcher for ChildTurns {
             model_calls: &model_calls,
             route: &route,
             seed_provenance: &spec.provenance,
+            release: work_ended,
             ended,
-        })
+        });
+        if !work_ended {
+            self.release_when_ended(handle, spend, spec.child_id);
+        }
+        outcome
+    }
+}
+
+impl ChildTurns {
+    /// Release a timed-out child's share once its aborted work task has
+    /// actually ended, and announce it (BR-8) — the half of a `timed_out`
+    /// [`ABORT_GRACE`] leaves behind.
+    ///
+    /// The abort lands when the blocking tool returns; the task then ends, and
+    /// only then can the child draw nothing more against its share. What moved
+    /// is published as `agent_child_share_released` through the parent's
+    /// emitter shape, the same payload the `agent` tool publishes for every
+    /// other ending ([`crate::cost::ShareRelease::announcement`]); by then the
+    /// parent may have read the result and the call may be over, and a
+    /// sibling still running is raised exactly as it would have been.
+    fn release_when_ended(&self, work: AbortOnDrop, spend: ChildSpend, child_id: ChildId) {
+        let events = SessionEvents::new(Arc::clone(&self.events), self.session_id.clone());
+        tokio::spawn(async move {
+            let mut work = work;
+            let _ = (&mut work.0).await;
+            if let Some(released) = spend.release() {
+                events.agent_event(Event::AgentChildShareReleased(
+                    released.announcement(&child_id),
+                ));
+            }
+        });
     }
 }
 
@@ -547,6 +598,9 @@ struct Finish<'a> {
     model_calls: &'a AtomicU32,
     route: &'a ChildRouteCell,
     seed_provenance: &'a Provenance,
+    /// Whether to release the share now — `false` only for a `timed_out`
+    /// child whose work is still inside a blocking tool (see [`ABORT_GRACE`]).
+    release: bool,
     ended: Ended,
 }
 
@@ -561,6 +615,7 @@ fn finish(finish: Finish<'_>) -> ChildOutcome {
         model_calls,
         route,
         seed_provenance,
+        release,
         ended,
     } = finish;
     let report = bound_report(&ended.text, report_max_bytes);
@@ -570,7 +625,7 @@ fn finish(finish: Finish<'_>) -> ChildOutcome {
         .bounds;
     // BR-8: released once, after its last response body has been dropped and
     // billed; the amount is the one the pool divided, under its lock.
-    let share_released = spend.release();
+    let share_released = if release { spend.release() } else { None };
     ChildOutcome {
         result: ChildResult {
             name,
@@ -633,6 +688,10 @@ impl Drop for CancelGuard {
             model_calls: &self.model_calls,
             route: &self.route,
             seed_provenance: &self.seed_provenance,
+            // A cancel releases at once: the parent turn is over and every
+            // sibling is being aborted with it, so no running sibling can
+            // draw on what is released.
+            release: true,
             ended: Ended::of(ChildStatus::Cancelled),
         });
         self.slot.put(outcome);
@@ -1814,6 +1873,110 @@ mod tests {
             Some(0)
         );
         assert!(broke.result.report.is_empty());
+    }
+
+    /// **BR-8: a timed-out child still inside a blocking tool keeps its share
+    /// until its work has actually ended** — the parent hears `timed_out` after
+    /// the grace, but a running sibling is handed the share only once the tool
+    /// has returned and the abort has landed, because until then the tool could
+    /// still draw a metered call against it. The release is then announced as
+    /// `agent_child_share_released`.
+    ///
+    /// Two children share a 1,000 pool (500 each); `stuck` spends nothing and
+    /// times out at 1 s inside `sleep 3 && touch done.flag`.
+    ///
+    /// Benign: a child timed out on a model call — which an abort stops at
+    /// once — releases inside the grace, on its result, as before.
+    ///
+    /// Mutation (run 2026-10-07, reverted): releasing at report time whatever
+    /// the work is doing (`release: true` on the `timed_out` arm, the pre-fix
+    /// shape) — 1 red of the 69 tests matching `child`, this one, at "the
+    /// sibling has not been handed the share yet".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_childs_share_waits_for_its_work_to_end() {
+        let rig = Rig::new("child-late-release", true);
+        let dispatcher = rig.dispatcher();
+        let pooled = |name: &str, sibling: &str| {
+            let (me, other) = (
+                ChildId::new("call-1", name),
+                ChildId::new("call-1", sibling),
+            );
+            let pool = SharePool::new(Some(1_000), &[me.clone(), other.clone()]);
+            let spend = ChildSpend::new(me, Arc::clone(&pool), None);
+            (pool, other, spend)
+        };
+
+        // Benign: parked on a model call, stopped inside the grace.
+        let (pool, sibling, spend) = pooled("parked", "parked-sibling");
+        let (release, parked) = mpsc::channel();
+        rig.engine.then(Reply::Park(parked));
+        let timed = dispatcher
+            .run_child(ChildSpec {
+                deadline: Duration::from_secs(1),
+                spend,
+                ..rig.spec("parked", "go")
+            })
+            .await;
+        let _ = release.send(());
+        assert_eq!(timed.status(), ChildStatus::TimedOut);
+        assert_eq!(
+            timed.share_released.map(|r| r.recipients),
+            Some(vec![(sibling.clone(), 1_000)]),
+            "benign: a run the abort stopped at once releases on its result"
+        );
+        assert_eq!(pool.share_of(&sibling), Some(1_000));
+
+        // Inside a blocking tool past the grace.
+        let (pool, sibling, spend) = pooled("stuck", "stuck-sibling");
+        let flag = rig.root.join("done.flag");
+        rig.engine.say(&call(
+            "shell",
+            serde_json::json!({ "command": "sleep 3 && touch done.flag" }),
+        ));
+        let mut sub = rig.events.subscribe(4096);
+        let timed = dispatcher
+            .run_child(ChildSpec {
+                deadline: Duration::from_secs(1),
+                spend,
+                ..rig.spec("stuck", "go")
+            })
+            .await;
+        assert_eq!(timed.status(), ChildStatus::TimedOut);
+        assert!(
+            !flag.exists(),
+            "non-vacuity: the result came back while the tool was in flight"
+        );
+        assert_eq!(timed.share_released, None, "{timed:?}");
+        assert_eq!(
+            pool.share_of(&sibling),
+            Some(500),
+            "the sibling has not been handed the share yet"
+        );
+
+        // The tool returns, the abort lands, the task ends: now it moves, and
+        // says so. Waited for on the bus — the event is published after the
+        // pool has moved, so polling the pool could read the move first.
+        let announced = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let envelope = sub.recv().await.expect("the bus is open");
+                if let Event::AgentChildShareReleased(released) = envelope.event {
+                    break released;
+                }
+            }
+        })
+        .await
+        .expect("the share was never released");
+        assert!(flag.exists(), "and only after the tool had run");
+        assert_eq!(pool.share_of(&sibling), Some(1_000));
+        assert_eq!(announced.child_id, ChildId::new("call-1", "stuck"));
+        assert_eq!(
+            announced.recipients,
+            vec![teton_protocol::events::ShareRecipient {
+                child_id: sibling.clone(),
+                new_ceiling_micro_cents: 1_000,
+            }]
+        );
+        assert_eq!(announced.released_micro_cents, 500);
     }
 
     /// **BR-10's "refused by a gate" (TASK-428's rule): a child with nothing to

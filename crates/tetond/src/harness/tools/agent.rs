@@ -50,8 +50,8 @@ use teton_core::config::AgentConfig;
 use teton_core::cost_ceiling::PromptSpend;
 use teton_protocol::agent::{AgentRefusal, ChildId, ChildResult, ChildStatus, ChildTask};
 use teton_protocol::events::{
-    AgentCallFinished, AgentCallRefused, AgentCallStarted, AgentChildFinished,
-    AgentChildShareReleased, Event, FinishedChild, PlannedChild, ShareRecipient,
+    AgentCallFinished, AgentCallRefused, AgentCallStarted, AgentChildFinished, Event,
+    FinishedChild, PlannedChild,
 };
 use teton_protocol::{Tier, TurnId};
 use tokio::runtime::Handle;
@@ -672,18 +672,9 @@ fn publish_finished(events: &SessionEvents, child_id: &ChildId, outcome: &ChildO
         truncated: outcome.truncated,
     }));
     if let Some(release) = &outcome.share_released {
-        events.agent_event(Event::AgentChildShareReleased(AgentChildShareReleased {
-            child_id: child_id.clone(),
-            released_micro_cents: release.released_micro_cents,
-            recipients: release
-                .recipients
-                .iter()
-                .map(|(child_id, ceiling)| ShareRecipient {
-                    child_id: child_id.clone(),
-                    new_ceiling_micro_cents: *ceiling,
-                })
-                .collect(),
-        }));
+        events.agent_event(Event::AgentChildShareReleased(
+            release.announcement(child_id),
+        ));
     }
 }
 
@@ -1924,7 +1915,7 @@ mod tests {
             "benign: the sibling received the doomed child's 500"
         );
 
-        let released: Vec<AgentChildShareReleased> = drained(&mut sub)
+        let released: Vec<teton_protocol::events::AgentChildShareReleased> = drained(&mut sub)
             .into_iter()
             .filter_map(|e| match e {
                 Event::AgentChildShareReleased(released) => Some(released),

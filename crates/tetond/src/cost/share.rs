@@ -61,6 +61,7 @@ use std::task::{Context, Poll};
 
 use futures::Stream;
 use teton_protocol::agent::ChildId;
+use teton_protocol::events::{AgentChildShareReleased, ShareRecipient};
 use teton_protocol::{ProviderId, SessionId, TurnId};
 use teton_providers::transport::{ByteStream, TransportError, TransportResponse};
 
@@ -134,6 +135,28 @@ pub struct ShareRelease {
     /// Every sibling that received a part, with its new ceiling, in the order
     /// the pool was built with.
     pub recipients: Vec<(ChildId, u64)>,
+}
+
+impl ShareRelease {
+    /// The `agent_child_share_released` payload announcing this release of
+    /// `child_id`'s share — the one composer, for the `agent` tool (a child
+    /// that ended in the ordinary way) and the runner (a timed-out child whose
+    /// release waited for its work to end).
+    #[must_use]
+    pub fn announcement(&self, child_id: &ChildId) -> AgentChildShareReleased {
+        AgentChildShareReleased {
+            child_id: child_id.clone(),
+            released_micro_cents: self.released_micro_cents,
+            recipients: self
+                .recipients
+                .iter()
+                .map(|(child_id, ceiling)| ShareRecipient {
+                    child_id: child_id.clone(),
+                    new_ceiling_micro_cents: *ceiling,
+                })
+                .collect(),
+        }
+    }
 }
 
 /// One child's place in a [`SharePool`].

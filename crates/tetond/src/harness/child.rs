@@ -202,7 +202,9 @@ pub struct ChildOutcome {
     pub truncated: bool,
     /// The child's unspent share, released to its running siblings when it
     /// ended — `agent_child_share_released`'s payload. `None` when nothing
-    /// moved.
+    /// moved, and `None` for a `timed_out` child whose work was still inside a
+    /// blocking tool when it was reported: its share is released once that
+    /// work has ended, and the runner announces it then (BR-8).
     pub share_released: Option<ShareRelease>,
 }
 
