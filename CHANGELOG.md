@@ -30,8 +30,9 @@ user having asked for it.
   never the parent's conversation. It has the session's tools except `agent`
   (children do not start children), the session's permission level, root and
   privacy boundaries, and `skill`. Its permission questions come through the
-  session's ordinary prompt, labelled with its name and asked one at a time; a
-  grant is the session's. A child may request a tier, but the router decides and
+  session's ordinary prompt, labelled with its name and `(for this session)`
+  and asked one at a time; a grant is the session's. A child's name is up to 40
+  letters, digits, `.`, `_` and `-`. A child may request a tier, but the router decides and
   a boundary still pins — and a child that reads protected content pins its
   parent's next call. Each child runs under a turn cap, a context budget, a
   deadline that does not count time spent waiting on the user, and, with `[cost]
@@ -49,7 +50,11 @@ user having asked for it.
   the bounds — `max_children_per_call` (5), `max_children_per_turn` (8),
   `child_max_turns` (12), `child_deadline_secs` (600), `report_max_bytes`
   (32768) — and `enabled = false` takes the tool out of every session. A zero
-  cap or deadline, or a `report_max_bytes` under 1024, is refused at load. A
+  cap or deadline, a deadline over a week (604800), a `max_children_per_call`
+  above `max_children_per_turn`, a `report_max_bytes` under 1024, or one set
+  above `[transcript] max_record_bytes`, is refused at load. A child that times
+  out or is cancelled abandons a tool still running — its output never reaches
+  a model — but does not kill it: a `shell` command runs to its own timeout. A
   child's remote calls are billed like any other and count against the same
   per-prompt ceiling, so one prompt can now spend on several calls at once: with
   a ceiling set it can finish over by one in-flight call per child rather than

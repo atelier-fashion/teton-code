@@ -254,7 +254,8 @@ that started it — the model gets each child's status and decides.
 What a child can do is what the session can do, and no more: the same tools
 except `agent` itself, the same permission level, root and privacy boundaries,
 and `skill`. When a child needs your permission it asks through the same
-prompt, labelled with its name — `allow shell for child audit-1?` — and two
+prompt, labelled with its name — `permission requested by child audit-1 (for
+this session): shell`, then `allow shell for child audit-1?` — and two
 children asking at once are asked one at a time while the rest keep working; a
 grant you give one child is the session's, so its siblings do not ask again.
 Unattended, a gate with no standing answer denies, and the child carries on
@@ -277,16 +278,18 @@ enabled = true              # false takes the tool out of every session
 max_children_per_call = 5   # more tasks in one call is refused whole
 max_children_per_turn = 8   # summed across every `agent` call in a prompt
 child_max_turns = 12        # model calls per child; never above the turn's
-child_deadline_secs = 600   # wall clock; waiting on your answer is not counted
+child_deadline_secs = 600   # wall clock, at most a week; waiting on you is not counted
 report_max_bytes = 32768    # longer is cut and marked; the transcript keeps all
 ```
 
 With `[cost] prompt_ceiling_usd` set, children spend from the prompt's ceiling
 and you pay for them as part of that one prompt: the headroom left when a call
 starts is split equally among its children, and a child that finishes under
-its share hands what is left to the siblings still running. A child whose next
-call would cross its share ends `spend_exhausted`, and if the children used up
-the ceiling, the turn's own next call is refused the usual way.
+its share hands what is left to the siblings still running. A child whose
+spend has reached its share ends `spend_exhausted` at its next call (the call
+that crossed it was allowed, so a child can finish over by one call), and if
+the children used up the ceiling, the turn's own next call is refused the
+usual way.
 
 Children are visible wherever the turn is. The activity row names the ones
 running — `children: audit-1 12s, audit-2 12s` — a child's tool lines are
