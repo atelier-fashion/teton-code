@@ -122,6 +122,14 @@ teton-code/
   (`(exit N)`, the `[stderr]` marker) and assert its shape — non-zero, names the
   builtin and the path — and correct any AC that transcribed the incidental
   value as a requirement (REQ-617, LESSON-644).
+- **An abort needs an await after every synchronous dispatch** (REQ-623,
+  LESSON-664). A tokio task that runs a tool through `block_in_place` and then
+  folds the result has no cancellation point in that stretch, so "cancelled"
+  means "cancelled after one more step": a timed-out child published its
+  call's update after its own finish and, 1 run in 14, sent the discarded
+  output to a model. Put `tokio::task::yield_now().await` right after the
+  dispatch in any scope that can be aborted from outside, and prove it with a
+  test that aborts while the tool is parked and asserts no further step.
 - **Re-measure a band before tuning inside it.** A comment stating a measured
   range has no test behind it: the assertion stands at one point, and a point
   inside a widened band stays green while the prose goes stale. A fixture
