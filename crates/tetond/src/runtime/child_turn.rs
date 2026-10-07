@@ -44,11 +44,11 @@ use teton_protocol::events::AgentChildStarted;
 use teton_protocol::methods::StopReason;
 use teton_protocol::TurnId;
 
-use crate::cost::{share::unspent, ChildSpend};
+use crate::cost::ChildSpend;
 use crate::harness::child::{
     bound_report, child_system_section, over_budget_refusal, turns_exhausted_report,
     ChildDispatcher, ChildOutcome, ChildOutcomeSlot, ChildRouteCell, ChildSpec, ChildTaskScope,
-    ChildToolCalls, ChildTurn, PausableDeadline, ShareRelease,
+    ChildToolCalls, ChildTurn, PausableDeadline, CHILD_PANICKED,
 };
 use crate::harness::context::BlockRole;
 use crate::harness::reply::prose_before_tool_call;
@@ -160,10 +160,7 @@ impl ChildDispatcher for ChildTurns {
                 Ok(ended) => ended,
                 // BR-10: a child's failure never fails the parent — not even a
                 // panic inside its run.
-                Err(err) if err.is_panic() => Ended::failed(
-                    "child_panicked: the child's run panicked; nothing it produced is returned"
-                        .to_owned(),
-                ),
+                Err(err) if err.is_panic() => Ended::failed(CHILD_PANICKED.to_owned()),
                 Err(_) => Ended::of(ChildStatus::Cancelled),
             },
             () = deadline.expired() => {
@@ -571,7 +568,9 @@ fn finish(finish: Finish<'_>) -> ChildOutcome {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .bounds;
-    let share_released = release(spend);
+    // BR-8: released once, after its last response body has been dropped and
+    // billed; the amount is the one the pool divided, under its lock.
+    let share_released = spend.release();
     ChildOutcome {
         result: ChildResult {
             name,
@@ -594,19 +593,6 @@ fn finish(finish: Finish<'_>) -> ChildOutcome {
         truncated: report.truncated,
         share_released,
     }
-}
-
-/// Release the child's unspent share to its running siblings (BR-8) — once,
-/// after its last response body has been dropped and billed.
-fn release(spend: &ChildSpend) -> Option<ShareRelease> {
-    let left = spend
-        .ceiling()
-        .map_or(0, |ceiling| unspent(ceiling, spend.spent()));
-    let recipients = spend.release();
-    (!recipients.is_empty()).then_some(ShareRelease {
-        released_micro_cents: left,
-        recipients,
-    })
 }
 
 /// Aborts the work task when the runner is dropped — the parent turn

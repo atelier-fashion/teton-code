@@ -118,6 +118,24 @@ pub fn release_parts(unspent: u64, running: usize) -> (u64, u64) {
 // The pool
 // ---------------------------------------------------------------------------
 
+/// What one child's end moved to its running siblings (BR-8) — the payload of
+/// `agent_child_share_released`, returned by [`SharePool::release`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareRelease {
+    /// What the child left unspent of its final ceiling.
+    ///
+    /// Computed under the pool's lock in the same step that froze the
+    /// ceiling and handed the parts out, so it is exactly the amount the
+    /// recipients' rises were divided from. A figure read beside the release
+    /// — the ceiling first, then the release — could be raised in between by
+    /// a sibling ending at the same moment, and the event would then name an
+    /// amount nobody received.
+    pub released_micro_cents: u64,
+    /// Every sibling that received a part, with its new ceiling, in the order
+    /// the pool was built with.
+    pub recipients: Vec<(ChildId, u64)>,
+}
+
 /// One child's place in a [`SharePool`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChildShare {
@@ -213,44 +231,42 @@ impl SharePool {
     /// `child` reached its terminal status having spent `spent`: split what it
     /// left unspent equally among the children still running (BR-8).
     ///
-    /// Returns every recipient with its new ceiling, in the order the pool was
-    /// built with — what `agent_child_share_released` announces. Empty when
+    /// Returns what moved — every recipient with its new ceiling, and the
+    /// amount released, [`unspent`] of the child's final ceiling and `spent`,
+    /// both read under the one lock (see [`ShareRelease::released_micro_cents`])
+    /// — which is what `agent_child_share_released` announces. `None` when
     /// nothing moved: the unlimited pool, a child that spent its whole share, a
-    /// part that floors to zero, no sibling still running, a child the pool does
-    /// not know, or a second release of the same child. The amount the event
-    /// names as released is [`unspent`] of the child's final ceiling
-    /// ([`Self::share_of`]) and `spent`.
+    /// part that floors to zero, no sibling still running, a child the pool
+    /// does not know, or a second release of the same child.
     ///
     /// `spent` is the child's own spend in the accumulator's unit —
     /// [`ChildSpend::spent`], or the ledger's `spent_by_child`, which agree.
-    #[must_use = "the recipients are what agent_child_share_released announces"]
-    pub fn release(&self, child: &ChildId, spent: u64) -> Vec<(ChildId, u64)> {
-        let Some(shares) = self.shares.as_ref() else {
-            return Vec::new();
-        };
-        let mut shares = lock(shares);
-        let Some(ending) = shares
+    #[must_use = "what moved is what agent_child_share_released announces"]
+    pub fn release(&self, child: &ChildId, spent: u64) -> Option<ShareRelease> {
+        let mut shares = lock(self.shares.as_ref()?);
+        let ending = shares
             .iter_mut()
-            .find(|share| &share.child == child && !share.ended)
-        else {
-            return Vec::new();
-        };
+            .find(|share| &share.child == child && !share.ended)?;
         ending.ended = true;
         let left = unspent(ending.ceiling, spent);
 
         let running = shares.iter().filter(|share| !share.ended).count();
         let (each, _unused) = release_parts(left, running);
         if each == 0 {
-            return Vec::new();
+            return None;
         }
-        shares
+        let recipients = shares
             .iter_mut()
             .filter(|share| !share.ended)
             .map(|share| {
                 share.ceiling = share.ceiling.saturating_add(each);
                 (share.child.clone(), share.ceiling)
             })
-            .collect()
+            .collect();
+        Some(ShareRelease {
+            released_micro_cents: left,
+            recipients,
+        })
     }
 }
 
@@ -348,12 +364,14 @@ impl ChildSpend {
     }
 
     /// Release this child's unspent share to its running siblings
-    /// ([`SharePool::release`] with [`Self::spent`]).
+    /// ([`SharePool::release`] with [`Self::spent`]) — `None` when nothing
+    /// moved.
     ///
-    /// Call it once the child has reached its terminal status and every
-    /// response body it drew has been dropped, so its last call is counted.
-    #[must_use = "the recipients are what agent_child_share_released announces"]
-    pub fn release(&self) -> Vec<(ChildId, u64)> {
+    /// Call it once the child has reached its terminal status and its work has
+    /// actually ended — every response body it drew dropped, so its last call
+    /// is counted, and no tool still running that could draw another.
+    #[must_use = "what moved is what agent_child_share_released announces"]
+    pub fn release(&self) -> Option<ShareRelease> {
         self.pool.release(&self.child, self.spent())
     }
 
@@ -500,6 +518,53 @@ mod tests {
         children.iter().map(|c| pool.share_of(c)).collect()
     }
 
+    /// The recipients a release moved, or none.
+    fn moved(release: Option<ShareRelease>) -> Vec<(ChildId, u64)> {
+        release.map_or_else(Vec::new, |released| released.recipients)
+    }
+
+    /// **BR-8: the amount a release names is the amount it divided** — the
+    /// child's final ceiling less its spend, read under the pool's lock in
+    /// the step that froze it, parts it received from an earlier sibling
+    /// included.
+    ///
+    /// `a` ends first and lifts `b` and `c` to 450 each; `b` then ends having
+    /// spent 50, so it left 400 — its stamped 300 plus the 150 part, less 50 —
+    /// and `c`, the one still running, rises by exactly that. Every expected
+    /// figure is worked by hand from the split, never read off the pool.
+    ///
+    /// This is what closes the window the runner's old composition had: it
+    /// read the ceiling, *then* released, so a sibling ending between the two
+    /// steps raised the ceiling the release divided without raising the figure
+    /// the event named.
+    ///
+    /// Mutation (run 2026-10-07, reverted): `released_micro_cents` computed
+    /// from the share's `stamped` rather than its `ceiling` — 1 red of the
+    /// 2,319 lib tests, this one, at `b`'s release (250 named, 400 divided).
+    #[test]
+    fn a_release_names_what_it_divided_including_parts_it_received() {
+        let children = ids(&["a", "b", "c"]);
+        let pool = SharePool::new(Some(900), &children);
+        let first = pool.release(&children[0], 0).expect("a's 300 moved");
+        assert_eq!(first.released_micro_cents, 300);
+        assert_eq!(
+            first.recipients,
+            vec![(children[1].clone(), 450), (children[2].clone(), 450)]
+        );
+
+        let second = pool.release(&children[1], 50).expect("b's 400 moved");
+        assert_eq!(
+            second.released_micro_cents, 400,
+            "b's final ceiling (300 stamped + 150 received) less its 50"
+        );
+        assert_eq!(second.recipients, vec![(children[2].clone(), 850)]);
+        assert_eq!(
+            850 - 450,
+            second.released_micro_cents,
+            "the one recipient rose by exactly the amount named"
+        );
+    }
+
     #[test]
     fn headroom_is_the_ceiling_less_the_spend_and_never_negative() {
         for (ceiling, spent, expected) in [
@@ -533,7 +598,7 @@ mod tests {
         let early = ChildId::new("turn-1:call-1", "early");
         let late = ChildId::new("turn-1:call-1", "late");
         let pool = SharePool::new(Some(900), &[early.clone(), late.clone()]);
-        let recipients = pool.release(&early, 150);
+        let recipients = moved(pool.release(&early, 150));
         assert_eq!(recipients, vec![(late.clone(), 750)]);
         assert_eq!(pool.share_of(&late), Some(750), "the ceiling rose");
         assert_eq!(pool.stamped_share_of(&late), Some(450), "the stamp did not");
@@ -610,7 +675,7 @@ mod tests {
             "floor(1000 / 3), the remainder unused"
         );
 
-        let recipients = pool.release(docs, 100);
+        let recipients = moved(pool.release(docs, 100));
         assert_eq!(
             recipients,
             vec![(audit.clone(), 333 + 116), (lint.clone(), 333 + 116)],
@@ -626,7 +691,7 @@ mod tests {
         // Benign: a child that spent its whole share has nothing to release,
         // and its sibling's ceiling does not move.
         assert!(
-            pool.release(audit, 449).is_empty(),
+            pool.release(audit, 449).is_none(),
             "a child that spent its whole share releases nothing"
         );
         assert_eq!(pool.share_of(lint), Some(449));
@@ -635,7 +700,7 @@ mod tests {
         let unlimited = SharePool::new(None, &children);
         assert_eq!(ceilings(&unlimited, &children), vec![None, None, None]);
         assert!(
-            unlimited.release(docs, 0).is_empty(),
+            unlimited.release(docs, 0).is_none(),
             "an unlimited pool releases nothing"
         );
         assert_eq!(
@@ -654,11 +719,11 @@ mod tests {
         let children = ids(&["a", "b", "c"]);
         let pool = SharePool::new(Some(900), &children);
         assert_eq!(
-            pool.release(&children[0], 0),
+            moved(pool.release(&children[0], 0)),
             vec![(children[1].clone(), 450), (children[2].clone(), 450)]
         );
         assert!(
-            pool.release(&children[0], 0).is_empty(),
+            pool.release(&children[0], 0).is_none(),
             "a second release of the same child hands out nothing"
         );
         assert_eq!(
@@ -667,7 +732,7 @@ mod tests {
         );
 
         let stranger = ChildId::new("call-2", "a");
-        assert!(pool.release(&stranger, 0).is_empty());
+        assert!(pool.release(&stranger, 0).is_none());
         assert_eq!(
             pool.share_of(&stranger),
             Some(0),
@@ -714,7 +779,7 @@ mod tests {
             (children[3].clone(), 0),
         ];
         for (who, spent) in steps {
-            let recipients = pool.release(&who, spent);
+            let recipients = moved(pool.release(&who, spent));
             let after = ceilings(&pool, &children);
             for (i, child) in children.iter().enumerate() {
                 assert!(

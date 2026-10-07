@@ -72,7 +72,7 @@ pub use prices::{ModelPrice, PriceTable};
 pub use report::{
     ChildTotals, CostReport, GroupTotals, SavingsEstimate, TurnTotals, UnpricedTotals, WebTotals,
 };
-pub use share::{ChildSpend, SharePool};
+pub use share::{ChildSpend, SharePool, ShareRelease};
 
 /// The billing attribution a caller pins to a remote call *at call time*.
 ///

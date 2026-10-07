@@ -62,7 +62,7 @@ use crate::cost::share::headroom;
 use crate::cost::{ChildSpend, SharePool};
 use crate::egress::Provenance;
 use crate::harness::child::{
-    ChildDispatcher, ChildOutcome, ChildOutcomeSlot, ChildSpec, ShareRelease,
+    ChildDispatcher, ChildOutcome, ChildOutcomeSlot, ChildSpec, CHILD_PANICKED,
 };
 use crate::harness::context::{ToolProvenance, UnknownReach};
 use crate::harness::turn_loop::SessionEvents;
@@ -621,40 +621,41 @@ impl Drop for Flight {
 /// its runner's drop guard left the `cancelled` outcome in the slot, or it was
 /// aborted before it was first polled — or panicked outside the runner's own
 /// guard, which is reported `failed` with its share released.
+///
+/// The slot is read first either way. A panic that unwinds through the
+/// runner drops its armed guard, which frames an outcome — **releasing the
+/// share** — and leaves it there; releasing again here would find the child
+/// already ended and move nothing, and the `agent_child_share_released` the
+/// guard's release earned would never be published. So a guard's outcome
+/// lends the panic its release (and the route, bounds and turns it had
+/// stamped); only a panic that left nothing — a dispatcher with no guard —
+/// is released here.
 fn lost(err: &JoinError, child: &Child) -> ChildOutcome {
+    let left = child.slot.take();
     if err.is_cancelled() {
-        return child
-            .slot
-            .take()
-            .unwrap_or_else(|| ChildOutcome::cancelled_before_start(child.name.clone()));
+        return left.unwrap_or_else(|| ChildOutcome::cancelled_before_start(child.name.clone()));
     }
-    let recipients = child.spend.release();
-    let released = child.spend.ceiling().map_or(0, |ceiling| {
-        crate::cost::share::unspent(ceiling, child.spend.spent())
-    });
+    let (share_released, stamped) = match left {
+        Some(left) => (left.share_released, Some(left.result)),
+        None => (child.spend.release(), None),
+    };
     ChildOutcome {
         result: ChildResult {
             name: child.name.clone(),
             status: ChildStatus::Failed,
             report: String::new(),
             refusal: None,
-            error: Some(
-                "child_panicked: the child's run panicked; nothing it produced is returned"
-                    .to_owned(),
-            ),
-            turns_used: 0,
-            route: None,
-            bounds: None,
+            error: Some(CHILD_PANICKED.to_owned()),
+            turns_used: stamped.as_ref().map_or(0, |r| r.turns_used),
+            route: stamped.as_ref().and_then(|r| r.route.clone()),
+            bounds: stamped.as_ref().and_then(|r| r.bounds),
             cost_micro_cents: child.spend.spent(),
             spend_ceiling_final_micro_cents: child.spend.ceiling(),
         },
         provenance: Provenance::empty(),
         report_bytes: 0,
         truncated: false,
-        share_released: (!recipients.is_empty()).then_some(ShareRelease {
-            released_micro_cents: released,
-            recipients,
-        }),
+        share_released,
     }
 }
 
@@ -1854,6 +1855,92 @@ mod tests {
             "{}",
             answer.content
         );
+    }
+
+    /// **BR-8 / BR-10: a runner that panics past its own guard is reported
+    /// `failed` with `child_panicked` — and the share its guard released while
+    /// the panic unwound is announced, not lost.**
+    ///
+    /// The stub plays the daemon's runner: on the way down it does what
+    /// `CancelGuard` does in `child_turn.rs` — frames an outcome, releasing the
+    /// child's share, and leaves it in the slot — and then panics. Two
+    /// children share a 1,000 pool (500 each); `doomed` spends nothing, so its
+    /// 500 goes to `steady`, which is still running, and lifts it to 1,000.
+    ///
+    /// Benign: `steady` completes as usual, and its result reports the raised
+    /// ceiling.
+    ///
+    /// Mutation (run 2026-10-07, reverted): `lost` releasing again instead of
+    /// reusing the slot's release (the pre-fix shape) — 1 red of the 2,320 lib
+    /// tests, this one, at the share event (the second release finds the
+    /// child ended and moves nothing).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_runner_is_failed_and_its_guards_release_is_published() {
+        let doomed_left = Arc::new(tokio::sync::Notify::new());
+        let child_run = {
+            let doomed_left = Arc::clone(&doomed_left);
+            run(move |spec: ChildSpec| {
+                let doomed_left = Arc::clone(&doomed_left);
+                async move {
+                    if spec.name == "doomed" {
+                        let mut left = ChildOutcome::cancelled_before_start(spec.name.clone());
+                        left.result.turns_used = 3;
+                        left.share_released = spec.spend.release();
+                        spec.cancelled.put(left);
+                        doomed_left.notify_one();
+                        panic!("the runner itself panicked");
+                    }
+                    // Still running when `doomed` releases, so it receives.
+                    doomed_left.notified().await;
+                    completed(&spec, "steady")
+                }
+            })
+        };
+        let f = fixture_with(
+            AgentConfig::default(),
+            |bus| AgentParent {
+                spend_ceiling: Some(1_000),
+                prompt_spend: Some(Arc::new(PromptSpend::new())),
+                ..parent(bus)
+            },
+            child_run,
+        );
+        let mut sub = f.bus.subscribe(1024);
+        let outcome = call(
+            &f.tool,
+            "call-1",
+            json!({ "tasks": [{ "task": "x", "name": "doomed" }, { "task": "y", "name": "steady" }] }),
+        )
+        .await;
+
+        let got = results(&outcome);
+        assert_eq!(got[0].status, ChildStatus::Failed, "{got:?}");
+        assert_eq!(got[0].error.as_deref(), Some(CHILD_PANICKED));
+        assert_eq!(got[0].turns_used, 3, "what the guard had stamped");
+        assert_eq!(got[1].status, ChildStatus::Completed);
+        assert_eq!(
+            got[1].spend_ceiling_final_micro_cents,
+            Some(1_000),
+            "benign: the sibling received the doomed child's 500"
+        );
+
+        let released: Vec<AgentChildShareReleased> = drained(&mut sub)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::AgentChildShareReleased(released) => Some(released),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            released.len(),
+            1,
+            "the release the guard made while the panic unwound is announced: {released:?}"
+        );
+        assert_eq!(
+            released[0].child_id,
+            ChildId::new("turn-9:call-1", "doomed")
+        );
+        assert_eq!(released[0].released_micro_cents, 500);
     }
 
     /// **ADR-4: a call splits the prompt's live headroom among its children.**

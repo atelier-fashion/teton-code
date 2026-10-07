@@ -3055,15 +3055,15 @@ mod tests {
             "the refused call never left"
         );
         assert!(
-            a.release().is_empty(),
+            a.release().is_none(),
             "a spent its whole share: nothing to give"
         );
 
         // `c` ends early having spent 100_000 of 333_333; `b` is the one running.
         one_call(&egress_c).await.expect("c's call");
         assert_eq!(
-            c.release(),
-            vec![(ChildId::new("call-1", "b"), 333_333 + 233_333)]
+            c.release().map(|released| released.recipients),
+            Some(vec![(ChildId::new("call-1", "b"), 333_333 + 233_333)])
         );
 
         // `b` at 400_000 is past its stamped share and under its raised one.

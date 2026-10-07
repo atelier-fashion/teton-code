@@ -242,14 +242,16 @@ impl ChildOutcome {
 }
 
 /// A child's unspent share as it was released to its running siblings
-/// (BR-8, `agent_child_share_released`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShareRelease {
-    /// What the child left unspent of its final ceiling.
-    pub released_micro_cents: u64,
-    /// Every sibling that received a part, with its new ceiling.
-    pub recipients: Vec<(ChildId, u64)>,
-}
+/// (BR-8, `agent_child_share_released`) — the pool's own value, so the amount
+/// is the one the pool divided, read under its lock.
+pub use crate::cost::ShareRelease;
+
+/// The error a child whose run panicked carries (BR-10): `failed`, never the
+/// parent's failure. One string for the two places a panic is caught — inside
+/// the runner, around its work task, and in the `agent` tool, around the
+/// runner itself.
+pub const CHILD_PANICKED: &str =
+    "child_panicked: the child's run panicked; nothing it produced is returned";
 
 /// Where a child's run leaves its `cancelled` outcome when the run's future is
 /// dropped before it can return one (BR-10).
