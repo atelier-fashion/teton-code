@@ -2157,12 +2157,13 @@ async fn run_the_allowed_tool(
     // runtime the chance to drop the task before any of the result is used —
     // which is what "its result never reaches a model" rests on. A prompt turn
     // takes no extra await here: its cancellation is the commit seam's.
-    if super::child::current_child().is_some() {
+    let child = super::child::current_child();
+    if child.is_some() {
         tokio::task::yield_now().await;
     }
     // REQ-623 BR-10: inside a child, a call that ran is a call the gate did
     // not stop — see `ChildToolCalls::gate_refusal`.
-    if let Some(child) = super::child::current_child() {
+    if let Some(child) = child {
         child.tool_calls.note_ran();
     }
     // REQ-567 OQ-1: the tool has RUN. Everything from here
@@ -2373,8 +2374,8 @@ async fn run_the_allowed_tool(
     // the model as an instruction that fires an allowlisted
     // tool. MCP results are already framed at their bridge.
     //
-    // REQ-587 ADR-1: the result says which of the three it
-    // is, and the name list is now only what `Data` — every
+    // REQ-587 ADR-1: the result says which of the four it
+    // is (REQ-623 added `UntrustedWhole`), and the name list is now only what `Data` — every
     // tool that shipped before this REQ — is measured
     // against. `UntrustedData` gets the envelope whatever
     // the tool is called; `Expansion` never gets it, because

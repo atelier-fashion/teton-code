@@ -736,7 +736,8 @@ impl<T: Transport> Egress<T> {
     /// and setting the pair after a child's spend is a debug assertion. The
     /// runtime's builders set no pair on a child's choke point at all.
     ///
-    /// `None` (the default) changes nothing.
+    /// `None` (the default) leaves the prompt pair in place; passing `None`
+    /// after a `Some` would drop the child's spend, which no builder does.
     #[must_use]
     pub fn with_child_spend(mut self, spend: Option<ChildSpend>) -> Self {
         if spend.is_some() {

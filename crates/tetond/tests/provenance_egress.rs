@@ -3837,10 +3837,11 @@ fn child_without_boundary_touch_does_not_pin_parent() {
 ///   of the source at `b6148d1` with the `yield_now` fix applied, counted
 ///   over 51 tests across this binary, `agent_dispatch` and
 ///   `event_response_ordering`): **3 red, 1 of them its own** — this test, at
-///   the per-provider check (request 0 of 1 carried the file). The AC-10 pair
-///   passed their own per-provider checks and went red only at the
-///   process-global capture this test's leak landed in: one leak, counted
-///   three times.
+///   the per-provider check (request 0 of 1 carried the file). Of the AC-10
+///   pair, `child_without_boundary_touch_does_not_pin_parent` went red only at
+///   the process-global capture this test's leak landed in;
+///   `child_local_only_read_pins_child_and_parent` fails on its own under the
+///   same mutation (run alone: the result's route is `remote`).
 /// - **Test-side: no boundary at all** (`[[boundaries]]` dropped and
 ///   `disable_default_boundaries = true`, on the shared tree): red at the
 ///   per-provider check — the remote provider's request 0 carried the file.

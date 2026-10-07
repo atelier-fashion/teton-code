@@ -76,8 +76,10 @@ pub const DOCS_TOOL_NAME: &str = "teton_docs";
 /// **The mechanism, read rather than assumed.** [`DocsTool::run`] answers with
 /// `ToolOutcome::ok(body)`, whose `disposition` is the default
 /// [`ResultDisposition::Data`](super::ResultDisposition::Data). The turn loop
-/// bypasses the digest for `ResultDisposition::Expansion` **only** — a skill
-/// body, which must be carried whole or refused (REQ-587 BR-7) — so a
+/// bypasses the digest for `ResultDisposition::Expansion` — a skill body,
+/// which must be carried whole or refused (REQ-587 BR-7) — and for
+/// `ResultDisposition::UntrustedWhole` — the `agent` tool's typed result
+/// (REQ-623 BR-11) — **only**, so a
 /// `teton_docs` result goes through
 /// [`summarize_if_large`](crate::harness::context::summarize_if_large) exactly
 /// as a large `read` does: under the route's `digest` threshold it is delivered
@@ -1090,7 +1092,7 @@ mod tests {
     ///    "restores" the old invariant by lowering the ceiling in silence.
     /// 2. **The docs tool is not exempt from the digest.** The turn loop
     ///    bypasses `summarize_if_large` for [`ResultDisposition::Expansion`]
-    ///    alone, and [`DocsTool`]'s outcome is
+    ///    and `ResultDisposition::UntrustedWhole` alone, and [`DocsTool`]'s outcome is
     ///    [`ResultDisposition::Data`](super::ResultDisposition::Data) — so an
     ///    over-threshold topic is condensed exactly as a large `read` is. This
     ///    half is the load-bearing one: were the docs tool ever given
