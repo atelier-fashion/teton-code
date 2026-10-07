@@ -252,6 +252,12 @@ impl AgentTool {
                 max: NAME_MAX_CHARS,
             });
         }
+        // After the length, so the name echoed is already within the bound.
+        if let Some(odd) = planned.iter().find(|p| !p.name.chars().all(is_name_char)) {
+            return Err(AgentRefusal::InvalidName {
+                name: odd.name.escape_debug().to_string(),
+            });
+        }
         for (index, p) in planned.iter().enumerate() {
             if planned[..index]
                 .iter()
@@ -397,6 +403,13 @@ fn parse(arguments: &Value) -> Result<Vec<ChildTask>, ToolError> {
     Ok(args.tasks)
 }
 
+/// Whether `c` may appear in a task's name: `[A-Za-z0-9._-]` — what the
+/// default `child-<n>` is made of, and nothing that can impersonate the text a
+/// consent prompt puts around the name (see `AgentRefusal::InvalidName`).
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
+}
+
 /// A name past the bound, cut to the bound for echoing — a refusal names the
 /// offending name, and a runaway one must not ride the bus whole.
 fn echo_bounded(name: &str) -> String {
@@ -437,6 +450,9 @@ pub fn refusal_message(refusal: &AgentRefusal) -> String {
         }
         AgentRefusal::NameTooLong { name, max } => {
             format!("the task name `{name}` is longer than {max} characters.")
+        }
+        AgentRefusal::InvalidName { name } => {
+            format!("the task name `{name}` may hold only ASCII letters, digits, `.`, `_` and `-`.")
         }
     };
     format!("{}: {why} No child was started.", refusal.code())
@@ -978,6 +994,88 @@ mod tests {
     fn results(outcome: &ToolOutcome) -> Vec<ChildResult> {
         assert!(!outcome.is_error, "an accepted call: {}", outcome.content);
         serde_json::from_str(&outcome.content).expect("the result is a JSON array of ChildResult")
+    }
+
+    /// **Security (verify): a task name is drawn from `[A-Za-z0-9._-]`, or the
+    /// call is refused whole with `invalid_name`** — a name is shown to the
+    /// user on a child's consent prompt beside the daemon's own words, so
+    /// `ok: read README.md (safe) ·` must not get there. The length bound is
+    /// counted in characters and checked first, so a long non-ASCII name is
+    /// `name_too_long` (its echo cut on a character boundary, never inside a
+    /// multi-byte one) and a short one is `invalid_name`; a control character
+    /// is echoed escaped.
+    ///
+    /// Benign: a name using every allowed class passes and starts its child.
+    ///
+    /// Mutation (run 2026-10-07, reverted): the charset check removed from
+    /// `admit` — 1 red of the 2,326 lib tests, this one, at the spoofing name.
+    #[tokio::test]
+    async fn a_name_outside_the_charset_is_refused_whole() {
+        let f = fixture(echo());
+        let mut sub = f.bus.subscribe(1024);
+        for (id, name, echoed) in [
+            (
+                "call-1",
+                "ok: read README.md (safe) ·",
+                "ok: read README.md (safe) ·",
+            ),
+            ("call-2", "名前", "名前"),
+            ("call-3", "a\nb", "a\\nb"),
+        ] {
+            let out = call(
+                &f.tool,
+                id,
+                json!({ "tasks": [{ "task": "a", "name": name }] }),
+            )
+            .await;
+            assert!(out.is_error, "{name:?}: {}", out.content);
+            assert!(
+                out.content.starts_with("invalid_name:") && out.content.contains("letters, digits"),
+                "{name:?}: {}",
+                out.content
+            );
+            assert_eq!(
+                refusals(&drained(&mut sub)),
+                [(
+                    format!("turn-9:{id}"),
+                    AgentRefusal::InvalidName {
+                        name: echoed.to_owned()
+                    }
+                )]
+            );
+        }
+
+        let wide = "é".repeat(41);
+        let long = call(
+            &f.tool,
+            "call-4",
+            json!({ "tasks": [{ "task": "a", "name": wide }] }),
+        )
+        .await;
+        assert!(
+            long.content.starts_with("name_too_long:"),
+            "{}",
+            long.content
+        );
+        assert_eq!(
+            refusals(&drained(&mut sub)),
+            [(
+                "turn-9:call-4".to_owned(),
+                AgentRefusal::NameTooLong {
+                    name: format!("{}…", "é".repeat(40)),
+                    max: 40
+                }
+            )]
+        );
+        assert!(f.seen.lock().unwrap().is_empty(), "no child was dispatched");
+
+        let fine = call(
+            &f.tool,
+            "call-5",
+            json!({ "tasks": [{ "task": "a", "name": "Audit-1.v2_x" }] }),
+        )
+        .await;
+        assert_eq!(results(&fine)[0].name, "Audit-1.v2_x", "benign");
     }
 
     /// **BR-3 / AC-4: both caps refuse the whole call, typed, and start no

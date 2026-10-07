@@ -78,7 +78,7 @@ REQ-587 AC-15 recorded, and it is the gate the `pipeline-runner`,
 | AgentCall | `tasks` | array of ChildTask | required; 1 ≤ len ≤ `max_children_per_call` |
 | AgentCall | `call_id` | string | daemon-minted, unique within the session; echoed on every event and result |
 | ChildTask | `task` | string | required, non-empty; the child's user-role prompt, verbatim |
-| ChildTask | `name` | string | optional; ≤ 40 chars; defaults to `child-<n>`; must be unique within the call |
+| ChildTask | `name` | string | optional; ≤ 40 chars; defaults to `child-<n>`; must be unique within the call; *amended 2026-10-07 (verify, security):* drawn from `[A-Za-z0-9._-]`, else the call is refused whole `invalid_name` — a name is shown on a consent prompt beside the daemon's own words |
 | ChildTask | `tier` | enum `reflex`/`scan`/`build`/`think` | optional; a *request*, not a binding — see BR-6 |
 | ChildTask | `context` | string | optional; extra text the parent chooses to pass; counts against the child's context budget |
 | ChildTurn | `child_id` | string | daemon-minted; `<call_id>/<name>` |

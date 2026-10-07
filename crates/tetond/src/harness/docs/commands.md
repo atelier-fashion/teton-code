@@ -96,8 +96,9 @@ one of them has ended.
 - `context` — optional extra text, placed beside the task. `task` and `context`
   together are admitted whole or refused (`over_budget`, with the sizes and the
   bound) — never shortened.
-- `name` — optional, at most 40 characters, unique within the call; defaults to
-  `child-1`, `child-2`, …. It is how the user sees the child.
+- `name` — optional, at most 40 characters of `A`–`Z`, `a`–`z`, `0`–`9`, `.`,
+  `_` and `-`, unique within the call; defaults to `child-1`, `child-2`, ….
+  It is how the user sees the child.
 - `tier` — optional, one of `reflex`, `scan`, `build`, `think`: a **request**.
   The router decides and a privacy boundary pins; a request it cannot honour is
   not a refusal, and the result names where the child actually ran.
@@ -151,7 +152,7 @@ prompt turn's is.
 
 These start no child, and the message names the numbers and the key:
 `too_many_children`, `child_cap_reached`, `duplicate_name`, `empty_task`,
-`name_too_long`. Change the call; the same call repeated is refused again, and
+`name_too_long`, `invalid_name`. Change the call; the same call repeated is refused again, and
 a third identical one is stopped before it reaches the tool.
 
 ### The result

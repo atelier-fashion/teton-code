@@ -263,7 +263,7 @@ parent turn:
 | `agent_child_share_released` | a child ended with unspent spend share and it was split among its running siblings | `child_id`, `released_micro_cents`, `recipients` (`[{ "child_id", "new_ceiling_micro_cents" }]`) |
 | `agent_child_finished` | a child reached its terminal status | `child_id`, `status` (`completed`, `refused`, `cancelled`, `turns_exhausted`, `budget_exhausted`, `spend_exhausted`, `timed_out`, `failed`), `turns_used`, `cost_micro_cents`, `report_bytes`, and `event_fields.truncated` — whether the report the parent received was cut at `agent.report_max_bytes` |
 | `agent_call_finished` | every child is terminal and the tool result is being returned | `call_id`, `children` (`[{ "name", "status" }]`), `total_cost_micro_cents`, `elapsed_ms` |
-| `agent_call_refused` | the call was refused whole before any child started | `call_id`, `refusal` (`{ "kind": "too_many_children" \| "child_cap_reached" \| "duplicate_name" \| "empty_task" \| "name_too_long", … }` with the numbers that refused it) |
+| `agent_call_refused` | the call was refused whole before any child started | `call_id`, `refusal` (`{ "kind": "too_many_children" \| "child_cap_reached" \| "duplicate_name" \| "empty_task" \| "name_too_long" \| "invalid_name", … }` with the numbers that refused it) |
 
 None of them carries a task's text or a child's report. The report reaches the
 parent as the `agent` call's `tool_result`, in full — a report the parent was

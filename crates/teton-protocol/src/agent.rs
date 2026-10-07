@@ -122,7 +122,10 @@ pub struct ChildTask {
     /// refusal into an anonymous argument error.
     pub task: String,
     /// The child's name, unique within the call; the daemon defaults it to
-    /// `child-<n>` when absent. The spec bounds it at 40 characters.
+    /// `child-<n>` when absent. The spec bounds it at 40 characters, drawn
+    /// from `[A-Za-z0-9._-]` ([`AgentRefusal::InvalidName`]): it is shown to
+    /// the user on a consent prompt, so it may not carry text that reads as
+    /// the prompt's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// The tier the caller would *like* the child to run on — a request to the
@@ -353,13 +356,26 @@ pub enum AgentRefusal {
     /// Its own code rather than a silent cut or a borrowed one: a cut name
     /// could collide with a sibling's and turn into a [`Self::DuplicateName`]
     /// the model never wrote, and `duplicate_name` / `empty_task` would each
-    /// name the wrong fault. Added by TASK-428, additively — a pre-REQ client
-    /// that does not know the tag fails to decode only this one event.
+    /// name the wrong fault. A client that does not know the tag fails to
+    /// decode only this one event.
     NameTooLong {
         /// The name as the call gave it.
         name: String,
         /// The bound, in characters.
         max: u32,
+    },
+    /// A task's `name` held a character outside `[A-Za-z0-9._-]`.
+    ///
+    /// A name is shown to the user — on a child's consent prompt, its tool
+    /// lines, its notices — beside text the daemon wrote. A free-form name
+    /// can impersonate that text (`ok: read README.md (safe) ·` ahead of a
+    /// real request), so the charset is closed rather than the label escaped
+    /// at every surface. Checked after the length, so the name echoed here is
+    /// already within the bound; it is echoed with its control characters
+    /// escaped.
+    InvalidName {
+        /// The name as the call gave it, control characters escaped.
+        name: String,
     },
 }
 
@@ -373,6 +389,7 @@ impl AgentRefusal {
             AgentRefusal::DuplicateName { .. } => "duplicate_name",
             AgentRefusal::EmptyTask { .. } => "empty_task",
             AgentRefusal::NameTooLong { .. } => "name_too_long",
+            AgentRefusal::InvalidName { .. } => "invalid_name",
         }
     }
 }
@@ -679,16 +696,17 @@ mod tests {
         );
     }
 
-    /// The five refusal codes — the four the spec names and `name_too_long`,
-    /// which TASK-428 added for the entity table's 40-character name bound —
-    /// each carrying its numbers under a `kind` tag that agrees with
-    /// [`AgentRefusal::code`]; a sixth code does not parse.
+    /// The six refusal codes — the four the spec names, `name_too_long` for
+    /// the entity table's 40-character name bound, and `invalid_name` for its
+    /// charset (verify, 2026-10-07) — each carrying its numbers under a `kind`
+    /// tag that agrees with [`AgentRefusal::code`]; a seventh code does not
+    /// parse.
     ///
-    /// Renamed from `agent_refusal_codes_are_the_four_the_spec_names` when the
-    /// fifth landed: a name stating "four" over a five-row table is a test
-    /// whose title lies.
+    /// Renamed each time a code landed (`…_the_four_the_spec_names`, then
+    /// `…_the_five_the_tool_raises`): a name stating a count over a table of
+    /// another is a test whose title lies.
     #[test]
-    fn agent_refusal_codes_are_the_five_the_tool_raises() {
+    fn agent_refusal_codes_are_the_six_the_tool_raises() {
         for (refusal, code) in [
             (
                 AgentRefusal::TooManyChildren {
@@ -719,6 +737,12 @@ mod tests {
                 },
                 "name_too_long",
             ),
+            (
+                AgentRefusal::InvalidName {
+                    name: "ok: read README.md".to_owned(),
+                },
+                "invalid_name",
+            ),
         ] {
             assert_eq!(refusal.code(), code);
             let wire = serde_json::to_value(&refusal).unwrap();
@@ -744,6 +768,13 @@ mod tests {
             })
             .unwrap(),
             json!({"kind": "name_too_long", "name": "auditor", "max": 40})
+        );
+        assert_eq!(
+            serde_json::to_value(AgentRefusal::InvalidName {
+                name: "a b".to_owned(),
+            })
+            .unwrap(),
+            json!({"kind": "invalid_name", "name": "a b"})
         );
         assert!(serde_json::from_value::<AgentRefusal>(json!({"kind": "nested_agent"})).is_err());
     }

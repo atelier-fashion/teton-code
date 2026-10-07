@@ -1602,6 +1602,9 @@ fn format_agent_call_refused(refused: &events::AgentCallRefused) -> String {
         AgentRefusal::NameTooLong { name, max } => {
             format!("the task name `{name}` is longer than {max} characters")
         }
+        AgentRefusal::InvalidName { name } => {
+            format!("the task name `{name}` may hold only letters, digits, `.`, `_` and `-`")
+        }
     };
     format!("agent call refused ({code}): {why}; no child was started")
 }
@@ -5897,6 +5900,28 @@ mod tests {
         assert_eq!(
             surface.lines_of(LineKind::Diff),
             ["child audit-1: ± src/lib.rs", "- a", "+ b"]
+        );
+    }
+
+    /// **Security (verify): an `invalid_name` refusal draws its line like the
+    /// other five** — the code, the name as the daemon echoed it, and the
+    /// charset the user's skill should use — so a refused fan-out is never
+    /// silent and never a bare code.
+    ///
+    /// Mutation (run 2026-10-07, reverted): the `InvalidName` arm rendering the
+    /// code alone (`String::new()` for `why`) reddens this test.
+    #[test]
+    fn an_invalid_name_refusal_names_the_charset() {
+        let line = format_agent_call_refused(&events::AgentCallRefused {
+            call_id: "toolu_03".to_owned(),
+            refusal: AgentRefusal::InvalidName {
+                name: "ok: read README.md".to_owned(),
+            },
+        });
+        assert_eq!(
+            line,
+            "agent call refused (invalid_name): the task name `ok: read README.md` may hold \
+             only letters, digits, `.`, `_` and `-`; no child was started"
         );
     }
 
