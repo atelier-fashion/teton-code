@@ -62,6 +62,7 @@ with its reason, `Allowance::Twice` in the repeat ledger, `Allow` at every permi
 - Tool result disposition is `UntrustedData` — a report is content about the repo, not instructions (REQ-587's framing rule).
 - The REQ-617 repeat ledger keys on name+args; identical `tasks` twice is the "repeat" case.
 - ASSUME-010: `#[cfg(test)]` after `impl Tool for AgentTool`.
+- 2026-10-07 (Phase-4 fix): the `agent` docs line was in neither prompt-size sweep. Both now register `turn_loop::AgentToolDocs::worst_case()` (both caps `u32::MAX` — `validate_agent` bounds them from below only, and they render as digits) with a `- agent: ` self-check; the stand-in renders from the extracted `agent::describe`/`agent::schema`, pinned by `the_doc_only_agent_tool_and_the_real_one_render_one_set_of_prompt_bytes`. Measured: the line is 1,301 B at the defaults, 1,328 B at the ceiling; `spent` 24,064 → 25,392 (opted-out) and 24,017 → 25,345 (web), 816 / 769 over 24 KiB. Decision: `REDACT_BODY_OVERHEAD_BYTES` 24 → 25 KiB (the one KiB that clears it); chunk count holds at 4, `REDACT_SCANNABLE_CONTEXT_BYTES` 183,334 → 182,403 (−931 on every redact route; `router` golden digest 67,138 → 66,797); margins 512 → 208 and 559 → 255, gap 47. Red-proofs: dropped registration → both self-checks red; constant back at 24 KiB → 6 lib tests red (both sweeps' `spent <` assertion, the re-stating test, budget's two literals, the router golden).
 
 ## Implementation notes (TASK-428)
 

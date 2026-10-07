@@ -596,19 +596,91 @@ pub(crate) const REDACT_ESCAPING_DIVISOR: usize = 10;
 /// **512** on this shape and 761 → **559** on the web-enabled twin, the gap
 /// still 47. 464 bytes of usable room above the floor.
 ///
-/// **What neither sweep measures yet, stated so the 512 is not trusted past what
-/// it covers:** the `agent` tool's own docs line. `register_agent_tool` puts the
-/// tool in every prompt turn's registry when `agent.enabled` — the default —
-/// cap-exempt, so its description and schema are resident exactly as the
-/// `skill` tool's are, and neither sweep registers it: the LESSON-481 shape
-/// ADR-9 closed for `skill`. Computed from its description and schema at the
-/// default caps (not measured here) it is about **1,301** bytes, more than the
-/// margin above, so a sweep that registered it would fail
-/// `spent < REDACT_BODY_OVERHEAD_BYTES` and this constant would need REQ-620's
-/// treatment — a raise and a re-derivation of the four figures below it.
-/// Recorded at TASK-431; the remedy belongs with the tool's registration
-/// (a doc-only stand-in in both sweeps, as `SkillToolDocs` is), not with a
-/// sentence of the guide.
+/// **What neither sweep measured, stated at TASK-431 so the 512 was not trusted
+/// past what it covered:** the `agent` tool's own docs line.
+/// `register_agent_tool` puts the tool in every prompt turn's registry when
+/// `agent.enabled` — the default — cap-exempt, so its description and schema
+/// are resident exactly as the `skill` tool's are, and neither sweep registered
+/// it: the LESSON-481 shape ADR-9 closed for `skill`. Computed at the default
+/// caps it was about **1,301** bytes, more than the margin above, and the
+/// remedy was named as belonging with the tool's registration rather than with
+/// a sentence of the guide. The next paragraph is that remedy.
+///
+/// **Raised 24→25 KiB by REQ-623 (TASK-428's Phase-4 fix, 2026-10-07), for that
+/// docs line.** Both sweeps now register `turn_loop::AgentToolDocs::worst_case()`
+/// — rendered by the shipped tool's own `agent::describe` and `agent::schema`,
+/// pinned byte-identical by
+/// `harness::tools::agent::tests::the_doc_only_agent_tool_and_the_real_one_render_one_set_of_prompt_bytes`
+/// — with a `- agent: ` self-check beside `skill`'s, so dropping the
+/// registration reddens rather than re-pins a smaller prompt. Measured, not
+/// added up:
+///
+/// ```text
+///   the docs line at the default caps (5, 8)    1,301   589 description, 688
+///                                                       schema, 24 of entry frame
+///                                                       — TASK-431's figure, to
+///                                                       the byte
+///   nine more digits in each of the three         27    both caps at u32::MAX:
+///   places a cap is rendered                            `validate_agent` bounds
+///                                                       them from below only, so
+///                                                       that is the ceiling
+///   = what the prompt actually pays             1,328
+/// ```
+///
+/// The widest prompt went 17,716 → **19,044** and `spent` 24,064 → **25,392**,
+/// **816 over** the 24,576 ceiling — and 17,669 → 18,997, 24,017 → 25,345,
+/// **769 over** on the web-enabled twin. That is the
+/// `spent < REDACT_BODY_OVERHEAD_BYTES` assertion, red before the floor or the
+/// pin was consulted, exactly as it was for REQ-620. At the default caps it
+/// would still have been 789 over, so no reading of the caps fits and no
+/// trimmed sentence closes it: the line is a tool's description and its JSON
+/// schema, and the 512 was never room for either. Raised by the one KiB that
+/// clears it — 26 KiB would have left 1,232 at the price of a second 931 off
+/// every scanned route, for room no claimant has asked for.
+///
+/// **Again only one figure below moves:**
+///
+/// ```text
+///   twice a full body      2 × (63,488 + 25,600)     = 178,176 bytes
+///   ÷ REDACT_CHUNK_MAX_BYTES     178,176 / 56,561    =    3.15   (3.11 before)
+///   → REDACT_TOTAL_CAP_CHUNKS                             4      (4 — unmoved)
+///   → REDACT_INPUT_MAX_BYTES     4 × 56,561          = 226,244   (226,244)
+///   → REDACT_SCANNABLE_CONTEXT_BYTES
+///                       (226,244 − 25,600) × 10 / 11 = 182,403   (183,334)
+///   → REDACT_MAX_CHUNKS
+///           (226,244 − 56,561).div_ceil(56,305) + 1  =       5   (5 — unmoved)
+/// ```
+///
+/// Four chunks hold twice a body while this constant is **49,634** or less
+/// (`226,244 / 2 − 63,488`), so the count — and with it the cap and the
+/// per-send call budget — has a long way to go before a raise moves it again.
+///
+/// **The consequence is REQ-620's, a second time:**
+/// [`REDACT_SCANNABLE_CONTEXT_BYTES`] **falls** 183,334 → 182,403, another
+/// **931-byte** cut to every `[privacy] redact = true` route's byte budget —
+/// `1,024 × 10 / 11` and nothing else, said out loud by
+/// `the_overhead_raise_restates_the_chunk_count_and_the_scannable_bound`, by
+/// `harness::budget`'s two default-literal pins and by `router`'s
+/// `BUDGET_FOR_GOLDEN` row (byte digest threshold 67,138 → 66,797).
+///
+/// **Measured after the raise: margin 512 → 208**
+/// ([`RECORDED_PROMPT_MARGIN_BYTES`]) and 559 → **255** on the web-enabled twin
+/// ([`RECORDED_WEB_PROMPT_MARGIN_BYTES`]), the gap still 47 — the check that both
+/// sweeps registered the same line. **160 bytes of usable room** above the
+/// 48-byte floor: a KiB bought for a 1,328-byte line leaves less than REQ-620's
+/// 666, and the next claimant of more than a clause should expect to make the
+/// ceiling case (ASSUME-043's posture).
+///
+/// **Mutations run (2026-10-07, each reverted by edit).** *(a)* The `agent`
+/// registration dropped from both sweeps → both red at the new `- agent: `
+/// self-check, before any arithmetic. (Behind it the BUG-193 pin would read
+/// 1,536 / 1,583 against 208 / 255 — computed, not run: "the prompt moved",
+/// where the self-check says the sweep stopped measuring a real turn.) *(b)*
+/// This constant back at `24 * 1024` with the registration in place → six red
+/// across the lib: both sweeps at `spent < REDACT_BODY_OVERHEAD_BYTES`
+/// (19,044 / 18,997 + 6,348 against 24,576), the re-stating test's second
+/// claim (the bound back at 183,334), and the three derived-literal pins named
+/// above.
 ///
 /// `pub(crate)` because the *other* prompt shape has to clear it too and cannot
 /// be built from here: with `[web] tier` above `off` the system prompt carries
@@ -690,10 +762,13 @@ pub(crate) const MIN_PROMPT_HEADROOM_BYTES: usize = 48;
 /// The ledger line, and the 931 it cost every scanned route, are on
 /// [`REDACT_BODY_OVERHEAD_BYTES`].
 ///
-/// REQ-623 leaves **512**, 464 usable: 202 bytes for the guide's sentence naming
-/// the `agent` tool beside `skill` (TASK-431). The `agent` tool's own docs line
-/// is not in either sweep, so this figure overstates the room a real prompt
-/// turn has; the ledger on [`REDACT_BODY_OVERHEAD_BYTES`] says by how much.
+/// REQ-623 left **512**, 464 usable, at TASK-431: 202 bytes for the guide's
+/// sentence naming the `agent` tool beside `skill` — a figure that overstated
+/// the room a real prompt turn had, because the `agent` tool's own docs line was
+/// in neither sweep. TASK-428's Phase-4 fix registered it (1,328 bytes at its
+/// ceiling), raised the overhead 24 → 25 KiB, and leaves **208**, 160 usable.
+/// The ledger line, and the second 931 it cost every scanned route, are on
+/// [`REDACT_BODY_OVERHEAD_BYTES`].
 ///
 /// # Updating it
 ///
@@ -747,7 +822,7 @@ const _: () = assert!(
 ///
 /// ```text
 ///   HarnessConfig::context_budget_bytes   63,488 bytes  (turn_loop.rs)
-///   + `REDACT_BODY_OVERHEAD_BYTES`        24,576 bytes  (system prompt, tool
+///   + `REDACT_BODY_OVERHEAD_BYTES`        25,600 bytes  (system prompt, tool
 ///                                                        descriptions, the
 ///                                                        repository-notes
 ///                                                        block, JSON envelope
@@ -756,11 +831,11 @@ const _: () = assert!(
 ///                                                        test below checks it
 ///                                                        against the real
 ///                                                        system prompt)
-///   = the largest ordinary outbound body  88,064 bytes
+///   = the largest ordinary outbound body  89,088 bytes
 ///   × 2 (the margin — a cap that only just clears the body it has to hold is
 ///        one context-budget bump away from being the old collision again)
-///   = 176,128 bytes to clear
-///   ÷ REDACT_CHUNK_MAX_BYTES              176,128 / 56,561 = 3.11
+///   = 178,176 bytes to clear
+///   ÷ REDACT_CHUNK_MAX_BYTES              178,176 / 56,561 = 3.15
 ///   → the next whole chunk up                        4
 /// ```
 ///
@@ -789,6 +864,11 @@ const _: () = assert!(
 /// than out of a new window. That account is on
 /// [`REDACT_BODY_OVERHEAD_BYTES`] too.
 ///
+/// REQ-623's 24→25 KiB raise (the `agent` tool's docs line, once both sweeps
+/// measured it) takes the quotient 3.11→3.15 and the count stays **four** for
+/// the same reason, so the KiB again comes out of
+/// [`REDACT_SCANNABLE_CONTEXT_BYTES`] (−931, 183,334 → 182,403).
+///
 /// **REQ-586: the remote budget is bounded by this when the scan applies.**
 /// The arithmetic above runs from the *default* context budget up to the cap;
 /// [`REDACT_SCANNABLE_CONTEXT_BYTES`] runs it the other way, from the cap down
@@ -810,8 +890,8 @@ const _: () = assert!(
 /// [`scan`](crate::harness::redact::scan) before the first call) — p50 ≤ 10 s
 /// and p95 ≤ 25 s at ADR-8's per-chunk budget, against a context-budget-full
 /// turn's expected **two**, which REQ-612's wider body left unchanged and
-/// REQ-620's leaves unchanged again (88,064 bytes is still one stride and a
-/// remainder). Five is the number that
+/// REQ-620's and REQ-623's leave unchanged again (89,088 bytes is still one
+/// stride and a remainder). Five is the number that
 /// has to stay small because it multiplies that budget, and a cap twice this
 /// size would double the ordinary latency. It no longer multiplies the *worst
 /// case*: the scan as a whole is bounded at one `DUTY_DEADLINE`, not one per
@@ -833,8 +913,10 @@ const REDACT_TOTAL_CAP_CHUNKS: usize = 4;
 ///
 /// **This is the number that used to sit under the harness's context budget**
 /// (32,768, then) and block every context-budget-full remote turn. It is now
-/// **226,244** — 3.56× the 63,488-byte local budget, 2.60× a full body with the
-/// system prompt and JSON overhead on top of it (it was 169,683 before REQ-612
+/// **226,244** — 3.56× the 63,488-byte local budget, 2.54× a full body with the
+/// system prompt and JSON overhead on top of it (2.60× at REQ-612's 23 KiB
+/// overhead, before REQ-620 and REQ-623 each widened it a KiB; it was 169,683
+/// before REQ-612
 /// put the repository-notes block in that overhead and the chunk count went
 /// three → four, and 108,280 on the 16,384-token window: 2.46× a full body,
 /// 2.6× before REQ-577 widened the overhead term, 2.58× before BUG-181 widened
@@ -867,25 +949,26 @@ pub const fn redact_input_max_bytes(n_ctx: u32) -> usize {
 ///
 /// ```text
 ///   REDACT_INPUT_MAX_BYTES              226,244 bytes  (the cap: 4 × 56,561)
-///   − REDACT_BODY_OVERHEAD_BYTES         24,576 bytes  (system prompt, the
+///   − REDACT_BODY_OVERHEAD_BYTES         25,600 bytes  (system prompt, the
 ///                                                       repository-notes
 ///                                                       block, JSON envelope —
 ///                                                       what the body carries
 ///                                                       beyond the context)
-///   = room for the escaped context      201,668 bytes
+///   = room for the escaped context      200,644 bytes
 ///   ÷ (1 + 1/REDACT_ESCAPING_DIVISOR)    × 10 / 11     (the context plus its
 ///                                                       own escaping has to fit
 ///                                                       in that room)
-///   = the scannable context              183,334 bytes
+///   = the scannable context              182,403 bytes
 /// ```
 ///
-/// So a body at the bound is `183,334 + 18,333 (escaping) + 24,576 (overhead) =
+/// So a body at the bound is `182,403 + 18,240 (escaping) + 25,600 (overhead) =
 /// 226,243 ≤ 226,244`: four chunk-widths, up to five chunks with the overlap
 /// ([`REDACT_MAX_CHUNKS`](crate::harness::redact::REDACT_MAX_CHUNKS)) — inside
 /// the envelope REQ-562 measured, and ≈ 2.9× the local context budget
-/// (63,488), which admits every ADLC skill. (It read `184,265 + 18,426 +
-/// 23,552 = 226,243` until REQ-620 took the overhead to 24 KiB — the same cap,
-/// 931 fewer bytes of context. Before REQ-612 raised the overhead
+/// (63,488), which admits every ADLC skill. (It read `183,334 + 18,333 +
+/// 24,576 = 226,243` until REQ-623 took the overhead to 25 KiB, and `184,265 +
+/// 18,426 + 23,552 = 226,243` until REQ-620 took it to 24 KiB — the same cap
+/// both times, 931 fewer bytes of context each time. Before REQ-612 raised the overhead
 /// this read `141,224 + 14,122 + 14,336 = 169,682 ≤ 169,683`, and on the
 /// 16,384-token engine window `88,196 + 8,819 + 11,264 = 108,279 ≤ 108,280`.)
 ///
@@ -910,7 +993,7 @@ pub const fn redact_input_max_bytes(n_ctx: u32) -> usize {
 /// reads it, and the egress-capture integration tests (the redact bound's own,
 /// AC-6) read the caps the same way from outside the crate. It is the *only*
 /// place the redact chain's arithmetic leaves this module — a second copy of
-/// the number anywhere (TASK-192's one-home grep: `183_334`/`183334` must hit
+/// the number anywhere (TASK-192's one-home grep: `182_403`/`182403` must hit
 /// comments and the one re-stating assertion only) would be the drift
 /// LESSON-446 is about.
 pub const REDACT_SCANNABLE_CONTEXT_BYTES: usize =
@@ -925,7 +1008,7 @@ pub const REDACT_SCANNABLE_CONTEXT_BYTES: usize =
 /// is still stated in exactly one expression — that expression now takes the
 /// window as an argument instead of reading it from a literal.
 ///
-/// `183_334`, the figure the one-home grep looks for, is this function at
+/// `182_403`, the figure the one-home grep looks for, is this function at
 /// 32,768 and stays the value of the constant.
 #[must_use]
 pub const fn redact_scannable_context_bytes(n_ctx: u32) -> usize {
@@ -2770,6 +2853,24 @@ mod tests {
     /// words elsewhere cost a net **7** bytes on both shapes, re-measured here
     /// rather than reasoned.)*
     ///
+    /// **Recorded headroom at REQ-623 (TASK-428's Phase-4 fix):** `worst`
+    /// **19,044** + `escaping` 6,348 = `spent` **25,392** against an overhead
+    /// raised 24 → 25 KiB by this fix, leaving a margin of **208**. The opted-in
+    /// twin is 18,997 / 25,345 / **255**, still the looser by 47. TASK-431 had
+    /// recorded 17,716 / 24,064 / 512 with the guide's `agent` sentence in and the
+    /// `agent` tool's own docs line in neither sweep; registering
+    /// `AgentToolDocs::worst_case()` here and in the twin added **1,328** to both
+    /// shapes (1,301 at the default caps, 27 more with both caps at `u32::MAX`),
+    /// 816 over the 24 KiB ceiling. The account of the raise and the 931 it cut
+    /// from every scanned route is on [`REDACT_BODY_OVERHEAD_BYTES`].
+    ///
+    /// **Mutations run for REQ-623** (2026-10-07, each reverted by edit):
+    /// dropping the `agent` registration → red at the `- agent: ` self-check in
+    /// this sweep and its twin, before any arithmetic; the overhead back at
+    /// `24 * 1024` with the registration in place → red at the first
+    /// assertion, a 19,044-byte prompt plus 6,348 of escaping against 24,576,
+    /// **816** over.
+    ///
     /// **Mutation run for REQ-620** (re-run at the Phase-5 re-verify, since the
     /// contract had grown 7 bytes since the figure was written). Setting the
     /// overhead back to `23 * 1024` with the contract in place → red at the
@@ -3154,7 +3255,8 @@ mod tests {
     ///    that moves it is indistinguishable, from every inequality in the
     ///    tests above, from the four raises that did not. REQ-620's 24 KiB
     ///    takes the quotient to 3.11 and the count stays four — a raise that
-    ///    inherits REQ-612's move rather than making one.
+    ///    inherits REQ-612's move rather than making one — and REQ-623's 25
+    ///    KiB takes it to 3.15 with the count at four again.
     /// 2. **Every `[privacy] redact = true` route's byte budget moved.**
     ///    [`REDACT_SCANNABLE_CONTEXT_BYTES`] is `(cap − overhead) × 10 / 11`, so
     ///    REQ-587's raise cut it 89,127 → 88,196 (931 bytes off the budget
@@ -3169,7 +3271,10 @@ mod tests {
     ///    re-statement is. REQ-620 cuts it, 184,265 → **183,334**: with the
     ///    count unmoved the cap cannot grow, so its one-KiB raise lands on the
     ///    bound as `1,024 × 10 / 11` — the same 931 REQ-587's raise cost, and
-    ///    the same 931 no inequality above this line can see.
+    ///    the same 931 no inequality above this line can see. REQ-623 cuts it
+    ///    again, 183,334 → **182,403**, the same 931 for the same reason: the
+    ///    `agent` tool's docs line, once both sweeps registered it, took the
+    ///    overhead 24 → 25 KiB.
     ///
     /// The literal here is the **assertion**, not a second home for the number
     /// (TASK-192's one-home grep is about the constant's definition, which is
@@ -3183,6 +3288,10 @@ mod tests {
     /// because that raise did not move the chunk count. Two claims, two
     /// failures, and the raise that reddens only one of them is the one this
     /// test was written to make visible.
+    ///
+    /// **Mutation run for REQ-623** (2026-10-07, reverted): the overhead back
+    /// at `24 * 1024` → red on the second claim again, the bound back at
+    /// 183,334 and the message naming the 931, with the first claim green.
     #[test]
     fn the_overhead_raise_restates_the_chunk_count_and_the_scannable_bound() {
         use crate::harness::turn_loop::HarnessConfig;

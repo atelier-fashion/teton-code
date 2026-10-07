@@ -56,6 +56,21 @@ user having asked for it.
   one in total. The cost ledger gains two nullable columns (`child_id`,
   `parent_turn_id`), added in place on first start.
 
+### Changed
+
+- **The system-prompt overhead ceiling rises 24 → 25 KiB
+  (`REDACT_BODY_OVERHEAD_BYTES`, REQ-623).** The `agent` tool's description and
+  schema ride every prompt turn while it is enabled — 1,328 bytes at the
+  largest caps the `[agent]` table admits — and the resident prompt had 512
+  left. The four figures derived from the ceiling were re-derived and
+  re-asserted: the chunk count stays 4, the total cap and the per-scan maximum
+  are unmoved.
+
+  **Upgrade note:** every route with `[privacy] redact = true` now scans 931
+  fewer bytes of context per turn — the scannable bound falls 183,334 →
+  182,403. Nothing else moves: no configuration key, on-disk file, or wire
+  shape changes with it, and routes without redaction are unaffected.
+
 ## [0.1.36] - 2026-09-22
 
 ### Fixed

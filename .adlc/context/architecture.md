@@ -701,6 +701,20 @@
   grammar the pin enforces, so `/shell allow` is no longer the model's only
   resident route to it (REQ-620 ADR-620-5, ASSUME-043 resolved, ASSUME-048).
 
+  **REQ-623 raised it again (2026-10-07), for a tool's docs line rather than a
+  sentence.** `register_agent_tool` puts the `agent` tool in every prompt turn's
+  registry while `agent.enabled` (the default), cap-exempt — resident exactly as
+  `skill` is, and in neither sweep until TASK-428's Phase-4 fix registered a
+  doc-only stand-in (`turn_loop::AgentToolDocs`, beside `SkillToolDocs`, pinned
+  byte-identical to the shipped tool) with a `- agent: ` self-check in both.
+  Measured at both caps' `u32::MAX` — the config bounds them from below only, and
+  they render as decimal digits — the line is 1,328 bytes (1,301 at the defaults),
+  816 over the 24 KiB ceiling, so `REDACT_BODY_OVERHEAD_BYTES` went 24 → 25 KiB.
+  The chunk count again holds at 4 (quotient 3.11 → 3.15; it holds until the
+  overhead passes 49,634), so the whole KiB again comes off
+  `REDACT_SCANNABLE_CONTEXT_BYTES`: 183,334 → **182,403**. Margins re-measured:
+  512 → **208** and 559 → **255**, the gap still 47, 160 usable above the floor.
+
 - **A repository-touching act with no human typing a name gets its own gate
   entry point, keyed by the durable root** (REQ-613). Writing a missing
   `TETON.md` is a *daemon* act rather than a tool call, so no tool name is on

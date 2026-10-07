@@ -2405,10 +2405,25 @@ mod tests {
     /// `REDACT_BODY_OVERHEAD_BYTES` unmoved at 24 KiB and the floor unmoved at
     /// 48. Both shapes pay the same 202: the guide's capability line gains the
     /// sentence naming the `agent` tool beside `skill` (TASK-431). This shape
-    /// stays the looser of the two by the same 47 B. **This sweep does not
+    /// stays the looser of the two by the same 47 B. **This sweep did not
     /// register the `agent` tool's own docs**, which every prompt turn with
-    /// `agent.enabled` carries; `egress::redact`'s twin of this paragraph says
-    /// what that leaves unmeasured.
+    /// `agent.enabled` carries — the gap the next paragraph closes.
+    ///
+    /// **Recorded headroom at REQ-623 (TASK-428's Phase-4 fix):** `worst`
+    /// **18,997**, `spent` **25,345**, margin **255** — against an overhead
+    /// raised 24 → 25 KiB by the fix, with the floor unmoved at 48 and this
+    /// shape still the looser of the two by 47 B. Both sweeps now register
+    /// `turn_loop::AgentToolDocs::worst_case()`, the `agent` tool's docs line at
+    /// both caps' `u32::MAX`: **1,328** bytes on both shapes (1,301 at the
+    /// default caps), which put this one 769 over the 24 KiB ceiling. The
+    /// account — and the second 931-byte cut to every scanned route — is
+    /// `egress::redact`'s twin of this paragraph.
+    ///
+    /// **Mutations run for REQ-623** (2026-10-07, each reverted by edit):
+    /// dropping the `agent` registration → red at this sweep's `- agent: `
+    /// self-check; the overhead back at `24 * 1024` → red at the first
+    /// arithmetic assertion, an 18,997-byte prompt plus 6,348 of escaping
+    /// against 24,576, **769** over.
     ///
     /// **Mutation run for REQ-612:** dropping `repo_context` from the config
     /// rows below turns this red at the block self-check, naming the reason,

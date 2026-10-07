@@ -1905,13 +1905,18 @@ mod tests {
     /// out here rather than computed from either tool, so the expected value
     /// does not come from the subject.
     ///
-    /// # Mutations (run 2026-10-07, each reverted)
+    /// The growth assertion is the one that still stands if the `u32::MAX` row
+    /// and `worst_case` were both walked back to a smaller table together.
+    ///
+    /// # Mutations (run 2026-10-07, each reverted by edit)
     ///
     /// - **`AgentToolDocs::input_schema` rendering `schema(5)`** (a stand-in
-    ///   frozen at the default cap): red at the `u32::MAX` row's schema
-    ///   assertion, and at the departed row's.
-    /// - **`AgentToolDocs::worst_case` at the defaults** (`AgentConfig::default()`):
-    ///   red at the 27-byte growth assertion, naming a growth of 0.
+    ///   frozen at the default cap): red at the departed row's schema
+    ///   assertion — the first row whose cap is not 5.
+    /// - **`AgentToolDocs::worst_case` at the defaults**: red here at the
+    ///   `u32::MAX` row's description assertion, and in both prompt-margin
+    ///   sweeps at their BUG-193 pins (margins 235 / 282 against 208 / 255 —
+    ///   the 27 bytes a sweep stops measuring).
     #[tokio::test]
     async fn the_doc_only_agent_tool_and_the_real_one_render_one_set_of_prompt_bytes() {
         use crate::harness::turn_loop::AgentToolDocs;

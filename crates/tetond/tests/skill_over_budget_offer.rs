@@ -1933,7 +1933,7 @@ fn route_for(bound: BudgetBound, verdict: WindowVerdict) -> (Fixture, Option<Moc
 /// The `RedactScan` cell, and the one fixture here that needs an argument
 /// string.
 ///
-/// The redact clamp is a fixed 183,334 bytes and `SKILL.md` is capped at
+/// The redact clamp is a fixed 182,403 bytes and `SKILL.md` is capped at
 /// 128 KiB by discovery, so no skill **body** can reach past that ceiling on its
 /// own. The expansion is therefore pushed over with `$ARGUMENTS`, which is
 /// bounded only by the RPC frame. The declared window is 100,000 so the
@@ -1949,16 +1949,19 @@ fn route_for(bound: BudgetBound, verdict: WindowVerdict) -> (Fixture, Option<Moc
 /// over budget does not fail as a stale number, it fails as a turn that
 /// **succeeds**, which reads as a missing refusal. REQ-620's 23 → 24 KiB raise
 /// then moved it the other way, to **183,334**, which widens this fixture's
-/// clearance rather than closing it; the figure is left where it is.
+/// clearance rather than closing it; the figure is left where it is. REQ-623's
+/// 24 → 25 KiB raise (the `agent` tool's docs line, once both prompt-margin
+/// sweeps measured it) moved it the same way again, to **182,403**, and the
+/// figure is left where it is a second time.
 ///
 /// It is squeezed from both sides, which is why the figure is 128,000 rather
 /// than something comfortably large. The expansion must be **over the clamp**
-/// (183,334 B) and still **fit the declared window**, because
+/// (182,403 B) and still **fit the declared window**, because
 /// `each_reachable_window_verdict_is_offered_and_pins_its_own_sentence` uses
 /// this route as its `RedactScan` + `FitsWindow` cell — and the usable window
 /// is 197,952 B, above which the verdict becomes `ExceedsWindow` (or, in the
 /// last 2,048 B, `FitsWindowIntoTheReservation`). 60,001 + 128,000 = 188,001
-/// sits between the two, 4,667 B clear of the clamp. It was 130,000 until
+/// sits between the two, 5,598 B clear of the clamp. It was 130,000 until
 /// REQ-623 registered `agent` for every prompt turn: its roster entry — about
 /// 1.6 KB, most of it a JSON schema — rides in the system prompt the window
 /// verdict measures with the expansion, and 130,000 then read
