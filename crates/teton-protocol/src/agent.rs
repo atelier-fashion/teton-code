@@ -196,7 +196,10 @@ pub enum ChildStatus {
     /// The child's deadline passed; an in-flight tool call was cancelled.
     TimedOut,
     /// A provider or engine error after the child's own retry and reroute path
-    /// was exhausted; [`ChildResult::error`] carries the code.
+    /// was exhausted; [`ChildResult::error`] carries the code. Also a child
+    /// whose last model call stopped at the route's output cap: its error opens
+    /// `max_tokens` — the [`StopReason`](crate::methods::StopReason) spelling —
+    /// and names the cap (BUG-235). A reply cut off there is not a final answer.
     Failed,
 }
 
@@ -289,7 +292,9 @@ pub struct ChildResult {
     /// the error code first, so a reader can key on it, then what the code
     /// says happened; absent otherwise. BR-10 has `failed` carry the error
     /// code, and the entity table has `refusal` absent outside `refused`, so
-    /// it needs a field of its own.
+    /// it needs a field of its own. The code is a numeric JSON-RPC error code,
+    /// or `max_tokens` for a child cut off at its output cap (BUG-235) — a stop,
+    /// not an RPC error, so it keys on the stop reason's spelling instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Model calls the child made.

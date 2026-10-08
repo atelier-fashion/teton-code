@@ -120,6 +120,12 @@ pub const REPORT_TRUNCATED: &str = "report_truncated";
 /// The token a `turns_exhausted` report's marker opens with (BR-10).
 pub const TURNS_EXHAUSTED: &str = "turns_exhausted";
 
+/// The code a `failed` child's error opens with when its last model call
+/// stopped at the route's output cap (BUG-235) — the wire spelling of
+/// [`teton_protocol::methods::StopReason::MaxTokens`], the token a prompt turn
+/// that ran out the same way ends with (BUG-229).
+pub const OUTPUT_CAP_REACHED: &str = "max_tokens";
+
 /// The refusal code of a child the permission gate stopped (BR-10's "refused
 /// by a gate"): `gate_denied:<tool>` — see [`ChildToolCalls::gate_refusal`].
 pub const GATE_DENIED: &str = "gate_denied";
@@ -820,6 +826,26 @@ pub fn turns_exhausted_report(text_so_far: &str, max_turns: u32) -> String {
     } else {
         format!("{marker}\n\n{text_so_far}")
     }
+}
+
+/// The `error` of a child whose last model call stopped at the route's
+/// `max_tokens` output cap (BUG-235): `failed`, not `completed`.
+///
+/// A reply the cap cut short did not end, it ran out — and a reasoning model
+/// can spend the whole cap thinking and write nothing. Reporting that as
+/// `completed` is BUG-229's silent success moved into the report the parent
+/// reads. The status says the child did not finish; the code is the stop
+/// reason a prompt turn ends with for the same cause; the number is the cap
+/// that ended it, as BR-10 has every bound-ended status carry. What the child
+/// wrote is not returned: BR-10 keeps a report to `completed` and
+/// `turns_exhausted`, and a cut-off reply is neither an answer nor marked.
+#[must_use]
+pub fn output_cap_error(max_tokens: u32) -> String {
+    format!(
+        "{OUTPUT_CAP_REACHED}: this child's reply reached its {max_tokens}-token output cap \
+         before it finished; nothing it wrote is returned — give it a narrower task, or a \
+         tier whose cap is larger"
+    )
 }
 
 /// A report cut to its bound (BR-11).

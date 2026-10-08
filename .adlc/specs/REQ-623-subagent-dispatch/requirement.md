@@ -278,6 +278,12 @@ REQ-587 AC-15 recorded, and it is the gate the `pipeline-runner`,
   model; the tool process itself is not killed (follow-up — see Deferred), so
   a blocking `shell` runs to its own timeout and may outlive the parent's
   turn, exactly as the parent's own cancelled `shell` does today.
+  *Amended 2026-10-07 (BUG-235):* (3) **A child cut off at its output cap
+  ends `failed`**, never `completed`: when its last model call stopped at the
+  route's `max_tokens` (BUG-229's `MaxTokens`), `error` is
+  `max_tokens: <sentence naming the cap>` and `report` is empty. The eight
+  statuses are unchanged — a ninth would be a protocol-version bump, since
+  `ChildStatus` is a closed set the CLI decodes.
 - [ ] BR-11: **A report is bounded, and over-bound is loud.** A child's final
   text longer than `report_max_bytes` is cut at the bound with a typed
   marker naming the kept and dropped byte counts, `truncated: true` on
