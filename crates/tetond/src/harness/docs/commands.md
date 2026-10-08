@@ -179,7 +179,9 @@ statuses:
 - `cancelled` — your turn was cancelled; a tool it had running is abandoned
   the same way.
 - `failed` — a provider or engine error after its own retries and reroutes;
-  `error` carries the code.
+  `error` carries the code. An `error` opening `max_tokens` means its reply
+  reached the output cap before it finished: nothing it wrote is returned, so
+  give it a narrower task or a tier with a larger cap.
 
 A report over `report_max_bytes` is cut there with a `report_truncated` marker
 naming the bytes kept and dropped; the whole text is in the session transcript.

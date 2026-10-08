@@ -46,9 +46,9 @@ use teton_protocol::TurnId;
 
 use crate::cost::ChildSpend;
 use crate::harness::child::{
-    bound_report, child_system_section, over_budget_refusal, turns_exhausted_report,
-    ChildDispatcher, ChildOutcome, ChildOutcomeSlot, ChildRouteCell, ChildSpec, ChildTaskScope,
-    ChildToolCalls, ChildTurn, PausableDeadline, CHILD_PANICKED,
+    bound_report, child_system_section, output_cap_error, over_budget_refusal,
+    turns_exhausted_report, ChildDispatcher, ChildOutcome, ChildOutcomeSlot, ChildRouteCell,
+    ChildSpec, ChildTaskScope, ChildToolCalls, ChildTurn, PausableDeadline, CHILD_PANICKED,
 };
 use crate::harness::context::BlockRole;
 use crate::harness::reply::prose_before_tool_call;
@@ -483,7 +483,14 @@ impl Work {
                         ..Ended::of(ChildStatus::TurnsExhausted)
                     },
                     StopReason::Cancelled => Ended::of(ChildStatus::Cancelled),
-                    _ => finished_on_its_own(outcome.final_text, &tool_calls),
+                    // BUG-235: cut off at the output cap is not finished. The
+                    // cap is the route the last call ran on — after any reroute.
+                    StopReason::MaxTokens => {
+                        Ended::failed(output_cap_error(st.route.harness.gen_params.max_tokens))
+                    }
+                    StopReason::EndTurn | StopReason::Refusal => {
+                        finished_on_its_own(outcome.final_text, &tool_calls)
+                    }
                 },
                 // The success arm always leaves its outcome; an `Ok` without one
                 // is a broken invariant, reported rather than unwrapped.
@@ -715,6 +722,10 @@ mod tests {
     enum Reply {
         /// Stream this text and end.
         Say(String),
+        /// Stream this text and report it used the call's whole `max_tokens`
+        /// — the local tier's only witness of a cap stop (BUG-229), which
+        /// `LocalEngineSource` turns into `stopped_at_cap: true`.
+        AtCap(String),
         /// Fail as the backend, with no window involved.
         Fail,
         /// Refuse the prompt as too big for the window — the typed local
@@ -736,6 +747,9 @@ mod tests {
     struct ScriptEngine {
         script: Arc<Mutex<VecDeque<Reply>>>,
         prompts: Arc<Mutex<Vec<String>>>,
+        /// The `max_tokens` each [`Reply::AtCap`] call was sent with — the
+        /// cap as the engine saw it, an oracle the child's code did not compute.
+        caps: Arc<Mutex<Vec<u32>>>,
     }
 
     impl ScriptEngine {
@@ -749,6 +763,10 @@ mod tests {
 
         fn prompts(&self) -> Vec<String> {
             self.prompts.lock().unwrap().clone()
+        }
+
+        fn caps(&self) -> Vec<u32> {
+            self.caps.lock().unwrap().clone()
         }
     }
 
@@ -770,7 +788,7 @@ mod tests {
             &mut self,
             _session: &str,
             prompt: &str,
-            _params: &GenParams,
+            params: &GenParams,
             on_token: &mut dyn FnMut(&str) -> bool,
         ) -> Result<Completion, EngineError> {
             self.prompts.lock().unwrap().push(prompt.to_owned());
@@ -779,6 +797,11 @@ mod tests {
                 Reply::Say(text) => {
                     on_token(&text);
                     Ok(Completion::cold(text, 10, 5))
+                }
+                Reply::AtCap(text) => {
+                    self.caps.lock().unwrap().push(params.max_tokens);
+                    on_token(&text);
+                    Ok(Completion::cold(text, 10, params.max_tokens))
                 }
                 Reply::Fail => Err(EngineError::Backend("scripted failure".to_owned())),
                 Reply::OverWindow => Err(EngineError::ContextWindowExceeded {
@@ -1868,6 +1891,64 @@ mod tests {
             Some(0)
         );
         assert!(broke.result.report.is_empty());
+    }
+
+    /// **BUG-235: a child whose last call stopped at the output cap ends
+    /// `failed` with `max_tokens` and the cap — never `completed`.** BUG-229
+    /// made a prompt turn end `MaxTokens` when its reply ran out at
+    /// `max_tokens`; a child's stop went to `finished_on_its_own`, so the
+    /// parent read "completed" over a cut-off reply, or over nothing at all
+    /// when a reasoning model spent the cap thinking.
+    ///
+    /// Both shapes are driven through the real `LocalEngineSource`, whose only
+    /// witness of a cap stop is a completion that used the whole cap
+    /// (`stopped_at_cap: true`): a reply cut mid-sentence, and an empty one.
+    /// The cap in the error is checked against the `max_tokens` the engine was
+    /// sent, not against anything the child computed. The control is the same
+    /// text under the cap, which still ends `completed` — so the discriminator
+    /// is the cap stop and nothing else about the reply.
+    ///
+    /// Mutation (run 2026-10-07, reverted): deleting the `MaxTokens` arm and
+    /// folding it into the `finished_on_its_own` arm — the pre-fix `_ =>` —
+    /// under `cargo test --workspace --no-fail-fast`: 1 red of 4,890, this
+    /// test, at the `cut-off` child's status (`Completed`, not `Failed`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_child_cut_off_at_its_output_cap_ends_failed() {
+        let rig = Rig::new("child-output-cap", true);
+        let dispatcher = rig.dispatcher();
+        let partial = "The three callers of the parser are";
+
+        // The control first: the same words, under the cap, are an answer.
+        rig.engine.say(partial);
+        let control = dispatcher.run_child(rig.spec("under-cap", "go")).await;
+        assert_eq!(control.status(), ChildStatus::Completed, "{control:?}");
+        assert_eq!(control.result.report, partial);
+        assert!(rig.engine.caps().is_empty(), "no call ran at its cap yet");
+
+        for (name, text) in [("cut-off", partial), ("thought-only", "")] {
+            rig.engine.then(Reply::AtCap(text.to_owned()));
+            let capped = dispatcher.run_child(rig.spec(name, "go")).await;
+            let cap = *rig.engine.caps().last().expect("the capped call ran");
+            assert_eq!(capped.status(), ChildStatus::Failed, "{name}: {capped:?}");
+            assert_eq!(capped.result.turns_used, 1, "{name}");
+            let error = capped.result.error.as_deref().expect("the code");
+            assert!(error.starts_with("max_tokens: "), "{name}: {error}");
+            assert!(
+                error.contains(&format!("its {cap}-token output cap")),
+                "{name}: the cap the engine was sent ({cap}) — {error}"
+            );
+            assert!(
+                capped.result.report.is_empty(),
+                "{name}: BR-10's empty report"
+            );
+            assert!(!capped.truncated, "{name}");
+            if !text.is_empty() {
+                assert!(
+                    !error.contains(text),
+                    "{name}: model output stays out of the error"
+                );
+            }
+        }
     }
 
     /// **BR-8: a timed-out child still inside a blocking tool keeps its share
