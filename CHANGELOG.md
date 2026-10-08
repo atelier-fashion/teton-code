@@ -18,6 +18,16 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [0.1.38] - 2026-10-08
+
+### Changed
+
+- **Build pipeline only: no change to `teton` or the daemon.** The release,
+  CI and site workflows move `actions/checkout` from v4 to v7.0.1, which runs
+  on Node.js 24. GitHub has deprecated the Node.js 20 runtime that v4
+  targets. The binaries are built from the same code as 0.1.37, so upgrading
+  is optional.
+
 ## [0.1.37] - 2026-10-08
 
 ### Added
