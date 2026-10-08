@@ -1,10 +1,11 @@
 ---
 id: BUG-235
 title: "A child cut off at its output cap reports completed"
-status: open
+status: resolved
 severity: medium
 created: 2026-10-07
 updated: 2026-10-07
+resolved: 2026-10-07
 component: "daemon/runtime/child_turn"
 domain: "harness"
 stack: ["rust", "daemon"]
@@ -74,9 +75,19 @@ compile error, because a catch-all match never asks about a new variant.
 **Decision: reuse `failed`; no new `ChildStatus` variant.** `ChildStatus` is a
 deliberately closed set ("a status this build does not know is an error to
 decode"), and the CLI decodes it on `agent_child_finished` and
-`agent_call_finished`. Under `teton-protocol/src/lib.rs`'s rule ("advertise only
-what the types can actually read"), a ninth variant needs `PROTOCOL_VERSION`
-bumped 2→3 on both ends, and REQ-623 BR-10 would need to say "nine". The
+`agent_call_finished`. A ninth variant would require rewriting BR-10's "eight
+statuses" and every renderer. On an older CLI, an event carrying the new status
+would also fail to decode, and the CLI's event decoder (`from_value(params).ok()?`)
+drops such events silently.
+
+*Correction at closure:* the PR body and the first version of this section said
+a ninth variant "needs `PROTOCOL_VERSION` 2→3". That overstates it. v2 has
+taken many additive events without a bump (REQ-623's seven `agent_*` among
+them), because an older client drops an event it cannot decode instead of
+failing. The only bump so far, #64, was for a reshaped required field in an RPC
+result. The cost of a ninth status is the silent drop on an older CLI plus the
+spec and renderer churn, not a forced handshake failure. The decision stands on
+those grounds. The
 alternative, `completed` with a marker in the report text the way
 `turns_exhausted_report` marks its report, leaves the status field claiming
 success, which is the shape this bug is about.
@@ -131,3 +142,15 @@ failed across 83 targets, and no `FAILED` in the output. `cargo clippy --workspa
 - `crates/teton-protocol/src/agent.rs`: `ChildStatus::Failed` and `ChildResult::error` docs name the `max_tokens` case (doc-only; no wire change)
 - `crates/tetond/src/harness/docs/commands.md`: the `agent` guide's `failed` bullet tells the model what `max_tokens` means and what to do
 - `.adlc/specs/REQ-623-subagent-dispatch/requirement.md`: BR-10 amendment (3)
+
+## Deployment
+
+- Merged: [atelier-fashion/teton-code#341](https://github.com/atelier-fashion/teton-code/pull/341)
+  as `f8140030` on 2026-10-07; all 8 required checks green.
+- Deploy: n/a. teton-code is a plain OSS, PR-gated repo with no staging or
+  Cloud Run targets. The fix ships in the next tagged release.
+- Lesson: LESSON-667 (sweep every catch-all when a variant becomes reachable;
+  a mutation must remove the fixed path).
+- Sweep at closure: the only other `StopReason` consumer, the CLI's
+  `turn_end_line`, prints the reason verbatim (`turn ended (MaxTokens)`) and
+  folds nothing.
