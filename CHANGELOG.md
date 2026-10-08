@@ -18,6 +18,19 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [0.1.39] - 2026-10-08
+
+### Changed
+
+- **Build pipeline only: no change to `teton` or the daemon.** The release and
+  site-deploy workflows move their last four actions off the deprecated
+  Node.js 20 runtime: `actions/download-artifact` v4.3.0 → v8.0.2,
+  `actions/upload-artifact` v4.6.2 → v7.0.2, `google-github-actions/auth`
+  v2.1.13 → v3.0.0, and `google-github-actions/setup-gcloud` v2.2.1 → v3.0.1.
+  A release artifact whose checksum doesn't match its upload now fails the run
+  instead of only warning. The binaries are built from the same code as
+  0.1.38, so upgrading is optional.
+
 ## [0.1.38] - 2026-10-08
 
 ### Changed
