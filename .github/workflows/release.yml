@@ -1038,7 +1038,7 @@ jobs:
       # the signing certificate, and this step is the hand-off that carries
       # the signed bytes out of the job. See the carve-out note above.
       - name: Upload target artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: teton-${{ matrix.target }}
           # The sidecar `.sha256` is deliberately left behind: the release's
@@ -1172,7 +1172,7 @@ jobs:
       # bytes the next steps attest and publish. See the carve-out note in
       # the `build` job above.
       - name: Download every target's tarball
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: staging
           pattern: teton-*
@@ -1717,7 +1717,7 @@ jobs:
       # the carve-out note in the `build` job above.
       - name: Download this run's build artifacts (dry runs)
         if: needs.preflight.outputs.publish != 'true'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
           pattern: teton-*
