@@ -72,6 +72,10 @@ const TOOL_SOURCES: &[(&str, &str)] = &[
         include_str!("../src/harness/tools/shell_provenance.rs"),
     ),
     (
+        "shell_quotes.rs",
+        include_str!("../src/harness/tools/shell_quotes.rs"),
+    ),
+    (
         "shell_syntax.rs",
         include_str!("../src/harness/tools/shell_syntax.rs"),
     ),
@@ -532,13 +536,16 @@ fn every_content_surfacing_tool_has_a_boundary_test() {
     // it to 14 (`shell_syntax.rs`, the null-redirect recogniser both the write
     // gate and the classifier read). Neither of those declares an `impl Tool
     // for`, so the derived set below was unchanged by them. REQ-623 raised it
-    // to 15 with `agent.rs`, which does, and whose tool is in `COVERAGE`. The
-    // equality — rather than a `>=` floor — is deliberate: it makes *adding* a
-    // tool source file a change someone has to look at, which is how a new
-    // file that should have carried a boundary test gets noticed.
+    // to 15 with `agent.rs`, which does, and whose tool is in `COVERAGE`.
+    // BUG-236 raised it to 16 with `shell_quotes.rs`, the quoted-literal lift
+    // the classifier reads — a pure string pre-pass with no `impl Tool for`, so
+    // the derived set is again unchanged. The equality — rather than a `>=`
+    // floor — is deliberate: it makes *adding* a tool source file a change
+    // someone has to look at, which is how a new file that should have carried
+    // a boundary test gets noticed.
     assert_eq!(
         TOOL_SOURCES.len(),
-        15,
+        16,
         "the embedded source list changed; the scan below is no longer the module's shape"
     );
     for (file, text) in TOOL_SOURCES {

@@ -18,6 +18,29 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [Unreleased]
+
+### Fixed
+
+- **A shell command whose quoted strings are plain literals no longer pins the
+  session to the local tier (BUG-236).** REQ-614's classifier refused every
+  command carrying a `'` or a `"` before reading its verb, on the argument that
+  modelling quoting would make the grammar a shell lexer. A plain quoted
+  literal is also the single most common thing a model writes into a shell
+  command: on 2026-10-08 three of the four children an `/analyze` turn fanned
+  out each ran one — `find … -name "*.toml"`, `grep -rnE '…' …` — within
+  fifteen seconds, each pinned the session, and the parent's typed skill was
+  refused at the reroute because it no longer fit the local window. The grammar
+  now lifts a **simple** quoted span — `'X'` or `"X"` where `X` is non-empty,
+  does not start with `~`, and holds no quote, backtick, `$`, backslash or
+  newline — before classifying the rest, and reads the span's bytes as the
+  word `sh` hands the program: `cat ".env"` still names `.env` and still pins
+  permanently, `"-exec"` is still `-exec`, `"python3"` is still opaque, and
+  `echo "a && cat .env"` runs no `cat`. Every other quote — `"$HOME"`, an
+  inner quote, a backslash, an empty or unterminated span — refuses the whole
+  command exactly as before, with the same sentence. The `shell` tool's
+  description now tells the model that plain quotes are fine.
+
 ## [0.1.39] - 2026-10-08
 
 ### Changed

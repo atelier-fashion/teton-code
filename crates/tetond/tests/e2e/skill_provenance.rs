@@ -1232,7 +1232,9 @@ fn skill_invoked_carries_each_commands_reach_and_nothing_more() {
 /// and the preamble spawns.
 const CLASS_PREAMBLES: &[(&str, &str)] = &[
     (
-        "echo 'q'",
+        // A span holding a quote of the other kind stays unmodelled (BUG-236
+        // lifts only simple spans), so the class still has a row.
+        "echo \"q's\"",
         "the command uses a quoted string this classifier does not model",
     ),
     (

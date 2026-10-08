@@ -774,14 +774,14 @@ mod tests {
         }
 
         // **The gate-only half.** These two rows are not in the differential
-        // above and must not be: the classifier refuses them on
-        // `UnmodelledSyntax::Quote`, which outranks `Redirect` in
-        // `UNMODELLED_ORDER`, so it never reaches the redirect question and the
-        // iff would hold for a reason that has nothing to do with redirection.
-        // What they assert is this gate's own quote awareness, which
-        // `strip_null_redirects` deliberately does not have (it is
-        // whitespace-word-based, and no word carrying a quote parses as a
-        // `NullRedirect`, so a lift cannot change the residue's quote parity).
+        // above and must not be: since BUG-236 the classifier lifts each span
+        // as a simple quoted literal and answers `Rooted` — it never reaches
+        // the redirect question either way, so the iff would hold for a reason
+        // that has nothing to do with redirection. What they assert is this
+        // gate's own quote awareness, which `strip_null_redirects` deliberately
+        // does not have (it is whitespace-word-based, and no word carrying a
+        // quote parses as a `NullRedirect`, so a lift cannot change the
+        // residue's quote parity).
         for command in ["echo \"2 > 1\"", "echo 'a > b'"] {
             assert!(
                 !has_top_level_redirection(command),

@@ -150,10 +150,10 @@ macro_rules! reach_contract {
     () => {
         "Commands are checked before they run. A command keeps the session on its \
          current tier when read verbs (ls, cat, grep, git status) name paths in the \
-         session root; `2>/dev/null` and `2>&1` are fine. Quotes, other redirects, \
-         globs, `$`, `~/` paths, other shell syntax, interpreters, network clients, \
-         or an unknown verb pin the rest of the session to the local tier; the pin \
-         is announced and only the user can lift it."
+         session root; `2>/dev/null`, `2>&1` and plain quotes are fine. Other \
+         redirects, globs, `$`, `~/` paths, other shell syntax, interpreters, network \
+         clients or an unknown verb pin the rest of the session to the local tier; \
+         the pin is announced and only the user can lift it."
     };
 }
 
@@ -1225,7 +1225,12 @@ mod tests {
                 "a redirect to the null device, which reads nothing",
             ),
             ("2>&1", "a descriptor duplication, which reads nothing"),
-            ("quotes", "quoting, which the grammar refuses whole"),
+            // BUG-236: plain quotes are modelled; the word still has to appear so
+            // a model learns they are safe rather than avoiding them.
+            (
+                "quotes",
+                "quoting — plain quotes are modelled, the rest refused",
+            ),
             ("globs", "wildcards, which the grammar refuses whole"),
             ("$", "variables and substitution"),
             ("~/", "a path outside the session root"),
