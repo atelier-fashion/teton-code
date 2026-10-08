@@ -18,7 +18,7 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
-## [Unreleased]
+## [0.1.37] - 2026-10-08
 
 ### Added
 
@@ -75,6 +75,45 @@ user having asked for it.
   fewer bytes of context per turn — the scannable bound falls 183,334 →
   182,403. Nothing else moves: no configuration key, on-disk file, or wire
   shape changes with it, and routes without redaction are unaffected.
+
+### Fixed
+
+- **`[cost] prompt_ceiling_usd` binds at the dollars you configured (BUG-231).**
+  The ceiling was converted at 100,000 units per dollar, but recorded call
+  costs are in millionths of a dollar. It therefore tripped at about a tenth of
+  the configured figure, and its refusal reported ten times the real spend (a
+  $0.44 call showed as "spent $4.40"). The conversion is now one helper shared
+  by the ceiling check, the refusal message, and the child spend shares.
+  `/cost` was always right.
+
+  **Upgrade note:** a prompt with a ceiling set can now spend up to the
+  configured amount, about ten times what older builds let it reach before
+  refusing. If you set the ceiling low to make up for the old behaviour, lower
+  it again.
+
+- **A remote reply gets room to finish, and a reply cut off at the cap says so
+  (BUG-229).** Remote routes inherited the local tier's 1,024-token output cap.
+  A reasoning model counts its thinking against that cap, so it could spend the
+  whole cap thinking and end the turn with no answer, reported as an ordinary
+  `turn ended (EndTurn)`. Remote routes now send 8,192 tokens, the largest
+  value every documented provider accepts, and a reply that hits the cap ends
+  `turn ended (MaxTokens)`. The local tier stays at 1,024.
+
+  **Upgrade note:** remote calls can produce, and bill, up to 8,192 output
+  tokens instead of 1,024. Every remote context budget is 7,168 tokens smaller
+  to reserve that room. A 128k window holds 79,872 words of context, down from
+  84,650.
+
+- **A child turn cut off at its output cap ends `failed`, not `completed`
+  (BUG-235).** Before this fix, the parent model was told the child had
+  finished, often with an empty report. The child's `error` now starts with
+  `max_tokens:` and names the cap, so the parent can retry with a narrower
+  task.
+
+- **A typed skill refused after a reroute no longer claims no provider saw the
+  turn (BUG-227).** When the reroute guard refused a `/name` expansion mid-turn,
+  the message said nothing had been sent, even though the earlier route may
+  already have served model calls. It now says what actually happened.
 
 ## [0.1.36] - 2026-09-22
 
