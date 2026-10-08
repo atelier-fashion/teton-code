@@ -59,7 +59,7 @@ jobs:
       publish: ${{ steps.gate.outputs.publish }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Nothing is built until the tag is a version shape this pipeline supports
       # and the tag and `[workspace.package] version` agree. The exit code is a
@@ -207,7 +207,7 @@ jobs:
       # the job — a moved tag would execute new code with the Developer ID
       # private key reachable. See the carve-out note below.
       - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install pinned Rust toolchain
         # rustup reads rust-toolchain.toml and installs the pinned channel.
@@ -1159,7 +1159,7 @@ jobs:
       # signed with, so the first action it runs is not left on a mutable tag.
       # See the carve-out note in the `build` job above.
       - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # This job's token can write to the repository. `persist-credentials`
           # would leave it in .git/config for every later step to read; `gh`
@@ -1635,7 +1635,7 @@ jobs:
       # repository every `brew install` reads. See the carve-out note in the
       # `build` job above.
       - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # This job holds the tap's write credential. Leaving the repository's
           # own token in .git/config for the whole job — through a `brew
@@ -2469,7 +2469,7 @@ jobs:
       # carries `attestations: read` to do it. A moved tag here could change
       # the script the gate executes. See the carve-out note in `build`.
       - name: Checkout (for the verification script only)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 

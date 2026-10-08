@@ -51,7 +51,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install pinned Rust toolchain
         # rustup reads rust-toolchain.toml and installs the pinned channel.
@@ -100,7 +100,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install pinned Rust toolchain
         run: |
@@ -118,7 +118,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Verifies that the *catalog* is honest: every entry's `sha256` and
       # `size_bytes` are compared against HuggingFace's `lfs.oid`/`lfs.size` at
@@ -167,7 +167,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install pinned Rust toolchain
         run: |
@@ -189,7 +189,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install pinned Rust toolchain
         run: |
@@ -243,7 +243,7 @@ jobs:
       ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # A download failure fails the job rather than warning past it. Unlike the
       # advisory database above — where an outage teaches nothing about our
@@ -403,7 +403,7 @@ jobs:
     # read-only on a public repository regardless.
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # PyYAML because BR-3 wants a real parse: a hand-rolled subset reader for
       # `jobs:` and `strategy.matrix` is the "works now, fails silently later"
