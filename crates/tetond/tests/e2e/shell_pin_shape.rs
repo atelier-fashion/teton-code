@@ -374,7 +374,9 @@ fn a_pin_carries_the_class_that_refused_and_no_command_bytes() {
     let provider = MockProvider::start(
         vec![MockResponse::ok(openai_turn(
             "Listing one thing.",
-            Some(("c1", "shell", r#"{"command":"ls 'ZQX9MARKER'"}"#)),
+            // A span holding a quote of the other kind: not a simple literal
+            // (BUG-236), so the `Quote` class still refuses it.
+            Some(("c1", "shell", r#"{"command":"ls \"ZQX9MARKER's\""}"#)),
             120,
             20,
         ))],

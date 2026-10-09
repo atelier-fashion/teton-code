@@ -2485,6 +2485,14 @@ mod tests {
     /// account — and the second 931-byte cut to every scanned route — is
     /// `egress::redact`'s twin of this paragraph.
     ///
+    /// **Recorded headroom at BUG-236:** `worst` **19,002**, `spent`
+    /// **25,350**, margin **250**, down 5 from 255, with the overhead unmoved
+    /// at 25 KiB, the floor unmoved at 48 and this shape still the looser of
+    /// the two by 47 B. Both shapes pay the same 5: the `shell` tool's reach
+    /// contract gains "and plain quotes are fine" (414 → 419 bytes, one under
+    /// ADR-620-5's ceiling). The twin paragraph is on
+    /// `egress::redact::REDACT_BODY_OVERHEAD_BYTES`.
+    ///
     /// **Mutations run for REQ-623** (2026-10-07, each reverted by edit):
     /// dropping the `agent` registration → red at this sweep's `- agent: `
     /// self-check; the overhead back at `24 * 1024` → red at the first

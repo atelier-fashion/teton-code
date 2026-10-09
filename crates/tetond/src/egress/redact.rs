@@ -682,6 +682,15 @@ pub(crate) const REDACT_ESCAPING_DIVISOR: usize = 10;
 /// claim (the bound back at 183,334), and the three derived-literal pins named
 /// above.
 ///
+/// **BUG-236 spends 5 bytes of margin and does NOT move this constant.** The
+/// `shell` tool's reach contract (`SHELL_REACH_CONTRACT`, resident in every
+/// remote turn's system prompt) gains "and plain quotes are fine" and drops
+/// "Quotes," from its pinning list — 414 → **419** bytes, under ADR-620-5's
+/// 420 ceiling by one. Margin 208 → **203** ([`RECORDED_PROMPT_MARGIN_BYTES`])
+/// and 255 → **250** on the web-enabled twin, the gap still 47. 155 bytes of
+/// usable room above the 48-byte floor. Re-measured, not reasoned: both sweeps
+/// went red by exactly −5 and were moved in the same diff.
+///
 /// `pub(crate)` because the *other* prompt shape has to clear it too and cannot
 /// be built from here: with `[web] tier` above `off` the system prompt carries
 /// the web tool's docs instead of REQ-563's BR-6 opt-in clause, and building
@@ -770,13 +779,17 @@ pub(crate) const MIN_PROMPT_HEADROOM_BYTES: usize = 48;
 /// The ledger line, and the second 931 it cost every scanned route, are on
 /// [`REDACT_BODY_OVERHEAD_BYTES`].
 ///
+/// BUG-236 leaves **203**, 155 usable: 5 bytes for the shell reach contract to
+/// say plain quotes are fine. The ledger line is on
+/// [`REDACT_BODY_OVERHEAD_BYTES`].
+///
 /// # Updating it
 ///
 /// Re-measure, do not reason — that correction is what reasoning about it cost
 /// last time. Add a ledger line to [`REDACT_BODY_OVERHEAD_BYTES`] saying which
 /// REQ spent the bytes, then move this number in the same diff.
 #[cfg(test)]
-pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 208;
+pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 203;
 
 /// The same pin for the **web-enabled** prompt shape measured by
 /// `harness::tools::web::tests::the_web_tool_docs_clear_the_outbound_body_overhead`.
@@ -788,7 +801,7 @@ pub(crate) const RECORDED_PROMPT_MARGIN_BYTES: usize = 208;
 /// holds the budget vocabulary, so the two shapes cannot come to disagree about
 /// which constant they are measuring against.
 #[cfg(test)]
-pub(crate) const RECORDED_WEB_PROMPT_MARGIN_BYTES: usize = 255;
+pub(crate) const RECORDED_WEB_PROMPT_MARGIN_BYTES: usize = 250;
 
 /// The gap between the two recorded margins, pinned (REQ-617).
 ///

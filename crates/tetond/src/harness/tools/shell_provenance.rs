@@ -158,6 +158,44 @@
 //! read the root, and `cat missing | head` still walks in its *first* segment,
 //! on `cat missing`. That is BR-4's stated limit rather than a gap.
 //!
+//! # The quoted-literal widening: a plain quote is the word it wraps (BUG-236)
+//!
+//! [`UNMODELLED`] refuses every command containing `'` or `"`, and that rule
+//! was the right one for quoting in general — a backslash, a `$`, a nested
+//! quote each change what `sh` does in ways a whitespace tokenizer cannot
+//! follow. It was the wrong one for the shape a model writes most: on
+//! 2026-10-08 three of the four children an `/analyze` turn fanned out each
+//! ran a quoted pattern — `find … -name "*.toml"`, `grep -rnE '…' …` — within
+//! fifteen seconds, each pinned the session, and the parent's typed skill was
+//! refused at the reroute (BUG-236). Every earlier `/analyze` incident
+//! (BUG-214, BUG-227) had pinned on a quote too (LESSON-668).
+//!
+//! So [`classify_with_budget`] now runs
+//! [`super::shell_quotes::lift_quoted_literals`] **before** the redirect
+//! strip, the unmodelled scan and the split (step 0). It lifts exactly one
+//! shape — a **simple** span, `'X'` or `"X"` with `X` non-empty, not starting
+//! with `~`, and free of quotes, backtick, `$`, backslash and newline — into a
+//! placeholder the three REQ-614 stages read as one opaque word, and
+//! [`classify_segment`] expands the placeholder back to `X` before it reads
+//! anything: the `=` rule, the opaque table, the `find -exec` guard, the verb
+//! tables and `resolve_token` all see the word `sh` hands the program. That
+//! is why the widening adds no reach: `cat ".env"` names `.env` and is the
+//! `BoundaryTouch` it always was, `"-exec"` is `-exec`, `"python3"` is opaque,
+//! `"IFS=:" ls` is refused on its `=`, and a span that names no existing file
+//! (`"*.toml"`) contributes nothing, exactly as an unquoted non-path does.
+//!
+//! The soundness argument is the lift's fallback, not its parser: a span that
+//! is not simple keeps its opening quote in the residue, so a command can only
+//! reach `Rooted` when **every** quote it carried was half of a simple pair —
+//! and for that case the lifted spans are exactly the spans `sh`'s lexer reads
+//! (that module's docs). Every other quote lands on the `Quote` class with the
+//! sentence it always drew. A command carrying the placeholder character
+//! itself is refused before anything reads it ([`RESERVED_CHARACTER_REASON`]).
+//!
+//! Not widened, on purpose: `--include='*.rs'` is still refused, on the `=`
+//! rule rather than the quote — that rule is also what keeps `--file=.env`
+//! from being read as a flag, and relaxing it is a different decision.
+//!
 //! # The refusal names its class (REQ-620 BR-6)
 //!
 //! The [`UNMODELLED`] scan used to answer one sentence — "the command uses
@@ -249,6 +287,28 @@
 //! `wc --files0-from -` row. `grep`'s long options survive that mutation
 //! through the per-word arm, so the guard's own coverage is exactly the filter
 //! rows.
+//!
+//! BUG-236's lift was mutated four ways against `cargo test -p tetond --lib`
+//! (run 2026-10-08, each reverted by edit). *(a)* `shell_quotes::is_simple`
+//! accepting `$` → **5** red: the lift's own table, this module's
+//! [`tests::a_span_that_could_expand_is_still_refused_on_its_quote`] and
+//! [`tests::the_lift_table_rows_classify_as_their_residue_says`], and REQ-620's
+//! [`tests::every_other_redirect_stays_unmodelled`] and
+//! [`tests::the_redirect_differential_table`] on their `> "$f"` rows — the
+//! older suites holding the new lift to the old answer, which is the coverage
+//! one wants from them. *(b)* [`classify_segment`] reading the residue words
+//! raw instead of expanding them → **2** red:
+//! [`tests::simple_quoted_literals_are_rooted_when_the_unquoted_word_would_be`]
+//! (the `cat ".env"` touch is lost) and
+//! [`tests::a_quoted_word_cannot_launder_its_program_or_its_path`] (`"-exec"`
+//! and `"python3"` pass). *(c)* the reserved-character guard dropped from
+//! `lift_quoted_literals` → **2** red: the lift's
+//! `a_command_carrying_the_placeholder_is_refused` and this module's
+//! [`tests::a_forged_placeholder_is_refused_not_expanded`]. *(d)* an empty
+//! span accepted → **3** red: the lift's table and the two BUG-236 tests
+//! named under *(a)*. Nothing outside those suites moved under any of the
+//! four, and no mutation reddened fewer than two suites — the lift and the
+//! classifier each hold the other to the rule.
 
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
@@ -260,6 +320,7 @@ use teton_core::entities::PrivacyBoundary;
 use teton_core::provenance_id::{ProvenanceError, ProvenanceId};
 use teton_protocol::methods::RootKind;
 
+use super::shell_quotes::{expand, lift_quoted_literals};
 use super::shell_syntax::strip_null_redirects;
 use super::walk::{self, WalkBudget, WalkPolicy};
 use super::{canonical_through_existing_ancestor, lexical_normalize, under_denied_prefix};
@@ -421,6 +482,10 @@ struct Scope<'a> {
     /// `None` when `$HOME` is unset or unresolvable: a `~/` token is then
     /// unresolvable and no home-relative spelling is tried.
     home: Option<&'a Path>,
+    /// The simple quoted spans [`lift_quoted_literals`] took out of the
+    /// command, which [`classify_segment`] puts back into each word before it
+    /// reads it (BUG-236).
+    literals: &'a [String],
 }
 
 /// What the tokens seen so far proved about a boundary — the state that used to
@@ -556,9 +621,26 @@ const GIT_NAME_ONLY: &[&str] = &[
 /// honest. A grammar that tried to *handle* quoting would be a half-written
 /// shell lexer, which is how a matcher starts guessing (the argument
 /// [`super::shell::is_env_assignment`] already makes, one step further).
+///
+/// Since BUG-236 the two quote characters reach this scan only when
+/// [`super::shell_quotes::lift_quoted_literals`] left them standing — a span
+/// that could expand, an unterminated quote, an empty one. A *simple* quoted
+/// span has been replaced by a placeholder before the scan runs, which is not
+/// a lexer: it reads exactly one shape, pairs each quote with the next of its
+/// kind, and refuses the whole command the moment any quote is not half of
+/// such a pair (see that module's docs for the soundness argument).
 const UNMODELLED: &[char] = &[
     '\'', '"', '`', '$', '\\', '>', '<', '{', '}', '!', '*', '?', '[',
 ];
+
+/// The refusal for a command that carries one of
+/// [`super::shell_quotes`]'s placeholder characters itself (BUG-236).
+///
+/// Not an [`UnmodelledSyntax`] class: no shell syntax was found, a byte that
+/// has no meaning to `sh` and a private one to this grammar was. Content-free
+/// like every other reason here, and a `&'static str` for the same reason.
+const RESERVED_CHARACTER_REASON: &str =
+    "the command carries a reserved character this classifier does not model";
 
 /// Which of [`UNMODELLED`]'s shapes refused a command (REQ-620 BR-6).
 ///
@@ -807,13 +889,28 @@ fn classify_with_budget(
         return Verdict::unknown("the session root is not a project");
     }
 
-    // REQ-620 ADR-620-2, steps 1 and 2. The strip is **first**, and the order
-    // is the whole correctness argument: stripping after the unmodelled scan
-    // cannot work (the scan refuses on `>`), and stripping after the split
-    // cannot work (the `&` in `2>&1` is a separator, so a splitter that saw it
-    // first would hand `2>` to `classify_segment` as a verb and `1` to the next
-    // segment as one). Everything past this line reads the residue and is
-    // exactly the REQ-614 grammar.
+    // BUG-236, step 0: lift every simple quoted span out of the command before
+    // anything else reads a byte of it. The lift goes **ahead of** the redirect
+    // strip, the unmodelled scan and the split for one reason each: a quoted
+    // `"2>&1"` is an argument and must not be stripped as a redirect, a quoted
+    // `"*.toml"` is a literal and must not be refused as a glob, and a quoted
+    // `"a|b"` is one word and must not be split into two segments. A command
+    // that carries the placeholder character itself has no honest residue and
+    // is refused here.
+    let Some(lifted) = lift_quoted_literals(command) else {
+        return Verdict::unknown(RESERVED_CHARACTER_REASON);
+    };
+    let command = lifted.residue.as_str();
+
+    // REQ-620 ADR-620-2, steps 1 and 2. The strip is **first** among the
+    // REQ-614 stages, and the order is the whole correctness argument:
+    // stripping after the unmodelled scan cannot work (the scan refuses on
+    // `>`), and stripping after the split cannot work (the `&` in `2>&1` is a
+    // separator, so a splitter that saw it first would hand `2>` to
+    // `classify_segment` as a verb and `1` to the next segment as one).
+    // Everything past this line reads the residue and is exactly the REQ-614
+    // grammar — over words whose quoted spans are placeholders until
+    // `classify_segment` expands them.
     let stripped = strip_null_redirects(command);
     let command = stripped.residue.as_str();
 
@@ -837,6 +934,7 @@ fn classify_with_budget(
         denied_prefixes: &denied_prefixes,
         budget,
         home: home.as_deref(),
+        literals: &lifted.literals,
     };
     let mut sources = BTreeSet::new();
     let mut evidence = BoundaryEvidence::default();
@@ -1077,14 +1175,31 @@ fn classify_segment(
     sources: &mut BTreeSet<ProvenanceId>,
     evidence: &mut BoundaryEvidence,
 ) -> SegmentVerdict {
-    let mut words = segment.split_whitespace();
+    // BUG-236: the words `sh` hands the program, with every lifted quoted span
+    // put back. **Every** check below reads the expanded word — the `=` rule,
+    // the opaque table, the `find -exec` guard, the verb tables and path
+    // resolution — because each is a statement about what the program
+    // receives, and a quote changes none of that: `"-exec"` is `-exec`,
+    // `"python3"` is `python3`, `".env"` is `.env`. A placeholder this function
+    // cannot read is not a shape the lift produces and is refused, not skipped.
+    let Some(expanded) = segment
+        .split_whitespace()
+        .map(|word| expand(word, scope.literals))
+        .collect::<Option<Vec<String>>>()
+    else {
+        return SegmentVerdict::Unknown(RESERVED_CHARACTER_REASON);
+    };
+    let mut words = expanded.iter().map(String::as_str);
     let Some(raw_verb) = words.next() else {
         return SegmentVerdict::Rooted;
     };
     // An `=` anywhere in a word is an environment assignment (or something
     // stranger). Either way it can change what the command does — `IFS=`,
-    // `LD_PRELOAD=` — and modelling that is out of this grammar's reach.
-    if segment.split_whitespace().any(|w| w.contains('=')) {
+    // `LD_PRELOAD=` — and modelling that is out of this grammar's reach. Read
+    // on the expanded word, so `"IFS=:" ls` is refused exactly as `IFS=: ls`
+    // is: `sh` would run a program named `IFS=:` rather than assign, and
+    // refusing is the direction that cannot leak.
+    if expanded.iter().any(|w| w.contains('=')) {
         return SegmentVerdict::Unknown("the command sets an environment variable");
     }
     // The basename, and **only** for the denylist below. A verb naming a path
@@ -1690,6 +1805,12 @@ mod tests {
             // `|` reads the previous segment's output, not the root.
             "cat .adlc/context/architecture.md 2>/dev/null || echo none",
             "ls .adlc/partials/ | head",
+            // BUG-236's flipped rows: the toolkit's *original* preamble shapes,
+            // each refused on its quote before this fix. The quoted text is a
+            // simple literal — no `$`, no backslash, no inner quote — so the
+            // lift takes it out and the rest is the grammar above.
+            r#"test -s .adlc/ETHOS.md && cat .adlc/ETHOS.md || echo "No ethos found — run /init to vendor .adlc/ETHOS.md""#,
+            r#"cat .adlc/context/architecture.md 2>/dev/null || echo "No architecture context found""#,
         ] {
             let v = verdict(&root, rewritten);
             assert_eq!(
@@ -1700,21 +1821,15 @@ mod tests {
                 v.reason
             );
         }
-        // The old shapes, still `Unknown` — and the first three **for the
-        // quote**, which is the assertion the Phase-5 verify added. Each of
-        // them also carries a `2>/dev/null` or a glob, so a table asserting
-        // only `Unknown` would have gone on passing had REQ-620's strip
-        // wrongly cleared them: the reason is what says the quote is what is
-        // still refusing the command.
+        // The old shapes, still `Unknown` — and the first **for the quote**,
+        // which is the assertion the Phase-5 verify added. It also carries a
+        // `2>/dev/null` and a glob, so a table asserting only `Unknown` would
+        // have gone on passing had REQ-620's strip wrongly cleared it: the
+        // reason is what says the quote is what is still refusing the command.
+        // Two sibling rows moved to the `Rooted` table above at BUG-236; this
+        // one stays because its span holds a backslash, which is not a simple
+        // literal.
         for (old, class) in [
-            (
-                r#"test -s .adlc/ETHOS.md && cat .adlc/ETHOS.md || echo "No ethos found — run /init to vendor .adlc/ETHOS.md""#,
-                Some(UnmodelledSyntax::Quote),
-            ),
-            (
-                r#"cat .adlc/context/architecture.md 2>/dev/null || echo "No architecture context found""#,
-                Some(UnmodelledSyntax::Quote),
-            ),
             (
                 r#"grep -rl 'status: draft\|status: approved' .adlc/specs/*/requirement.md 2>/dev/null | head -20 || echo "No active specs""#,
                 Some(UnmodelledSyntax::Quote),
@@ -1739,6 +1854,285 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **BUG-236: a simple quoted literal is the word `sh` hands the program,
+    /// and the classifier reads that word.**
+    ///
+    /// The three commands that pinned the 2026-10-08 `/analyze` fan-out, each
+    /// `Rooted` now (the `xargs` one stays opaque on its verb, as it should),
+    /// beside the shapes around them: whitespace, separators and shell syntax
+    /// inside a span are literal, a span glued to unquoted text is one word,
+    /// and a quoted path is the same path — so it is in `sources` when it is a
+    /// file and it is a touch when it is protected.
+    ///
+    /// Each `Rooted` row is also asserted **differentially** against its
+    /// unquoted spelling where one exists: the quotes change nothing `sh`
+    /// does, so they must change nothing here — same kind, same sources.
+    ///
+    /// **Mutation (run, red, reverted):** skip the expansion in
+    /// [`classify_segment`] (read the residue words raw) — the `cat ".env"`
+    /// rows red (a placeholder resolves to nothing, so the touch is lost), and
+    /// `a_quoted_word_cannot_launder_its_program_or_its_path` reds with them.
+    #[test]
+    fn simple_quoted_literals_are_rooted_when_the_unquoted_word_would_be() {
+        let root = project_root("quoted-literals");
+        std::fs::write(root.join(".env"), "SECRET=1\n").unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\n").unwrap();
+
+        let main_rs = ProvenanceId::from_resolved(&root, &root.join("src/main.rs")).unwrap();
+        let env = ProvenanceId::from_resolved(&root, &root.join(".env")).unwrap();
+        let cargo_toml = ProvenanceId::from_resolved(&root, &root.join("Cargo.toml")).unwrap();
+
+        // (quoted, unquoted twin or None, expected sources)
+        let rooted: &[(&str, Option<&str>, &[&ProvenanceId])] = &[
+            (
+                r#"find src -maxdepth 2 -name "*.toml" | head -20 && echo --- && ls src 2>/dev/null"#,
+                None,
+                &[],
+            ),
+            (
+                "grep -rn 'fn main' src/main.rs",
+                Some("grep -rn fn.main src/main.rs"),
+                &[&main_rs],
+            ),
+            (
+                r#"echo "No ethos found — run /init to vendor .adlc/ETHOS.md""#,
+                None,
+                &[],
+            ),
+            // The whole of `a && cat .env` is one argument to `echo`; no `cat`
+            // runs and `.env` is not a path this command names.
+            (r#"echo "a && cat .env""#, None, &[]),
+            (r#"grep "a|b" src/main.rs"#, None, &[&main_rs]),
+            (
+                r#"test -s "src/main.rs" && cat 'src/main.rs'"#,
+                Some("test -s src/main.rs && cat src/main.rs"),
+                &[&main_rs],
+            ),
+            (r#"cat src/"main.rs""#, Some("cat src/main.rs"), &[&main_rs]),
+            (
+                r#"wc -l "src/main.rs""#,
+                Some("wc -l src/main.rs"),
+                &[&main_rs],
+            ),
+            // `ls` of a file lists its name and records it, as the unquoted
+            // form does.
+            (
+                r#"ls "src" "Cargo.toml""#,
+                Some("ls src Cargo.toml"),
+                &[&cargo_toml],
+            ),
+            (
+                r#"git log --grep "fix" -3"#,
+                Some("git log --grep fix -3"),
+                &[],
+            ),
+        ];
+        for (quoted, twin, expected) in rooted {
+            let v = verdict(&root, quoted);
+            assert_eq!(
+                v.kind,
+                VerdictKind::Rooted,
+                "{quoted:?} should be Rooted, got {:?} ({})",
+                v.kind,
+                v.reason
+            );
+            let expected: BTreeSet<ProvenanceId> =
+                expected.iter().map(|id| (*id).clone()).collect();
+            assert_eq!(v.sources, expected, "{quoted:?}: sources");
+            if let Some(twin) = twin {
+                let t = verdict(&root, twin);
+                assert_eq!(t.kind, v.kind, "{quoted:?} and {twin:?} must agree on kind");
+                assert_eq!(
+                    t.sources, v.sources,
+                    "{quoted:?} and {twin:?} must agree on sources"
+                );
+            }
+        }
+
+        // A quoted protected path is the same protected path.
+        for touch in [
+            r#"cat ".env""#,
+            "cat '.env'",
+            r#"cat .en"v""#,
+            r#"grep SECRET ".env""#,
+            r#"test -s ".env" && echo present"#,
+        ] {
+            let v = verdict(&root, touch);
+            assert_eq!(
+                v.kind,
+                VerdictKind::BoundaryTouch,
+                "{touch:?} names a protected file through its quotes ({})",
+                v.reason
+            );
+            assert!(v.sources.contains(&env), "{touch:?}: the touch is nameable");
+        }
+
+        // A quoted literal that names no existing file contributes nothing, so
+        // a content verb given only that falls back to its default source —
+        // the root, which holds `.env` — exactly as the unquoted form would.
+        let v = verdict(&root, r#"cat "*.env""#);
+        assert_eq!(v.kind, VerdictKind::Unknown, "{}", v.reason);
+        assert_eq!(
+            v.reason,
+            "the command reads the root and it could hold a protected file"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **BUG-236: quoting a word cannot change which program runs or which
+    /// path is read**, because every check runs on the expanded word.
+    ///
+    /// **Mutation (run, red, reverted):** expand only the path tokens and
+    /// read the verb and flags raw — the `"-exec"` and `"python3"` rows red.
+    #[test]
+    fn a_quoted_word_cannot_launder_its_program_or_its_path() {
+        let root = project_root("quoted-launder");
+        std::fs::write(root.join(".env"), "SECRET=1\n").unwrap();
+        for (command, reason) in [
+            (r#"find . "-exec" cat"#, "the command runs `find -exec`"),
+            (
+                r#""python3" -c pass"#,
+                "the command runs an interpreter, build tool or network client",
+            ),
+            (
+                r#"ls | "xargs" cat"#,
+                "the command runs an interpreter, build tool or network client",
+            ),
+            (r#""IFS=:" ls"#, "the command sets an environment variable"),
+            (
+                r#"ls "--include=*.rs""#,
+                "the command sets an environment variable",
+            ),
+            (r#""bin/ls" src"#, "the command names its program by path"),
+            (
+                r#""base64" src/main.rs"#,
+                "the command's verb is not one this classifier recognises",
+            ),
+        ] {
+            let v = verdict(&root, command);
+            assert_eq!(v.kind, VerdictKind::Unknown, "{command:?} ({})", v.reason);
+            assert_eq!(v.reason, reason, "{command:?}");
+        }
+        // And a quoted *verb* that is a content reader still reads what it
+        // names: `"cat" .env` runs `cat` on `.env`.
+        for command in [r#""cat" .env"#, r#"ls src | "cat" .env"#] {
+            let v = verdict(&root, command);
+            assert_eq!(
+                v.kind,
+                VerdictKind::BoundaryTouch,
+                "{command:?} reads a protected file whatever its verb is wrapped in ({})",
+                v.reason
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **BUG-236: a span that could expand, or that this grammar will not
+    /// read, is still refused on its quote** — the pre-BUG-236 answer, with the
+    /// pre-BUG-236 sentence, so the pin a user sees for `"$HOME"` is the same
+    /// one it always was.
+    ///
+    /// The `~` row is the one that is not about expansion: `"~/.ssh/id_rsa"`
+    /// is a literal to `sh` (a quoted tilde does not expand) and names
+    /// `<root>/~/.ssh/id_rsa`, which this grammar's `resolve_token` would read
+    /// as the user's home. Declining the span refuses rather than guesses
+    /// either way.
+    ///
+    /// **Mutation (run, red, reverted):** make `shell_quotes::is_simple`
+    /// accept `$` — the `"$HOME"` row reds here, and the lift's own table reds
+    /// with it.
+    #[test]
+    fn a_span_that_could_expand_is_still_refused_on_its_quote() {
+        let root = project_root("quoted-refused");
+        let home = fixture_home("quoted-refused");
+        for command in [
+            r#"echo "$HOME""#,
+            r#"echo "$(ls)""#,
+            r#"echo "`ls`""#,
+            r#"echo "a\"b""#,
+            "echo 'a\\b'",
+            r#"echo "it's""#,
+            r#"echo """#,
+            "echo ''",
+            r#"cat "~/.ssh/id_rsa""#,
+            "cat '~/.ssh/id_rsa'",
+            "ls 'a",
+            r#"echo "x"'"#,
+            "echo 'a\nb'",
+        ] {
+            let v = verdict_with_home(&root, &home, command);
+            assert_eq!(v.kind, VerdictKind::Unknown, "{command:?} ({})", v.reason);
+            assert_eq!(
+                v.reason,
+                UnmodelledSyntax::Quote.reason(),
+                "{command:?} is refused on its quote, not on what the quote holds"
+            );
+            assert!(
+                !v.out_of_root_touch,
+                "{command:?}: a declined span is not read as a path, so it touches nothing"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// **BUG-236: a command that carries the placeholder character itself is
+    /// refused, never expanded.** The only way to reach a literal the command
+    /// did not quote would be to forge an index; the guard sits over the whole
+    /// command, spans included.
+    ///
+    /// **Mutation (run, red, reverted):** drop the `contains` guard at the top
+    /// of `shell_quotes::lift_quoted_literals` — the first row reds here (the
+    /// forged placeholder expands to nothing and `ls` of nothing is `Rooted`),
+    /// and the lift's own `a_command_carrying_the_placeholder_is_refused` reds
+    /// with it.
+    #[test]
+    fn a_forged_placeholder_is_refused_not_expanded() {
+        use super::super::shell_quotes::{LITERAL_CLOSE, LITERAL_OPEN};
+        let root = project_root("quoted-forged");
+        for command in [
+            format!("ls {LITERAL_OPEN}0{LITERAL_CLOSE}"),
+            format!("cat '{LITERAL_OPEN}'"),
+            format!("echo {LITERAL_CLOSE}"),
+        ] {
+            let v = verdict(&root, &command);
+            assert_eq!(v.kind, VerdictKind::Unknown, "{command:?} ({})", v.reason);
+            assert_eq!(v.reason, RESERVED_CHARACTER_REASON, "{command:?}");
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The lift's residue table, through the classifier's own entry point:
+    /// every row that lifts cleanly and names only in-root, unprotected paths
+    /// is `Rooted`, and every row that leaves a quote standing is `Unknown` on
+    /// the quote. One table (`shell_quotes::LIFT_ROWS`), two suites.
+    #[test]
+    fn the_lift_table_rows_classify_as_their_residue_says() {
+        use super::super::shell_quotes::LIFT_ROWS;
+        let root = project_root("lift-rows");
+        std::fs::write(root.join(".env"), "SECRET=1\n").unwrap();
+        for (command, residue, _) in LIFT_ROWS {
+            let v = verdict(&root, command);
+            let quote_left = residue.contains(['\'', '"']);
+            if quote_left {
+                assert_eq!(
+                    v.reason,
+                    UnmodelledSyntax::Quote.reason(),
+                    "{command:?} leaves a quote in its residue and is refused on it ({:?})",
+                    v.kind
+                );
+            } else {
+                assert_ne!(
+                    v.reason,
+                    UnmodelledSyntax::Quote.reason(),
+                    "{command:?} lifted every quote, so whatever it is refused on is not a quote"
+                );
+            }
+        }
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// BR-1, benign path. The legitimate actor — the four commands AC-12 scripts
@@ -3010,7 +3404,9 @@ mod tests {
     /// precedence is asserted separately below where a mutation to
     /// [`UNMODELLED_ORDER`] can be seen to move it.
     const ONE_PER_CLASS: &[(&str, UnmodelledSyntax)] = &[
-        ("ls 'ZQX9'", UnmodelledSyntax::Quote),
+        // A span holding a quote of the other kind: not a simple literal
+        // (BUG-236), so the class still refuses it.
+        ("ls \"ZQX9's\"", UnmodelledSyntax::Quote),
         ("ls $(echo ZQX9)", UnmodelledSyntax::Substitution),
         ("ls $ZQX9", UnmodelledSyntax::Variable),
         ("ls > ZQX9", UnmodelledSyntax::Redirect),
@@ -3030,7 +3426,7 @@ mod tests {
     /// replaced left `Brace`/`Escape` free to swap with nothing going red).
     const ADJACENT_PAIRS: &[(&str, UnmodelledSyntax)] = &[
         // Quote > Substitution
-        ("echo \"x\" `y`", UnmodelledSyntax::Quote),
+        ("echo \"x's\" `y`", UnmodelledSyntax::Quote),
         // Substitution > Variable
         ("echo $(x) $y", UnmodelledSyntax::Substitution),
         // Variable > Redirect
@@ -3058,7 +3454,8 @@ mod tests {
     ///    miniature — a reason that does not tell the reader which byte to fix.
     /// 3. **Precedence.** `ls *.rs 'ZQX9'` holds a glob *before* a quote in the
     ///    text and reports the quote, because [`UNMODELLED_ORDER`] decides and
-    ///    the command's byte order does not. The `$…>` row proves the order is
+    ///    the command's byte order does not. (Every quote in this test holds an
+    ///    apostrophe, so none is a simple literal BUG-236 would lift.) The `$…>` row proves the order is
     ///    read past its first entry.
     /// 4. **Content-freeness.** No sentence contains [`COMMAND_MARKER`], and no
     ///    sentence contains the command that produced it. The `&'static str`
@@ -3124,7 +3521,7 @@ mod tests {
 
         // 3. Precedence: the order decides, not the command's byte order.
         assert_eq!(
-            verdict(&root, "ls *.rs 'ZQX9'").reason,
+            verdict(&root, "ls *.rs \"ZQX9's\"").reason,
             UnmodelledSyntax::Quote.reason(),
             "a command with a quote and a glob reports the quote"
         );

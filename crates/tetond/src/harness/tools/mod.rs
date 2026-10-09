@@ -57,6 +57,7 @@ pub mod projects;
 pub mod read;
 pub mod shell;
 pub mod shell_provenance;
+pub mod shell_quotes;
 pub mod shell_syntax;
 pub mod skill;
 pub mod walk;
