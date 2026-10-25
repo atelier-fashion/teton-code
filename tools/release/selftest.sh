@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Standing regression suite for the release scripts in this directory, plus
-# site/render.sh. CI runs it as, exactly:
+# Standing regression suite for the release scripts in this directory. CI runs
+# it as, exactly:
 #
 #     bash tools/release/selftest.sh
 #
@@ -20,9 +20,6 @@
 #                   report "no version found".
 #   render-formula  both input modes, and every refusal: unfilled placeholder,
 #                   missing sha, non-hex sha, prerelease and +build versions.
-#   site/render     the same, against an isolated copy of the tree, so a case
-#                   that deliberately renders a broken page cannot touch the
-#                   real site/dist.
 #   changelog       changelog-section.sh — the topmost changelog section and
 #                   ONLY it, the several shapes that must publish nothing
 #                   without failing a release, and the release.yml wiring that
@@ -96,8 +93,6 @@ VERIFY_SIGNATURE="$script_dir/verify-signature.sh"
 VERIFY_ATTESTATION="$script_dir/verify-attestation.sh"
 VERIFY_BATCH="$script_dir/verify-attestations-batch.sh"
 CHANGELOG_SECTION="$script_dir/changelog-section.sh"
-SITE_RENDER="$repo_root/site/render.sh"
-SITE_TEMPLATE="$repo_root/site/index.html"
 FORMULA_TEMPLATE="$repo_root/packaging/homebrew/teton.rb.tmpl"
 RUNBOOK="$repo_root/docs/release-runbook.md"
 README="$repo_root/README.md"
@@ -111,7 +106,7 @@ RELEASE_WORKFLOW="$repo_root/.github/workflows/release.yml"
 # loop that already skips a missing one by name.
 for required in "$LIB" "$VERIFY" "$PACKAGE" "$RENDER_FORMULA" "$SMOKE" \
     "$VERIFY_SIGNATURE" "$VERIFY_ATTESTATION" "$VERIFY_BATCH" \
-    "$CHANGELOG_SECTION" "$SITE_RENDER" "$SITE_TEMPLATE" "$FORMULA_TEMPLATE" \
+    "$CHANGELOG_SECTION" "$FORMULA_TEMPLATE" \
     "$RELEASE_WORKFLOW"; do
     if [ ! -f "$required" ]; then
         echo "selftest: $required is missing — nothing was tested." >&2
@@ -292,7 +287,7 @@ skip() {
 group "syntax (bash -n)"
 for s in "$LIB" "$VERIFY" "$PACKAGE" "$RENDER_FORMULA" "$SMOKE" \
     "$VERIFY_SIGNATURE" "$VERIFY_ATTESTATION" "$VERIFY_BATCH" \
-    "$CHANGELOG_SECTION" "$SITE_RENDER" "${BASH_SOURCE[0]}"; do
+    "$CHANGELOG_SECTION" "${BASH_SOURCE[0]}"; do
     expect_exit 0 "bash -n $(basename "$s")" bash -n "$s"
 done
 
@@ -438,97 +433,6 @@ expect_exit 75 "template not found -> 75 UNCHECKED" \
     --sha-aarch64-apple-darwin "$SHA_A" \
     --sha-x86_64-apple-darwin "$SHA_B" \
     --sha-x86_64-unknown-linux-gnu "$SHA_C"
-
-# --- site/render.sh --------------------------------------------------------
-#
-# Against COPIES: render.sh resolves its template and its output directory from
-# its own location, so running the repo's copy would write (and, in the
-# surviving-placeholder case, delete) the real site/dist/index.html.
-
-group "site/render.sh"
-
-site_ok="$work/site-ok"
-mkdir -p "$site_ok"
-cp "$SITE_RENDER" "$site_ok/render.sh"
-cp "$SITE_TEMPLATE" "$site_ok/index.html"
-
-expect_exit 0 "renders the real page template" bash "$site_ok/render.sh" 1.2.3
-assert "  ... the page was written" [ -s "$site_ok/dist/index.html" ]
-refute "  ... no {{placeholder}} survived" grep -Fq '{{' "$site_ok/dist/index.html"
-assert "  ... the version was stamped" grep -Fq 'v1.2.3' "$site_ok/dist/index.html"
-assert "  ... the default install command was stamped" \
-    grep -Fq 'brew install atelier-fashion/tap/teton' "$site_ok/dist/index.html"
-
-expect_exit 0 "accepts an explicit install command" \
-    bash "$site_ok/render.sh" v1.2.3 "brew install teton"
-assert "  ... and stamps it" grep -Fq 'brew install teton' "$site_ok/dist/index.html"
-
-# D-1: the landing page must not name a binary the formula does not install.
-# tetoncode.ai shipped "teton / tetond" for the whole life of v0.1.1 — the
-# daemon had been renamed to teton-code everywhere the rename swept, and the
-# page was the one surface nothing checked. The formula's bin.install line is
-# the owner (it is what lands in a user's PATH); the page is asserted against
-# it rather than against a list restated here.
-installed_bins="$(sed -nE 's|^[[:space:]]*bin\.install[[:space:]]+(.+)$|\1|p' \
-    "$FORMULA_TEMPLATE" | head -1 | tr -d '"' | tr ',' ' ')"
-if [ -z "$installed_bins" ]; then
-    report_fail "site/formula binary cross-check could not read bin.install" \
-        "from $FORMULA_TEMPLATE"
-else
-    for bin_name in $installed_bins; do
-        assert "the page names the installed binary '$bin_name'" \
-            grep -Fq "$bin_name" "$SITE_TEMPLATE"
-    done
-    # The negative half, and the one that would have caught the live bug: the
-    # page must not name a binary that no longer exists.
-    if grep -Fq "tetond" "$SITE_TEMPLATE"; then
-        report_fail "the page names 'tetond', which bin.install does not install" \
-            "$(grep -n 'tetond' "$SITE_TEMPLATE" | head -3)"
-    else
-        report_pass "the page names no binary outside bin.install"
-    fi
-fi
-
-# D-2: the published install command and render.sh's default must be the same
-# string. deploy-site.yml passes the value explicitly; render.sh owns it. Two
-# copies of one fact is exactly the shape that broke v0.1.1's log paths, so the
-# pair is pinned here rather than trusted.
-wf_cmd="$(sed -nE 's|^[[:space:]]*INSTALL_COMMAND:[[:space:]]*(.+)$|\1|p' \
-    "$repo_root/.github/workflows/deploy-site.yml" | head -1)"
-default_cmd="$(sed -nE "s|^readonly DEFAULT_INSTALL_COMMAND='(.+)'$|\\1|p" \
-    "$SITE_RENDER" | head -1)"
-if [ -z "$wf_cmd" ] || [ -z "$default_cmd" ]; then
-    report_fail "install command cross-check could not read both copies" \
-        "workflow='$wf_cmd' render.sh='$default_cmd'"
-else
-    assert "the published install command matches render.sh's default" \
-        [ "$wf_cmd" = "$default_cmd" ]
-fi
-
-expect_exit 64 "no argument -> 64" bash "$site_ok/render.sh"
-expect_exit 64 "a malformed version -> 64" bash "$site_ok/render.sh" "not-a-version"
-expect_exit 64 "an empty version -> 64" bash "$site_ok/render.sh" ""
-expect_exit 64 "a prerelease version -> 64, agreeing with the release scripts" \
-    bash "$site_ok/render.sh" 1.2.3-rc.1
-expect_exit 64 "a +build version -> 64, agreeing with the release scripts" \
-    bash "$site_ok/render.sh" 1.2.3+build.7
-expect_exit 64 "an install command carrying markup -> 64" \
-    bash "$site_ok/render.sh" 1.2.3 'brew install <script>alert(1)</script>'
-
-site_missing="$work/site-missing"
-mkdir -p "$site_missing"
-cp "$SITE_RENDER" "$site_missing/render.sh"
-expect_exit 75 "template not found -> 75 UNCHECKED, not 64" bash "$site_missing/render.sh" 1.2.3
-expect_output "  ... and says nothing was rendered" "nothing was rendered"
-
-site_drift="$work/site-drift"
-mkdir -p "$site_drift"
-cp "$SITE_RENDER" "$site_drift/render.sh"
-printf '<!DOCTYPE html>\n<html><body><p>v{{VERSION}} {{MYSTERY}}</p></body></html>\n' \
-    >"$site_drift/index.html"
-expect_exit 64 "a placeholder the script cannot fill -> 64" bash "$site_drift/render.sh" 1.2.3
-assert "  ... and the half-rendered page was deleted, not published" \
-    [ ! -e "$site_drift/dist/index.html" ]
 
 # --- smoke.sh, tested as a tester ------------------------------------------
 

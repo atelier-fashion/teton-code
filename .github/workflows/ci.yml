@@ -296,22 +296,22 @@ jobs:
           shellcheck --version
           actionlint -color -shellcheck shellcheck .github/workflows/*.yml
 
-      # The release and site pipelines are mostly shell, and it is shell that
+      # The release pipeline is mostly shell, and it is shell that
       # runs against a published release with no undo. `failglob` makes a
       # vanished directory a named error instead of shellcheck being handed a
       # literal '*' pattern.
-      - name: Lint the release + site shell scripts (shellcheck)
+      - name: Lint the release shell scripts (shellcheck)
         run: |
           set -euo pipefail
           shopt -s failglob
-          shellcheck tools/release/*.sh site/render.sh
+          shellcheck tools/release/*.sh
 
       # The self-test is the release tooling's own test suite (network-free,
       # cargo-free): it drives every script under tools/release/ through its
       # positive AND negative paths, including smoke.sh, so the exit-code
       # taxonomy the workflows branch on is verified rather than assumed.
       #
-      # This path is a contract. `release.yml`, `deploy-site.yml` and
+      # This path is a contract. `release.yml` and
       # docs/release-runbook.md all treat "the selftest is green" as the
       # standing evidence for the release scripts; do not rename it and do not
       # inline its logic here.

@@ -969,8 +969,10 @@ is where these artifacts already live and are updated.
   commit SHAs and by a configurable base URL (`HF_ENDPOINT`-style) that also
   serves firewalled/mirrored users and makes a future host move a config change
   rather than a release.
-- `models.tetoncode.ai` stays available as a fallback mirror if HF becomes a
-  real constraint.
+- ~~`models.tetoncode.ai` stays available as a fallback mirror if HF becomes a
+  real constraint.~~ The mirror was never built, and the `tetoncode.ai` site
+  and its GCP project were retired on 2026-10-25; a future mirror would need
+  new hosting. The configurable base URL above is the remaining escape hatch.
 
 **Alternatives rejected**: self-hosted CDN (control and stable URLs, but real
 bandwidth cost and ops burden for a pre-alpha with no users); bundling weights

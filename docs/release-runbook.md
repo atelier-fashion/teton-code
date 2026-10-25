@@ -16,10 +16,6 @@ to go stale:
 
 - [`docs/homebrew-tap-setup.md`](homebrew-tap-setup.md) — the
   `atelier-fashion/homebrew-tap` repository and the `HOMEBREW_TAP_TOKEN` secret.
-- [`docs/site-deploy-runbook.md`](site-deploy-runbook.md) — `tetoncode.ai`,
-  which this workflow **dispatches** after the tap bump succeeds. Live since
-  v0.1.5 (OQ-5 resolved 2026-08-01); a red `Deploy site` run is now a finding,
-  not the expected state.
 
 **The invariant this whole pipeline defends:** a green release run means the tap
 points at the release, the release's artifacts hash to the checksums published
@@ -38,7 +34,6 @@ LESSON-447).
 | 2 | **`tap-publish` environment** carries `HOMEBREW_TAP_TOKEN` (the environment copy; org-approved if required, repo-level copy retires per §11). Deployment rules: tags `v*.*.*` **+** branch `main` | **done** 2026-07-31 (`main` added 2026-08-01) | [homebrew-tap-setup.md §2](homebrew-tap-setup.md) | `bump-formula` (exits `75` without the token; the job never starts at all on a ref the rules refuse) |
 | 3 | **`release-signing` environment** carries secrets `MACOS_CERT_P12`, `MACOS_CERT_PASSWORD` and variable `APPLE_TEAM_ID`. Deployment rules: tags `v*.*.*` **+** branch `main` | **done** 2026-07-31 (`main` added 2026-08-01) | §10 below | the whole `build` matrix — it declares `environment: release-signing`, so nothing builds on a ref the rules refuse |
 | 4 | A dry run has gone green end to end | **outstanding** | §2 below | everything — do not skip |
-| 5 | GCP secrets for the site | **done** 2026-08-01 (OQ-5 resolved; first green deploy at v0.1.5) | [site-deploy-runbook.md §2](site-deploy-runbook.md) | `tetoncode.ai` only; a release is fine without them |
 
 Rows 2 and 3 are the two things a first-time operator otherwise discovers the
 hard way — as a `75` from a job that could not read a secret, or as a job that
@@ -51,11 +46,10 @@ The tap is intentionally empty — no `Formula/teton.rb` until the first bump
 writes one, and no `Formula/` directory either; `bump-formula` creates it. An
 empty tap is the correct pre-first-release state, not a missing step.
 
-Items 2, 3 and 5 were somebody's *access*, not somebody's afternoon: the tap
-token may need an organisation owner's approval, the signing secrets need the
-Apple Developer account holder (§10), and the site's GCP coordinates needed
-somebody with the Atelier GCP org. All three are in place; if any has to be
-re-established, start it before you want to release, not during.
+Items 2 and 3 are somebody's *access*, not somebody's afternoon: the tap
+token may need an organisation owner's approval, and the signing secrets need
+the Apple Developer account holder (§10). Both are in place; if either has to
+be re-established, start it before you want to release, not during.
 
 ---
 
@@ -184,12 +178,6 @@ that users' `brew install` may already have resolved.
 | `bump-formula` | macos-15 | Re-downloads the published assets and re-checks them against the published `checksums.txt`; renders `Formula/teton.rb`; asserts Homebrew resolves it at the tag; `brew style` + `brew audit`; fetches all three URLs; then — **before the push** — installs the rendered formula, runs `brew test` (AC-5) and `brew services start` → `doctor` → `restart` → `stop` (AC-6); only then commits and pushes the tap | any of the above. Nothing here is `continue-on-error` — BR-4. The install/service gates run pre-push deliberately: a broken `service` block fails with the tap still pointing at the previous good release, and its messages say so ("The tap was NOT updated") |
 | `verify-install` | macos-15 | Post-push **reachability** evidence only: `brew install atelier-fashion/tap/teton` on a runner that has never seen the tap, `brew test`, version check — proving the one-command auto-tap path works against the *live* tap (BR-1). The functional service gates already ran in `bump-formula` | any step. Covers **macOS arm64 only** — a green run here is not evidence about Intel or Linux (LESSON-433) |
 
-After `bump-formula` is green, the run **dispatches**
-[`deploy-site.yml`](../.github/workflows/deploy-site.yml) to republish
-`tetoncode.ai` at the new version. That is a separate workflow run with its own
-entry in the Actions list, not a job in this table — see §5 for why it is a
-dispatch and why it comes after the bump rather than beside it.
-
 Exit codes across `tools/release/` are a taxonomy, not a boolean, so "it failed"
 and "it could not run" can never be confused (LESSON-442, ADR-548-4):
 
@@ -291,34 +279,6 @@ procedure of its own. AC-6, the Keychain-grant survival that signature buys, is
 **staged**: it needs two consecutively signed releases before it can be run at
 all, and is recorded as unrun until the second one (§10).
 
-Finally, the site. Once `bump-formula` has pushed the tap, this workflow
-**dispatches** [`deploy-site.yml`](../.github/workflows/deploy-site.yml) — an
-explicit `workflow_dispatch`, not a `release: published` subscription. It has to
-be: `gh release create` runs under the default `GITHUB_TOKEN`, and GitHub does
-not raise workflow-triggering events for that token's actions, so a subscribed
-workflow would sit silent after every release while looking perfectly healthy.
-
-The ordering is deliberate and is an invariant (ADR-548-3a): the page advertises
-a version *and* the `brew install` that fetches it, and both are only true once
-the tap points at the new release. A site deploy that ran beside the bump would
-publish a page naming vX.Y.Z next to an install command still handing out
-vX.Y.Z-1. So if `bump-formula` fails, the site is not deployed — correctly: the
-page already up matches the version the tap still serves.
-
-That dispatched run renders the page, uploads it as the `site-dist` artifact,
-and publishes it. It has deployed for real since **v0.1.5** (OQ-5 resolved
-2026-08-01) — so a red `Deploy site` run is now a finding to diagnose, not the
-documented expectation it was through v0.1.4. Check the page yourself:
-
-```sh
-curl -s https://tetoncode.ai | grep -o 'v[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1
-```
-
-The `Deploy result` step still fails on purpose when the GCP configuration is
-missing, rather than skipping or going green having published nothing — see
-[site-deploy-runbook.md](site-deploy-runbook.md). That guard is what makes the
-red-is-a-finding reading true.
-
 ---
 
 ## 6. The upgrade path (AC-4)
@@ -397,14 +357,15 @@ install and record the result in that release's sign-off.
    true** — OQ-5 was resolved 2026-08-01 and the site has deployed for real
    since v0.1.5. Kept struck through rather than deleted because this section
    is the record of what v0.1.0 actually looked like: at that release the
-   dispatched `Deploy site` run did go red at its last step, by design. If you
-   see that today, diagnose it (§5) instead of expecting it.
+   dispatched `Deploy site` run did go red at its last step, by design. The
+   site and its workflow were retired on 2026-10-25, so there is no site
+   deploy at all any more.
 5. **AC-4 is staged**, not met (§6).
 6. **AC-1/AC-2 human sign-off** (§8) — CI covers macOS arm64. The other two
    platforms are unrun until a human runs them, and are recorded as unrun.
 7. **The release tooling is already under standing CI.** `ci.yml`'s `tooling`
    job runs on every pull request: `actionlint` (shellcheck-backed) over the
-   workflows, `shellcheck` over `tools/release/*.sh` and `site/render.sh`, and
+   workflows, `shellcheck` over `tools/release/*.sh`, and
    `tools/release/selftest.sh`, which exercises each release script's success
    **and** failure paths with no network and no cargo. So a syntax error or a
    broken exit code in this pipeline is caught on the PR that introduces it,
@@ -899,12 +860,7 @@ published but the formula cannot be pushed" — §9).
       only copy that was ever working — restore it as an *environment* secret,
       not a repository one, and re-run the job.
 
-AC-4 also names `GCP_*`. There is nothing to delete there, and that is now
-checkable rather than asserted: `deploy-site.yml` declares
-`environment: site-deploy`, and `GCP_PROJECT`, `GCP_SERVICE_ACCOUNT` and
-`GCP_WIF_PROVIDER` live on that environment with **no repository-level copy of
-any of them** — verified 2026-08-04, when the repository secret list came back
-empty. So the site deploy went from blocked to live (OQ-5, 2026-08-01) without
-ever putting a `GCP_*` secret at repository level, which is the posture AC-4
-asks for. What remains is the GCP-side attribute condition on the workload
-identity provider — [site-deploy-runbook.md](site-deploy-runbook.md).
+AC-4 also named `GCP_*`. Those lived only on the `site-deploy` environment,
+never at repository level (verified 2026-08-04). The site, its deploy workflow,
+the `site-deploy` environment and its GCP project were all retired on
+2026-10-25, so no `GCP_*` secret exists anywhere in this repository now.

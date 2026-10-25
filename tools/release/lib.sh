@@ -14,8 +14,8 @@
 #     bare "command not found" under `set -e`, a code outside package.sh's own
 #     taxonomy. render-formula.sh's copy checked `command -v` and returned 1.
 #     The returning shape is the one that survived.
-#   * the release-version shape — render-formula.sh and site/render.sh both
-#     accepted `-rc.1`/`+build` suffixes that the release workflow's tag
+#   * the release-version shape — render-formula.sh and the (since retired)
+#     landing-page renderer both accepted `-rc.1`/`+build` suffixes that the release workflow's tag
 #     preflight refuses, so the two halves of the release disagreed about what
 #     a version is.
 #
@@ -31,21 +31,16 @@
 # version renders download URLs and formula stanzas for bytes no release ever
 # uploaded. Refusing is the honest answer until prereleases are something this
 # project actually ships; loosening this regex means teaching the tarball
-# naming, the tap push, and the landing page about prereleases first.
+# naming and the tap push about prereleases first.
 #
-# THIS IS THE AUTHORITY for that shape. Two other places restate it and must be
-# changed with it:
-#   * .github/workflows/release.yml — the tag preflight.
-#   * site/render.sh — which cannot source this file (the deploy workflow runs
-#     it from a checkout that need not contain tools/), so it carries its own
-#     copy behind a comment pointing here.
+# THIS IS THE AUTHORITY for that shape. One other place restates it and must be
+# changed with it: .github/workflows/release.yml — the tag preflight.
 is_release_version() {
     # The `case` runs FIRST because the grep below is line-anchored, not
     # string-anchored: `grep -Eq '^...$'` happily matches a multi-line string
     # whose first line looks like a version, while release.yml's bash `[[ =~ ]]`
     # would reject it. Without this guard the file that calls itself the
-    # authority would be the most permissive of the three. (site/render.sh
-    # carries the same pair for the same reason.)
+    # authority would be the more permissive of the two.
     case "${1-}" in
         *[!0-9.]* | '') return 1 ;;
     esac
