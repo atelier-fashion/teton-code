@@ -20,6 +20,14 @@ user having asked for it.
 
 ## [Unreleased]
 
+### Removed
+
+- **The tetoncode.ai landing page and its deploy pipeline.** The site, its
+  Firebase Hosting deploy workflow and the release job that dispatched it are
+  gone, and the Homebrew formula's homepage now points at the GitHub
+  repository. Nothing changes for an installed `teton`: the binaries never
+  contacted the site.
+
 ### Fixed
 
 - **A shell command whose quoted strings are plain literals no longer pins the

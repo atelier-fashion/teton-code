@@ -43,9 +43,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
-# Least privilege by default. Two jobs widen this, each only to what it needs:
-# `release` writes the GitHub Release, `dispatch-site-deploy` starts one
-# workflow.
+# Least privilege by default. Jobs widen this only to what they need:
+# `release` writes the GitHub Release.
 permissions:
   contents: read
 
@@ -2556,66 +2555,3 @@ jobs:
               ;;
           esac
           exit "$status"
-
-  # BR-8: tetoncode.ai must advertise this release, and it will not do so on its
-  # own.
-  #
-  # deploy-site.yml triggers on `release: published`, and that event never
-  # arrives: GitHub does not raise workflow-triggering events for actions taken
-  # with the repository's GITHUB_TOKEN, and `gh release create` above is one of
-  # them. The site workflow is therefore not "wired up and occasionally flaky" —
-  # it can never fire from a release this pipeline publishes. The event trigger
-  # stays in deploy-site.yml for releases cut by a human or a PAT; this job is
-  # the path that actually runs for a tag push.
-  #
-  # `workflow_dispatch` is the documented exception to that rule — along with
-  # `repository_dispatch` it is the one event GITHUB_TOKEN may raise — which is
-  # why this dispatches rather than, say, re-creating the release.
-  #
-  # DO NOT "simplify" this away by relying on the release event. It looks
-  # redundant with deploy-site.yml's own trigger and it is not.
-  #
-  # Placed last on purpose: the site may only advertise a version that is
-  # published, whose tap actually carries it, and which installs from that tap.
-  # A page announcing a version whose tap bump failed sends every reader to a
-  # `brew install` that hands them the previous release.
-  dispatch-site-deploy:
-    name: publish tetoncode.ai (BR-8)
-    needs: [preflight, release, bump-formula, verify-install]
-    if: needs.preflight.outputs.publish == 'true'
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      # `gh workflow run` is an Actions API write. Scoped to this job; no other
-      # job in this workflow may start a workflow.
-      actions: write
-    steps:
-      - name: Dispatch deploy-site.yml at the release tag
-        env:
-          # No checkout in this job, so `gh` has no git remote to infer the
-          # repository from; GH_REPO tells it directly.
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ needs.preflight.outputs.tag }}
-        run: |
-          set -uo pipefail
-
-          dispatch_status=0
-          # -f tag: the dispatched run must render THE version whose tap bump
-          # this run just proved. --ref alone selects which workflow FILE to
-          # run, not which version it renders; without the input deploy-site
-          # falls back to `releases/latest`, which under two racing releases is
-          # a different version than the tap now carries — the page would
-          # advertise X beside a `brew install` that hands visitors Y.
-          gh workflow run deploy-site.yml --ref "$TAG" -f tag="$TAG" || dispatch_status=$?
-
-          if [ "$dispatch_status" -ne 0 ]; then
-            echo "::error title=Site deploy was NOT requested (BR-8)::'gh workflow run deploy-site.yml --ref $TAG' exited $dispatch_status, so tetoncode.ai was never asked to republish and still advertises the previous version. The release and the tap are correct; only the site is stale. Re-run this job, or dispatch Deploy site manually with tag=$TAG."
-            exit 65
-          fi
-
-          # Stated at exactly the strength it holds: this job proves the deploy
-          # was REQUESTED and accepted. Whether tetoncode.ai actually
-          # republished is that run's own red-or-green, not this one's — a green
-          # box here is not evidence the site is live (LESSON-443).
-          echo "::notice title=Site deploy requested (BR-8)::Deploy site was dispatched against $TAG. Its own run reports whether tetoncode.ai republished: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/workflows/deploy-site.yml"
