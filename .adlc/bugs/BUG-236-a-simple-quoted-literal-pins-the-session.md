@@ -1,10 +1,11 @@
 ---
 id: BUG-236
 title: "A simple quoted literal pins the session, and three /analyze children each wrote one"
-status: open
+status: resolved
 severity: high
 created: 2026-10-08
-updated: 2026-10-08
+updated: 2026-10-09
+resolved: 2026-10-09
 component: "daemon/harness"
 domain: "harness"
 stack: ["rust", "daemon"]
@@ -122,6 +123,11 @@ reverted). Full `tetond` lib suite: 2,348 passed.
 Not changed, by design: `--include='*.rs'` is still refused, on the `=` rule
 (which also guards `--file=.env`); spans holding `$`, a backtick or a
 backslash; REQ-623's propagation of a child's taint into its parent.
+
+## Deployment
+
+Merged to `main` 2026-10-09 as the squash of PR #348. No Cloud Run or iOS
+target: the fix ships in the next tagged release of `teton` / `teton-code`.
 
 ## Files Changed
 
